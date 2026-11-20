@@ -30,7 +30,7 @@ pub const FB_MAX_H: usize = 2048;
 /// Independent revisions of the cached Newport display state. The source
 /// identifies the screen that issued them, so replacing a screen cannot make
 /// an old compositor cache appear current.
-#[cfg(all(test, feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ng1DisplayGenerations {
     pub(crate) source: u64,
@@ -43,7 +43,7 @@ pub(crate) struct Ng1DisplayGenerations {
     pub(crate) geometry: u64,
 }
 
-#[cfg(all(test, feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 impl Ng1DisplayGenerations {
     fn new() -> Self {
         static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
@@ -60,10 +60,11 @@ impl Ng1DisplayGenerations {
 
 /// A Newport display snapshot with no access to either CPU framebuffer.
 /// The generations change when the corresponding cached state changes.
-#[cfg(all(test, feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 pub(crate) struct Ng1DisplaySource<'a> {
     pub(crate) generations: Ng1DisplayGenerations,
     pub(crate) did: &'a [u8],
+    pub(crate) resident_did: &'a Mutex<Option<crate::dev::ng1::wgpu::direct::ResidentDid>>,
     pub(crate) xmap_mode: &'a [u32; 32],
     pub(crate) xmap_config: u8,
     pub(crate) xmap_cursor_cmap: u8,
@@ -122,6 +123,8 @@ pub struct Rex3Screen {
     pub topscan:         usize,
     /// Cursor X correction from VT timing decode
     pub cursor_x_adjust: i32,
+    /// The cursor-gap fault last reported, so each table is reported once.
+    cursor_gap_warned: Option<CursorGapFault>,
 
     /// When true, renderers may skip full compositor work and refresh only the
     /// status bar (heartbeat frames with no FB/palette change).
@@ -139,10 +142,12 @@ pub struct Rex3Screen {
     /// Bumped each time `rgba` is rewritten with a composed frame, so frame
     /// consumers (VNC) can skip unchanged ones without comparing pixels.
     pub frame_seq: u64,
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     display_generations: Ng1DisplayGenerations,
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     display_geometry: (usize, usize, usize, i32),
+    #[cfg(feature = "wgpu")]
+    resident_did: Mutex<Option<crate::dev::ng1::wgpu::direct::ResidentDid>>,
 }
 
 impl Rex3Screen {
@@ -172,40 +177,46 @@ impl Rex3Screen {
             xmap_popup_cmap:  0,
             topscan:          0,
             cursor_x_adjust:  0,
+            cursor_gap_warned: None,
             status_bar_only:  false,
             #[cfg(not(feature = "rex-dirty-upload"))]
             fb_borrowed:      false,
             prebuilt:         false,
             frame_seq:        0,
-            #[cfg(all(test, feature = "wgpu"))]
+            #[cfg(feature = "wgpu")]
             display_generations: Ng1DisplayGenerations::new(),
-            #[cfg(all(test, feature = "wgpu"))]
+            #[cfg(feature = "wgpu")]
             display_geometry: (0, 0, 0, 0),
+            #[cfg(feature = "wgpu")]
+            resident_did: Mutex::new(None),
         }
     }
 
-    fn decode_did(&mut self) -> bool {
+    fn decode_did_into(
+        vc2_regs: &[u16; 32],
+        vc2_ram: &[u16],
+        width: usize,
+        height: usize,
+        did_buf: &mut [u8],
+    ) -> bool {
         fn fill(dst: &mut [u8], value: u8) -> bool {
-            #[cfg(all(test, feature = "wgpu"))]
+            #[cfg(feature = "wgpu")]
             let changed = dst.iter().any(|&old| old != value);
-            #[cfg(not(all(test, feature = "wgpu")))]
+            #[cfg(not(feature = "wgpu"))]
             let changed = false;
             dst.fill(value);
             changed
         }
 
-        let display_ctrl = self.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
+        let display_ctrl = vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
         if (display_ctrl & VC2_CTRL_DID_EN) == 0 {
-            return fill(&mut self.did, 0);
+            return fill(did_buf, 0);
         }
 
         let mut changed = false;
-        let did_ptr  = self.vc2_regs[VC2_REG_DID_ENTRY_PTR as usize];
-        let scan_len = (self.vc2_regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as usize;
-        let width    = self.width;
-        let height   = self.height;
-        let ram      = &self.vc2_ram;
-        let did_buf  = &mut self.did;
+        let did_ptr  = vc2_regs[VC2_REG_DID_ENTRY_PTR as usize];
+        let scan_len = (vc2_regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as usize;
+        let ram      = vc2_ram;
 
         let effective_len = if scan_len > 0 && scan_len <= 2048 { scan_len } else { width };
 
@@ -258,9 +269,46 @@ impl Rex3Screen {
         changed
     }
 
+    fn decode_did(&mut self) -> bool {
+        Self::decode_did_into(
+            &self.vc2_regs,
+            &self.vc2_ram,
+            self.width,
+            self.height,
+            &mut self.did,
+        )
+    }
+
+    #[cfg(all(test, feature = "wgpu"))]
+    pub(crate) fn decoded_did_oracle(&self) -> Vec<u8> {
+        let mut did = self.did.clone();
+        Self::decode_did_into(
+            &self.vc2_regs,
+            &self.vc2_ram,
+            self.width,
+            self.height,
+            &mut did,
+        );
+        did
+    }
+
     // Returns (width, height, cursor_x_adjust).
-    fn decode_video_timings(&self) -> (usize, usize, i32) {
-        decode_vc2_timings(&self.vc2_regs, &self.vc2_ram)
+    fn decode_video_timings(&mut self) -> (usize, usize, i32) {
+        let (w, h, adjust, fault) = decode_vc2_timings_gap(&self.vc2_regs, &self.vc2_ram);
+        // Said once per table, and only while there is a cursor to misplace.
+        let cursor_on = self.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize] & VC2_CTRL_CURSOR_EN != 0;
+        match fault {
+            Some(gap) if cursor_on && self.cursor_gap_warned != Some(gap) => {
+                self.cursor_gap_warned = Some(gap);
+                match gap {
+                    Some(d) => println!("Rex3: WARNING: hpos_to_visible={d} is out of the cursor adjustment's range, using 11"),
+                    None => println!("Rex3: WARNING: HPOS leading edge not found in the video table, using cursor_x_adjust=11"),
+                }
+            }
+            None => self.cursor_gap_warned = None,
+            _ => {}
+        }
+        (w, h, adjust)
     }
 
     /// Copy framebuffer and display state into this cache.
@@ -331,13 +379,14 @@ impl Rex3Screen {
 
     /// Snapshot Newport display controls and tables without accessing either
     /// CPU framebuffer. Returns `true` if the display resolution changed.
-    pub(crate) fn refresh_display_state(
+    fn refresh_display_state_inner(
         &mut self,
         vc2: &Mutex<Vc2>,
         xmap: &Mutex<Xmap9>,
         cmap: &Mutex<Cmap>,
         bt445: &Mutex<Bt445>,
         diag: &AtomicU64,
+        decode_did: bool,
     ) -> bool {
         let mut resized = false;
 
@@ -348,7 +397,7 @@ impl Rex3Screen {
         {
             let mut vc2 = vc2.lock();
             if vc2.dirty {
-                #[cfg(all(test, feature = "wgpu"))]
+                #[cfg(feature = "wgpu")]
                 {
                     if self.vc2_ram != vc2.ram {
                         Ng1DisplayGenerations::bump(&mut self.display_generations.vc2_ram);
@@ -368,7 +417,7 @@ impl Rex3Screen {
         {
             let mut cmap = cmap.lock();
             if cmap.dirty {
-                #[cfg(all(test, feature = "wgpu"))]
+                #[cfg(feature = "wgpu")]
                 if self.cmap != cmap.palette {
                     Ng1DisplayGenerations::bump(&mut self.display_generations.cmap);
                 }
@@ -382,7 +431,7 @@ impl Rex3Screen {
             let mut dac = bt445.lock();
             if dac.dirty {
                 let palette = dac.palette_as_rgb();
-                #[cfg(all(test, feature = "wgpu"))]
+                #[cfg(feature = "wgpu")]
                 if self.ramdac_palette != palette {
                     Ng1DisplayGenerations::bump(&mut self.display_generations.ramdac);
                 }
@@ -395,7 +444,7 @@ impl Rex3Screen {
         {
             let mut xmap = xmap.lock();
             if xmap.dirty {
-                #[cfg(all(test, feature = "wgpu"))]
+                #[cfg(feature = "wgpu")]
                 if self.xmap_mode != xmap.mode_table
                     || self.xmap_config != xmap.config
                     || self.xmap_cursor_cmap != xmap.cursor_cmap_msb
@@ -434,22 +483,47 @@ impl Rex3Screen {
             resized = true;
         }
 
-        diag.fetch_or(Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
-        let did_changed = self.decode_did();
-        #[cfg(all(test, feature = "wgpu"))]
-        if did_changed {
-            Ng1DisplayGenerations::bump(&mut self.display_generations.did);
+        if decode_did {
+            diag.fetch_or(Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
+            let did_changed = self.decode_did();
+            #[cfg(feature = "wgpu")]
+            if did_changed {
+                Ng1DisplayGenerations::bump(&mut self.display_generations.did);
+            }
+            #[cfg(not(feature = "wgpu"))]
+            let _ = did_changed;
+            diag.fetch_and(!Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
         }
-        #[cfg(not(all(test, feature = "wgpu")))]
-        let _ = did_changed;
-        diag.fetch_and(!Rex3::DIAG_LOOP_DECODE_DID, Ordering::Relaxed);
 
         resized
     }
 
+    pub(crate) fn refresh_display_state(
+        &mut self,
+        vc2: &Mutex<Vc2>,
+        xmap: &Mutex<Xmap9>,
+        cmap: &Mutex<Cmap>,
+        bt445: &Mutex<Bt445>,
+        diag: &AtomicU64,
+    ) -> bool {
+        self.refresh_display_state_inner(vc2, xmap, cmap, bt445, diag, true)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn refresh_resident_display_state(
+        &mut self,
+        vc2: &Mutex<Vc2>,
+        xmap: &Mutex<Xmap9>,
+        cmap: &Mutex<Cmap>,
+        bt445: &Mutex<Bt445>,
+        diag: &AtomicU64,
+    ) -> bool {
+        self.refresh_display_state_inner(vc2, xmap, cmap, bt445, diag, false)
+    }
+
     /// Borrow only display state. Geometry includes externally supplied
     /// topscan as well as the decoded dimensions and cursor adjustment.
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     pub(crate) fn display_state(&mut self) -> Ng1DisplaySource<'_> {
         let geometry = (self.width, self.height, self.topscan, self.cursor_x_adjust);
         if self.display_geometry != geometry {
@@ -459,6 +533,7 @@ impl Rex3Screen {
         Ng1DisplaySource {
             generations: self.display_generations,
             did: &self.did,
+            resident_did: &self.resident_did,
             xmap_mode: &self.xmap_mode,
             xmap_config: self.xmap_config,
             xmap_cursor_cmap: self.xmap_cursor_cmap,
@@ -551,8 +626,88 @@ impl Rex3Screen {
     }
 }
 
+/// What a VC2 or VC3 timing generator's tables add up to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vc2Totals {
+    /// Pixel clocks a line, blanking included.
+    pub h_total: u32,
+    /// Lines a frame, blanking included, over all of its fields.
+    pub v_total: u32,
+    /// Lines with any pixel out of blanking.
+    pub visible_lines: u32,
+    /// Runs of visible lines: 1, or 2 for an interlaced, a two-field or a
+    /// field-sequential stereo format, each with its own vertical blank.
+    pub fields: u32,
+}
+
+/// Total a VC2's video timing tables (the VC3's are laid out the same): the
+/// frame table at the video entry pointer lists (line table, repeat count)
+/// pairs up to a zero count; a line is runs of states, each lasting its
+/// duration field in units of two pixel clocks, and ends with the address
+/// of the line that follows. `visible` says whether a run's states (the
+/// first word's seven A bits, and the C bits of the last second word) put
+/// its line in the picture: the VC2's composite blank is a C bit, the VC3
+/// marks its visible lines in an A bit. None while no table is loaded.
+pub fn decode_vc2_totals(vc2_regs: &[u16; 32], ram: &[u16], visible_run: impl Fn(u8, u8) -> bool) -> Option<Vc2Totals> {
+    let mut frame = vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;
+    let (mut h_total, mut v_total, mut visible_lines, mut fields) = (0u32, 0u32, 0u32, 0u32);
+    let mut in_picture = false;
+    // The tables are the guest's: every walk is bounded.
+    for _ in 0..1024 {
+        let (mut line, mut repeat) = (*ram.get(frame)? as usize, *ram.get(frame + 1)? as usize);
+        if repeat == 0 {
+            break;
+        }
+        while repeat > 0 {
+            let (mut clocks, mut visible, mut state_c) = (0u32, false, 0u8);
+            for _ in 0..1024 {
+                let w1 = *ram.get(line)?;
+                line += 1;
+                let mut eol = w1 & 0x8000 != 0;
+                if w1 & 0x0080 == 0 {
+                    let w2 = *ram.get(line)?;
+                    line += 1;
+                    eol |= w2 & 0x8000 != 0;
+                    state_c = (w2 & 0x7F) as u8;
+                }
+                visible |= visible_run((w1 & 0x7F) as u8, state_c);
+                clocks += 2 * ((w1 >> 8) & 0x7F) as u32;
+                if eol {
+                    break;
+                }
+            }
+            h_total = h_total.max(clocks);
+            v_total += 1;
+            if visible {
+                visible_lines += 1;
+                fields += !in_picture as u32;
+            }
+            in_picture = visible;
+            if v_total > 8192 {
+                return None;
+            }
+            repeat -= 1;
+            line = *ram.get(line)? as usize;
+        }
+        frame += 2;
+    }
+    (h_total != 0 && v_total != 0 && visible_lines != 0).then_some(Vc2Totals { h_total, v_total, visible_lines, fields })
+}
+
 /// Decode visible display size from VC2 state (used by compositor and timing presets).
 pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usize, i32) {
+    let (w, h, adjust, _) = decode_vc2_timings_gap(vc2_regs, vc2_ram);
+    (w, h, adjust)
+}
+
+/// A cursor placement the video table does not give: the distance from the
+/// HPOS edge to the first visible pixel was missing (`None`) or outside what
+/// the cursor adjustment covers, so the default adjustment is used.
+pub type CursorGapFault = Option<usize>;
+
+/// [`decode_vc2_timings`], also saying when the cursor adjustment is the
+/// fallback and why. It matters only while the cursor is shown.
+pub fn decode_vc2_timings_gap(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usize, i32, Option<CursorGapFault>) {
     let frame_ptr = vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;
     let ram = vc2_ram;
 
@@ -646,22 +801,15 @@ pub fn decode_vc2_timings(vc2_regs: &[u16; 32], vc2_ram: &[u16]) -> (usize, usiz
     if max_visible_width > 0 && total_visible_lines > 0 {
         let w = max_visible_width.min(2048);
         let h = total_visible_lines.min(1024);
-        let cursor_x_adjust = match hpos_to_visible {
-            Some(d) => {
-                let adj = d as i32 - 31;
-                if adj < 0 || adj > 64 {
-                    println!("Rex3: WARNING: hpos_to_visible={} gives cursor_x_adjust={}, out of range, falling back to 11", d, adj);
-                    11
-                } else { adj }
-            }
-            None => {
-                println!("Rex3: WARNING: HPOS leading edge not found in VT, falling back to cursor_x_adjust=11");
-                11
-            }
+        let (cursor_x_adjust, fault) = match hpos_to_visible {
+            // The NG2 table (a Newport in an expansion slot) has a 30-pixel
+            // gap, so the adjustment goes slightly negative.
+            Some(d) if (-16..=64).contains(&(d as i32 - 31)) => (d as i32 - 31, None),
+            other => (11, Some(other)),
         };
-        (w, h, cursor_x_adjust-2)
+        (w, h, cursor_x_adjust - 2, fault)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, None)
     }
 }
 
@@ -809,9 +957,17 @@ pub struct StatusSource {
     l1i_hits: Arc<AtomicU64>,
     l1i_fetches: Arc<AtomicU64>,
     uncached: Arc<AtomicU64>,
+    /// The machine's display refresh thread. It is here because the status
+    /// source is the one thing every graphics board of a machine is given.
+    refresh: Arc<crate::display::Refresh>,
 }
 
 impl StatusSource {
+    /// The display refresh thread the machine's boards share.
+    pub fn refresh(&self) -> &Arc<crate::display::Refresh> {
+        &self.refresh
+    }
+
     /// Heartbeat bits that stay lit between frames (the front-panel LEDs).
     /// Everything else in the heartbeat is activity and clears once shown.
     pub const PERSISTENT: u64 = Rex3::HB_PERSISTENT;
@@ -827,6 +983,7 @@ impl StatusSource {
             l1i_hits: Arc::new(AtomicU64::new(0)),
             l1i_fetches: Arc::new(AtomicU64::new(0)),
             uncached: Arc::new(AtomicU64::new(0)),
+            refresh: crate::display::Refresh::new(),
         })
     }
 

@@ -1,6 +1,7 @@
 // System Snapshot — save and restore full machine state to/from a directory.
 //
-// Layout of saves/<name>/ (schema_version = 2):
+// Layout of saves/<name>/ for an Indy or Indigo2 (the current schema is
+// `SCHEMA_VERSION`; the other machines save their own device files):
 //   snapshot.toml  — manifest (always TOML, human-readable)
 //   cpu.bin        — CPU core (GPRs, CP0, FPU), TLB entries  (postcard BinValue)
 //   mc.bin         — Memory Controller registers + GIO DMA state
@@ -14,7 +15,8 @@
 //   bank2.bin      — 128 MB RAM bank C
 //   bank3.bin      — 128 MB RAM bank D
 //
-// schema_version = 1: same layout but device state is *.toml (hex strings).
+// Before schema_version 2 device state was *.toml (hex strings):
+// schema_version = 1: same layout but device state is *.toml.
 // schema_version = 0 (no manifest): legacy, also *.toml.
 
 use serde::{Deserialize, Serialize};
@@ -60,13 +62,21 @@ use toml::Value;
 /// arrays and the cursor memory). postcard is not self-describing, so a v6 reader
 /// would take the new field's bytes for something else and a v7 reader would fail on
 /// a v6 `chunks.bin`; the bump makes both refuse. Nothing else changed shape.
-pub const SCHEMA_VERSION: u32 = 7;
+///
+/// v7 → v8: `ChunksManifest` gains named IMPACT board state chunks. Metadata
+/// remains in the device state file; large framebuffer, texture, frontend and
+/// raster-engine payloads are content-addressed here.
+///
+/// v8 → v9: `ChunksManifest` gains named VPro/Odyssey board state and VRAM
+/// chunks. The board's small metadata remains in its device state file.
+///
+/// v9 → v10: `ChunksManifest` gains named GR2 board state, VRAM, and Z-buffer
+/// chunks. The board's small metadata remains in its device state file.
+pub const SCHEMA_VERSION: u32 = 10;
 
-/// The oldest schema this build reads. v6 → v7 only appended `kona_chunks` to
-/// `ChunksManifest` and the KONA board has no machine that saves it yet, so a
-/// v6 snapshot of an Indy, an O2 or an Octane loads as it did, with that list
-/// empty (`ChunksManifest::from_bytes`). Raise this when a change makes an
-/// older snapshot unreadable.
+/// The oldest schema this build reads. The v6 through v10 chunk manifests are
+/// decoded explicitly; absent KONA, IMPACT, VPro, or GR2 lists become empty. Raise
+/// this when a change makes an older snapshot unreadable.
 pub const OLDEST_SCHEMA: u32 = 6;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
@@ -489,6 +499,60 @@ pub struct ChunksManifest {
     pub framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
     /// The KONA pipe's pixel store and cursor memory; empty when the machine has none.
     pub kona_chunks: Vec<crate::dev::kona::KonaChunk>,
+    /// Named IMPACT architectural state; empty when the machine has no IMPACT board.
+    pub mgras_chunks: Vec<MgrasChunk>,
+    /// Named VPro architectural state and VRAM; empty when the machine has no VPro board.
+    pub odyssey_chunks: Vec<OdysseyChunk>,
+    /// Named GR2 architectural state, VRAM, and Z-buffer; empty without GR2.
+    pub gr2_chunks: Vec<Gr2Chunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MgrasChunk {
+    pub name: String,
+    pub words: usize,
+    pub hashes: Vec<ChunkHash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OdysseyChunk {
+    pub name: String,
+    pub words: usize,
+    pub hashes: Vec<ChunkHash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gr2Chunk {
+    pub name: String,
+    pub words: usize,
+    pub hashes: Vec<ChunkHash>,
+}
+
+/// `chunks.bin` as schema 9 wrote it: `ChunksManifest` before `gr2_chunks`.
+#[derive(Serialize, Deserialize)]
+struct ChunksManifestV9 {
+    bank_chunks: [Vec<ChunkHash>; 4],
+    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
+    kona_chunks: Vec<crate::dev::kona::KonaChunk>,
+    mgras_chunks: Vec<MgrasChunk>,
+    odyssey_chunks: Vec<OdysseyChunk>,
+}
+
+/// `chunks.bin` as schema 8 wrote it: `ChunksManifest` before `odyssey_chunks`.
+#[derive(Serialize, Deserialize)]
+struct ChunksManifestV8 {
+    bank_chunks: [Vec<ChunkHash>; 4],
+    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
+    kona_chunks: Vec<crate::dev::kona::KonaChunk>,
+    mgras_chunks: Vec<MgrasChunk>,
+}
+
+/// `chunks.bin` as schema 7 wrote it: `ChunksManifest` before `mgras_chunks`.
+#[derive(Serialize, Deserialize)]
+struct ChunksManifestV7 {
+    bank_chunks: [Vec<ChunkHash>; 4],
+    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
+    kona_chunks: Vec<crate::dev::kona::KonaChunk>,
 }
 
 /// `chunks.bin` as schema 6 wrote it: `ChunksManifest` before `kona_chunks`.
@@ -499,17 +563,52 @@ struct ChunksManifestV6 {
 }
 
 impl ChunksManifest {
-    /// Decode a `chunks.bin` of schema 6 or 7. A v6 file is the v7 layout cut
-    /// short before `kona_chunks`; postcard reports that as a short read, so
-    /// it is tried as v6, which must use every byte. Whatever else fails to
-    /// parse is reported as a v7 failure.
+    /// Decode a `chunks.bin` of schema 6 through 10. Older layouts must consume
+    /// every byte so a corrupt current manifest cannot be accepted as one.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
         let current = match postcard::from_bytes::<ChunksManifest>(bytes) {
             Ok(m) => return Ok(m),
             Err(e) => e,
         };
+        if let Ok((old, [])) = postcard::take_from_bytes::<ChunksManifestV9>(bytes) {
+            return Ok(ChunksManifest {
+                bank_chunks: old.bank_chunks,
+                framebuffer_chunks: old.framebuffer_chunks,
+                kona_chunks: old.kona_chunks,
+                mgras_chunks: old.mgras_chunks,
+                odyssey_chunks: old.odyssey_chunks,
+                gr2_chunks: Vec::new(),
+            });
+        }
+        if let Ok((old, [])) = postcard::take_from_bytes::<ChunksManifestV8>(bytes) {
+            return Ok(ChunksManifest {
+                bank_chunks: old.bank_chunks,
+                framebuffer_chunks: old.framebuffer_chunks,
+                kona_chunks: old.kona_chunks,
+                mgras_chunks: old.mgras_chunks,
+                odyssey_chunks: Vec::new(),
+                gr2_chunks: Vec::new(),
+            });
+        }
+        if let Ok((old, [])) = postcard::take_from_bytes::<ChunksManifestV7>(bytes) {
+            return Ok(ChunksManifest {
+                bank_chunks: old.bank_chunks,
+                framebuffer_chunks: old.framebuffer_chunks,
+                kona_chunks: old.kona_chunks,
+                mgras_chunks: Vec::new(),
+                odyssey_chunks: Vec::new(),
+                gr2_chunks: Vec::new(),
+            });
+        }
         match postcard::take_from_bytes::<ChunksManifestV6>(bytes) {
-            Ok((old, [])) => Ok(ChunksManifest { bank_chunks: old.bank_chunks, framebuffer_chunks: old.framebuffer_chunks, kona_chunks: Vec::new() }),
+            Ok((old, [])) => Ok(ChunksManifest {
+                bank_chunks: old.bank_chunks,
+                framebuffer_chunks: old.framebuffer_chunks,
+                kona_chunks: Vec::new(),
+                mgras_chunks: Vec::new(),
+                odyssey_chunks: Vec::new(),
+                gr2_chunks: Vec::new(),
+            }),
             _ => Err(current),
         }
     }
@@ -517,13 +616,24 @@ impl ChunksManifest {
     /// Iterate every chunk hash referenced by this manifest. Used by `gc`
     /// to build the live set across all kept snapshots.
     pub fn referenced_hashes(&self) -> impl Iterator<Item = &ChunkHash> {
-        self.bank_chunks.iter().flatten().chain(
-            self.framebuffer_chunks
-                .iter()
-                .flat_map(|(rgb, aux)| rgb.iter().chain(aux.iter())),
-        )
-        // A zero chunk's place holds the zero hash, which the store never holds.
-        .chain(self.kona_chunks.iter().flat_map(|c| c.hashes.iter()).filter(|h| **h != [0u8; 32]))
+        self.bank_chunks
+            .iter()
+            .flatten()
+            .chain(
+                self.framebuffer_chunks
+                    .iter()
+                    .flat_map(|(rgb, aux)| rgb.iter().chain(aux.iter())),
+            )
+            // A zero chunk's place holds the zero hash, which the store never holds.
+            .chain(
+                self.kona_chunks
+                    .iter()
+                    .flat_map(|c| c.hashes.iter())
+                    .filter(|h| **h != [0u8; 32]),
+            )
+            .chain(self.mgras_chunks.iter().flat_map(|c| c.hashes.iter()))
+            .chain(self.odyssey_chunks.iter().flat_map(|c| c.hashes.iter()))
+            .chain(self.gr2_chunks.iter().flat_map(|c| c.hashes.iter()))
     }
 }
 
@@ -870,23 +980,116 @@ mod tests {
             assert!(chunks.bank_chunks[1..].iter().all(|b| b.is_empty()));
             assert_eq!(chunks.framebuffer_chunks, framebuffer.then(|| (vec![[0xcd; 32]], vec![])));
             assert!(chunks.kona_chunks.is_empty());
+            assert!(chunks.mgras_chunks.is_empty());
+            assert!(chunks.odyssey_chunks.is_empty());
+            assert!(chunks.gr2_chunks.is_empty());
             assert_eq!(chunks.referenced_hashes().count(), 1 + framebuffer as usize);
             let _ = fs::remove_dir_all(&dir);
         }
     }
 
-    /// The current layout still round-trips, and a file that is neither layout
-    /// is refused: a v7 file cut short, or a v6 file with something after it.
+    #[test]
+    fn a_schema_7_chunk_manifest_loads_with_no_impact_chunks() {
+        let old = ChunksManifestV7 {
+            bank_chunks: std::array::from_fn(|i| if i == 1 { vec![[7; 32]] } else { Vec::new() }),
+            framebuffer_chunks: None,
+            kona_chunks: vec![crate::dev::kona::KonaChunk { name: "state".into(), hashes: vec![[8; 32]] }],
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        let back = ChunksManifest::from_bytes(&bytes).unwrap();
+        assert_eq!(back.bank_chunks[1], vec![[7; 32]]);
+        assert_eq!(back.kona_chunks, old.kona_chunks);
+        assert!(back.mgras_chunks.is_empty());
+        assert!(back.odyssey_chunks.is_empty());
+        assert!(back.gr2_chunks.is_empty());
+    }
+
+    #[test]
+    fn a_schema_8_chunk_manifest_loads_with_no_vpro_chunks() {
+        let old = ChunksManifestV8 {
+            bank_chunks: std::array::from_fn(|i| if i == 2 { vec![[7; 32]] } else { Vec::new() }),
+            framebuffer_chunks: None,
+            kona_chunks: vec![crate::dev::kona::KonaChunk {
+                name: "state".into(),
+                hashes: vec![[8; 32]],
+            }],
+            mgras_chunks: vec![MgrasChunk {
+                name: "front".into(),
+                words: 19,
+                hashes: vec![[9; 32]],
+            }],
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        let back = ChunksManifest::from_bytes(&bytes).unwrap();
+        assert_eq!(back.bank_chunks[2], old.bank_chunks[2]);
+        assert_eq!(back.kona_chunks, old.kona_chunks);
+        assert_eq!(back.mgras_chunks, old.mgras_chunks);
+        assert!(back.odyssey_chunks.is_empty());
+        assert!(back.gr2_chunks.is_empty());
+    }
+
+    #[test]
+    fn a_schema_9_chunk_manifest_loads_with_no_gr2_chunks() {
+        let old = ChunksManifestV9 {
+            bank_chunks: std::array::from_fn(|i| if i == 3 { vec![[7; 32]] } else { Vec::new() }),
+            framebuffer_chunks: None,
+            kona_chunks: vec![],
+            mgras_chunks: vec![MgrasChunk {
+                name: "front".into(),
+                words: 19,
+                hashes: vec![[9; 32]],
+            }],
+            odyssey_chunks: vec![OdysseyChunk {
+                name: "vram".into(),
+                words: 23,
+                hashes: vec![[10; 32]],
+            }],
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        let back = ChunksManifest::from_bytes(&bytes).unwrap();
+        assert_eq!(back.bank_chunks[3], old.bank_chunks[3]);
+        assert_eq!(back.mgras_chunks, old.mgras_chunks);
+        assert_eq!(back.odyssey_chunks, old.odyssey_chunks);
+        assert!(back.gr2_chunks.is_empty());
+    }
+
+    /// The current layout still round-trips, and a file that is neither a
+    /// complete current layout nor an exact older layout is refused.
     #[test]
     fn a_chunks_manifest_of_the_current_layout_round_trips_and_garbage_is_refused() {
         let mut m = ChunksManifest::default();
         m.bank_chunks[2].push([7; 32]);
-        m.kona_chunks.push(crate::dev::kona::KonaChunk { name: "state-9".into(), hashes: vec![[9; 32]] });
+        m.kona_chunks.push(crate::dev::kona::KonaChunk {
+            name: "state-9".into(),
+            hashes: vec![[9; 32]],
+        });
+        m.mgras_chunks.push(MgrasChunk {
+            name: "front".into(),
+            words: 17,
+            hashes: vec![[10; 32]],
+        });
+        m.odyssey_chunks.push(OdysseyChunk {
+            name: "vram".into(),
+            words: 23,
+            hashes: vec![[11; 32]],
+        });
+        m.gr2_chunks.push(Gr2Chunk {
+            name: "zbuf".into(),
+            words: 29,
+            hashes: vec![[12; 32]],
+        });
         let bytes = postcard::to_allocvec(&m).unwrap();
         let back = ChunksManifest::from_bytes(&bytes).unwrap();
         assert_eq!(back.bank_chunks[2], m.bank_chunks[2]);
         assert_eq!(back.kona_chunks, m.kona_chunks);
-        assert!(ChunksManifest::from_bytes(&bytes[..bytes.len() - 1]).is_err(), "cut short");
+        assert_eq!(back.mgras_chunks, m.mgras_chunks);
+        assert_eq!(back.odyssey_chunks, m.odyssey_chunks);
+        assert_eq!(back.gr2_chunks, m.gr2_chunks);
+        assert!(back.referenced_hashes().any(|hash| *hash == [12; 32]));
+        assert!(
+            ChunksManifest::from_bytes(&bytes[..bytes.len() - 1]).is_err(),
+            "cut short"
+        );
         let mut padded = v6_chunks_bin(false);
         padded.extend([5, 5]);
         assert!(ChunksManifest::from_bytes(&padded).is_err(), "trailing bytes after a v6 layout");

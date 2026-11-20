@@ -370,7 +370,7 @@ mod tests {
         x.draw_command(&d, X_SEGMENT, &[pack(-30000, -30000), pack(30000, 30000)]);
     }
 
-    /// A line whose destination does not fit the target draws nothing, as
+    /// A line whose destination is outside the target draws nothing, as
     /// every other fill is checked before it is drawn.
     #[test]
     fn a_line_over_a_wide_destination_is_refused_whole() {

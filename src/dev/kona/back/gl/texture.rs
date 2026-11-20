@@ -202,7 +202,7 @@ impl Header {
         let p = self.pixel_bytes()? as u64;
         let l = if u.row_length == 0 { self.w } else { u.row_length } as u64;
         let a = u.alignment.max(1) as u64;
-        // The unpack state is the guest's: a product past what fits is no size (counted as an unsupported load).
+        // The unpack state is the guest's: a product past the limit is no size (counted as an unsupported load).
         let stride = (l * p).div_ceil(a).checked_mul(a)?;
         let start = (u.skip_rows as u64).checked_mul(stride)?.checked_add(self.offset as u64)?.checked_add(u.skip_pixels as u64 * p)?;
         Some((p, stride, start))
@@ -661,7 +661,7 @@ impl TexContext {
         // pool is refused before anything is retired or written (the model's own limit, as the bank's edge is).
         let (rw, rh) = ((h.x1 - h.x0 + 1).min(h.w), (h.y1 - h.y0 + 1).min(h.h));
         let first = h.address as u64 * UNIT_WORDS as u64 + (slice * pw * ph) as u64 + h.y0 as u64 * pw as u64 + h.x0 as u64;
-        if !store.fits(plane, first, rw as u64, pw as u64, rh as u64) {
+        if !store.holds(plane, first, rw as u64, pw as u64, rh as u64) {
             counts.full += 1;
             return false;
         }
@@ -1578,7 +1578,7 @@ mod tests {
     /// one, then a level that is larger than either hole and smaller than the free total. The hardware has no
     /// allocator to refuse with, so the load goes where its address says and overwrites what is there.
     #[test]
-    fn a_load_that_fits_no_hole_is_not_refused() {
+    fn a_load_with_no_hole_to_go_in_is_not_refused() {
         // A bank of 16 units.
         let store = TextureStore::with_capacity_bytes(16 * 64);
         assert_eq!(store.bank_units(), 16);
@@ -1636,7 +1636,7 @@ mod tests {
     }
 
     /// A load whose address and extent reach past the bank is refused and counted, as the model's own
-    /// limit: nothing already loaded is touched, and a reload of a level that is there always fits. Giving a
+    /// limit: nothing already loaded is touched, and a reload of a level that is there is always allowed. Giving a
     /// context's texture memory back empties it.
     #[test]
     fn loads_past_the_bank_are_refused_and_a_released_context_is_empty() {
@@ -1698,7 +1698,7 @@ mod tests {
     }
 
     /// A load past the pool is refused and counted, and the levels already there are left alone, including when the
-    /// refused load would have retired one. A reload of what is held still fits.
+    /// refused load would have retired one. A reload of what is held is still allowed.
     #[test]
     fn a_load_past_the_pool_is_refused_and_leaves_the_old_levels() {
         // A bank of 3 pages and a pool of 6.

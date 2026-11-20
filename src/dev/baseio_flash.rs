@@ -1,15 +1,10 @@
-//! The BaseIO card's boot flash: a 1 MiB, 512K x 16 top-boot part on the
-//! Bridge's flash port, holding the I/O PROM the IP27 PROM copies into memory
-//! at "Loading BASEIO prom". Without it the IP27 PROM falls back to its own
-//! reduced copy, which has no graphics console.
+//! The BaseIO card's boot flash: a 1 MiB, 512K x 16 top-boot part holding the
+//! I/O PROM the IP27 PROM loads ("Loading BASEIO prom"); without it, a reduced copy.
 //!
-//! The part answers the AMD command set ([`crate::dev::sflash::amd`]) far
-//! enough for the PROM's loader to accept it: reset (0xf0) and the autoselect
-//! sequence, with manufacturer 0x01 and device 0x22da, one of the three
-//! identities the loader accepts. Which part SGI fitted is not established.
-//! The array is read-only here: program and erase cycles are logged and
-//! refused. The unlock addresses are x16 word addresses, matched on their low
-//! eleven bits as the part does.
+//! It answers the AMD command set (`crate::dev::sflash::amd`): reset (0xf0)
+//! and autoselect as manufacturer 0x01, device 0x22da, one of three identities
+//! the loader accepts (the part SGI used is not established). Read-only:
+//! program and erase are logged and refused.
 //!
 //! Ported from hw/mips/sgi/baseio-flash.c in jamesbraid/qemu-sgi-origami.
 
@@ -22,9 +17,7 @@ pub const SIZE: usize = 1 << 20;
 pub const MANUFACTURER: u16 = 0x01;
 pub const DEVICE: u16 = 0x22da;
 
-/// The part, to the command engine: 512K x 16, unlock addresses matched on
-/// their low eleven bits, the identification words at the first two word
-/// addresses, and program and erase refused.
+/// 512K x 16; unlock addresses match on their low eleven bits.
 const GEOMETRY: Geometry = Geometry {
     x8: false,
     sector_size: 0x1_0000,
@@ -42,6 +35,10 @@ const GEOMETRY: Geometry = Geometry {
 pub struct BaseioFlash {
     image: Box<[u8]>,
     core: Mutex<AmdCore>,
+    /// JIT v2: the part's identity in a page key, and its write counter:
+    /// a command cycle changes what a read returns.
+    #[cfg(feature = "jitv2")]
+    code: (crate::traits::CodeBank, std::sync::atomic::AtomicU64),
 }
 
 impl BaseioFlash {
@@ -52,7 +49,12 @@ impl BaseioFlash {
         }
         let mut image = vec![0xff; SIZE].into_boxed_slice();
         image[..file.len()].copy_from_slice(file);
-        Ok(Self { image, core: Mutex::new(AmdCore::new(GEOMETRY)) })
+        Ok(Self {
+            image,
+            core: Mutex::new(AmdCore::new(GEOMETRY)),
+            #[cfg(feature = "jitv2")]
+            code: Default::default(),
+        })
     }
 }
 
@@ -71,10 +73,23 @@ impl BusDevice for BaseioFlash {
     fn write16(&self, addr: u64, val: u16) -> u32 {
         // The engine logs a cycle it does not take, including the program and
         // erase this part refuses.
-        match self.core.lock().write16(addr as usize, val) {
+        let cycle = self.core.lock().write16(addr as usize, val);
+        #[cfg(feature = "jitv2")]
+        self.code.1.fetch_add(1, std::sync::atomic::Ordering::Release);
+        match cycle {
             Ok(_) => BUS_OK,
             Err(()) => BUS_ERR,
         }
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.code.1
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        ((addr as usize) < self.image.len()).then(|| self.code.0.page(addr, &self.code.1))
     }
 }
 

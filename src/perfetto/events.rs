@@ -332,6 +332,18 @@ pub static ODSY_PRESENT: EventDef = EventDef::new("present", cat::GFX).on_track(
 /// for the raster unit (on the display thread).
 pub static ODSY_FRAME_PLANES: EventDef = EventDef::new("frame planes", cat::GFX);
 
+// ── Display refresh thread ───────────────────────────────────────────────────
+
+/// A head's vertical blank, from vblank start to vblank end (arg: field).
+pub static DISPLAY_VBLANK: EventDef = EventDef::new("vblank", cat::GFX).on_track("Display vblank").in_group(GFX_GROUP).with_arg("field");
+/// The board taking a frame from its live state, composing it, and the
+/// renderer showing it: one after another on the refresh thread.
+pub static DISPLAY_CAPTURE: EventDef = EventDef::new("capture", cat::GFX).on_track("Display frame").in_group(GFX_GROUP);
+pub static DISPLAY_COMPOSE: EventDef = EventDef::new("compose", cat::GFX).on_track("Display frame").in_group(GFX_GROUP);
+pub static DISPLAY_PRESENT: EventDef = EventDef::new("present", cat::GFX).on_track("Display frame").in_group(GFX_GROUP);
+/// A capture the board refused (Newport's fence): the frame on screen stays.
+pub static DISPLAY_NOT_READY: EventDef = EventDef::new("capture refused", cat::GFX).on_track("Display frame").in_group(GFX_GROUP);
+
 // ── jitv2 ────────────────────────────────────────────────────────────────────
 
 /// A dispatch queued a page compile (arg: guest PC).

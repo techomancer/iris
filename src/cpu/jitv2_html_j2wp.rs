@@ -54,7 +54,7 @@ pub mod jitv2_html {
         pub pfn: u32,
         pub phys_addr: u64,
         /// The name of the machine's memory range this page is in, or
-        /// [`super::OTHER_REGION`] — purely a label for the region-overview
+        /// `super::OTHER_REGION` — purely a label for the region-overview
         /// grid; jitv2 itself tracks pages by bare pfn, agnostic to which bus
         /// window/device they fall in.
         pub window: &'static str,
@@ -477,13 +477,20 @@ pub fn write_jitv2_html(
     // (Jitv2::code_bytes_used doc comment) — fine for an on-demand dump,
     // not a hot path.
     for page in jit.claimed_pages() {
-        let phys_addr = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+        // Where the lowest-numbered CPU that reaches the page has it.
+        let located = jit.buses().locate(page, 0);
+        let phys_addr = located.as_ref().map_or(page.pfn() as u64 * crate::cpu::jitv2::PAGE_SIZE as u64, |(_, at)| *at);
+        let bus = located.as_ref().map_or(bus, |(b, _)| b);
         let window = memory.find(phys_addr).map_or(OTHER_REGION, |r| r.name);
         let page_gen = page.current_gen();
 
         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
         for (i, w) in words.iter_mut().enumerate() {
-            *w = bus.read32(phys_addr + i as u64 * 4).data;
+            *w = if page.words().is_null() {
+                bus.read32(phys_addr + i as u64 * 4).data
+            } else {
+                unsafe { std::ptr::read_volatile(page.words().add(i)) }
+            };
         }
 
         // §13: one function/gen/instr_count/code_size/call_count/
@@ -547,7 +554,7 @@ pub fn write_jitv2_html(
         let guest_code_size = (rows.len() as u32) * 4;
 
         pages.push(jitv2_html::PageDump {
-            pfn: page.pfn,
+            pfn: (phys_addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32,
             phys_addr,
             window,
             gen: page_gen,

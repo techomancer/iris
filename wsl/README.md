@@ -36,8 +36,8 @@ These settings are part of this repository and share the core configuration sche
 | **Premiere GUI** | `cargo build -p iris-gui --features premiere` — embedded `lightning` + `idle-pause`; `run-iris-gui-premiere.bat` |
 | **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in the machine's own TOML; **File → Prepare for premiere…** flushes it to disk and reports the path to run the CLI `--config` against, from that machine's folder |
 | **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [clanker/perf/gui-idle-refresh.md](../clanker/perf/gui-idle-refresh.md) |
-| **Audio** | HAL2 wall-clock pacing/resampling; Display tab `[audio]` prebuf / device buffer |
-| **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); use `jitv2_lockstep` for diagnostics or `jitv2_opcodefusion` separately (they conflict); `[jitv2] threads` configures the pool |
+| **Audio** | Every sound device plays through the `iris-audio` crate (WASAPI on Windows); the GUI's audio settings write `[audio]`: host, prebuffer, host buffer (`latency_ms`), channels and a WAV file to play into |
+| **jitv2 (experimental)** | `--features jitv2` — whole-page compiler, on at runtime once compiled in (no env-var toggle); use `jitv2_lockstep` for diagnostics or `jitv2_opcodefusion` separately (they conflict); `[jitv2] threads` sets the compile pool (unset: one thread per guest CPU, at most 4, capped by the host's usable CPUs) |
 
 See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 
@@ -91,7 +91,7 @@ The REX3 draw-mode JIT learns across sessions. **First boot after install is alw
 
 **Before recording:** boot IRIX once, open a GL app (`glxgears`, 4Dwm), interact for 5–10 minutes, quit cleanly. The second boot replays the saved profile and is smoother.
 
-Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `hal2 status` (host stream underrun counter; codec A dedicated pump).
+Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `audio status` (frames moved and skipped, host stream queue and underrun counters).
 
 **Profile script:** `wsl\profile.ps1` — Task Manager + monitor scrape.
 
@@ -180,8 +180,10 @@ Send `premiere-debug.log`, monitor `status`/`bt`/`dt 80`, and `hinv -t memory` a
 
 ### R5000 Indy
 
-The CPU is a runtime setting, not a build feature: every build contains the
-R4400, R5000, and R10000 (IP28 default). Pick **R5000** in iris-gui (Machine menu or General tab),
+The CPU is a runtime setting, not a build feature: every build contains every
+model (R4400, R5000, R10000, R12000, R14000, R16000), and each machine offers
+the ones it shipped with. The Indy and Indigo2 take the R4400 (default) or the
+R5000. Pick **R5000** in iris-gui (Machine menu or General tab),
 or in the TOML / on the command line:
 
 ```toml
@@ -352,14 +354,14 @@ cargo build --release --bin iris --features lightning,rex-jit,idle-pause
 cargo build -p iris-gui --release
 ```
 
-Add `,jitv2` to try the experimental region JIT instead of (or alongside) `rex-jit`.
+Add `,jitv2` to try the experimental MIPS JIT alongside `rex-jit`.
 
 ---
 
 ## Sync source from Windows → WSL copy
 
 ```bash
-rsync -a --exclude target /mnt/c/Users/chron/CURSOR-PROJECTS/iris-main/ ~/iris-wsl-build/
+rsync -a --exclude target /mnt/c/path/to/your/iris-checkout/ ~/iris-wsl-build/
 chmod +x ~/iris-wsl-build/wsl/*.sh
 ```
 

@@ -55,7 +55,7 @@ pub enum LogModule {
     /// model does not support.
     Odyssey = 28,
     Bedrock = 29,
-    /// The SN0 node controller: guest accesses the model does not support.
+    /// The IP27 node controller: guest accesses the model does not support.
     Hub = 30,
     /// PCI configuration cycles on every bus: who was addressed, what was
     /// read or written, and whether anything answered.
@@ -71,7 +71,7 @@ pub enum LogModule {
     Nvme = 34,
     L1 = 35,
     Usb = 36,
-    /// The SN0 module controller (ELSC and the Origin 2000 module), its
+    /// The IP27 module controller (ELSC and the Origin 2000 module), its
     /// configuration NVRAM and its I2C controller: protocol surprises and
     /// refused commands.
     Module = 37,
@@ -558,7 +558,7 @@ impl Device for DevLog {
              \x20             pdma mask categories: hal enet scsi on/all off/none <hex>\n\
              \x20             mips mask categories: insn tlb mem fpu cp0 on/all off/none <hex>\n\
              \x20             l1i/l1d/l2c mask categories: hit miss op on/all off/none <hex>\n\
-             \x20             [DEV] = requires --features developer build to produce output", modules.join(" ")),
+             \x20             [DEV] = some of a module's messages appear only in a --features developer build", modules.join(" ")),
         )]
     }
 

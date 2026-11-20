@@ -1,7 +1,7 @@
 # IRIS — SGI workstation emulator
 
 The complete core/GUI feature and configuration inventory is in
-[FEATURES.md](FEATURES.md). For the Fuel, see the [Fuel guide](docs/fuel-ip34.md); for the Tezro, the [Tezro guide](docs/tezro-ip53.md).
+[FEATURES.md](FEATURES.md). For platform-specific setup, see the [machine guides](README.md#current-status).
 This guide explains everyday use. The monitor's full command reference is in
 [debug.md](debug.md).
 
@@ -69,12 +69,16 @@ On IP22/IP24, each bank is at most 128 MB. IP28 also supports 256 MB and
 [IP28 512 MB banks](clanker/devices/ip28-512mb-banks.md). The table below describes
 the IP22/IP24 extended layouts.
 
-`banks` has room for eight entries; every machine today uses four, and the
-rest must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
+`banks` has room for eight entries. Fuel uses two, Tezro and the IP35 brick
+machines use up to eight, and the other profiles use four. Entries beyond
+the profile's bank count must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
 256 MB), largest first: `[256, 256, 256, 256]` is 1 GB. On the Octane each
 entry is a bank of two matched DIMMs (64, 128, 256, 512, 1024 or 2048 MB), so
 its eight DIMM slots are four entries: `[2048, 2048, 2048, 2048]` is the
-largest machine, 8 GB of 1 GB DIMMs.
+largest machine, 8 GB of 1 GB DIMMs. The other machines take these bank
+sizes: Origin 200, Origin 2000 and Onyx2 64, 128, 256 or 512 MB; Fuel 256 MB;
+Tezro 512 or 1024 MB (with `banks` unset it gets 4 GB); Origin 3200 and
+Onyx 3000 256 or 512 MB.
 
 `banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
 Changing RAM while IRIX is running updates the config but not the live guest —
@@ -157,8 +161,9 @@ required — it works out of the box once an Ethernet MAC address is set (see
 
 Other networking paths, each covered in this file or in its own doc: NFS file sharing
 (in-process, nothing to install), port forwarding, TFTP for PROM network boot
-(`--tftp-dir`), an XDMCP helper ([docs/xdmcp.md](docs/xdmcp.md)), PCAP bridging
-onto a real LAN (README), and DaynaPort SCSI Ethernet
+(`--tftp-dir`), a read-only rsh server (`--rsh-dir`), an XDMCP helper
+([docs/xdmcp.md](docs/xdmcp.md)), and, in [NETWORKING.md](NETWORKING.md), PCAP
+bridging onto a real LAN, a private stream segment and DaynaPort SCSI Ethernet
 ([docs/dev/daynaport.md](docs/dev/daynaport.md)).
 
 ### Addresses
@@ -470,7 +475,9 @@ the leftover, and it refuses a file that is not a socket. A
 client that reads too slowly loses output, as on the TCP port. `serial_log`
 writes the console's transcript and `serial_log_a` / `serial_log_b` the other
 line's (the Indy and Indigo2 console is channel B, the Octane's and O2's
-channel A). With `ci`, a console that has a socket still feeds the control
+channel A). A log that already exists is added to; `serial_log_overwrite =
+true` (`--serial-log-overwrite`) starts every serial log afresh each run
+instead. With `ci`, a console that has a socket still feeds the control
 socket's `serial-read` and `wait-serial`, and either side may type.
 
 ```bash
@@ -528,7 +535,34 @@ standalone `iris` window if you need them.
 
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
-`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu` feature) draws the window through wgpu instead of OpenGL, with the same scaling rules. With a VPro or IMPACT whose raster unit is on the GPU (`raster = "wgpu"`) the window shares that GPU, and each frame goes from the board's memory to the screen without passing through main memory; screenshots and VNC still read frames back when they ask for them. Newport's display (Indy, Indigo2 XL) is composed on the GPU as well. Its legacy `IRIS_REX3_GPU` prototype shares the device in a `rex-gpu` build but still synchronizes through the CPU framebuffer. A separate GPU-resident Newport path is internal to tests and cannot be selected; Newport rejects `raster = "wgpu"` until M3 (complete REX3 command coverage). If wgpu cannot open the window, iris says so and draws with OpenGL.
+`renderer = "wgpu"` (or `--renderer wgpu`, in a build with the `wgpu`
+feature) draws the window through wgpu instead of OpenGL, with the same scaling
+rules. With a VPro or IMPACT whose raster unit is on the GPU
+(`raster = "wgpu"`) the window shares that GPU, and each frame goes from the
+board's memory to the screen without passing through main memory; screenshots
+and VNC still read frames back when they ask for them.
+
+Newport can also select the experimental GPU-authoritative raster with
+`[graphics] raster = "wgpu"`. Its default `newport_mode = "direct"` requires a
+visible window to use `renderer = "wgpu"` on the same device; startup fails
+rather than falling back to GL or CPU raster. The initial production backends
+are Vulkan and D3D12. `gpu_backend = "auto"` is allowed only when it resolves
+to one of those, and explicit Metal or GL selection is rejected. Screenshots,
+CI capture and VNC read the composed GPU output when requested, not the raw
+planes.
+
+`newport_mode = "readback"` (or `--newport-mode readback`) is an explicit slow
+compatibility/validation mode for a GL or CPU compositor. It synchronizes both
+complete 2048 x 1024 planes -- 16 MiB -- for each newly composed frame and may
+take up to two seconds on first capture. It is never selected because direct
+presentation failed. The older `IRIS_REX3_GPU` prototype remains
+CPU-canonical, requires a `rex-gpu` build, and is mutually exclusive with the
+production resident selector. Other boards retain their historical
+wgpu-to-OpenGL window fallback; direct resident Newport does not.
+
+iris-gui can run only that explicit Newport readback mode when built with
+`cargo run -p iris-gui --release --features wgpu`; its eframe frontend does not
+yet provide the same-device wgpu presenter required by direct mode.
 
 ## VNC
 
@@ -562,10 +596,11 @@ Authentication", so only the first 8 bytes count and nothing after the
 handshake is encrypted: for a network you do not trust, tunnel the port (SSH,
 WireGuard) instead of relying on it.
 
-It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
-the O2), with the normal window open or under `--ci` with no window. Not with
-`--headless`, which has no screen to serve. The window, the monitor and any
-number of viewers can type and click at the same time.
+It works with every graphics board through the common display interface, with
+the normal window open or under `--ci` with no window. A graphics board must be
+fitted and producing frames: a serial-only machine, or an Indy or Indigo2
+whose Newport `--headless` removed, has no screen to serve. The window, the
+monitor and any number of viewers can type and click at the same time.
 
 **iris-gui** serves the screen too: set **Serve on** in the Performance tab
 (a port for `127.0.0.1`, or `host:port`), which is the same `vnc.listen` key
@@ -574,9 +609,11 @@ it, and a port already in use is reported rather than failing the start.
 
 What you see is the guest's screen, without the window's status bar. Only
 the parts of the screen that change are sent, so an idle desktop costs next
-to nothing. With Newport, the window uses the software compositor while a
+to nothing. With CPU-raster Newport, the window uses the software compositor while a
 viewer is connected (`disp compositor gl` is refused) and switches back when
-the last one leaves.
+the last one leaves. Direct resident Newport instead captures composed GPU
+output while viewers are connected; it does not refresh the raw CPU plane
+shadows.
 
 **The mouse.** The guest's mouse sends movements, not positions, and IRIX
 accelerates fast ones. iris steers the guest pointer onto the spot you point
@@ -590,9 +627,10 @@ it catches up within a fraction of a second.
 extension) work with any host layout. Others send characters, which iris
 types on a US layout.
 
-**Security.** There is no password. Leave the server on `127.0.0.1` and use
-an SSH tunnel (`ssh -L 5900:localhost:5900 host`) to reach it from
-elsewhere.
+**Security.** Without a password the server is open to anyone who can reach
+it, and even with one the session is not encrypted. Leave it on `127.0.0.1`
+where you can and use an SSH tunnel (`ssh -L 5900:localhost:5900 host`) to
+reach it from elsewhere.
 
 ---
 
@@ -607,7 +645,7 @@ ignored. The checked-in `iris.toml` is a commented example of everything in this
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
-prom     = "prom.bin"       # PROM image; the built-in one runs if this is left as is
+prom     = "prom.bin"       # PROM image; left as is, prom.bin (or the machine's release file) if present, else the built-in one; "(embedded)" forces the built-in one
 nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy); the PROM's flash (O2). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 
@@ -616,9 +654,10 @@ nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
-headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
+headless = false            # no window; drops Newport, the O2 boots on its serial console (audio unaffected)
 no_audio = false            # no sound device output (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
+vsync = false               # true = wait for the host monitor's vertical sync
 # renderer = "gl"           # "wgpu": draw the window through wgpu (builds with the wgpu feature)
 mouse_scroll_pixels_per_line = 40
 
@@ -630,10 +669,11 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # serial_port_a = 8880          # serial channel A (ttyd2); likewise
 # serial_port_b = 8881          # serial channel B (ttyd1, the console); likewise
 # keyboard = "ansi"             # host keyboard shape: "ansi", "iso" or "jis" (see Keyboard)
-# ci = false                    # CI control socket (see README)
+# ci = false                    # CI control socket (see STORAGE.md)
 # ci_socket = "/tmp/iris.sock"  # default: iris.sock in $TMPDIR, else /tmp; Windows: "127.0.0.1:19851"
 # ci_display = false
 # serial_log = "ttyd1.log"
+# serial_log_overwrite = false  # true: start the serial logs over each run instead of adding to them
 
 # Bare-metal testing (cpu-tests/, bench/)
 # load_elf = "test.elf"
@@ -645,18 +685,25 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ── Machine ──────────────────────────────────────────────────────────────────
 
 [machine]
-profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
-cpu     = "r4400"           # "r5000" (--cpu); IP28: "r10000", Octane: r10000/r12000/r14000, O2: r5000/r10000/r12000, Tezro: r16000; or a part, "r14000_600", "r16000_800"
-# cpus  = 2                 # Octane only: a second processor (docs/octane-ip30-multiprocessor.md)
+profile = "indy_ip24"       # or indigo2_ip22 (--ip22), indigo2_ip28, o2_ip32, octane_ip30, origin200_ip29, origin2000_ip27,
+                            # onyx2_ip27, fuel_ip34, tezro_ip53, origin3200_ip35, onyx3000_ip35; --machine NAME (--machine help lists them)
+cpu     = "r4400"           # unset: the machine's first. Indy, IP22: r4400/r5000; IP28: r10000; O2: r5000/r10000/r12000;
+                            # Octane: r10000/r12000/r14000; Origin 200/2000, Onyx2: r10000/r12000; Fuel: r14000;
+                            # Tezro: r16000 (or a part, "r16000_800"); Origin 3200, Onyx 3000: r12000
+# cpus  = 2                 # Octane: 1 or 2 (docs/octane-ip30-multiprocessor.md); Tezro: 1, 2 or 4 (default 4)
 
 [graphics]
-board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
-heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
+board      = "newport"      # Indy, Indigo2: "newport", "xz", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); "extreme" on IP22 only
+                            # Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
+                            # Onyx2: "ir2", "ir2:2rm", "ir2e", "ir2e:2rm" or "none" (default); Onyx 3000: "ir3" (default) or "v12"
+                            # Fuel: "v10", "v12" or "none" (default); Tezro: "v12" or "none" (default); Origin 200/2000/3200: "none"
+heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 0; turns the Ultra64 board off)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
 # tile     = 32             # VPro: screen tile size, a power of two from 8 to 256
-# raster   = "cpu"          # VPro, IMPACT: "wgpu" draws on the host GPU (builds with the wgpu feature; work in progress)
-# gpu_backend = "auto"      # with raster = "wgpu": "vulkan", "metal", "dx12" or "gl"; WGPU_BACKEND=gl (and so on) overrides it
+# raster   = "cpu"          # VPro, IMPACT, Newport: "wgpu" draws on the host GPU (needs the wgpu feature)
+# newport_mode = "direct"   # Newport wgpu only: "direct" or explicit slow "readback" compatibility
+# gpu_backend = "auto"      # with raster = "wgpu"; Newport initially supports only Vulkan and D3D12; WGPU_BACKEND overrides it
 
 [clock]
 # fixed_mhz = 33            # Count MHz: default half the part's clock: 75 on the Indy and Indigo2 R4400, 97.5 on IP28
@@ -680,13 +727,14 @@ overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
                             # power cut can lose the last ~5 s of writes. false: every write is stored on the host's disk before it completes, as on SGI's drives (slower). See STORAGE.md.
 # controller = 0            # Indigo2 and O2 have two: 0 or 1 (the O2's 1 is its external bus); or write [scsi.17]
 
-# A CD-ROM. path may be empty to start with an empty tray.
+# A CD-ROM. path may be empty to start with an empty tray, or an http:// or
+# https:// URL (read-only, fetched in pieces; see STORAGE.md).
 [scsi.4]
 path  = "cdrom4.iso"
 cdrom = true
 # discs = ["irix65.iso", "extras.iso", "patches.iso"]   # changer; "scsi eject 4" cycles
 
-# Scratch volume for file injection without networking (see README).
+# Scratch volume for file injection without networking (see STORAGE.md).
 # [scsi.2]
 # path    = "scratch.raw"
 # scratch = true
@@ -736,6 +784,16 @@ prebuf_ms = 20              # sound held before playing: the margin against a la
 # [ultra64]                 # N64 dev board
 # enabled = true
 
+# [virtio_serial]           # Indy, Indigo2, Octane, Tezro: byte channels for a guest with a driver (docs/dev/virtio-serial.md)
+# enabled = true
+# [virtio_9p]               # Indy, Indigo2, Octane, Tezro: a host directory the guest mounts (docs/dev/virtio-9p.md)
+# enabled = true
+# path = "shared"
+
+# Machine-specific tables ([o2], [octane], [origin200], [origin2000], [onyx2], [fuel],
+# [tezro], [origin3200], [onyx3000]) are described in each machine's guide in docs/:
+# for example [fuel] usb_input = true (a USB keyboard and mouse) and [tezro] audio = true.
+
 # ── Host tuning and debugging ────────────────────────────────────────────────
 
 [perf]
@@ -745,7 +803,8 @@ thread_affinity = false     # pin threads to cores
 # refresh_core = 4
 
 [jitv2]
-# threads = 1               # compile-pool threads, --features jitv2 (unset: one per CPU, at most 4)
+# threads = 1               # compile-pool threads, --features jitv2 (unset: one per guest CPU, at most 4, capped by the host's CPUs)
+# compile = "async"         # "sync" compiles on the CPU thread, so a run executes the same host code every time (one CPU only)
 cache = false               # reuse compiled pages across runs (opt-in)
 # cache_dir = ""            # blank: platform user cache directory / iris/jitv2
 
@@ -778,6 +837,11 @@ ids 1–7 on controller 1 (16 slots per controller); `controller = 1` in a low
 key's table is the older spelling and still works. The monitor's `scsi1`
 addresses the second controller.
 
+On the Octane the internal bus (controller 0) has three drive bays, and the
+PROM and IRIX look for devices on it only at ids 1–3. Put a CD-ROM, and any
+fourth disk, on the external bus: `controller = 1`, or `[scsi.20]` for id 4
+there. iris warns at start-up about a device it will never find.
+
 ---
 
 ## Checking a configuration
@@ -806,7 +870,7 @@ machine starts.
 ## Command-line options
 
 All options are optional and override the corresponding `iris.toml` value.
-`iris --help` prints the same list.
+`iris --help` prints the full list with each option's own description.
 
 ```
 iris [OPTIONS]
@@ -818,22 +882,28 @@ Configuration
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --machine <NAME>            Machine to emulate (a [machine] profile name); `help` lists them
   --ip22                      Same as --machine indigo2_ip22
-  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
-  --cpu <MODEL>               r4400 (default), r5000, r10000, r12000 or r14000, as the machine allows
+  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12,
+                              ir2, ir2:2rm, ir2e, ir2e:2rm, ir3 or none, as the machine allows
+  --cpu <MODEL>               A family (r4400, r5000, r10000, r12000, r14000, r16000) or a part
+                              (r14000_600), as the machine allows; default the machine's first
+  --cache <MODEL>             CPU cache model: auto (default), full or shadow (R10000 family: always shadow)
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
   --clock-fixed-mhz <MHZ>     CP0 Count frequency (default: half the part's clock, 75 for an Indy R4400)
 
 Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
-  --cdrom4/5/6 <FILE>         CD-ROM primary disc at that SCSI ID
+  --cdrom4/5/6 <FILE|URL>     CD-ROM primary disc at that SCSI ID (a file, or an http(s):// URL)
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
   --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 
 Display and audio
   --2x                        2× window scaling
-  --headless                  No window, no REX3 graphics (audio unaffected)
-  --noaudio                   Disable HAL2 audio (graphics unaffected)
+  --renderer <RENDERER>       gl (default) or wgpu (builds with the wgpu feature)
+  --raster <UNIT>             VPro, IMPACT: cpu (default) or wgpu
+  --keyboard <LAYOUT>         Host keyboard: ansi (default), iso or jis
+  --headless                  No window; drops Newport (other boards stay fitted), O2 uses serial
+  --noaudio                   Disable sound device output (graphics unaffected)
   --audio-host HOST           Host audio: default, pulse, wasapi, coreaudio or null
 
 Networking
@@ -855,6 +925,7 @@ Automation and debugging
   --serial-log-timestamps <MODE>  off (raw), wall (stamp each completed line) or ecs
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
+  --vnc-password-file <FILE>  Ask VNC viewers for the password in FILE
   --validate                  Check the --config file and exit; 0 if iris would start
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
@@ -863,7 +934,11 @@ Automation and debugging
   --serial-log-a <FILE>       Log channel A when it is not the console
   --serial-log-b <FILE>       Likewise channel B
   --gdb-port <PORT>           Start the GDB stub
-  --jitv2-threads <N>         jitv2 compile-pool thread count
+  --jitv2-threads <N>         jitv2 compile-pool threads (default: one per guest CPU, at most 4,
+                              capped by the host's usable CPUs)
+  --jitv2-compile <MODE>      async (default) or sync (compile on the CPU thread; one CPU only)
+  --perfetto <FILE>           Record a Perfetto trace from startup (--features perfetto);
+                              --perfetto-cats and --perfetto-clock as for the monitor's perfetto start
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry
   --test-device               Map the bare-metal test device into GIO slot 0
   --test-device-dump <FILE>   Where its machine-state dump goes
@@ -1008,16 +1083,16 @@ load base/desktop       # restore saved state (graphics limitations below)
 
 `iris-ci` adds restore/rollback checkpoints, `tree`, `diff`, `gc`, `validate`
 and HTTP `push`/`pull`; iris-gui has Save/Restore under the Machine menu. The
-on-disk format is schema version 3 — a `snapshot.toml` manifest, postcard-encoded
+on-disk format is schema version 10 — a `snapshot.toml` manifest, postcard-encoded
 device state, and RAM stored as content-addressed chunks under `saves/.cas/`.
 A snapshot refuses to load onto a different CPU model or host architecture. See
 [snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
-GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
-See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
 
 The Indy, Indigo2, O2 and Octane have snapshots. An Octane snapshot is
-refused with two processors or with an IMPACT or VPro board fitted: the stop
-does not yet bring both processors to one recorded instruction boundary, and
-neither board saves its state. Loading an Octane snapshot writes its boot flash and
-NVRAM over the configured flash and NVRAM files, so a PROM flashed since the
-save is replaced by the one the snapshot holds.
+refused with two processors or virtio-serial: the stop does not yet bring both
+processors to one recorded instruction boundary, and virtio-serial does not
+save its queues. IMPACT and VPro V6/V8/V10/V12 board state and graphics memory
+are included. XZ and Extreme snapshots include the complete GR2 command,
+drawing, display, VRAM and Z/stencil state. Loading an Octane snapshot writes
+its boot flash and NVRAM over the configured flash and NVRAM files, so a PROM
+flashed since the save is replaced by the one the snapshot holds.

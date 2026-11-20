@@ -80,6 +80,11 @@ whether the opcode already has a `scsi_cmd::` constant before adding one —
 several are defined for logging/length purposes only and were never wired
 into the actual `match` in `request()`.
 
+Later (2026-11): disks now have a write cache (`write_cache`, on by default),
+and SYNCHRONIZE CACHE(10)/(16) syncs the disk through `flush_data`; the
+caching page's WCE bit follows the setting. The "no write-back cache"
+reasoning above no longer holds; see STORAGE.md.
+
 ## 3. Missing mode pages produce misleading (not fatal) Linux log lines
 
 `sd.c` logs "No Caching mode page found" whenever MODE SENSE doesn't return

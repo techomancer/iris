@@ -7,10 +7,20 @@
 use super::rex3::{
     Rex3Context, CLIPMODE_CIDMATCH_MASK, CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_MASK,
     DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN, DRAWMODE0_OPCODE_DRAW,
-    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC,
-    DRAWMODE1_PLANES_CID, DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB,
+    DRAWMODE1_COMPARE_DISABLE, DRAWMODE1_DRAWDEPTH_24, DRAWMODE1_LOGICOP_SRC, DRAWMODE1_PLANES_CID,
+    DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     OCTANT_XDEC, OCTANT_YDEC, REX3_COORD_BIAS, REX3_SCREEN_HEIGHT, REX3_SCREEN_WIDTH,
 };
+use super::rex3_generic::{fastclear_color, ls_pattern_state_after, Mode};
+use super::rex3_shape;
+#[cfg(feature = "wgpu")]
+use super::wgpu::{
+    fill_walk::{prepare_fill_walk, FillCompletion, FillOperation, FillWalkKind},
+    shade::ShadeDda,
+};
+
+#[cfg(feature = "wgpu")]
+const RESIDENT_PAYLOAD_WORDS: u64 = 1024 * 1024 / size_of::<u32>() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FillPlane {
@@ -18,26 +28,48 @@ pub(crate) enum FillPlane {
     Aux,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FillKind {
+    Block,
+    Span,
+    Clear,
+}
+
 /// A nonempty, screen-clipped fill, independent of framebuffer layout.
 ///
 /// The rectangle is `min_x..min_x + width`, `min_y..min_y + height`.
 /// Although the planes have 2048 columns, CPU/JIT writes stop at column
-/// 1344. `color` and `write_mask` retain all 32 bits of the framebuffer word.
+/// 1344. Ordinary commands retain the raw source in `color`; clears retain
+/// their replicated `COLORVRAM` word. Walker endpoints remain unwindowed so
+/// clipped lanes can recover pattern phase. `write_mask` remains a full word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FlatFill {
+    pub(crate) kind: FillKind,
     pub(crate) plane: FillPlane,
     pub(crate) min_x: u32,
     pub(crate) min_y: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) walker_x0: i32,
+    pub(crate) walker_y0: i32,
+    pub(crate) walker_xsave: i32,
+    pub(crate) walker_x1: i32,
+    pub(crate) walker_y1: i32,
+    pub(crate) walker_block: bool,
+    pub(crate) first_row_visits: u32,
+    pub(crate) full_row_visits: u32,
+    pub(crate) rows: u32,
+    pub(crate) first_row_complete: bool,
     pub(crate) color: u32,
     pub(crate) write_mask: u32,
 }
 
 #[derive(Debug)]
 enum ContextAdvance {
-    Block { xsave: i32, yend: i32 },
+    Block { xsave: i32, y_after: i32 },
     Span { xend: i32 },
+    #[cfg(feature = "wgpu")]
+    Resident(FillCompletion),
 }
 
 /// A matched GO and its context completion, prepared once after setup.
@@ -50,6 +82,11 @@ enum ContextAdvance {
 pub(crate) struct PreparedFlatFill {
     fill: Option<FlatFill>,
     advance: ContextAdvance,
+    final_lsrcount: Option<u32>,
+    #[cfg(feature = "wgpu")]
+    shade_payload: Option<Vec<u32>>,
+    #[cfg(feature = "wgpu")]
+    final_shade: Option<ShadeDda>,
 }
 
 impl PreparedFlatFill {
@@ -57,22 +94,39 @@ impl PreparedFlatFill {
         self.fill
     }
 
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn shade_payload(&self) -> Option<&[u32]> {
+        self.shade_payload.as_deref()
+    }
+
     /// Complete an accepted GO, including a supported no-op.
     ///
     /// A refused/full batch must leave both this command and the post-setup
     /// context untouched so they can be retried after submission.
     pub(crate) fn finish(self, context: &mut Rex3Context) {
+        #[cfg(feature = "wgpu")]
+        if let Some(shade) = self.final_shade {
+            shade.write_back(context);
+        }
         match self.advance {
-            ContextAdvance::Block { xsave, yend } => {
+            ContextAdvance::Block { xsave, y_after } => {
                 context.xstart = xsave;
-                context.ystart = yend + (1 << 11);
+                context.ystart = y_after;
             }
             ContextAdvance::Span { xend } => {
                 context.xstart = xend + (1 << 11);
             }
+            #[cfg(feature = "wgpu")]
+            ContextAdvance::Resident(completion) => {
+                completion.apply(context);
+                return;
+            }
         }
         context.pat_bit = 31;
         context.zpat_bit = 31;
+        if let Some(count) = self.final_lsrcount {
+            context.lsmode.set_lsrcount(count);
+        }
         context.mid_primitive = false;
         context.host_len = 1;
         context.host_cursor = 0;
@@ -87,17 +141,96 @@ pub(crate) fn prepare_flat_fill(context: &Rex3Context) -> Result<PreparedFlatFil
 
 /// The resident path also handles simple auxiliary-plane fills. The legacy
 /// prototype continues to accept RGB only.
-#[cfg(test)]
+#[cfg(feature = "wgpu")]
 pub(crate) fn prepare_resident_flat_fill(
     context: &Rex3Context,
 ) -> Result<PreparedFlatFill, &'static str> {
-    prepare(context, true)
+    let walk = prepare_fill_walk(context, FillOperation::Draw)?;
+    let mode = rex3_shape::unpack(
+        context.drawmode0.0,
+        context.drawmode1.0,
+        context.clipmode,
+    );
+    let fast_clear = mode.fastclear() != 0;
+    let completion = walk.completion(
+        context,
+        mode.enzpattern() != 0,
+        mode.enlspattern() != 0,
+    );
+    let fill = if walk.writes_possible(context) {
+        let color = if fast_clear {
+            fastclear_color(context, &mode)
+        } else {
+            (context.get_colori() & 0x00ff_ffff)
+                | (Rex3Context::clamp_color_component(context.coloralpha) << 24)
+        };
+        Some(FlatFill {
+            kind: if fast_clear {
+                FillKind::Clear
+            } else if walk.kind == FillWalkKind::Block {
+                FillKind::Block
+            } else {
+                FillKind::Span
+            },
+            plane: walk.plane.expect("writeable fill has a plane"),
+            min_x: walk.min_x as u32,
+            min_y: walk.min_y as u32,
+            width: (walk.max_x - walk.min_x + 1) as u32,
+            height: (walk.max_y - walk.min_y + 1) as u32,
+            walker_x0: walk.walker_x0,
+            walker_y0: walk.walker_y0,
+            walker_xsave: walk.walker_xsave,
+            walker_x1: walk.walker_x1,
+            walker_y1: walk.walker_y1,
+            walker_block: walk.kind == FillWalkKind::Block,
+            first_row_visits: walk.first_row_visits,
+            full_row_visits: walk.full_row_visits,
+            rows: walk.rows,
+            first_row_complete: walk.first_row_complete,
+            color,
+            write_mask: context.wrmask,
+        })
+    } else {
+        None
+    };
+    let (shade_payload, final_shade) = if mode.shade() != 0 {
+        let mut shade = ShadeDda::from_context(context);
+        let payload_words = walk
+            .visits
+            .checked_add(31)
+            .and_then(|pixels| pixels.checked_div(32))
+            .and_then(|checkpoints| checkpoints.checked_mul(4))
+            .ok_or("shade payload length")?;
+        if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
+            return Err("shade payload length");
+        }
+        let mut payload = fill.map(|_| Vec::with_capacity(payload_words as usize));
+        for index in 0..walk.visits {
+            if index & 31 == 0 {
+                if let Some(payload) = payload.as_mut() {
+                    payload.extend_from_slice(&shade.components());
+                }
+            }
+            shade.advance();
+        }
+        (payload, Some(shade))
+    } else {
+        (None, None)
+    };
+    Ok(PreparedFlatFill {
+        fill,
+        advance: ContextAdvance::Resident(completion),
+        final_lsrcount: None,
+        shade_payload,
+        final_shade,
+    })
 }
 
 fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &'static str> {
     let dm0 = context.drawmode0;
     let dm1 = context.drawmode1;
     let adrmode = dm0.adrmode();
+    let block = adrmode == DRAWMODE0_ADRMODE_BLOCK;
     let full_primitive = match adrmode {
         DRAWMODE0_ADRMODE_SPAN => dm0.stoponx(),
         DRAWMODE0_ADRMODE_BLOCK => dm0.stoponx() && dm0.stopony(),
@@ -112,7 +245,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     if context.mid_primitive {
         return Err("continuation state");
     }
-    if adrmode == DRAWMODE0_ADRMODE_BLOCK && context.xsave != context.xstart {
+    if block && context.xsave != context.xstart {
         return Err("block start state");
     }
     // A multiword host token makes the CPU resume the GO even when this
@@ -120,107 +253,224 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     if context.host_len > 1 {
         return Err("host transfer");
     }
+    let mode = rex3_shape::unpack(dm0.0, dm1.0, context.clipmode);
+    let fast_clear = allow_aux && mode.fastclear() != 0;
     if dm0.colorhost()
         || dm0.alphahost()
         || dm0.skipfirst()
         || dm0.skiplast()
-        || dm0.enzpattern()
-        || dm0.enlspattern()
         || dm0.length32()
-        || dm0.zpopaque()
-        || dm0.lsopaque()
-        || dm0.shade()
         || dm0.lronly()
-        || dm0.xyoffset()
-        || dm0.ciclamp()
+        || (!allow_aux && dm0.xyoffset())
         || dm0.endptfilter()
         || dm0.ystride()
     {
         return Err("draw mode 0");
     }
-    let plane = match dm1.planes() {
-        DRAWMODE1_PLANES_RGB if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() => {
-            FillPlane::Rgb
+    if !fast_clear && !allow_aux && (dm0.shade() || dm0.ciclamp()) {
+        return Err("draw mode 0");
+    }
+    let plane = if allow_aux {
+        match dm1.planes() {
+            DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => FillPlane::Rgb,
+            DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => {
+                FillPlane::Aux
+            }
+            _ => return Err("pixel format"),
         }
-        DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID
-            if allow_aux && (!dm1.rgbmode() || dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24) =>
-        {
-            FillPlane::Aux
+    } else {
+        match dm1.planes() {
+            DRAWMODE1_PLANES_RGB
+                if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() =>
+            {
+                FillPlane::Rgb
+            }
+            _ => return Err("pixel format"),
         }
-        _ => return Err("pixel format"),
     };
-    if dm1.dblsrc()
-        || dm1.yflip()
-        || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
-        || dm1.dither()
-        || dm1.fastclear()
-        || dm1.blend()
-        || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
-    {
+    if !allow_aux && dm1.yflip() {
         return Err("pixel operation");
     }
-    if context.clipmode & CLIPMODE_ENSMASK_MASK != 0
-        || context.clipmode & CLIPMODE_CIDMATCH_MASK != 0xF << CLIPMODE_CIDMATCH_SHIFT
+    if !fast_clear {
+        let unsupported = if allow_aux {
+            dm1.fastclear()
+        } else {
+            dm1.dblsrc()
+                || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
+                || dm1.dither()
+                || dm1.fastclear()
+                || dm1.blend()
+                || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
+        };
+        if unsupported {
+            return Err("pixel operation");
+        }
+    }
+    if !allow_aux
+        && (context.clipmode & CLIPMODE_ENSMASK_MASK != 0
+            || context.clipmode & CLIPMODE_CIDMATCH_MASK
+                != 0xF << CLIPMODE_CIDMATCH_SHIFT)
     {
         return Err("clip mode");
     }
     if (context.xstart | context.xend | context.ystart | context.yend) & 0x7FF != 0 {
         return Err("fractional coordinates");
     }
-    if context.xend < context.xstart
-        || (adrmode == DRAWMODE0_ADRMODE_BLOCK && context.yend < context.ystart)
-        || context.bresoctinc1.octant() & (OCTANT_XDEC | OCTANT_YDEC) != 0
+    let octant = context.bresoctinc1.octant();
+    let x_dec = block && octant & OCTANT_XDEC != 0;
+    let y_dec = block && octant & OCTANT_YDEC != 0;
+    let x_direction_matches = if x_dec {
+        context.xend <= context.xstart
+    } else {
+        context.xend >= context.xstart
+    };
+    let y_direction_matches = !block
+        || if y_dec {
+            context.yend <= context.ystart
+        } else {
+            context.yend >= context.ystart
+        };
+    if !x_direction_matches
+        || !y_direction_matches
+        || (!allow_aux && octant & (OCTANT_XDEC | OCTANT_YDEC) != 0)
     {
         return Err("negative direction");
     }
 
     let x_window = (context.xywin >> 16) as i16 as i32;
     let y_window = context.xywin as i16 as i32;
-    let x0 = (context.xstart >> 11) + x_window - REX3_COORD_BIAS;
-    let x1 = (context.xend >> 11) + x_window - REX3_COORD_BIAS;
-    let y0 = (context.ystart >> 11) + y_window - REX3_COORD_BIAS;
+    let x_move = if dm0.xyoffset() {
+        (context.xymove >> 16) as i16 as i32
+    } else {
+        0
+    };
+    let y_move = if dm0.xyoffset() {
+        context.xymove as i16 as i32
+    } else {
+        0
+    };
+    let walker_x0 = context.xstart >> 11;
+    let walker_y0 = context.ystart >> 11;
+    let walker_x1 = context.xend >> 11;
+    let walker_y1 = if block {
+        context.yend >> 11
+    } else {
+        walker_y0
+    };
+    let x0 = walker_x0 + x_move + x_window - REX3_COORD_BIAS;
+    let x1 = walker_x1 + x_move + x_window - REX3_COORD_BIAS;
+    let physical_y = |raw: i32| {
+        let absolute = (raw >> 11) + y_move + y_window;
+        if dm1.yflip() {
+            0x23ff - absolute
+        } else {
+            absolute - REX3_COORD_BIAS
+        }
+    };
+    let y0 = physical_y(context.ystart);
     let y1 = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
-        (context.yend >> 11) + y_window - REX3_COORD_BIAS
+        physical_y(context.yend)
     } else {
         y0
     };
 
-    let min_x = x0.max(0);
-    let max_x = x1.min(REX3_SCREEN_WIDTH - 1);
-    let min_y = y0.max(0);
-    let max_y = y1.min(REX3_SCREEN_HEIGHT - 1);
+    let min_x = x0.min(x1).max(0);
+    let max_x = x0.max(x1).min(REX3_SCREEN_WIDTH - 1);
+    let min_y = y0.min(y1).max(0);
+    let max_y = y0.max(y1).min(REX3_SCREEN_HEIGHT - 1);
+    let pixel_width = i64::from(walker_x1).abs_diff(i64::from(walker_x0)) + 1;
+    let pixel_height = i64::from(walker_y1).abs_diff(i64::from(walker_y0)) + 1;
     let fill = if min_x > max_x || min_y > max_y || context.wrmask == 0 {
         None
     } else {
-        let raw_color = (context.get_colori() & 0x00FF_FFFF)
-            | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
-        // The CPU's amplify stage replicates the unmasked source into both
-        // auxiliary slots before applying the full-word WRMASK.
-        let color = match dm1.planes() {
-            DRAWMODE1_PLANES_OLAY => (raw_color << 8) | (raw_color << 16),
-            DRAWMODE1_PLANES_PUP => (raw_color << 2) | (raw_color << 6),
-            DRAWMODE1_PLANES_CID => raw_color | (raw_color << 4),
-            _ => raw_color,
+        let color = if fast_clear {
+            debug_assert_ne!(mode.fastclear(), 0);
+            fastclear_color(context, &mode)
+        } else {
+            let raw_color = (context.get_colori() & 0x00FF_FFFF)
+                | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
+            raw_color
         };
         Some(FlatFill {
+            kind: if fast_clear {
+                FillKind::Clear
+            } else if block {
+                FillKind::Block
+            } else {
+                FillKind::Span
+            },
             plane,
             min_x: min_x as u32,
             min_y: min_y as u32,
             width: (max_x - min_x + 1) as u32,
             height: (max_y - min_y + 1) as u32,
+            walker_x0,
+            walker_y0,
+            walker_xsave: context.xsave >> 11,
+            walker_x1,
+            walker_y1,
+            walker_block: block,
+            first_row_visits: pixel_width as u32,
+            full_row_visits: pixel_width as u32,
+            rows: pixel_height as u32,
+            first_row_complete: true,
             color,
             write_mask: context.wrmask,
         })
     };
-    let advance = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
+    let advance = if block {
         ContextAdvance::Block {
             xsave: context.xsave,
-            yend: context.yend,
+            y_after: context.yend + if y_dec { -(1 << 11) } else { 1 << 11 },
         }
     } else {
         ContextAdvance::Span { xend: context.xend }
     };
-    Ok(PreparedFlatFill { fill, advance })
+    let pattern_advances = pixel_width
+        .checked_mul(pixel_height)
+        .ok_or("pattern length")?;
+    let final_lsrcount = (mode.enlspattern() != 0).then(|| {
+        ls_pattern_state_after(
+            context.lsmode.lsrcount(),
+            context.lsmode.lsrepeat(),
+            context.lsmode.lslength(),
+            context.pat_bit,
+            pattern_advances,
+        ).0
+    });
+    #[cfg(feature = "wgpu")]
+    let (shade_payload, final_shade) = if allow_aux && mode.shade() != 0 {
+        let mut shade = ShadeDda::from_context(context);
+        let payload_words = pattern_advances
+            .checked_add(31)
+            .and_then(|pixels| pixels.checked_div(32))
+            .and_then(|checkpoints| checkpoints.checked_mul(4))
+            .ok_or("shade payload length")?;
+        if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
+            return Err("shade payload length");
+        }
+        let mut payload = fill.map(|_| Vec::with_capacity(payload_words as usize));
+        for index in 0..pattern_advances {
+            if index & 31 == 0 {
+                if let Some(payload) = payload.as_mut() {
+                    payload.extend_from_slice(&shade.components());
+                }
+            }
+            shade.advance();
+        }
+        (payload, Some(shade))
+    } else {
+        (None, None)
+    };
+    Ok(PreparedFlatFill {
+        fill,
+        advance,
+        final_lsrcount,
+        #[cfg(feature = "wgpu")]
+        shade_payload,
+        #[cfg(feature = "wgpu")]
+        final_shade,
+    })
 }
 
 #[cfg(test)]
@@ -425,11 +675,22 @@ mod tests {
             assert_eq!(
                 command.fill(),
                 Some(FlatFill {
+                    kind: FillKind::Block,
                     plane: FillPlane::Rgb,
                     min_x: 1342,
                     min_y: 1023,
                     width: 2,
                     height: 1,
+                    walker_x0: 1342 + REX3_COORD_BIAS,
+                    walker_y0: 1023 + REX3_COORD_BIAS,
+                    walker_xsave: 1342 + REX3_COORD_BIAS,
+                    walker_x1: 1350 + REX3_COORD_BIAS,
+                    walker_y1: 1028 + REX3_COORD_BIAS,
+                    walker_block: true,
+                    first_row_visits: 9,
+                    full_row_visits: 9,
+                    rows: 6,
+                    first_row_complete: true,
                     color: 0x7A33_2211,
                     write_mask: 0xAA00_00FF,
                 })
@@ -451,6 +712,82 @@ mod tests {
             assert_eq!(empty.xstart, (1351 + REX3_COORD_BIAS) << 11);
             assert_eq!((empty.host_len, empty.host_cursor), (1, 0));
             assert_eq!((empty.pat_bit, empty.zpat_bit), (31, 31));
+
+            let mut offset = context(DRAWMODE0_ADRMODE_BLOCK_SH, (10, 20), (12, 23));
+            offset.drawmode0.0 |= 1 << 20;
+            offset.xymove = ((-3i16 as u16 as u32) << 16) | 4;
+            offset.xywin = ((5i16 as u16 as u32) << 16) | (-2i16 as u16 as u32);
+            offset.clipmode = 1 | (0b0101 << CLIPMODE_CIDMATCH_SHIFT);
+            assert_eq!(prepare_flat_fill(&offset).unwrap_err(), "draw mode 0");
+            let fill = prepare_resident_flat_fill(&offset).unwrap().fill().unwrap();
+            assert_eq!(
+                (fill.min_x, fill.min_y, fill.width, fill.height),
+                (12, 22, 3, 4),
+            );
+        });
+    }
+
+    #[test]
+    fn reverse_blocks_and_fast_clears_match_cpu() {
+        on_large_stack(|| {
+            for fast_clear in [false, true] {
+                let mut normalized = context(DRAWMODE0_ADRMODE_BLOCK_SH, (9, 8), (3, 2));
+                normalized.bresoctinc1.set_octant(OCTANT_XDEC | OCTANT_YDEC);
+                if fast_clear {
+                    normalized.drawmode1.0 |= (1 << 16) | (1 << 17) | (1 << 18);
+                    normalized.colorvram = 0x00ab_cdef;
+                }
+                let legacy_error = prepare_flat_fill(&normalized).unwrap_err();
+                assert_eq!(
+                    legacy_error,
+                    if fast_clear {
+                        "pixel operation"
+                    } else {
+                        "negative direction"
+                    }
+                );
+
+                let mut cpu = normalized;
+                let before = context_state(&normalized);
+                let command = prepare_resident_flat_fill(&normalized).expect("resident fill");
+                assert_eq!(context_state(&normalized), before);
+                let fill = command.fill().expect("visible resident fill");
+                assert_eq!(
+                    fill.kind,
+                    if fast_clear {
+                        FillKind::Clear
+                    } else {
+                        FillKind::Block
+                    }
+                );
+                assert_eq!(
+                    (fill.min_x, fill.min_y, fill.width, fill.height),
+                    (3, 2, 7, 7)
+                );
+                if fast_clear {
+                    assert_eq!(fill.color, 0x00ab_cdef);
+                }
+
+                let seed: Vec<u32> = (0..PIXELS as u32)
+                    .map(|i| i.wrapping_mul(0x9e37_79b9) ^ 0x5a5a_0000)
+                    .collect();
+                let mut actual = seed.clone();
+                let mut expected = seed.clone();
+                let mut aux = vec![0u32; PIXELS];
+                apply(fill, &mut actual);
+                let fb = Framebuffers {
+                    rgb: expected.as_mut_ptr(),
+                    aux: aux.as_mut_ptr(),
+                };
+                let mode = rex3_shape::unpack(cpu.drawmode0.0, cpu.drawmode1.0, cpu.clipmode);
+                draw_with_fb(&mut cpu, &fb, &mode);
+                cpu.hostrw_arm_single();
+                command.finish(&mut normalized);
+                assert_plane_eq(&actual, &expected, "resident reverse fill");
+                assert_eq!(context_state(&normalized), context_state(&cpu));
+                assert_eq!(normalized.xstart, (9 + REX3_COORD_BIAS) << 11);
+                assert_eq!(normalized.ystart, (1 + REX3_COORD_BIAS) << 11);
+            }
         });
     }
 

@@ -13,7 +13,7 @@
 //! `config_write`, so it works behind any bridge.
 //!
 //! Modelled: the PCI identity and revision; the capability list and vital
-//! product data reads ([`caps`]); the chip id in MISC_CTL; the global reset with
+//! product data reads (`caps`); the chip id in MISC_CTL; the global reset with
 //! the on-chip firmware-ready handshake in SRAM and the firmware-progress
 //! register; the self-clearing mode-register resets; the MII path to the
 //! PHY ([`phy`]); the station address the bootcode leaves in SRAM and in
@@ -23,7 +23,7 @@
 //! send ring and its doorbell, the standard, jumbo and return receive rings,
 //! the status block DMA, host coalescing, the interrupt it drives, the
 //! transmit checksum offload and segmentation, and the receive checksum
-//! report ([`dma`]).
+//! report (`dma`).
 //!
 //! # What is approximated
 //!
@@ -53,7 +53,7 @@
 //!   product data reads act: the PCI-X and power-management fields store
 //!   what is written and change nothing, MSI cannot be enabled, so the chip
 //!   always interrupts on INTA, and a VPD write is refused and counted.
-//!   Without a fitted EEPROM the VPD reads all ones; what an unprogrammed
+//!   Without an attached EEPROM the VPD reads all ones; what an unprogrammed
 //!   board returns is unknown.
 //! - Frames reach the host through the shared network link; the chip's
 //!   virtio-net offload path has no counterpart, so a large TCP buffer is
@@ -145,7 +145,7 @@ pub(crate) mod caps {
 }
 
 /// What a board gives the chip: its station address and, optionally, the
-/// serial EEPROM the board fits.
+/// serial EEPROM the board has.
 pub struct Bcm5701Config {
     pub mac: [u8; 6],
     pub eeprom: Option<Eeprom>,
@@ -474,7 +474,7 @@ impl Bcm5701 {
         self.st.lock().refused()
     }
 
-    /// The serial EEPROM backing's current contents, if one is fitted.
+    /// The serial EEPROM backing's current contents, if one is attached.
     pub fn eeprom_bytes(&self) -> Option<Vec<u8>> {
         self.st.lock().eeprom_bytes()
     }

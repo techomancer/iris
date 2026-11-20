@@ -1,4 +1,4 @@
-//! Test-only resident frame cuts, direct presentation and composed capture.
+//! Resident frame cuts, direct presentation and composed capture.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -7,14 +7,35 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use super::{RasterMode, Rex3, Renderer, GFIFO_RESIDENT_FRAME, STATUS_VRINT};
-use crate::dev::ng1::wgpu::direct::{CaptureFault, Ng1ResidentScanout, ResidentFrameStamp, ResidentScanoutTraffic};
-use crate::dev::ng1::wgpu::resident::{Position, ResidentError};
+use crate::compositor::SwCompositor;
+use crate::dev::ng1::wgpu::direct::{
+    CaptureCount, Ng1ResidentScanout, ResidentFrameStamp, ResidentScanoutTraffic,
+};
+#[cfg(test)]
+use crate::dev::ng1::wgpu::direct::CaptureFault;
+use crate::dev::ng1::wgpu::resident::{
+    Observation, ObservationReason, PlaneMask, Position, ResidentError,
+};
+use crate::dev::ng1::wgpu::telemetry::{duration_ns, FlushReason};
 use crate::dev::ng1::wgpu::Ng1Scanout;
-use crate::disp::{BarStats, StatusBar, StatusBarTexture, FB_STRIDE};
+use crate::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture, FB_STRIDE};
 use crate::debug_overlay::DebugOverlay;
 use crate::wgpu::Gpu;
 
 const FRAME_WAIT: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidentDisplayMode {
+    DirectWgpu,
+    ReadbackCompatibility,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResidentDisplayFrame {
+    pub(crate) position: Position,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
 
 struct Marker {
     id: u64,
@@ -25,6 +46,21 @@ struct Marker {
 struct MarkerState {
     next: u64,
     active: Option<Marker>,
+}
+
+#[derive(Default)]
+struct CaptureTotals {
+    direct: CaptureCount,
+    compatibility: CaptureCount,
+}
+
+impl CaptureTotals {
+    fn for_mode(&mut self, mode: ResidentDisplayMode) -> &mut CaptureCount {
+        match mode {
+            ResidentDisplayMode::DirectWgpu => &mut self.direct,
+            ResidentDisplayMode::ReadbackCompatibility => &mut self.compatibility,
+        }
+    }
 }
 
 /// One marker at a time. The processor acknowledges the marker and then
@@ -40,6 +76,8 @@ pub(super) struct ResidentFrameControl {
     screenshots: AtomicU64,
     screenshots_completed: AtomicU64,
     captured: AtomicBool,
+    // Like raw observations, composed-capture totals survive resident resets.
+    captures: Mutex<CaptureTotals>,
     error: Mutex<Option<ResidentError>>,
 }
 
@@ -103,8 +141,41 @@ impl ResidentFrameControl {
         self.captured.store(true, Ordering::Release);
     }
 
-    fn invalidate(&self) {
+    pub(super) fn invalidate(&self) {
         self.captured.store(false, Ordering::Release);
+    }
+
+    pub(super) fn quiescent(&self) -> bool {
+        let Some(_serial) = self.serial.try_lock() else { return false; };
+        self.marker.lock().active.is_none()
+    }
+
+    fn capture_count(&self, mode: ResidentDisplayMode) -> CaptureCount {
+        *self.captures.lock().for_mode(mode)
+    }
+
+    fn capture_attempt(&self, mode: ResidentDisplayMode, bytes: u64) -> Result<(), ResidentError> {
+        self.captures.lock().for_mode(mode).attempt(bytes)
+    }
+
+    fn capture_success(&self, mode: ResidentDisplayMode, bytes: u64) -> Result<(), ResidentError> {
+        self.captures.lock().for_mode(mode).success(bytes)
+    }
+
+    fn capture_delta(&self, mode: ResidentDisplayMode, before: CaptureCount, after: CaptureCount) -> Result<(), ResidentError> {
+        let mut totals = self.captures.lock();
+        let total = totals.for_mode(mode);
+        let add_delta = |current: u64, old: u64, new: u64| {
+            new.checked_sub(old).and_then(|delta| current.checked_add(delta))
+                .ok_or(ResidentError::InvalidState("composed capture counter decreased or overflowed"))
+        };
+        *total = CaptureCount {
+            attempts: add_delta(total.attempts, before.attempts, after.attempts)?,
+            attempted_bytes: add_delta(total.attempted_bytes, before.attempted_bytes, after.attempted_bytes)?,
+            successes: add_delta(total.successes, before.successes, after.successes)?,
+            successful_bytes: add_delta(total.successful_bytes, before.successful_bytes, after.successful_bytes)?,
+        };
+        Ok(())
     }
 
     pub(super) fn wake(&self) {
@@ -136,6 +207,10 @@ impl Drop for FrameCut<'_> {
 }
 
 impl Rex3 {
+    pub(crate) fn resident_composed_captures(&self, mode: ResidentDisplayMode) -> CaptureCount {
+        self.resident_frame.capture_count(mode)
+    }
+
     fn resident_display_fence_complete(&self) -> bool {
         let target = self.xmap_fence.load(Ordering::Acquire);
         self.gfifo_fence.load(Ordering::Acquire).wrapping_sub(target) < 0x8000_0000
@@ -162,6 +237,7 @@ impl Rex3 {
     }
 
     fn resident_frame_cut(&self, timeout: Duration) -> Result<FrameCut<'_>, ResidentError> {
+        let started = Instant::now();
         let control = &self.resident_frame;
         let deadline = Instant::now() + timeout;
         let serial = control.serial.try_lock_for(timeout)
@@ -202,7 +278,10 @@ impl Rex3 {
                 match result {
                     Ok((position, topscan)) => {
                         drop(state);
-                        return Ok(FrameCut { control, id, position, topscan, requests, _serial: serial });
+                        let cut = FrameCut { control, id, position, topscan, requests, _serial: serial };
+                        let elapsed = duration_ns(started.elapsed()).map_err(ResidentError::InvalidState)?;
+                        self.resident_telemetry.lock().cut(elapsed);
+                        return Ok(cut);
                     }
                     Err(error) => {
                         state.active = None;
@@ -252,27 +331,48 @@ impl Rex3 {
         }
     }
 
-    /// Opt in only from tests, after starting the resident GFIFO processor.
-    pub(crate) fn start_resident_display(&self, gpu: Arc<Gpu>) -> Result<(), ResidentError> {
+    /// Start the fixed resident display mode after the GFIFO processor.
+    pub(crate) fn start_resident_display(
+        &self,
+        gpu: Arc<Gpu>,
+        mode: ResidentDisplayMode,
+    ) -> Result<(), ResidentError> {
+        let _lifecycle = self.resident_lifecycle.write();
         if !self.running.load(Ordering::Acquire) {
             return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
         }
+        self.check_resident_health(false)?;
         let mut thread_slot = self.refresh_thread.lock();
         if thread_slot.is_some() {
             return Err(ResidentError::InvalidState("resident display already started"));
         }
-        let mut display = ResidentDisplay::new(self, &gpu)?;
+        let mut display = match ResidentDisplay::new(self, &gpu, mode) {
+            Ok(display) => display,
+            Err(error) => {
+                if matches!(error, ResidentError::DeviceLost(_) | ResidentError::Failed(_)) {
+                    self.fail_resident(error.clone());
+                }
+                return Err(error);
+            }
+        };
         if !self.running.load(Ordering::Acquire) {
             return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
         }
         let rex = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
-        let handle = std::thread::Builder::new().name("REX3-Resident-Display-Test".into())
+        let handle = std::thread::Builder::new().name("REX3-Resident-Display".into())
             .spawn(move || {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| display.run(rex))).is_err() {
                     rex.fail_resident(ResidentError::Failed("resident display worker panicked".into()));
                 }
-            })
-            .map_err(|error| ResidentError::Failed(format!("start resident display: {error}")))?;
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                let error = ResidentError::Failed(format!("start resident display: {error}"));
+                self.fail_resident(error.clone());
+                return Err(error);
+            }
+        };
         *thread_slot = Some(handle);
         Ok(())
     }
@@ -306,8 +406,217 @@ pub(super) fn validate_presenter(renderer: &dyn Renderer, gpu: &Arc<Gpu>) -> Res
     Ok(())
 }
 
+fn validate_compatibility_presenter(renderer: &dyn Renderer) -> Result<(), ResidentError> {
+    if !renderer.takes_resident_readback_frames() {
+        return Err(ResidentError::Unsupported("resident compatibility display requires a readback-capable renderer"));
+    }
+    Ok(())
+}
+
+fn publish_capture(rex: &Rex3, screen: &mut Rex3Screen, requests: Requests, save_screenshots: bool) {
+    screen.frame_seq = screen.frame_seq.wrapping_add(1);
+    rex.resident_frame.complete(requests);
+    if requests.needs_screenshot && save_screenshots {
+        let (width, height) = (screen.width, screen.height);
+        let pixels = screen.rgba.clone();
+        let n = rex.screenshot_counter.fetch_add(1, Ordering::Relaxed);
+        let path = format!("screenshot_{n:04}.png");
+        std::thread::spawn(move || {
+            match crate::disp::save_screenshot(&path, &pixels, width, height) {
+                Ok(()) => println!("iris: screenshot saved to {path}"),
+                Err(error) => println!("iris: screenshot failed: {error}"),
+            }
+        });
+    }
+}
+
+fn observed_words(observation: &Observation, rgb: bool) -> Result<Vec<u32>, ResidentError> {
+    let bytes = if rgb { observation.rgb() } else { observation.aux() }
+        .ok_or(ResidentError::InvalidState("compatibility observation is missing a plane"))?;
+    let mut chunks = bytes.chunks_exact(size_of::<u32>());
+    let words = chunks
+        .by_ref()
+        .map(|bytes| u32::from_ne_bytes(bytes.try_into().expect("u32-sized chunk")))
+        .collect();
+    if !chunks.remainder().is_empty() {
+        return Err(ResidentError::InvalidState("compatibility observation has a partial word"));
+    }
+    Ok(words)
+}
+
+/// Explicitly slow validation/compatibility path: read both authoritative
+/// planes, then hand the CPU snapshots to the ordinary renderer.
+struct ResidentCompatibilityDisplay {
+    overlay: DebugOverlay,
+    status: StatusBar,
+    sbtex: StatusBarTexture,
+    compositor: Option<SwCompositor>,
+    capture: CaptureCount,
+    #[cfg(test)]
+    capture_fault: Option<CaptureFault>,
+    save_screenshots: bool,
+    resize_pending: bool,
+}
+
+impl ResidentCompatibilityDisplay {
+    fn new(rex: &Rex3) -> Result<Self, ResidentError> {
+        if let Some(renderer) = rex.head.renderer_slot().lock().as_deref() {
+            validate_compatibility_presenter(renderer)?;
+        }
+        Ok(Self {
+            overlay: DebugOverlay::new(),
+            status: StatusBar::new(),
+            sbtex: StatusBarTexture::new(),
+            compositor: None,
+            capture: CaptureCount::default(),
+            #[cfg(test)]
+            capture_fault: None,
+            save_screenshots: true,
+            resize_pending: true,
+        })
+    }
+
+    fn render(
+        &mut self,
+        rex: &Rex3,
+        timeout: Duration,
+        at_marker: impl FnOnce(Position),
+    ) -> Result<ResidentDisplayFrame, ResidentError> {
+        rex.wait_resident_display_fence(timeout)?;
+        let cut = rex.resident_frame_cut(timeout)?;
+        let requests = cut.requests;
+        let capture = requests.needs_frame || requests.needs_screenshot
+            || rex.head.capturing();
+        if capture {
+            rex.resident_frame.invalidate();
+        }
+        at_marker(cut.position);
+
+        let mut screen = rex.head.screen().lock();
+        screen.topscan = cut.topscan;
+        screen.status_bar_only = false;
+        let resized = screen.refresh_display_state(
+            &rex.vc2,
+            &rex.xmap0,
+            &rex.cmap0,
+            &rex.bt445,
+            &rex.diag,
+        );
+        if resized {
+            rex.resident_frame.invalidate();
+        }
+        self.resize_pending |= resized;
+        if !rex.resident_display_fence_complete() {
+            return Err(ResidentError::Timeout("display fence after frame marker"));
+        }
+        if screen.width == 0 || screen.width > FB_STRIDE || screen.height == 0
+            || screen.height > super::REX3_SCREEN_HEIGHT as usize
+        {
+            return Err(ResidentError::InvalidState("resident scanout dimensions exceed the Newport planes"));
+        }
+        self.overlay.show_cmap = rex.show_cmap.load(Ordering::Relaxed);
+        self.overlay.show_disp_debug = rex.show_disp_debug.load(Ordering::Relaxed);
+        self.overlay.show_draw_debug = rex.draw_debug_active();
+        let stats: BarStats = rex.status.snapshot(Instant::now(), rex.gfifo.len());
+
+        let mut renderer = rex.head.renderer_slot().lock();
+        if let Some(renderer) = renderer.as_deref() {
+            validate_compatibility_presenter(renderer)?;
+        }
+        let mut mode = rex.raster.lock();
+        let RasterMode::Resident(raster) = &mut *mode else {
+            return Err(ResidentError::InvalidState("resident raster is not active"));
+        };
+        if raster.status()?.accepted != cut.position {
+            return Err(ResidentError::InvalidState("resident frame marker stream cut changed"));
+        }
+        raster.submit_for(FlushReason::FrameCut)?;
+        let observation = raster.observe(ObservationReason::Compatibility, PlaneMask::Both)?;
+        if observation.position() != cut.position {
+            return Err(ResidentError::InvalidState("compatibility observation used the wrong stream cut"));
+        }
+        let rgb = observed_words(&observation, true)?;
+        let aux = observed_words(&observation, false)?;
+        screen.fb_rgb.resize(rgb.len(), 0);
+        screen.fb_aux.resize(aux.len(), 0);
+        #[cfg(feature = "rex-dirty-upload")]
+        let damage = {
+            use crate::dev::ng1::rex3_dirty::{DamagePlane, DamageSnapshot};
+            let mut damage = DamageSnapshot::default();
+            damage.mark_full(DamagePlane::Rgb);
+            damage.mark_full(DamagePlane::Aux);
+            damage
+        };
+        let resized = screen.refresh(
+            &rgb,
+            &aux,
+            #[cfg(feature = "rex-dirty-upload")]
+            &damage,
+            #[cfg(not(feature = "rex-dirty-upload"))]
+            true,
+            &rex.vc2,
+            &rex.xmap0,
+            &rex.cmap0,
+            &rex.bt445,
+            &rex.diag,
+        );
+        if resized {
+            rex.resident_frame.invalidate();
+        }
+        self.resize_pending |= resized;
+        if !rex.resident_display_fence_complete() {
+            return Err(ResidentError::Timeout("display fence after compatibility observation"));
+        }
+        if let Some(renderer) = renderer.as_deref_mut() {
+            if self.resize_pending {
+                renderer.resize(screen.width, screen.height);
+                self.resize_pending = false;
+            }
+            renderer.present(
+                &mut screen,
+                &mut self.overlay,
+                &mut self.status,
+                &mut self.sbtex,
+                &stats,
+                false,
+                None,
+                None,
+            );
+        } else {
+            self.resize_pending = true;
+        }
+        let (width, height) = (screen.width, screen.height);
+        if capture {
+            let bytes = (width * height * size_of::<u32>()) as u64;
+            self.capture.attempt(bytes)?;
+            rex.resident_frame.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, bytes)?;
+            #[cfg(test)]
+            let fault = self.capture_fault.take();
+            #[cfg(test)]
+            if matches!(fault, Some(CaptureFault::BeforeCapture)) {
+                return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
+            }
+            let compositor = self.compositor.get_or_insert_with(SwCompositor::new);
+            compositor.compose_pixels(&screen.compositor_source());
+            #[cfg(test)]
+            if matches!(fault, Some(CaptureFault::AfterStaging)) {
+                return Err(ResidentError::Failed("injected composed capture failure after staging".into()));
+            }
+            for y in 0..height {
+                let row = y * FB_STRIDE;
+                screen.rgba[row..row + width]
+                    .copy_from_slice(&compositor.pixels()[row..row + width]);
+            }
+            self.capture.success(bytes)?;
+            rex.resident_frame.capture_success(ResidentDisplayMode::ReadbackCompatibility, bytes)?;
+            publish_capture(rex, &mut screen, requests, self.save_screenshots);
+        }
+        Ok(ResidentDisplayFrame { position: cut.position, width: width as u32, height: height as u32 })
+    }
+}
+
 /// Owns the composed output and its staging buffer across refreshes.
-pub(crate) struct ResidentDisplay {
+struct ResidentDirectDisplay {
     scanout: Ng1ResidentScanout,
     overlay: DebugOverlay,
     status: StatusBar,
@@ -317,9 +626,9 @@ pub(crate) struct ResidentDisplay {
     resize_pending: bool,
 }
 
-impl ResidentDisplay {
-    pub(crate) fn new(rex: &Rex3, gpu: &Arc<Gpu>) -> Result<Self, ResidentError> {
-        if let Some(renderer) = rex.renderer.lock().as_deref() {
+impl ResidentDirectDisplay {
+    fn new(rex: &Rex3, gpu: &Arc<Gpu>) -> Result<Self, ResidentError> {
+        if let Some(renderer) = rex.head.renderer_slot().lock().as_deref() {
             validate_presenter(renderer, gpu)?;
         }
         let scanout = Ng1Scanout::new_resident(gpu, &rex)?;
@@ -334,21 +643,9 @@ impl ResidentDisplay {
         })
     }
 
-    pub(crate) fn traffic(&self) -> ResidentScanoutTraffic {
-        self.scanout.traffic()
-    }
-
-    pub(crate) fn fail_next_capture(&mut self, fault: CaptureFault) {
-        self.scanout.fail_next_capture(fault);
-    }
-
-    pub(crate) fn suppress_screenshot_files(&mut self) {
-        self.save_screenshots = false;
-    }
-
     /// The hook runs at the FIFO cut, before the raster lock is taken. It is
     /// used to deterministically queue later draws in the ordering tests.
-    pub(crate) fn render(
+    fn render(
         &mut self,
         rex: &Rex3,
         timeout: Duration,
@@ -358,14 +655,25 @@ impl ResidentDisplay {
         let cut = rex.resident_frame_cut(timeout)?;
         let requests = cut.requests;
         let capture = requests.needs_frame || requests.needs_screenshot
-            || rex.capture_users.load(Ordering::Acquire) != 0;
+            || rex.head.capturing();
+        if capture {
+            rex.resident_frame.invalidate();
+        }
         at_marker(cut.position);
 
-        let mut screen = rex.screen.lock();
-        rex.resident_frame.invalidate();
+        let mut screen = rex.head.screen().lock();
         screen.topscan = cut.topscan;
         screen.status_bar_only = false;
-        let resized = screen.refresh_display_state(&rex.vc2, &rex.xmap0, &rex.cmap0, &rex.bt445, &rex.diag);
+        let resized = screen.refresh_resident_display_state(
+            &rex.vc2,
+            &rex.xmap0,
+            &rex.cmap0,
+            &rex.bt445,
+            &rex.diag,
+        );
+        if resized {
+            rex.resident_frame.invalidate();
+        }
         self.resize_pending |= resized;
         // A mode write after the initial wait may have published a later
         // fence. Its GFIFO entry cannot pass this marker, so defer rather
@@ -379,7 +687,7 @@ impl ResidentDisplay {
         if self.overlay.active() {
             return Err(ResidentError::Unsupported("resident debug overlays require CPU planes"));
         }
-        let mut renderer = rex.renderer.lock();
+        let mut renderer = rex.head.renderer_slot().lock();
         if let Some(renderer) = renderer.as_deref_mut() {
             validate_presenter(renderer, self.scanout.gpu())?;
             if self.resize_pending {
@@ -403,7 +711,7 @@ impl ResidentDisplay {
             return Err(ResidentError::InvalidState("resident frame marker stream cut changed"));
         }
 
-        raster.submit()?;
+        raster.submit_for(FlushReason::FrameCut)?;
         let frame = self.scanout.compose(&screen.display_state(), raster)?;
         if frame.position != cut.position {
             return Err(ResidentError::InvalidState("resident scanout used the wrong stream cut"));
@@ -421,7 +729,11 @@ impl ResidentDisplay {
         if capture {
             let (width, height) = (stamp.width as usize, stamp.height as usize);
             self.capture.resize(width * height, 0);
-            self.scanout.capture(stamp, raster, &mut self.capture)?;
+            let before = self.scanout.traffic().composed_readbacks;
+            let result = self.scanout.capture(stamp, raster, &mut self.capture);
+            let after = self.scanout.traffic().composed_readbacks;
+            rex.resident_frame.capture_delta(ResidentDisplayMode::DirectWgpu, before, after)?;
+            result?;
             for y in 0..height {
                 let row = y * FB_STRIDE;
                 for (dst, &src) in screen.rgba[row..row + width]
@@ -430,21 +742,104 @@ impl ResidentDisplay {
                     *dst = 0xff00_0000 | src.swap_bytes() >> 8;
                 }
             }
-            screen.frame_seq = screen.frame_seq.wrapping_add(1);
-            rex.resident_frame.complete(requests);
-            if requests.needs_screenshot && self.save_screenshots {
-                let pixels = screen.rgba.clone();
-                let n = rex.screenshot_counter.fetch_add(1, Ordering::Relaxed);
-                let path = format!("screenshot_{n:04}.png");
-                std::thread::spawn(move || {
-                    match crate::disp::save_screenshot(&path, &pixels, width, height) {
-                        Ok(()) => println!("iris: screenshot saved to {path}"),
-                        Err(error) => println!("iris: screenshot failed: {error}"),
-                    }
-                });
-            }
+            publish_capture(rex, &mut screen, requests, self.save_screenshots);
         }
         Ok(stamp)
+    }
+}
+
+enum ResidentDisplayDriver {
+    Direct(ResidentDirectDisplay),
+    Compatibility(ResidentCompatibilityDisplay),
+}
+
+/// The selected mode is fixed for this display; errors never change it.
+pub(crate) struct ResidentDisplay {
+    gpu: Arc<Gpu>,
+    driver: ResidentDisplayDriver,
+}
+
+impl ResidentDisplay {
+    pub(crate) fn new(rex: &Rex3, gpu: &Arc<Gpu>, mode: ResidentDisplayMode) -> Result<Self, ResidentError> {
+        let resident_gpu = {
+            let mut raster = rex.raster.lock();
+            let RasterMode::Resident(raster) = &mut *raster else {
+                return Err(ResidentError::InvalidState("resident raster is not active"));
+            };
+            raster.status()?;
+            raster.gpu().ok_or(ResidentError::Unsupported("resident display requires a GPU"))?
+        };
+        if !Arc::ptr_eq(&resident_gpu, gpu) {
+            return Err(ResidentError::DeviceMismatch);
+        }
+        let driver = match mode {
+            ResidentDisplayMode::DirectWgpu => ResidentDisplayDriver::Direct(ResidentDirectDisplay::new(rex, gpu)?),
+            ResidentDisplayMode::ReadbackCompatibility => {
+                ResidentDisplayDriver::Compatibility(ResidentCompatibilityDisplay::new(rex)?)
+            }
+        };
+        Ok(Self { gpu: Arc::clone(gpu), driver })
+    }
+
+    pub(crate) fn mode(&self) -> ResidentDisplayMode {
+        match self.driver {
+            ResidentDisplayDriver::Direct(_) => ResidentDisplayMode::DirectWgpu,
+            ResidentDisplayDriver::Compatibility(_) => ResidentDisplayMode::ReadbackCompatibility,
+        }
+    }
+
+    pub(crate) fn direct_traffic(&self) -> Option<ResidentScanoutTraffic> {
+        match &self.driver {
+            ResidentDisplayDriver::Direct(display) => Some(display.scanout.traffic()),
+            ResidentDisplayDriver::Compatibility(_) => None,
+        }
+    }
+
+    pub(crate) fn capture_count(&self) -> CaptureCount {
+        match &self.driver {
+            ResidentDisplayDriver::Direct(display) => display.scanout.traffic().composed_readbacks,
+            ResidentDisplayDriver::Compatibility(display) => display.capture,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_capture(&mut self, fault: CaptureFault) {
+        match &mut self.driver {
+            ResidentDisplayDriver::Direct(display) => display.scanout.fail_next_capture(fault),
+            ResidentDisplayDriver::Compatibility(display) => display.capture_fault = Some(fault),
+        }
+    }
+
+    pub(crate) fn suppress_screenshot_files(&mut self) {
+        match &mut self.driver {
+            ResidentDisplayDriver::Direct(display) => display.save_screenshots = false,
+            ResidentDisplayDriver::Compatibility(display) => display.save_screenshots = false,
+        }
+    }
+
+    pub(crate) fn render(
+        &mut self,
+        rex: &Rex3,
+        timeout: Duration,
+        at_marker: impl FnOnce(Position),
+    ) -> Result<ResidentDisplayFrame, ResidentError> {
+        let started = Instant::now();
+        let requests = rex.resident_frame.requests();
+        // Retain a completed capture across uncaptured presentations; otherwise
+        // a CI consumer can miss it before it acquires the screen lock.
+        if requests.needs_frame || requests.needs_screenshot || rex.head.capturing() {
+            rex.resident_frame.invalidate();
+        }
+        let frame = match &mut self.driver {
+            ResidentDisplayDriver::Direct(display) => {
+                let stamp = display.render(rex, timeout, at_marker)?;
+                Ok(ResidentDisplayFrame { position: stamp.position, width: stamp.width, height: stamp.height })
+            }
+            ResidentDisplayDriver::Compatibility(display) => display.render(rex, timeout, at_marker),
+        }?;
+        let elapsed = duration_ns(started.elapsed()).map_err(ResidentError::InvalidState)?;
+        rex.resident_telemetry.lock().presentation(elapsed);
+        Ok(frame)
     }
 
     fn run(&mut self, rex: &Rex3) {
@@ -453,13 +848,13 @@ impl ResidentDisplay {
             let start = Instant::now();
             let requests = rex.resident_frame.requests();
             let needs_frame = requests.needs_frame || requests.needs_screenshot
-                || rex.capture_users.load(Ordering::Acquire) != 0;
-            if needs_frame || rex.renderer.lock().is_some() {
+                || rex.head.capturing();
+            if needs_frame || rex.head.renderer_slot().lock().is_some() {
                 let result = self.render(rex, FRAME_WAIT, |_| {});
                 *rex.resident_frame.error.lock() = result.as_ref().err().cloned();
                 if let Err(error) = result {
                     let fatal = rex.resident_fault().or_else(|| {
-                        self.scanout.gpu().check().err().map(|message| {
+                        self.gpu.check().err().map(|message| {
                             if message.starts_with("wgpu device lost (") {
                                 ResidentError::DeviceLost(message)
                             } else {
@@ -479,7 +874,7 @@ impl ResidentDisplay {
                 std::thread::sleep(period - elapsed);
             }
         }
-        rex.display_stop.finish(&rex.renderer);
+        rex.head.display_stop().finish(rex.head.renderer_slot());
     }
 }
 
@@ -520,6 +915,26 @@ mod tests {
         assert!(control.frame_available());
         control.invalidate();
         assert!(!control.frame_available(), "an unpublished display state is not a captured frame");
+
+        control.capture_attempt(ResidentDisplayMode::DirectWgpu, 64).unwrap();
+        control.capture_success(ResidentDisplayMode::DirectWgpu, 64).unwrap();
+        control.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, 32).unwrap();
+        control.activate();
+        assert_eq!(control.capture_count(ResidentDisplayMode::DirectWgpu), CaptureCount {
+            attempts: 1, successes: 1, attempted_bytes: 64, successful_bytes: 64,
+        });
+        assert_eq!(control.capture_count(ResidentDisplayMode::ReadbackCompatibility), CaptureCount {
+            attempts: 1, successes: 0, attempted_bytes: 32, successful_bytes: 0,
+        });
+        let exhausted = CaptureCount { attempts: u64::MAX, attempted_bytes: 64, successes: 1, successful_bytes: 64 };
+        control.captures.lock().direct = exhausted;
+        assert!(control.capture_attempt(ResidentDisplayMode::DirectWgpu, 1).is_err());
+        assert_eq!(control.capture_count(ResidentDisplayMode::DirectWgpu), exhausted);
+        assert!(control.capture_delta(
+            ResidentDisplayMode::ReadbackCompatibility,
+            CaptureCount { attempts: 1, ..CaptureCount::default() },
+            CaptureCount::default(),
+        ).is_err());
     }
 
     #[test]
@@ -533,7 +948,7 @@ mod tests {
             rex.request_frame();
             rex.request_screenshot();
             {
-                let mut screen = rex.screen.lock();
+                let mut screen = rex.head.screen().lock();
                 screen.width = 1;
                 screen.height = 1;
                 screen.rgba[0] = 0xff12_3456;
@@ -545,7 +960,7 @@ mod tests {
             let mut pixels = vec![0xfeed_beef];
             assert_eq!(fresh_frame(&*rex, &mut pixels, Duration::ZERO), None);
             assert_eq!(pixels, [0xfeed_beef]);
-            assert_eq!(rex.screen.lock().frame_seq, 7);
+            assert_eq!(rex.head.screen().lock().frame_seq, 7);
 
             rex.gfifo_fence.store(9, Ordering::Release);
             assert!(matches!(rex.resident_frame_cut(Duration::from_millis(10)),
@@ -580,6 +995,14 @@ mod tests {
             });
             rex.running.store(false, Ordering::Release);
             rex.gfifo.reset();
+            assert!(rex.snapshot_resident_registers().is_ok());
+            let serial = rex.resident_frame.serial.lock();
+            assert!(rex.snapshot_resident_registers().is_err());
+            drop(serial);
+            rex.resident_frame.marker.lock().active = Some(Marker { id: 1, reached: None });
+            assert!(rex.snapshot_resident_registers().is_err());
+            rex.resident_frame.marker.lock().active = None;
+            assert!(rex.snapshot_resident_registers().is_ok());
         }).unwrap().join().unwrap();
     }
 

@@ -170,6 +170,104 @@ impl HostInterface {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct HostInterfaceSnapshot {
+    identity: u32,
+    widget_control: u32,
+    xt_req_timeout: u32,
+    int_dest_upper: u32,
+    int_dest_lower: u32,
+    error_command: u32,
+    intr_flags: u32,
+    intr_enable: u32,
+    sw_token: u32,
+    flctl_target: u32,
+    route_dest_upper: u32,
+    route_dest_lower: u32,
+    route_vectors: u32,
+    swap_arm: u32,
+    pending_swaps: u32,
+    swap_control: u32,
+    swap_control_companion: u32,
+    swap_set: u32,
+    swap_clear: u32,
+    displayed_buffer: u32,
+}
+
+impl HostInterfaceSnapshot {
+    pub(super) fn validate(&self, expected_identity: u32) -> Result<(), String> {
+        if self.identity != expected_identity {
+            return Err(format!(
+                "VPro host identity is {:#010x}, expected {expected_identity:#010x}",
+                self.identity
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl HostInterface {
+    pub(super) fn snapshot(&self) -> HostInterfaceSnapshot {
+        HostInterfaceSnapshot {
+            identity: self.identity,
+            widget_control: self.widget_control,
+            xt_req_timeout: self.xt_req_timeout,
+            int_dest_upper: self.int_dest_upper,
+            int_dest_lower: self.int_dest_lower,
+            error_command: self.error_command,
+            intr_flags: self.intr_flags,
+            intr_enable: self.intr_enable,
+            sw_token: self.sw_token,
+            flctl_target: self.flctl_target,
+            route_dest_upper: self.route_dest_upper,
+            route_dest_lower: self.route_dest_lower,
+            route_vectors: self.route_vectors,
+            swap_arm: self.swap_arm,
+            pending_swaps: self.swap_pending,
+            swap_control: self.swap_control,
+            swap_control_companion: self.swap_control_companion,
+            swap_set: self.swap_set,
+            swap_clear: self.swap_clear,
+            displayed_buffer: self.displayed_buffer,
+        }
+    }
+
+    pub(super) fn restore_snapshot(
+        &mut self,
+        snapshot: HostInterfaceSnapshot,
+    ) -> Result<(), String> {
+        snapshot.validate(self.identity)?;
+        let stream_pos = self.fifo.pushed();
+        self.identity = snapshot.identity;
+        self.widget_control = snapshot.widget_control;
+        self.xt_req_timeout = snapshot.xt_req_timeout;
+        self.int_dest_upper = snapshot.int_dest_upper;
+        self.int_dest_lower = snapshot.int_dest_lower;
+        self.error_command = snapshot.error_command;
+        self.intr_flags = snapshot.intr_flags;
+        self.intr_enable = snapshot.intr_enable;
+        self.sw_token = snapshot.sw_token;
+        self.flctl_target = snapshot.flctl_target;
+        self.route_dest_upper = snapshot.route_dest_upper;
+        self.route_dest_lower = snapshot.route_dest_lower;
+        self.route_vectors = snapshot.route_vectors;
+        self.swap_arm = snapshot.swap_arm;
+        self.swap_pending = snapshot.pending_swaps;
+        self.swap_control = snapshot.swap_control;
+        self.swap_control_companion = snapshot.swap_control_companion;
+        self.swap_set = snapshot.swap_set;
+        self.swap_clear = snapshot.swap_clear;
+        self.displayed_buffer = snapshot.displayed_buffer;
+        self.displayed_written = true;
+        self.swap_after = stream_pos;
+        self.stream_pos = stream_pos;
+        self.interrupt_asserted = false;
+        self.flag_held = false;
+        self.update_irq();
+        Ok(())
+    }
+}
+
 impl HostInterface {
     /// An interrupt packet into the widget-addressed fabric.
     pub fn send_packet(&mut self, where_: u64, vector: u8, set: bool) {

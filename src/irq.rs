@@ -55,6 +55,31 @@ impl IrqLine {
     }
 }
 
+/// Several outputs tied to one input: the input is high while any of them is.
+/// An Indy expansion slot has one interrupt pin, so a card with two sources
+/// (a second Newport's retrace and FIFO) joins them here.
+struct WiredOr {
+    out: IrqLine,
+    high: std::sync::Mutex<u32>,
+}
+
+impl InterruptController for WiredOr {
+    fn set_line(&self, line: u32, level: bool) {
+        // Held across the delivery so two sources' changes reach `out` in order.
+        let mut high = self.high.lock().unwrap();
+        if level { *high |= 1 << line } else { *high &= !(1 << line) }
+        self.out.set(*high != 0);
+    }
+}
+
+impl IrqLine {
+    /// `N` lines that together drive `out` (see [`WiredOr`]).
+    pub fn wired_or<const N: usize>(out: IrqLine) -> [IrqLine; N] {
+        let or: Arc<dyn InterruptController> = Arc::new(WiredOr { out, high: std::sync::Mutex::new(0) });
+        std::array::from_fn(|i| IrqLine::new(or.clone(), i as u32))
+    }
+}
+
 struct Unconnected;
 
 /// A device state behind a lock, with the interrupt line it drives. The
@@ -78,6 +103,7 @@ pub struct IrqMutex<S: IrqLevel> {
 
 /// A device state that gives the level of its interrupt line.
 pub trait IrqLevel {
+    /// The level this state puts on the line: `true` is asserted.
     fn irq_level(&self) -> bool;
 }
 
@@ -87,6 +113,8 @@ pub trait IrqLevel {
 struct Last(Option<bool>);
 
 impl<S: IrqLevel> IrqMutex<S> {
+    /// `state` behind the lock, with nothing yet written to the line: the
+    /// first drive always writes.
     pub fn new(state: S) -> Self {
         Self { inner: Mutex::new((state, Last::default())) }
     }
@@ -104,6 +132,8 @@ impl<S: IrqLevel> IrqMutex<S> {
     }
 }
 
+/// The locked state of an [`IrqMutex`]. Dropping it, waiting with it, or
+/// running unlocked with it drives the line from the state first.
 pub struct IrqGuard<'a, S: IrqLevel> {
     guard: MutexGuard<'a, (S, Last)>,
     line: &'a OnceLock<IrqLine>,
@@ -259,6 +289,19 @@ impl InterruptController for Unconnected {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn wired_or_is_high_while_any_source_is() {
+        let (probe, out) = LevelProbe::line();
+        let [a, b] = IrqLine::wired_or(out);
+        a.set(true);
+        b.set(true);
+        a.set(false);
+        assert!(probe.level(), "b still holds the line");
+        b.set(false);
+        assert!(!probe.level());
+    }
+
 
     struct Recorder(Mutex<Vec<(u32, bool)>>);
     impl InterruptController for Recorder {

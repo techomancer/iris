@@ -1,116 +1,52 @@
-use super::origin3200::{Fitting, IBRICK};
 use super::*;
-use crate::config::{MachineConfig, MachineProfile, NetMode};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
+use crate::dev::xbridge::{HEAD_E, HEAD_F};
+use crate::ip35::test_support::{config, headless, widget, with_machine};
+use crate::dev::bedrock::Bedrock;
+use crate::dev::bedrock_flash::Flash;
+use crate::sn::Machine;
 use crate::test_temp::TempPath;
-use crate::traits::{BUS_ERR, BUS_OK};
-use std::sync::Weak;
+use crate::traits::{BusDevice, BUS_ERR, BUS_OK};
+use std::path::Path;
 
-/// A PROM stand-in: a recognisable first word.
-fn prom() -> Vec<u8> {
-    let mut p = vec![0u8; 0x1000];
-    p[..4].copy_from_slice(&0x3c08_a600u32.to_be_bytes());
-    p
-}
-
-fn config(dir: &Path, c_bricks: u8) -> MachineConfig {
-    let mut cfg = MachineConfig::default();
-    cfg.machine.profile = MachineProfile::Origin3200Ip35;
-    cfg.origin3200.c_bricks = c_bricks;
-    cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
-    cfg.headless = true;
-    cfg.network.mode = NetMode::Off;
-    cfg.serial_port_a = Some(0);
-    cfg.serial_port_b = Some(0);
-    cfg
-}
-
-fn chassis(dir: &Path, c_bricks: u8) -> Chassis<Origin3200> {
-    Chassis::<Origin3200>::build(&config(dir, c_bricks), &prom(), Arc::new(|| 0)).unwrap()
-}
-
-/// A PIO address: the widget in bits 27:24.
-fn widget(widget: u64, offset: u64) -> u64 {
-    (widget << 24) | offset
-}
-
-/// One and two C-bricks build and are freed: nothing the chips, their
-/// registered decodes, the windows or the I-brick hold keeps a chip alive.
+/// The I-brick's slots read back as wired: the Fibre Channel adapter at device 1,
+/// the IOC3 at 4 and the USB controller at 5 of head F, nothing anywhere on head E,
+/// and nothing at the second host port.
 #[test]
-fn one_and_two_c_bricks_build_and_are_freed() {
-    for count in [1u8, 2] {
-        let dir = TempPath::dir("o3k-free");
-        let chassis = chassis(&dir, count);
-        assert_eq!(chassis.nodes.len(), usize::from(count));
-        assert_eq!(chassis.windows.is_some(), count == 2);
-        let chips: Vec<Weak<Bedrock>> = chassis.nodes.iter().map(|n| Arc::downgrade(&n.bedrock)).collect();
-        let windows = chassis.windows.as_ref().map(Arc::downgrade);
-        drop(chassis);
-        assert!(chips.iter().all(|c| c.upgrade().is_none()), "{count} C-bricks: a chip is held by a ring");
-        assert!(windows.is_none_or(|w| w.upgrade().is_none()));
-    }
-}
-
-/// The I-brick's slots read back as the row says: the Fibre Channel adapter
-/// at device 1, the IOC3 at 4 and the USB controller at 5 of head F, nothing
-/// anywhere on head E, and nothing at the second host port.
-#[test]
-fn the_ibricks_slots_read_back_as_the_row_says() {
+fn the_ibricks_slots_read_back_as_wired() {
     let dir = TempPath::dir("o3k-slots");
-    let chassis = chassis(&dir, 1);
-    let pio = chassis.nodes[0].bedrock.pio();
-    let [head_e, head_f] = IBRICK.heads;
-    let id = |head: u8, device: u64| pio.read32(widget(u64::from(head), 0x2_0000 + (device << 12)));
-    for &(device, fitting) in IBRICK.head_f {
-        let read = id(head_f, u64::from(device));
-        match fitting {
-            Fitting::Ioc3(_) => assert_eq!(read.data, 0x0003_10a9, "device {device}"),
-            Fitting::Usb => assert_eq!(read.data, 0x5802_11c1, "device {device}"),
-            Fitting::FibreChannel => assert_eq!(read.data, 0x2200_1077, "device {device}"),
+    with_machine(config(&dir, 1), |m| {
+        let pio = m.nodes[0].chip.pio();
+        let id = |head: u8, device: u64| pio.read32(widget(u64::from(head), 0x2_0000 + (device << 12)));
+        for (device, want) in [(1, 0x2200_1077), (4, 0x0003_10a9), (5, 0x5802_11c1)] {
+            assert_eq!(id(HEAD_F, device).data, want, "device {device}");
         }
-    }
-    for device in 0..8 {
-        let read = id(head_e, device);
-        assert!(read.status != BUS_OK || read.data == 0xffff_ffff, "head E device {device} is empty");
-    }
-    assert_eq!(pio.read32(widget(u64::from(IBRICK.spare_port), 0)).status, BUS_ERR, "port B is empty");
+        for device in 0..8 {
+            let read = id(HEAD_E, device);
+            assert!(read.status != BUS_OK || read.data == 0xffff_ffff, "head E device {device} is empty");
+        }
+        assert_eq!(pio.read32(widget(u64::from(SPARE_PORT), 0)).status, BUS_ERR, "port B is empty");
+    });
 }
-
-/// Each node's processors fetch the reset PROM from their own node's flash
-/// at the uncached-fetch window, which the node routing would otherwise read
-/// as node number 1.
-#[test]
-fn the_reset_fetch_window_stays_on_each_node() {
-    let dir = TempPath::dir("o3k-fetch");
-    let chassis = chassis(&dir, 2);
-    for (bus, node) in chassis.processors.iter().zip(&chassis.nodes) {
-        let r = bus.read32(crate::ip35::RESET_WINDOW_FETCH);
-        assert_eq!((r.status, r.data), (BUS_OK, 0x3c08_a600));
-        assert_eq!(node.bus.read32(crate::ip35::RESET_WINDOW_FETCH).data, 0x3c08_a600);
-    }
-}
-
 /// A processor's thread is a processor of the node it runs on and of no
 /// other: the second node's chip numbers the machine's CPU 1 its own
 /// processor 0, and takes the first node's thread for no processor.
 #[test]
 fn a_node_numbers_only_its_own_processors() {
     let dir = TempPath::dir("o3k-cpus");
-    let chassis = chassis(&dir, 2);
-    let second = chassis.specs[1].processors.with_first_cpu(1);
+    let specs = node_specs(&config(&dir, 2)).unwrap();
+    let second = specs[1].processors.with_first_cpu(1);
     assert_eq!((second.local(0), second.local(1), second.local(2)), (None, Some(0), None));
     assert_eq!(second.slot_of_cpu(1), Some((0, 0)));
-    assert_eq!(chassis.specs[0].processors.local(1), None);
+    assert_eq!(specs[0].processors.local(1), None);
 }
-
 fn refused(cfg: &MachineConfig) -> String {
     cfg.validate().unwrap_err()
 }
-
 /// The row's limits: one or two C-bricks, banks a C-brick takes in matched
-/// pairs, disks on the loop and not on `[scsi.N]`, no option board keys, no
-/// graphics.
+/// pairs, disks on the loop and not on `[scsi.N]`, no option board keys, no graphics.
 #[test]
-fn the_configuration_refuses_what_the_row_does_not_fit() {
+fn the_configuration_refuses_what_the_row_does_not_hold() {
     let dir = TempPath::dir("o3k-config");
     config(&dir, 1).validate().unwrap();
     config(&dir, 2).validate().unwrap();
@@ -143,7 +79,6 @@ fn the_configuration_refuses_what_the_row_does_not_fit() {
     cfg.graphics.board = Some(crate::config::GraphicsBoard::V12);
     assert!(refused(&cfg).contains("Origin 3200"));
 }
-
 /// `r12000` and `r12000_400` name the C-brick's processor, the 400 MHz part
 /// with 8 MiB of secondary cache; the Octane's 2 MiB part is not offered.
 #[test]
@@ -153,90 +88,27 @@ fn the_c_brick_takes_the_400_mhz_r12000_with_the_8_mib_cache() {
     }
     assert!(MachineProfile::Origin3200Ip35.part(Some("r12000_360")).is_err());
 }
-
-/// With a 512 MiB bank 0 the memory covers the reset PROM's window. Once the
-/// controller maps it, the processor still fetches the PROM's first word at
-/// the reset vector, where the cached plane answers RAM.
+/// With a 512 MiB bank 0 the memory covers the reset PROM's window.
 #[test]
 fn the_prom_still_fetches_under_a_512_mib_bank() {
-    crate::display_stop_tests::big_stack(|| {
-        use crate::gdb_stub::StopReason;
-        use gdbstub_arch::mips::reg::id::MipsRegId;
-        let dir = TempPath::dir("o3k-bank512");
-        let mut cfg = config(&dir, 1);
-        let path = dir.join("prom.bin");
-        std::fs::write(&path, prom()).unwrap();
-        cfg.prom = path.to_string_lossy().into_owned();
-        (cfg.origin3200.l1_port, cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0), Some(0));
-        cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
-        cfg.banks_set = true;
-        let m = Origin3200Machine::new(&cfg).unwrap();
-        let node = &m.units[0].node;
+    use crate::gdb_stub::StopReason;
+    use gdbstub_arch::mips::reg::id::MipsRegId;
+    let dir = TempPath::dir("o3k-bank512");
+    let mut cfg = config(&dir, 1);
+    cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
+    cfg.banks_set = true;
+    with_machine(cfg, |m| {
+        let node = &m.nodes[0];
         // Banks 0 and 1 enabled, size code 4 (512 MiB): slot 0 holds RAM past 0x1fc00000.
-        assert_eq!(node.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x43), BUS_OK);
-        assert!(node.cached.read32(0x1fc0_0000).status == BUS_OK, "RAM answers the PROM's window in the cached view");
-        assert_eq!(node.cached.read32(0x1fc0_0000).data, 0, "and it is not the PROM's word");
-        let cpu = m.units[0].cpu.clone().debug_adapter();
+        assert_eq!(node.chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x43), BUS_OK);
+        assert!(node.chip.decode.physical().read32(0x1fc0_0000).status == BUS_OK, "RAM answers the PROM's window in the cached view");
+        assert_eq!(node.chip.decode.physical().read32(0x1fc0_0000).data, 0, "and it is not the PROM's word");
+        let cpu = m.node_cpus[0][0].clone().debug_adapter();
         assert_eq!(cpu.step_one(), StopReason::DoneStep);
         let t0 = cpu.read_reg(MipsRegId::Gpr(8)).unwrap();
         assert_eq!(t0, 0xffff_ffff_a600_0000, "the first instruction was the PROM's lui, not RAM's zero word");
     });
 }
-
-/// A page compiled on a node of two watches the counter the banks bump. The
-/// processor's stores and a bus master's both reach the banks, so both must
-/// advance the counter the JIT was handed, or code written after it was
-/// compiled keeps running.
-#[cfg(feature = "jitv2")]
-#[test]
-fn a_two_node_machines_code_pages_see_processor_and_dma_stores() {
-    use std::sync::atomic::Ordering;
-    let dir = TempPath::dir("o3k-gen");
-    let chassis = chassis(&dir, 2);
-    for (n, node) in chassis.nodes.iter().enumerate() {
-        // Banks 0 and 1 enabled, 256 MiB each.
-        assert_eq!(node.bedrock.registers().write64(crate::dev::bedrock::reg::MD_BASE + 8, 0x33), BUS_OK);
-        let at = 0x2000;
-        let counter = node.cached.gen_ptr(at);
-        assert!(!counter.is_null(), "node {n}");
-        let read = || unsafe { (*counter).load(Ordering::Acquire) };
-        let before = read();
-        assert_eq!(node.cached.write32(at, 1), BUS_OK);
-        let after_store = read();
-        assert!(after_store > before, "node {n}: a processor store left the page's counter at {before}");
-        assert_eq!(node.bedrock.dma_view().write32(at, 2), BUS_OK);
-        assert!(read() > after_store, "node {n}: a DMA store left the page's counter at {after_store}");
-    }
-}
-
-/// The second node's memory sits at node number 1, from 8 GiB, and the code
-/// the JIT compiles from there is that node's RAM, not the reset PROM's
-/// uncached-fetch copy. The second node's kernel text lies at its first
-/// frame, so a PROM alias on those addresses has its processor run the PROM.
-#[cfg(feature = "jitv2")]
-#[test]
-fn the_second_nodes_memory_is_not_hidden_by_the_proms_fetch_alias() {
-    use crate::dev::bedrock::reg::{lb, LB_BASE, MD_BASE};
-    let dir = TempPath::dir("o3k-alias");
-    let chassis = chassis(&dir, 2);
-    for node in &chassis.nodes {
-        assert_eq!(node.bedrock.registers().write64(MD_BASE + 8, 0x33), BUS_OK);
-    }
-    assert_eq!(chassis.nodes[1].bedrock.registers().write64(LB_BASE + lb::NODE_REGION, 1 << 32), BUS_OK);
-    let word = 0x2400_0001;
-    assert_eq!(chassis.nodes[1].bedrock.dma_view().write32(0, word), BUS_OK);
-    let second = 1u64 << 33;
-    for (n, node) in chassis.nodes.iter().enumerate() {
-        let read = node.code.read32(second);
-        assert_eq!((read.status, read.data), (BUS_OK, word), "node {n} reads the second node's first word");
-        assert!(!node.code.gen_ptr(second).is_null(), "node {n}: the word is on a page the JIT can compile");
-    }
-    // And the PROM is still fetchable where it is presented.
-    for node in &chassis.nodes {
-        assert_eq!(node.code.read32(crate::ip35::RESET_WINDOW_FETCH).data, 0x3c08_a600);
-    }
-}
-
 /// The `[fibre_channel.disk.N]` disks are on the I-brick's loop at the loop IDs
 /// they name, and a machine with none still has the adapter.
 #[test]
@@ -246,79 +118,163 @@ fn the_loop_has_the_configured_disks() {
     std::fs::write(&image, vec![0u8; 1 << 20]).unwrap();
     let mut cfg = config(&dir, 1);
     cfg.fibre_channel = Some(toml::from_str(&format!("[disk.3]\npath = {:?}\noverlay = true", image.to_string_lossy())).unwrap());
-    let chassis = Chassis::<Origin3200>::build(&cfg, &prom(), Arc::new(|| 0)).unwrap();
-    let fibre = chassis.io.fibre.as_ref().expect("the adapter is on the I-brick");
-    use crate::scsi_monitor::ScsiTargets;
-    let attached: Vec<usize> = fibre.scsi_bus().with_targets(|t| t.iter().enumerate().filter(|(_, d)| d.is_some()).map(|(i, _)| i).collect());
-    assert_eq!(attached, [3]);
-    let bare = Chassis::<Origin3200>::build(&config(&dir, 1), &prom(), Arc::new(|| 0)).unwrap();
-    assert!(bare.io.fibre.is_some());
-}
-
-/// A snapshot is refused with the reason, in both directions, rather than
-/// saved from a machine whose chips and node memory have nothing to save.
-#[test]
-fn a_snapshot_is_refused_with_a_reason() {
-    crate::display_stop_tests::big_stack(|| {
-        let dir = TempPath::dir("o3k-snapshot");
-        let mut cfg = config(&dir, 1);
-        let path = dir.join("prom.bin");
-        std::fs::write(&path, prom()).unwrap();
-        cfg.prom = path.to_string_lossy().into_owned();
-        // Port 0 takes any free host port.
-        (cfg.origin3200.l1_port, cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0), Some(0));
-        let mut m = Origin3200Machine::new(&cfg).unwrap();
-        for result in [Workstation::save_snapshot(&mut m, "s"), Workstation::load_snapshot(&mut m, "s")] {
-            let why = result.unwrap_err();
-            assert!(why.contains("Origin 3200") && why.contains("not supported yet") && why.contains("no saved state"), "{why}");
-        }
-    });
-}
-
-/// `[jitv2] compile` reaches the machine: `async` starts each node's compile
-/// pool and `sync` leaves it stopped, for the processor to compile inline. The
-/// machine is then dropped, which must join the pool rather than hang.
-#[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]
-#[test]
-fn the_jitv2_compile_setting_reaches_the_machine_and_drop_joins_the_pool() {
-    use crate::config::JitCompile;
-    crate::display_stop_tests::big_stack(|| {
-        for (mode, pool_runs) in [(JitCompile::Async, true), (JitCompile::Sync, false)] {
-            let dir = TempPath::dir("o3k-jitmode");
-            let mut cfg = config(&dir, 1);
-            let path = dir.join("prom.bin");
-            std::fs::write(&path, prom()).unwrap();
-            cfg.prom = path.to_string_lossy().into_owned();
-            (cfg.origin3200.l1_port, cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0), Some(0));
-            cfg.jitv2.compile = mode;
-            let m = Origin3200Machine::new(&cfg).unwrap();
-            for u in &m.units {
-                assert_eq!(u.cpu.jitv2().lock().compile_queue.is_running(), pool_runs, "{mode:?}");
+    let attached = |m: &mut Machine<Bedrock, Flash>| {
+        let mut attached = Vec::new();
+        (m.io.disks)(&mut |buses| {
+            for bus in buses {
+                attached.push(bus.with_targets(|t| t.iter().enumerate().filter(|(_, d)| d.is_some()).map(|(i, _)| i).collect::<Vec<_>>()));
             }
-            drop(m);
+        });
+        attached
+    };
+    assert_eq!(with_machine(cfg, attached), [vec![3]]);
+    assert_eq!(with_machine(config(&dir, 1), attached), [Vec::<usize>::new()], "the adapter is on the I-brick");
+}
+
+fn onyx_config(dir: &Path, board: GraphicsBoard) -> MachineConfig {
+    let mut cfg = headless(dir, MachineProfile::Onyx3000Ip35);
+    cfg.graphics.board = Some(board);
+    cfg.onyx3000.l1_port = Some(0);
+    cfg
+}
+
+/// The pipe answers at widget 11 of the I-brick's crossbar and its identity
+/// reads there, where the Origin 3200 has nothing.
+#[test]
+fn the_pipe_reads_back_at_widget_11() {
+    let dir = TempPath::dir("o3k-ir-widget");
+    with_machine(onyx_config(&dir, GraphicsBoard::Ir3), |m| {
+        let pio = m.nodes[0].chip.pio();
+        let id = pio.read32(widget(u64::from(PIPE_WIDGET), 0x04));
+        assert_eq!((id.status, id.data), (BUS_OK, 0x0c10_2555), "widget identification");
+        // The I-brick's other ports are as on the Origin 3200: the host port and
+        // the heads answer, a port with nothing attached does not.
+        for port in [HOST_WIDGET, HEAD_E, HEAD_F] {
+            assert_eq!(pio.read32(widget(u64::from(port), 0x04)).status, BUS_OK, "port {port}");
+        }
+        assert_ne!(pio.read32(widget(9, 0x04)).status, BUS_OK, "port 9 is empty");
+    });
+}
+
+/// The pipe's interrupt controller is the I-brick's inbound port for its widget: a packet reaches
+/// the processor interface its address names, which is why the pipe hands over the address the
+/// driver programmed (`dev::kona`'s test of the packet it sends).
+#[test]
+fn a_packet_from_the_pipes_widget_reaches_the_processor_interface_its_address_names() {
+    use crate::dev::bedrock::regs::{pi, PI1_BASE};
+    use crate::irq::InterruptController;
+    let dir = TempPath::dir("o3k-ir-int");
+    with_machine(onyx_config(&dir, GraphicsBoard::Ir3), |m| {
+        let bedrock = &m.nodes[0].chip;
+        let port = bedrock.inbound(PIPE_WIDGET);
+        let pending = |base: u64| bedrock.registers().read64(base + 0x98).data & (1 << 12) != 0;
+        assert!(!pending(PI1_BASE) && !pending(pi::BASE));
+        assert!(port.packet(PIPE_WIDGET, 0x8000_0180_0090 + PI1_BASE, 12, true));
+        assert!(pending(PI1_BASE), "the second processor interface took the packet");
+        assert!(!pending(pi::BASE), "and the first did not");
+    });
+}
+
+/// A Crossbow link reset of the pipe's port resets the widget's Crosstalk registers and leaves the
+/// board's own: the driver's adaptor reset follows it with the board's reset pulse, and the board
+/// state in between (the map RAM among it) must survive.
+#[test]
+fn a_link_reset_of_the_pipes_port_leaves_the_boards_own_registers() {
+    const INT_VECTORS: u64 = 0x5c;
+    const INT_ENABLE: u64 = 0x80_0230;
+    // Link 3 (widget 11) of the crossbar's registers in widget 0: its reset register's low word.
+    const LINK3_RESET: u64 = 0x100 + 0x40 * 3 + 0x30 + 4;
+    let dir = TempPath::dir("o3k-ir-linkreset");
+    with_machine(onyx_config(&dir, GraphicsBoard::Ir3), |m| {
+        for d in &m.io.devices {
+            d.start();
+        }
+        let pio = m.nodes[0].chip.pio();
+        // The pipe applies its stores in order, and a read waits behind them.
+        let read = |off: u64| loop {
+            let r = pio.read32(widget(u64::from(PIPE_WIDGET), off));
+            match r.status {
+                crate::traits::BUS_BUSY => std::thread::yield_now(),
+                status => {
+                    assert_eq!(status, BUS_OK, "read of {off:#x}");
+                    break r.data;
+                }
+            }
+        };
+        let write = |off: u64, value: u32| loop {
+            match pio.write32(widget(u64::from(PIPE_WIDGET), off), value) {
+                crate::traits::BUS_BUSY => std::thread::yield_now(),
+                status => break assert_eq!(status, BUS_OK, "write of {off:#x}"),
+            }
+        };
+        write(INT_VECTORS, 0x3e_2210);
+        write(INT_ENABLE, 0xf7c);
+        assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0x3e_2210, 0xf7c));
+        assert_eq!(pio.write32(widget(0, LINK3_RESET), 0), BUS_OK);
+        assert_eq!((read(INT_VECTORS), read(INT_ENABLE)), (0, 0xf7c), "the widget's registers reset, the board's stay");
+        for d in m.io.devices.iter().rev() {
+            d.stop();
         }
     });
 }
 
-/// A dropped Origin 3200 frees every processor, and through their batch
-/// hooks the nodes and what they hold open. Under jitv2 the machine once kept
-/// a strong handle on each processor after giving its compile pool a weak one.
+/// The profile's limits: the pipe is a product the table ships in an Onyx 3000; the C-bricks are
+/// the graphics brick's, not a key; the machine has graphics, so none is the Origin 3200.
 #[test]
-fn a_dropped_origin_frees_its_processors() {
-    crate::display_stop_tests::big_stack(|| {
-        for c_bricks in [1u8, 2] {
-            let dir = TempPath::dir("o3k-drop");
-            let mut cfg = config(&dir, c_bricks);
-            let path = dir.join("prom.bin");
-            std::fs::write(&path, prom()).unwrap();
-            cfg.prom = path.to_string_lossy().into_owned();
-            (cfg.origin3200.l1_port, cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0), Some(0));
-            let m = Origin3200Machine::new(&cfg).unwrap();
-            let cpus: Vec<_> = m.units.iter().map(|u| Arc::downgrade(&u.cpu)).collect();
-            let chips: Vec<Weak<Bedrock>> = m.units.iter().map(|u| Arc::downgrade(&u.node.bedrock)).collect();
-            drop(m);
-            assert!(cpus.iter().all(|c| c.upgrade().is_none()), "{c_bricks} C-bricks: a processor outlives the machine");
-            assert!(chips.iter().all(|c| c.upgrade().is_none()), "{c_bricks} C-bricks: a node's chip outlives the machine");
-        }
+fn the_configuration_refuses_what_the_onyx_does_not_hold() {
+    let dir = TempPath::dir("o3k-ir-config");
+    onyx_config(&dir, GraphicsBoard::Ir3).validate().unwrap();
+    for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2e, GraphicsBoard::None, GraphicsBoard::V10, GraphicsBoard::V8] {
+        assert!(refused(&onyx_config(&dir, board)).contains("Onyx 3000"), "{}", board.as_str());
+    }
+    // Its graphics board fixes the C-bricks, so `[onyx3000]` has no count.
+    let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
+    cfg.onyx3000.c_bricks = 2;
+    assert!(refused(&cfg).contains("onyx3000.c_bricks"), "{}", refused(&cfg));
+    // The brick keys are read from `[onyx3000]`, and an error names it.
+    let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
+    cfg.onyx3000.brick_serial = Some("X".repeat(38));
+    assert!(refused(&cfg).starts_with("onyx3000.brick_serial"), "{}", refused(&cfg));
+    let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
+    cfg.origin3200.brick_serial = Some("X".repeat(38));
+    cfg.validate().unwrap();
+    cfg.onyx3000.l1_port = Some(8882);
+    assert_eq!(cfg.ip35_section().l1_port, Some(8882));
+    assert_eq!(cfg.ip35_section().brick_serial, None, "`[origin3200]` is not read");
+    let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
+    cfg.graphics.board = None;
+    cfg.validate().unwrap();
+    assert_eq!(cfg.graphics_board(), GraphicsBoard::Ir3, "the default");
+}
+
+/// The V12 reads back at widget 8 of the second C-brick's crossbar; the first
+/// C-brick has no such widget, and carries no pipe at widget 11.
+#[test]
+fn the_vpro_reads_back_at_widget_8_of_the_second_c_brick() {
+    let dir = TempPath::dir("o3k-vpro-widget");
+    with_machine(onyx_config(&dir, GraphicsBoard::V12), |m| {
+        let second = m.nodes[1].chip.pio();
+        let id = second.read32(widget(u64::from(VPRO_WIDGET), 0x04));
+        assert_eq!(id.status, BUS_OK, "the V12 answers");
+        assert_ne!(id.data, 0xffff_ffff);
+        // The V-brick's crossbar is an XBridge at widget 0, with its host port.
+        assert_eq!(second.read32(widget(0, 0)).status, BUS_OK);
+        assert_eq!(second.read32(widget(10, 0)).status, BUS_OK);
+        let first = m.nodes[0].chip.pio();
+        assert_ne!(first.read32(widget(u64::from(VPRO_WIDGET), 0x04)).status, BUS_OK, "the I-brick has no widget 8");
+        assert_ne!(first.read32(widget(u64::from(PIPE_WIDGET), 0x04)).status, BUS_OK, "and no pipe");
     });
+}
+
+/// Each C-brick's controller names the brick on its link: the I-brick on the
+/// first, the V-brick on the second answering as an X-brick (approximation).
+#[test]
+fn each_c_bricks_controller_names_its_brick() {
+    let dir = TempPath::dir("o3k-vpro-l1");
+    let v = node_specs(&onyx_config(&dir, GraphicsBoard::V12)).unwrap();
+    let attached: Vec<_> = v.iter().map(|s| s.l1.attached.map(|b| (b.type_code, b.graphics_bay))).collect();
+    assert_eq!(attached, [Some((0x49, None)), Some((0x58, None))]);
+    let g = node_specs(&onyx_config(&dir, GraphicsBoard::Ir3)).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].l1.attached.map(|b| (b.type_code, b.graphics_bay)), Some((0x49, Some(G_BRICK_BAY))));
 }

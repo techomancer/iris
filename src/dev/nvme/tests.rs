@@ -1207,7 +1207,7 @@ fn directly_in_the_slot_the_bar_decodes_and_the_commands_run() {
 fn behind_a_bridge_the_window_the_bridge_forwards_decodes_the_bar() {
     let host = host();
     let bus = bus(&host);
-    let ppb = PciToPciBridge::new(&bus, at(3), 0x1011, 0x0026);
+    let ppb = PciToPciBridge::with_io32_windows(&bus, at(3), 0x1011, 0x0026, 0);
     bus.attach(at(3), ppb.clone());
     let n = Nvme::new();
     let img = image("behind", 64);

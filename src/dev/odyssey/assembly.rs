@@ -67,7 +67,7 @@ pub(super) fn report_w_plane_clip() {
 /// model-view, eye to clip by the projection, clip to window by the
 /// viewport, window depth through the depth range, and the user clip
 /// planes, in eye coordinates, those whose bit is set enabled.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(super) struct XfState {
     /// Column-major.
     pub modelview: [f32; 16],
@@ -152,7 +152,7 @@ pub(super) trait PrimSink {
 }
 
 /// A polygon's vertices, kept until the end of the primitive.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct PolygonBuffer {
     pub vertices: Vec<f32>,
     pub count: u32,
@@ -185,7 +185,7 @@ impl PolygonBuffer {
 }
 
 /// The board's primitive assembly and its transform state.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Assembly {
     /// The board's context identity.
     pub hw_id: u32,

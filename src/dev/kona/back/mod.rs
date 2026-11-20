@@ -927,7 +927,7 @@ impl KonaBackend {
     /// page from offset 8, with the completion word written last. The client has no timeout on the bare form, so
     /// every read is answered. A level that is not loaded answers zeros, and so does a format or type the packer does
     /// not know (the whole reply area is zeroed, then the completion word), counted. A read too big to build, or a bare
-    /// one whose image would not fit the page, is refused and counted: only the completion word is posted, or the
+    /// one whose image would be larger than the page, is refused and counted: only the completion word is posted, or the
     /// bracket is refused. A read with no context or return page to answer on is counted.
     ///
     /// Luminance and luminance-alpha come from the sum of red, green and blue clamped at 1.0, as the pipe's colour path

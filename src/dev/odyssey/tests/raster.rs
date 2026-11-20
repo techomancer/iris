@@ -760,7 +760,7 @@ fn assert_frame_is_whole_resolve(h: &BoardLocks, display: &Display, what: &str) 
     let frame = crate::dev::odyssey::frame::Frame::snapshot_for_screen(&regs, displayed).expect("the scan-out is set up");
     let mut want = vec![0u32; w * ht];
     frame.compose(s.vram.ptr_shared(), &regs, &mut want, w, ht);
-    let screen = display.screen.lock();
+    let screen = display.screen().lock();
     let stride = crate::disp::FB_STRIDE;
     for y in 0..ht {
         assert_eq!(&screen.fb_rgb[y * stride..y * stride + w], &want[y * w..(y + 1) * w], "{what}: row {y}");
@@ -843,11 +843,11 @@ fn stress(seed: u64, last_is_lut: bool) {
     // is carried from one frame to the next), so an idle frame is a pure
     // recompute; ten of them, after the four settled ones above, still catch a
     // frame that drifts with no writer.
-    let before = display.screen.lock().fb_rgb.clone();
+    let before = display.screen().lock().fb_rgb.clone();
     for _ in 0..10 {
         Odyssey::frame(&h, &display);
     }
-    assert!(display.screen.lock().fb_rgb == before, "an idle frame changed the picture");
+    assert!(display.screen().lock().fb_rgb == before, "an idle frame changed the picture");
     assert_frame_is_whole_resolve(&h, &display, "after idle frames");
     h.raster.stop();
 }
@@ -890,7 +890,7 @@ fn swap_atomicity() {
             while !stop.load(SeqCst) {
                 Odyssey::frame(&h, &display);
                 let reader = display.reader.lock();
-                let screen = display.screen.lock();
+                let screen = display.screen().lock();
                 let stride = crate::disp::FB_STRIDE;
                 let w = reader.frame_width as usize;
                 let bit = (h.front.lock().displayed_buffer & 1) as usize;
@@ -1039,35 +1039,25 @@ fn the_sphere_map_reflects_the_eye_vector_about_the_normal() {
     assert!((tt - 0.5).abs() < 1e-6, "{tt}");
 }
 
-/// What the display thread presents: an idle board is presented only on
-/// the display's refresh frames, and a change shows on the next frame.
+/// What the display composes: nothing for an idle board (the refresh
+/// thread shows the frame it has again), and a change on the next frame.
 #[test]
-fn an_idle_display_presents_only_its_refresh_frames() {
+fn an_idle_display_composes_no_frames() {
     if super::gpu_unit_tests() {
         // The GPU scan-out composes every frame.
         return;
     }
     let (h, _st, display) = display_rig();
-    let seq = |d: &Display| d.screen.lock().frame_seq;
 
-    Odyssey::frame(&h, &display);
-    let first = seq(&display);
-    assert_eq!(first, 1, "the first frame is presented");
+    assert!(Odyssey::frame(&h, &display), "the first frame is composed");
     // The reset's stores bring one more frame, which catches data their
     // mark was seen ahead of.
-    Odyssey::frame(&h, &display);
-    assert_eq!(seq(&display), 2);
-    let refresh = (1..=10).filter(|_| {
-        let before = seq(&display);
-        Odyssey::frame(&h, &display);
-        seq(&display) != before
-    }).count();
-    assert_eq!(refresh, 1, "ten idle frames present once, at the refresh");
+    assert!(Odyssey::frame(&h, &display));
+    let composed = (1..=10).filter(|_| Odyssey::frame(&h, &display)).count();
+    assert_eq!(composed, 0, "ten idle frames compose nothing");
 
     h.raster.wait_idle();
     h.test_board().vram.ptr().store(0x1000, 4, 0x55);
-    let before = seq(&display);
-    Odyssey::frame(&h, &display);
-    assert_eq!(seq(&display), before + 1, "a store shows on the next frame");
+    assert!(Odyssey::frame(&h, &display), "a store shows on the next frame");
     h.raster.stop();
 }

@@ -1,24 +1,16 @@
-//! Fuel's L1 controller protocol parser and reply model.
-//!
-//! This state owns packet framing, controller identity records, console
-//! commands and power events. The UART register file and receive pacing live
-//! in the shared Ns16550 core.
+//! Fuel's L1 controller protocol parser and reply model: packet framing, identity records, console
+//! commands and power events. The UART registers and receive pacing live in the Ns16550 core.
 //!
 //! Ported from hw/misc/sgi-l1.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
 
-/// Firmware revision the model reports for request 0x0005.
-///
-/// 1.48.1 is the revision a real Fuel's L1 prints. The model reproduces
-/// that firmware's replies, not its code, so the revision is a label.
+/// Firmware revision for request 0x0005: 1.48.1, what a real Fuel's L1 prints. A label; the model
+/// copies replies, not code.
 pub const DEFAULT_REVISION: [u32; 3] = [1, 48, 1];
 
-/// Brick serial the model reports for request 0x0004.
-///
-/// A made-up serial, `EMU` for the emulator, system-board letter `N` and
-/// instance 0. The real format is unknown, and the value must not pass as
-/// a real SGI serial.
+/// Brick serial for request 0x0004: made up (`EMU`, board letter `N`, instance 0), as the real
+/// format is unknown and it must not pass as an SGI serial.
 pub const DEFAULT_BRICK_SERIAL: &str = "EMUN00";
 
 /// Parse a "major.minor.patch" revision string, as a `[fuel] l1_revision`
@@ -40,25 +32,18 @@ pub fn parse_revision(text: &str) -> Result<[u32; 3], String> {
     Ok(rev)
 }
 
-/// The brick on a C-brick's XIO cable. The C-brick's L1 reaches the brick's
-/// own controller through requests addressed to `0x4ffff` and names its
-/// letter in the PROM's I/O interface set-up (request 0xa).
+/// The brick on a C-brick's XIO cable, reached through requests to `0x4ffff`.
 ///
-/// Approximation: this is a stub of the I-brick's own L1. It answers only
-/// the module identity (bay and letter) itself; every other request is
-/// served as the C-brick's, so the I-brick shares the C-brick's revision and
-/// board records instead of holding its own.
+/// Approximation: a stub of the I-brick's own L1; it answers only the module identity itself and
+/// serves every other request as the C-brick's, sharing its revision and board records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachedBrick {
     pub bay: u32,
     /// The brick type character: 0x49 for an I-brick.
     pub type_code: u32,
-    /// The bay of the G-brick whose pipe is on the brick's other Crosstown2
-    /// port. The brick's attached-brick reply (request 0xc) lists it at port
-    /// 2, after the C-brick at port 1. The PROM asks for that list when the
-    /// brick's second port is up, to tell a graphics brick from a second
-    /// host. Approximation: the port numbers and the letter `G` are the
-    /// model's choice; no real reply is captured.
+    /// The bay of the G-brick on the other Crosstown2 port, listed at port 2 after the C-brick
+    /// (request 0xc). The port numbers and letter `G` are the model's choice; no real reply is
+    /// captured.
     pub graphics_bay: Option<u32>,
 }
 
@@ -72,9 +57,9 @@ pub struct ComputeNode {
     /// The node's position in the machine. It numbers the synthetic serials
     /// of the node board and the modules, so two nodes differ.
     pub index: u8,
-    /// Bit n set when PIMM n is fitted. Approximation: which count a
-    /// one-processor C-brick reports is not established; the PROM reset the
-    /// module in a model run when two were reported and one processor ran.
+    /// Bit n set when PIMM n is populated. Approximation: what a one-processor C-brick reports is not
+    /// established; the PROM reset the module in a model run when two were reported and one
+    /// processor ran.
     pub pimm_mask: u8,
     /// The module's identity as its board area names it.
     pub pimm: BoardIdentity,
@@ -89,11 +74,9 @@ pub struct L1Config {
     pub revision: Option<[u32; 3]>,
     pub mac: [u8; 6],
     pub brick_serial: Option<String>,
-    /// The system serial request 0x0008 answers with. `None` answers with
-    /// the station address in hex, as the Fuel's L1 does. It names the
-    /// system, so every L1 of a machine is given the same text; the board
-    /// serials in the records stay as they are, because the PROM ties its
-    /// NVRAM to the node board's serial.
+    /// The system serial for request 0x0008; `None` answers the station address in hex, as the
+    /// Fuel's L1 does. Every L1 of a machine gets the same text; board serials stay, as the PROM
+    /// ties its NVRAM to the node board's.
     pub system_serial: Option<String>,
     pub auto_power: bool,
     /// First integer of the port-speed reply (request 0xa). The PROM uses it
@@ -104,20 +87,16 @@ pub struct L1Config {
     pub router: bool,
     /// The CPU configuration the node board's record carries, if any.
     pub cpu_context: Option<CpuContext>,
-    /// The node board's identity in component 0's board area. Unset, the
-    /// board is the Fuel's system board, which answers as both the node
-    /// board and the I/O board, the I/O area carrying the station address.
-    /// Set, component 0 names this board and no I/O board record is given,
-    /// as QEMU's L1 does for an IP53 node.
+    /// The node board's identity in component 0. Unset, the Fuel's system board answers as node and
+    /// I/O board; set, it names this board with no I/O record, as QEMU's L1 does for an IP53 node.
     pub node_board: Option<BoardIdentity>,
     /// A brick on the XIO cable whose controller this one relays to.
     pub attached: Option<AttachedBrick>,
     /// Set on a C-brick: its processor modules at components 1 and 2, with
     /// marked synthetic serials. Needs `node_board`.
     pub compute_node: Option<ComputeNode>,
-    /// The graphics board's identity in component 2's board area, the area
-    /// IRIX reads to name a graphics board on this node. Unset, nothing
-    /// answers there.
+    /// The graphics board's identity in component 2's board area, which IRIX reads to name it;
+    /// unset, nothing answers.
     pub graphics_board: Option<BoardIdentity>,
 }
 
@@ -135,15 +114,9 @@ impl BoardIdentity {
     pub const FUEL: Self = Self { name: "IP34", part: "030-1707-003", revision: "-G" };
 }
 
-/// The CPU configuration an IP35 node board's EEPROM record carries beside
-/// its identity: the processor mode word and the processor and Hub clocks.
-/// At start-up the PROM checks the configuration block in its boot flash
-/// against these, and when a board record carries none it falls back to a
-/// table row chosen by the board word; a block that matches neither draws
-/// "CPU configuration values mismatch". The encoding is the one QEMU's L1
-/// gives the Tezro and Origin 350 boards, which the stock PROM 6.210
-/// accepts; no factory record has been read, so the bytes are a software
-/// input, not a capture.
+/// The mode word and clocks an IP35 node board's EEPROM record carries; the PROM checks its
+/// boot-flash block against them ("CPU configuration values from board EEPROM/PSC did not match").
+/// QEMU's L1 encoding, which PROM 6.210 accepts; no factory record was read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuContext {
     /// The full 32-bit mode word, as the configuration block holds it.
@@ -280,10 +253,8 @@ fn board(identity: BoardIdentity, serial: &str, mac: Option<[u8; 6]>, cpu: Optio
     b.extend_from_slice(&[1, 0]);
     ia_text(&mut b, "00");
     if let Some(cpu) = cpu {
-        // Format 2 and a one-byte binary 3 select the CPU fields: the Hub
-        // mode bits, Config0 to Config3, the Hub and CPU clocks in MHz and
-        // three minimum versions. Only Config0 and the clocks are known;
-        // the rest are empty fields, not zeros.
+        // Format 2 and a one-byte binary 3 select the CPU fields: mode bits, Config0 to 3, clocks,
+        // minimum versions. Only Config0 and the clocks are known; the rest are empty, not zero.
         b[0] = 2;
         b.extend_from_slice(&[1, 3, 0]);
         b.push(4);
@@ -589,10 +560,9 @@ impl State {
                 self.eeprom(channel, &a);
                 return;
             }
-            // Without a configured system serial it is the station address
-            // as twelve uppercase hexadecimal digits in address order, no
-            // separators or OUI added: the text the stock PROM converts
-            // straight back into the Ethernet address.
+            // Without a configured serial: the station address as twelve uppercase hex digits in
+            // address order, no separators or OUI, which the stock PROM converts straight back into
+            // the Ethernet address.
             8 => {
                 let serial = self.config.system_serial.clone().unwrap_or_else(|| {
                     self.config.mac.iter().map(|b| format!("{b:02X}")).collect()
@@ -607,9 +577,8 @@ impl State {
             0xa => values.extend([self.config.port_speed_first, self.config.attached.map_or(0, |brick| brick.type_code)]),
             // Zero: the PROM's partition check goes no further.
             0xb => values.push(0),
-            // Ports 1 to 4 of the attached bricks, a rack-and-bay word and a
-            // type letter each. Asked of an I/O brick's controller, it lists
-            // the C-brick that asked at port 1 and a G-brick at port 2.
+            // Ports 1 to 4 of the attached bricks, a rack-and-bay word and a type letter each. An
+            // I/O brick's controller lists the asking C-brick at port 1 and a G-brick at port 2.
             0xc => match attached {
                 Some(brick) => {
                     let named = |bay: u32| (self.config.rack << 6) | bay;

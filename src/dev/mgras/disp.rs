@@ -1,13 +1,15 @@
-//! Display side: the refresh thread (vertical retrace, then a frame
-//! snapshot and composition, see `frame`), host GL frame compositing, and
-//! PNG output.
+//! Display side: the board on the display refresh thread (vertical
+//! retrace, then a frame snapshot and composition, see `frame`), host GL
+//! frame compositing, and PNG output.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::dcb::Dcb;
+use super::pixmem::{Buffer, Kind, TILE_H};
 use super::rss::{self, Rss};
 use super::frame::{self, Frame};
+use crate::display::Mark;
 use super::{microcode, plain, Line, Mgras};
 
 /// The window ID a frame for the window at (`x`, `y`), `w` x `h` (screen
@@ -204,154 +206,281 @@ pub fn save_png(path: &str, frame: &[u32], width: usize, height: usize) -> Resul
     out.write_image_data(&rows).map_err(|e| e.to_string())
 }
 
-impl Mgras {
-    pub(super) fn refresh_loop(self: &Arc<Self>) {
-        let frame = std::time::Duration::from_micros(16_667);
-        {
-            let mut screen = self.screen.lock();
-            (screen.width, screen.height) = frame::DEFAULT_SIZE;
-            screen.fb_rgb.fill(0xFF00_0000);
-            screen.prebuilt = true;
-        }
-        let mut overlay = crate::debug_overlay::DebugOverlay::new();
-        let mut status_bar = crate::disp::StatusBar::new();
-        let mut sbtex = crate::disp::StatusBarTexture::new();
-        // Size the renderer was last given; the guest can change modes.
-        let mut shown = (0usize, 0usize);
-        let mut idle_frames = 0u32;
-        let mut shots = 0u32;
-        // Microcode fingerprints: checked every two seconds, logged once
-        // the same value is seen twice in a row and differs from the last
-        // one logged.
-        let mut microcode_seen = microcode::Fingerprints::default();
-        let mut microcode_logged = microcode::Fingerprints::default();
-        let mut frames = 0u32;
-        let mut last_rec_flush = std::time::Instant::now();
-        let mut snap = plain::boxed_zeroed::<Frame>();
+/// A buffer as a draw mark's store: its page pointer and its kind.
+pub(super) fn store_key(b: &Buffer) -> u64 {
+    b.ptr as u64 | ((b.kind == Kind::Overlay) as u64) << 16
+}
 
-        while self.running.load(Ordering::Relaxed) {
-            let start = std::time::Instant::now();
-            // Both queues: the HQ3's usually drains at once, and the backlog
-            // waits in front of the raster engines.
-            let stats = self.status.snapshot(start, self.hq_fifo.len() + self.rss_fifo.len());
-            if last_rec_flush.elapsed() >= std::time::Duration::from_millis(500) {
-                if let Some(rec) = self.mem_rec.lock().clone() {
-                    rec.lock().flush();
-                }
-                last_rec_flush = std::time::Instant::now();
+/// The planes of a pair word the display reads for buffer `b`: those its
+/// colour depends on.
+fn pair_planes(pair: rss::Pair, b: bool) -> u64 {
+    let shown = |w: u32| pair.unpack(w, b) & 0xFF_FFFF;
+    (0..32).filter(|i| shown(1 << i) != shown(0)).fold(0, |m, i| m | 1 << i)
+}
+
+/// Whether any drawing in `marks` (`Rss::drawn`) shows in the frame the
+/// display state describes: a mark shows when some pixel in its box
+/// belongs to a window ID whose displayed buffer is the page it drew in
+/// and reads a plane it could change. A double-buffered window's drawing
+/// goes to the buffer its window ID does not show (the other page, or the
+/// other half of the pixel pair), so it does not; the kernel's flip at the
+/// retrace changes the display state, which is damage of its own.
+pub(super) fn marks_show(marks: &[Mark], rss: &Rss, dcb: &Dcb) -> bool {
+    if marks.is_empty() {
+        return false;
+    }
+    let (w, h) = frame::display_size(dcb);
+    let (main, _) = frame::scanout_buffers(rss, dcb);
+    let back = Buffer::new(dcb.xmap.dib_pointers() >> 10, Kind::Wide, rss.reg(rss::reg::DRBSIZE));
+    let select = dcb.xmap.buf_select();
+    // Pages a displayed buffer runs over from its pointer: a buffer drawn
+    // at another pointer inside them shares memory with it.
+    let span = ((h.div_ceil(1 << main.yshift)).div_ceil(TILE_H) * main.xtiles as usize) as u32;
+    let near = |a: u32, b: u32| {
+        let d = a.wrapping_sub(b) & 0x3FF;
+        d < span || 0x400 - d < span
+    };
+    // Per window ID: the page its pixels are read from, and the planes.
+    let mut reads: [Option<(u32, u64)>; 32] = [None; 32];
+    let mut read = |did: usize| {
+        *reads[did].get_or_insert_with(|| {
+            let mode = frame::MainMode::of(dcb.xmap.main_mode(did as u32));
+            let b = select >> did & 1 != 0;
+            match mode.pair {
+                Some(pair) => (main.ptr, pair_planes(pair, b)),
+                None if !mode.rgb => (main.ptr, if b { 0xFFF000 } else { mode.index_mask as u64 }),
+                None if b => (back.ptr, 0xFF_FFFF),
+                None => (main.ptr, 0xFF_FFFF),
             }
-            self.trace_flush(false);
-            frames = frames.wrapping_add(1);
-            if frames % 120 == 0 {
-                let fp = self.microcode_fingerprints();
-                if fp.hq != 0 && fp == microcode_seen && fp != microcode_logged {
-                    eprintln!("impact: microcode {fp}");
-                    microcode_logged = fp;
-                }
-                microcode_seen = fp;
-            }
-            let dirty = self.dirty.swap(false, Ordering::AcqRel);
-            let shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-            // Someone reads `screen.rgba` (monitor screenshots, VNC): with
-            // the GPU scan-out, only then is a frame read back.
-            let want = self.frame_request.load(Ordering::Acquire) || self.capture.load(Ordering::Acquire) != 0;
-            idle_frames += 1;
-            // The window shares the GPU unit's device: compose there and
-            // present from there, every frame (cheap; the cursor and the
-            // last batches show without a dirty mark).
-            #[cfg(feature = "wgpu")]
-            let on_gpu = self.presents_on_gpu() && !shot && !want && self.renderer.lock().as_ref().is_some_and(|r| r.takes_gpu_frames());
-            #[cfg(not(feature = "wgpu"))]
-            let on_gpu = false;
-            #[cfg(feature = "wgpu")]
-            if on_gpu {
-                self.present_on_gpu(&mut shown, &mut overlay, &mut status_bar, &mut sbtex, &stats);
-            }
-            if !on_gpu && (dirty || shot || want || idle_frames >= 6) {
-                idle_frames = 0;
-                let mut screen = self.screen.lock();
-                if dirty || shot || want {
-                    let screen = &mut *screen;
-                    // The snapshot comes before this frame's retrace pulse:
-                    // the last retrace's updates (window-ID tables, swaps)
-                    // are in, and nothing draws into the front buffer now.
-                    // SAFETY: a read-only view of the framebuffer; tearing
-                    // tolerated.
-                    let rss = unsafe { &*self.rss.get() };
-                    crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
-                    let (w, h) = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
-                        Some(size) => size,
-                        None => {
-                            snap.snapshot(rss, &self.front_view().dcb);
-                            snap.compose(&mut screen.fb_rgb);
-                            (snap.width, snap.height)
-                        }
-                    };
-                    crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
-                    // The frame is already final RGB, so keep `rgba` (what CI
-                    // screenshots read) current without a renderer readback,
-                    // as GR2 does. This also makes screenshots work headless.
-                    for y in 0..h {
-                        let row = y * 2048;
-                        screen.rgba[row..row + w].copy_from_slice(&screen.fb_rgb[row..row + w]);
-                    }
-                    screen.frame_seq = screen.frame_seq.wrapping_add(1);
-                    screen.width = w;
-                    screen.height = h;
-                    screen.status_bar_only = false;
-                    self.frame_request.store(false, Ordering::Release);
-                } else {
-                    screen.status_bar_only = true;
-                }
-                if let Some(r) = self.renderer.lock().as_mut() {
-                    if shown != (screen.width, screen.height) {
-                        shown = (screen.width, screen.height);
-                        r.resize(shown.0, shown.1);
-                    }
-                    crate::pf_begin!(crate::perfetto::events::MGRAS_PRESENT);
-                    r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, shot, None, None);
-                    crate::pf_end!(crate::perfetto::events::MGRAS_PRESENT);
-                }
-                // The screenshot hotkey (Right Ctrl + Print Screen), as REX3
-                // and GR2 do: the frame just composed, written off-thread.
-                if shot {
-                    let (pixels, w, h) = (screen.fb_rgb.clone(), screen.width, screen.height);
-                    let path = format!("screenshot_{shots:04}.png");
-                    shots += 1;
-                    std::thread::spawn(move || match save_png(&path, &pixels, w, h) {
-                        Ok(()) => println!("iris: screenshot saved to {path}"),
-                        Err(e) => println!("iris: screenshot failed: {e}"),
-                    });
-                }
-            }
-            // Vertical retrace, after the frame is taken: scanout reads the
-            // front buffer during the frame, and the kernel's retrace
-            // handler flips buffers (XMAP buffer select) during the blank.
-            // Taken after the pulse, the snapshot raced the flip: the
-            // handler flips and the client starts its next frame in the
-            // buffer just shown, while the snapshot was still copying it
-            // (octahedra tore). Now a flip at this retrace shows from the
-            // next frame, as on the board.
-            self.begin_frame();
-            // Video timing chip display control bit 0: retrace interrupts.
-            let retrace = self.front_view().dcb.vc3.regs[0x1E] & 1 != 0;
-            // A pulse per frame. The handler acknowledges nothing on the
-            // board, so the line must drop again by itself.
-            if retrace {
-                crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
-                self.set_line(Line::Retrace, true);
-                std::thread::sleep(std::time::Duration::from_micros(500));
-                self.set_line(Line::Retrace, false);
-            }
-            if let Some(rest) = frame.checked_sub(start.elapsed()) {
-                std::thread::sleep(rest);
+        })
+    };
+    let mut runs = Vec::with_capacity(64);
+    let screen = crate::display::Rect::new(0, 0, w as i32 - 1, h as i32 - 1);
+    for m in marks {
+        if m.store >> 16 != 0 {
+            // The overlay planes: shown wherever they are on.
+            return true;
+        }
+        let ptr = m.store as u32 & 0x3FF;
+        let (on_main, on_back) = (ptr == main.ptr, ptr == back.ptr);
+        if (!on_main && near(ptr, main.ptr)) || (!on_back && select != 0 && near(ptr, back.ptr)) {
+            return true;
+        }
+        if !on_main && !on_back {
+            // Another buffer altogether (depth, a pbuffer).
+            continue;
+        }
+        let r = m.rect.intersect(&screen);
+        if r.is_empty() {
+            continue;
+        }
+        for fb_y in r.y0..=r.y1 {
+            // The screen's top row is framebuffer row height - 1.
+            dcb.vc3.main_did_runs(h - 1 - fb_y as usize, &mut runs);
+            // The window IDs the row shows over the mark's box: the runs
+            // that reach into it, not every pixel of the row.
+            if frame::for_each_did_in_row(&mut runs, r.x0 as usize, r.x1 as usize, |did| {
+                let (page, planes) = read(did as usize & 31);
+                page == ptr && planes & m.planes != 0
+            }) {
+                return true;
             }
         }
-        // The renderer's GL state belongs to this thread (its context is
-        // current here), so it is torn down here and nowhere else.
-        self.display_stop.finish(&self.renderer);
+    }
+    false
+}
+
+/// What the refresh thread keeps between its callbacks.
+pub(super) struct Scan {
+    /// The draw marks of the frame, taken by `changed`.
+    marks: Vec<Mark>,
+    /// The raster FIFO's consumed count at the last frame.
+    consumed: usize,
+    /// The frame `capture` took, for `compose`.
+    taken: Taken,
+    /// The retrace line is up.
+    retrace: bool,
+    frames: u32,
+    /// Microcode fingerprints: checked every two seconds, logged once the
+    /// same value is seen twice in a row and differs from the last one
+    /// logged.
+    microcode_seen: microcode::Fingerprints,
+    microcode_logged: microcode::Fingerprints,
+    last_rec_flush: std::time::Instant,
+}
+
+enum Taken {
+    None,
+    /// Nothing to take: `compose` reads the pixel pages themselves.
+    Pages,
+    /// Composed on the GPU and read back into `screen.fb_rgb`.
+    Read(usize, usize),
+    /// Composed on the GPU, for a renderer on the same device.
+    #[cfg(feature = "wgpu")]
+    Gpu(::wgpu::Buffer, u32, u32),
+}
+
+impl Scan {
+    pub(super) fn new() -> Self {
+        Scan {
+            marks: Vec::new(),
+            consumed: 0,
+            taken: Taken::None,
+            retrace: false,
+            frames: 0,
+            microcode_seen: Default::default(),
+            microcode_logged: Default::default(),
+            last_rec_flush: std::time::Instant::now(),
+        }
+    }
+}
+
+impl crate::display::Head for Mgras {
+    /// Whether the raster engines drew into something the screen shows
+    /// (`marks_show`), or are in the middle of something long; the display
+    /// state's own changes are the head's damage. With the wgpu window on the GPU unit's device the frame is
+    /// composed and presented there every frame (cheap; the cursor and the
+    /// last batches show without a mark).
+    fn changed(&self) -> bool {
+        let mut scan = self.scan.lock();
+        let any = self.marks.take(&mut scan.marks);
+        // A command marks when it is done. One that has kept the engines
+        // for a whole frame (the X server's full-screen fills take several)
+        // is shown as far as it has got, as the board's scan-out would.
+        let consumed = self.rss_fifo.consumed();
+        let held = consumed == scan.consumed && self.rss_fifo.len() != 0;
+        scan.consumed = consumed;
+        if any || held || (self.presents_on_gpu() && self.head.want().gpu) {
+            return true;
+        }
+        // SAFETY: a read of one register (the buffers' size), racing the
+        // engines as the frame's snapshot does.
+        let rss = unsafe { &*self.rss.get() };
+        marks_show(&scan.marks, rss, &self.front_view().dcb)
     }
 
+    /// The frame is made after the blank: the kernel's retrace handler has
+    /// flipped buffers (XMAP buffer select) and updated the window-ID
+    /// tables, and the client draws its next frame in the buffer that is
+    /// not shown. On the CPU there is nothing to take first: `compose`
+    /// reads the pixel pages and the display state as they are, before the
+    /// next retrace can change either. With the GPU unit the frame is
+    /// composed there, here.
+    fn capture(&self, screen: &mut crate::disp::Rex3Screen, want: crate::display::Want) -> bool {
+        let mut scan = self.scan.lock();
+        // SAFETY: a read-only view of the framebuffer; tearing tolerated.
+        let rss = unsafe { &*self.rss.get() };
+        crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
+        scan.taken = Taken::None;
+        #[cfg(feature = "wgpu")]
+        if want.gpu && self.presents_on_gpu() {
+            // SAFETY: the scan-out is the refresh thread's; the registers
+            // and the DCB are read racily, as the CPU snapshot reads them.
+            if let Some(sc) = (unsafe { &mut *self.gpu_scanout.get() }).as_mut() {
+                match sc.compose(rss, &self.front_view().dcb) {
+                    Ok((buffer, w, h)) => {
+                        self.gpu_frames[0].fetch_add(1, Ordering::Relaxed);
+                        scan.taken = Taken::Gpu(buffer, w, h);
+                    }
+                    Err(e) => self.fail_gpu("scan-out compose", e),
+                }
+            }
+        }
+        let _ = want;
+        if self.gpu_failed() {
+            crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
+            return false;
+        }
+        if matches!(scan.taken, Taken::None) {
+            scan.taken = match self.compose_gpu_into(rss, &mut screen.fb_rgb) {
+                Some((w, h)) => Taken::Read(w, h),
+                None if self.gpu_failed() => {
+                    crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
+                    return false;
+                }
+                None => Taken::Pages,
+            };
+        }
+        crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
+        true
+    }
+
+    fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        self.begin_frame();
+        // The refresh rate is the guest's: the VC3's totals and the DAC's
+        // pixel clock, decoded when the display bus was written. A timing
+        // the thread cannot run (tables half loaded) leaves the last one.
+        if self.timing_stale.swap(false, Ordering::AcqRel) {
+            if let Some(timing) = self.front_view().dcb.video_timing() {
+                self.head.set_timing(timing);
+            }
+        }
+        // Video timing chip display control bit 0: retrace interrupts. The
+        // handler acknowledges nothing on the board, so the line drops
+        // again by itself, at the end of the blank.
+        if self.front_view().dcb.vc3.regs[0x1E] & 1 != 0 {
+            crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
+            self.scan.lock().retrace = true;
+            self.set_line(Line::Retrace, true);
+        }
+    }
+
+    fn vblank_end(&self, _field: u32, _t_ns: u64) {
+        let mut scan = self.scan.lock();
+        if std::mem::take(&mut scan.retrace) {
+            self.set_line(Line::Retrace, false);
+        }
+        if scan.last_rec_flush.elapsed() >= std::time::Duration::from_millis(500) {
+            if let Some(rec) = self.mem_rec.lock().clone() {
+                rec.lock().flush();
+            }
+            scan.last_rec_flush = std::time::Instant::now();
+        }
+        self.trace_flush(false);
+        scan.frames = scan.frames.wrapping_add(1);
+        if scan.frames % 120 == 0 {
+            let fp = self.microcode_fingerprints();
+            if fp.hq != 0 && fp == scan.microcode_seen && fp != scan.microcode_logged {
+                eprintln!("impact: microcode {fp}");
+                scan.microcode_logged = fp;
+            }
+            scan.microcode_seen = fp;
+        }
+    }
+
+    fn compose(&self, screen: &mut crate::disp::Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
+        use crate::display::Composed;
+        let mut scan = self.scan.lock();
+        screen.prebuilt = true;
+        match std::mem::replace(&mut scan.taken, Taken::None) {
+            Taken::None => Composed::Unchanged,
+            Taken::Pages => {
+                // SAFETY: a read-only view of the framebuffer, read while
+                // the engines draw, as the board's scan-out reads it.
+                let rss = unsafe { &*self.rss.get() };
+                (screen.width, screen.height) = frame::compose_direct(rss, &self.front_view().dcb, &mut screen.fb_rgb);
+                Composed::Frame
+            }
+            Taken::Read(w, h) => {
+                (screen.width, screen.height) = (w, h);
+                Composed::Frame
+            }
+            #[cfg(feature = "wgpu")]
+            Taken::Gpu(frame, width, height) => {
+                (screen.width, screen.height) = (width as usize, height as usize);
+                Composed::Gpu { frame, width, height }
+            }
+        }
+    }
+
+    /// Both queues: the HQ3's usually drains at once, and the backlog waits
+    /// in front of the raster engines.
+    fn gfifo_pending(&self) -> usize {
+        self.hq_fifo.len() + self.rss_fifo.len()
+    }
+}
+
+impl Mgras {
     /// With the GPU unit: compose the displayed frame on the GPU and read
     /// it back into `out` (`frame.rs`'s layout); its size. None on the CPU
     /// raster path, or if the scan-out fails (the planes are then composed
@@ -367,79 +496,151 @@ impl Mgras {
                     self.gpu_frames[1].fetch_add(1, Ordering::Relaxed);
                     return Some(size);
                 }
-                Err(e) => eprintln!("mgras: GPU scan-out: {e}"),
+                Err(e) => self.fail_gpu("scan-out readback", e),
             }
         }
         let _ = (rss, out);
         None
     }
 
-    /// One frame composed on the GPU and presented from there by a renderer
-    /// on the same device: nothing is read back. `screen.rgba` keeps its
-    /// last frame.
-    #[cfg(feature = "wgpu")]
-    fn present_on_gpu(
-        &self,
-        shown: &mut (usize, usize),
-        overlay: &mut crate::debug_overlay::DebugOverlay,
-        status_bar: &mut crate::disp::StatusBar,
-        sbtex: &mut crate::disp::StatusBarTexture,
-        stats: &crate::disp::BarStats,
-    ) {
-        // SAFETY: the scan-out is the display thread's; the registers and
-        // the DCB are read racily, as the CPU snapshot reads them.
-        let Some(sc) = (unsafe { &mut *self.gpu_scanout.get() }).as_mut() else { return };
-        let rss = unsafe { &*self.rss.get() };
-        crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
-        let composed = sc.compose(rss, &self.front_view().dcb);
-        crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
-        let (buffer, w, h) = match composed {
-            Ok(f) => {
-                self.gpu_frames[0].fetch_add(1, Ordering::Relaxed);
-                f
-            }
-            Err(e) => {
-                eprintln!("mgras: GPU scan-out: {e}");
-                return;
-            }
-        };
-        let mut screen = self.screen.lock();
-        screen.width = w as usize;
-        screen.height = h as usize;
-        screen.prebuilt = true;
-        screen.status_bar_only = false;
-        if let Some(r) = self.renderer.lock().as_mut() {
-            if *shown != (w as usize, h as usize) {
-                *shown = (w as usize, h as usize);
-                r.resize(shown.0, shown.1);
-            }
-            crate::pf_begin!(crate::perfetto::events::MGRAS_PRESENT);
-            r.present_gpu_frame(&buffer, w, h, &mut screen, overlay, status_bar, sbtex, stats);
-            crate::pf_end!(crate::perfetto::events::MGRAS_PRESENT);
-        }
-    }
-
-    /// Start the engines and the display refresh thread.    /// Start the engines and the display refresh thread.
+    /// Start the engines and the display.
     pub fn start_display(self: &Arc<Self>) {
         self.start_engines();
         if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
-        let me = Arc::clone(self);
-        *self.refresh.lock() = Some(
-            std::thread::Builder::new()
-                .name("MGRAS-Refresh".into())
-                .spawn(move || me.refresh_loop())
-                .expect("spawn MGRAS refresh thread"),
-        );
+        {
+            let mut screen = self.head.screen().lock();
+            (screen.width, screen.height) = frame::DEFAULT_SIZE;
+            screen.fb_rgb.fill(0xFF00_0000);
+            screen.prebuilt = true;
+        }
+        self.head.start();
     }
 
     pub fn stop_display(&self) {
-        self.display_stop.request();
+        // The renderer's GL state belongs to the refresh thread (its
+        // context is current there), which lets go of it here.
+        self.head.stop();
         self.running.store(false, Ordering::Release);
-        if let Some(h) = self.refresh.lock().take() {
-            let _ = h.join();
-        }
         self.stop_engines();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::rss::reg;
+    use crate::display::{Marks, Rect};
+
+    /// A 1024x768 screen (two raster engines, a buffer 144 pages) of
+    /// window ID 0 with window ID `did` at (100, 100)-(299, 299), buffer A
+    /// at page 0x1C0 and B at 0x2E0.
+    fn screen(did: u8, mode: u32, select: u32) -> (Box<Rss>, Box<Dcb>) {
+        let mut r = Rss::new_boxed();
+        r.write(reg::DRBSIZE, 0x9000_025A, false);
+        r.write(reg::DRBPOINTERS, 0x1C0 | 0x2E0 << 10, false);
+        let mut dcb = plain::boxed_zeroed::<Dcb>();
+        dcb.xmap.set_modes(0, 0x15, 0);
+        dcb.xmap.set_modes(did as u32, mode, 0);
+        dcb.xmap.set_scanout(select, 0x1C0 | 0x2E0 << 10 | 0x40 << 20, 0);
+        let vc3 = &mut dcb.vc3;
+        vc3.regs[4] = 0;
+        // Line tables: the desktop alone, and with the window across it.
+        vc3.sram[0x2000] = 0;
+        vc3.sram[0x2001] = 0x7FF << 5;
+        vc3.sram[0x2040] = 0;
+        vc3.sram[0x2041] = 100 << 5 | did as u16;
+        vc3.sram[0x2042] = 300 << 5;
+        vc3.sram[0x2043] = 0x7FF << 5;
+        for y in 0..768 {
+            vc3.sram[y] = if (100..300).contains(&y) { 0x2040 } else { 0x2000 };
+        }
+        vc3.sram[768] = 0xFFFF;
+        (r, dcb)
+    }
+
+    /// The marks of a primitive under fill mode `pp1` clipped to display
+    /// box (x0, y0)-(x1, y1), and whether they show.
+    fn drawn_shows(r: &mut Rss, dcb: &Dcb, pp1: u32, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> bool {
+        r.write(reg::PP1FILLMODE, pp1, false);
+        r.write(reg::CLIP_MODE, 0x11, false);
+        r.write(reg::CLIP_X, x0 << 16 | x1, false);
+        // The screen's top row is framebuffer row 767.
+        r.write(reg::CLIP_Y, (767 - y1) << 16 | (767 - y0), false);
+        let marks = Marks::new();
+        r.drawn(|b, planes, rect| marks.mark(store_key(&b), planes, rect));
+        let mut taken = Vec::new();
+        assert!(!marks.take(&mut taken));
+        marks_show(&taken, r, dcb)
+    }
+
+    const WINDOW: (u32, u32, u32, u32) = (100, 100, 299, 299);
+
+    #[test]
+    fn a_24_bit_window_s_back_page_does_not_show() {
+        // RGBA8888 through all planes; draw field 1 is page A, 4 page B.
+        let (a, b, both) = (0x200 | 1 << 14, 0x200 | 4 << 14, 0x200 | 5 << 14);
+        let (mut r, dcb) = screen(5, 0x15, 0);
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKLSBSB, u32::MAX, false);
+        assert!(drawn_shows(&mut r, &dcb, a, WINDOW), "the window shows A");
+        assert!(!drawn_shows(&mut r, &dcb, b, WINDOW), "B is its back buffer");
+        assert!(drawn_shows(&mut r, &dcb, both, WINDOW));
+        // A box one pixel into the desktop is still only B there.
+        assert!(!drawn_shows(&mut r, &dcb, b, (99, 100, 300, 300)));
+        let (mut r, dcb) = screen(5, 0x15, 1 << 5);
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKLSBSB, u32::MAX, false);
+        assert!(drawn_shows(&mut r, &dcb, b, WINDOW), "after the flip the window shows B");
+        assert!(!drawn_shows(&mut r, &dcb, a, WINDOW));
+        assert!(drawn_shows(&mut r, &dcb, a, (99, 100, 299, 299)), "the desktop beside it shows A");
+        assert!(!drawn_shows(&mut r, &dcb, b, (400, 400, 500, 500)), "the desktop never shows B");
+    }
+
+    #[test]
+    fn a_pair_window_s_other_half_does_not_show() {
+        // 5:5:5 pairs on one page: the plane mask picks the half.
+        let (a, b) = (0x100 | 1 << 14, 0x100 | 2 << 14);
+        for select in [0, 1 << 7] {
+            let (mut r, mut dcb) = screen(7, 7, select);
+            // One page for both, as a HighImpact at 1280x1024 has it.
+            r.write(reg::DRBSIZE, 0x9000_031A, false);
+            dcb.xmap.set_scanout(select, 0x240 | 0x240 << 10 | 0x40 << 20, 0);
+            r.write(reg::DRBPOINTERS, 0x240 | 0x240 << 10, false);
+            r.write(reg::COLORMASKLSBSA, 0x4000_7FFF, false);
+            r.write(reg::COLORMASKLSBSB, 0xBFFF_8000, false);
+            let shows_b = select != 0;
+            assert_eq!(drawn_shows(&mut r, &dcb, a, WINDOW), !shows_b, "select {select:#x}: half A");
+            assert_eq!(drawn_shows(&mut r, &dcb, b, WINDOW), shows_b, "select {select:#x}: half B");
+            // Alpha alone is in neither half's colour.
+            r.write(reg::COLORMASKLSBSA, 0x4000_0000, false);
+            assert!(!drawn_shows(&mut r, &dcb, a, WINDOW));
+        }
+    }
+
+    #[test]
+    fn overlay_drawing_and_shared_pages_always_show() {
+        let (mut r, dcb) = screen(5, 0x15, 0);
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        assert!(drawn_shows(&mut r, &dcb, 0x200 | 0x4F << 14, WINDOW), "the overlay planes");
+        // A buffer three pages into A shares its memory.
+        r.write(reg::DRBPOINTERS, 0x1C3, false);
+        assert!(drawn_shows(&mut r, &dcb, 0x200 | 1 << 14, WINDOW));
+        // One clear of both (a depth buffer's pages) does not.
+        r.write(reg::DRBPOINTERS, 0x100, false);
+        assert!(!drawn_shows(&mut r, &dcb, 0x200 | 1 << 14, WINDOW));
+        // Clip-ID drawing is in no frame.
+        r.write(reg::DRBPOINTERS, 0x1C0, false);
+        assert!(!drawn_shows(&mut r, &dcb, 0x200 | 0x50 << 14, WINDOW));
+        // No screen mask: the whole screen, where the desktop shows A.
+        r.write(reg::PP1FILLMODE, 0x200 | 1 << 14, false);
+        r.write(reg::CLIP_MODE, 0, false);
+        let marks = Marks::new();
+        r.drawn(|b, planes, rect| marks.mark(store_key(&b), planes, rect));
+        let mut taken = Vec::new();
+        marks.take(&mut taken);
+        assert_eq!(taken[0].rect, Rect::new(0, 0, rss::WIDTH as i32 - 1, rss::HEIGHT as i32 - 1));
+        assert!(marks_show(&taken, &r, &dcb));
     }
 }

@@ -8,8 +8,8 @@ the first. Two C-bricks are joined by a direct NUMAlink cable with no router.
 
 ## Configuration
 
-Select `machine.profile = "origin3200_ip35"` and give the PROM payload as for
-the [Fuel](fuel-ip34.md). `[origin3200]` takes `c_bricks` (1 or 2), `flash`,
+Select `machine.profile = "origin3200_ip35"`. The IP35 PROM 6.210 is built
+in; `prom` overrides it as on the [Fuel](fuel-ip34.md). `[origin3200]` takes `c_bricks` (1 or 2), `flash`,
 `console`, `l1_port`, `l1_log`, `l1_revision` and `brick_serial`; see
 [FEATURES.md](../FEATURES.md#origin3200). `banks` is per C-brick: left unset it
 is two 256 MiB banks. Banks of 256 or 512 MiB are accepted, up to eight, in pairs of one size.
@@ -25,7 +25,7 @@ three power cycles for each.
 
 ## The I-brick
 
-The I-brick is data (`IBRICK` in `src/ip35_machine/origin3200.rs`): an XBridge
+The I-brick is data (`IBRICK` in `src/ip35_machine.rs`): an XBridge
 whose heads E and F are widgets 14 and 15, host port A (widget 10) cabled to the
 first C-brick, and on head F's bus (the IO7) a Fibre Channel adapter at device 1,
 the IOC3 at device 4 and the USB controller at device 5. The controller's two
@@ -69,7 +69,8 @@ BASEIO` and carries on.
   letter and serves every other request as its own.
 - The IO7's IOC3 is the Fuel's with the placeholder subsystem id `0xffff`;
   the clock part is unidentified and is the Fuel's M48T35-compatible one.
-- A reset or power request from either node resets the whole machine.
+- A reset or a power cycle requested from either node resets the whole
+  machine; only a shutdown (`halt -p` in IRIX) powers it off.
 - No cache coherence runs between the nodes; both see the same host memory.
 - A cached reference to the reset PROM's address window always stays on the
   node. A 512 MiB bank among 0 to 3 covers that window, so the processor

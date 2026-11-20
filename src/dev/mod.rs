@@ -1,7 +1,11 @@
-//! Emulated hardware. Graphics boards get a directory each (GR2, Newport,
-//! IMPACT); the rest of the system's devices sit here as single files.
+//! Emulated hardware. Each graphics board has a directory (GR2 `gr2`,
+//! Newport `ng1`, IMPACT `mgras`, VPro `odyssey`, InfiniteReality `kona`).
+//! A device too large for one file has one too, its module beside it or
+//! inside (`ioc3`, `virtio`, `nvme`, `bcm5701`, `bedrock`, `xbridge`, the
+//! QLogic adapters and others); the rest sit here as single files.
 
 pub mod aic7880;
+pub mod audio_dump;
 pub mod crime_mem;
 pub mod o2gfx;
 pub mod o2gfx_trace;
@@ -13,6 +17,7 @@ pub mod mace_audio;
 pub mod mace_isa;
 pub mod crime;
 pub mod battery_clock;
+pub mod chip_clock;
 pub mod deadline_timers;
 pub mod deadline;
 pub mod ds1685;
@@ -83,6 +88,8 @@ pub mod wd33c93a;
 pub mod z85c30;
 pub mod baseio_flash;
 pub mod node_flash;
+#[macro_use]
+mod reg_defs;
 pub mod hub;
 pub mod pi_gfx;
 pub mod dp83840;
@@ -98,6 +105,7 @@ pub mod pic;
 pub mod pxbow;
 pub mod prom_image;
 pub mod timekeeper;
+pub mod widths;
 pub mod xbridge;
 #[cfg(test)]
 mod xtalk_test_doubles;

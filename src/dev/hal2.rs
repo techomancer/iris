@@ -1,3 +1,16 @@
+//! HAL2, the Indy's and Indigo2's audio ASIC, behind HPC3's PBUS: its
+//! direct and indirect registers, the three Bresenham clock generators, and
+//! the DMA engines of codec A, codec B and the AES transmitter and receiver.
+//!
+//! Each running engine is paced by a recurring `hptimer` callback
+//! (`PACE_PERIOD`) that moves the frames the wall clock says are due, with
+//! bounded catch-up. Codec A plays to the host through
+//! [`crate::host_audio`], scaled by the CS4216's mute and DAC attenuators
+//! and by the 8-bit MDAC volume registers HPC3 forwards
+//! ([`Hal2::set_volume_left`], [`Hal2::set_volume_right`]). Codec B records
+//! silence and the AES pair loops back; neither reaches the host.
+//! `docs/dev/hal2.md` and `docs/dev/cs4216.md` describe the registers.
+
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7,7 +20,8 @@ use std::io::Write;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
 use crate::config::{AudioConfig, AudioHost};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
-use crate::host_audio::Output as AudioOut;
+use crate::dev::audio_dump::AudioDump;
+use crate::host_audio::{Meter, Output as AudioOut, Skip};
 
 // HAL2 Register Offsets (relative to 0x1FBD8000)
 pub const HAL2_ISR: u32 = 0x10; // Interrupt Status Register
@@ -176,11 +190,13 @@ struct Pacer {
     start: Instant,
     rate: u64,
     done: u64,
+    /// Frames of stalls `due` has skipped, until the caller takes them.
+    skipped: u64,
 }
 
 impl Pacer {
     fn new(rate: u32) -> Self {
-        Self { start: Instant::now(), rate: rate as u64, done: 0 }
+        Self { start: Instant::now(), rate: rate as u64, done: 0, skipped: 0 }
     }
 
     /// Frames to move now, counting them as done: what the wall clock says is
@@ -194,12 +210,17 @@ impl Pacer {
     /// 18 ms chunks. A late wake now moves at most PACE_CATCHUP times a
     /// period's frames and the backlog drains over the next wakes.
     fn due(&mut self) -> u64 {
-        let elapsed = self.start.elapsed();
+        self.due_at(self.start.elapsed())
+    }
+
+    /// [`Pacer::due`] with `elapsed` as the time since the start.
+    fn due_at(&mut self, elapsed: Duration) -> u64 {
         let target = (elapsed.as_nanos() as u64).saturating_mul(self.rate) / 1_000_000_000;
         let backlog = target.saturating_sub(self.done);
         let max_backlog = self.rate * PACE_MAX_BACKLOG.as_millis() as u64 / 1000;
         if backlog > max_backlog {
             // Skip the stall rather than replay it.
+            self.skipped += target - max_backlog - self.done;
             self.done = target - max_backlog;
         }
         let per_period = (self.rate * PACE_PERIOD.as_micros() as u64).div_ceil(1_000_000);
@@ -207,6 +228,10 @@ impl Pacer {
         let due = target.saturating_sub(self.done).min(cap);
         self.done += due;
         due
+    }
+
+    fn take_skipped(&mut self) -> u64 {
+        std::mem::take(&mut self.skipped)
     }
 
     /// Frames `due` handed out but not moved after all: still due.
@@ -224,26 +249,15 @@ struct CodecAState {
     out: Option<AudioOut>,
     nonzero_seen: bool,
     timer_id: Option<TimerId>,
-    /// The DMA channel the armed timer reads, and what it has done since
-    /// it was armed: callbacks, frames read, reads that found no data.
-    armed_ch: Option<usize>,
-    calls: u64,
-    frames: u64,
-    dry_reads: u64,
 }
 
 impl CodecAState {
     fn new() -> Self {
-        Self { out: None, nonzero_seen: false, timer_id: None,
-               armed_ch: None, calls: 0, frames: 0, dry_reads: 0 }
+        Self { out: None, nonzero_seen: false, timer_id: None }
     }
     fn reset_audio(&mut self) {
         // Keep `out` — stream stays open.  Just reset codec-side state.
         self.nonzero_seen = false;
-        self.armed_ch = None;
-        self.calls = 0;
-        self.frames = 0;
-        self.dry_reads = 0;
         // The DAC has stopped: what is queued plays out, and the silence
         // after it is not an underrun.
         if let Some(o) = &mut self.out {
@@ -272,9 +286,6 @@ struct Hal2State {
     isr: u16,
     iar: u16,
     idr: [u16; 4],
-    /// The last indirect accesses (IAR, then IDR0..3 as they stood), for
-    /// `hal2 status`.
-    iar_log: std::collections::VecDeque<(u16, [u16; 4])>,
 
     // Internal Registers
     // ctrl[0] = CTRL1 (IDR0), ctrl[1] = CTRL2 IDR0, ctrl[2] = CTRL2 IDR1
@@ -367,6 +378,11 @@ pub struct Hal2 {
     ar_state: Arc<Mutex<AesRxState>>,
     // [audio]: which host to play through, and its buffer size.
     audio: AudioConfig,
+    /// What codec A moved and skipped (`audio status`); codec B is not counted.
+    meter: Arc<Meter>,
+    /// IRIS_AUDIO_DUMP=<file>: the frames codec A reads, at its rate, before
+    /// its volume (see `audio_dump`).
+    dump: Option<Arc<AudioDump>>,
 }
 
 /// The rate codec A's stream opens at, until the guest programs one.
@@ -386,7 +402,6 @@ impl Hal2 {
                 isr: 0,
                 iar: 0,
                 idr: [0; 4],
-                iar_log: std::collections::VecDeque::new(),
                 codeca_ctrl: [0; 3],
                 codecb_ctrl: [0; 3],
                 aestx_ctrl: [0; 3],
@@ -409,6 +424,8 @@ impl Hal2 {
             at_state: Arc::new(Mutex::new(AesTxState { timer_id: None })),
             ar_state: Arc::new(Mutex::new(AesRxState { loopback: std::collections::VecDeque::new(), timer_id: None })),
             audio,
+            meter: Meter::new("HAL2", &["analog out"]),
+            dump: AudioDump::from_env(),
         }
     }
 
@@ -498,12 +515,15 @@ impl Hal2 {
         let state = self.state.clone();
         let ca_state = self.ca_state.clone();
         let mut pacer = Pacer::new(pitch_rate);
-        // The frames one wake moves, kept between wakes.
+        let meter = self.meter.clone();
+        let dump = self.dump.clone();
+        // The frames one wake moves, kept between wakes: for the host, and as read.
         let mut pcm: Vec<i16> = Vec::new();
+        let mut raw: Vec<(i16, i16)> = Vec::new();
 
-        self.ca_state.lock().armed_ch = Some(dma_ch);
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
             let mut due = pacer.due();
+            meter.skipped(0, Skip::Stale, pacer.take_skipped());
             // Keep within READ_AHEAD_MS of the position the guest last polled
             // (see READ_AHEAD_MS); the rest stays due for the next wake.
             if let Some(ahead_words) = dma_client.read_ahead_of_poll() {
@@ -521,31 +541,31 @@ impl Hal2 {
             crate::pf_scope!(crate::perfetto::events::HAL2_PACE, due);
             let (gain_l, gain_r) = state.lock().output_gains();
             let mut st = ca_state.lock();
-            st.calls += 1;
 
-            // No audio output — still drain DMA so the kernel doesn't hang
-            // waiting for PDMA_CTRL_ACT to clear.
-            if st.out.is_none() {
-                for _ in 0..due {
-                    let _ = read_frame_from(&dma_client, mode);
-                }
-                return TimerReturn::Continue;
-            }
-
+            // Read the channel even with no host output, so the kernel's
+            // PDMA_CTRL_ACT wait clears.
             pcm.clear();
+            raw.clear();
+            let mut got = 0;
             for _ in 0..due {
-                match read_frame_from(&dma_client, mode) {
-                    Some((l, r)) => {
-                        st.frames += 1;
-                        if !st.nonzero_seen && (l != 0 || r != 0) {
-                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
-                            st.nonzero_seen = true;
-                        }
-                        pcm.push(scale_sample(l, gain_l));
-                        pcm.push(scale_sample(r, gain_r));
+                if let Some((l, r)) = read_frame_from(&dma_client, mode) {
+                    got += 1;
+                    if dump.is_some() {
+                        raw.push((l, r));
                     }
-                    None => st.dry_reads += 1,
+                    if st.out.is_none() { continue; }
+                    if !st.nonzero_seen && (l != 0 || r != 0) {
+                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
+                        st.nonzero_seen = true;
+                    }
+                    pcm.push(scale_sample(l, gain_l));
+                    pcm.push(scale_sample(r, gain_r));
                 }
+            }
+            meter.add(0, got);
+            meter.skipped(0, Skip::Dry, due - got);
+            if let Some(d) = dump.as_ref() {
+                d.record(0, pitch_rate, raw.iter().copied());
             }
             if let Some(o) = st.out.as_mut() {
                 if o.rate() != pitch_rate {
@@ -778,11 +798,6 @@ impl Hal2 {
     fn handle_iar_write(&self, val: u16) {
         let mut state = self.state.lock();
         state.iar = val;
-        let idr = state.idr;
-        if state.iar_log.len() == 32 {
-            state.iar_log.pop_front();
-        }
-        state.iar_log.push_back((val, idr));
 
         let is_read  = (val & IAR_ACCESS_READ) != 0;
         let typ      = val & IAR_TYPE_MASK;
@@ -1126,113 +1141,16 @@ impl Device for Hal2 {
 
     fn get_clock(&self) -> u64 { 0 }
 
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("hal2".to_string(), "HAL2 commands: hal2 status".to_string())]
-    }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
-        if cmd != "hal2" { return Err("Command not found".to_string()); }
-
-        match args.first().map(|s| *s) {
-            Some("status") => {
-                let s = self.state.lock();
-
-                writeln!(writer, "ISR: 0x{:04x}  global_reset_n={} codec_reset_n={} codec_mode={}",
-                    s.isr,
-                    (s.isr & isr::GLOBAL_RESET_N as u16 != 0) as u8,
-                    (s.isr & isr::CODEC_RESET_N  as u16 != 0) as u8,
-                    if s.isr & isr::CODEC_MODE as u16 != 0 { "quad" } else { "indigo" },
-                ).unwrap();
-
-                writeln!(writer, "DMA enable: 0x{:02x}  codeca={} codecb={} aes_tx={} aes_rx={}",
-                    s.dma_enable,
-                    (s.dma_enable & DMA_EN_CODECA != 0) as u8,
-                    (s.dma_enable & DMA_EN_CODECB != 0) as u8,
-                    (s.dma_enable & DMA_EN_AES_TX != 0) as u8,
-                    (s.dma_enable & DMA_EN_AES_RX != 0) as u8,
-                ).unwrap();
-                // dma_drive uses physical HPC3 channel bits (bit N = PBUS channel N)
-                writeln!(writer, "DMA drive:  0x{:02x}  (physical HPC3 channel bitmask)", s.dma_drive).unwrap();
-
-                for i in 0..3 {
-                    let master = if s.bres_clock_sel[i] == 0 { 48000u32 } else { 44100 };
-                    writeln!(writer, "BRES{}: sel={} ({} Hz master)  inc={}  modctrl={}  → {}Hz",
-                        i + 1, s.bres_clock_sel[i], master,
-                        s.bres_clock_inc[i], s.bres_clock_modctrl[i],
-                        s.bres_clock_rate[i],
-                    ).unwrap();
-                }
-
-                let mode_str = |m| match m { 1 => "mono", 2 => "stereo", 3 => "quad", _ => "off" };
-                // bres=0 means CLKID 0: no generator selected.
-
-                let (ca_ch, ca_clk, ca_mode) = s.codeca_cfg();
-                let mute = (s.codeca_ctrl[1] & CODECA_CTRL2_MUTE) != 0;
-                let la = (s.codeca_ctrl[2] >> CODECA_CTRL2_LA_SHIFT) & CODECA_CTRL2_ATTEN_MASK;
-                let ra = (s.codeca_ctrl[2] >> CODECA_CTRL2_RA_SHIFT) & CODECA_CTRL2_ATTEN_MASK;
-                writeln!(writer, "Codec A: ch={} bres={} rate={}Hz mode={}",
-                    ca_ch, ca_clk, s.bres_rate(ca_clk), mode_str(ca_mode)).unwrap();
-                writeln!(writer, "  ctrl1=0x{:04x} ctrl2=[0x{:04x} 0x{:04x}] mute={} atten_l=-{:.1}dB atten_r=-{:.1}dB",
-                    s.codeca_ctrl[0], s.codeca_ctrl[1], s.codeca_ctrl[2],
-                    mute as u8, la as f32 * 1.5, ra as f32 * 1.5).unwrap();
-                writeln!(writer, "Volume (MDAC): left=0x{:02x} ({}) right=0x{:02x} ({})",
-                    s.vol_left, s.vol_left, s.vol_right, s.vol_right).unwrap();
-
-                let (cb_ch, cb_clk, cb_mode) = s.codecb_cfg();
-                writeln!(writer, "Codec B: ch={} bres={} rate={}Hz mode={}",
-                    cb_ch, cb_clk, s.bres_rate(cb_clk), mode_str(cb_mode)).unwrap();
-
-                let (at_ch, at_clk, _) = s.aestx_cfg();
-                let (ar_ch, ar_clk, _) = s.aesrx_cfg();
-                writeln!(writer, "AES TX: ch={} bres={} rate={}Hz", at_ch, at_clk, s.bres_rate(at_clk)).unwrap();
-                writeln!(writer, "AES RX: ch={} bres={} rate={}Hz", ar_ch, ar_clk, s.bres_rate(ar_clk)).unwrap();
-                drop(s);
-
-                let ca = self.ca_state.lock();
-                match ca.out.as_ref() {
-                    Some(o) => {
-                        let st = o.stats();
-                        writeln!(writer, "Codec A out: {}  guest rate: {}Hz  device: {}  timer: {}",
-                            o.device().unwrap_or_default(),
-                            o.rate(),
-                            st.device.map_or("-".to_string(), |d| format!("{}Hz x{}", d.rate, d.channels)),
-                            ca.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id)),
-                        ).unwrap();
-                        writeln!(writer, "Host stream: {}  queued {:.1} ms  device delay {}  adjust {:+.3}%  underruns {}  overruns {}  dropped {}",
-                            if st.playing { "playing" } else { "waiting" },
-                            st.queued.as_secs_f64() * 1e3,
-                            st.device_delay.map_or("?".to_string(), |d| format!("{:.1} ms", d.as_secs_f64() * 1e3)),
-                            st.adjust * 100.0, st.underruns, st.overruns, st.dropped,
-                        ).unwrap();
-                    }
-                    None => writeln!(writer, "Codec A out: none  timer: {}",
-                        ca.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id))).unwrap(),
-                }
-                writeln!(writer, "Codec A timer: reads ch={}  calls={}  frames={}  dry reads={}",
-                    ca.armed_ch.map_or("-".to_string(), |c| c.to_string()), ca.calls, ca.frames, ca.dry_reads).unwrap();
-                drop(ca);
-
-                writeln!(writer, "Codec B timer: {}",
-                    self.cb_state.lock().timer_id.map_or("none".to_string(), |id| format!("{:#x}", id))).unwrap();
-                writeln!(writer, "AES TX timer: {}",
-                    self.at_state.lock().timer_id.map_or("none".to_string(), |id| format!("{:#x}", id))).unwrap();
-                let ar = self.ar_state.lock();
-                writeln!(writer, "AES RX timer: {}  loopback_len={}",
-                    ar.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id)),
-                    ar.loopback.len(),
-                ).unwrap();
-                drop(ar);
-                let log: Vec<(u16, [u16; 4])> = self.state.lock().iar_log.iter().copied().collect();
-                writeln!(writer, "Recent indirect accesses (IAR: IDR0 IDR1 IDR2 IDR3), oldest first:").unwrap();
-                for (iar, idr) in log {
-                    writeln!(writer, "  {:04x}{}: {:04x} {:04x} {:04x} {:04x}", iar,
-                        if iar & IAR_ACCESS_READ != 0 { " (read)" } else { "" },
-                        idr[0], idr[1], idr[2], idr[3]).unwrap();
-                }
-            }
-            _ => return Err("Usage: hal2 status".to_string()),
-        }
-        Ok(())
+    /// `audio status`: codec A is the only output counted. Its rate is the
+    /// guest's while its timer runs.
+    fn audio_report(&self) -> Option<String> {
+        let ca = self.ca_state.lock();
+        let rate = ca.timer_id.is_some().then(|| {
+            let s = self.state.lock();
+            s.bres_rate(s.codeca_cfg().1)
+        }).filter(|&r| r > 0);
+        let outs: Vec<&AudioOut> = ca.out.iter().collect();
+        Some(self.meter.report(&[rate], &outs))
     }
 }
 
@@ -1262,6 +1180,14 @@ mod tests {
         let mut total = first;
         for _ in 0..200 { total += p.due(); }
         assert!(total >= 110, "backlog not delivered: {}", total);
+    }
+
+    /// A stall past PACE_MAX_BACKLOG is dropped and counted.
+    #[test]
+    fn pacer_counts_the_stall_it_skips() {
+        let mut p = Pacer::new(11025);
+        p.due_at(Duration::from_secs(5));
+        assert_eq!(p.take_skipped(), 11025 * 5 - 11025 * PACE_MAX_BACKLOG.as_millis() as u64 / 1000);
     }
 }
 
@@ -1293,6 +1219,35 @@ mod host_tests {
         fn write(&self, _val: u32, _eop: bool) -> DmaStatus {
             DmaStatus::ok()
         }
+    }
+
+    /// Codec A's timer hands the recorder the frames it read, as read, at
+    /// the codec's rate. The wake is the host's, so the test waits for frames.
+    #[test]
+    fn codec_a_records_what_it_reads_at_its_rate() {
+        let words: Vec<u32> = (1..=8).collect();
+        let dma = Arc::new(Looping { words: words.clone(), at: Default::default(), late: AtomicBool::new(false) });
+        let (dump, bytes) = crate::dev::audio_dump::tests::dump();
+        let mut h = Hal2::new(vec![dma]);
+        h.dump = Some(dump);
+        h.set_timer_manager(Arc::new(TimerManager::new()));
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+            s.dma_enable = DMA_EN_CODECA;
+        }
+        h.apply_dma_enable(0, DMA_EN_CODECA);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while bytes.records().iter().map(|(_, f)| f.len()).sum::<usize>() < 64 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Device::stop(&h);
+        let recs = bytes.records();
+        assert!(recs.iter().all(|(rate, _)| *rate == 48000));
+        let played: Vec<i16> = recs.iter().flat_map(|(_, f)| f.iter().flat_map(|&(l, r)| [l, r])).collect();
+        let want: Vec<i16> = words.iter().map(|&w| w as i16).cycle().take(played.len()).collect();
+        assert!(played.len() >= 128 && played == want, "{} samples", played.len());
     }
 
     /// The whole way from the DMA channel to the host as a running machine

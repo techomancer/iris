@@ -1,6 +1,7 @@
 //! The PROMs iris embeds: download them from the catalog, and pack them into
 //! `data/proms/<board>.deflate`. Run from the repository root:
 //!
+//! ```text
 //!     cargo run -p iris-prom -- download [--into DIR]    fetch and verify the catalog's files
 //!     cargo run -p iris-prom -- pack [--from DIR]        unwrap and deflate them into data/proms
 //!     cargo run -p iris-prom -- pack --check             fail unless data/proms holds exactly the
@@ -8,6 +9,7 @@
 //!     cargo run -p iris-prom -- show FILE                what a PROM file holds
 //!     cargo run -p iris-prom -- extract FILE [--segment NAME] [--out PATH]
 //!                                                        write its payload, or one segment
+//! ```
 //!
 //! `data/proms/proms.toml` lists each published file with its size and sha256. What is
 //! stored is the PROM a machine runs: the file unwrapped by `prom_image::decode` (the

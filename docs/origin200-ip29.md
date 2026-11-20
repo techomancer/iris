@@ -8,7 +8,8 @@ headless on the IOC3's first serial port.
 ## Configuration
 
 Copy [`origin200.toml.example`](../origin200.toml.example) to `origin200.toml`,
-provide the PROM and disk named there, and run `iris --config origin200.toml`.
+provide the disk named there, and run `iris --config origin200.toml`. The IP27
+PROM is built in.
 The sample selects `machine.profile = "origin200_ip29"`.
 
 - `machine.cpu` is `r10000_180` (180 MHz, 1 MiB secondary cache, the default
@@ -28,13 +29,19 @@ The sample selects `machine.profile = "origin200_ip29"`.
 - `[origin200] flash` keeps the 1 MiB node boot flash, where the PROM stores
   its environment log. Unset, the flash starts fresh every run.
   `controller_store` does the same for the module controller's store.
-- `prom` takes the stock IP27 PROM as a raw payload or SGI's distribution
-  container. The flash configuration block is patched for the product and
-  processor module before the PROM runs.
+- The stock IP27 PROM 6.156 from the IRIX 6.5.30 media is built in and runs
+  when `prom` is left at its default, unless `prom.bin` or `ip27prom.img` is in
+  the working directory. `prom` overrides it with a raw payload or SGI's
+  distribution container, and a file it names must load;
+  `prom = "(embedded)"` selects the built-in PROM outright. The flash
+  configuration block is patched for the product and processor module before
+  the PROM runs.
+- The Origin 200 has no BaseIO card, so `[origin200] io_prom` is refused.
 
 The PROM runs its diagnostics and reaches the System Maintenance Menu and the
 Command Monitor on the first serial port, and an installed IRIX 6.5.30 disk
-boots to a serial login.
+boots to a serial login. `serial_log` copies the console to a file, adding to
+an existing log unless `serial_log_overwrite` is set.
 
 ## Limits
 

@@ -8,8 +8,8 @@ use crate::dev::kona::KonaProduct;
 /// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
 /// which of them a machine takes.
 pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
-/// Bank sizes in MB up to the IP28's and O2's largest; validation restricts
-/// 256/512 MB banks to those machines.
+/// Bank sizes expressible by the MC family. IP22/IP24 validation restricts
+/// these to 128 MB; IP28 can also use 256 and 512 MB banks.
 const MC_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
@@ -156,7 +156,8 @@ impl ScsiDeviceConfig {
     pub fn is_daynaport(&self) -> bool { self.kind() == ScsiKind::Daynaport }
 
     /// Where the `[scsi.KEY]` table puts this target, as (controller, id).
-    /// Keys 1–15 are ids on `controller` (1–7 off the Octane; 0 unless the key says otherwise);
+    /// Keys 1–15 are ids on `controller` (default 0). The profile's
+    /// `max_scsi_id()` restricts narrow buses to IDs 1–7;
     /// a key of 16 + id names controller 1 directly, so the same id can be
     /// used on both controllers. See [`scsi_slot`].
     pub fn placement(&self, key: u8) -> (u8, u8) {
@@ -189,7 +190,7 @@ impl ScsiDeviceConfig {
     /// is unset), as an absolute path, so a later change of directory still
     /// finds it.
     ///
-    /// The name carries [`ci_run_tag`](Self::ci_run_tag), so an interactive
+    /// The name carries `ci_run_tag`, so an interactive
     /// iris holding `PATH.overlay`, any number of CI runs, and a later run
     /// that gets the same process ID never open each other's overlay. A
     /// machine rebuilt in the same process reopens its own. The files are
@@ -357,7 +358,7 @@ impl Default for NatSubnet {
     }
 }
 
-/// Selects which networking backend the SEEQ Ethernet controller is wired to.
+/// Selects the onboard Ethernet adapter's host networking backend.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[value(rename_all = "lowercase")]
@@ -369,7 +370,8 @@ pub enum NetMode {
     /// (Linux/macOS) or a WinPcap-compatible driver (WinPcap or Npcap) on Windows.
     /// Requires building with `--features pcap` and elevated privileges at runtime.
     /// The guest appears as a real L2 host on the physical LAN; NAT services
-    /// (DHCP/DNS/NFS/port-forward) are NOT provided — use the real network's.
+    /// (DHCP/DNS/port-forward) are not provided. An explicitly configured
+    /// NFS share may run as a separate LAN host through `nfs_pcap_ip`.
     Pcap,
     /// No Ethernet: the adapter is not plugged into anything. Not on the
     /// Indy and Indigo2, which always have a network (`MachineConfig::validate`).
@@ -384,14 +386,14 @@ impl Default for NetMode {
     fn default() -> Self { NetMode::Nat }
 }
 
-/// Networking parameters extracted from `MachineConfig` for the NAT engine and HPC3.
+/// Resolved networking parameters shared by the host backends and adapters.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub nfs:          Option<NfsConfig>,
     pub port_forward: Vec<PortForwardConfig>,
     /// Parsed subnet; None means use the built-in default (192.168.0.0/24).
     pub nat_subnet:   Option<NatSubnet>,
-    /// Backend selection: NAT (default) or PCAP bridged.
+    /// Backend selection: NAT (default), PCAP, stream segment or disconnected.
     pub mode:         NetMode,
     /// Host interface name to bridge onto when `mode == Pcap`. None = auto-pick
     /// the first non-loopback interface that libpcap reports as up/running.
@@ -399,9 +401,9 @@ pub struct NetworkConfig {
     /// PCAP-only virtual IP for the in-process NFS server (so a bridged guest can
     /// mount it). None = NFS-in-PCAP not configured.
     pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
-    /// Ethernet station address for `ec0`, backdoor-injected into NVRAM
-    /// (Indy) / serial EEPROM (Indigo2) before boot. Defaults to
-    /// [`DEFAULT_MAC`] when `[network] mac` is unset.
+    /// Ethernet station address, resolved from `[network] mac` and the
+    /// platform's default identity. MC machines inject it into their
+    /// NVRAM/EEPROM; newer platforms pass it to their onboard adapter.
     pub mac: [u8; 6],
     /// Directory served read-only over TFTP at the gateway, for PROM network
     /// boot. None (the default) disables the TFTP server.
@@ -451,7 +453,7 @@ pub struct NetworkSection {
     /// this and serves NFS at the gateway IP instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
-    /// Ethernet station address for the built-in SEEQ controller (`ec0`), e.g.
+    /// Ethernet station address for the onboard adapter, e.g.
     /// "08:00:69:12:34:56" (SGI's registered OUI). Defaults to
     /// `08:00:69:12:34:56` when unset, or on a machine that takes
     /// `[machine] emu_id` to the address that gives. Real hardware has no way to leave this
@@ -535,9 +537,10 @@ pub struct Ultra64Config {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VirtioGioSlot {
-    /// 0x1F400000; shared with `--test-device` and the Ultra64 board.
+    /// 0x1F400000; shared with `--test-device`, the Ultra64 board and the
+    /// second Newport head (`graphics.heads = 2`).
     Exp0,
-    /// 0x1F600000; shared with the second Newport head (`graphics.heads = 2`).
+    /// 0x1F600000.
     #[default]
     Exp1,
 }
@@ -573,6 +576,9 @@ pub struct VirtioSerialConfig {
     /// machines with PCI (O2, Octane) put it on the PCI bus and ignore this.
     #[serde(default)]
     pub slot: VirtioGioSlot,
+    /// The Octane's onboard Bridge slot, 4 to 7. Unset: 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_slot: Option<u8>,
     /// The ports, in order; port 0 is the first. Empty means one console
     /// port on TCP 127.0.0.1:8890.
     #[serde(default, rename = "port", skip_serializing_if = "Vec::is_empty")]
@@ -698,6 +704,9 @@ pub struct Virtio9pConfig {
     /// Octane puts it on the PCI bus and ignores this.
     #[serde(default)]
     pub slot: VirtioGioSlot,
+    /// The Octane's onboard Bridge slot, 4 to 7. Unset: 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_slot: Option<u8>,
     /// Host directory to share.
     #[serde(default)]
     pub path: String,
@@ -735,6 +744,7 @@ impl Default for Virtio9pConfig {
         Self {
             enabled: false,
             slot: VirtioGioSlot::default(),
+            bridge_slot: None,
             path: String::new(),
             tag: default_9p_tag(),
             readonly: false,
@@ -774,32 +784,32 @@ pub enum MachineProfile {
     /// Use an IMPACT board (`src/dev/mgras/`): an IP28 kernel carries no
     /// Newport driver, so REX3 is not an alternative for that guest.
     Indigo2Ip28,
-    /// SGI O2 IP32: CRIME, MACE and GBE, with an R5000 or R10000. Built from
-    /// the `[o2]` section, not the fullhouse/Guinness options above; see
+    /// SGI O2 IP32: CRIME, MACE and GBE, with R5000/R10000/R12000. Uses the
+    /// shared configuration keys and O2-specific `[o2]` options; see
     /// `src/ip32_machine.rs`.
     O2Ip32,
     /// SGI Octane IP30: HEART, the Crossbow and the onboard Bridge, with an
-    /// R10000. Configured by the shared keys and the `[octane]` section; see
+    /// R10000, R12000 or R14000. Uses the shared keys and `[octane]`; see
     /// `src/ip30_machine.rs` and `docs/octane-ip30-address-map.md`.
     OctaneIp30,
     /// SGI Origin 200: the IP29 System Board on the IP27 software platform,
     /// one Hub node with an R10000 or R12000, the Bridge, two ISP1040s and an
     /// IOC3. Configured by the shared keys and `[origin200]`; see
-    /// `src/ip27_machine.rs`.
+    /// `src/ip29_machine.rs`.
     Origin200Ip29,
     /// SGI Origin 2000 deskside: one or two IP27 node boards, each the host
     /// of a Crossbow, the first carrying the BaseIO. Configured by the shared
-    /// keys and `[origin2000]`; see `src/ip27_deskside.rs`.
+    /// keys and `[origin2000]`; see `src/ip27_machine.rs`.
     Origin2000Ip27,
     /// SGI Onyx2 deskside: one or two IP27 node boards sharing one Crossbow,
     /// the BaseIO-G at widget 15 and a graphics slot at widget 8, which holds
     /// a test widget. Configured by the shared keys and `[onyx2]`; see
-    /// `src/ip27_deskside.rs`.
+    /// `src/ip27_machine.rs`.
     Onyx2Ip27,
     /// SGI Fuel: the IP34 board on the IP35 software platform, headless or
     /// with a VPro in its graphics slot. See `src/ip34_machine.rs`.
     FuelIp34,
-    /// Serial-only Tezro: the IP53 board on the IP35 software platform,
+    /// SGI Tezro: the IP53 board on the IP35 software platform,
     /// configured by the shared keys and the `[tezro]` section; see
     /// `src/ip53_machine.rs`.
     TezroIp53,
@@ -809,16 +819,13 @@ pub enum MachineProfile {
     Origin3200Ip35,
     /// SGI Onyx 3000: the Origin 3200's C-brick and I-brick with a graphics
     /// brick, configured by the shared keys, `[onyx3000]` and `[graphics]`;
-    /// see `src/ip35_machine/onyx3000.rs`.
+    /// see `src/ip35_machine.rs`.
     Onyx3000Ip35,
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. Single source of truth for the
-    /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    pub const ALL: [Self; 5] = [
-        Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
-    ];
+    /// All selectable profiles, shared by the GUI and command-line front ends.
+    pub const ALL: [Self; 12] = Self::EVERY;
 
     /// The bank sizes in MB (0 is an empty bank) that `validate()` accepts
     /// for this profile. The Octane's banks are matched DIMM pairs of 64 MB
@@ -860,13 +867,12 @@ impl MachineProfile {
             Self::Indigo2Ip28 => Some("070-1477-002.bin"),
             Self::OctaneIp30 => Some(crate::ip30_machine::OCTANE_PROM_FILE),
             Self::O2Ip32 => Some(crate::ip32_machine::O2_PROM_FILE),
-            _ if self.is_ip27() => Some(crate::ip27_machine::IP27_PROM_FILE),
+            _ if self.is_ip27() => Some(crate::ip27::IP27_PROM_FILE),
             _ => None,
         }
     }
 
-    /// Every profile, in the order `workstation::build` lists them. `ALL` is
-    /// only the ones the GUI offers.
+    /// Every profile, in the order `workstation::build` lists them.
     pub const EVERY: [Self; 12] = [
         Self::IndyIp24,
         Self::Indigo2Ip22,
@@ -906,28 +912,36 @@ impl MachineProfile {
         }
     }
 
-    /// The three SN0 machines, which share the Hub node, the module controller
+    /// The three IP27 machines, which share the Hub node, the module controller
     /// and the IP27 PROM.
     pub fn is_ip27(self) -> bool {
         matches!(self, Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27)
     }
 
-    /// An SN0 product's name as a sentence has it, `None` for the other machines.
-    pub fn ip27_name(self) -> Option<&'static str> {
+    /// The product's name as a sentence has it, `None` for the machines without a product table.
+    pub fn product_name(self) -> Option<&'static str> {
         match self {
             Self::Origin200Ip29 => Some("Origin 200"),
             Self::Origin2000Ip27 => Some("Origin 2000"),
             Self::Onyx2Ip27 => Some("Onyx2"),
+            Self::Origin3200Ip35 => Some("Origin 3200"),
+            Self::Onyx3000Ip35 => Some("Onyx 3000"),
+            Self::FuelIp34 => Some("Fuel"),
+            Self::TezroIp53 => Some("Tezro"),
             _ => None,
         }
     }
 
-    /// The table of SN0 keys the product reads, `None` for the other machines.
-    pub fn ip27_table(self) -> Option<&'static str> {
+    /// The table of keys the product reads, `None` for the machines without one.
+    pub fn table_name(self) -> Option<&'static str> {
         match self {
             Self::Origin200Ip29 => Some("origin200"),
             Self::Origin2000Ip27 => Some("origin2000"),
             Self::Onyx2Ip27 => Some("onyx2"),
+            Self::Origin3200Ip35 => Some("origin3200"),
+            Self::Onyx3000Ip35 => Some("onyx3000"),
+            Self::FuelIp34 => Some("fuel"),
+            Self::TezroIp53 => Some("tezro"),
             _ => None,
         }
     }
@@ -945,7 +959,7 @@ impl MachineProfile {
         Self::EVERY.iter().map(|p| format!("{:<14}{}\n", p.name(), p.label())).collect()
     }
 
-    /// The processors fitted at most: four on the Tezro, two on the Octane,
+    /// The processors populated at most: four on the Tezro, two on the Octane,
     /// one elsewhere.
     pub fn max_cpus(self) -> u8 {
         match self {
@@ -999,10 +1013,9 @@ impl MachineProfile {
         }
     }
 
-    /// MC/IOC/HPC3 Guinness vs Fullhouse layout. Indy IP24 is Guinness (`true`).
-    /// How many SCSI controllers the machine has: two on the Indigo2 (two
-    /// WD33C93As) and the O2 (two Adaptec 7880s, the second on the external
-    /// connector), one on the Indy.
+    /// The number of SCSI controllers accepted by configuration validation.
+    /// Indy has one; IP22, O2, Octane, SN0, Fuel and Tezro accept two.
+    /// IP35 brick machines use their Fibre Channel disk tables instead.
     pub fn scsi_controllers(self) -> u8 {
         if self.is_ip27() || matches!(self, Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::FuelIp34 | Self::TezroIp53) { 2 } else { 1 }
     }
@@ -1036,7 +1049,7 @@ impl MachineProfile {
     pub fn cpus(self) -> &'static [&'static Part] {
         match self {
             Self::OctaneIp30 => crate::ip30_machine::CPUS,
-            Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => crate::ip27_machine::CPUS,
+            Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => crate::cpu::parts::CPUS,
             Self::O2Ip32 => crate::ip32_machine::CPUS,
             Self::Indigo2Ip28 => crate::machine::IP28_CPUS,
             Self::FuelIp34 => crate::ip34_machine::CPUS,
@@ -1053,7 +1066,7 @@ impl MachineProfile {
     }
 }
 
-/// Indy / Indigo2 graphics board in the GIO gfx slot.
+/// Graphics board selected for a machine; `supports` describes compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum GraphicsBoard {
     /// Newport (REX3) — fully emulated. Default.
@@ -1115,13 +1128,17 @@ pub enum GraphicsBoard {
 }
 
 impl GraphicsBoard {
-    pub const ALL: [Self; 6] = [
+    /// Every board, in the order menus list them, `None` last.
+    pub const ALL: [Self; 16] = [
         Self::Newport,
         Self::Xz,
         Self::Extreme,
         Self::SolidImpact,
         Self::HighImpact,
         Self::MaxImpact,
+        Self::V6, Self::V8, Self::V10, Self::V12,
+        Self::Ir2, Self::Ir2x2, Self::Ir2e, Self::Ir2ex2, Self::Ir3,
+        Self::None,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1255,7 +1272,7 @@ impl std::str::FromStr for GraphicsBoard {
             "ir3" | "infinitereality3" => Ok(Self::Ir3),
             "none" => Ok(Self::None),
             _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, ir2, ir2:2rm, ir2e, ir2e:2rm, none)"
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none)"
             )),
         }
     }
@@ -1286,19 +1303,37 @@ impl std::fmt::Display for GraphicsBoard {
     }
 }
 
+/// Deprecated `[impact]` section: the IMPACT slot population of the Indigo2
+/// preview, replaced by `[graphics] board = "solidimpact"` (or `highimpact`,
+/// `maximpact`). Kept so configs written before the change still load;
+/// [`MachineConfig::fold_deprecated`] moves `gfx` over and it is never written
+/// back. Slots held `none`, `solid`, `high` or `max`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyImpactSection {
+    #[serde(default)]
+    pub gfx: Option<String>,
+    #[serde(default)]
+    pub exp0: Option<String>,
+    #[serde(default)]
+    pub exp1: Option<String>,
+}
+
 /// `[graphics]` section — Newport head count and display options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
     /// Graphics board: Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum,
-    /// or none (Octane and Fuel). Unset: the machine's default
+    /// VPro V6/V8/V10/V12, InfiniteReality (IR2, IR2E, IR3) or none, as each
+    /// machine takes them (see `validate`). Unset: the machine's default
     /// ([`GraphicsBoard::default_for`]); read it with
-    /// [`MachineConfig::graphics_board`]. Extreme is restricted to IP22,
-    /// the Octane to IMPACT or none; non-Newport boards require one head
+    /// [`MachineConfig::graphics_board`]. Extreme is restricted to IP22;
+    /// non-Newport boards require one head
     /// and Guest resolution. See [`MachineConfig::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<GraphicsBoard>,
-    /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 at GIO slot 1.
+    /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 in GIO
+    /// expansion slot 0, which the Ultra64 board then cannot have.
     #[serde(default = "default_graphics_heads")]
     pub heads: u8,
     /// Host-forced Newport video mode at VM start (`guest` = IRIX/setmon controls VC2).
@@ -1313,11 +1348,16 @@ pub struct GraphicsSection {
     /// two from 8 to 256.
     #[serde(default = "default_graphics_tile")]
     pub tile: u32,
-    /// VPro and IMPACT: where the raster unit runs: `cpu` (the threads
-    /// above; IMPACT's raster engine threads) or `wgpu` (the host GPU
-    /// through wgpu compute; needs the `wgpu` feature).
+    /// Where the raster unit runs: `cpu` (the threads above; IMPACT's raster
+    /// engine threads) or `wgpu` (the host GPU through wgpu compute; needs
+    /// the `wgpu` feature).
     #[serde(default)]
     pub raster: RasterUnit,
+    /// Newport wgpu raster presentation mode. Unset means `direct`, which
+    /// shares authoritative GPU planes with the wgpu renderer. `readback`
+    /// explicitly selects the slower GL/CPU compatibility path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newport_mode: Option<NewportWgpuMode>,
     /// The wgpu backend for `raster = "wgpu"`: `auto`, `vulkan`, `metal`,
     /// `dx12` or `gl`.
     #[serde(default = "default_gpu_backend")]
@@ -1347,12 +1387,25 @@ pub enum RasterUnit {
     Wgpu,
 }
 
+/// How an authoritative Newport wgpu framebuffer reaches display consumers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum NewportWgpuMode {
+    #[default]
+    Direct,
+    Readback,
+}
+
 impl GraphicsSection {
     /// Pixel size for host window layout when a preset is selected.
     pub fn host_display_size(&self) -> (u32, u32) {
         self.resolution
             .visible_size()
             .unwrap_or((1280, 1024))
+    }
+
+    pub fn newport_wgpu_mode(&self) -> NewportWgpuMode {
+        self.newport_mode.unwrap_or_default()
     }
 }
 
@@ -1370,6 +1423,7 @@ impl Default for GraphicsSection {
             threads: default_graphics_threads(),
             tile: default_graphics_tile(),
             raster: RasterUnit::Cpu,
+            newport_mode: None,
             gpu_backend: default_gpu_backend(),
             flash: None,
         }
@@ -1462,7 +1516,7 @@ pub struct MachineSection {
     pub cpu: Option<String>,
     #[serde(default)]
     pub cache: CacheModel,
-    /// Processors fitted, or the machine's default when unset: read it with
+    /// Processors populated, or the machine's default when unset: read it with
     /// [`MachineSection::cpus`]. More than one only on the Octane and the
     /// Tezro.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1481,9 +1535,9 @@ fn is_zero_u32(v: &u32) -> bool {
 }
 
 impl MachineSection {
-    /// The processors fitted: `cpus` as set, or the profile's default. A
+    /// The processors populated: `cpus` as set, or the profile's default. A
     /// machine owns its own default (the Tezro's is
-    /// `ip53_machine::DEFAULT_CPUS`); every other profile fits one.
+    /// `ip53_machine::DEFAULT_CPUS`); every other profile populates one.
     pub fn cpus(&self) -> u8 {
         self.cpus.unwrap_or(match self.profile {
             MachineProfile::TezroIp53 => crate::ip53_machine::DEFAULT_CPUS,
@@ -1529,7 +1583,7 @@ pub struct O2Section {
     /// Deprecated: `nvram`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flash: Option<String>,
-    /// Deprecated: `banks`, fitted largest kits first.
+    /// Deprecated: `banks`, installed largest kits first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_mb: Option<u32>,
     /// Deprecated: `banks`.
@@ -1590,7 +1644,7 @@ impl OctaneSection {
     }
 }
 
-/// `[origin200]`, `[origin2000]` and `[onyx2]`: the keys the SN0 machines have
+/// `[origin200]`, `[origin2000]` and `[onyx2]`: the keys the IP27 machines have
 /// beyond the shared ones. Each product reads the table named for it
 /// ([`MachineConfig::ip27_section`]); the Origin 200 has one node, so `nodes`
 /// is refused there.
@@ -1772,7 +1826,9 @@ pub enum JitCompile {
 #[serde(deny_unknown_fields)]
 pub struct Jitv2Config {
     /// Compile-pool threads. Unset, one per guest CPU, at most
-    /// `AUTO_JITV2_THREADS_MAX` (see [`MachineConfig::settle_jitv2_threads`]).
+    /// `AUTO_JITV2_THREADS_MAX`, and capped by the host's usable CPUs with
+    /// one held back for the device threads (see
+    /// [`MachineConfig::settle_jitv2_threads`] and [`auto_jitv2_threads`]).
     #[serde(default = "default_jitv2_threads")]
     pub threads: usize,
     /// Compile on the pool's threads (`async`, the default) or on the CPU
@@ -1798,6 +1854,57 @@ fn default_jitv2_threads() -> usize { 1 }
 /// Four threads cut IRIX login time by 12-19% against one in the median and
 /// single-CPU runs measured.
 pub const AUTO_JITV2_THREADS_MAX: usize = 4;
+
+/// Host CPUs held back for the emulator's own device threads (the graphics
+/// compose, SCSI, ethernet, audio and timer threads) when the compile pool
+/// is auto-sized. One is the smallest reserve that keeps the pool off the
+/// device threads' backs on a small host.
+pub const AUTO_JITV2_HOST_RESERVE: usize = 1;
+
+/// The host's usable parallelism — the logical CPUs this process may run
+/// on. `available_parallelism` honours the CPU affinity mask and cgroup
+/// quotas, so a container or a pinned process sees its own budget rather
+/// than the machine's.
+pub fn host_parallelism() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// The compile-pool size for a guest with `guest_cpus` processors on a host
+/// with `host_cpus` usable CPUs, and why that size.
+///
+/// The pool wants one worker per guest CPU — each CPU asks for its own
+/// pages, and a single worker kept a 4-CPU Tezro's boot waiting on
+/// compiles — capped at [`AUTO_JITV2_THREADS_MAX`]. The host's CPU count
+/// caps that, one CPU held back for the device threads: a worker needs a
+/// CPU of its own to run on, and the graphics compose, SCSI, ethernet,
+/// audio and timer threads need one too.
+///
+/// The guest's own CPU threads are **not** subtracted from the pool's
+/// budget. They are the ones waiting for the compiles: a guest CPU that
+/// reaches a page with no compiled code does not block, it keeps running
+/// the interpreter until the pool publishes the page (see the dispatch
+/// gate in `src/cpu/mips_exec.rs`). The measured boot profile left the
+/// workers under half busy each while the guest's own threads ran at a
+/// quarter of a CPU — so the host had room to spare during exactly the
+/// phase the pool exists for, and a rule that also reserved the guest's
+/// CPUs left most of a small host idle through it.
+///
+/// Returns `(threads, reason)`; the reason is what `j2 threads` reports.
+pub fn auto_jitv2_threads(guest_cpus: usize, host_cpus: usize) -> (usize, String) {
+    let want = guest_cpus.clamp(1, AUTO_JITV2_THREADS_MAX);
+    // Never zero: a pool with no workers would compile nothing and the
+    // guest would run the interpreter forever.
+    let usable = host_cpus.saturating_sub(AUTO_JITV2_HOST_RESERVE).max(1);
+    let threads = want.min(usable);
+    let reason = if usable >= want {
+        format!("auto: one worker per guest CPU ({want}); the host's {host_cpus} usable CPUs have room")
+    } else {
+        format!(
+            "auto: {threads} of {want} workers — the host's {host_cpus} usable CPUs leave {usable} for the pool ({AUTO_JITV2_HOST_RESERVE} held back for the device threads)"
+        )
+    };
+    (threads, reason)
+}
 
 impl Default for Jitv2Config {
     fn default() -> Self {
@@ -2119,16 +2226,6 @@ mod scsi_keys {
     }
 }
 
-/// Fuel's independent serial connections. The selected console serves CI and serial_log.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FuelConsole {
-    #[default]
-    L1,
-    Ioc3A,
-    Ioc3B,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FuelSection {
@@ -2136,18 +2233,18 @@ pub struct FuelSection {
     #[serde(default)]
     pub flash: Option<String>,
     #[serde(default)]
-    pub console: FuelConsole,
+    pub console: Ip35Console,
     /// L1 host console TCP port; IOC3 keeps serial_port_a and serial_port_b.
     #[serde(default)]
     pub l1_port: Option<u16>,
     /// Separate L1 log when an IOC3 port is selected as console.
     #[serde(default)]
     pub l1_log: Option<String>,
-    /// Fit the PS/2 keyboard and mouse controller in the onboard IOC3 and
+    /// Attach the PS/2 keyboard and mouse controller in the onboard IOC3 and
     /// feed it the host's keyboard and mouse.
     #[serde(default = "default_fuel_input")]
     pub ps2_input: bool,
-    /// Plug a USB keyboard and mouse into the OHCI controller's first two
+    /// Connect a USB keyboard and mouse into the OHCI controller's first two
     /// root ports and send the host's keyboard and mouse to them instead of
     /// the PS/2 pair. Off by default: the Fuel's manual and its PROM treat
     /// PS/2 as the standard keyboard and mouse.
@@ -2169,7 +2266,7 @@ impl Default for FuelSection {
     fn default() -> Self {
         Self {
             flash: None,
-            console: FuelConsole::default(),
+            console: Ip35Console::default(),
             l1_port: None,
             l1_log: None,
             ps2_input: true,
@@ -2184,7 +2281,7 @@ impl FuelSection {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
         self.flash.is_none()
-            && self.console == FuelConsole::default()
+            && self.console == Ip35Console::default()
             && self.l1_port.is_none()
             && self.l1_log.is_none()
             && self.ps2_input
@@ -2194,18 +2291,18 @@ impl FuelSection {
     }
 }
 
-/// The Origin 3200's serial connections: the first C-brick's L1 and the
-/// I-brick's IOC3 ports. The selected console serves CI and serial_log.
+/// The L1 and IOC3 serial connections of the Fuel, Origin 3200 and Onyx 3000: the
+/// first brick's L1, then the IOC3 ports. The selected console serves CI and serial_log.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Origin3200Console {
+pub enum Ip35Console {
     #[default]
     L1,
     Ioc3A,
     Ioc3B,
 }
 
-impl Origin3200Console {
+impl Ip35Console {
     /// The connection's index: 0 for the L1, then the IOC3's ports.
     pub fn index(self) -> usize {
         self as usize
@@ -2215,7 +2312,7 @@ impl Origin3200Console {
 /// `[origin3200]`: the keys the Origin 3200 has beyond the shared ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Origin3200Section {
+pub struct Ip35Section {
     /// C-bricks: 1 or 2. Two are joined by the direct NUMAlink cable, with no
     /// router. The I-brick is cabled to the first.
     #[serde(default = "default_c_bricks")]
@@ -2225,7 +2322,7 @@ pub struct Origin3200Section {
     #[serde(default)]
     pub flash: Option<String>,
     #[serde(default)]
-    pub console: Origin3200Console,
+    pub console: Ip35Console,
     /// The first C-brick's L1 host console TCP port; the IOC3 keeps
     /// serial_port_a and serial_port_b.
     #[serde(default)]
@@ -2245,12 +2342,12 @@ pub struct Origin3200Section {
 
 fn default_c_bricks() -> u8 { 1 }
 
-impl Default for Origin3200Section {
+impl Default for Ip35Section {
     fn default() -> Self {
         Self {
             c_bricks: default_c_bricks(),
             flash: None,
-            console: Origin3200Console::default(),
+            console: Ip35Console::default(),
             l1_port: None,
             l1_log: None,
             l1_revision: None,
@@ -2259,52 +2356,12 @@ impl Default for Origin3200Section {
     }
 }
 
-impl Origin3200Section {
+impl Ip35Section {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
         self.c_bricks == default_c_bricks()
             && self.flash.is_none()
-            && self.console == Origin3200Console::default()
-            && self.l1_port.is_none()
-            && self.l1_log.is_none()
-            && self.l1_revision.is_none()
-            && self.brick_serial.is_none()
-    }
-}
-
-/// `[onyx3000]`: the keys the Onyx 3000 has beyond the shared ones, those of
-/// `[origin3200]` less `c_bricks`: its graphics board fixes the C-bricks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Onyx3000Section {
-    /// Persistent 16 MiB boot flash of the first C-brick (a second keeps its
-    /// own beside it, at the name with `.1` added). Absent means volatile.
-    #[serde(default)]
-    pub flash: Option<String>,
-    #[serde(default)]
-    pub console: Origin3200Console,
-    /// The first C-brick's L1 host console TCP port; the IOC3 keeps
-    /// serial_port_a and serial_port_b.
-    #[serde(default)]
-    pub l1_port: Option<u16>,
-    /// Separate L1 log when an IOC3 port is selected as console.
-    #[serde(default)]
-    pub l1_log: Option<String>,
-    /// L1 firmware revision as "major.minor.patch", reported to request
-    /// 0x0005. Unset: 1.48.1.
-    #[serde(default)]
-    pub l1_revision: Option<String>,
-    /// Brick serial the first C-brick reports to L1 request 0x0004, at most 37
-    /// bytes. Unset: the marked synthetic `EMUN00`.
-    #[serde(default)]
-    pub brick_serial: Option<String>,
-}
-
-impl Onyx3000Section {
-    /// Left out of a written config when nothing in it was set.
-    fn is_default(&self) -> bool {
-        self.flash.is_none()
-            && self.console == Origin3200Console::default()
+            && self.console == Ip35Console::default()
             && self.l1_port.is_none()
             && self.l1_log.is_none()
             && self.l1_revision.is_none()
@@ -2332,10 +2389,10 @@ impl TezroConsole {
     }
 }
 
-/// The processor counts a Tezro board fits.
+/// The processor counts a Tezro board holds.
 pub const TEZRO_CPUS: [u8; 3] = [1, 2, 4];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TezroSection {
     /// Persistent 16 MiB boot flash store; absent means volatile flash.
@@ -2360,20 +2417,6 @@ pub struct TezroSection {
     /// keeps the controller but gives it no host output.
     #[serde(default)]
     pub audio: bool,
-}
-
-impl Default for TezroSection {
-    fn default() -> Self {
-        Self {
-            flash: None,
-            console: TezroConsole::default(),
-            l1_port: None,
-            l1_log: None,
-            serial_port_c: None,
-            serial_port_d: None,
-            audio: false,
-        }
-    }
 }
 
 impl TezroSection {
@@ -2424,8 +2467,9 @@ pub struct MachineConfig {
     #[serde(default = "default_nveeprom")]
     pub nveeprom: String,
 
-    /// RAM bank sizes in MB, one per bank, up to [`MAX_BANKS`]. Every machine
-    /// today has four (`MachineProfile::memory_banks`); the rest must be 0.
+    /// RAM bank sizes in MB, one per bank, up to [`MAX_BANKS`]. The profile
+    /// supplies the bank count (`MachineProfile::memory_banks`); unused entries
+    /// must be zero. Fuel uses two; Tezro and IP35 brick machines use eight.
     /// On the Indy and Indigo2 a bank is 0 (absent), 8, 16, 32, 64 or 128 MB
     /// (the IP28 also 256 or 512); on the O2 it is the kit in a DIMM pair, 32,
     /// 64, 128 or 256 MB, largest first from pair A. A config may list fewer
@@ -2436,25 +2480,35 @@ pub struct MachineConfig {
 
     /// Whether `banks` was given (in the config file or by `--bank0..3`), as
     /// opposed to left at the generic default, so that a value equal to the
-    /// default still counts as chosen. Only the Tezro reads it.
+    /// default still counts as chosen. Tezro and IP35 brick machines read it.
     #[serde(skip)]
     pub banks_set: bool,
 
     /// Whether `[jitv2] threads` was given (in the config file or by
-    /// `--jitv2-threads`). When not, the pool follows the CPU count.
+    /// `--jitv2-threads`). When not, the pool follows the CPU count and the
+    /// host's usable CPUs.
     #[serde(skip)]
     pub jitv2_threads_set: bool,
+
+    /// Why the compile pool is sized as it is — the auto-sizing
+    /// explanation, or "set explicitly". Not a config key: it is derived
+    /// from the guest's CPU count and the host's parallelism, and reported
+    /// by `j2 threads`.
+    #[serde(skip)]
+    pub jitv2_threads_reason: String,
 
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
     pub scale: u32,
 
-    /// Run without graphics (no window, no REX3). Use no_audio to also disable HAL2.
-    /// Useful for headless/server/CI environments.
+    /// Suppress the standalone window. Newport is not fitted in this mode;
+    /// O2 selects a serial console. Other graphics boards can remain fitted.
+    /// Use `no_audio` independently to suppress host audio output.
     #[serde(default)]
     pub headless: bool,
 
-    /// Disable audio emulation (no HAL2). Independent of headless/graphics.
+    /// Disable audio output on machines with audio support, independently
+    /// of headless mode and the selected graphics board.
     #[serde(default)]
     pub no_audio: bool,
 
@@ -2572,6 +2626,12 @@ pub struct MachineConfig {
     /// its own window and ignores this.
     #[serde(default)]
     pub renderer: UiRenderer,
+    /// Wait for the host display's vertical sync when a frame is shown.
+    /// Off, frames are shown at once and the guest's video timing is kept
+    /// whatever the host monitor's rate. On, a present can hold the display
+    /// thread for a host frame, which also delays the guest's retrace.
+    #[serde(default)]
+    pub vsync: bool,
 
     /// Optional file path that will receive every byte the guest emits on
     /// its serial console, added to if the file exists (see
@@ -2593,8 +2653,8 @@ pub struct MachineConfig {
     /// Files that receive what the guest sends on serial channel A or B when
     /// that channel is not the console (`serial_log` is the console's):
     /// channel B on the Octane and O2, channel A on the Indy and Indigo2.
-    /// Written from the start on the Octane and O2, appended to on the Indy
-    /// and Indigo2, like `serial_log`.
+    /// Appended to on every machine, like `serial_log`, unless
+    /// `serial_log_overwrite` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log_a: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2632,7 +2692,7 @@ pub struct MachineConfig {
     #[serde(default = "default_scsi_deferred_int")]
     pub scsi_deferred_int: bool,
 
-    /// HAL2 audio output tuning (`[audio]` section).
+    /// Host audio output tuning (`[audio]` section).
     #[serde(default)]
     pub audio: AudioConfig,
 
@@ -2655,6 +2715,10 @@ pub struct MachineConfig {
     /// The O2 (`[o2]` section), used when `[machine] profile = "o2_ip32"`.
     #[serde(default)]
     pub o2: O2Section,
+
+    /// Deprecated `[impact]` section; see [`LegacyImpactSection`].
+    #[serde(default, skip_serializing)]
+    pub impact: Option<LegacyImpactSection>,
 
     /// The Octane (`[octane]` section), used when `[machine] profile = "octane_ip30"`.
     #[serde(default, skip_serializing_if = "OctaneSection::is_default")]
@@ -2679,12 +2743,13 @@ pub struct MachineConfig {
 
     /// C-bricks, serial console and flash storage for the Origin 3200
     /// (`[origin3200]`).
-    #[serde(default, skip_serializing_if = "Origin3200Section::is_default")]
-    pub origin3200: Origin3200Section,
+    #[serde(default, skip_serializing_if = "Ip35Section::is_default")]
+    pub origin3200: Ip35Section,
 
-    /// Serial console and flash storage for the Onyx 3000 (`[onyx3000]`).
-    #[serde(default, skip_serializing_if = "Onyx3000Section::is_default")]
-    pub onyx3000: Onyx3000Section,
+    /// `[onyx3000]`: the keys of `[origin3200]`; `c_bricks` is refused, the
+    /// graphics board fixes it.
+    #[serde(default, skip_serializing_if = "Ip35Section::is_default")]
+    pub onyx3000: Ip35Section,
 
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
@@ -2801,7 +2866,7 @@ fn default_nveeprom() -> String {
     "nveeprom.bin".to_string()
 }
 
-/// Room in `banks`: eight, for machines with more than today's four.
+/// Maximum number of configurable banks, including Tezro and IP35 bricks.
 pub const MAX_BANKS: usize = 8;
 
 fn default_banks() -> [u32; MAX_BANKS] {
@@ -2815,9 +2880,8 @@ pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
     banks
 }
 
-/// The first four banks of a full `banks` array. Every machine today has
-/// four banks or fewer, so the rest of the array is always zeros; the
-/// front-ends' per-bank pickers work on a `[u32; 4]`.
+/// The first four banks of a full `banks` array, for legacy four-bank callers.
+/// This discards banks 4 through 7; profile-aware front ends use the full array.
 pub fn banks_to4(banks: [u32; MAX_BANKS]) -> [u32; 4] {
     let mut four = [0u32; 4];
     four.copy_from_slice(&banks[..4]);
@@ -2874,6 +2938,7 @@ impl Default for MachineConfig {
             banks: default_banks(),
             banks_set: false,
             jitv2_threads_set: false,
+            jitv2_threads_reason: String::new(),
             scsi: default_scsi(),
             scale: default_scale(),
             nfs: None,
@@ -2910,6 +2975,7 @@ impl Default for MachineConfig {
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
             renderer: UiRenderer::default(),
+            vsync: false,
             scsi_deferred_int: default_scsi_deferred_int(),
             audio: AudioConfig::default(),
             machine: MachineSection::default(),
@@ -2917,14 +2983,15 @@ impl Default for MachineConfig {
             debug: DebugConfig::default(),
             jitv2: Jitv2Config::default(),
             o2: O2Section::default(),
+            impact: None,
             octane: OctaneSection::default(),
             origin200: Ip27Section::default(),
             origin2000: Ip27Section::default(),
             onyx2: Ip27Section::default(),
             fuel: FuelSection::default(),
             tezro: TezroSection::default(),
-            origin3200: Origin3200Section::default(),
-            onyx3000: Onyx3000Section::default(),
+            origin3200: Ip35Section::default(),
+            onyx3000: Ip35Section::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
@@ -3007,19 +3074,17 @@ impl MachineConfig {
         match self.machine.profile {
             MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
                 match v.slot {
-                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device => Err(
-                        "[virtio_serial] slot = \"exp0\" is taken by the ultra64 board or test_device; use \"exp1\"".into(),
-                    ),
-                    VirtioGioSlot::Exp1 if self.graphics.heads == 2 && !self.headless => Err(
-                        "[virtio_serial] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"".into(),
+                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device
+                        || (self.graphics.heads == 2 && !self.headless) => Err(
+                        "[virtio_serial] slot = \"exp0\" is taken by the ultra64 board, test_device or the second graphics head; use \"exp1\"".into(),
                     ),
                     _ => Ok(()),
                 }
             }
-            // The Octane has a PCI bridge with a free slot.
-            MachineProfile::OctaneIp30 => Ok(()),
+            // The Octane has a PCI bridge with free slots.
+            MachineProfile::OctaneIp30 => self.octane_virtio_slots().map(|_| ()),
             p @ (MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) => {
-                Err(format!("[virtio_serial] is not wired on the {}", p.ip27_name().expect("an SN0 product")))
+                Err(format!("[virtio_serial] is not wired on the {}", p.product_name().expect("an IP27 product")))
             }
             MachineProfile::FuelIp34 => Err(
                 "[virtio_serial] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
@@ -3154,16 +3219,14 @@ impl MachineConfig {
                     ));
                 }
                 match v.slot {
-                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device => Err(
-                        "[virtio_9p] slot = \"exp0\" is taken by the ultra64 board or test_device; use \"exp1\"".into(),
-                    ),
-                    VirtioGioSlot::Exp1 if self.graphics.heads == 2 && !self.headless => Err(
-                        "[virtio_9p] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"".into(),
+                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device
+                        || (self.graphics.heads == 2 && !self.headless) => Err(
+                        "[virtio_9p] slot = \"exp0\" is taken by the ultra64 board, test_device or the second graphics head; use \"exp1\"".into(),
                     ),
                     _ => Ok(()),
                 }
             }
-            MachineProfile::OctaneIp30 => Ok(()),
+            MachineProfile::OctaneIp30 => self.octane_virtio_slots().map(|_| ()),
             MachineProfile::O2Ip32 => Err(
                 "[virtio_9p] is not wired on the O2: the MACE PCI bridge has no interrupt route for a third slot".into(),
             ),
@@ -3178,10 +3241,35 @@ impl MachineConfig {
         }
     }
 
+    /// The Octane's onboard Bridge slots for virtio-serial and virtio-9p, as
+    /// `bridge_slot` names them or by default 4 and 5. Slots 0 to 3 hold the
+    /// board's own devices; two enabled devices cannot share a slot.
+    pub fn octane_virtio_slots(&self) -> Result<(u8, u8), String> {
+        let serial = self.virtio_serial.bridge_slot.unwrap_or(7);
+        let p9 = self.virtio_9p.bridge_slot.unwrap_or(5);
+        for (name, slot, enabled) in [("virtio_serial", serial, self.virtio_serial.enabled), ("virtio_9p", p9, self.virtio_9p.enabled)] {
+            if enabled && !(4..=7).contains(&slot) {
+                return Err(format!("[{name}] bridge_slot = {slot}: the Octane's Bridge has slots 4 to 7 free"));
+            }
+        }
+        if self.virtio_serial.enabled && self.virtio_9p.enabled && serial == p9 {
+            return Err(format!("[virtio_serial] and [virtio_9p] are both in Bridge slot {serial}"));
+        }
+        Ok((serial, p9))
+    }
+
     /// The serial channels' TCP ports (A, B), defaults filled in.
     pub fn serial_ports(&self) -> [u16; 2] {
         let [a, b] = crate::dev::z85c30::DEFAULT_PORTS;
         [self.serial_port_a.unwrap_or(a), self.serial_port_b.unwrap_or(b)]
+    }
+
+    /// Parse a config file's text as [`try_load`](Self::try_load) does, for
+    /// front ends that read the file themselves: remembers whether it set
+    /// `banks` and `[jitv2] threads`, folds in older spellings and settles
+    /// an unset thread count.
+    pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
+        Self::parse_toml(text)
     }
 
     /// Parse a config file's text, remembering whether it listed `banks`, and
@@ -3196,13 +3284,34 @@ impl MachineConfig {
         Ok(cfg)
     }
 
-    /// Give an unset `[jitv2] threads` one compile thread per guest CPU, at
-    /// most `AUTO_JITV2_THREADS_MAX`. Each CPU asks for its own pages, and a
-    /// single thread kept a 4-CPU Tezro's boot waiting on compiles.
+    /// Give an unset `[jitv2] threads` a size that fits both the guest and
+    /// the host, and record why (for `j2 threads`). Each CPU asks for its
+    /// own pages, so the pool wants one worker per guest CPU — the host's
+    /// usable CPUs cap that, one held back for the device threads; see
+    /// [`auto_jitv2_threads`].
     pub fn settle_jitv2_threads(&mut self) {
-        if !self.jitv2_threads_set {
-            self.jitv2.threads = (self.machine.cpus() as usize).clamp(1, AUTO_JITV2_THREADS_MAX);
+        let (threads, reason) = self.jitv2_pool_size();
+        self.jitv2.threads = threads;
+        self.jitv2_threads_reason = reason;
+    }
+
+    /// The compile-pool size this configuration asks for, and why. An
+    /// explicit `[jitv2] threads` (or `--jitv2-threads`) wins; otherwise
+    /// the size follows the guest's CPU count and the host's usable CPUs
+    /// (see [`auto_jitv2_threads`]).
+    ///
+    /// The machine builders ask here rather than reading
+    /// [`Self::jitv2`]'s `threads` field, so a configuration built in code
+    /// (never parsed, never settled) still gets the auto size.
+    pub fn jitv2_pool_size(&self) -> (usize, String) {
+        if self.jitv2_threads_set {
+            // Not clamped here: an explicit 0 has to reach `validate`,
+            // which rejects it. The pool itself clamps to at least one
+            // worker (see `CompileQueue::set_thread_count`).
+            let threads = self.jitv2.threads;
+            return (threads, format!("set explicitly ({threads} worker(s))"));
         }
+        auto_jitv2_threads(self.machine.cpus() as usize, host_parallelism())
     }
 
     /// Load from `iris.toml` if it exists, otherwise return defaults.
@@ -3320,6 +3429,18 @@ impl MachineConfig {
             self.port_forward.extend(forwards);
             moved.push("o2.forwards -> [[port_forward]]");
         }
+        if let Some(impact) = self.impact.take() {
+            let board = match impact.gfx.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("solid") => Some(GraphicsBoard::SolidImpact),
+                Some("high") => Some(GraphicsBoard::HighImpact),
+                Some("max") => Some(GraphicsBoard::MaxImpact),
+                _ => None,
+            };
+            if let Some(board) = board {
+                if self.graphics.board.is_none() { self.graphics.board = Some(board); }
+                eprintln!("iris: deprecated [impact] gfx folded into [graphics] board = \"{}\"; move it in the config to silence this", board.as_str());
+            }
+        }
         if !moved.is_empty() {
             eprintln!(
                 "iris: deprecated [o2] keys folded into the shared settings ({}); move them in the config to silence this",
@@ -3339,45 +3460,27 @@ impl MachineConfig {
     /// 4 GiB default when `banks` was never set (the generic default names a
     /// bank size no Tezro takes, so a `banks` equal to it is a mistake to
     /// report, not a request for the default).
-    pub fn tezro_memory(&self) -> Result<crate::ip53_machine::MemoryPopulation, String> {
-        use crate::ip53_machine::MemoryPopulation;
+    pub fn tezro_memory(&self) -> Result<Vec<u32>, String> {
         if !self.banks_set && self.banks == default_banks() {
-            return Ok(MemoryPopulation::default());
+            return Ok(crate::ip53_machine::DEFAULT_BANKS_MIB.to_vec());
         }
         let n = self.banks.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         if let Some(gap) = self.banks[..n].iter().position(|&b| b == 0) {
             return Err(format!("banks: bank {gap} is empty but a later bank is populated; fill the banks from 0"));
         }
-        MemoryPopulation::from_mib(&self.banks[..n]).map_err(|e| format!("banks: {e}"))
+        crate::ip53_machine::check_banks(&self.banks[..n]).map_err(|e| format!("banks: {e}"))?;
+        Ok(self.banks[..n].to_vec())
     }
 
-    /// The keys of the section that configures an IP35 brick machine:
-    /// `[origin3200]`, or `[onyx3000]` read as the same keys with one C-brick.
-    pub fn ip35_section(&self) -> Origin3200Section {
-        if self.machine.profile != MachineProfile::Onyx3000Ip35 {
-            return self.origin3200.clone();
-        }
-        let s = &self.onyx3000;
-        Origin3200Section {
-            c_bricks: default_c_bricks(),
-            flash: s.flash.clone(),
-            console: s.console,
-            l1_port: s.l1_port,
-            l1_log: s.l1_log.clone(),
-            l1_revision: s.l1_revision.clone(),
-            brick_serial: s.brick_serial.clone(),
-        }
-    }
-
-    /// The name of the section that configures an IP35 brick machine.
-    pub fn ip35_section_name(&self) -> &'static str {
-        if self.machine.profile == MachineProfile::Onyx3000Ip35 { "onyx3000" } else { "origin3200" }
+    /// The section that configures an IP35 brick machine: `[origin3200]` or `[onyx3000]`.
+    pub fn ip35_section(&self) -> &Ip35Section {
+        if self.machine.profile == MachineProfile::Onyx3000Ip35 { &self.onyx3000 } else { &self.origin3200 }
     }
 
     /// The memory of each C-brick of an Origin 3200 in MiB: `banks` from
     /// locational bank 0, or the C-brick's 512 MiB default (two 256 MiB banks)
     /// when `banks` was never set.
-    pub fn origin3200_banks(&self) -> Result<Vec<u32>, String> {
+    pub fn ip35_banks(&self) -> Result<Vec<u32>, String> {
         if !self.banks_set && self.banks == default_banks() {
             return Ok(vec![256, 256]);
         }
@@ -3394,24 +3497,45 @@ impl MachineConfig {
         Ok(banks.to_vec())
     }
 
-    /// Validate bank sizes, returns a description of any errors.
-    /// The graphics board: `[graphics] board`, or the machine's default
-    /// (Solid IMPACT on Octane, none on Fuel, Newport elsewhere).
+    /// The configured graphics board, or `GraphicsBoard::default_for` this profile.
     pub fn graphics_board(&self) -> GraphicsBoard {
         self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
     }
 
-    /// Newport's authoritative GPU raster is not selectable until M3.
-    /// Keep this separate so checked machine construction also enforces it
-    /// when a caller has not run the full configuration validation.
+    /// Validate Newport's authoritative GPU mode independently so checked
+    /// machine construction enforces it even without full config validation.
     pub(crate) fn validate_newport_raster_gate(&self) -> Result<(), String> {
-        if self.graphics.raster == RasterUnit::Wgpu
-            && self.graphics_board() == GraphicsBoard::Newport
+        let newport = self.graphics_board() == GraphicsBoard::Newport;
+        if self.graphics.newport_mode.is_some()
+            && (!newport || self.graphics.raster != RasterUnit::Wgpu)
         {
             return Err(
-                "graphics.raster = \"wgpu\" is not available for Newport yet; \
-                 the resident backend remains gated until M3. A rex-gpu build may use \
-                 IRIS_REX3_GPU for the legacy experimental prototype"
+                "graphics.newport_mode applies only to graphics.board = \"newport\" \
+                 with graphics.raster = \"wgpu\""
+                    .into(),
+            );
+        }
+        if self.graphics.raster != RasterUnit::Wgpu || !newport {
+            return Ok(());
+        }
+        if !cfg!(feature = "wgpu") {
+            return Err("graphics.raster = \"wgpu\" needs a build with the wgpu feature".into());
+        }
+        if matches!(self.graphics.gpu_backend.as_str(), "metal" | "gl") {
+            return Err(format!(
+                "Newport graphics.raster = \"wgpu\" supports only validated Vulkan and \
+                 D3D12 devices; graphics.gpu_backend {:?} is not supported",
+                self.graphics.gpu_backend
+            ));
+        }
+        let visible_window = !self.headless && (!self.ci || self.ci_display);
+        if visible_window
+            && self.graphics.newport_wgpu_mode() == NewportWgpuMode::Direct
+            && self.renderer != UiRenderer::Wgpu
+        {
+            return Err(
+                "Newport direct wgpu raster requires renderer = \"wgpu\"; select \
+                 graphics.newport_mode = \"readback\" explicitly for GL/CPU compatibility"
                     .into(),
             );
         }
@@ -3440,7 +3564,7 @@ impl MachineConfig {
         self.machine.cpu = Some(part.name());
     }
 
-    /// The table an SN0 product reads, named for it; `None` for the other
+    /// The table an IP27 product reads, named for it; `None` for the other
     /// machines.
     pub fn ip27_section(&self) -> Option<&Ip27Section> {
         match self.machine.profile {
@@ -3451,21 +3575,26 @@ impl MachineConfig {
         }
     }
 
-    /// Refuse an SN0 table that is not the profile's own, and `nodes` where
-    /// the product has one node board.
+    /// Refuse an IP27 table that is not the profile's own, and `nodes` outside what the product
+    /// takes: one for the Origin 200, one or two for the desksides.
     fn validate_ip27_sections(&self) -> Result<(), String> {
         let profile = self.machine.profile;
         for (name, section) in [("origin200", &self.origin200), ("origin2000", &self.origin2000), ("onyx2", &self.onyx2)] {
-            if section.is_default() || profile.ip27_table() == Some(name) {
+            if section.is_default() || profile.table_name() == Some(name) {
                 continue;
             }
-            return Err(match profile.ip27_table() {
+            return Err(match profile.table_name().filter(|_| profile.is_ip27()) {
                 Some(own) => format!("[{name}] does not apply to machine.profile {}, which reads [{own}]: rename the table", profile.name()),
                 None => format!("[{name}] is set but machine.profile is {}", profile.name()),
             });
         }
         if profile == MachineProfile::Origin200Ip29 && self.origin200.nodes != default_ip27_nodes() {
             return Err("origin200.nodes: an Origin 200 has one node board".into());
+        }
+        if let (Some(table), Some(section)) = (profile.table_name(), self.ip27_section()) {
+            if matches!(profile, MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) && !(1..=2).contains(&section.nodes) {
+                return Err(format!("{table}.nodes {} is invalid (valid: 1, 2)", section.nodes));
+            }
         }
         if profile == MachineProfile::Origin200Ip29 && self.origin200.io_prom.is_some() {
             return Err("origin200.io_prom: an Origin 200 has no BaseIO card".into());
@@ -3505,8 +3634,8 @@ impl MachineConfig {
                     format!("graphics.board \"{name}\" is not modelled on the Onyx 3000 (valid: ir3, v12)")
                 } else if self.machine.profile == MachineProfile::Onyx2Ip27 {
                     format!("graphics.board \"{name}\" is not modelled on the Onyx2 (valid: ir2, ir2:2rm, ir2e, ir2e:2rm, none)")
-                } else if let Some(product) = self.machine.profile.ip27_name() {
-                    format!("graphics.board \"{name}\" is not modelled on the {product} (valid: none)")
+                } else if self.machine.profile.is_ip27() {
+                    format!("graphics.board \"{name}\" is not modelled on the {} (valid: none)", self.machine.profile.product_name().unwrap_or_default())
                 } else if self.machine.profile == MachineProfile::FuelIp34 {
                     format!("graphics.board \"{name}\" is not a Fuel board (valid: v12, v10, none)")
                 } else {
@@ -3562,7 +3691,10 @@ impl MachineConfig {
                 ));
             }
             if dev.is_daynaport() && (matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) || self.machine.profile.is_ip27()) {
-                let on = self.machine.profile.ip27_name().map_or_else(|| self.machine.profile.label().to_string(), |p| format!("the {p}"));
+                let on = match self.machine.profile.product_name().filter(|_| self.machine.profile.is_ip27()) {
+                    Some(p) => format!("the {p}"),
+                    None => self.machine.profile.label().to_string(),
+                };
                 return Err(format!(
                     "scsi.{}: kind = \"daynaport\" is not available on {on} (its Ethernet is built in)", key
                 ));
@@ -3605,7 +3737,8 @@ impl MachineConfig {
                 }
             }
             crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
-        } else if let Some(name) = self.machine.profile.ip27_name() {
+        } else if self.machine.profile.is_ip27() {
+            let name = self.machine.profile.product_name().unwrap_or_default();
             // The node has four banks of a DIMM pair each, filled from
             // bank 0 without a gap.
             let banks = &self.banks[..bank_count];
@@ -3642,16 +3775,19 @@ impl MachineConfig {
             }
         } else if self.machine.profile.is_ip35_bricks() {
             let section = self.ip35_section();
-            let name = self.ip35_section_name();
+            let name = self.machine.profile.table_name().unwrap_or_default();
             let onyx = self.machine.profile == MachineProfile::Onyx3000Ip35;
             if onyx {
+                if section.c_bricks != default_c_bricks() {
+                    return Err("onyx3000.c_bricks is not a key of the Onyx 3000".into());
+                }
                 if let Some((product, _)) = board.kona() {
                     product.spec().check_host(crate::dev::kona::KonaHost::Onyx3000)?;
                 }
             } else if !(1..=2).contains(&section.c_bricks) {
                 return Err(format!("origin3200.c_bricks {} is invalid (valid: 1, 2)", section.c_bricks));
             }
-            self.origin3200_banks()?;
+            self.ip35_banks()?;
             if !board.supports(self.machine.profile) {
                 return Err(if onyx {
                     format!("graphics.board \"{}\" is not modelled on the Onyx 3000 (valid: ir3, v12)", board.as_str())
@@ -3670,7 +3806,7 @@ impl MachineConfig {
                 return Err(format!("[machine] cpus = {} is not a Tezro board's population (valid: {TEZRO_CPUS:?})", self.machine.cpus()));
             }
             crate::ip53_machine::chip(self.cpu()).accepts_cpus(self.machine.cpus())?;
-            self.tezro_memory()?.check_for_cpus(usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
+            crate::ip53_machine::check_banks_for_cpus(&self.tezro_memory()?, usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
             if !board.supports(MachineProfile::TezroIp53) {
                 return Err(format!("graphics.board \"{}\" is not a Tezro board (valid: v12, none)", board.as_str()));
             }
@@ -3847,7 +3983,7 @@ impl MachineConfig {
         use crate::identity::{default_mac, KIND};
         match self.machine.profile {
             MachineProfile::FuelIp34 | MachineProfile::TezroIp53 if self.machine.emu_id != 0 => {
-                default_mac(KIND, self.machine.emu_id, 0).expect("node 0 always fits the default address")
+                default_mac(KIND, self.machine.emu_id, 0).expect("node 0 always holds the default address")
             }
             _ => DEFAULT_MAC,
         }
@@ -3951,7 +4087,8 @@ pub struct Cli {
     #[arg(long)]
     pub bank3: Option<u32>,
 
-    /// jitv2 compile-pool thread count (fixed at startup, see jitv2.threads)
+    /// jitv2 compile-pool threads (default: one per guest CPU, at most 4,
+    /// fewer on a small host; see jitv2.threads)
     #[arg(long = "jitv2-threads", value_name = "N")]
     pub jitv2_threads: Option<usize>,
 
@@ -4013,15 +4150,15 @@ pub struct Cli {
     #[arg(long = "2x", default_value_t = false)]
     pub scale2x: bool,
 
-    /// Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable)
+    /// Suppress the standalone window (platform-specific graphics/console behavior; audio unaffected)
     #[arg(long, default_value_t = false)]
     pub headless: bool,
 
-    /// Disable audio emulation (no HAL2); graphics still works
+    /// Disable host audio output; graphics is unaffected
     #[arg(long = "noaudio", default_value_t = false)]
     pub no_audio: bool,
 
-    /// Host audio system: default, pulse, wasapi, coreaudio or null (overrides [audio] host)
+    /// Host audio system: default, pulse, wasapi, coreaudio or null (overrides `[audio] host`)
     #[arg(long = "audio-host", value_enum, value_name = "HOST")]
     pub audio_host: Option<AudioHost>,
 
@@ -4036,7 +4173,7 @@ pub struct Cli {
 
     /// Networking backend: "nat" (default, software gateway), "pcap"
     /// (bridge onto a real host interface; requires --features pcap),
-    /// "stream" (a private segment; needs [network] stream) or "off".
+    /// "stream" (a private segment; needs `[network] stream`) or "off".
     #[arg(long = "net-mode", value_name = "MODE")]
     pub net_mode: Option<NetMode>,
 
@@ -4061,14 +4198,16 @@ pub struct Cli {
     #[arg(long = "no-scsi-deferred-int", default_value_t = false)]
     pub no_scsi_deferred_int: bool,
 
-    /// Emulated CPU: a family (`r4400` (default), `r5000`, `r10000`, `r12000` or `r14000`) or a chip (`r14000_600`). Overrides `[machine] cpu`.
+    /// Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000` or `r16000`) or a chip (`r14000_600`); default: the machine's first. Overrides `[machine] cpu`.
     ///
     /// Every model is compiled into every build — each is its own
     /// monomorphisation, so the hot path carries no per-model branch — and this
     /// picks between them at construction. The `r5k` Cargo feature is removed.
     /// A family means the machine's chip of that family. The Indy and
     /// `indigo2_ip22` take `r4400` and `r5000`; the IP28 `r10000`; the Octane
-    /// `r10000`, `r12000` and `r14000`; the O2 `r5000`, `r10000` and `r12000`.
+    /// `r10000`, `r12000` and `r14000`; the O2 `r5000`, `r10000` and `r12000`;
+    /// the SN0 machines `r10000` and `r12000`; the Fuel `r14000`; the Tezro
+    /// `r16000`; the Origin 3200 and Onyx 3000 `r12000`.
     #[arg(long = "cpu", value_name = "MODEL")]
     pub cpu: Option<String>,
 
@@ -4078,20 +4217,24 @@ pub struct Cli {
     #[arg(long = "cache", value_name = "MODEL")]
     pub cache: Option<CacheModel>,
 
-    /// Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`).
+    /// Graphics board: `newport`, `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12`, `ir2`, `ir2:2rm`, `ir2e`, `ir2e:2rm`, `ir3` or `none`; default: the machine's own.
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
     pub graphics: Option<GraphicsBoard>,
 
-    /// VPro and IMPACT: where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
+    /// Where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
     #[arg(long = "raster", value_name = "UNIT")]
     pub raster: Option<RasterUnit>,
+
+    /// Newport wgpu presentation: `direct` (default, same-device wgpu) or explicit `readback` compatibility.
+    #[arg(long = "newport-mode", value_name = "MODE")]
+    pub newport_mode: Option<NewportWgpuMode>,
 
     /// What draws the window: `gl` (default) or `wgpu` (needs a build with the `wgpu` feature).
     #[arg(long = "renderer", value_name = "RENDERER")]
     pub renderer: Option<UiRenderer>,
 
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
-    /// Connect with: target remote localhost:<port>
+    /// Connect with: `target remote localhost:<port>`
     #[arg(long = "gdb-port", value_name = "PORT")]
     pub gdb_port: Option<u16>,
 
@@ -4223,7 +4366,7 @@ pub struct Cli {
     #[arg(long = "serial-log-b", value_name = "FILE")]
     pub serial_log_b: Option<String>,
 
-    /// Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28).
+    /// Override CP0 Count MHz (default: half the CPU's clock, e.g. 75 on a 150 MHz R4400).
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
     pub clock_fixed_mhz: Option<f64>,
@@ -4286,6 +4429,7 @@ impl Cli {
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
         if let Some(r) = self.raster { cfg.graphics.raster = r; }
+        if let Some(m) = self.newport_mode { cfg.graphics.newport_mode = Some(m); }
         if let Some(r) = self.renderer { cfg.renderer = r; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
@@ -4457,31 +4601,56 @@ mod export_tests {
     }
 
     #[test]
-    fn newport_rejects_the_unimplemented_wgpu_raster_selection() {
+    fn newport_resident_wgpu_raster_requires_the_feature_and_direct_renderer() {
         let mut cfg = MachineConfig::default();
         cfg.graphics.raster = RasterUnit::Wgpu;
         let error = cfg.validate().unwrap_err();
-        assert!(
-            error.contains("not available for Newport yet")
-                && error.contains("until M3")
-                && error.contains("IRIS_REX3_GPU"),
-            "{error}"
-        );
+        if cfg!(feature = "wgpu") {
+            assert!(error.contains("renderer = \"wgpu\""), "{error}");
+        } else {
+            assert!(error.contains("wgpu feature"), "{error}");
+        }
+        cfg.renderer = UiRenderer::Wgpu;
+        if cfg!(feature = "wgpu") {
+            cfg.validate().expect("direct Newport wgpu selection");
+        } else {
+            assert!(cfg.validate().unwrap_err().contains("wgpu feature"));
+        }
     }
 
     #[test]
-    fn newport_resident_raster_has_no_toml_or_cli_selector() {
-        assert_eq!(
-            <RasterUnit as clap::ValueEnum>::value_variants(),
-            &[RasterUnit::Cpu, RasterUnit::Wgpu]
-        );
-        assert!(toml::from_str::<MachineConfig>("[graphics]\nraster = \"resident\"\n").is_err());
-        assert!(Cli::try_parse_from(["iris", "--raster", "resident"]).is_err());
+    fn newport_readback_mode_is_explicit_in_toml_and_cli() {
+        let toml_cfg: MachineConfig = toml::from_str(
+            "[graphics]\nraster = \"wgpu\"\nnewport_mode = \"readback\"\n",
+        ).unwrap();
+        assert_eq!(toml_cfg.graphics.newport_wgpu_mode(), NewportWgpuMode::Readback);
+        if cfg!(feature = "wgpu") {
+            toml_cfg.validate().expect("explicit readback compatibility");
+        } else {
+            assert!(toml_cfg.validate().unwrap_err().contains("wgpu feature"));
+        }
 
-        let toml_cfg: MachineConfig = toml::from_str("[graphics]\nraster = \"wgpu\"\n").unwrap();
-        assert!(toml_cfg.validate().unwrap_err().contains("until M3"));
-        let cli = Cli::try_parse_from(["iris", "--raster", "wgpu"]).unwrap();
-        assert!(cli.apply(MachineConfig::default()).validate().unwrap_err().contains("until M3"));
+        let cli = Cli::try_parse_from([
+            "iris", "--raster", "wgpu", "--newport-mode", "direct", "--renderer", "wgpu",
+        ]).unwrap();
+        let cfg = cli.apply(MachineConfig::default());
+        assert_eq!(cfg.graphics.newport_wgpu_mode(), NewportWgpuMode::Direct);
+        if cfg!(feature = "wgpu") {
+            cfg.validate().expect("direct CLI selection");
+        } else {
+            assert!(cfg.validate().unwrap_err().contains("wgpu feature"));
+        }
+    }
+
+    #[test]
+    fn newport_mode_is_rejected_when_it_cannot_apply() {
+        let mut cfg = MachineConfig::default();
+        cfg.graphics.newport_mode = Some(NewportWgpuMode::Readback);
+        let error = cfg.validate().unwrap_err();
+        assert!(error.contains("applies only"), "{error}");
+        cfg.graphics.raster = RasterUnit::Wgpu;
+        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
+        assert!(cfg.validate().unwrap_err().contains("applies only"));
     }
 
     #[test]
@@ -4495,9 +4664,29 @@ mod export_tests {
         cfg.graphics.board = Some(GraphicsBoard::V10);
         assert!(cfg.validate_newport_raster_gate().is_ok());
         cfg.graphics.board = Some(GraphicsBoard::Newport);
-        assert!(cfg.validate_newport_raster_gate().is_err());
+        cfg.renderer = UiRenderer::Wgpu;
+        assert_eq!(
+            cfg.validate_newport_raster_gate().is_ok(),
+            cfg!(feature = "wgpu")
+        );
         cfg.graphics.raster = RasterUnit::Cpu;
         assert!(cfg.validate_newport_raster_gate().is_ok());
+    }
+
+    #[test]
+    fn newport_wgpu_rejects_unvalidated_backends() {
+        let mut cfg = MachineConfig::default();
+        cfg.graphics.raster = RasterUnit::Wgpu;
+        cfg.renderer = UiRenderer::Wgpu;
+        for backend in ["metal", "gl"] {
+            cfg.graphics.gpu_backend = backend.into();
+            let error = cfg.validate_newport_raster_gate().unwrap_err();
+            if cfg!(feature = "wgpu") {
+                assert!(error.contains("only validated Vulkan and D3D12"), "{error}");
+            } else {
+                assert!(error.contains("wgpu feature"), "{error}");
+            }
+        }
     }
 
     /// IDs 1 to 15 are valid on the Octane's wide buses, and 1 to 7 on the
@@ -4543,7 +4732,7 @@ mod export_tests {
         assert_eq!(octane(&format!("{shoehorn}{shoehorn}widget = 10\n")).xio_widgets().unwrap(), [12, 10]);
         assert!(octane(&format!("{shoehorn}widget = 13\n")).validate().unwrap_err().contains("not an Octane XIO slot"), "13 is the module's");
         assert!(octane(&format!("{shoehorn}widget = 9\n{shoehorn}widget = 9\n")).validate().unwrap_err().contains("named twice"));
-        // The graphics board's slot is its own; with none fitted it is free.
+        // The graphics board's slot is its own; with none attached it is free.
         let mut with_graphics = octane(&format!("{shoehorn}widget = 11\n"));
         with_graphics.validate().expect("no graphics board in 11");
         with_graphics.graphics.board = Some(GraphicsBoard::SolidImpact);
@@ -4836,18 +5025,72 @@ mod export_tests {
     }
 
     #[test]
-    fn jitv2_threads_follow_the_cpus_unless_set() {
+    fn jitv2_threads_follow_the_guest_and_the_host_unless_set() {
         let parse = |t: &str| MachineConfig::parse_toml(t).expect("parse");
-        assert_eq!(parse("").jitv2.threads, 1);
-        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\ncpus = 2\n").jitv2.threads, 2);
-        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n").jitv2.threads, 4);
+        // The auto size depends on the host, so compare against what this
+        // host would choose rather than a fixed number.
+        let auto = |guest: usize| auto_jitv2_threads(guest, host_parallelism()).0;
+        assert_eq!(parse("").jitv2.threads, auto(1));
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\ncpus = 2\n").jitv2.threads, auto(2));
+        assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n").jitv2.threads, auto(4));
         assert_eq!(parse("[machine]\nprofile = \"tezro_ip53\"\n[jitv2]\nthreads = 1\n").jitv2.threads, 1);
 
         use clap::Parser;
         let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53"]).expect("parse flags");
-        assert_eq!(cli.apply(parse("")).jitv2.threads, 4, "--machine changes the CPU count");
+        assert_eq!(cli.apply(parse("")).jitv2.threads, auto(4), "--machine changes the CPU count");
         let cli = Cli::try_parse_from(["iris", "--machine", "tezro_ip53", "--jitv2-threads", "2"]).expect("parse flags");
         assert_eq!(cli.apply(parse("")).jitv2.threads, 2);
+    }
+
+    /// The auto pool size has to fit the host: the pool takes what the
+    /// host's usable CPUs leave after the device threads' reserve — but
+    /// never nothing, or nothing would ever compile. The guest's own CPU
+    /// threads do not come out of the pool's budget: they are the ones
+    /// waiting for the compiles, and they keep running the interpreter
+    /// while the pool works.
+    #[test]
+    fn the_auto_pool_size_fits_the_host() {
+        // A host with room: one worker per guest CPU, up to the cap.
+        assert_eq!(auto_jitv2_threads(1, 16).0, 1);
+        assert_eq!(auto_jitv2_threads(2, 16).0, 2);
+        assert_eq!(auto_jitv2_threads(4, 16).0, 4);
+        assert_eq!(auto_jitv2_threads(8, 16).0, AUTO_JITV2_THREADS_MAX);
+        // A small host (4 logical CPUs, as an i3-4130 has): the guest's
+        // CPUs do not come out of the pool's budget, only the device
+        // threads' one-CPU reserve does.
+        assert_eq!(auto_jitv2_threads(2, 4).0, 2);
+        assert_eq!(auto_jitv2_threads(4, 4).0, 3);
+        // Two logical CPUs: one CPU for the device threads, one for the
+        // pool.
+        assert_eq!(auto_jitv2_threads(2, 2).0, 1);
+        assert_eq!(auto_jitv2_threads(1, 2).0, 1);
+        // Never zero: a pool with no workers would compile nothing and the
+        // guest would run the interpreter forever.
+        assert_eq!(auto_jitv2_threads(4, 1).0, 1);
+        // The reason says where the number came from.
+        assert!(auto_jitv2_threads(2, 16).1.contains("one worker per guest CPU"));
+        assert!(auto_jitv2_threads(4, 4).1.contains("3 of 4 workers"), "{}", auto_jitv2_threads(4, 4).1);
+        assert!(auto_jitv2_threads(4, 4).1.contains("device threads"), "{}", auto_jitv2_threads(4, 4).1);
+    }
+
+    /// An explicitly set pool size wins over the auto size, and says so.
+    #[test]
+    fn an_explicit_pool_size_wins_and_says_so() {
+        let parse = |t: &str| MachineConfig::parse_toml(t).expect("parse");
+        let cfg = parse("[jitv2]\nthreads = 3\n");
+        let (threads, reason) = cfg.jitv2_pool_size();
+        assert_eq!(threads, 3);
+        assert!(reason.contains("set explicitly"), "{reason}");
+        assert!(cfg.jitv2_threads_reason.contains("set explicitly"), "{}", cfg.jitv2_threads_reason);
+        // An explicit 0 is not silently clamped away: `validate` still
+        // refuses it.
+        let mut zero = MachineConfig::default();
+        zero.scsi.clear();
+        zero.jitv2.threads = 0;
+        zero.jitv2_threads_set = true;
+        assert_eq!(zero.jitv2_pool_size().0, 0, "an explicit 0 must not be clamped");
+        let err = zero.validate().unwrap_err();
+        assert!(err.contains("jitv2.threads"), "{err}");
     }
 
     #[test]
@@ -5051,72 +5294,86 @@ mod export_tests {
         }
     }
 
-    fn sn0(profile: &str, tables: &str) -> MachineConfig {
+    fn ip27_config(profile: &str, tables: &str) -> MachineConfig {
         toml::from_str(&format!("[machine]\nprofile = \"{profile}\"\n{tables}")).unwrap()
     }
 
-    /// Each SN0 product reads the table named for it, and only that one.
+    /// Each IP27 product reads the table named for it, and only that one.
     #[test]
-    fn each_sn0_product_reads_its_own_table() {
+    fn each_ip27_product_reads_its_own_table() {
         for (profile, table) in [("origin200_ip29", "origin200"), ("origin2000_ip27", "origin2000"), ("onyx2_ip27", "onyx2")] {
-            let cfg = sn0(profile, &format!("[{table}]\nflash = \"f\"\ncontroller_store = \"c\"\n"));
+            let cfg = ip27_config(profile, &format!("[{table}]\nflash = \"f\"\ncontroller_store = \"c\"\n"));
             cfg.validate().unwrap();
             let section = cfg.ip27_section().unwrap();
             assert_eq!((section.flash.as_deref(), section.controller_store.as_deref()), (Some("f"), Some("c")), "{profile}");
-            assert_eq!(cfg.machine.profile.ip27_table(), Some(table));
+            assert_eq!(cfg.machine.profile.table_name(), Some(table));
         }
-        assert!(sn0("octane_ip30", "").ip27_section().is_none());
+        assert!(ip27_config("octane_ip30", "").ip27_section().is_none());
     }
 
     /// A table is written to a saved config only for the product that sets it.
     #[test]
-    fn only_the_products_own_sn0_table_is_written() {
-        let cfg = sn0("onyx2_ip27", "[onyx2]\nnodes = 2\n");
+    fn only_the_products_own_ip27_table_is_written() {
+        let cfg = ip27_config("onyx2_ip27", "[onyx2]\nnodes = 2\n");
         let text = toml::to_string(&cfg).unwrap();
         assert!(text.contains("[onyx2]") && !text.contains("[origin"), "{text}");
         let back: MachineConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.onyx2.nodes, 2);
-        assert!(!toml::to_string(&sn0("origin200_ip29", "")).unwrap().contains("[origin"));
+        assert!(!toml::to_string(&ip27_config("origin200_ip29", "")).unwrap().contains("[origin"));
     }
 
     /// The Onyx2 once read `[origin2000]`; a file that still says so is told
     /// what to rename, and so is any other table that is not the profile's.
     #[test]
-    fn a_table_for_another_sn0_product_is_refused() {
-        let e = sn0("onyx2_ip27", "[origin2000]\nnodes = 2\n").validate().unwrap_err();
+    fn a_table_for_another_ip27_product_is_refused() {
+        let e = ip27_config("onyx2_ip27", "[origin2000]\nnodes = 2\n").validate().unwrap_err();
         assert!(e.contains("[origin2000]") && e.contains("reads [onyx2]") && e.contains("rename"), "{e}");
-        let e = sn0("origin2000_ip27", "[origin200]\nflash = \"f\"\n").validate().unwrap_err();
+        let e = ip27_config("origin2000_ip27", "[origin200]\nflash = \"f\"\n").validate().unwrap_err();
         assert!(e.contains("[origin200]") && e.contains("reads [origin2000]"), "{e}");
-        let e = sn0("origin200_ip29", "[origin2000]\nflash = \"f\"\n").validate().unwrap_err();
+        let e = ip27_config("origin200_ip29", "[origin2000]\nflash = \"f\"\n").validate().unwrap_err();
         assert!(e.contains("[origin2000]") && e.contains("reads [origin200]"), "{e}");
-        let e = sn0("octane_ip30", "[onyx2]\nflash = \"f\"\n").validate().unwrap_err();
+        let e = ip27_config("octane_ip30", "[onyx2]\nflash = \"f\"\n").validate().unwrap_err();
         assert!(e.contains("[onyx2]") && e.contains("octane_ip30"), "{e}");
     }
 
-    /// The three SN0 machines answer `is_ip27` and nothing else does, and a
+    /// The deskside tables take one or two node boards; the refusal names the table.
+    #[test]
+    fn the_deskside_has_one_or_two_node_boards() {
+        for (profile, table) in [("origin2000_ip27", "origin2000"), ("onyx2_ip27", "onyx2")] {
+            for nodes in [1, 2] {
+                ip27_config(profile, &format!("[{table}]\nnodes = {nodes}\n")).validate().unwrap();
+            }
+            for nodes in [0, 3] {
+                let e = ip27_config(profile, &format!("[{table}]\nnodes = {nodes}\n")).validate().unwrap_err();
+                assert!(e.contains(&format!("{table}.nodes {nodes} is invalid (valid: 1, 2)")), "{e}");
+            }
+        }
+    }
+
+    /// The three IP27 machines answer `is_ip27` and nothing else does, and a
     /// refusal that names the machine names the one configured.
     #[test]
-    fn refusals_name_the_sn0_machine_configured() {
-        let sn0_profiles: Vec<_> = MachineProfile::EVERY.into_iter().filter(|p| p.is_ip27()).collect();
-        assert_eq!(sn0_profiles, [MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27]);
+    fn refusals_name_the_ip27_machine_configured() {
+        let ip27_profiles: Vec<_> = MachineProfile::EVERY.into_iter().filter(|p| p.is_ip27()).collect();
+        assert_eq!(ip27_profiles, [MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27]);
         for (profile, product) in [("origin200_ip29", "Origin 200"), ("origin2000_ip27", "Origin 2000"), ("onyx2_ip27", "Onyx2")] {
-            let e = sn0(profile, "[scsi.4]\nkind = \"daynaport\"\n").validate().unwrap_err();
+            let e = ip27_config(profile, "[scsi.4]\nkind = \"daynaport\"\n").validate().unwrap_err();
             assert!(e.contains(&format!("not available on the {product} ")), "{e}");
-            let e = sn0(profile, "[graphics]\nboard = \"v12\"\n").validate().unwrap_err();
+            let e = ip27_config(profile, "[graphics]\nboard = \"v12\"\n").validate().unwrap_err();
             assert!(e.contains(&format!("not modelled on the {product} ")), "{e}");
-            let e = sn0(profile, "[virtio_serial]\nenabled = true\n").validate().unwrap_err();
+            let e = ip27_config(profile, "[virtio_serial]\nenabled = true\n").validate().unwrap_err();
             assert!(e.contains(&format!("not wired on the {product}")), "{e}");
         }
     }
 
     #[test]
     fn network_off_and_a_second_scsi_controller_name_the_machines_that_take_them() {
-        let mut cfg = sn0("indy_ip24", "");
+        let mut cfg = ip27_config("indy_ip24", "");
         cfg.network.mode = NetMode::Off;
         let e = cfg.validate().unwrap_err();
         assert!(e.contains("the Origin 200, the Origin 2000 and the Onyx2"), "{e}");
-        sn0("onyx2_ip27", "[network]\nmode = \"off\"\n").validate().unwrap();
-        let e = sn0("indy_ip24", "[scsi.17]\npath = \"d.raw\"\n").validate().unwrap_err();
+        ip27_config("onyx2_ip27", "[network]\nmode = \"off\"\n").validate().unwrap();
+        let e = ip27_config("indy_ip24", "[scsi.17]\npath = \"d.raw\"\n").validate().unwrap_err();
         for p in MachineProfile::EVERY.into_iter().filter(|p| p.scsi_controllers() > 1) {
             assert!(e.contains(p.name()), "{e}");
         }
@@ -5124,17 +5381,17 @@ mod export_tests {
 
     #[test]
     fn the_origin_200_has_one_node() {
-        let e = sn0("origin200_ip29", "[origin200]\nnodes = 2\n").validate().unwrap_err();
+        let e = ip27_config("origin200_ip29", "[origin200]\nnodes = 2\n").validate().unwrap_err();
         assert!(e.contains("origin200.nodes"), "{e}");
-        sn0("origin200_ip29", "[origin200]\nnodes = 1\n").validate().unwrap();
+        ip27_config("origin200_ip29", "[origin200]\nnodes = 1\n").validate().unwrap();
     }
 
     #[test]
-    fn the_origin_200_has_no_baseio_card_to_fit_an_io_prom() {
-        let e = sn0("origin200_ip29", "[origin200]\nio_prom = \"io6prom.img\"\n").validate().unwrap_err();
+    fn the_origin_200_has_no_baseio_card_to_attach_an_io_prom() {
+        let e = ip27_config("origin200_ip29", "[origin200]\nio_prom = \"io6prom.img\"\n").validate().unwrap_err();
         assert!(e.contains("origin200.io_prom"), "{e}");
         for (profile, table) in [("origin2000_ip27", "origin2000"), ("onyx2_ip27", "onyx2")] {
-            sn0(profile, &format!("[{table}]\nio_prom = \"io6prom.img\"\n")).validate().unwrap();
+            ip27_config(profile, &format!("[{table}]\nio_prom = \"io6prom.img\"\n")).validate().unwrap();
         }
     }
 
@@ -5289,6 +5546,36 @@ mod export_tests {
         "#).expect("parse");
         cfg.fold_deprecated();
         assert_eq!(cfg.prom, "mine.bin");
+    }
+
+    /// Configs written before `[impact]` became `[graphics] board` still
+    /// load; an empty one is dropped, a populated gfx slot becomes the board,
+    /// and the section is never written back.
+    #[test]
+    fn legacy_impact_section_loads_and_folds() {
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            [impact]
+            gfx = "none"
+            exp0 = "none"
+            exp1 = "none"
+        "#).expect("parse");
+        cfg.fold_deprecated();
+        assert!(cfg.impact.is_none());
+        assert_eq!(cfg.graphics.board, None);
+
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            [machine]
+            profile = "indigo2_ip22"
+            [impact]
+            gfx = "high"
+        "#).expect("parse");
+        cfg.fold_deprecated();
+        assert_eq!(cfg.graphics.board, Some(GraphicsBoard::HighImpact));
+        assert!(!toml::to_string(&cfg).unwrap().contains("[impact]"));
+
+        // The GUI's settings file holds the same struct as JSON.
+        let json = r#"{"impact":{"gfx":"none","exp0":"none","exp1":"none"}}"#;
+        assert!(serde_json::from_str::<MachineConfig>(json).is_ok());
     }
 
     /// `[scsi.17]` is id 1 on controller 1, so one id can be on both
@@ -5601,7 +5888,7 @@ mod fuel_input_tests {
         let saved = toml::to_string(&other).unwrap();
         assert!(!saved.contains("[fuel]"), "{saved}");
         let mut fuel = MachineConfig::default();
-        fuel.fuel.console = FuelConsole::Ioc3B;
+        fuel.fuel.console = Ip35Console::Ioc3B;
         fuel.fuel.flash = Some("flash.bin".into());
         fuel.fuel.l1_port = Some(18882);
         fuel.fuel.l1_log = Some("l1.log".into());
@@ -5610,12 +5897,12 @@ mod fuel_input_tests {
         let saved = toml::to_string(&fuel).unwrap();
         assert!(saved.contains("[fuel]"), "{saved}");
         let loaded: MachineConfig = toml::from_str(&saved).unwrap();
-        assert_eq!(loaded.fuel.console, FuelConsole::Ioc3B);
+        assert_eq!(loaded.fuel.console, Ip35Console::Ioc3B);
         assert_eq!(loaded.fuel.flash.as_deref(), Some("flash.bin"));
         assert_eq!(loaded.fuel.l1_port, Some(18882));
         assert_eq!(loaded.fuel.l1_log.as_deref(), Some("l1.log"));
         assert!(!loaded.fuel.ps2_input && loaded.fuel.usb_input);
-        assert!(!MachineProfile::ALL.contains(&MachineProfile::FuelIp34));
+        assert!(MachineProfile::ALL.contains(&MachineProfile::FuelIp34));
     }
 
     /// PS/2 is the Fuel's standard keyboard and mouse and USB is opt-in;
@@ -5819,10 +6106,10 @@ mod tezro_config_tests {
     fn tezro_memory_defaults_to_the_4_gib_layout_and_takes_listed_banks() {
         let mut cfg = tezro();
         cfg.validate().unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::MemoryPopulation::default());
+        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::DEFAULT_BANKS_MIB);
         cfg.banks = [1024, 1024, 512, 0, 0, 0, 0, 0];
         cfg.validate().unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap().banks_mib(), [1024, 1024, 512]);
+        assert_eq!(cfg.tezro_memory().unwrap(), [1024, 1024, 512]);
         cfg.banks = [1024, 512, 0, 0, 0, 0, 0, 0];
         assert!(cfg.validate().unwrap_err().contains("share one size"));
         cfg.banks = [1024, 0, 512, 0, 0, 0, 0, 0];
@@ -5882,7 +6169,7 @@ mod tezro_config_tests {
         let cfg = load("[machine]\nprofile = \"tezro_ip53\"\n");
         assert_eq!(cfg.cpu(), &parts::R16000_700_EARLY);
         assert!(!cfg.banks_set);
-        assert_eq!(cfg.tezro_memory().unwrap().total_mib(), 4096);
+        assert_eq!(cfg.tezro_memory().unwrap().iter().sum::<u32>(), 4096);
         let e = load("[machine]\nprofile = \"tezro_ip53\"\ncpu = \"not_a_cpu\"\n").validate().unwrap_err();
         assert!(e.contains("SGI Tezro (IP53) takes"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5903,7 +6190,7 @@ mod tezro_config_tests {
         assert!(cfg.validate().unwrap_err().contains("512 or 1024"));
 
         let cfg = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\n").unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::MemoryPopulation::default());
+        assert_eq!(cfg.tezro_memory().unwrap(), crate::ip53_machine::DEFAULT_BANKS_MIB);
     }
 
     /// The processor is one of the Tezro's R16000 chips, with no graphics
@@ -5935,7 +6222,7 @@ mod tezro_config_tests {
         cfg.validate().unwrap();
     }
 
-    /// `[machine] cpus` is the processors fitted: four on a Tezro unless
+    /// `[machine] cpus` is the processors populated: four on a Tezro unless
     /// set, one elsewhere, and only the Octane and the Tezro take more.
     #[test]
     fn machine_cpus_defaults_to_four_on_the_tezro_and_one_elsewhere() {
@@ -5957,11 +6244,11 @@ mod tezro_config_tests {
         assert!(fuel.validate().unwrap_err().contains("only the Octane and the Tezro"));
     }
 
-    /// The 700 MHz chip is fitted as one, two or four processors, the 1000
+    /// The 700 MHz chip is populated as one, two or four processors, the 1000
     /// MHz chip as two or four, the 800 and 900 MHz chips as four only, and
     /// the refusal says so.
     #[test]
-    fn each_chip_is_fitted_with_the_counts_its_board_data_allows() {
+    fn each_chip_is_populated_with_the_counts_its_board_data_allows() {
         for &chip in crate::ip53_machine::CPUS {
             for cpus in 0..=5u8 {
                 let mut cfg = tezro();
@@ -5972,8 +6259,8 @@ mod tezro_config_tests {
                     c if c == &parts::R16000_1000 => &[2, 4],
                     _ => &[4],
                 };
-                let fits = counts.contains(&cpus);
-                assert_eq!(cfg.validate().is_ok(), fits, "{} with {cpus}", chip.name());
+                let holds = counts.contains(&cpus);
+                assert_eq!(cfg.validate().is_ok(), holds, "{} with {cpus}", chip.name());
             }
             if chip != &parts::R16000_700_EARLY {
                 let mut cfg = tezro();
@@ -5987,7 +6274,7 @@ mod tezro_config_tests {
     }
 
     #[test]
-    fn tezro_refuses_a_processor_count_its_board_does_not_fit() {
+    fn tezro_refuses_a_processor_count_its_board_does_not_hold() {
         for cpus in [0, 3, 5] {
             let mut cfg = tezro();
             cfg.machine.cpus = Some(cpus);
@@ -6001,7 +6288,7 @@ mod tezro_config_tests {
         let cfg: MachineConfig = toml::from_str(include_str!("../tezro.toml.example")).unwrap();
         assert_eq!(cfg.machine.profile, MachineProfile::TezroIp53);
         cfg.validate().unwrap();
-        assert_eq!(cfg.tezro_memory().unwrap().total_mib(), 4096);
+        assert_eq!(cfg.tezro_memory().unwrap().iter().sum::<u32>(), 4096);
     }
 
     /// A `[tezro]` table is written only when something in it was set, and
@@ -6018,6 +6305,6 @@ mod tezro_config_tests {
         let again: MachineConfig = toml::from_str(&toml::to_string(&loaded).unwrap()).unwrap();
         assert_eq!(again.tezro.flash.as_deref(), Some("flash.bin"));
         assert_eq!((again.tezro.l1_port, again.tezro.serial_port_c), (Some(18882), Some(18883)));
-        assert!(!MachineProfile::ALL.contains(&MachineProfile::TezroIp53));
+        assert!(MachineProfile::ALL.contains(&MachineProfile::TezroIp53));
     }
 }

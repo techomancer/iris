@@ -180,6 +180,10 @@ mod tests {
         fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
             std::ptr::null()
         }
+        #[cfg(feature = "jitv2")]
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, std::ptr::null()))
+        }
     }
 
     /// Disable every jitv2 dispatch path on a freshly-constructed executor —
@@ -1195,7 +1199,7 @@ mod tests {
     }
 
     /// Two pages 1 MiB apart collide in the same direct-mapped set
-    /// (NUTLB_BITS=8 → index is VA[19:12]). Alternating between them must
+    /// (NUTLB_BITS=8 → index is VA\[19:12\]). Alternating between them must
     /// still be *correct*, just slower — this is the conflict-miss case the
     /// `nutlb_conflict` counter exists to measure.
     #[cfg(feature = "tlbstats")]
@@ -1975,6 +1979,43 @@ mod tests {
         assert_eq!(exec.core.read_gpr(2), 7, "released, the instruction runs");
     }
 
+    /// Under `ci_clock` a WAIT stall runs no steps, so the stall must raise
+    /// IP7 when it passes the Compare deadline. A soft reset after 1 s stops
+    /// a regression instead of hanging.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_wait_wakes_on_the_compare_deadline() {
+        let (mut exec, _) = create_executor();
+        exec.core.pc = 0xFFFF_FFFF_8000_1000;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE
+            | (1 << (crate::cpu::mips_core::STATUS_IM_SHIFT + 7));
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        let deadline = exec.core.hot.cycles + 100_000; // 1 ms of stall at 10 ns/cycle
+        exec.core.count_fire_cycle = deadline;
+
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let (done, stop) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let irq = irq;
+            if stop.recv_timeout(std::time::Duration::from_secs(1)).is_err() {
+                // SAFETY: the executor outlives this thread, which is joined below.
+                unsafe { &*irq.0 }.fetch_or(crate::cpu::mips_exec::SOFT_RESET_BIT, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        let _ = done.send(());
+        watchdog.join().unwrap();
+
+        let pending = exec.core.hot.interrupts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(pending & crate::cpu::mips_exec::SOFT_RESET_BIT, 0,
+            "the stall ran 1 s past a 1 ms Compare deadline");
+        assert_ne!(pending & crate::cpu::mips_core::CAUSE_IP7 as u64, 0, "IP7 must be pending");
+        assert!(exec.core.hot.cycles >= deadline);
+    }
+
     #[test]
     fn test_eret() {
         let (mut exec, _) = create_executor();
@@ -2130,7 +2171,7 @@ mod tests {
                 "the exception vector {vector:#x} itself must be fetchable");
     }
 
-    /// `Index` selects a TLB slot from bits [5:0] — by masking, never modulo.
+    /// `Index` selects a TLB slot from bits \[5:0\] — by masking, never modulo.
     ///
     /// `%` folds out-of-range values back onto *valid* slots, which is silent
     /// corruption rather than a no-op:
@@ -2213,13 +2254,13 @@ mod tests {
     /// A 32-bit TLB miss must leave `EntryHi.Region` matching the address's
     /// segment: `11` for KSSEG/KSEG3, `00` for KUSEG.
     ///
-    /// The mask used to be `EH_VPN2_32` alone, which wiped bits [63:32] and left
+    /// The mask used to be `EH_VPN2_32` alone, which wiped bits \[63:32\] and left
     /// Region = `00` (User) even for a kernel-segment miss. A refill handler that
     /// then issued TLBWI would commit the entry under the wrong region.
     /// (cpucritique.md TLB-4.)
     ///
     /// The fix needs no branch on bit 31: in 32-bit mode every address reaching
-    /// the TLB is sign-extended, so bits [63:32] are all-1 for KSSEG/KSEG3 and
+    /// the TLB is sign-extended, so bits \[63:32\] are all-1 for KSSEG/KSEG3 and
     /// all-0 for KUSEG — keeping EH_REGION in the mask lets the region fall out
     /// of the sign extension. This test pins both directions so a future
     /// "simplification" back to the 32-bit-only mask is caught.
@@ -4715,7 +4756,7 @@ mod tests {
 
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
-    /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
+    /// bits as PA\[34:33\]. `phys_mask` must fold them away before the bus.
     #[test]
     fn phys_mask_folds_physical_bits_the_board_ignores() {
         let (mut exec, _mem) = create_executor();
@@ -5834,6 +5875,9 @@ mod tests {
             let counter = gens.entry(page).or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
             counter.as_ref() as *const std::sync::atomic::AtomicU64
         }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr)))
+        }
     }
 
     #[test]
@@ -6516,8 +6560,8 @@ mod tests {
     }
 
     /// FR=0: odd register (FPR1) is the upper 32 bits of physical slot 0.
-    /// Writing FPR1 via MTC1 must land in fpr[0] bits 63:32.
-    /// Writing FPR0 via MTC1 must land in fpr[0] bits 31:0.
+    /// Writing FPR1 via MTC1 must land in fpr\[0\] bits 63:32.
+    /// Writing FPR0 via MTC1 must land in fpr\[0\] bits 31:0.
     #[test]
     fn test_fr0_register_aliasing_mtc1_mfc1() {
         let (mut exec, _) = create_executor();
@@ -7319,6 +7363,35 @@ mod tests {
         crate::cpu::mips_exec::MipsCpu::new(exec)
     }
 
+    /// `loadsym` goes to the selected CPU and a breakpoint to every CPU. With
+    /// a symbol table per CPU the unselected ones refused the name and the
+    /// whole command failed with "unknown symbol".
+    #[test]
+    fn a_symbol_loaded_once_names_a_breakpoint_on_every_cpu() {
+        use crate::traits::Device;
+        let map = std::env::temp_dir().join(format!("iris-symtest-{}.map", std::process::id()));
+        std::fs::write(&map, "ffffffff80001000 T sendsig\n").unwrap();
+        let cpus: Vec<Arc<dyn crate::cpu::mips_exec::CpuDevice>> = vec![Arc::new(nop_cpu()), Arc::new(nop_cpu())];
+        let monitor = crate::cpu::cpu_monitor::CpuMonitor::new(cpus);
+        let run = |line: &str| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let cap = Capture::default();
+            let r = monitor.execute_command(words[0], &words[1..], Box::new(cap.clone()));
+            let out = String::from_utf8_lossy(&cap.0.lock()).into_owned();
+            (r, out)
+        };
+        let (r, _) = run(&format!("loadsym {}", map.display()));
+        std::fs::remove_file(&map).ok();
+        assert!(r.is_ok(), "{:?}", r);
+        let (r, out) = run("b sendsig if a1 == 11");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("sendsig") && out.contains("if a1 == 11"), "{}", out);
+        // The unselected CPU has it too, by name.
+        let (r, out) = run("cpu 1 bl");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("sendsig"), "{}", out);
+    }
+
     // `lightning` compiles breakpoint checks out of the run loop, so nothing
     // would ever stop the CPU at the breakpoint.
     #[cfg(not(feature = "lightning"))]
@@ -7363,6 +7436,254 @@ mod tests {
         assert!(!cpu.is_running());
         let (_, out) = mon(&cpu, "bp list");
         assert!(out.contains("[hits 1]"), "{}", out);
+    }
+
+    /// Two RAM banks of 1 MiB at 0 and 1 MiB, which a store to nothing swaps:
+    /// a memory controller moving banks.
+    #[cfg(feature = "jitv2")]
+    struct SwapBus {
+        banks: [crate::dev::mem::Memory; 2],
+        swapped: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl SwapBus {
+        fn at(&self, addr: u64) -> (&crate::dev::mem::Memory, u64) {
+            let swapped = self.swapped.load(std::sync::atomic::Ordering::Relaxed);
+            let bank = ((addr >> 20) & 1) as usize ^ swapped as usize;
+            (&self.banks[bank], addr & 0xF_FFFF)
+        }
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl BusDevice for SwapBus {
+        fn read8(&self, a: u64) -> BusRead8 { let (d, a) = self.at(a); d.read8(a) }
+        fn write8(&self, a: u64, v: u8) -> u32 { let (d, a) = self.at(a); d.write8(a, v) }
+        fn read16(&self, a: u64) -> BusRead16 { let (d, a) = self.at(a); d.read16(a) }
+        fn write16(&self, a: u64, v: u16) -> u32 { let (d, a) = self.at(a); d.write16(a, v) }
+        fn read32(&self, a: u64) -> BusRead32 { let (d, a) = self.at(a); d.read32(a) }
+        fn write32(&self, a: u64, v: u32) -> u32 { let (d, a) = self.at(a); d.write32(a, v) }
+        fn read64(&self, a: u64) -> BusRead64 { let (d, a) = self.at(a); d.read64(a) }
+        fn write64(&self, a: u64, v: u64) -> u32 { let (d, a) = self.at(a); d.write64(a, v) }
+        fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 { let (d, a) = self.at(a); d.gen_ptr(a) }
+        fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> { let (d, a) = self.at(a); d.code_page(a) }
+    }
+
+    /// Compiled code is keyed by the bank it was compiled from: when a remap
+    /// puts another bank at its address, the address runs that bank's page,
+    /// and the code is found again, not recompiled, where its bank went.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn compiled_code_follows_its_bank_through_a_remap() {
+        use std::sync::atomic::Ordering;
+        let bus = Arc::new(SwapBus { banks: [crate::dev::mem::Memory::new(1), crate::dev::mem::Memory::new(1)], swapped: Default::default() });
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus.clone() as Arc<dyn BusDevice>, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        exec.install_jit_hooks();
+        // Each bank adds its own number to r2 four times and returns.
+        for (bank, add) in [(0u64, 1u16), (1, 2)] {
+            for i in 0..4 {
+                bus.write32((bank << 20) + 0x1000 + 4 * i, make_i(OP_ADDIU, 2, 2, add));
+            }
+            bus.write32((bank << 20) + 0x1010, make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR));
+        }
+        exec.core.gpr[31] = 0xffff_ffff_8000_f000;
+        let arrive = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, pc: u64| {
+            exec.core.pc = pc;
+            exec.core.in_delay_slot = false;
+            exec.core.jit_trigger = true;
+            exec.step_jit();
+            exec.jitv2_current_page()
+        };
+        let low = arrive(&mut exec, 0xffff_ffff_8000_1000);
+        assert!(!low.is_null());
+        let low = unsafe { &*low };
+        let key0 = bus.banks[0].code_page(0x1000).unwrap().key;
+        let key1 = bus.banks[1].code_page(0x1000).unwrap().key;
+        assert_eq!(low.key, key0, "the page is keyed by its bank, not its address");
+        assert!(low.is_runnable(0));
+        let compiles = low.compiles_since_flush();
+
+        // The controller swaps the banks, and tells the CPU as a machine does.
+        bus.swapped.store(true, Ordering::Relaxed);
+        exec.jitv2_layout_changed();
+        assert!(low.is_runnable(0), "a remap drops no code");
+        assert_eq!(low.addr_of(0), None, "the CPU no longer knows where the page is");
+
+        let other = arrive(&mut exec, 0xffff_ffff_8000_1000);
+        assert!(!std::ptr::eq(other, low), "the address now holds the other bank's page");
+        assert_eq!(unsafe { &*other }.key, key1);
+
+        let moved = arrive(&mut exec, 0xffff_ffff_8010_1000);
+        assert!(std::ptr::eq(moved, low), "the first bank's page is found at its new address");
+        assert_eq!(low.addr_of(0), Some((0x101, false)));
+        assert_eq!(low.compiles_since_flush(), compiles, "and runs the code it already had");
+        let jit = exec.jitv2.clone();
+        assert_eq!(jit.lock().pages_used(), 2);
+    }
+
+    /// A remap request posted while the CPU is stopped is taken by a step,
+    /// and drops no compiled code.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn a_remap_request_keeps_compiled_code() {
+        use crate::cpu::mips_exec::CpuDevice;
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        let jit = exec.jitv2.clone();
+        let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+        let world = crate::cpu::smp::World::new();
+        world.set_slots(vec![cpu.park_slot()]);
+        let page = || {
+            let mut jit = jit.lock();
+            let slot = jit.page_for(1, 0x1000, mem.as_ref(), false).expect("a page for the spin");
+            jit.page_ptr(slot)
+        };
+        crate::traits::Device::start(&*cpu);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !unsafe { (*page()).is_runnable(0) } {
+            assert!(std::time::Instant::now() < deadline, "the spin was never compiled");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        crate::traits::Device::stop(&*cpu);
+        let before = page();
+        let remaps = jit.lock().stats.remaps.load(std::sync::atomic::Ordering::Relaxed);
+        world.layout_changed();
+        cpu.step_n_inline(0).unwrap();
+        assert_eq!(jit.lock().stats.remaps.load(std::sync::atomic::Ordering::Relaxed), remaps + 1, "the step took the request");
+        assert!(unsafe { (*before).is_runnable(0) }, "the page keeps its code through a remap");
+        assert_eq!(jit.lock().pages_used(), 1);
+    }
+
+    /// 64 entries on one page (four adds and a return each), sync compile.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    fn sync_arrival_rig() -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<JitCapableMockMemory>) {
+        let mem = Arc::new(JitCapableMockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        exec.install_jit_hooks();
+        for slot in 0..64 {
+            let at = 0x1000 + 0x40 * slot;
+            for i in 0..4 {
+                mem.write32(at + 4 * i, make_i(OP_ADDIU, 2, 2, 1));
+            }
+            mem.write32(at + 16, make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR));
+        }
+        exec.core.gpr[31] = 0xffff_ffff_8000_f000;
+        (exec, mem)
+    }
+
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    fn sync_arrive(exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, slot: u64) {
+        exec.core.pc = 0xffff_ffff_8000_1000 + 0x40 * slot;
+        exec.core.in_delay_slot = false;
+        exec.core.jit_trigger = true;
+        exec.step_jit();
+    }
+
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    fn sync_compiles(exec: &MipsExecutor<PassthroughTlb, PassthroughCache>, mem: &JitCapableMockMemory) -> u32 {
+        let jit = exec.jitv2.clone();
+        let mut jit = jit.lock();
+        let slot = jit.page_for(1, 0x1000, mem, false).expect("the page");
+        unsafe { &*jit.page_ptr(slot) }.compiles_since_flush()
+    }
+
+    /// New entries on a page with code compile once when it gets hot, not per entry.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn sync_compile_recompiles_a_page_once_per_hot_promotion() {
+        use crate::cpu::jitv2::jitv2::HOT_PROMOTE_ARRIVALS;
+        let (mut exec, mem) = sync_arrival_rig();
+        sync_arrive(&mut exec, 0);
+        assert_eq!(sync_compiles(&exec, &mem), 1, "a page with no code compiles at once");
+        for slot in 1..64 {
+            sync_arrive(&mut exec, slot);
+        }
+        assert_eq!(sync_compiles(&exec, &mem), 1, "63 new entries did not recompile it");
+        for i in 0..HOT_PROMOTE_ARRIVALS as u64 {
+            sync_arrive(&mut exec, 1 + i % 63);
+        }
+        assert_eq!(sync_compiles(&exec, &mem), 2, "the hot page recompiled once for all of them");
+    }
+
+    /// Interpreted arrivals on a page with code never set the in-flight flag `j2 pcp` shows.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn sync_compile_leaves_a_page_with_code_unscheduled() {
+        let (mut exec, mem) = sync_arrival_rig();
+        sync_arrive(&mut exec, 0);
+        for slot in 1..8 {
+            sync_arrive(&mut exec, slot);
+        }
+        let jit = exec.jitv2.clone();
+        let mut jit = jit.lock();
+        let slot = jit.page_for(1, 0x1000, &*mem, false).expect("the page");
+        assert!(!unsafe { &*jit.page_ptr(slot) }.is_scheduled());
+    }
+
+    /// A stale page waits to get hot too: stores between new entries don't compile per arrival.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn sync_compile_does_not_recompile_a_stale_page_per_arrival() {
+        let (mut exec, mem) = sync_arrival_rig();
+        sync_arrive(&mut exec, 0);
+        for slot in 1..64 {
+            unsafe { &*mem.gen_ptr(0x1000) }.fetch_add(1, std::sync::atomic::Ordering::Release);
+            sync_arrive(&mut exec, slot);
+        }
+        assert_eq!(sync_compiles(&exec, &mem), 1, "63 stores and new entries did not recompile it");
+    }
+
+    /// A monitor command stops and restarts a running CPU through the park bit,
+    /// which a hold also uses, so a held CPU must stay held.
+    #[test]
+    fn a_monitor_command_leaves_a_held_cpu_held() {
+        use crate::cpu::smp::{HOLD_HEART, HOST_PARK_BIT};
+        use std::sync::atomic::Ordering;
+        let cpu = nop_cpu();
+        let park = crate::cpu::mips_exec::CpuDevice::park_slot(&cpu);
+        park.hold(HOLD_HEART);
+        crate::traits::Device::start(&cpu);
+        park.wait_parked();
+
+        let (r, _) = mon(&cpu, "regs");
+        assert!(r.is_ok());
+        assert!(cpu.is_running());
+        let word = unsafe { &*cpu.interrupts_ptr() };
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0, "the command released the hold");
+
+        park.release(HOLD_HEART);
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        crate::traits::Device::stop(&cpu);
+    }
+
+    /// A remap posts a JIT flush through the park bit; a monitor `step` must take it.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn a_monitor_step_after_a_remap_still_steps() {
+        let cpu = nop_cpu();
+        let world = crate::cpu::smp::World::new();
+        world.set_slots(vec![crate::cpu::mips_exec::CpuDevice::park_slot(&cpu)]);
+        world.layout_changed();
+        let (r, out) = mon(&cpu, "step 2");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(!out.contains("giving up"), "{}", out);
     }
 
     /// A guest spinning in a region the JIT compiled never returns to the run
@@ -7425,6 +7746,56 @@ mod tests {
             let _ = done_tx.send(());
         });
         done_rx.recv_timeout(Duration::from_secs(5)).expect("second stop did not return");
+    }
+
+    /// Under `ci_clock` no timer thread raises IP7, and a spin on one `beq`
+    /// never leaves compiled code, so compiled code must test the deadline.
+    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    #[test]
+    fn ci_clock_a_compiled_spin_takes_the_compare_deadline() {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_IE, STATUS_IM_SHIFT};
+        use crate::cpu::smp::HOST_PARK_BIT;
+        use std::sync::atomic::Ordering;
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        // Compiled code calls the Compare hook at a cycle flush.
+        exec.install_jit_hooks();
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        exec.core.count_fire_cycle = 100;
+
+        // A failed run spins in compiled code for good; the park bit, which
+        // compiled code does see, gets it out so the test fails instead.
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let (done, stop) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let irq = irq;
+            if stop.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                // SAFETY: the executor outlives this thread, which is joined below.
+                unsafe { &*irq.0 }.fetch_or(HOST_PARK_BIT, Ordering::SeqCst);
+            }
+        });
+        for _ in 0..100_000 {
+            exec.step_jit();
+            if exec.core.cp0_status & STATUS_EXL != 0
+                || exec.core.hot.interrupts.load(Ordering::SeqCst) & HOST_PARK_BIT != 0 {
+                break;
+            }
+        }
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        assert_eq!(exec.core.hot.interrupts.load(Ordering::SeqCst) & HOST_PARK_BIT, 0,
+            "the compiled spin ran 2 s past the deadline");
+        assert_ne!(exec.core.cp0_status & STATUS_EXL, 0, "no interrupt taken");
     }
 
     #[test]
@@ -7798,6 +8169,37 @@ mod tests {
         assert_eq!(run::<R10K>(OP_LW).0, BUS_ERR, "a refused load still faults");
     }
 
+    /// The `j2` commands read code and claim pages through the cacheable bus,
+    /// as the JIT does. Here `sysad` refuses everything, so a read through it
+    /// would miss the code and the generation counter.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn j2_commands_read_code_through_the_cacheable_bus() {
+        use std::sync::atomic::Ordering;
+        fn cpu_with_cacheable_code() -> crate::cpu::mips_exec::MipsCpu<PassthroughTlb, PassthroughCache> {
+            let mem = Arc::new(JitCapableMockMemory::new());
+            mem.set_double(0x1000, 0); // nops
+            unsafe { (*mem.gen_ptr(0x1000)).store(7, Ordering::Relaxed) };
+            let refusing: Arc<dyn BusDevice> = Arc::new(RefusingBus);
+            let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+                MipsExecutor::new(refusing, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            exec.set_cached_bus(mem);
+            crate::cpu::mips_exec::MipsCpu::new(exec)
+        }
+        let cpu = cpu_with_cacheable_code();
+        let (r, out) = mon(&cpu, "j2 analyze 0x1000");
+        assert!(r.is_ok() && out.contains("analyze phys=0x00001000"), "analyze: {r:?} {out}");
+        let (r, _) = mon(&cpu, "j2 deny 0x1000");
+        assert!(r.is_ok(), "deny: {r:?}");
+        let (_, out) = mon(&cpu, "j2 pcp 0xffffffff80001000");
+        assert!(out.contains("gen=7 "), "deny claimed the page with the wrong counter: {out}");
+
+        let cpu = cpu_with_cacheable_code();
+        let dump = crate::test_temp::TempPath::new("j2-dumppcp");
+        let (r, out) = mon(&cpu, &format!("j2 dumppcp 0x1000 {}", dump.display()));
+        assert!(r.is_ok() && out.contains("gen 7 "), "dumppcp: {r:?} {out}");
+    }
+
     /// A bus error on an instruction fetch is IBE (ExcCode 6), not DBE, on the
     /// uncached (kseg1) and cache-fill (kseg0) paths of every cache model, and
     /// in a delay slot EPC is the branch with BD set (R4000 UM p. 134; VR5000
@@ -7862,7 +8264,7 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
     }
 
-    /// A partial LWR keeps rt[63:32] only on the R10000 family, and only while the
+    /// A partial LWR keeps rt\[63:32\] only on the R10000 family, and only while the
     /// current privilege level's own addressing bit (KX, SX or UX) is set. Runs the
     /// instruction after each way the mode changes: a Status write at each level,
     /// an exception entry (EXL forces kernel, KX decides) and ERET. Fix: partial LWR.

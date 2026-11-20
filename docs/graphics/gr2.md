@@ -31,7 +31,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: colour stepping not documented.<br/>No texture on this board<br/>Iris: same span routine"]
   G["<b>Per-fragment operations</b><br/>Hardware: per-pixel list not documented;<br/>blending and alpha test not documented<br/>Iris: same span routine; RE3 pattern, window-ID, Z,<br/>stencil and logic op; Iris blends in the span routine"]
   H[("<b>Frame buffer</b><br/>Hardware: video memory boards and a Z-buffer board<br/>(type not documented)<br/>Iris: one word per pixel, in Re3")]
-  I["<b>Scan-out</b><br/>Hardware: XMAP5, Bt457; VC1 timing (inferred)<br/>Iris: GR2-Display, gr2comp"]
+  I["<b>Scan-out</b><br/>Hardware: XMAP5, Bt457; VC1 timing (inferred)<br/>Iris: Display-Refresh, gr2comp"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -47,7 +47,7 @@ flowchart LR
   RE3 -- "span" --> JIT["span shader<br/>or interpreter"]
   JIT --> VRAM[("frame buffer and Z buffer")]
   RE3 --> VRAM
-  VRAM --> DISP["GR2-Display<br/>gr2comp compose"]
+  VRAM --> DISP["Display-Refresh<br/>gr2comp compose"]
   TAB["XMAP5, Bt457; VC1 (inferred)"] --> DISP
   DISP --> SCR["installed renderer"]
 ```
@@ -91,14 +91,15 @@ flowchart LR
   cpu -->|re3_fifo: RE3 registers| re3["GR2-RE3<br/>draws spans"]
   hq -->|re3_fifo: RE3 register writes| re3
   jit["span compiler (gr2-jit, optional)"] -.->|compiled shaders| re3
-  re3 -.->|frame buffer, read unlocked| disp["GR2-Display<br/>compose, retrace"]
+  re3 -.->|frame buffer, read unlocked| disp["Display-Refresh<br/>retrace, compose"]
 ```
 
 - **GR2-HQ2.** Runs the HQ2 commands and GL state.
 - **GR2-RE3.** Applies register writes and draws spans into the frame buffer and the Z
   buffer.
-- **GR2-Display** (`display_loop` in `gr2disp.rs`). Retrace, composition and
-  presentation.
+- **Display-Refresh**, the machine's display refresh thread (HACKING.md,
+  "The display refresh thread"). It calls the board for the retrace and to
+  compose the frame (`gr2disp.rs`), and presents it.
 - **Span compiler** (`re3_jit/`). Built only with `gr2-jit`.
 
 The display thread reads the frame buffer with no lock. Tearing is tolerated.
@@ -146,10 +147,15 @@ against the hardware.
 
 ## Display and presentation
 
-`display_loop` runs at 60 Hz. It composes when the picture changed, or once per
-idle interval so the status bar keeps moving. It presents the frame through the
-installed renderer, then pulses the retrace line. A flip that the guest makes
-during blanking shows from the next frame.
+The display refresh thread runs the board at the rate the guest programs: the
+VC1's timing tables give the pixel clocks a line and the lines a frame, and the
+clock is the one the PLL is programmed for (107.352 MHz for 60 Hz, 130 MHz for
+72 Hz). A format of two fields, such as full-screen stereo, gets a retrace for
+each. At each retrace it raises the retrace line for the length of
+the vertical blank, then composes if the picture changed (or shows the last
+frame again ten times a second so the status bar keeps moving) and presents the
+frame through the installed renderer. A flip that the guest makes during
+blanking is in the frame composed right after it.
 
 On the machine side the retrace is GIO interrupt 2. The header of `gr2disp.rs` says
 the IOC latches the retrace until the host acknowledges it. The register code here does not confirm that.

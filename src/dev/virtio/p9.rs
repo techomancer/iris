@@ -8,7 +8,7 @@
 //! that a worker pool would buy nothing.
 //!
 //! **Staying inside the share.** The guest names files by path, and may itself
-//! create symlinks, so no path is ever handed to the host whole: [`Server::dir`]
+//! create symlinks, so no path is ever handed to the host whole: `Server::dir`
 //! walks from the root's descriptor one `openat(O_NOFOLLOW)` at a time, and
 //! everything else is a `*at` call on the directory that returns. A symlink in
 //! the share therefore cannot lead out of it: the guest reads it with Treadlink
@@ -17,6 +17,9 @@
 //! **Ownership.** The guest does its own permission checks from what Tgetattr
 //! reports. Host files all belong to one host user, so every file reports the
 //! configured `uid` and `gid`, and a guest chown succeeds without effect.
+//! With `owners = "passthrough"` ([`Server::with_passthrough`]) the host's
+//! owners are reported instead, through `uid_map` and `gid_map`, and a guest
+//! chown is made on the host.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};

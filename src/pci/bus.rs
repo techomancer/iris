@@ -5,7 +5,7 @@
 //! a [`PciHost`], only what is its own: the DMA a requester gets and where each
 //! host IRQ goes. It pushes its CPU windows with [`PciBus::set_host_windows`]
 //! and decides what byte order to apply to an access. The bus has no byte
-//! order, no SCSI and no card names; a machine fits its functions with
+//! order, no SCSI and no card names; a machine attaches its functions with
 //! [`PciBus::attach`] and the bus gives each its interrupt line and its way to
 //! memory.
 //!
@@ -132,7 +132,7 @@ impl PciBus {
         }
     }
 
-    /// Fit a function: give it its way to memory and, if it has an interrupt
+    /// Attach a function: give it its way to memory and, if it has an interrupt
     /// pin, the line that pin drives, then tell it it is attached. Panics, as a
     /// wiring mistake in the machine, on a device number the wiring lacks, an
     /// address already taken, or a pin the wiring does not route.
@@ -211,8 +211,8 @@ impl PciBus {
     /// nothing answers on a root bus; behind a bridge the write is discarded by
     /// master abort, as a read of nothing is (see [`PciBus::config_read`]), and
     /// counts as answered. The mappings are updated when the command register,
-    /// a BAR, or a bridge's bus numbers or windows changed, the only registers
-    /// they are built from.
+    /// a BAR, or a bridge's bus numbers, windows or bridge control changed,
+    /// the only registers they are built from.
     pub fn config_write(&self, at: DevFn, off: usize, width: usize, val: u32) -> bool {
         let f = self.function(at);
         crate::dlog!(LogModule::Pci, "pci: bus {} {}.{} write {off:#04x}/{width} {val:#x}{}", self.0.number, at.device, at.function,
@@ -228,8 +228,9 @@ impl PciBus {
         let new = cfg.read(reg);
         f.config_written(reg, old, new);
         // The command register, the BARs and, in a bridge's header, its bus
-        // numbers and windows: the registers the table is built from.
-        if new != old && matches!(reg, 1 | 4..=9) {
+        // numbers, windows, their upper halves and the bridge control
+        // register (ISA enable): the registers the table is built from.
+        if new != old && (matches!(reg, 1 | 4..=9) || (cfg.is_type1() && matches!(reg, 10..=12 | 15))) {
             self.update_mappings(None);
         }
         true
@@ -833,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn function_0_reports_multifunction_only_while_a_higher_function_is_fitted() {
+    fn function_0_reports_multifunction_only_while_a_higher_function_is_attached() {
         let (_host, bus) = bus();
         let header = |function| bus.config_read(at(2, function), 0x0e, 1).unwrap();
         let card = || TestCard::new(bars(), 0);

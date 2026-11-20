@@ -454,7 +454,7 @@ impl Rex3 {
     /// or stop the running one with `None` (checkpointing where it ends).
     /// Returns the stopped recording's path and record count.
     pub fn set_recording(&self, path: Option<&str>, state: bool) -> std::io::Result<Option<(String, u64)>> {
-        #[cfg(all(test, feature = "wgpu"))]
+        #[cfg(feature = "wgpu")]
         self.reject_resident_operation("recording").map_err(std::io::Error::other)?;
         // Raise the tap first so every producer that starts an access from
         // here on blocks on the lock below; whatever slipped in before is
@@ -625,7 +625,7 @@ pub(crate) mod tests {
     fn request_cleanup(
         rex: Arc<Rex3>, spawn: impl FnOnce(CleanupTask) -> std::io::Result<()>,
     ) -> Result<(), String> {
-        rex.display_stop.request();
+        rex.head.display_stop().request();
         rex.running.store(false, Ordering::SeqCst);
         rex.tap.fetch_and(!super::super::trace::TRACE_ALL, Ordering::SeqCst);
         let exit_queued = rex.gfifo_try_push(super::super::GFIFO_EXIT, 0);
@@ -802,7 +802,7 @@ pub(crate) mod tests {
         replay_recs_with_hook(rex, bus, recs, check_hashes, |_, _| {})
     }
 
-    pub(super) fn replay_recs_with_hook(
+    pub(crate) fn replay_recs_with_hook(
         rex: &Rex3, bus: &dyn BusDevice, recs: &[Rec], check_hashes: bool,
         mut before_record: impl FnMut(usize, &Rec),
     ) -> Report {
@@ -908,6 +908,15 @@ pub(crate) mod tests {
         // A failed access can leave the processor blocked or already dead.
         // Only a completed replay may synchronously drain it.
         if rep.access_error.is_none() {
+            #[cfg(feature = "wgpu")]
+            if rex.resident_active() {
+                if rex.wait_resident_idle().is_err() {
+                    rep.access_error = Some("resident replay failed while draining".into());
+                }
+            } else {
+                rex.wait_idle();
+            }
+            #[cfg(not(feature = "wgpu"))]
             rex.wait_idle();
         }
         rep

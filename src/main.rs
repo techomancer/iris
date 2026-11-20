@@ -39,6 +39,7 @@ fn main() {
     let scroll_pixels_per_line = cfg.mouse_scroll_pixels_per_line;
     let lock_aspect_ratio = cfg.lock_aspect_ratio;
     let ui_renderer = cfg.renderer;
+    iris::display::set_host_vsync(cfg.vsync);
     let headless = cfg.headless;
     let gdb_port = cfg.gdb_port;
     let ci_enabled = cfg.ci;
@@ -182,8 +183,9 @@ fn main() {
     if !ci_enabled {
         if let Some(addr) = machine.monitor_addr() {
             let slot = machine.machine_slot();
+            let monitor = machine.monitor().clone();
             std::thread::spawn(move || {
-                Machine::run_console_client(addr, iris::workstation::console_quit(slot));
+                Machine::run_console_client(addr, monitor, iris::workstation::console_quit(slot));
             });
         }
     }
@@ -196,7 +198,7 @@ fn main() {
         if headless {
             eprintln!("iris: running headless (no REX3, no window)");
         } else if no_board {
-            eprintln!("iris: no graphics board fitted: running on the serial console, no window");
+            eprintln!("iris: no graphics board attached: running on the serial console, no window");
         } else if ci_enabled {
             eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
         }
@@ -213,7 +215,25 @@ fn main() {
         #[cfg(feature = "wgpu")]
         iris::wgpu::set_display(event_loop.owned_display_handle());
         let display = machine.get_display().expect("a graphics board must be present in non-headless mode");
-        let ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer);
+        let mut ui = match Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio, ui_renderer) {
+            Ok(ui) => ui,
+            Err(error) => {
+                eprintln!("iris: cannot initialize the graphics window: {error}");
+                iris::workstation::exit_process("graphics initialization failure", 1, || {
+                    iris::workstation::stop_and_flush(&mut *machine, "graphics initialization failure")
+                });
+                return;
+            }
+        };
+        if let Some(head1) = machine.get_display_head1() {
+            if let Err(error) = ui.add_head(head1, &event_loop) {
+                eprintln!("iris: cannot initialize the secondary graphics window: {error}");
+                iris::workstation::exit_process("secondary graphics initialization failure", 1, || {
+                    iris::workstation::stop_and_flush(&mut *machine, "secondary graphics initialization failure")
+                });
+                return;
+            }
+        }
         ui.run(event_loop);
     }
 
@@ -266,4 +286,3 @@ fn start_perfetto((path, cats, clock): (Option<String>, Option<String>, Option<S
 fn print_build_features() {
     eprintln!("iris: build features: {}", iris::build_features::banner());
 }
-

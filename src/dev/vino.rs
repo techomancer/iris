@@ -78,7 +78,7 @@ pub mod reg {
 // ─── Revision/ID register ────────────────────────────────────────────────────
 
 pub mod rev_id {
-    /// Expected chip ID in bits [7:4].
+    /// Expected chip ID in bits \[7:4\].
     pub const CHIP_ID: u32 = 0xB;
     /// Reset value: chip_id=0xB, rev=0 → 0xB0.
     pub const RESET_VAL: u32 = 0xB0;
@@ -193,7 +193,7 @@ pub mod clip {
 pub mod frame_rate {
     /// Bit 0: 0 = NTSC (30 fps / 60 fields), 1 = PAL (25 fps / 50 fields).
     pub const PAL: u32         = 1 << 0;
-    /// Bits [12:1]: 12-bit frame-skip mask (1 bit per field in a 12/10-field window).
+    /// Bits \[12:1\]: 12-bit frame-skip mask (1 bit per field in a 12/10-field window).
     pub const MASK_SHIFT: u32  = 1;
     pub const MASK_BITS: u32   = 0x0FFF;
     /// Full register mask.
@@ -206,7 +206,7 @@ pub mod frame_rate {
 // descriptors per channel as u64 with validity/control flags in the upper half.
 
 pub mod desc {
-    /// Physical address mask (bits [29:4], 16-byte aligned). The address field of
+    /// Physical address mask (bits \[29:4\], 16-byte aligned). The address field of
     /// a descriptor / descriptor-table pointer is only 30 bits wide: bits 31 and
     /// 30 are the STOP and JUMP control bits, NOT part of the address. The 6.5
     /// kernel encodes pointers as `JUMP_BIT | kvtophys(addr)` (see
@@ -217,7 +217,7 @@ pub mod desc {
     pub const PTR_MASK: u32     = 0x3FFF_FFF0;
     /// Control bit: STOP — terminate DMA after this descriptor; raise DESC interrupt.
     pub const STOP_BIT: u64     = 1 << 31;
-    /// Control bit: JUMP — bits [29:0] are a pointer to the next descriptor block.
+    /// Control bit: JUMP — bits \[29:0\] are a pointer to the next descriptor block.
     pub const JUMP_BIT: u64     = 1 << 30;
     /// Internal: valid flag (set by emulator to track cache state).
     pub const VALID_BIT: u64    = 1u64 << 32;
@@ -524,7 +524,7 @@ impl Vino {
 
     /// Fetch four 32-bit descriptors from `addr` in system memory into the
     /// channel's descriptor cache.  Each entry gets VALID_BIT set.
-    /// If descriptor[0] has STOP_BIT the DMA thread will handle the interrupt.
+    /// If descriptor\[0\] has STOP_BIT the DMA thread will handle the interrupt.
     fn descriptor_fetch(chan: &mut ChannelState, addr: u32, mem: &Arc<dyn BusDevice>) {
         for i in 0..4usize {
             let word_addr = addr.wrapping_add((i as u32) * 4);
@@ -1765,7 +1765,7 @@ mod tests {
 
     /// Descriptor-pointer registers carry the kernel's bit-30 control flag: the
     /// 6.5 driver programs them as `JUMP_BIT | kvtophys(table)` (e.g. 0x4861e000).
-    /// The address field is only bits [29:4], so PTR_MASK must strip bits 31/30 to
+    /// The address field is only bits \[29:4\], so PTR_MASK must strip bits 31/30 to
     /// recover the real lomem address (0x0861e000). This is what lets VINO DMA hit
     /// real RAM directly — there is no 0x40000000 RAM alias on the hardware, so
     /// the strip has to happen here at the source, not in the physical bus map.

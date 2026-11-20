@@ -2,7 +2,7 @@
 //! last eight are a BCD calendar.
 //!
 //! The Tezro's IO9 maps one in the IOC4's BAR (byte-bus
-//! select 0 of the IOC4). The part reads like the Fuel's M48T35 [`Timekeeper`] at a
+//! select 0 of the IOC4). The part reads like the Fuel's M48T35 [`Timekeeper`](crate::dev::timekeeper::Timekeeper) at a
 //! glance, and has the same geometry and clock offsets, but differs where
 //! software looks: the control register carries the century beside the
 //! write and read bits, the day register holds a weekday that advances
@@ -17,7 +17,7 @@
 //!
 //! # What is approximated here
 //!
-//! * The fitted IO9 part and its physical address wiring are unknown. The
+//! * The IO9 part and its physical address wiring are unknown. The
 //!   32 KiB geometry is the profile's choice.
 //! * With a fresh-year base of 1968 the guest's year digits count from that
 //!   year, as its driver expects: the host date is shifted into 2000 to
@@ -256,7 +256,7 @@ impl Ds1744 {
             }
         }
         st.file = Some(path.to_path_buf());
-        self.save_clock(&mut st);
+        let _ = self.save_clock(&mut st);
         Ok(())
     }
 
@@ -280,23 +280,24 @@ impl Ds1744 {
 
     /// Write the whole image and the clock reference. Errors are reported
     /// and remembered so an equal write retries them.
-    fn save_clock(&self, st: &mut State) {
-        let Some(path) = st.file.clone() else { return };
+    fn save_clock(&self, st: &mut State) -> Result<(), String> {
+        let Some(path) = st.file.clone() else { return Ok(()) };
         let mut image = st.ram.clone();
         image.extend_from_slice(&self.image(st));
         let reference = battery_clock::encode(CLOCK_TAG, battery_clock::unix_now(), None);
         let result = std::fs::write(&path, &image)
             .and_then(|()| battery_clock::write(&battery_clock::companion(&path), &reference));
         st.storage_failed = result.is_err();
-        if let Err(e) = result {
+        result.map_err(|e| {
             log::error!("DS1744: could not save {}: {e}", path.display());
-        }
+            format!("{}: {e}", path.display())
+        })
     }
 
     /// Save the calendar now, as a stop or shutdown does.
-    pub fn flush(&self) {
+    pub fn flush(&self) -> Result<(), String> {
         let mut st = self.st.lock();
-        self.save_clock(&mut st);
+        self.save_clock(&mut st)
     }
 
     fn read(&self, a: usize) -> u8 {
@@ -376,7 +377,7 @@ impl Ds1744 {
             let valid = self.commit(&mut st, value & 0x3f);
             st.control = (value & 0xc0) | if valid { value & 0x3f } else { old & 0x3f };
             if valid {
-                self.save_clock(&mut st);
+                let _ = self.save_clock(&mut st);
             }
             return;
         }
@@ -406,7 +407,7 @@ impl BusDevice for Ds1744 {
 
 impl Drop for Ds1744 {
     fn drop(&mut self) {
-        self.flush();
+        let _ = self.flush();
     }
 }
 

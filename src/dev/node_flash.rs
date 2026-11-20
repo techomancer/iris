@@ -1,31 +1,29 @@
-//! The boot flash of an SN0 node: one byte-wide 1 MiB AMD-command part in
+//! The boot flash of an IP27 node: one byte-wide 1 MiB AMD-command part in
 //! sixteen 64 KiB sectors, behind the Hub's flash controller.
 //!
-//! The part is seen two ways. [`NodeFlash::chip`] is the chip itself, byte
-//! addressed, as the reset view at node offset 0x1fc0_0000 shows it. The Hub's
-//! controller window ([`NodeFlash::window`]) decodes the chip onto the 64-bit
-//! junk bus: a read repeats the image across the window, and a command is a
-//! 64-bit write with chip byte N at bus offset 8N. Both reach the same bytes
-//! and the same command state.
+//! [`NodeFlash::chip`] is the chip, byte addressed, as the reset view at node
+//! offset 0x1fc0_0000 shows it. The controller window ([`NodeFlash::window`])
+//! decodes it onto the 64-bit junk bus: reads repeat the image, and a command
+//! is a 64-bit write with chip byte N at bus offset 8N. Both share bytes and command state.
 //!
-//! The command set is the shared AMD engine ([`super::sflash::amd`]) at this
-//! part's [`GEOMETRY`]. The part is not identified. The geometry, the
-//! manufacturer and device codes (0x01, 0xd5) and the unlock addresses
-//! (0x5555, 0x2aaa) are the ones the node PROM's flash commands need. Approximations:
+//! The command set is the shared AMD engine (`super::sflash::amd`) at
+//! [`GEOMETRY`]. The part is not identified; the geometry, codes (0x01, 0xd5)
+//! and unlock addresses (0x5555, 0x2aaa) are what the node PROM's commands
+//! need. Approximations:
 //!
-//! * Program and sector erase complete inside the write that starts them, so
-//!   a status poll finds the finished data and no toggle ever shows.
-//! * Programming only clears bits, as on the part. A program of an address in
-//!   a protected sector is not modelled (there is no protection).
-//! * Chip erase and the CFI query set are not implemented; either is logged
-//!   and ignored.
+//! * Program and sector erase finish inside the starting write, so no toggle shows.
+//! * Programming only clears bits; sector protection is not modelled.
+//! * Chip erase and the CFI query set are logged and ignored.
 //!
 //! Ported from hw/mips/sgi/sn0.c and hw/mips/sgi/initial-flash.c in
 //! jamesbraid/qemu-sgi-origami.
 
+#![warn(dead_code)]
+
+use crate::cpu::parts;
 use crate::devlog::LogModule;
 use crate::dlog;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::io;
 use std::path::Path;
@@ -65,14 +63,13 @@ pub struct FlashValues {
 }
 
 impl FlashValues {
-    /// The stock PROM image's own values: the Origin 200 with a 180 MHz R10000
-    /// and 1 MiB of secondary cache. Every product starts from them and
-    /// replaces what differs for it and its processor module.
+    /// The stock PROM image's values (Origin 200, 180 MHz R10000, 1 MiB cache);
+    /// every product starts from them and replaces what differs.
     pub const STOCK_R10000_180: Self = Self {
         machine_type: 1,
         read_cycles: 15,
         write_cycles: 4,
-        cpu_mode_bits: 0x1211_a785,
+        cpu_mode_bits: parts::R10000_180_SYSCLK_90.mode_word,
         cpu_clock_hz: 180_000_000,
     };
 }
@@ -87,9 +84,8 @@ fn byte_sum(b: &[u8]) -> u8 {
     b.iter().fold(0u8, |s, x| s.wrapping_add(*x))
 }
 
-/// The template a flash starts from: entry zero spins, the other nine jump-table
-/// entries return, the configuration block is filled in and the environment
-/// log has its header. A payload overlays the front of it.
+/// The template a flash starts from: entry zero spins, the other nine
+/// jump-table entries return. A payload overlays its front.
 fn template(values: &FlashValues) -> Vec<u8> {
     let mut f = vec![0xff; SIZE];
     for i in 0..10 {
@@ -119,9 +115,8 @@ fn template(values: &FlashValues) -> Vec<u8> {
     f
 }
 
-/// Patch the product and module values into the configuration block, keeping
-/// the block's byte sum: the checksum adjustment word absorbs the change. A
-/// block without the magic is left alone.
+/// Patch product and module values into the configuration block, keeping its
+/// byte sum via the adjustment word. A block without the magic is left alone.
 fn configure(f: &mut [u8], values: &FlashValues) {
     let c = &mut f[CONFIG_OFFSET..CONFIG_OFFSET + CONFIG_SIZE];
     if u64::from_be_bytes(c[0x08..0x10].try_into().unwrap()) != CONFIG_MAGIC {
@@ -139,8 +134,7 @@ fn configure(f: &mut [u8], values: &FlashValues) {
 }
 
 /// A fresh flash image: the template, the PROM payload over its front, and the
-/// product and module values patched into whichever configuration block is
-/// there.
+/// product and module values patched into any configuration block there.
 pub fn initial_image(payload: &[u8], values: &FlashValues) -> Result<Vec<u8>, String> {
     if payload.len() > SIZE {
         return Err(format!("the PROM payload is {} bytes; the node flash holds {SIZE}", payload.len()));
@@ -214,6 +208,10 @@ impl State {
 
 pub struct NodeFlash {
     st: Mutex<State>,
+    /// JIT v2: the part's identity in a page key, and its write counter:
+    /// every write cycle bumps it, since a command changes what a read returns.
+    #[cfg(feature = "jitv2")]
+    code: (crate::traits::CodeBank, std::sync::atomic::AtomicU64),
 }
 
 impl NodeFlash {
@@ -223,17 +221,20 @@ impl NodeFlash {
         }
         Ok(Arc::new(Self {
             st: Mutex::new(State::new(image, None)),
+            #[cfg(feature = "jitv2")]
+            code: Default::default(),
         }))
     }
 
-    /// A flash backed by `path`: an existing file of exactly 1 MiB replaces
-    /// `image` (completed programs and erases are written through), an empty
-    /// or missing one is seeded from it.
+    /// A flash backed by `path`: a 1 MiB file replaces `image` (programs and
+    /// erases write through); an empty or missing one is seeded from it.
     pub fn with_file(image: Vec<u8>, path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
         let mut data = image;
         let backing = FlashBacking::open(path, &mut data)?;
         Ok(Arc::new(Self {
             st: Mutex::new(State::new(data, Some(backing))),
+            #[cfg(feature = "jitv2")]
+            code: Default::default(),
         }))
     }
 
@@ -259,6 +260,19 @@ impl Resettable for NodeFlash {
     }
 }
 
+/// A boot flash with no time of its own: the machine starts and stops it like its board's devices.
+impl Device for NodeFlash {
+    fn step(&self, _: u64) {}
+    fn start(&self) {}
+    fn stop(&self) {}
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn get_clock(&self) -> u64 {
+        0
+    }
+}
+
 struct Chip(Arc<NodeFlash>);
 
 impl Chip {
@@ -276,7 +290,29 @@ macro_rules! chip_read {
         }
     };
 }
+impl NodeFlash {
+    /// A write cycle reached the part: compiled code read from it is stale.
+    fn wrote(&self) {
+        #[cfg(feature = "jitv2")]
+        self.code.1.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The page holding byte `offset` of the part, for the JIT.
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, offset: usize) -> Option<crate::traits::CodePage> {
+        (offset < SIZE).then(|| self.code.0.page(offset as u64, &self.code.1))
+    }
+}
+
 impl BusDevice for Chip {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _a: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.0.code.1
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> {
+        self.0.code_page(usize::try_from(a).ok()?)
+    }
     chip_read!(read8, u8, BusRead8);
     chip_read!(read16, u16, BusRead16);
     chip_read!(read32, u32, BusRead32);
@@ -285,6 +321,7 @@ impl BusDevice for Chip {
         match usize::try_from(a) {
             Ok(a) if a < SIZE => {
                 self.0.st.lock().write(a, v);
+                self.0.wrote();
                 BUS_OK
             }
             _ => BUS_ERR,
@@ -307,12 +344,22 @@ macro_rules! window_read {
     };
 }
 impl BusDevice for Window {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _a: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.0.code.1
+    }
+    // Reads repeat the image, so the page is the image's, wherever it repeats.
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> {
+        self.0.code_page(a as usize % SIZE)
+    }
     window_read!(read8, u8, BusRead8);
     window_read!(read16, u16, BusRead16);
     window_read!(read32, u32, BusRead32);
     window_read!(read64, u64, BusRead64);
     fn write64(&self, a: u64, v: u64) -> u32 {
         self.0.st.lock().write((a as usize / 8) % SIZE, v as u8);
+        self.0.wrote();
         BUS_OK
     }
     fn write8(&self, a: u64, v: u8) -> u32 {
@@ -337,40 +384,12 @@ mod tests {
         machine_type: 1,
         read_cycles: 15,
         write_cycles: 4,
-        cpu_mode_bits: 0x1211_a785,
+        cpu_mode_bits: parts::R10000_180_SYSCLK_90.mode_word,
         cpu_clock_hz: 180_000_000,
     };
 
-    fn payload() -> Vec<u8> {
-        // A payload whose configuration block is the stock shape: magic in
-        // place, product fields as a stock image holds them.
-        let mut p = vec![0u8; 0x1000];
-        let c = &mut p[0x60..0xb0];
-        put32(c, 0x04, 0x1211_a785);
-        put64(c, 0x08, 0x6970_3237_636f_6e66u64);
-        put64(c, 0x10, 180_000_000);
-        put32(c, 0x2c, 8);
-        put32(c, 0x30, 0);
-        put32(c, 0x3c, 1);
-        p
-    }
-
-    #[test]
-    fn the_four_product_words_are_patched_and_the_block_sum_kept() {
-        let p = payload();
-        let before = byte_sum(&p[0x60..0xb0]);
-        let f = initial_image(&p, &V).unwrap();
-        let c = &f[0x60..0xb0];
-        assert_eq!(u32::from_be_bytes(c[0x2c..0x30].try_into().unwrap()), 15);
-        assert_eq!(u32::from_be_bytes(c[0x30..0x34].try_into().unwrap()), 1);
-        assert_eq!(u32::from_be_bytes(c[0x3c..0x40].try_into().unwrap()), 4);
-        assert_ne!(c[0x34..0x38], [0; 4], "the adjustment word absorbs the change");
-        assert_eq!(byte_sum(c), before);
-    }
-
-    /// A stock block (the shipped PROM's values) patched for the default
-    /// module moves exactly the cycle counts and machine type, and the
-    /// adjustment word that keeps the block's sum is 0xf5.
+    /// A stock block patched for the default module moves exactly the cycle
+    /// counts and machine type; the sum-keeping adjustment word is 0xf5.
     #[test]
     fn the_adjustment_byte_for_the_stock_block_is_0xf5() {
         let mut p = vec![0u8; 0x1000];
@@ -386,7 +405,9 @@ mod tests {
         put32(c, 0x3c, 1);
         put32(c, 0x40, 6);
         put32(c, 0x44, 156);
+        let before = byte_sum(&p[0x60..0xb0]);
         let f = initial_image(&p, &V).unwrap();
+        assert_eq!(byte_sum(&f[0x60..0xb0]), before);
         assert_eq!(&f[0x94..0x98], &0xf5u32.to_be_bytes());
         assert_eq!(&f[0x8c..0x90], &15u32.to_be_bytes());
         assert_eq!(&f[0x90..0x94], &1u32.to_be_bytes());
@@ -424,18 +445,20 @@ mod tests {
         assert_eq!(f.window().write64(off as u64 * 8, u64::from(v)), BUS_OK);
     }
 
+    fn program(f: &Arc<NodeFlash>, off: usize, v: u8) {
+        for (off, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0xa0), (off, v)] {
+            command(f, off, v);
+        }
+    }
+
     #[test]
     fn program_clears_bits_and_erase_restores_a_sector() {
         let f = NodeFlash::new(vec![0xff; 0x10_0000]).unwrap();
         let chip = f.chip();
-        for (off, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0xa0), (0x1234, 0x5a)] {
-            command(&f, off, v);
-        }
+        program(&f, 0x1234, 0x5a);
         assert_eq!(chip.read8(0x1234).data, 0x5a);
         // Programming cannot set a bit.
-        for (off, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0xa0), (0x1234, 0xa5)] {
-            command(&f, off, v);
-        }
+        program(&f, 0x1234, 0xa5);
         assert_eq!(chip.read8(0x1234).data, 0x00);
         for (off, v) in [
             (0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0x80),
@@ -451,9 +474,7 @@ mod tests {
     #[test]
     fn a_program_of_0xf0_is_data_not_a_reset() {
         let f = NodeFlash::new(vec![0xff; 0x10_0000]).unwrap();
-        for (off, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0xa0), (0x77, 0xf0)] {
-            command(&f, off, v);
-        }
+        program(&f, 0x77, 0xf0);
         assert_eq!(f.chip().read8(0x77).data, 0xf0);
     }
 
@@ -490,9 +511,7 @@ mod tests {
         let dir = crate::test_temp::TempPath::dir("node-flash");
         let path = dir.join("flash.raw");
         let f = NodeFlash::with_file(vec![0xff; 0x10_0000], &path).unwrap();
-        for (off, v) in [(0x5555, 0xaa), (0x2aaa, 0x55), (0x5555, 0xa0), (9, 0x12)] {
-            command(&f, off, v);
-        }
+        program(&f, 9, 0x12);
         drop(f);
         let again = NodeFlash::with_file(vec![0xff; 0x10_0000], &path).unwrap();
         assert_eq!(again.chip().read8(9).data, 0x12);

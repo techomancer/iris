@@ -50,8 +50,22 @@ impl Monitor {
         *self.bound.lock()
     }
 
+    /// Every command name a client can type, for Tab completion: the
+    /// devices' own and the three `handle_client` answers itself.
+    pub fn command_names(&self) -> Vec<String> {
+        let devs = self.devices.lock();
+        let own = devs.iter().flat_map(|d| d.register_commands()).map(|(name, _)| name);
+        own.chain(["help", "quit", "exit"].map(String::from)).collect()
+    }
+
     pub fn register_device(&self, device: Arc<dyn Device>) {
         self.devices.lock().push(device);
+    }
+
+    /// What `audio status` prints.
+    #[cfg(test)]
+    pub fn audio_status(&self) -> String {
+        audio_status(&self.devices.lock())
     }
 
     /// Bind `addr` and serve it on a new thread. The bind happens before
@@ -101,6 +115,12 @@ impl Monitor {
             }
         });
     }
+}
+
+/// Every sound card's report, or why there is none.
+fn audio_status(devices: &[Arc<dyn Device>]) -> String {
+    let reports: String = devices.iter().filter_map(|d| d.audio_report()).collect();
+    if reports.is_empty() { "No audio device.\n".to_string() } else { reports }
 }
 
 fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
@@ -176,6 +196,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         
         let mut target_device: Option<Arc<dyn Device>> = None;
         let mut is_help = false;
+        let audio = cmd == "audio" && (args.is_empty() || args == ["status"]);
         
         if cmd == "help" {
             is_help = true;
@@ -184,12 +205,14 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         {
             let devs = devices.lock();
             if is_help {
-                for dev in devs.iter() {
-                    for (c, h) in dev.register_commands() {
-                        let _ = writeln!(writer, "{:12} - {}", c, h);
-                    }
+                let cmds: Vec<_> = devs.iter().flat_map(|d| d.register_commands()).collect();
+                if !cmds.iter().any(|(c, _)| c == "audio") {
+                    let _ = writeln!(writer, "{:12} - {}", "audio", "audio status: each sound card's frames moved and skipped, and its host stream");
                 }
-            } else {
+                for (c, h) in cmds {
+                    let _ = writeln!(writer, "{:12} - {}", c, h);
+                }
+            } else if !audio {
                 for dev in devs.iter() {
                     let cmds = dev.register_commands();
                     if cmds.iter().any(|(c, _)| c == cmd) {
@@ -200,7 +223,10 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             }
         }
         
-        if !is_help {
+        if audio {
+            let text = audio_status(&devices.lock());
+            let _ = write!(writer, "{}", text);
+        } else if !is_help {
             if let Some(dev) = target_device {
                 let cmd_writer = Box::new(BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap())));
                 match dev.execute_command(cmd, args, cmd_writer) {
@@ -253,6 +279,29 @@ mod tests {
         wait_for("port release", || TcpListener::bind(addr).ok());
     }
 
+    struct Ping;
+
+    impl Device for Ping {
+        fn step(&self, _cycles: u64) {}
+        fn stop(&self) {}
+        fn start(&self) {}
+        fn is_running(&self) -> bool { false }
+        fn get_clock(&self) -> u64 { 0 }
+        fn register_commands(&self) -> Vec<(String, String)> {
+            vec![("ping".to_string(), "ping status".to_string())]
+        }
+    }
+
+    #[test]
+    fn command_names_lists_the_devices_commands_and_the_built_ins() {
+        let monitor = Monitor::new();
+        monitor.register_device(Arc::new(Ping));
+        let names = monitor.command_names();
+        for want in ["ping", "help", "quit"] {
+            assert!(names.iter().any(|n| n == want), "{want} missing from {names:?}");
+        }
+    }
+
     /// A port already in use (another iris's monitor) leaves this monitor
     /// unbound, and says so as soon as `start_server` returns — the console
     /// client must not go looking for a monitor on that port.
@@ -263,6 +312,46 @@ mod tests {
         let monitor = Arc::new(Monitor::new());
         monitor.clone().start_server(addr.to_string());
         assert_eq!(monitor.bound_addr(), None);
+    }
+
+    /// A stub sound card; with `own_command` it registers `audio` itself.
+    struct Card(&'static str, bool);
+    impl Device for Card {
+        fn step(&self, _: u64) {}
+        fn stop(&self) {}
+        fn start(&self) {}
+        fn is_running(&self) -> bool { true }
+        fn get_clock(&self) -> u64 { 0 }
+        fn audio_report(&self) -> Option<String> { Some(format!("audio: {}\n", self.0)) }
+        fn register_commands(&self) -> Vec<(String, String)> {
+            if self.1 { vec![("audio".into(), "own".into())] } else { vec![] }
+        }
+    }
+
+    /// `help` lists `audio` once, even where a card registers its own.
+    #[test]
+    fn help_lists_audio_once() {
+        let lines = |cards: Vec<Card>| {
+            let out = converse_with(cards.into_iter().map(|c| Arc::new(c) as Arc<dyn Device>).collect(), b"help\n");
+            out.lines().filter(|l| l.trim_start_matches("> ").starts_with("audio ")).count()
+        };
+        assert_eq!(lines(vec![]), 1);
+        assert_eq!(lines(vec![Card("a", true)]), 1, "the card's own line, not a second");
+    }
+
+    /// `audio status` lists every card registered, several at once, and on a
+    /// machine with none says so rather than calling the command unknown.
+    #[test]
+    fn audio_status_lists_every_sound_card() {
+        for line in [&b"audio status\n"[..], b"audio\n"] {
+            let out = converse(line);
+            assert!(out.contains("No audio device"), "{out}");
+            assert!(!out.contains("Unknown command"), "{out}");
+        }
+        let monitor = Monitor::new();
+        monitor.register_device(Arc::new(Card("one", false)));
+        monitor.register_device(Arc::new(Card("two", false)));
+        assert_eq!(monitor.audio_status(), "audio: one\naudio: two\n");
     }
 
     /// `quit` ends the connection even though the machine's log sink keeps a
@@ -285,9 +374,16 @@ mod tests {
     /// Send `input` to a fresh monitor, then `quit`, and return everything it
     /// said before hanging up.
     fn converse(input: &[u8]) -> String {
+        converse_with(Vec::new(), input)
+    }
+
+    fn converse_with(devices: Vec<Arc<dyn Device>>, input: &[u8]) -> String {
         use std::io::{Read, Write};
         crate::devlog::init_devlog();
         let monitor = Arc::new(Monitor::new());
+        for d in devices {
+            monitor.register_device(d);
+        }
         monitor.clone().start_server("127.0.0.1:0".to_string());
         let addr = wait_for("bind", || monitor.bound_addr());
         let mut s = TcpStream::connect(addr).unwrap();

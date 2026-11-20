@@ -119,7 +119,7 @@ pub struct FillCounts {
     pub drawn: u64,
     /// Requests refused because the context did not decode (or was opaque with
     /// no stipple), because it targets planes not held, or because a
-    /// destination word did not fit the target.
+    /// destination word was out of range for the target.
     pub bad_context: u64,
     pub other_target: u64,
     pub bad_destination: u64,
@@ -300,9 +300,9 @@ impl<'a> Plan<'a> {
         (row, p.width, (x - p.origin.0).rem_euclid(p.width))
     }
 
-    /// Whether every pixel this box would change holds a word that fits the
-    /// target: only a fill that reads its destination can fail.
-    fn destination_fits(&self, b: Box4, spans: &mut Vec<(i64, i64)>) -> bool {
+    /// Whether every pixel this box would change holds a word the
+    /// target can take: only a fill that reads its destination can fail.
+    fn destination_in_range(&self, b: Box4, spans: &mut Vec<(i64, i64)>) -> bool {
         let Some((x1, y1, x2, y2)) = self.clip(b) else { return true };
         for y in y1..y2 {
             self.row_spans(y, x1, x2, spans);
@@ -391,7 +391,7 @@ fn rows<const GX: u32, const NEEDS: bool, const STIP: bool>(p: &Plan<'_>, b: Box
     }
 }
 
-/// Draw `b` with the loop that fits the request: chosen once, not per pixel.
+/// Draw `b` with the loop that suits the request: chosen once, not per pixel.
 fn draw(p: &Plan<'_>, b: Box4, spans: &mut Vec<(i64, i64)>) {
     macro_rules! by_op {
         ($stip:literal, $($gx:literal),*) => {
@@ -436,7 +436,7 @@ impl XState {
             Err(why) => return Outcome { drawn: 0, refused: Some(why) },
         };
         let back = plan.second();
-        if plan.needs && !boxes.clone().all(|b| plan.destination_fits(b, spans) && back.as_ref().is_none_or(|p| p.destination_fits(b, spans))) {
+        if plan.needs && !boxes.clone().all(|b| plan.destination_in_range(b, spans) && back.as_ref().is_none_or(|p| p.destination_in_range(b, spans))) {
             return Outcome { drawn: 0, refused: Some(Refused::Destination) };
         }
         let mut drawn = 0;

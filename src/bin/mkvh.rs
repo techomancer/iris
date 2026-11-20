@@ -1,11 +1,15 @@
 //! SGI volume-header image tool: build a PROM-bootable image, or dump one.
 //!
+//! ```text
 //! Build:  mkvh build <out.img> [--size N] [--bootfile NAME]
 //!                    [--part slot:type:first:nblks[=file]] <name=path> ...
 //! Dump:   mkvh dump <image>
+//! ```
 //!
 //! A built image is bootable by name from the PROM:
+//! ```text
 //!   boot -f dksc(0,<scsi-id>,8)<name>
+//! ```
 //!
 //! Dump mode is the layout check: run it on an original SGI CD and the voldir
 //! should list sashARCS and friends with a valid checksum.

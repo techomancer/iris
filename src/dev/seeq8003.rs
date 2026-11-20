@@ -1,6 +1,9 @@
 // SEEQ 8003 / 80C03 Ethernet Data Link Controller emulation
 //
-// Acts as a minimal NAT gateway/router at 192.168.0.1 for the emulated machine.
+// The Indy's and Indigo2's onboard Ethernet, behind HPC3's Ethernet DMA. Its
+// frames go to the backend `[network]` selects (the NAT gateway, by default at
+// 192.168.0.1 on `nat_subnet`, a PCAP bridge or a stream segment), which runs
+// on the `seeq-net` thread.
 //
 // RX DMA buffer layout (per IRIX if_ec2.c / seeq.h):
 //   [2 bytes pad][ethernet frame][1 byte SEEQ status]
@@ -215,8 +218,8 @@ pub struct Seeq8003 {
 }
 
 /// The network backend behind the Ethernet. Each `start` runs a fresh
-/// backend with new rings, through the [`Session`](crate::net::Session) every
-/// NIC uses.
+/// backend with new rings, through the [`Session`](crate::net::Session) the
+/// NICs share.
 struct Net {
     session: crate::net::Session,
     /// enet waits on this for frames from the backend; `kick_*` notifies it.
@@ -542,13 +545,13 @@ impl Seeq8003 {
     }
 
     /// Return current RX status byte without side-effects (no OLD-marking).
-    /// Used by HPC3 to mirror SEEQ status into rx_ctrl[7:0].
+    /// Used by HPC3 to mirror SEEQ status into rx_ctrl\[7:0\].
     pub fn get_rx_status(&self) -> u8 {
         lock_state!(self.state).rx_stat
     }
 
     /// Return current TX status byte without side-effects (no OLD-marking).
-    /// Used by HPC3 to mirror SEEQ status into tx_ctrl[7:0].
+    /// Used by HPC3 to mirror SEEQ status into tx_ctrl\[7:0\].
     pub fn get_tx_status(&self) -> u8 {
         lock_state!(self.state).tx_stat
     }

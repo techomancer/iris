@@ -3,8 +3,11 @@
 > Historical May 2026 handoff. Idle parking is now implemented behind
 > `idle-pause` (`src/cpu/idle_park.rs`) and used by GUI premiere builds.
 > September fixes wake parked CPUs on device interrupts and prevent parking
-> with all interrupts masked. The uncommitted state and old JIT commands below
-> describe the original investigation. Current usage is in README.md/HACKING.md.
+> with all interrupts masked. November 2026 added multiprocessor parking
+> (slices, kicks, the shared-loop rule) and parking under jitv2 (probe runs,
+> learned signatures): see `idle-park-smp-run-queue-polling.md`. The
+> uncommitted state and old JIT commands below describe the original
+> investigation. Current usage is in README.md/HACKING.md.
 
 Status as of 2026-05-29. Goal: **stop spinning the host CPU at 100% when IRIX is
 idle** by detecting the kernel idle loop and parking the emulator until the next

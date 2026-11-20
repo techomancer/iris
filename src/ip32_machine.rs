@@ -1,8 +1,9 @@
 //! The O2 (IP32) as a machine: iris's CPU thread and window around the IP32
 //! bus and devices (`ip32.rs`).
 //!
-//! Selected with `[machine] profile = "o2_ip32"` and configured by `[o2]`
-//! (see [`crate::config::O2Section`]). Between instructions, two things run:
+//! Selected with `[machine] profile = "o2_ip32"`, the shared configuration
+//! keys and O2-specific `[o2]` options ([`crate::config::O2Section`]). Between
+//! instructions, two things run:
 //!
 //! - a service thread keeps the devices' interrupts current in CRIME and
 //!   CRIME's in the CPU's IP2, runs the MACE clock from the host clock, and
@@ -10,7 +11,7 @@
 //! - a batch hook on the CPU thread lends the firmware the FPU, when
 //!   `arcs_fpu` asks for it, with where the guest is running.
 //!
-//! Both CPUs run on the shadow cache from reset: the JIT reaches RAM through
+//! R5000, R10000 and R12000 all run on the shadow cache from reset: the JIT reaches RAM through
 //! the ppmem window with no tag probe, LRU or dirty bit on any load or store.
 //! The stack POST keeps in cache tags is [`O2Memory`]'s business.
 //!
@@ -216,7 +217,7 @@ impl O2Machine {
         // The NVMe card, in the "PCI option" slot.
         if !cfg.nvme.path.is_empty() {
             let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
-            card.fit(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
+            card.attach(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
             let _ = bus.nvme.set(card.nvme);
         }
         let scratch_path = attached.scratch;
@@ -261,6 +262,9 @@ impl O2Machine {
         let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = crate::with_cpu!(part, true, true, C =>
             Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), part.prid()));
+        let world = Arc::new(crate::cpu::smp::World::new());
+        world.set_slots(vec![cpu.park_slot()]);
+        bus.ram.set_world(world);
 
         // ppmem: the CPU's cache and the JIT reach RAM through a cached view
         // of the memory's window, publishing its bitmap into the CPU's own
@@ -287,29 +291,12 @@ impl O2Machine {
         // geometry once, as it starts, and without the windows that geometry
         // has no inline load or store path.
         #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            // Not under lockstep, as on the other machines: lockstep compiles
-            // inline on the CPU thread, and a running pool both owns the
-            // Codegen inline needs and deadlocks the CPU thread's flush (its
-            // join waits on workers parked on the Jitv2 lock it holds).
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                drop(g);
-                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, bus.phys.clone() as Arc<dyn BusDevice>);
-            }
-        }
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, bus.phys.clone(), None);
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
-        bus.gbe.use_cpu_clock(cpu.cycles_ptr(), cpu_mhz);
         // CRIME's rendering engine draws on its own thread, fed through
         // its interface buffer.
         bus.crime.re.start(bus.clone(), |b: &Ip32Bus| &b.crime.re);
@@ -317,7 +304,12 @@ impl O2Machine {
         let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
-        let display = Arc::new(O2Display::new(bus.clone(), status, running.clone()));
+        let paused = Arc::new(AtomicBool::new(false));
+        // GBE's timing interrupts come at their lines from the timer thread.
+        status.refresh().set_timers(timer_manager.clone());
+        let display = Arc::new(O2Display::new(bus.clone(), status, paused.clone()));
+        let head: Arc<dyn crate::display::Head> = display.clone();
+        display.head.attach(Arc::downgrade(&head));
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
@@ -377,7 +369,7 @@ impl O2Machine {
             controller_up: Arc::new(AtomicBool::new(false)),
             controller_slot: None,
             boot,
-            paused: Arc::new(AtomicBool::new(false)),
+            paused,
             lifecycle: crate::machine_state::GuestState::Idle,
             disks,
             flash_path: Some(cfg.nvram.clone()),
@@ -456,8 +448,7 @@ impl O2Machine {
         }
         self.running.store(true, Ordering::SeqCst);
         self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
-        let d = self.display.clone();
-        self.threads.push(std::thread::Builder::new().name("O2-Display".into()).spawn(move || d.display_loop()).unwrap());
+        self.display.head.start();
         let bus = self.bus.clone();
         let cpu = self.cpu.clone();
         let running = self.running.clone();
@@ -803,7 +794,8 @@ impl Drop for O2Machine {
         self.cpu.clone().as_device().stop();
         #[cfg(feature = "jitv2")]
         crate::cpu::jitv2::Jitv2::stop_for_drop(&self.cpu.jitv2(), || self.cpu.clone().as_device().stop());
-        self.display.display_stop.request();
+        // The refresh thread lets go of the renderer here (`DisplayStop`).
+        self.display.head.stop();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();
@@ -834,7 +826,7 @@ impl Workstation for O2Machine {
         crate::workstation::register_system_controller(&self.monitor, slot, events);
         self.controller_up.store(true, Ordering::SeqCst);
     }
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.monitor.bound_addr() }
+    fn monitor(&self) -> &Arc<crate::monitor::Monitor> { &self.monitor }
     /// The PROM's flash, where `setenv` keeps its settings, and the RTC's RAM,
     /// written out now. The flash goes only to the file `nvram` names.
     fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
@@ -907,108 +899,138 @@ impl Workstation for O2Machine {
     }
 }
 
-/// GBE's picture, scanned out of RAM about sixty times a second and handed
-/// to whatever renderer the front-end installs.
+/// GBE's picture, scanned out of RAM every frame by the display refresh
+/// thread and handed to whatever renderer the front-end installs.
 pub struct O2Display {
     bus: Arc<Ip32Bus>,
-    renderer: Mutex<Option<Box<dyn Renderer>>>,
-    display_stop: crate::gfx_display::DisplayStop,
-    screen: Mutex<Rex3Screen>,
-    screenshot_pending: AtomicBool,
+    /// The display channel: screen, renderer slot and frame requests
+    /// (`crate::display`).
+    head: Arc<crate::display::HeadHandle>,
+    /// The scan-out's RGBA bytes, and the last size shown.
+    scan: Mutex<Scan>,
     /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
     /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
     /// which has no 8254).
     status: Arc<crate::disp::StatusSource>,
-    running: Arc<AtomicBool>,
+    /// Where the beam meets each of GBE's four timing interrupts, in lines
+    /// after the start of vertical blanking, as of the last retrace.
+    irq_lines: Mutex<[Option<u32>; 4]>,
+    /// The machine is stopped: the guest's state is left alone.
+    paused: Arc<AtomicBool>,
+}
+
+/// The scan-out's side of the screen.
+struct Scan {
+    /// The reader's view of RAM.
+    window: crate::dev::crime_mem::RamWindow,
+    /// The last size shown.
+    size: (usize, usize),
+    /// What the screen's buffer holds of GBE's frame (`Gbe::render_direct`).
+    memo: crate::dev::o2gfx::ScanMemo,
+    /// The buffer holds the black of a display that is off.
+    black: bool,
 }
 
 impl O2Display {
-    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, running: Arc<AtomicBool>) -> Self {
+    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, paused: Arc<AtomicBool>) -> Self {
         Self {
+            irq_lines: Mutex::new([None; 4]),
+            paused,
+            head: status.refresh().head(status.clone()),
+            scan: Mutex::new(Scan { window: bus.ram.window(), size: (0, 0), memo: Default::default(), black: false }),
             bus,
-            renderer: Mutex::new(None),
-            display_stop: Default::default(),
-            screen: Mutex::new(Rex3Screen::new()),
-            screenshot_pending: AtomicBool::new(false),
             status,
-            running,
+        }
+    }
+}
+
+impl crate::display::Head for O2Display {
+    /// GBE scans RAM the CPU and the rendering engine write with no mark
+    /// the display could test, so every frame is looked at: the scan-out
+    /// finds what changed (`compose` answers `Unchanged` when nothing did).
+    fn changed(&self) -> bool {
+        true
+    }
+
+    /// The frame rate is the guest's: GBE's frame size at its dot clock.
+    /// The lines past the picture's height are the vertical blank. GBE's
+    /// frame begins here (its shadows go live), and its timing interrupts,
+    /// which are line compares, are asked for at their lines.
+    fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        if !self.paused.load(Ordering::Relaxed) {
+            let lines = self.bus.gbe.retrace();
+            let mut at = [0u32; 4];
+            let mut n = 0;
+            for line in lines.into_iter().flatten() {
+                at[n] = line;
+                n += 1;
+            }
+            self.head.set_line_events(&at[..n]);
+            *self.irq_lines.lock() = lines;
+        }
+        if let Some((h_total, v_total, pixel_clock_hz)) = self.bus.video_totals() {
+            let height = self.scan.lock().size.1 as u32;
+            let blank = v_total.saturating_sub(height);
+            let vblank_lines = if height != 0 && blank != 0 { blank } else { (v_total / 25).max(1) };
+            self.head.set_timing(crate::display::VideoTiming { h_total, v_total, pixel_clock_hz, vblank_lines, fields: 1 });
         }
     }
 
-    fn display_loop(&self) {
-        let frame_time = Duration::from_micros(16_667);
-        let mut status_bar = crate::disp::StatusBar::new();
-        let mut overlay = crate::debug_overlay::DebugOverlay::new();
-        let mut sbtex = crate::disp::StatusBarTexture::new();
-        let mut rgba = vec![0u8; 2048 * 2048 * 4];
-        let mut size = (0usize, 0usize);
-        let mut shots = 0u32;
-        while self.running.load(Ordering::Relaxed) {
-            let start = Instant::now();
-            let shown = self.bus.render_screen(&mut rgba);
-            // Off: keep the last size, black.
-            let (w, h) = shown.map(|(w, h)| (w as usize, h as usize)).unwrap_or(if size.0 == 0 { (1280, 1024) } else { size });
-            {
-                let mut screen = self.screen.lock();
-                let stride = crate::disp::FB_STRIDE;
-                for y in 0..h {
-                    for x in 0..w {
-                        let v = if shown.is_some() {
-                            let o = (y * w + x) * 4;
-                            u32::from_le_bytes([rgba[o], rgba[o + 1], rgba[o + 2], 0xff])
-                        } else {
-                            0xff00_0000
-                        };
-                        screen.fb_rgb[y * stride + x] = v;
-                        screen.rgba[y * stride + x] = v;
-                    }
-                }
-                screen.frame_seq = screen.frame_seq.wrapping_add(1);
-                screen.prebuilt = true;
-                screen.width = w;
-                screen.height = h;
-                screen.status_bar_only = false;
-                let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-                let stats = self.status.snapshot(start, 0);
-                if let Some(r) = self.renderer.lock().as_mut() {
-                    if (w, h) != size {
-                        r.resize(w, h);
-                    }
-                    r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, take_shot, None, None);
-                }
-                size = (w, h);
-                if take_shot {
-                    let pixels = screen.rgba.clone();
-                    let path = format!("screenshot_{shots:04}.png");
-                    shots += 1;
-                    std::thread::spawn(move || match crate::disp::save_screenshot(&path, &pixels, w, h) {
-                        Ok(()) => println!("iris: screenshot saved to {path}"),
-                        Err(e) => println!("iris: screenshot failed: {e}"),
-                    });
-                }
-            }
-            let spent = start.elapsed();
-            if spent < frame_time {
-                std::thread::sleep(frame_time - spent);
+    fn line(&self, line: u32, _field: u32, _t_ns: u64) {
+        if self.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        let lines = *self.irq_lines.lock();
+        for (n, at) in lines.into_iter().enumerate() {
+            if at == Some(line) {
+                self.bus.gbe.timing_interrupt(n);
             }
         }
-        self.display_stop.finish(&self.renderer);
+    }
+
+    /// GBE's picture straight out of RAM into the screen
+    /// (`Gbe::render_direct`); black at the last size while the display is
+    /// off.
+    fn compose(&self, screen: &mut Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
+        let mut scan = self.scan.lock();
+        let Scan { window, size, memo, black } = &mut *scan;
+        let stride = crate::disp::FB_STRIDE;
+        let (w, h, new) = match self.bus.gbe.render_direct(window, &mut screen.fb_rgb, stride, memo) {
+            Some((w, h, wrote)) => {
+                *black = false;
+                (w as usize, h as usize, wrote)
+            }
+            None => {
+                let (w, h) = if size.0 == 0 { (1280, 1024) } else { *size };
+                let new = !*black;
+                if new {
+                    for y in 0..h {
+                        screen.fb_rgb[y * stride..y * stride + w].fill(0xff00_0000);
+                    }
+                    memo.forget();
+                    *black = true;
+                }
+                (w, h, new)
+            }
+        };
+        let new = new || (w, h) != *size || !screen.prebuilt;
+        screen.prebuilt = true;
+        screen.width = w;
+        screen.height = h;
+        *size = (w, h);
+        if new { crate::display::Composed::Frame } else { crate::display::Composed::Unchanged }
     }
 }
 
 impl crate::gfx_display::GfxDisplay for O2Display {
-    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> {
-        &self.renderer
-    }
-    fn display_stop(&self) -> &crate::gfx_display::DisplayStop {
-        &self.display_stop
-    }
-    fn screen(&self) -> &Mutex<Rex3Screen> {
-        &self.screen
-    }
-    fn request_screenshot(&self) {
-        self.screenshot_pending.store(true, Ordering::Relaxed);
-    }
+    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { self.head.renderer_slot() }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { self.head.display_stop() }
+    fn screen(&self) -> &Mutex<Rex3Screen> { self.head.screen() }
+    fn request_screenshot(&self) { self.head.request_screenshot(); }
+    fn screenshot_pending(&self) -> bool { self.head.screenshot_pending() }
+    fn request_frame(&self) { self.head.request_frame(); }
+    fn frame_pending(&self) -> bool { self.head.frame_pending() }
+    fn set_capture(&self, on: bool) { self.head.set_capture(on); }
     fn cycles(&self) -> CyclesPtr {
         self.status.cycles()
     }
@@ -1323,7 +1345,7 @@ mod drop_tests {
     /// `[nvme]` puts a card in the "PCI option" slot and records its disk;
     /// the bus's disk flush reaches its namespace.
     #[test]
-    fn an_nvme_card_is_fitted_in_the_option_slot() {
+    fn an_nvme_card_is_attached_in_the_option_slot() {
         let dir = scratch("o2-nvme");
         let disk = dir.join("nvme.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();

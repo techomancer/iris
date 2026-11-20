@@ -1,6 +1,6 @@
 # Testing and benchmarking
 
-The suite commands and benchmarking guidance previously in README.md.
+How to run the test suites and benchmarks, and what CI runs.
 Build-feature and configuration combinations are listed in
 [FEATURES.md](FEATURES.md); outstanding functionality is tracked in
 [TODO.md](clanker/TODO.md).
@@ -19,7 +19,7 @@ and R5000, both passing every check); see
 ```sh
 make -C cpu-tests all    # build the guest; compiler: see cpu-tests/docs/toolchain.md
 make -C cpu-tests run    # one run on ../target/release/iris, PASS/FAIL per test, no verdict
-cargo test --release [--features jitv2] --test cpu_tests -- --ignored   # judged, both CPUs
+cargo test --release [--features jitv2] --test cpu_tests -- --ignored   # judged, every CPU
 ```
 
 `make run` only prints. The verdict is the cargo test, which builds the
@@ -75,7 +75,7 @@ memories are compared word for word. They need a GPU, or lavapipe, and print
 `skipped` without one.
 
 ```sh
-cargo test --features wgpu --lib wgpu::tests odyssey::wgpu
+cargo test --features wgpu --lib -- wgpu::tests odyssey::wgpu
 ```
 
 **GL suites in a live guest** — `test/gltest/glsuite.sh` runs every GL check
@@ -136,8 +136,9 @@ sends to the host:
 
 - **`[audio] file`**: the card's host stream played into a WAV file in real
   time, silent where the card was late. It needs no sound card. It goes
-  through the stream's prebuffer and rate conversion, but cannot see the
-  host's audio system, its sound server or its mixer.
+  through the stream's prebuffer and rate conversion (no clock following,
+  so 48 kHz is copied exactly), but cannot see the host's audio system, its
+  sound server or its mixer.
 - **The real device** (Linux): the card plays into the host's default output
   and the test records it back from a loopback. `IRIS_AUDIO_LOOPBACK` names
   it as `<output host>:<capture source>`: the `[audio] host` the card plays
@@ -251,8 +252,10 @@ stale pixels even when the later final state matches:
 REX3_GPU_BACKEND=vulkan cargo test -p iris --lib --features rex-gpu,rex-jit,rexdiag rex3_corpus_gpu_ -- --ignored --nocapture --test-threads=1
 ```
 
-The separate **test-only resident Newport raster** has CPU-only limit,
-status and GFIFO gate tests, plus ignored hardware parity tests. The hardware
+The **resident Newport raster** has CPU-only limit, status and GFIFO gate
+tests, plus ignored hardware parity tests. Production activation uses the same
+backend; the hardware tests retain direct injection so they can isolate plane
+authority, ordering and failure behavior. The hardware
 tests require the named hardware adapter/backend rather than silently skipping;
 they compare both complete linear planes and the final architectural
 `Rex3Context` with the CPU oracle, including overlapping fills, clipping,
@@ -260,8 +263,8 @@ masks, tile boundaries, retries, and offscreen columns. They exercise the real
 GFIFO, reset, and partial-prefix restore. Scissor/CID clip modes outside the
 gated slice are rejected without advancing context or falling back. Explicit
 observation selects RGB, auxiliary or both and returns a snapshot; installing
-and acknowledging a CPU shadow is separate. These tests do not enable resident
-raster or direct scanout in a running emulator.
+and acknowledging a CPU shadow is separate. These tests do not depend on the production configuration selector; live
+activation is validated separately below.
 
 The opt-in CPU-plane residency tripwire copies each board shadow into its own
 page-aligned OS mapping, seeds the GPU, then protects both complete mappings.
@@ -288,16 +291,132 @@ published frame sequence. Additional cases inject loss into the shared
 asynchronous device-error sink before and after submission and while idle,
 including a full GFIFO and a full ordinary machine event queue. They require
 a single first-fault notification and reject restart.
-These tests opt in to the test-only display worker; they do not enable resident
-raster in the emulator. They do not complete board-level HOSTR, snapshot or
-other raw consumers, full opcode/lifecycle coverage, or live-window validation.
-Changed decoded DID metadata may still upload a cached 2 MiB map, so this is not
-yet the small-state-only/GPU-DID completion of direct scanout.
+These tests opt in to the manual display seam rather than production startup,
+so failures remain attributable to scanout/capture behavior. Production tests
+and live runs cover automatic startup, board-level snapshot/monitor consumers
+and the visible same-device window. On Windows and Linux, an additional
+hardware test sends two
+ordered draws and a resize through the common wgpu presenter on a native
+window. It explicitly reads the presenter's unpacked frame texture, including
+padded rows after the resize, and compares it pixel-for-pixel with the software
+compositor. This diagnostic readback is not part of ordinary presentation and
+does not inspect the final swapchain or on-screen pixels. The window test is
+excluded on macOS, where a separate main-thread harness is not yet provided.
+Resident refresh skips CPU DID decoding. A GPU kernel expands changed VC2 DID
+tables before scanout, and traffic assertions require zero decoded-map uploads
+and less than 128 KiB for the complete initial display-state transfer. The
+hardware oracle covers disabled DID, malformed line pointers, line-table
+termination with stale-row preservation, zero scanline length, and width and
+height changes on both backends. It explicitly reads the GPU DID metadata for
+byte-for-byte comparison with the CPU map; ordinary frames do not perform that
+test readback. The tests also cover scanout replacement, reset and restore
+epochs, switching displays, inactive display controls, and rejection of
+unreconstructible initial DID history or a different GPU device.
+The explicitly selected compatibility case does the opposite by design: it
+requires one successful, attributed
+`Compatibility` observation of both complete planes (16 MiB), composes from a
+separate CPU cache, leaves the board shadows stale and protected, and matches
+the software oracle. It is not a fallback from direct presentation.
+Three CPU command-ABI tests lock the 64-byte command and 256-byte state-slot
+packing, normalized fill capture, and bounded transactional payload ranges.
+The hardware fill cases consume the same records through WGSL and retain
+overlapping command order across bounded batch reuse.
+Four flat-fill normalizer tests additionally compare blocks, spans, consistent
+reverse-direction resident blocks and active `COLORVRAM` fast clears with the
+CPU walker, including exact context advancement. The dual-backend hardware
+fill case includes the reverse fast-clear command.
+Two line-normalizer tests compare payload coverage and exact context
+completion with the CPU walker across all octants, both BRESROUND tie modes,
+fractional endpoints, skip-first/last and antialiased endpoint filtering.
+Their HostW coverage also checks transactional integer, fractional and
+antialiased completion, mixed shade/pattern state, single-step continuation,
+`LENGTH32` outer retries and restored fractional endpoint state. The hardware
+line case executes ordinary integer, fractional and antialiased commands
+against complete seeded RGB and auxiliary planes on both backends.
+The hardware clipping case compares complete planes after offset blocks and
+lines using SMASK0, OR-combined SMASK1-4 and CIDMATCH. It also verifies that a
+CID write earlier in one ordered batch affects a later overlapping RGB
+command without a submission boundary.
+The hardware pixel-format case covers RGB/RGBA and CI depths 4, 8, 12 and 24,
+both `DBLSRC` slots, OLAY/PUP/CID packing, alpha pass and rejection, all logic
+operations used by the matrix, WRMASK, Bayer dithering and YFLIP blocks and
+lines. Complete seeded RGB and auxiliary planes are compared with the CPU
+oracle on both hardware backends.
+The hardware blending case runs the complete 6x6 matrix of defined source and
+destination factors with both `BLENDALPHA` behaviors, then covers
+`BACKBLEND`, 4/8/12-bit expansion and recompression, dithering, `DBLSRC`,
+OLAY/PUP/CID packing and a YFLIP line. Both complete planes and final context
+state are compared with the CPU oracle.
+The hardware pattern case covers transparent and opaque Z and line patterns,
+combined tests, `LSREPEAT`/`LSLENGTH`, `LSADVLAST`, row reset with a continuing
+repeat counter, clipped phase, reverse blocks, YFLIP, fractional and
+antialiased lines, and `COLORBACK` through the ordinary pixel pipeline. It
+compares both complete planes and final pattern context on both backends.
+The hardware screen-copy case covers safe and feedback-producing horizontal
+and vertical overlap orders, packed-slot copies, clipping, logic/WRMASK
+feedback, ignored compare and pattern tests with state advancement,
+SKIPFIRST, auxiliary planes, spans and all three line families. It compares
+both complete planes and final context with the CPU walker on both backends.
+The hardware continuation case covers every block stop-bit combination,
+partial `XSAVE` rows, reverse YSTRIDE, fractional and no-plane draws,
+LENGTH32 spans and lines, single-step integer/fractional/antialiased lines,
+partial overlapping copies, NOOP, and an armed non-host HostRW token's
+no-progress retry. It compares complete planes and the full context after
+each direct segment and after the board-level retry on both backends.
+Two CPU HostW walker tests compare transactional completion with the generic
+walker, including restored noncanonical line-pattern phase, and pin the
+FASTCLEAR+ALPHAHOST field consumption and retirement. A separate
+interpreter/Cranelift oracle pins
+mixed host-source selection. The hardware HostW case stages PIO and multiword BLOCK/SPAN and line transfers
+and compares both complete planes and full context with the CPU oracle. Its
+segment matrix covers COLORHOST, ALPHAHOST and both, packed and unpacked
+4/8/12/32-bit fields, RWDOUBLE, SWAPENDIAN, residual input state, row-boundary
+continuation, PIO replication, clipping, logic, blending, WRMASK,
+RGB/auxiliary planes and board-level outer GO integration. It also covers
+transparent and opaque combined patterns, row reset, shade with host color
+and/or alpha, endpoint skips, LENGTH32 continuation and increasing and
+decreasing LR-only semantics. The line matrix adds all integer octants,
+fractional and antialiased lines, BRESROUND state, restored fractional
+endpoint filtering across multiword `LENGTH32` retries, single-step
+continuation, YFLIP/XYOFFSET, shade, transparent and opaque patterns, partial
+clipping, CID and alpha rejection, packed/unpacked input and command-free
+no-progress retirement. Canonical FASTCLEAR+ALPHAHOST fill and line records
+prove that HostRW fields are consumed while conflicting shade, pattern, alpha,
+logic, blend and dither state is bypassed; complete planes also cover clipping
+and WRMASK. A 6x4 `glPixelZoom`-style source grid verifies that
+24 full-block PIO records remain unsubmitted until one explicit batch flush,
+then match the CPU plane. Overlapping HostW-to-ordinary-to-HostW draws verify
+both ordering boundaries, while the board-level one-slot backend proves that
+capacity exhaustion submits the accepted prefix and retries the next HostW
+record without duplicated context advancement. The producer reliability
+coverage refuses a bulk VDMA transfer with `BUS_BUSY` while the GFIFO lacks
+room, proves that neither token nor payload prefix was published, and retries
+the complete transfer exactly once. Concurrent scalar and batch producers run
+2048 records apiece across repeated ring wraps. The hardware oracle alternates
+24 PIO and VDMA HostW records through the board, then uses a four-word payload
+arena, three state slots and two reusable GPU sets to force repeated payload
+and state exhaustion. Complete planes, context, counters and stream positions
+must remain CPU-identical on both backends.
+
+Two focused CPU tests pin resident HostR board gating, sticky failure and
+batch retirement across PIO, scalar DMA and bulk DMA ports. The hardware
+observation case runs the existing CPU HostR walker against one reusable
+selected-plane snapshot and checks RGB/auxiliary cache reuse. The board oracle
+writes distinct GPU-resident RGB words, verifies PIO read-then-advance and
+bulk-DMA prime-then-read values, proves repeated GOs use one attributed
+full-plane map, then writes the selected plane and requires exactly one new
+map. The board CPU framebuffer remains stale throughout.
 
 ```sh
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_ -- --test-threads=1
 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::rex3_flat_fill::tests -- --test-threads=1
-cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_display_generations_track_real_changes -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::line::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::host::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag mixed_host_sources_match_between_interpreter_and_jit -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag test_hostr_board_ -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag line_pattern_closed_form_matches_scalar_advancement -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::command::tests -- --test-threads=1
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag direct_ng1_scanout_ -- --test-threads=1
 REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
 REX3_RESIDENT_BACKEND=vulkan cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag dev::ng1::wgpu::direct_tests -- --ignored --nocapture --test-threads=1
 REX3_RESIDENT_BACKEND=dx12 cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag resident_gpu_ -- --ignored --nocapture --test-threads=1
@@ -319,16 +438,124 @@ Remove-Item Env:\IRIS_NO_JIT -ErrorAction SilentlyContinue
 .\scripts\test-resident-gate.ps1
 ```
 
-The script requires 25 `resident_` CPU tests, three flat-fill tests and one
-display-generation test, then **10 resident GPU tests and five direct
-scanout tests on each backend**. It checks each libtest pass count, rejects
-hardware skips and prints the selected adapter; both Vulkan and D3D12 must
-succeed for the full gate. `.\scripts\test-resident-gate.ps1 -Backend vulkan`
-or `-Backend dx12` runs just one hardware backend and is not the complete
-two-backend gate. For manual PowerShell runs set
+The exact 131-case script requires 44 `resident_` CPU tests, four flat-fill
+tests, two line tests, two HostW walker tests, one HostW interpreter/JIT
+source test, one shade-DDA test, one pattern-state test, two resident HostR
+port/retirement tests, three command-ABI tests and three direct-state tests,
+then **24 resident GPU tests and ten direct scanout tests on each backend**.
+That is 131 tests in total. The window test requires an available native
+desktop and a GPU that can present to it. The script checks each libtest pass
+count, rejects hardware skips and prints the selected adapter; both Vulkan and
+D3D12 must succeed for the full gate. `.\scripts\test-resident-gate.ps1
+-Backend vulkan` or `-Backend dx12` runs just one hardware backend and is not
+the complete two-backend gate. For manual PowerShell runs set
 `$env:REX3_RESIDENT_BACKEND = 'vulkan'` or `'dx12'` before each command
 instead of the shell prefix. A host that lacks either required hardware
 backend cannot claim the complete gate. Metal is not covered by this script.
+
+The direct group covers the explicit resident frontend matrix: CPU
+software/GL composition, CPU planes through wgpu scanout, same-device
+resident wgpu scanout, and explicitly labeled resident readback through the
+ordinary CPU renderer. Both resident modes exercise transactional screenshot,
+headless frame and loopback VNC capture. Capture failures must keep tickets
+pending, preserve the last published pixels and `frame_seq`, and leave the
+selected display mode unchanged. Assertions distinguish per-mode composed
+capture attempts, successes and bytes from attributed raw-plane
+`Compatibility` observations.
+
+The lifecycle cases stop and serialize producers at an empty GFIFO boundary,
+capture registers and both complete authoritative planes once, and restore
+them into a new epoch before restart. They cover disk snapshots, CI rollback,
+live debugger checkpoints, a second Newport head, reset, monitor exclusion,
+HostW continuation and sticky failure. Hardware cases round-trip complete
+GPU-written planes and both resident display modes while the CPU framebuffer
+mappings remain protected. Missing, duplicate, incomplete or failed snapshot
+halves must not publish registers, pixels, captures or a restartable board.
+Metal remains outside this gate.
+
+Production activation has two additional ignored hardware regressions. They
+construct a normal Newport machine rather than injecting the backend directly:
+both heads must share one `Arc<Gpu>`, repeated peripheral start must leave both
+processor/display workers alive, direct mode must require the same-device
+presenter, and explicit readback mode must advertise its two-second minimum
+capture timeout. Run them on both supported backends:
+
+```powershell
+$env:REX3_RESIDENT_BACKEND = 'vulkan'
+cargo test --locked -p iris --lib --features wgpu production_newport_wgpu_tests -- --ignored --nocapture --test-threads=1
+$env:REX3_RESIDENT_BACKEND = 'dx12'
+cargo test --locked -p iris --lib --features wgpu production_newport_wgpu_tests -- --ignored --nocapture --test-threads=1
+cargo test --locked -p iris --lib --features wgpu power_on_reset_fits_default_service_thread_stack -- --test-threads=1
+```
+
+The final live matrix uses an ordinary `iris` binary and CI socket, not a test
+fixture. For each of Vulkan and D3D12 it boots the embedded PROM in direct
+mode, requests a composed screenshot, saves and restores a disk snapshot,
+performs CI rollback, resets through the monitor, restarts, captures again and
+checks `rex status` for `no_cpu_fallback=true` and zero unsupported work.
+Vulkan additionally exercises a visible same-device wgpu window, explicit
+readback compatibility and a real RFB 3.8 loopback VNC framebuffer update.
+The direct VNC run must show composed direct bytes with zero compatibility raw
+bytes. These runs establish production lifecycle wiring independently of the
+representative application run below.
+
+The application-level acceptance run uses an installed IRIX 6.5 IP22 system
+with Xsgi, 4Dwm, toolchest, Showcase and the Atlantis demo. It boots the same
+disk through three isolated overlays: CPU raster, Vulkan resident direct and
+D3D12 resident direct. A scripted Showcase rectangle/ellipse workload must
+produce the same canvas pixels on all three paths. Save/restore and rollback
+must reproduce the complete pre-mutation resident screenshot exactly.
+Atlantis then runs for a 15-second warm-up and a 30-second measured interval.
+On the RTX 5070 / 16-logical-CPU acceptance host, the measured results were:
+
+| Engine | REX3 GO/s | Host core equivalents | Throughput vs CPU | Host CPU vs CPU |
+|---|---:|---:|---:|---:|
+| CPU raster/JIT | 4,761.5 | 1.673 | baseline | baseline |
+| Vulkan direct | 6,765.6 | 1.574 | +42.1% | -5.9% |
+| D3D12 direct | 5,918.0 | 1.545 | +24.3% | -7.7% |
+
+CPU throughput is the `rex status` `GO TOTAL` delta. Resident throughput is
+the telemetry accepted-command delta, and host core equivalents are process
+CPU seconds divided by wall seconds. Both resident samples require
+`unsupported=0`, `no_cpu_fallback=true`, no increase in raw/composed readback
+counters during the timed interval, and conservative p95 presentation buckets
+no higher than 4.2 ms. The accepted Showcase canvas crop SHA-256 was
+`b733d604c1a34554578e69fd9874d9ab892a470d54e67428d6a7fc081eec4190`
+on all three paths. Screenshots and snapshot plane observations occur outside
+the timing window and remain explicitly attributed.
+
+The M8 cases add checked histogram/delta accounting, exact GFIFO
+full-versus-contention telemetry, bounded-set wait accounting, a 4 ms
+continuous-stream batch-age boundary and profiling-only validation of the
+GPU-generated active-tile dispatch. The independent mixed-workload hardware
+gate compares complete planes and context against the CPU engine after fills,
+copies, integer/fractional/antialiased lines, HostW, HostR, direct
+presentations and explicit observations. It also requires zero ordinary
+raw-plane/composed readback and reports typed batch, GFIFO and latency
+aggregates.
+
+An optional local recorder file can be replayed through the resident backend
+without printing records or pixels. The file is not a test artifact and must
+not be committed. `REX3_RESIDENT_PROFILE` enables a 64-byte metadata map and
+wait per nonempty batch; omit it to verify the default map-free path.
+`REX3_RESIDENT_REPLAY_FRAMES` optionally presents the final replayed state
+through direct wgpu scanout that many times without requesting capture. The
+recording must contain valid final display state when that option is used.
+For example, on PowerShell:
+
+```powershell
+$env:REX3_RESIDENT_REPLAY = 'C:\local\newport.rec'
+$env:REX3_RESIDENT_BACKEND = 'vulkan' # repeat with dx12
+$env:REX3_RESIDENT_PROFILE = '1'
+$env:REX3_RESIDENT_REPLAY_FRAMES = '8'
+cargo test --locked -p iris --lib --features wgpu,rex-jit,rexdiag,gputrace resident_replay_aggregate_file -- --ignored --nocapture --test-threads=1
+```
+
+The aggregate reports records and checked reads, accepted/no-op/unsupported
+operations, typed primitive/mode/coverage/HostRW distributions, nonempty
+batches and flush reasons, GFIFO/backpressure, attributed transfer bytes and
+conservative latency buckets. Replay throughput and optional post-replay
+presentations are test-path measurements, not live guest wall-clock timing.
 
 To deliberately regenerate, set `REX3_CORPUS_OUT` to an existing relative
 directory with a pre-existing regular `.rex3-corpus-root` file and run
@@ -356,9 +583,9 @@ That single-file run is not corpus coverage.
 
 | Workflow | Runs | What it checks |
 |---|---|---|
-| `rust.yml` | every pull request and push to `main` | `cargo nextest run` on the workspace, a build of the release feature set, the interpreter's hot paths |
-| `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models, e.g. `intx::loom_tests`; locally `cargo loom` |
-| `tsan.yml` | nightly on `main` at 03:30 UTC, and by hand from Actions; gates nothing | the threaded device tests under ThreadSanitizer, to catch data races; the `tsan` nextest profile selects them; locally `RUSTFLAGS="-Zsanitizer=thread" CARGO_PROFILE_RELEASE_PANIC=unwind cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib --profile tsan` |
+| `rust.yml` | every pull request and push to `main` | `cargo nextest run` on the workspace, the audio tests through a PulseAudio null sink, a build of the release feature set, the interpreter's hot paths, the REX3 dirty-upload tests and a lint of the distribution scripts; pushes to `main` also run the full-size GR2 and IMPACT JIT sweeps (`rss_jit_tests`, `re3_jit_tests`) |
+| `loom.yml` | pull requests that change a file holding loom models (`cfg(loom)`), nightly on `main` at 04:30 UTC, and by hand from Actions | the `loom_tests` concurrency models; locally `cargo loom` (see [Loom models](#loom-models-and-threadsanitizer)) |
+| `tsan.yml` | nightly on `main` at 03:30 UTC, and by hand from Actions; gates nothing | the threaded device tests under ThreadSanitizer, to catch data races (see [below](#loom-models-and-threadsanitizer)) |
 | `suites.yml` | pull requests and pushes that touch the CPU, `cpu-tests/`, `bench/` or the test code | the two bare-metal suites on each engine |
 | `nightly.yml` | every day at 05:00 UTC when `main` has moved, and by hand from Actions | the `build.yml` packages and IRIX boot, then publishes; a job beside them runs the default-feature tests and the `ci_clock` tests (`cargo ci-clock`) the pull-request run leaves out. It gates no publish |
 | `build.yml` | nightly and release | packages for every OS, then boots every IRIX image to the login prompt on each CLI build |
@@ -387,7 +614,7 @@ six. A new push cancels the run it replaces on a pull request; each push to
 `main` gets its own run and none is cancelled.
 
 CI builds two feature sets: the default features, and the default plus `jitv2`,
-`rex-gpu` and `rex-jit`. `.cargo/config.toml` owns every test command and the
+`rex-jit` and `gputrace`. `.cargo/config.toml` owns every test command and the
 workflows only call its aliases: `cargo ci-test` (the second set, on the Linux
 jobs), `cargo ci-test-default`, and `cargo ci-clock` (the nightly clock tests).
 `jitv2` implies `tcache`, which compiles out the real-cache path, so the default
@@ -395,13 +622,46 @@ build stays: Windows and macOS test it on pull requests and the nightly workflow
 tests it on x86-64 Linux. Windows also runs `cargo ci-test`. The Linux job
 compiles the `iris` crate fewer times than the others: it skips
 `cargo build --workspace` and the SIMD lane step because nextest builds and
-runs the same code, and runs the REX3 GPU matcher and replay corpus tests in the
-same build (the one ignored filesystem test runs in a second invocation over
-that build). Pull requests restore `main`'s
+runs the same code, and runs the REX3 replay corpus tests in the same build
+(the one ignored filesystem test runs in a second invocation over that build).
+`rex-gpu` is not in either set: it turns on the whole `wgpu` feature, whose GPU
+suites need a named adapter. The other platforms only compile it, with a
+`cargo check` of the `rex3-gpu-probe` example. Pull requests restore `main`'s
 build cache but never save one, so they cannot push `main`'s entries out of the
 repository's cache quota. The Linux, AppImage and Windows package builds in
 `build.yml` cache only the cargo registry and git checkouts, not their target
 trees.
+
+### Loom models and ThreadSanitizer
+
+The lock-free and condition-variable protocols have [loom](https://docs.rs/loom)
+models in `loom_tests` modules beside the code they check: the GFIFO ring
+(`src/gfifo.rs`), the interrupt guard `IrqMutex` (`src/irq.rs`), PCI INTx
+routing (`src/pci/intx.rs`), the IP7 timer ticket (`src/cpu/ip7_ticket.rs`)
+and the jitv2 compile pool's flush barrier (`src/cpu/jitv2/pool_barrier.rs`).
+They are built only under `--cfg loom`, where `src/sync.rs` swaps
+`parking_lot`'s `Mutex` and `Condvar` for loom's, so the model drives the code
+the device runs rather than a copy of it. Run them all with:
+
+```sh
+cargo loom    # alias in .cargo/config.toml: the lib's loom_tests, built with --cfg loom and jitv2
+```
+
+`jitv2` is on so the compile pool's models, which exist only with it, are
+built. Name a new model module `loom_tests` and `cargo loom` and the workflow
+pick it up.
+
+ThreadSanitizer sees races that functional tests and loom miss, such as a
+plain `u64` written from another thread. The `tsan` profile in
+`.config/nextest.toml` selects the threaded device tests by name (`ioc3`,
+`hub`, `intx`, `bridge`, `isp1040`, `isp12160`) and leaves out `ppmem`, whose
+plain read of an atomically updated word is the lock-free design. Locally, on
+x86-64 Linux with the `rust-src` component:
+
+```sh
+RUSTFLAGS="-Zsanitizer=thread" CARGO_PROFILE_RELEASE_PANIC=unwind \
+cargo nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib --profile tsan
+```
 
 ### The bare-metal suites
 
@@ -437,7 +697,9 @@ comparison report, for people to read.
   (`rust.yml`) or every XML file in `target/nextest/ci/` (`suites.yml`) and marks
   each failing case on the pull request's Checks tab and in the diff. It only annotates; the job's own status is what blocks.
 * **Two levels of case.** nextest's `junit.xml` has one case per Rust test: a
-  CPU (`r4400`, `r5000`, `r10000_195`) for one engine, with a message naming the
+  CPU for one engine (`cpu_tests`: `r4400`, `r4400_other_cache`, `r5000`,
+  `r5000_other_cache`, `r10000`, `r12000`, `r14000`; `bench_accuracy`:
+  `r4400`, `r5000`, `r10000_195`), with a message naming the
   guest tests or kernels that broke. Beside it, `cpu-tests-<cpu>-<engine>.xml`
   has a case per guest test (`fpu/trap_overflow`), filed under the class
   `cpu-tests.<cpu>.<engine>`, and `bench-<cpu>-<engine>.xml` a case per kernel
@@ -487,14 +749,18 @@ Windows: a platform by image matrix in which each image is listed once, from a
 pinned, checksummed stock disk. IRIX 5.3 boots on the serial and graphics
 consoles ([clanker/testing/ci-irix53-disk.md](clanker/testing/ci-irix53-disk.md));
 IRIX 6.5.22 and 6.5.30 do the same, each against a golden screenshot of its own
-login (`scripts/boot-goldens/`). No 6.5.30 Indy disk is published, so 6.5.30
-boots an O2 (`--machine o2_ip32`) on its own PROM image, pinned in the matrix.
+login (`scripts/boot-goldens/`). The 6.5.22 Indy disk has the HAL2 audio
+driver in its kernel. No 6.5.30 Indy disk is published, so 6.5.30 boots an O2
+(`--machine o2_ip32`) on the O2's built-in PROM.
 
 `iris-ci boot-test` seeds NVRAM on a first headless run, boots with the console
 on serial and waits up to 15 minutes for `login:`, then does the same with the
 console on the graphics board and a screenshot to match. It reads the seeded
 NVRAM back from the PROM and from the booted guest, and checks that iris quits
-cleanly. What it seeds and checks is `tests/irix/boot.toml`. Each check is a
+cleanly. What it seeds and checks is data: `tests/irix/boot.toml` (built in, and
+used for 5.3), or the image's own `--steps` file (`tests/irix/boot-irix65.toml`,
+`tests/irix/boot-irix6530-o2.toml`). The nightly gives each boot 10 minutes
+(`--timeout 600`). Each check is a
 JUnit case, so a failed run is annotated with the check that failed, and the run
 keeps the logs. When the headless run never reaches the PROM's menu or a prompt,
 `phase-a.log` holds everything the PROM printed and `phase-a-cpu.log` the CPU's
@@ -504,8 +770,8 @@ has the details.
 
 ## Disk persistence on exit
 
-`src/exit_persistence_tests.rs` builds every machine (Indy, Indigo2, Indigo2
-IMPACT, O2, Octane) with one disk of each kind (raw with an overlay, raw in
+`src/exit_persistence_tests.rs` builds the Indy, Indigo2, Indigo2 IMPACT, O2,
+Octane and Tezro, each with one disk of each kind (raw with an overlay, raw in
 place, compressed CHD, CHD with the copy-on-write flag, scratch volume), writes
 sectors with WRITE(10), ends the session each way iris can end (guest power-off,
 `quit` over the CI socket, `quit` at the terminal console, `main` returning,

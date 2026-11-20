@@ -15,16 +15,32 @@
 #     NOTARY_APPLE_ID, NOTARY_PASSWORD (app-specific), NOTARY_TEAM_ID
 #
 # Set REQUIRE_NOTARIZATION=1 to fail instead of shipping unnotarized files.
+#
+# CI builds each architecture on its own runner: `--build-only --target T`
+# builds T's iris-gui, iris and iris-ci into target/T/release and stops; the
+# packaging run then gets both slices there and runs with --skip-build.
 source "$(dirname "$0")/lib.sh"
 
 parse_common_args "$@"
 set -- ${REST[@]+"${REST[@]}"}
+BUILD_ONLY=0
 case "${1:-}" in
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; common_usage; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; common_usage
+               echo "  --build-only         build --target's binaries into target/ and stop"; exit 0 ;;
+    --build-only) BUILD_ONLY=1 ;;
     "") ;;
     *) die "unknown option: $1" ;;
 esac
 [ "$(uname -s)" = Darwin ] || die "package-macos.sh runs on macOS only"
+
+if [ "$BUILD_ONLY" = 1 ]; then
+    [ "$SKIP_BUILD" = 1 ] && die "--build-only and --skip-build are opposites"
+    # The same features the bundle and the CLI steps below build with.
+    build_gui "$TARGET" "$(with_bundled "$GUI_FEATURES")"
+    build_cli "$TARGET" "$CLI_FEATURES"
+    ls -l "$(release_dir "$TARGET")"/{iris-gui,iris,iris-ci} >&2
+    exit 0
+fi
 need lipo codesign hdiutil ditto
 
 IDENTITY="${MACOS_SIGN_IDENTITY:--}"
@@ -104,7 +120,15 @@ ditto -c -k --keepParent "$APP" "$ZIP"
 mkdir -p "$WORK/dmg"
 cp -R "$APP" "$WORK/dmg/"
 ln -s /Applications "$WORK/dmg/Applications"
-hdiutil create -volname "IRIS" -srcfolder "$WORK/dmg" -ov -format UDZO "$DMG"
+# Size the image ourselves: hdiutil's own estimate from -srcfolder came out
+# too small on the macos-26 runners ("No space left on device" copying
+# iris-gui into /Volumes/IRIS with 95 GB free on the host). Content plus a
+# fifth plus 20 MB; UDZO compresses the slack away.
+DMG_KB=$(du -sk "$WORK/dmg" | cut -f1)
+IMAGE_KB=$(( DMG_KB + DMG_KB / 5 + 20480 ))
+echo "dmg contents: $(( DMG_KB / 1024 )) MB, image: $(( IMAGE_KB / 1024 )) MB"
+hdiutil create -volname "IRIS" -srcfolder "$WORK/dmg" -fs HFS+ \
+    -size "${IMAGE_KB}k" -ov -format UDZO "$DMG"
 [ "$IDENTITY" = "-" ] || codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 group_end
 notarize "$DMG"

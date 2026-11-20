@@ -8,6 +8,10 @@
 //! out at once, and the interpreter's preamble then retires nothing more
 //! until the boundary. Holding is cold; the running CPU pays one load per
 //! batch.
+//!
+//! [`REQUEST_JIT_REMAP`] rides the same bit but is not a hold: at the boundary
+//! the CPU forgets where its JIT's code pages are and runs on
+//! ([`World::layout_changed`]).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,11 +20,14 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-/// Most CPUs HEART has slots for. IRIX's Octane kernel and PROM use two.
+/// Most CPUs one machine runs: the four HEART has slots for (IRIX's Octane
+/// kernel and PROM use two), and a Tezro's four. Per-CPU tables size to it.
+/// The CPU ids it bounds also index the idle parker's `u8` masks.
 pub const MAX_CPUS: usize = 4;
 
-/// Bit of `MipsCore::hot.interrupts` asking the CPU to stop at its next batch
-/// boundary. Bit 63 is the soft-reset request; Cause only takes bits 8..15.
+/// Bit of `MipsCore::hot.interrupts` asking the CPU to stop: it retires
+/// nothing more and parks at its next batch boundary. Bit 63 is the
+/// soft-reset request; Cause only takes bits 8..15.
 pub const HOST_PARK_BIT: u64 = 1 << 62;
 
 /// HEART's MODE register disables this processor.
@@ -30,6 +37,10 @@ pub const HOLD_WORLD: u32 = 1 << 1;
 /// The board holds this processor at a firmware rendezvous until the ones
 /// it must follow catch up (the IP35 PROM's presence publication).
 pub const HOLD_RENDEZVOUS: u32 = 1 << 2;
+/// Not a hold: memory moved, so at its next batch boundary the CPU forgets
+/// the addresses it reached its JIT's code pages at. The pages keep their
+/// code, which is keyed by the memory it came from.
+pub const REQUEST_JIT_REMAP: u32 = 1 << 3;
 
 const NOT_A_CPU: u8 = u8::MAX;
 
@@ -66,6 +77,8 @@ struct SlotState {
 
 /// One CPU's place to wait.
 pub struct ParkSlot {
+    /// The CPU that parks here; a CPU number is not a slot index.
+    cpu: u8,
     word: *const AtomicU64,
     /// A CPU thread exists for this CPU. A stopped CPU counts as parked.
     active: AtomicBool,
@@ -80,8 +93,8 @@ unsafe impl Sync for ParkSlot {}
 
 impl ParkSlot {
     /// `word` must outlive the slot.
-    pub fn new(word: *const AtomicU64) -> Self {
-        Self { word, active: AtomicBool::new(false), state: Mutex::new(SlotState::default()), changed: Condvar::new() }
+    pub fn new(cpu: u8, word: *const AtomicU64) -> Self {
+        Self { cpu, word, active: AtomicBool::new(false), state: Mutex::new(SlotState::default()), changed: Condvar::new() }
     }
 
     fn word(&self) -> &AtomicU64 {
@@ -98,14 +111,20 @@ impl ParkSlot {
         crate::cpu::idle_park::wake();
     }
 
-    /// Drop one reason to stop; the CPU continues when none is left.
-    pub fn release(&self, why: u32) {
+    /// Drop one reason to stop, saying whether it was posted. The CPU
+    /// continues when no hold is left.
+    pub fn release(&self, why: u32) -> bool {
         let mut s = self.state.lock();
+        let posted = s.holds & why != 0;
         s.holds &= !why;
         if s.holds == 0 {
             self.word().fetch_and(!HOST_PARK_BIT, Ordering::SeqCst);
+        }
+        // A parked CPU does not wait on a remap request; wake it now, not at its next timeout.
+        if s.holds & !REQUEST_JIT_REMAP == 0 {
             self.changed.notify_all();
         }
+        posted
     }
 
     /// Why the CPU is held, for the monitor.
@@ -133,12 +152,12 @@ impl ParkSlot {
     }
 
     /// The CPU thread, with its executor unlocked: wait out the holds, or
-    /// until the CPU is stopped.
+    /// until the CPU is stopped. A remap request is not waited on.
     pub fn park(&self, running: &AtomicBool) {
         let mut s = self.state.lock();
         s.parked = true;
         self.changed.notify_all();
-        while s.holds != 0 && running.load(Ordering::Relaxed) {
+        while s.holds & !REQUEST_JIT_REMAP != 0 && running.load(Ordering::Relaxed) {
             self.changed.wait_for(&mut s, Duration::from_millis(1));
         }
         s.parked = false;
@@ -173,8 +192,8 @@ impl World {
     /// or device lock another CPU could be waiting on. Two CPUs asking at once
     /// take turns: the one waiting its turn counts as parked for the other.
     pub fn stop_others<R>(&self, f: impl FnOnce() -> R) -> R {
-        let me = on_cpu_thread();
-        let mine = me.and_then(|m| self.slots().get(m));
+        let me = CURRENT_CPU.with(Cell::get);
+        let mine = self.slots().iter().find(|s| s.cpu == me);
         if let Some(s) = mine {
             s.mark_parked(true);
         }
@@ -194,12 +213,20 @@ impl World {
         self.leader.try_lock().map(|turn| self.hold_others(turn))
     }
 
+    /// Memory moved under an address: every CPU, the caller's included,
+    /// forgets the addresses of its JIT's code pages before it runs guest code
+    /// again, and finds each page again through the bus.
+    pub fn layout_changed(&self) {
+        #[cfg(feature = "jitv2")]
+        self.slots().iter().for_each(|s| s.hold(REQUEST_JIT_REMAP));
+    }
+
     fn slots(&self) -> &[Arc<ParkSlot>] {
         self.slots.get().map_or(&[], |s| s.as_slice())
     }
 
     fn hold_others<'a>(&'a self, turn: parking_lot::MutexGuard<'a, ()>) -> WorldHold<'a> {
-        let hold = WorldHold { world: self, me: on_cpu_thread(), _turn: turn };
+        let hold = WorldHold { world: self, me: CURRENT_CPU.with(Cell::get), _turn: turn };
         hold.others().for_each(|s| s.hold(HOLD_WORLD));
         hold.others().for_each(|s| s.wait_parked());
         hold
@@ -209,20 +236,22 @@ impl World {
 /// The other CPUs stay parked while this lives.
 pub struct WorldHold<'a> {
     world: &'a World,
-    me: Option<usize>,
+    me: u8,
     _turn: parking_lot::MutexGuard<'a, ()>,
 }
 
 impl WorldHold<'_> {
     fn others(&self) -> impl Iterator<Item = &Arc<ParkSlot>> {
         let me = self.me;
-        self.world.slots().iter().enumerate().filter(move |(i, _)| Some(*i) != me).map(|(_, s)| s)
+        self.world.slots().iter().filter(move |s| s.cpu != me)
     }
 }
 
 impl Drop for WorldHold<'_> {
     fn drop(&mut self) {
-        self.others().for_each(|s| s.release(HOLD_WORLD));
+        for s in self.others() {
+            s.release(HOLD_WORLD);
+        }
     }
 }
 
@@ -248,9 +277,9 @@ mod tests {
         })
     }
 
-    fn slot() -> (Arc<ParkSlot>, Arc<AtomicU64>) {
+    fn slot(cpu: u8) -> (Arc<ParkSlot>, Arc<AtomicU64>) {
         let word = Arc::new(AtomicU64::new(0));
-        (Arc::new(ParkSlot::new(Arc::as_ptr(&word))), word)
+        (Arc::new(ParkSlot::new(cpu, Arc::as_ptr(&word))), word)
     }
 
     #[test]
@@ -268,7 +297,7 @@ mod tests {
 
     #[test]
     fn the_cpu_runs_again_only_when_every_hold_is_gone() {
-        let (s, word) = slot();
+        let (s, word) = slot(0);
         s.hold(HOLD_HEART);
         s.hold(HOLD_WORLD);
         s.release(HOLD_WORLD);
@@ -279,7 +308,7 @@ mod tests {
 
     #[test]
     fn holding_leaves_the_interrupt_lines_alone() {
-        let (s, word) = slot();
+        let (s, word) = slot(0);
         word.store(0x400, Ordering::SeqCst);
         s.hold(HOLD_HEART);
         s.release(HOLD_HEART);
@@ -288,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_stopped_cpu_counts_as_parked() {
-        let (s, _word) = slot();
+        let (s, _word) = slot(0);
         s.hold(HOLD_WORLD);
         s.wait_parked();
         assert!(s.is_parked());
@@ -296,7 +325,7 @@ mod tests {
 
     #[test]
     fn stop_others_runs_with_the_other_cpu_still_and_then_lets_it_go() {
-        let (s, word) = slot();
+        let (s, word) = slot(1);
         let running = Arc::new(AtomicBool::new(true));
         let work = Arc::new(AtomicUsize::new(0));
         let t = cpu_thread(s.clone(), word, running.clone(), 1, work.clone());
@@ -326,13 +355,50 @@ mod tests {
         assert!(world.try_lead().is_some());
     }
 
+    /// A remap request sets the park bit but does not hold a parked CPU.
+    #[test]
+    fn a_layout_change_asks_every_cpu_without_holding_it() {
+        let (s, word) = slot(0);
+        let world = World::new();
+        world.set_slots(vec![s.clone()]);
+        world.layout_changed();
+        if cfg!(feature = "jitv2") {
+            assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        }
+        s.park(&AtomicBool::new(true));
+        assert_eq!(s.release(REQUEST_JIT_REMAP), cfg!(feature = "jitv2"));
+        assert!(!s.release(REQUEST_JIT_REMAP));
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+    }
+
+    /// The request leaves another hold's park bit set.
+    #[test]
+    fn releasing_the_remap_request_keeps_another_hold() {
+        let (s, word) = slot(0);
+        s.hold(REQUEST_JIT_REMAP);
+        s.hold(HOLD_HEART);
+        assert!(s.release(REQUEST_JIT_REMAP));
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+    }
+
     /// Both CPUs want the machine at once, as two CPUs running out of JIT pages
     /// together would. Each waits for the other unless a CPU waiting its turn
     /// counts as parked.
     #[test]
     fn two_cpus_stopping_each_other_take_turns() {
-        let (a, wa) = slot();
-        let (b, wb) = slot();
+        take_turns(0, 1);
+    }
+
+    /// The IP27 numbers its processors 0 and 2, two slots: the caller is found
+    /// by its slot, or CPU 2 would wait for itself.
+    #[test]
+    fn cpus_numbered_apart_find_their_own_slots() {
+        take_turns(0, 2);
+    }
+
+    fn take_turns(first: u8, second: u8) {
+        let (a, wa) = slot(first);
+        let (b, wb) = slot(second);
         let world = Arc::new(World::new());
         world.set_slots(vec![a.clone(), b.clone()]);
         let turns = Arc::new(AtomicUsize::new(0));
@@ -354,7 +420,7 @@ mod tests {
         };
         // Both words outlive both threads: a slot's word must outlive anyone who
         // can hold it, and a thread that finished first is still held by the other.
-        let (t0, t1) = (spawn(0, a, wa.clone()), spawn(1, b, wb.clone()));
+        let (t0, t1) = (spawn(first, a, wa.clone()), spawn(second, b, wb.clone()));
         t0.join().unwrap();
         t1.join().unwrap();
         drop((wa, wb));

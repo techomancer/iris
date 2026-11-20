@@ -147,7 +147,7 @@ pub struct PixelCounts {
     pub reads: u64,
     pub finishes: u64,
     /// Writes and copies refused: the context or setup was not understood,
-    /// the target has no store, a destination word did not fit, or the
+    /// the target has no store, a destination word was out of range, or the
     /// window-copy pair.
     pub bad_context: u64,
     pub other_target: u64,
@@ -253,9 +253,9 @@ impl ReadDma {
         (span <= 64 << 20).then_some((io, pitch, lines))
     }
 
-    /// Whether the descriptor fits the read `header` names: the rows laid
+    /// Whether the descriptor matches the read `header` names: the rows laid
     /// end to end, or one line, with the bytes a row of the read takes.
-    fn fits(&self, h: &[u32; 7]) -> bool {
+    fn matches(&self, h: &[u32; 7]) -> bool {
         if !matches!(h[4], 1 | 2 | 4) || h[5] != 0 || h[6] != 0 {
             return false;
         }
@@ -566,7 +566,7 @@ fn copy_rows(plan: &Plan<'_>, s: &Setup, [sx, sy, dx, dy]: [i64; 4], spans: &mut
         return Verdict::Done;
     }
     let mask = plan.gc.width_mask;
-    // Every source word, and every destination word a write reads, must fit.
+    // Every source word, and every destination word a write reads, must be in range.
     for j in j0..j1 {
         let sbase = (top - (sy + j)) as usize * pitch;
         for i in i0..i1 {
@@ -713,7 +713,7 @@ impl XState {
         let mut pad = std::mem::take(&mut self.pixel.row);
         let verdict = match Plan::with_gc(self, surface, gc, stipple) {
             Ok(Some(plan)) => {
-                let fits = !plan.needs || {
+                let within = !plan.needs || {
                     let mut ok = true;
                     let mask = plan.gc.width_mask;
                     walk_kind(&plan, kind, &conv, &geo, words, &mut spans, &mut pad, |i, _| {
@@ -722,7 +722,7 @@ impl XState {
                     });
                     ok
                 };
-                if fits {
+                if within {
                     draw_by_op(&plan, kind, &conv, &geo, words, &mut spans, &mut pad);
                     Verdict::Done
                 } else {
@@ -756,7 +756,7 @@ impl XState {
         let setup = self.pixel.setup.unwrap_or_default();
         let (x, y) = (args.first().copied().unwrap_or(0), args.get(1).copied().unwrap_or(0));
         let header = [x, y, setup.width, setup.height, [1, 2, 4].get(setup.dst as usize).copied().unwrap_or(0), 0, 0];
-        if dma.refused || dma.data.is_some() || !dma.fits(&header) {
+        if dma.refused || dma.data.is_some() || !dma.matches(&header) {
             dma.refused = true;
             dma.data = None;
         } else if let Some(d) = data {
@@ -794,7 +794,7 @@ impl XState {
         } else if d[2] as usize == data.len() && d[3] == d[2] && d[4] == 0 && dma.buffer().is_some() {
             dma.texels = true;
             dma.data = Some(data);
-        } else if !dma.fits(&header) {
+        } else if !dma.matches(&header) {
             dma.refused = true;
             dma.data = None;
         } else {
@@ -822,7 +822,7 @@ impl XState {
     pub fn feed_finish(&mut self, args: &[u32]) -> Option<FeedDone> {
         let dma = self.pixel.read_dma.take()?;
         let &[mark, echo] = <&[u32; 2]>::try_from(args).ok()?;
-        if dma.refused || mark != 0x100 || !(dma.texels || dma.fits(&dma.header)) {
+        if dma.refused || mark != 0x100 || !(dma.texels || dma.matches(&dma.header)) {
             self.pixel.counts.bracket_refused += 1;
             return None;
         }
@@ -1427,8 +1427,8 @@ mod tests {
     }
 
     /// A read inside a bracket waits for the finish, which hands back its
-    /// lines for the host buffer; a bracket whose descriptor or read does not
-    /// fit is refused and writes nothing.
+    /// lines for the host buffer; a bracket whose descriptor or read is out of
+    /// range is refused and writes nothing.
     #[test]
     fn a_read_bracket_hands_back_its_lines_at_the_finish() {
         let mut gc = [0u32; 13];

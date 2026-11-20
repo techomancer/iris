@@ -56,7 +56,7 @@ impl Default for Stipple {
     }
 }
 
-fn fits(entry: u32, width: u32, height: u32) -> bool {
+fn within(entry: u32, width: u32, height: u32) -> bool {
     (entry as usize) < ENTRIES && (1..=MAX_SIDE).contains(&width) && (1..=MAX_SIDE).contains(&height)
 }
 
@@ -87,7 +87,7 @@ impl Stipple {
         if s.loading() {
             for e in 0..ENTRIES {
                 let (w, h) = (self.width[e], self.height[e]);
-                if (w, h) != (0, 0) && !fits(e as u32, w, h) {
+                if (w, h) != (0, 0) && !within(e as u32, w, h) {
                     s.fail(&format!("stipple entry {e} is {w} by {h}, past the {MAX_SIDE} by {MAX_SIDE} the cache holds"));
                     (self.width[e], self.height[e]) = (0, 0);
                 }
@@ -110,7 +110,7 @@ impl Stipple {
         // The rows are asked for as one data run: a count past this model's
         // own bound is refused whole rather than swallow the stream. A store
         // refused for its size still has its rows consumed, up to that bound.
-        if !fits(entry, width, height) || height > ROWS_MAX {
+        if !within(entry, width, height) || height > ROWS_MAX {
             self.refused += 1;
         }
         if height > ROWS_MAX {
@@ -128,7 +128,7 @@ impl Stipple {
     /// The rows behind a store.
     pub fn rows(&mut self, words: &[u32]) {
         let Some((entry, width, height)) = self.pending.take() else { return };
-        if fits(entry, width, height) && words.len() == height as usize {
+        if within(entry, width, height) && words.len() == height as usize {
             let e = entry as usize;
             self.rows[e][..words.len()].copy_from_slice(words);
             self.width[e] = width;

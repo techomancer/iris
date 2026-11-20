@@ -8,7 +8,16 @@
 //!   rex3_rec.rs      replayable bus recording (`rex rec`), replay tests
 //!   rex3_trace.rs    annotated GFIFO/CPU trace (`rex trace`)
 //!                    (both are submodules of rex3.rs, for its private state)
+//!   rex3_plane.rs    page-isolated CPU plane shadows for the resident tests
+//!   rex3_frame.rs    resident frame cuts, direct presentation, capture
+//!                    (submodules of rex3.rs; test-only)
+//!   rex3_dirty.rs    per-tile damage tracking of the planes
+//!   rex3_flat_fill.rs flat fills the GPU raster paths share (`wgpu`)
+//!   rex3_gpu.rs      host-GPU flat-fill prototype (`rex-gpu`, `IRIS_REX3_GPU`)
 //!   rex3_jit/        Cranelift shader JIT (`rex-jit`)
+//!   rex3_jit_queue.rs its priority compile queue, free of Cranelift types
+//!   wgpu/            the display composed on the host GPU (`wgpu`), and the
+//!                    test-only resident raster
 //!   vc2.rs           VC2 video controller (+ vc2_timings.rs presets)
 //!   xmap9.rs         XMAP9 cross-map
 //!   cmap.rs          CMAP colour map

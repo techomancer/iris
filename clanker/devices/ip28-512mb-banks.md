@@ -10,7 +10,7 @@ profile = "indigo2_ip28"
 cpu = "r10000"
 ```
 
-IP28 has an embedded PROM fallback; use `prom` to override it. In the GUI,
+IP28 has a built-in PROM; `prom` names another (which must then load). In the GUI,
 select the IP28 profile and the **1024 MB** preset, or set banks 0 and 1 to **512 MB**.
 Stop and start the machine to apply the configuration.
 

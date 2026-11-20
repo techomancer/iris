@@ -462,7 +462,7 @@ pub struct Ip32Bus {
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
     /// The NVMe card in the "PCI option" slot (`[nvme]`), set once when
-    /// the machine fits it.
+    /// the machine attaches it.
     pub nvme: std::sync::OnceLock<Arc<crate::dev::nvme::Nvme>>,
 }
 
@@ -643,6 +643,12 @@ impl Ip32Bus {
     /// the display is off. See [`crate::dev::o2gfx::Gbe::render`].
     pub fn render_screen(&self, out: &mut [u8]) -> Option<(u32, u32)> {
         self.gbe.render_from(&self.ram, out)
+    }
+
+    /// GBE's programmed timing: pixels a line, lines a frame and the dot
+    /// clock in Hz. See [`crate::dev::o2gfx::Gbe::video_totals`].
+    pub fn video_totals(&self) -> Option<(u32, u32, u64)> {
+        self.gbe.video_totals()
     }
 
     /// Where CRIME's output goes: the CPU's IP2, for a machine whose CPU
@@ -827,6 +833,10 @@ impl crate::traits::Device for Ip32Bus {
         self.devices().iter().flat_map(|d| d.register_commands()).collect()
     }
 
+    fn audio_report(&self) -> Option<String> {
+        self.devices().iter().find_map(|d| d.audio_report())
+    }
+
     fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         for d in self.devices() {
             if d.register_commands().iter().any(|(c, _)| c == cmd) {
@@ -842,6 +852,8 @@ impl crate::traits::Device for Ip32Bus {
 impl BusDevice for Ip32Bus {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 { self.phys.gen_ptr(addr) }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { self.phys.code_page(addr) }
     fn read8(&self, addr: u64) -> BusRead8 { self.phys.read8(addr) }
     fn read16(&self, addr: u64) -> BusRead16 { self.phys.read16(addr) }
     fn read32(&self, addr: u64) -> BusRead32 { self.phys.read32(addr) }

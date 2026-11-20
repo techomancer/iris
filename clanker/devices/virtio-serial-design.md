@@ -1,9 +1,18 @@
 # virtio-serial: one core, a transport per bus (design and gotchas)
 
 Status: implemented 2026-11-01 for IP22/IP24/IP28 (mmio, GIO slot) and IP30
-(pci, Bridge slot 4). IP32 transport exists, not wired. No guest driver has
-exercised it yet, only unit and bus-level tests. User docs:
-`docs/dev/virtio-serial.md`.
+(pci, Bridge slot 7 on INTB; slot 4 until 2026-11-16). IP32 transport
+exists, not wired. User docs: `docs/dev/virtio-serial.md`. Since 2026-11-12 also on the Tezro (IP53: IO9
+PIC bus 1, device 1, `fbcbedde`; the `slot` setting does not apply there).
+
+- **Octane interrupt pins.** Bridge pin 4 is the IOC3's Super I/O interrupt,
+  so a function at slot 4 on INTA shares it. Linux's Bridge driver gives each
+  (slot, pin) its own IRQ and points the pin at whichever it set up last, so
+  loading virtio_console took the serial console's interrupts and the console
+  died; OpenBSD's `ioc` takes the SuperIO pin from the first empty slot. Pins
+  6 and 7 are the power switch and AC fail; free are pin 3 (the RAD raises
+  none) and pin 5. virtio-serial is slot 7 on INTB (7 ^ 4 = 3), virtio-9p
+  slot 5 on INTA.
 
 ## Layers (`src/dev/virtio/`)
 
@@ -43,7 +52,9 @@ exercised it yet, only unit and bus-level tests. User docs:
 - **IP32:** needs the CRIME input a third MACE PCI slot drives. Add to
   `crime_input` in `dev/mace_pci.rs`, attach in `ip32.rs`, drop the O2 error in
   `validate_virtio_serial`.
-- **Snapshots:** `VirtioCore` has no `Saveable`; restore leaves it idle.
+- **Snapshots:** `VirtioCore` has no `Saveable`. The Octane refuses to save or
+  load a snapshot with virtio-serial fitted (`084ed672`): the Bridge would
+  restore the function's enabled PCI header over a device the load reset.
 - **Input latency:** the console pump polls (5/50 ms) because the socket
   backends are non-blocking with nothing to wait on.
 - **IP22 interrupt:** Indy uses `GioExp0/1`; Indigo2/IP28 use the

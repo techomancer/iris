@@ -6,7 +6,7 @@
 //!
 //! Architecture:
 //! - A compiler thread owns the Cranelift JITModule and compiles on demand.
-//! - The compiled shader cache is an RwLock<HashMap> — readers (draw path) never block
+//! - The compiled shader cache is an `RwLock<HashMap>` — readers (draw path) never block
 //!   each other; the compiler thread holds the write lock only while inserting.
 //! - execute_go() checks the cache; on hit, calls the compiled shader directly.
 //!   On miss, requests compilation and falls back to the interpreter.

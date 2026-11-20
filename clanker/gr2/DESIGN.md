@@ -9,9 +9,25 @@ boards. HQ2, RE3, and display each have a worker thread. GE7 stores diagnostic
 microcode but does not execute it. `gl.rs` and `gl_light.rs` hold the geometry
 and lighting HLE; this is functional emulation, not GE7 instruction emulation.
 
-Saveable currently covers register/microcode/display tables, not VRAM or full
-drawing/context state. See [current board guide](../../docs/graphics/gr2-xz-extreme.md)
-and [feature-completion backlog](../TODO.md) for remaining work.
+Snapshot schema 10 stores exact named `state`, `vram` and `zbuf` parts. The
+state includes partial HQ2/GL parsing, complete RE3 continuation, FIN2 waits
+and unread GEDMA output. Disk, rollback and live checkpoints share this
+representation and validate it before mutation. Stop drains both engine
+queues; power-on clears architectural state while preserving the selected JIT
+mode. Runtime threads, queues, trace/presentation objects, telemetry and JIT
+memoization are rebuilt or reset.
+
+Runtime telemetry counts span sizes, consecutive same-pipeline opportunities,
+synchronization boundaries, candidate framebuffer/Z traffic, host reads,
+presentation scans and JIT hits/misses. It is published atomically by the RE3
+worker for `gr2 metrics`; it is evidence, not architectural state.
+
+The M16 resident-GPU gate is a measured no-go for now. Captured GL traces show
+useful long-span batching, but two interleaved sustained runs put warmed
+`gr2-jit` at 178-187 Mpx/s for 4-pixel spans and 520-568 Mpx/s for
+1280-pixel spans on the measured host. Ordinary presentation scans host VRAM,
+and no resident GPU prototype or representative guest result exists. Retain
+the JIT and revisit only with evidence that clears every gate.
 
 ## Original implementation proposal
 
@@ -67,8 +83,6 @@ the design phases
 - implement textport tokens for hq2
 - implement 2d tokens for hq2 for Xsgi to use
 - implement 3d tokens for hq2 for opengl to use
-
-
 
 
 

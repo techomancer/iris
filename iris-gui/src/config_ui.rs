@@ -98,6 +98,7 @@ pub enum Tab {
     Debug,
     Ci,
     Bench,
+    Advanced,
 }
 
 impl Tab {
@@ -109,7 +110,7 @@ impl Tab {
     pub fn visible() -> Vec<Tab> {
         let mut tabs = vec![
             Tab::General, Tab::Disks, Tab::Network, Tab::Memory,
-            Tab::Display, Tab::VideoIn, Tab::Performance,
+            Tab::Display, Tab::VideoIn, Tab::Performance, Tab::Advanced,
         ];
         if !build_features::LIGHTNING {
             tabs.push(Tab::Debug);
@@ -137,6 +138,7 @@ impl Tab {
             Tab::Debug   => t!("config-tab-debug"),
             Tab::Ci      => t!("config-tab-ci"),
             Tab::Bench   => t!("config-tab-bench"),
+            Tab::Advanced => t!("config-tab-advanced"),
         }
     }
 }
@@ -207,6 +209,7 @@ pub fn show_tab(
         Tab::Debug   => TabOutcome { action: show_debug(ui, cfg), ..Default::default() },
         Tab::Ci      => TabOutcome { action: show_ci(ui, cfg), ..Default::default() },
         Tab::Bench   => { crate::bench_ui::show(ui, bench, mem_ctx.running); TabOutcome::default() }
+        Tab::Advanced => { crate::extra_ui::show(ui, cfg, mem_ctx.running); TabOutcome::default() }
     }).inner
 }
 
@@ -215,37 +218,19 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     ui.heading(t!("config-tab-general"));
     ui.label(t!("config-platform", platform = cfg.machine.profile.label()));
     let profile_before = cfg.machine.profile;
-    ComboBox::from_id_salt("machine_profile")
-        .selected_text(cfg.machine.profile.label())
-        .show_ui(ui, |ui| {
-            for p in MachineProfile::ALL {
-                ui.selectable_value(&mut cfg.machine.profile, p, p.label());
-            }
-        });
+    ui.add_enabled_ui(!mem_ctx.running, |ui| {
+        ComboBox::from_id_salt("machine_profile")
+            .selected_text(cfg.machine.profile.label())
+            .show_ui(ui, |ui| {
+                for p in MachineProfile::ALL {
+                    ui.selectable_value(&mut cfg.machine.profile, p, p.label());
+                }
+            });
+    });
     let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
     let o2 = cfg.machine.profile == MachineProfile::O2Ip32;
-    if cfg.machine.profile == MachineProfile::OctaneIp30 && profile_before != MachineProfile::OctaneIp30 {
-        octane_defaults(cfg);
-    }
-    if o2 && profile_before != MachineProfile::O2Ip32 {
-        o2_defaults(cfg);
-    }
-    // A board the new machine does not take would fail `validate()` at
-    // Start: GR2 Extreme moving to Indy keeps the closest board (XZ); any
-    // other falls back to the machine's default.
-    let board = cfg.graphics_board();
-    if !board.supports(cfg.machine.profile) {
-        cfg.graphics.board = (board == GraphicsBoard::Extreme && !octane).then_some(GraphicsBoard::Xz);
-    }
-    // Only IP28 can express 256/512 MB banks, and the Octane's start at 64 MB.
-    // Clamp them when switching to IP22/IP24 so the new profile passes
-    // `validate()` at Start. (An O2's banks are re-fitted in `o2_defaults`,
-    // which knows the kit rules; a bare clamp would leave a layout `validate()`
-    // rejects for other reasons — a gap, or a bank that is not a kit size.)
-    if !matches!(cfg.machine.profile, MachineProfile::Indigo2Ip28 | MachineProfile::OctaneIp30 | MachineProfile::O2Ip32) {
-        for bank in &mut cfg.banks {
-            if *bank > 128 { *bank = 128; }
-        }
+    if cfg.machine.profile != profile_before {
+        crate::extra_ui::switch_profile(cfg);
     }
     subtitle(ui, t!("config-platform-subtitle"));
     subtitle(ui, t!("config-viewport-subtitle"));
@@ -273,8 +258,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // CPU models are compiled in and `Machine::new` picks between them at
         // construction, so the choice belongs to the machine's config the same
         // way its RAM does.
-        // Only the CPUs this machine can be built with: the Octane has one,
-        // the 195 MHz R10000, and an O2 refuses an R4400.
+        // Resolve the available processor modules from the core's profile table.
         ui.add_enabled_ui(!mem_ctx.running, |ui| {
             let mut cpu = cfg.cpu();
             ComboBox::from_id_salt("cpu_model")
@@ -350,7 +334,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     } else {
         show_board_picker(ui, cfg, mem_ctx.running);
     }
-    if !octane && cfg.graphics_board() == GraphicsBoard::Newport {
+    if !o2 && !octane && cfg.graphics_board() == GraphicsBoard::Newport {
         ui.horizontal(|ui| {
             ui.label(t!("config-newport-heads"));
             ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
@@ -368,14 +352,14 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         path_row(ui, "prom", &mut cfg.prom, Pick::OpenFile, &prom_filters());
         ui.end_row();
 
-        // Leaving the PROM path empty boots the built-in PROM. Expose that as
-        // an explicit button so reverting from a (possibly missing) custom PROM
-        // is discoverable instead of "delete the text by hand". Disabled when
-        // already empty, so the confirm prompt only ever appears when a custom
-        // PROM is selected.
+        // `(embedded)` boots the built-in PROM. Expose that as an explicit
+        // button so reverting from a (possibly missing) custom PROM is
+        // discoverable instead of "type the keyword by hand". Disabled when
+        // the built-in PROM already runs, so the confirm prompt only ever
+        // appears when a custom PROM is selected.
         ui.label("");
         ui.horizontal(|ui| {
-            let custom = !cfg.prom.is_empty();
+            let custom = !crate::extra_ui::builtin_prom(cfg);
             if ui.add_enabled(custom, egui::Button::new(t!("config-prom-builtin")))
                 .tip(t!("config-prom-builtin-tip"))
                 .clicked()
@@ -399,7 +383,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             path_row(ui, "octane_flash", &mut flash, Pick::SaveFile, &nvram_filters());
             cfg.octane.flash = if flash.is_empty() { None } else { Some(flash) };
             ui.end_row();
-        } else if !o2 {
+        } else if crate::extra_ui::mc_machine(cfg.machine.profile) {
             // The O2's NVRAM is its own PROM flash, already covered by `nvram`
             // above; it has no separate motherboard EEPROM.
             ui.label(t!("config-nveeprom"))
@@ -410,6 +394,13 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
         ui.label(t!("config-serial-log"));
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, &any_filters());
+        ui.end_row();
+
+        // `serial_log_overwrite`: every log (`serial_log`, `serial_log_a/_b`)
+        // is added to by default; this starts them over each run.
+        ui.label("");
+        ui.checkbox(&mut cfg.serial_log_overwrite, t!("config-serial-log-overwrite"))
+            .tip(t!("config-serial-log-overwrite-tip"));
         ui.end_row();
     });
 
@@ -475,9 +466,17 @@ fn show_host_ports(ui: &mut Ui, cfg: &mut MachineConfig) {
     Grid::new("host_ports_grid").num_columns(2).striped(true).show(ui, |ui| {
         port_row(ui, t!("config-port-monitor"), t!("config-port-monitor-tip"),
                  &mut cfg.monitor_port, iris::monitor::DEFAULT_PORT);
-        port_row(ui, t!("config-port-serial1"), t!("config-port-serial1-tip"),
-                 &mut cfg.serial_port_b, def_b);
-        port_row(ui, t!("config-port-serial2"), t!("config-port-serial2-tip"), &mut cfg.serial_port_a, def_a);
+        // The console is channel B on the Indy and Indigo2 and channel A on
+        // the other machines (whose L1, where fitted, is in Advanced).
+        if crate::extra_ui::mc_machine(cfg.machine.profile) {
+            port_row(ui, t!("config-port-serial1"), t!("config-port-serial1-tip"),
+                     &mut cfg.serial_port_b, def_b);
+            port_row(ui, t!("config-port-serial2"), t!("config-port-serial2-tip"), &mut cfg.serial_port_a, def_a);
+        } else {
+            port_row(ui, t!("config-port-serial1"), t!("config-port-serial1-tip"),
+                     &mut cfg.serial_port_a, def_a);
+            port_row(ui, t!("config-port-serial2"), t!("config-port-serial2-tip"), &mut cfg.serial_port_b, def_b);
+        }
     });
     let mut ports = vec![monitor_port(cfg), cfg.serial_ports()[0], cfg.serial_ports()[1]];
     if let Some(g) = cfg.gdb_port { ports.push(g); }
@@ -570,6 +569,10 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
 }
 
 fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
+    if cfg.machine.profile == MachineProfile::O2Ip32 {
+        ui.label(t!("extra-gbe"));
+        return;
+    }
     let before = cfg.graphics_board();
     let mut choice = before;
     ui.horizontal(|ui| {
@@ -579,10 +582,9 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 .selected_text(choice.label())
                 .show_ui(ui, |ui| {
                     for c in GraphicsBoard::ALL {
-                        ui.add_enabled_ui(c.supports(cfg.machine.profile), |ui| {
-                            ui.selectable_value(&mut choice, c, c.label())
-                                .on_disabled_hover_text(t!("config-graphics-indigo2-only"));
-                        });
+                        if crate::extra_ui::board_supported(c, cfg.machine.profile) {
+                            ui.selectable_value(&mut choice, c, c.label());
+                        }
                     }
                 });
         });
@@ -615,97 +617,13 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     }
 }
 
-/// The Octane's graphics port holds an IMPACT board (Solid, High as the SI
-/// with texture option, Maximum as the MXI) or nothing (`[graphics] board
-/// = "none"`); the other boards are not modelled there.
+/// The common picker filters against the core's board compatibility rules.
 fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let fitted = cfg.graphics_board();
-    let mut choice = fitted;
-    let name = |b: GraphicsBoard| if b == GraphicsBoard::None { t!("config-octane-graphics-none") } else { b.label().to_string() };
-    ui.horizontal(|ui| {
-        ui.label(t!("config-graphics-board"));
-        ui.add_enabled_ui(!running, |ui| {
-            ComboBox::from_id_salt("octane_graphics")
-                .selected_text(name(choice))
-                .show_ui(ui, |ui| {
-                    for b in [GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact] {
-                        ui.selectable_value(&mut choice, b, b.label());
-                    }
-                    ui.selectable_value(&mut choice, GraphicsBoard::None, t!("config-octane-graphics-none"));
-                });
-        });
-    });
-    if choice != fitted {
-        cfg.graphics.board = Some(choice);
-        cfg.graphics.heads = 1;
-        cfg.graphics.resolution = NewportResolution::Guest;
-    }
-    if running {
-        ui.label(
-            RichText::new(t!("config-graphics-locked"))
-                .color(Color32::from_rgb(220, 170, 90))
-                .small(),
-        );
-    }
-    subtitle(ui, t!("config-octane-graphics-subtitle"));
-}
-
-/// What switching a machine to the Octane changes so it passes `validate()`:
-/// the R10000, a valid bank layout (bank 0 filled, 64 MB to 2 GB, no gaps)
-/// and a graphics board it models.
-/// What switching to the O2 has to fix before the machine will start. Called
-/// once, on the frame the profile changes — not every frame, or it would fight
-/// the user's own edits on the Memory tab.
-///
-/// `validate()` rejects an R4400 on an O2 and any bank layout that is not
-/// DIMM-pair kits of 32/64/128/256 MB filled from pair A, so a config that was
-/// an Indy a moment ago carries both.
-fn o2_defaults(cfg: &mut MachineConfig) {
-    if cfg.cpu_part().is_err() {
-        cfg.machine.cpu = None;
-    }
-    // CP0 Count is half the chip's clock, and a clock carried over from
-    // another machine would make IRIX's clock run at the wrong rate. Unset it
-    // so the chip's own default applies.
-    cfg.clock.fixed_mhz = None;
-    // Kits only, filled from pair A. Judge the layout by the core's own rules
-    // rather than restating them here, so the two cannot drift.
-    let pairs = &cfg.banks[..MachineProfile::O2Ip32.memory_banks()];
-    let kits: Vec<u32> = pairs.iter().copied().take_while(|&b| b != 0).collect();
-    let valid = !kits.is_empty()
-        && pairs.iter().skip(kits.len()).all(|&b| b == 0)
-        && iris::dev::crime_mem::check_kits(&kits).is_ok();
-    if !valid {
-        let total: u32 = pairs.iter().sum();
-        cfg.banks = crate::ram::o2_kits_for(total);
-    }
-    if !cfg.graphics_board().supports(MachineProfile::O2Ip32) {
-        cfg.graphics.board = None;
-    }
-    cfg.graphics.heads = 1;
-    cfg.graphics.resolution = NewportResolution::Guest;
-}
-
-fn octane_defaults(cfg: &mut MachineConfig) {
-    cfg.machine.cpu = None;
-    let sizes = MachineProfile::OctaneIp30.bank_sizes();
-    let banks = &cfg.banks[..MachineProfile::OctaneIp30.memory_banks()];
-    let filled = banks.iter().take_while(|&&b| b != 0).count();
-    let valid = filled > 0 && banks[filled..].iter().all(|&b| b == 0) && banks.iter().all(|b| sizes.contains(b));
-    if !valid {
-        let total: u32 = banks.iter().sum();
-        cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 8192), MachineProfile::OctaneIp30);
-    }
-    if !cfg.graphics_board().supports(MachineProfile::OctaneIp30) {
-        cfg.graphics.board = None;
-    }
-    cfg.graphics.heads = 1;
-    cfg.graphics.resolution = NewportResolution::Guest;
-    cfg.octane.graphics = None;
+    show_board_picker(ui, cfg, running);
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
+    let newport = crate::extra_ui::mc_machine(cfg.machine.profile) && cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
     ui.horizontal(|ui| {
         let label = ui.label(t!("config-resolution"));
         if !newport {
@@ -779,7 +697,7 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
         t!("config-ram-banks-subtitle")
     });
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
-        for i in 0..4 {
+        for i in 0..profile.memory_banks() {
             ui.label(t!("config-ram-bank", bank = i));
             let cur = cfg.banks[i];
             ui.add_enabled_ui(!mem_ctx.running, |ui| {
@@ -872,6 +790,26 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 cfg.audio.latency_ms = if ms == 0 { None } else { Some(ms) };
             }
             ui.end_row();
+            // `[audio] channels`: only the Tezro's multichannel card reads it.
+            if cfg.machine.profile == MachineProfile::TezroIp53 {
+                ui.label(t!("config-audio-channels"))
+                    .tip(t!("config-audio-channels-tip"));
+                ComboBox::from_id_salt("audio_channels")
+                    .selected_text(cfg.audio.channels.to_string())
+                    .show_ui(ui, |ui| {
+                        for n in [2usize, 4, 6, 8] {
+                            ui.selectable_value(&mut cfg.audio.channels, n, n.to_string());
+                        }
+                    });
+                ui.end_row();
+            }
+            // `[audio] file`: a WAV recording in place of the sound card.
+            ui.label(t!("config-audio-file"))
+                .tip(t!("config-audio-file-tip"));
+            let mut file = cfg.audio.file.as_ref().map(|p| p.to_string_lossy().into_owned());
+            path_row_opt(ui, "audio_file", &mut file, Pick::SaveFile, &wav_filters());
+            cfg.audio.file = file.map(std::path::PathBuf::from);
+            ui.end_row();
         });
         subtitle(ui, t!("config-audio-rate-subtitle"));
     }
@@ -880,155 +818,192 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) {
     let mut edit = PathEdit::default();
     let mut action = ConfigAction::None;
+    if cfg.machine.profile.is_ip35_bricks() {
+        crate::extra_ui::expansion(ui, cfg);
+        return (edit, action);
+    }
     ui.heading(t!("config-scsi"));
     ui.horizontal(|ui| {
         subtitle(ui, t!("config-scsi-subtitle"));
     });
     let mut to_delete: Option<u8> = None;
-    for id in 1u8..=7 {
-        ui.separator();
-        let exists = cfg.scsi.contains_key(&id);
-        ui.horizontal(|ui| {
-            ui.strong(t!("config-scsi-id", id = id));
-            if exists {
-                if ui.button(t!("config-remove")).clicked() {
-                    to_delete = Some(id);
+    // Every (controller, id) the profile has: two controllers on the
+    // Indigo2, O2, Octane, SN0, Fuel and Tezro; ids up to 15 on wide buses.
+    // A target's `[scsi.KEY]` is found through its placement, so an older
+    // `controller = 1` table keyed by the bare id still shows where it is.
+    let profile = cfg.machine.profile;
+    let controllers = profile.scsi_controllers();
+    let max_id = profile.max_scsi_id();
+    for controller in 0..controllers {
+        if controllers > 1 {
+            ui.separator();
+            ui.heading(t!("config-scsi-controller", controller = controller));
+        }
+        for id in 1u8..=max_id {
+            ui.separator();
+            let found = crate::extra_ui::scsi_key(cfg, controller, id);
+            let exists = found.is_some();
+            let key = found.unwrap_or(iris::config::scsi_slot(controller, id));
+            // An older `[scsi.N] controller = 1` table holds key N, so the
+            // controller-0 target with that id has no key left to take.
+            let key_taken = !exists && cfg.scsi.contains_key(&key);
+            ui.horizontal(|ui| {
+                if controller == 0 {
+                    ui.strong(t!("config-scsi-id", id = id));
+                } else {
+                    ui.strong(t!("config-scsi-controller-id", controller = controller, id = id));
                 }
-            } else if ui.button(t!("config-scsi-attach")).clicked() {
-                cfg.scsi.insert(id, ScsiDeviceConfig {
-                    path: crate::settings::GuiSettings::default_disk_path(id),
-                    ..Default::default()
-                });
-            }
-        });
-        if let Some(dev) = cfg.scsi.get_mut(&id) {
-            // A DaynaPort has no image, no media and no overlay — it is an
-            // Ethernet adapter on the SCSI bus. Show its own short form
-            // instead of the storage rows below.
-            if dev.is_daynaport() {
-                Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
-                    ui.label(t!("config-scsi-type"));
-                    scsi_type_combo(ui, id, dev, &mut edit);
-                    ui.end_row();
-
-                    ui.label(t!("config-scsi-mac"))
-                        .tip(t!("config-scsi-mac-tip"));
-                    let mut mac = dev.mac.clone().unwrap_or_default();
-                    if ui.add(TextEdit::singleline(&mut mac).hint_text("00:80:19:44:50:03")).changed() {
-                        dev.mac = if mac.trim().is_empty() { None } else { Some(mac) };
-                        edit.changed = true;
+                if exists {
+                    if ui.button(t!("config-remove")).clicked() {
+                        to_delete = Some(key);
                     }
-                    ui.end_row();
-
-                    ui.label(t!("config-scsi-subnet"))
-                        .tip(t!("config-scsi-subnet-tip"));
-                    let mut subnet = dev.subnet.clone().unwrap_or_default();
-                    if ui.add(TextEdit::singleline(&mut subnet).hint_text("192.168.10.0/24")).changed() {
-                        dev.subnet = if subnet.trim().is_empty() { None } else { Some(subnet) };
-                        edit.changed = true;
-                    }
-                    ui.end_row();
-                });
-                subtitle(ui, t!("config-daynaport-subtitle"));
-                continue;
-            }
-            Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
-                ui.label(t!("config-scsi-image"));
-                let e = path_row_disk(ui, ("scsi_path", id), &mut dev.path,
-                    if dev.scratch { Pick::SaveFile } else { Pick::OpenFile },
-                    &disk_filters());
-                edit.changed |= e.changed;
-                edit.picked |= e.picked;
-                // For CD-ROMs, picking a path immediately loads the disc into
-                // the running machine (equivalent to Ctrl+F12). The core's
-                // count-driven queue decides whether this replaces the current
-                // disc or joins the changer cycle.
-                if dev.cdrom && e.picked && !dev.path.is_empty() {
-                    action = ConfigAction::LoadDisc {
-                        id, path: dev.path.clone(), remount: true,
-                    };
-                }
-                ui.end_row();
-                // Active copy-on-write overlay for a compressed CHD: show exactly
-                // which `.diff.chd` is in use (the path honours IRIS_CHD_DIFF_DIR,
-                // so on the sandbox build this is the container sidecar) and its
-                // size, so it's unambiguous that changes are landing here and that
-                // this is the file folded back into the disk on a clean exit.
-                if dev.path.ends_with(".chd") {
-                    let diff = iris::chd_disk::diff_path_for(Path::new(&dev.path));
-                    if let Ok(meta) = std::fs::metadata(&diff) {
-                        let mb = meta.len() as f64 / (1024.0 * 1024.0);
-                        ui.label(t!("config-scsi-overlay"));
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(t!("config-scsi-overlay-file",
-                                    path = diff.display(), size = format!("{mb:.1}")))
-                                .weak().small())
-                                .tip(t!("config-scsi-overlay-tip"));
-                            if ui.small_button("📂").tip(t!("config-reveal-tip")).clicked() {
-                                reveal_in_file_manager(&diff.to_string_lossy());
-                            }
-                        });
-                        ui.end_row();
-                    }
-                }
-
-                ui.label(t!("config-scsi-type"));
-                let was_cd = dev.cdrom;
-                scsi_type_combo(ui, id, dev, &mut edit);
-                // Switching to CD-ROM defaults to an empty drive (no media):
-                // clear the auto-generated HDD placeholder path so it doesn't
-                // look like a (missing) disc. Load media via "Insert disc…" in
-                // the SCSI menu, or just type a path here.
-                if dev.cdrom && !was_cd && (dev.path == crate::settings::GuiSettings::default_disk_path(id) || dev.path == format!("scsi{id}.raw")) {
-                    dev.path.clear();
-                }
-                ui.end_row();
-                if dev.cdrom && dev.path.is_empty() {
-                    ui.label("");
-                    ui.label(RichText::new(t!("config-scsi-cdrom-empty"))
-                        .weak().small());
-                    ui.end_row();
-                }
-
-                ui.label(t!("config-scsi-cow"))
-                    .tip(t!("config-scsi-cow-tip"));
-                ui.checkbox(&mut dev.overlay, "")
-                    .tip(t!("config-scsi-cow-check-tip"));
-                ui.end_row();
-
-                ui.label(t!("config-scsi-scratch"));
-                ui.checkbox(&mut dev.scratch, "");
-                ui.end_row();
-
-                if dev.scratch {
-                    ui.label(t!("config-scsi-scratch-size"));
-                    let mut sz = dev.size_mb.unwrap_or(64);
-                    if ui.add(DragValue::new(&mut sz).range(1..=8192)).changed() {
-                        dev.size_mb = Some(sz);
-                    }
-                    ui.end_row();
-                }
-            });
-
-            if dev.cdrom {
-                ui.label(t!("config-scsi-changer"));
-                let mut drop_idx: Option<usize> = None;
-                for (i, disc) in dev.discs.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        let e = path_row_disk(ui, ("disc", id, i), disc, Pick::OpenFile, &disk_filters());
-                        edit.changed |= e.changed;
-                        edit.picked |= e.picked;
-                        if ui.button("×").tip(t!("config-scsi-disc-remove-tip")).clicked() { drop_idx = Some(i); }
+                } else if key_taken {
+                    ui.label(RichText::new(t!("config-scsi-key-taken", key = key)).weak());
+                } else if ui.button(t!("config-scsi-attach")).clicked() {
+                    cfg.scsi.insert(key, ScsiDeviceConfig {
+                        path: crate::settings::GuiSettings::default_disk_path(key),
+                        ..Default::default()
                     });
                 }
-                if let Some(i) = drop_idx { dev.discs.remove(i); }
-                if ui.button(t!("config-scsi-add-disc")).clicked() {
-                    dev.discs.push(String::new());
+            });
+            if let Some(dev) = cfg.scsi.get_mut(&key).filter(|_| exists) {
+                // A DaynaPort has no image, no media and no overlay — it is an
+                // Ethernet adapter on the SCSI bus. Show its own short form
+                // instead of the storage rows below.
+                if dev.is_daynaport() {
+                    Grid::new(("scsi_grid", key)).num_columns(2).striped(true).show(ui, |ui| {
+                        ui.label(t!("config-scsi-type"));
+                        scsi_type_combo(ui, key, dev, &mut edit);
+                        ui.end_row();
+
+                        ui.label(t!("config-scsi-mac"))
+                            .tip(t!("config-scsi-mac-tip"));
+                        let mut mac = dev.mac.clone().unwrap_or_default();
+                        if ui.add(TextEdit::singleline(&mut mac).hint_text("00:80:19:44:50:03")).changed() {
+                            dev.mac = if mac.trim().is_empty() { None } else { Some(mac) };
+                            edit.changed = true;
+                        }
+                        ui.end_row();
+
+                        ui.label(t!("config-scsi-subnet"))
+                            .tip(t!("config-scsi-subnet-tip"));
+                        let mut subnet = dev.subnet.clone().unwrap_or_default();
+                        if ui.add(TextEdit::singleline(&mut subnet).hint_text("192.168.10.0/24")).changed() {
+                            dev.subnet = if subnet.trim().is_empty() { None } else { Some(subnet) };
+                            edit.changed = true;
+                        }
+                        ui.end_row();
+                    });
+                    subtitle(ui, t!("config-daynaport-subtitle"));
+                    continue;
+                }
+                Grid::new(("scsi_grid", key)).num_columns(2).striped(true).show(ui, |ui| {
+                    ui.label(t!("config-scsi-image"));
+                    let e = path_row_disk(ui, ("scsi_path", key), &mut dev.path,
+                        if dev.scratch { Pick::SaveFile } else { Pick::OpenFile },
+                        &disk_filters());
+                    edit.changed |= e.changed;
+                    edit.picked |= e.picked;
+                    // For CD-ROMs, picking a path immediately loads the disc into
+                    // the running machine (equivalent to Ctrl+F12). The core's
+                    // count-driven queue decides whether this replaces the current
+                    // disc or joins the changer cycle.
+                    if controller == 0 && dev.is_cdrom() && e.picked && !dev.path.is_empty() {
+                        action = ConfigAction::LoadDisc {
+                            id, path: dev.path.clone(), remount: true,
+                        };
+                    }
+                    ui.end_row();
+                    // Active copy-on-write overlay for a compressed CHD: show exactly
+                    // which `.diff.chd` is in use (the path honours IRIS_CHD_DIFF_DIR,
+                    // so on the sandbox build this is the container sidecar) and its
+                    // size, so it's unambiguous that changes are landing here and that
+                    // this is the file folded back into the disk on a clean exit.
+                    if dev.path.ends_with(".chd") {
+                        let diff = iris::chd_disk::diff_path_for(Path::new(&dev.path));
+                        if let Ok(meta) = std::fs::metadata(&diff) {
+                            let mb = meta.len() as f64 / (1024.0 * 1024.0);
+                            ui.label(t!("config-scsi-overlay"));
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(t!("config-scsi-overlay-file",
+                                        path = diff.display(), size = format!("{mb:.1}")))
+                                    .weak().small())
+                                    .tip(t!("config-scsi-overlay-tip"));
+                                if ui.small_button("📂").tip(t!("config-reveal-tip")).clicked() {
+                                    reveal_in_file_manager(&diff.to_string_lossy());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    }
+
+                    ui.label(t!("config-scsi-type"));
+                    let was_cd = dev.is_cdrom();
+                    scsi_type_combo(ui, key, dev, &mut edit);
+                    // Switching to CD-ROM defaults to an empty drive (no media):
+                    // clear the auto-generated HDD placeholder path so it doesn't
+                    // look like a (missing) disc. Load media via "Insert disc…" in
+                    // the SCSI menu, or just type a path here.
+                    if dev.is_cdrom() && !was_cd && (dev.path == crate::settings::GuiSettings::default_disk_path(key) || dev.path == format!("scsi{key}.raw")) {
+                        dev.path.clear();
+                    }
+                    ui.end_row();
+                    if dev.is_cdrom() && dev.path.is_empty() {
+                        ui.label("");
+                        ui.label(RichText::new(t!("config-scsi-cdrom-empty"))
+                            .weak().small());
+                        ui.end_row();
+                    }
+
+                    ui.label(t!("config-scsi-cow"))
+                        .tip(t!("config-scsi-cow-tip"));
+                    ui.checkbox(&mut dev.overlay, "")
+                        .tip(t!("config-scsi-cow-check-tip"));
+                    ui.end_row();
+
+                    // `write_cache`: hard disks only; a CD-ROM is read-only and
+                    // a scratch volume is written straight through.
+                    if !dev.is_cdrom() && !dev.scratch {
+                        ui.label(t!("config-scsi-write-cache"))
+                            .tip(t!("config-scsi-write-cache-tip"));
+                        ui.checkbox(&mut dev.write_cache, "");
+                        ui.end_row();
+                    }
+
+                    ui.label(t!("config-scsi-scratch"));
+                    ui.checkbox(&mut dev.scratch, "");
+                    ui.end_row();
+
+                    if dev.scratch {
+                        ui.label(t!("config-scsi-scratch-size"));
+                        let mut sz = dev.size_mb.unwrap_or(64);
+                        if ui.add(DragValue::new(&mut sz).range(1..=8192)).changed() {
+                            dev.size_mb = Some(sz);
+                        }
+                        ui.end_row();
+                    }
+                });
+
+                if dev.is_cdrom() {
+                    ui.label(t!("config-scsi-changer"));
+                    let mut drop_idx: Option<usize> = None;
+                    for (i, disc) in dev.discs.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            let e = path_row_disk(ui, ("disc", key, i), disc, Pick::OpenFile, &disk_filters());
+                            edit.changed |= e.changed;
+                            edit.picked |= e.picked;
+                            if ui.button("×").tip(t!("config-scsi-disc-remove-tip")).clicked() { drop_idx = Some(i); }
+                        });
+                    }
+                    if let Some(i) = drop_idx { dev.discs.remove(i); }
+                    if ui.button(t!("config-scsi-add-disc")).clicked() {
+                        dev.discs.push(String::new());
+                    }
                 }
             }
         }
     }
-    if let Some(id) = to_delete { cfg.scsi.remove(&id); }
+    if let Some(key) = to_delete { cfg.scsi.remove(&key); }
     (edit, action)
 }
 
@@ -1076,9 +1051,9 @@ fn show_network(
     let mut out = NetworkOutcome::default();
     ui.heading(t!("config-tab-network"));
 
-    // The Octane's address is not in its NVRAM; it comes from `[network] mac`
-    // or a generated default.
-    if cfg.machine.profile != MachineProfile::OctaneIp30 {
+    // Only MC machines keep the editable Ethernet address in these battery
+    // files. Newer platforms use `[network] mac` or their generated default.
+    if crate::extra_ui::mc_machine(cfg.machine.profile) {
         ethernet_address_row(ui, cfg, running);
     }
     ui.add_space(4.0);
@@ -1096,9 +1071,8 @@ fn show_network(
                 .selected_text(match cfg.network.mode {
                     NetMode::Nat  => t!("config-net-mode-nat"),
                     NetMode::Pcap => t!("config-net-mode-pcap"),
-                    // Only an O2 config can say this, and the GUI does not run one yet.
+                    // These backends and the stream peer are also editable in Advanced.
                     NetMode::Off  => "off".to_string(),
-                    // Set in the config file only; the GUI offers no field for the peer.
                     NetMode::Stream => "stream".to_string(),
                 })
                 .show_ui(ui, |ui| {
@@ -1984,8 +1958,8 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 ///
 /// These are the knobs that matter on a small host (a two-core laptop, a
 /// mini PC), so they live in one place rather than being scattered across the
-/// General, Display and Debug tabs. Nothing here changes what the guest sees;
-/// it changes how much of the host the emulator costs.
+/// General, Display and Debug tabs. Processor count also changes the hardware
+/// presented to the guest.
 fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.heading(t!("config-tab-performance"));
     subtitle(ui, t!("config-perf-subtitle"));
@@ -2020,19 +1994,19 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 
     ui.separator();
     ui.label(RichText::new(t!("config-perf-cpu-count")).strong());
-    let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
+    let profile = cfg.machine.profile;
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(octane, |ui| {
+        ui.add_enabled_ui(profile.max_cpus() > 1, |ui| {
             ComboBox::from_id_salt("machine_cpus")
                 .selected_text(format!("{}", cfg.machine.cpus()))
                 .show_ui(ui, |ui| {
-                    for n in [1u8, 2] {
+                    for n in (1..=profile.max_cpus()).filter(|&n| profile.accepts_cpus(n).is_ok() && (profile != MachineProfile::TezroIp53 || iris::config::TEZRO_CPUS.contains(&n))) {
                         ui.selectable_value(&mut cfg.machine.cpus, Some(n), format!("{n}"));
                     }
                 });
         });
-        if !octane {
-            ui.label(RichText::new(t!("config-perf-cpus-octane-only")).weak());
+        if profile.max_cpus() == 1 {
+            ui.label(RichText::new(t!("config-perf-cpus-single")).weak());
         }
     });
     subtitle(ui, t!("config-perf-cpus-subtitle"));
@@ -2043,8 +2017,23 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         Grid::new("perf_jit_grid").num_columns(2).striped(true).show(ui, |ui| {
             let max = std::thread::available_parallelism().map_or(8, |n| n.get()).max(1);
             ui.label(t!("config-jit-threads"));
-            ui.add(DragValue::new(&mut cfg.jitv2.threads).range(1..=max))
-                .tip(t!("config-jit-threads-tip"));
+            ui.horizontal(|ui| {
+                // Unset `[jitv2] threads` follows the guest CPU count (one
+                // each, up to four) and the host's usable CPUs; a number
+                // here pins it.
+                let mut auto = !cfg.jitv2_threads_set;
+                if ui.checkbox(&mut auto, t!("config-jit-threads-auto"))
+                    .tip(t!("config-jit-threads-auto-tip"))
+                    .changed()
+                {
+                    cfg.jitv2_threads_set = !auto;
+                }
+                if auto {
+                    cfg.settle_jitv2_threads();
+                }
+                ui.add_enabled(!auto, DragValue::new(&mut cfg.jitv2.threads).range(1..=max))
+                    .tip(t!("config-jit-threads-tip"));
+            });
             ui.end_row();
             ui.label(t!("config-jit-cache"));
             ui.checkbox(&mut cfg.jitv2.cache, "")
@@ -2080,6 +2069,12 @@ fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         {
             cfg.vnc.max_fps = Some(fps.max(1) as u32);
         }
+        ui.end_row();
+        // `[vnc] password_file`: without it the IRIS_VNC_PASSWORD_FILE and
+        // IRIS_VNC_PASSWORD variables are tried, then no password.
+        ui.label(t!("config-vnc-password-file"))
+            .tip(t!("config-vnc-password-file-tip"));
+        path_row_opt(ui, "vnc_password_file", &mut cfg.vnc.password_file, Pick::OpenFile, &any_filters());
         ui.end_row();
     });
     subtitle(ui, t!("config-perf-vnc-subtitle"));
@@ -2200,7 +2195,7 @@ fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             let status = std::process::Command::new(client)
                 .current_dir(cwd)
                 .arg("ping")
-                .env("IRIS_CI_SOCKET", &socket)
+                .arg("--socket").arg(&socket)
                 .output();
             match status {
                 Ok(o) if o.status.success() => eprintln!("iris-ci ping: OK"),
@@ -2219,7 +2214,7 @@ fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 
 /// How a Browse button should pick a path.
 #[derive(Clone, Copy)]
-enum Pick {
+pub(crate) enum Pick {
     OpenFile,
     SaveFile,
     Dir,
@@ -2251,7 +2246,7 @@ pub fn reveal_in_file_manager(path: &str) {
 /// safe time to (re)check folder-grant permissions, since reacting to every
 /// keystroke would pop a dialog mid-typing.
 #[derive(Default, Clone, Copy)]
-struct PathEdit {
+pub(crate) struct PathEdit {
     changed: bool,
     picked: bool,
 }
@@ -2343,7 +2338,7 @@ fn path_row_in(
 }
 
 /// `path_row_in` anchored on the app's data folder: PROM, NVRAM, logs, shares.
-fn path_row(
+pub(crate) fn path_row(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
     value: &mut String,
@@ -2356,7 +2351,7 @@ fn path_row(
 /// `path_row_in` anchored on the managed disks folder — every hard disk, CD
 /// image and disc in the changer. Browsing one of these opens where that image
 /// actually is, or where a not-yet-created one is destined for.
-fn path_row_disk(
+pub(crate) fn path_row_disk(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
     value: &mut String,
@@ -2368,7 +2363,7 @@ fn path_row_disk(
 
 /// Same as `path_row` but for `Option<String>` — Browse populates Some,
 /// the user can clear by emptying the text.
-fn path_row_opt(
+pub(crate) fn path_row_opt(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
     value: &mut Option<String>,
@@ -2381,22 +2376,25 @@ fn path_row_opt(
 }
 
 /// Common file filters: (label, extensions).
-type Filters = Vec<(String, &'static [&'static str])>;
+pub(crate) type Filters = Vec<(String, &'static [&'static str])>;
 fn prom_filters() -> Filters {
     vec![(t!("config-filter-prom"), &["bin"][..]), (t!("config-filter-all"), &["*"][..])]
 }
 fn nvram_filters() -> Filters {
     vec![(t!("config-filter-nvram"), &["bin"][..]), (t!("config-filter-all"), &["*"][..])]
 }
-fn disk_filters() -> Filters {
+pub(crate) fn disk_filters() -> Filters {
     vec![
         (t!("config-filter-disk"), &["raw", "img", "chd"][..]),
         (t!("config-filter-iso"),  &["iso"][..]),
         (t!("config-filter-all"),  &["*"][..]),
     ]
 }
-fn any_filters() -> Filters {
+pub(crate) fn any_filters() -> Filters {
     vec![(t!("config-filter-all"), &["*"][..])]
+}
+fn wav_filters() -> Filters {
+    vec![(t!("config-filter-wav"), &["wav"][..])]
 }
 #[cfg(feature = "perfetto")]
 fn perfetto_filters() -> Filters {

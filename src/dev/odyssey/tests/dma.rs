@@ -417,6 +417,29 @@ fn a_readback_sends_the_pixel_to_the_guest_as_abgr() {
     assert_eq!(pixel(&s, 0, 200, 300), 0x3322_11ff);
 }
 
+/// The X server's colour-index save of screen pixels, as the Motif text
+/// cursor's save-under sends it: the frame buffer named by address (not
+/// the read drawable), word 4 class 0 code 1, the 0x41 format byte, one
+/// byte a pixel. Board memory records no display mode, so the byte is the
+/// field's as it stands. Refusing the read left the guest's buffer as it
+/// was, and the cursor's restore then painted that (zero) back: a black
+/// block wherever the cursor had been.
+#[test]
+fn an_index_read_of_board_memory_by_address_returns_the_field_byte() {
+    let (mut s, _, ram) = fenced_board();
+    colour_destination(&mut s);
+    pixel_write(&mut s, 200, 300, 0x2a);
+    ram.put(PAGE_A, &[0xa5; 36]);
+    let mut expect = [0xa5u8; 36];
+
+    put_table(&ram, TABLE, [0x2000, 300 << 16 | 200, 0x50, 0x10001, 0x8263_3008, 0, 1, 0x3305_0041], &[pte(PAGE_A + 16, 1)]);
+    descriptor(&mut s, TABLE);
+
+    expect[16] = 0x2a;
+    assert_eq!(ram.get(PAGE_A, 36), expect);
+    assert_eq!(pixel(&s, 0, 200, 300), 0x2a, "the plane is left alone");
+}
+
 /// The X server's 24-bit TrueColor visuals have red mask 0xff and blue
 /// mask 0xff0000, so an XPutImage pixel is 0x00BBGGRR and the server's DMA
 /// put names it with source code 0x4c, bytes A, B, G, R. An orange pixel
@@ -471,3 +494,51 @@ fn a_context_switch_with_no_shadow_address_writes_nothing() {
     assert_eq!(ram.get(0, 0x2000), before);
 }
 
+
+/// The pixel mode the X server selects at the screen before it puts a
+/// colour-index image (traced: LightWave Modeler's viewports).
+const CI16_MODE: u32 = 0x2008_6980;
+
+/// Index `(x, y)` of the screen's front field as CI16_MODE lays it out.
+fn index_at(s: &Board, x: i32, y: i32) -> u32 {
+    use crate::dev::odyssey::field::Layout;
+    use crate::dev::odyssey::vram::Format;
+    s.gpu_sync();
+    let f = Format::decode(CI16_MODE);
+    let field = Layout::of(f).field(false);
+    Rows::new(s.vram_ptr(), View::colour(&Surface::new(0x2000, 0x50, f.fb_log2), field, MAX_DIM)).load_word(x, y).unwrap()
+}
+
+/// The X server puts a colour-index image as 2-byte big-endian indices,
+/// source code 0x61 at bpp index 0, into the front field at byte 6 of the
+/// 16-byte screen pixel (word 4 0x83331071, LightWave's header with a
+/// smaller rectangle). Each index lands whole up to the board's 12 bits,
+/// the row gap is skipped, and nothing outside the rectangle is touched.
+///
+/// QEMU: readback/put-ci16-x-image.
+#[test]
+fn a_ci16_image_put_lands_its_indices_in_the_index_field() {
+    let (mut s, _, ram) = board_with_ram();
+    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, CI16_MODE, 0] {
+        s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
+    }
+    let src: Vec<u8> = [0x0123u16, 0x0456, 0x0fff, 0xdead, 0x0001, 0x0a5a, 0x1234]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect();
+    ram.put(PAGE_A, &src);
+    let header = [0x2000, 312 << 16 | 147, 0x50, 2 << 16 | 3, 0x8333_1071, 2, 6, 0x3200_0061];
+    put_table(&ram, TABLE, header, &[pte(PAGE_A, 12)]);
+
+    descriptor(&mut s, TABLE);
+
+    assert_eq!(index_at(&s, 147, 312), 0x123);
+    assert_eq!(index_at(&s, 148, 312), 0x456);
+    assert_eq!(index_at(&s, 149, 312), 0xfff);
+    assert_eq!(index_at(&s, 147, 313), 0x001);
+    assert_eq!(index_at(&s, 148, 313), 0xa5a);
+    assert_eq!(index_at(&s, 149, 313), 0x234, "indices keep the board's 12 bits");
+    assert_eq!(index_at(&s, 150, 312), 0);
+    assert_eq!(index_at(&s, 146, 313), 0);
+    assert_eq!(index_at(&s, 147, 314), 0);
+}

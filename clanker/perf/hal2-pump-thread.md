@@ -14,7 +14,8 @@ Both versions were reverted; `src/dev/hal2.rs` is back on `TimerManager` via
 audio ticks stay on schedule. `thread::sleep` on Windows — even with
 `timeBeginPeriod(1)` from `Hal2::start()` — cannot reliably sleep for 23 µs;
 effective wakeups land near **1 ms**, so DMA was drained ~40× too slowly. The
-cpal ring buffer underran constantly (scratchy/crackling audio).
+host output's ring buffer (cpal then; iris-audio since 2026-11) underran
+constantly (scratchy/crackling audio).
 
 ## Why the whole pump-thread approach was reverted, not just re-fixed
 
@@ -45,7 +46,7 @@ chasing unrelated kernel panics.
 
 ## Verify after HAL2 changes
 
-- Telnet monitor `hal2 status` — the `Host stream` line's `underruns` should stay low
+- Telnet monitor `audio status` — the `host:` line's `underruns` should stay low
   during desktop idle and under `glxgears`-style load.
 - **Boot a fresh IRIX image and confirm the startup chime plays correctly**
   (not silent, not garbled/truncated) — this was the concrete symptom that

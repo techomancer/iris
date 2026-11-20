@@ -92,6 +92,31 @@ const WRITE_FORMAT_MASK: u32 = 0x1f;
 const WRITE_FORMAT_COLOR_INDEX: u32 = 1;
 /// Word 7 bit 27.
 const COPY_TRANSFORM: u32 = 1 << 27;
+/// Word 7's write format RGBA (bits 4:0) and its type US_4_4_4_4 (bits 8:5).
+const WRITE_FORMAT_RGBA: u32 = 0xb;
+const WRITE_TYPE_SHIFT: u32 = 5;
+const WRITE_TYPE_MASK: u32 = 0xf;
+const WRITE_TYPE_US_4444: u32 = 6;
+
+/// How the board stores into a colour field of `bytes` bytes, by the write
+/// format and type in the low bits of `word` (a copy's word 7, a DMA
+/// header's control word), where they name the packing whole: a colour
+/// index, or RGBA as 4:4:4:4 in 2 bytes. The library picks the write pair
+/// from the destination's pixel class (`ignore/odsy`,
+/// devices/buzz/pixel-paths.md, the host-to-board table), so it names the
+/// field as the window holds it. The selected pixel mode can belong to
+/// another window by then (traced, Icon Catalog on a 12-bit visual): the X
+/// server puts its 8-bit tab strip with a 4:4:4:4 window's mode still
+/// selected, and its scroll copies (read 4:4:4:4, write RGBA/US_4_4_4_4)
+/// come with an index mode selected. None leaves the packing to the mode.
+pub(super) fn write_codec(bytes: u8, word: u32) -> Option<Codec> {
+    let (format, kind) = (word & WRITE_FORMAT_MASK, (word >> WRITE_TYPE_SHIFT) & WRITE_TYPE_MASK);
+    match (bytes, format, kind) {
+        (2 | 4, WRITE_FORMAT_COLOR_INDEX, _) => Some(Codec::Texel { bytes, field: FIELD_INDEX }),
+        (2, WRITE_FORMAT_RGBA, WRITE_TYPE_US_4444) => Some(Codec::Texel { bytes: 2, field: FIELD_FOUR }),
+        _ => None,
+    }
+}
 
 impl CopyOperands {
     pub fn decode(op: &[u32]) -> CopyOperands {
@@ -221,6 +246,12 @@ impl Board {
             .into_iter()
             .find(|f| f.at == dst.at && !whole_wid)
             .map_or_else(|| source_codec(dst.bytes, 0), |f| f.codec);
+        // Word 7's write pair, where it names the packing, over the mode's
+        // (write_codec); the window-id buffer's bytes stay whole.
+        let dst_codec = match write_codec(dst.bytes, c.w[7]) {
+            Some(w) if !whole_wid && !c.transform() => w,
+            _ => dst_codec,
+        };
         let mem = self.vram.ptr();
         let side_rows = |s: &Side, codec: Codec, base: u32| {
             let surface = Surface::new(base, s.stride, s.pixel_log2);
@@ -318,8 +349,12 @@ impl Board {
             // records and with no readback, when it can take the copy.
             if !fragment {
                 let op = self.copy_op(&c, &src, &dst, &from, ab.as_ref(), &to, (ox, oy), (dx0, dy0), (mirror_x, mirror_y), raw, byte_masks, filter);
-                if self.raster.run_now(|ctx| ctx.gpu.as_mut().is_some_and(|g| g.copy(&op))) {
-                    return;
+                match self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").copy(&op)) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").reject("GPU framebuffer copy", error.0));
+                        return;
+                    }
                 }
             }
             // Otherwise the source and destination rectangles come back,
@@ -327,7 +362,14 @@ impl Board {
             let region = |rows: &Rows, x: i32, y: i32| {
                 self.raster.run_now(|ctx| {
                     if let Some(g) = &mut ctx.gpu {
-                        if let Err(e) = g.read_back_view(&rows.v, x, y, x.wrapping_add(w as i32 - 1), y.wrapping_add(h as i32 - 1)) {
+                        if let Err(e) = g.read_back_view(
+                            &rows.v,
+                            x,
+                            y,
+                            x.wrapping_add(w as i32 - 1),
+                            y.wrapping_add(h as i32 - 1),
+                            super::gpu_unit::Observation::CopySource,
+                        ) {
                             crate::dlog!(crate::devlog::LogModule::Odyssey, "sgi-odyssey: gpu readback: {e}");
                         }
                     }
@@ -383,6 +425,7 @@ impl Board {
                             let q = BackQuad { x: px, y: py, cov: 1, zq: [zq, 0, 0, 0], rgba: [src4.map(|c| c as u16), [0; 4], [0; 4], [0; 4]], ..Default::default() };
                             self.raster.run_now(|ctx| ctx.gpu.as_mut().expect("the unit").push_frag(&q, &slot));
                         }
+                        None if gpu => {}
                         None => f.0.fragment_q(&self.dest_mem(), px, py, zq, src4),
                     }
                 } else if let (true, Some(m)) = (raw, byte_masks) {

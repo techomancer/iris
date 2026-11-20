@@ -14,12 +14,28 @@ pub(super) const SCANOUT_MAX_DIM: u32 = 16384;
 /// 1 kHz: well above any SGI display's field rate.
 pub(super) const SCANOUT_MIN_PERIOD_NS: i64 = 1000000;
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct ScanoutMode {
     pub width: u32, // visible pixels and lines
     pub height: u32,
     pub frame_clocks: u64, // clocks per frame, blanking included
     pub clock_hz: u32,     // the clock they count; 0: no retrace
+    pub line_clocks: u32,  // clocks per line, blanking included
+    pub blank_lines: u32,  // lines of vertical blanking per field
+    pub fields: u32,       // fields per frame, each with its own retrace
+}
+
+impl ScanoutMode {
+    /// The mode as the refresh thread's timing; None with no retrace.
+    pub fn video_timing(&self) -> Option<crate::display::VideoTiming> {
+        (self.clock_hz != 0 && self.line_clocks != 0).then(|| crate::display::VideoTiming {
+            h_total: self.line_clocks,
+            v_total: (self.frame_clocks / self.line_clocks as u64) as u32,
+            pixel_clock_hz: self.clock_hz as u64,
+            vblank_lines: self.blank_lines,
+            fields: self.fields.max(1),
+        })
+    }
 }
 
 /// The scanout as the front end sees it: the mode it set. The retrace
@@ -132,7 +148,7 @@ impl RetraceClock {
         }
         // n * fc / hz seconds, exactly, without overflowing for any n a run
         // reaches: whole seconds' worth of frames first, then the rest, whose
-        // product fits because both factors are below 2^32.
+        // product stays in range because both factors are below 2^32.
         (self.epoch as u64)
             .wrapping_add((n / hz).wrapping_mul(fc).wrapping_mul(NS_PER_SECOND))
             .wrapping_add(mul_div((n % hz).wrapping_mul(fc), NS_PER_SECOND, hz)) as i64
@@ -141,6 +157,7 @@ impl RetraceClock {
     /// Whether a retrace has come due at `now_ns`. If so it is counted and
     /// the next one armed, and the caller runs it; a caller that has fallen
     /// behind gets each missed retrace in turn.
+    #[cfg(test)]
     pub fn next_retrace(&mut self, now_ns: i64) -> bool {
         if self.deadline < 0 || now_ns < self.deadline {
             return false;

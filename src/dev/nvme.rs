@@ -8,7 +8,9 @@
 //!
 //! What it does: the admin command set and the NVM Read, Write, Write Zeroes
 //! and Flush commands, physically contiguous queues, PRP data pointers, one
-//! 512-byte-block namespace, pin-based interrupts (the PCI core has no MSI).
+//! 512-byte-block namespace, pin-based interrupts (the PCI core has no MSI),
+//! and a volatile write cache (`[nvme] write_cache` sets how it powers up;
+//! Set Features switches it, as MODE SELECT does a SCSI disk's).
 //! The namespace is a disk of the shared SCSI target layer (raw image, CHD,
 //! copy-on-write overlay), so images, overlays, flushing and snapshots behave
 //! as they do for the SCSI disks. Anything else is refused with the status
@@ -24,8 +26,9 @@
 //!   completion raises the pin at once.
 //! * The PCI Express and Power Management capabilities are present and
 //!   read-only.
-//! * The namespace is limited to 2 TiB by the SCSI layer's 32-bit block
-//!   address.
+//! * The namespace is limited to 2 TiB: the controller reaches its disk with
+//!   READ(10) and WRITE(10), whose block address is 32 bits. (The SCSI layer
+//!   itself also takes the 16-byte commands.)
 //! * The namespace GUID is derived from the image path.
 //! * A doorbell value outside its queue is ignored and counted; no
 //!   asynchronous error event is raised.
@@ -65,9 +68,11 @@ pub const PCI_VENDOR: u16 = 0x1b36;
 pub const PCI_DEVICE: u16 = 0x0010;
 pub const PCI_CLASS_NVME: u32 = 0x01_0802;
 
-/// The identity of the bridge a `bridge = true` card sits behind: a DEC
-/// 21150, the generic PCI-to-PCI bridge drivers know. Only its type 1 header
-/// is modelled.
+/// The identity of the bridge a `bridge = true` card sits behind: DEC
+/// 1011:0026, the 21154 in Linux's `pci_ids.h`, a generic PCI-to-PCI bridge
+/// drivers know. Only its type 1 header is modelled, with the 32-bit I/O
+/// window of the DEC 2115x family
+/// ([`crate::pci::PciToPciBridge::with_io32_windows`]).
 pub(crate) const BRIDGE_VENDOR: u16 = 0x1011;
 pub(crate) const BRIDGE_DEVICE: u16 = 0x0026;
 
@@ -108,10 +113,10 @@ impl Card {
 
     /// Put the card in `device` of `bus`: in the slot itself, or behind a
     /// PCI-to-PCI bridge there, as device 0 of the bridge's bus.
-    pub fn fit(&self, bus: &PciBus, device: u8) {
+    pub fn attach(&self, bus: &PciBus, device: u8) {
         let at = |device| DevFn { device, function: 0 };
         if self.bridge {
-            let ppb = PciToPciBridge::new(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE);
+            let ppb = PciToPciBridge::with_io32_windows(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE, 0);
             bus.attach(at(device), ppb.clone());
             ppb.secondary().attach(at(0), self.nvme.clone());
         } else {
@@ -350,7 +355,8 @@ impl Nvme {
             .bus
             .attach_device(0, path, false, Vec::new(), overlay, overlay_path, write_cache)
             .map_err(|e| format!("could not open {path}: {e}"))?;
-        // The SCSI layer addresses blocks in 32 bits.
+        // The commands the controller sends its disk (READ(10), WRITE(10))
+        // address blocks in 32 bits.
         if blocks > u64::from(u32::MAX) {
             let _ = self.bus.attach(0, Box::new(crate::scsi::ScsiDevice::new_empty_cdrom(IDENTITY)));
             return Err(format!("{path} is larger than 2 TiB, which the disk layer cannot address"));

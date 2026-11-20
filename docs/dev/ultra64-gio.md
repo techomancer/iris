@@ -290,48 +290,42 @@ not used by current SDK code.
 ### 5.1 Shared Memory Layout (`/iris_n64_bridge`)
 
 The shm region begins with two embedded `raw_sync` Events (auto-reset, semaphore semantics) in a
-fixed 256-byte area, followed by the header and the 16 MB RAMROM.
+fixed 256-byte area, followed by the header and the 16 MB RAMROM. The layout is defined once, in
+`src/ultra_proto.rs`, which both IRIS and gopher64 compile.
 
 ```
 [0x000–0x0FF]   Event area (256 bytes)
-                  EVT_H2N at offset 0    — Indy signals, N64 waits (RDB Indy→N64 + reset/NMI)
-                  EVT_N2H after h2n      — N64 signals, Indy waits (RDB N64→Indy)
+                  EVT_H2N at offset 0    — Indy signals, N64 waits
+                  EVT_N2H after h2n      — N64 signals, Indy waits
 
-[0x100–0x11F]   ShmHeader (current, to be replaced by ring buffers — see below)
-                  magic:             u32  0x4E36344D ("N64M")
-                  version:           u32  1
-                  cart_int_payload:  u32  (legacy 6-bit, Indy→N64)
-                  gio_int_payload:   u32  (legacy 6-bit, N64→Indy)
-                  gio_sync:          u32  (legacy bits[5:0])
-                  n64_reset:         u32  (1 = reset asserted)
-                  n64_nmi:           u32  (1 = NMI pending)
-                  page_select:       u32  (current 1 MB page, 0–15)
-                  cart_int_seq:      u32  (sequence counter, legacy)
+[0x100– ]       ShmHeader
+                  magic:     u32      0x4E36344D ("N64M")
+                  version:   u32      1
+                  h2n_ring:  IpcRing  Indy → N64
+                  n2h_ring:  IpcRing  N64 → Indy
 
-[0x120–0x11FFFF] RAMROM (16 MB)
+[after header]  RAMROM (16 MB)
 ```
 
-**Planned redesign**: Replace the flat header fields with two SPSC ring buffers, one per
-direction, each carrying typed 32-bit entries that mirror the real `rdbPacket` format:
+Each `IpcRing` is a single-producer, single-consumer ring: `head` (the consumer's count),
+`tail` (the producer's count) and 64 messages, each a `kind` word and a `payload` word. The
+counters wrap; a slot is the counter modulo 64, and a push to a full ring is dropped.
 
-```
-[31:24]  type     — mirrors RDB_TYPE_* (+ emulation-specific types for reset/NMI)
-[23:0]   payload  — 24 bits of data (matches rdbPacket length+buf fields)
-```
+| Direction | Kinds |
+| :--- | :--- |
+| Indy → N64 (`h2n`) | `RESET_ASSERT`, `RESET_DEASSERT`, `NMI_ASSERT`, `CART_INT` (6-bit payload), `RDB_WRITE` (an RDB packet word), `RDB_ACK` (the new acknowledge count) |
+| N64 → Indy (`n2h`) | `GIO_INT` (5-bit payload), `GIO_SYNC` (5-bit payload), `RDB_WRITE` (an RDB packet word), `RDB_READ` (the N64 read the Indy's packet) |
 
-Additional emulation-specific types (no hardware equivalent):
-- `RESET_ASSERT` / `RESET_DEASSERT` — replace the `n64_reset` field
-- `NMI` — replaces the `n64_nmi` field
-
-Ring depth 16 entries; head/tail as u32 counters (wrapping mod 16). This eliminates all
-sequencing/overwrite races inherent in the flat field approach.
+Reset and NMI are messages, not fields, so a reset, an NMI and RDB traffic arrive in the order
+they were made, with no overwrite race. An RDB packet word is the real `rdbPacket` encoding:
+bits 31:26 the type, 25:18 the length, 17:0 the data.
 
 ### 5.2 Events
 
 | Event    | Direction  | Fires on |
 | :---     | :---       | :--- |
-| `EVT_H2N` | Indy → N64 | Indy writes an RDB packet (data ready); reset/NMI state change |
-| `EVT_N2H` | N64 → Indy | N64 writes an RDB packet |
+| `EVT_H2N` | Indy → N64 | Indy pushes a message onto `h2n_ring` (an RDB packet, a cart interrupt, reset or NMI) |
+| `EVT_N2H` | N64 → Indy | N64 pushes a message onto `n2h_ring` (an RDB packet or read, a GIO interrupt or sync value) |
 
 These are `raw_sync` auto-reset events (one wake per signal), embedded in the shm region so both
 processes can attach to them without a separate named semaphore.

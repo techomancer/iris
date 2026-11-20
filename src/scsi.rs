@@ -1,3 +1,16 @@
+//! The SCSI target layer every storage controller shares.
+//!
+//! [`ScsiDevice`] is a disk or a CD-ROM drive: the command set (INQUIRY,
+//! the 6-, 10- and 16-byte reads and writes, READ CAPACITY(10) and (16),
+//! MODE SENSE and MODE SELECT with the caching page's write cache,
+//! SYNCHRONIZE CACHE, the CD-ROM's TOC and its tray), sense data, and the
+//! media behind it: an image file, a CHD, a copy-on-write overlay, or a
+//! CD-ROM served over HTTP(S) ([`crate::http_disk`]), through
+//! [`crate::block_node`]. Which chip carries the commands, and what each
+//! machine says its drives are ([`ScsiIdentity`]), belong to the
+//! controllers. [`ScsiBus`] (`bus.rs`) is the id-to-target table each
+//! controller owns; `attach.rs` puts the `[scsi.N]` tables on it.
+
 use std::io;
 
 mod attach;
@@ -7,6 +20,21 @@ pub use attach::{attach_failed, attach_from_config, attach_table, Attached, Dayn
 pub use bus::{ScsiBus, ScsiIdentities, ScsiTarget, Targets};
 
 use crate::block_node::{Background, ChangerNode, Removable, BlockNode};
+
+/// Attach the tables of a machine whose Ethernet is built in, and return its scratch
+/// image. A `daynaport` entry is refused, naming `machine`.
+pub fn attach_without_daynaport<'a>(
+    cfg: &crate::config::MachineConfig,
+    table: &str,
+    machine: &str,
+    route: &dyn Fn(u8) -> Result<&'a ScsiBus, String>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let attached = attach_from_config(cfg, Some(table), route)?;
+    match attached.daynaports.first() {
+        Some(d) => Err(format!("{}: kind = \"daynaport\" is not available on the {machine}", crate::config::scsi_label(d.controller, d.id))),
+        None => Ok(attached.scratch),
+    }
+}
 
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
@@ -170,7 +198,8 @@ pub struct ScsiDevice {
     /// Used for TOC lead-out LBA (CD spec requires TOC in physical sectors).
     phys_block_size: u64,
     /// Logical block size: LBA→byte offset = lba * logical_block_size.
-    /// Defaults to 512. IRIX switches via MODE SELECT (512↔2048). Persists across disc changes.
+    /// Starts at 512 for disks, 2048 for CD-ROMs. IRIX can switch it with
+    /// MODE SELECT (512↔2048); the selected size persists across disc changes.
     logical_block_size: u64,
     /// What INQUIRY reports (the attaching controller's choice).
     identity: ScsiIdentity,
@@ -212,8 +241,8 @@ impl ScsiDevice {
         };
         // A disk's writes reach the host's file as they come; a thread of its
         // own syncs that file about 5 s after the first write that follows a
-        // sync, so a host crash loses at most that much (see STORAGE.md). It
-        // takes no lock a command holds.
+        // sync. This is a typical interval, not a hard loss bound on a host
+        // crash (see STORAGE.md). It takes no lock a command holds.
         let background = match (&media, is_cdrom) {
             (Media::Fixed(node, _), false) => node.background().filter(|bg| match bg.spawn() {
                 Ok(()) => true,
@@ -409,7 +438,7 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
         }
         let block_size = self.logical_block_size as u32;
-        // FFFFFFFFh tells the host the last LBA does not fit, and to ask READ
+        // FFFFFFFFh tells the host the last LBA is too large, and to ask READ
         // CAPACITY(16). A last LBA of exactly FFFFFFFFh gets the same answer,
         // as the host could not tell it from that marker.
         let last_lba = (self.size() / self.logical_block_size).saturating_sub(1).min(u64::from(u32::MAX)) as u32;
@@ -587,7 +616,7 @@ impl ScsiDevice {
         let block_desc: Vec<u8> = if dbd {
             vec![]
         } else {
-            // All ones when the count does not fit the field.
+            // All ones when the count exceeds the field.
             let total_blocks = (self.size() / self.logical_block_size).min(0x00ff_ffff) as u32;
             vec![
                 0x00,                               // density code
@@ -1893,7 +1922,7 @@ mod tests {
         (ScsiDevice::new(Box::new(node), false, "sparse".into(), Vec::new(), identity), last_write)
     }
 
-    /// Past 2 TiB the last LBA does not fit READ CAPACITY(10)'s four bytes.
+    /// Past 2 TiB the last LBA is beyond READ CAPACITY(10)'s four bytes.
     /// It answers FFFFFFFFh, which tells the host to ask READ CAPACITY(16).
     #[test]
     fn a_disk_over_2_tib_answers_read_capacity_16() {
@@ -1928,7 +1957,7 @@ mod tests {
     }
 
     /// MODE SENSE's block descriptor holds the block count in three bytes; a
-    /// count that does not fit reads as all ones, not as its low 24 bits.
+    /// count that is beyond the field reads as all ones, not as its low 24 bits.
     #[test]
     fn mode_sense_saturates_the_block_count() {
         let (mut dev, _) = sparse_disk(3u64 << 31);

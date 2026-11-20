@@ -43,19 +43,19 @@
 //!
 //! ## Dispatch
 //!
-//! [`MemoryController::dma_dispatch`] picks one of four bodies from the latched
+//! `MemoryController::dma_dispatch` picks one of four bodies from the latched
 //! [`VdmaJob`]. The generic byte engine is the reference implementation and
 //! handles every case; the three specialised paths are byte-identical
 //! shortcuts for the shapes that dominate real workloads, and are gated by
-//! [`VdmaJob::flat_run`] — a pure *shape* test — so that anything unusual falls
+//! `VdmaJob::flat_run` — a pure *shape* test — so that anything unusual falls
 //! through to the generic engine rather than growing a corner case here.
 //!
 //! | path | shape |
 //! |---|---|
-//! | [`dma_fill_phys`](MemoryController::dma_fill_phys) | untranslated word fill — the PROM clearing memory |
-//! | [`dma_mem_to_gio_64`](MemoryController::dma_mem_to_gio_64) | 64-bit memory → GIO/REX3 image upload, translated or not |
-//! | [`dma_gio_to_mem_64`](MemoryController::dma_gio_to_mem_64) | 64-bit GIO/REX3 → memory image readback, translated or not |
-//! | [`dma_generic_bytes`](MemoryController::dma_generic_bytes) | everything else: unaligned, descending, zoom/stride blocks |
+//! | `dma_fill_phys` | untranslated word fill — the PROM clearing memory |
+//! | `dma_mem_to_gio_64` | 64-bit memory → GIO/REX3 image upload, translated or not |
+//! | `dma_gio_to_mem_64` | 64-bit GIO/REX3 → memory image readback, translated or not |
+//! | `dma_generic_bytes` | everything else: unaligned, descending, zoom/stride blocks |
 //!
 //! The 64-bit paths translate once per qword; the generic engine still
 //! translates once per *byte* (a µTLB walk, a state-lock acquisition and a PTE
@@ -203,7 +203,7 @@ pub struct VdmaJob {
     pub word_aligned: bool,
     /// Target GIO slot is 32 bits wide (its `GIO64_ARB` *_SIZE_64 bit is
     /// clear), e.g. GR2. Set by the worker after latching; routes the whole
-    /// transfer to [`dma_gio32`](MemoryController::dma_gio32).
+    /// transfer to `dma_gio32`.
     pub gio32: bool,
     /// Port address for 32-bit transfers (4-byte granular).
     pub gio_addr32: u32,
@@ -364,15 +364,15 @@ impl VdmaJob {
 /// Why a DMA translation failed (the DMA_CAUSE bit it raises in brackets).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaXlateFault {
-    /// No µTLB entry's VPNhi matches [TLB_MISS].
+    /// No µTLB entry's VPNhi matches (`TLB_MISS`).
     TlbMiss,
-    /// The matching µTLB entry is not valid [TLB_MISS].
+    /// The matching µTLB entry is not valid (`TLB_MISS`).
     TlbInvalid,
-    /// The page table word could not be read (no memory there) [none].
+    /// The page table word could not be read (no memory there) (`none`).
     PteRead,
-    /// PTE not valid [FAULT].
+    /// PTE not valid (`FAULT`).
     Page,
-    /// Write to a PTE without the dirty/writable bit [CLEAN].
+    /// Write to a PTE without the dirty/writable bit (`CLEAN`).
     Clean,
 }
 

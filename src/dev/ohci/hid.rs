@@ -313,7 +313,7 @@ impl HidFunction {
     }
 
     /// Queue a mouse report, folding it into the newest one when the host is
-    /// behind, the buttons match and the sum still fits an axis byte.
+    /// behind, the buttons match and the sum still stays within an axis byte.
     fn enqueue_pointer(&self, s: &mut State, report: Vec<u8>) {
         if s.configured && s.queue.len() >= 8 {
             if let Some(tail) = s.queue.back_mut() {

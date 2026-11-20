@@ -37,6 +37,8 @@ impl Window {
         self
     }
     pub(crate) fn contains(&self, a: u64, n: u64) -> bool { self.local(a, n).is_some() }
+    /// The addresses the window answers.
+    pub(crate) fn span(&self) -> std::ops::Range<u64> { self.base..self.base + self.size }
     fn local(&self, a: u64, n: u64) -> Option<u64> {
         let local = a.checked_sub(self.base)?;
         (local.checked_add(n)? <= self.size
@@ -74,6 +76,10 @@ impl BusDevice for Window {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
         self.local(address, 1).map(|local| self.device.gen_ptr(local)).unwrap_or(std::ptr::null())
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, address: u64) -> Option<crate::traits::CodePage> {
+        self.local(address, 1).and_then(|local| self.device.code_page(local))
     }
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
         if a & 7 != 0 {
@@ -166,6 +172,10 @@ impl BusDevice for SparseWindowMap {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
         self.target(address).map(|window| window.gen_ptr(address)).unwrap_or(std::ptr::null())
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, address: u64) -> Option<crate::traits::CodePage> {
+        self.target(address).and_then(|window| window.code_page(address))
     }
     fn write64_masked(&self, address: u64, value: u64, mask: u64) -> u32 {
         self.target(address).map(|window| window.write64_masked(address, value, mask))

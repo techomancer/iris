@@ -292,7 +292,7 @@ fn non_utf8() -> io::Error {
 }
 
 /// The file under a writable hard-disk CHD, written by MAME's CHD code
-/// through a [`ChdFileIo`].
+/// through a `ChdFileIo`.
 ///
 /// MAME stores a write to a hunk the image already holds in place. A write
 /// to a hunk it does not hold yet is appended at the end of the file, and
@@ -593,7 +593,7 @@ impl Read for MergedReader {
 /// any error or cancellation the base and diff are left exactly as they were, so
 /// the next launch simply reattaches the diff — nothing is lost. A crash after
 /// the rename and before the diff is gone is recovered by the next open (see
-/// [`finish_interrupted_fold`]).
+/// `finish_interrupted_fold`).
 ///
 /// `progress(fraction)` receives 0.0..=1.0; `cancel()` aborts cleanly. The caller
 /// MUST have dropped any open [`ChdHd`] for this base first (so the files are
@@ -698,7 +698,7 @@ fn sha1_of(path: &Path) -> io::Result<[u8; 20]> {
 /// [`flatten_diff`] writes the marker before it renames the rebuilt base into
 /// place, and removes it last. A marker that is still there means the process
 /// died somewhere after that. If the base is the rebuilt one, the diff was
-/// already folded into it and no longer fits it (its parent is the old base):
+/// already folded into it and no longer applies to it (its parent is the old base):
 /// remove it. If the base is the old one the rename never happened, the diff
 /// is good, and only the marker is stale.
 fn finish_interrupted_fold(base: &Path, diff: &Path) {
@@ -1004,7 +1004,7 @@ mod tests {
         drop(hd);
 
         // A crash before the rename leaves a marker and a diff that still
-        // fits its base: the diff is kept.
+        // applies to its base: the diff is kept.
         let mut hd = ChdHd::open(base.to_str().unwrap(), false).unwrap();
         hd.write_sectors(3, &[0x33u8; 512]).unwrap();
         let (_, d) = hd.pending_sync().unwrap();

@@ -34,9 +34,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use parking_lot::Mutex;
 use crate::config::AudioConfig;
+use crate::dev::audio_dump::AudioDump;
 use crate::dev::crime_mem::O2Memory;
 use crate::traits::BusDevice;
-use crate::host_audio::Output;
+use crate::host_audio::{Meter, Output, Skip};
 
 /// Where the audio registers sit, and their 16 KB block.
 pub const MACE_AUDIO: u32 = 0x1f30_0000;
@@ -113,8 +114,9 @@ impl Chan {
     /// second behind (a host stall is skipped, not replayed). A new rate
     /// starts the count again: amesh moved a running clock from 48 to
     /// 32 kHz, the old count passed the new target, and the difference,
-    /// unsigned, wrapped to a loop the service thread never left.
-    fn due(&mut self, now: Instant, rate: u32) -> u64 {
+    /// unsigned, wrapped to a loop the service thread never left. Returns the
+    /// frames due and the frames skipped.
+    fn due(&mut self, now: Instant, rate: u32) -> (u64, u64) {
         if self.start.is_none() || self.rate != rate {
             self.start = Some(now);
             self.done = 0;
@@ -122,12 +124,14 @@ impl Chan {
         }
         let target = (now - self.start.unwrap()).as_micros() as u64 * rate as u64 / 1_000_000;
         let lag = rate as u64 / 4;
+        let mut skipped = 0;
         if target > self.done + lag {
+            skipped = target - lag - self.done;
             self.done = target - lag;
         }
         let due = target.saturating_sub(self.done);
         self.done = self.done.max(target);
-        due
+        (due, skipped)
     }
 
     /// Blocks in the ring: write minus read, in 32-byte units.
@@ -282,6 +286,8 @@ struct Player {
 }
 
 pub struct MaceAudio {
+    /// What the DACs moved and skipped (`audio status`).
+    meter: Arc<Meter>,
     st: Mutex<State>,
     player: Mutex<Player>,
     config: Mutex<Option<AudioConfig>>,
@@ -294,9 +300,9 @@ pub struct MaceAudio {
     gaps: [AtomicU64; 2],
     gap_items: [AtomicU64; 2],
     last_report: Mutex<Option<Instant>>,
-    /// IRIS_O2_AUDIO_DUMP=<file>: every sample each output plays, at the
-    /// guest's rate, before resampling (see `dump`).
-    dump: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+    /// `IRIS_AUDIO_DUMP=<file>`: every sample each output plays, at the
+    /// guest's rate, before resampling (see `audio_dump`).
+    dump: Option<Arc<AudioDump>>,
     /// Its bits of MACE's ISA status (0..7).
     irq: std::sync::OnceLock<Vec<crate::irq::IrqLine>>,
 }
@@ -310,6 +316,7 @@ impl Default for MaceAudio {
 impl MaceAudio {
     pub fn new() -> Self {
         Self {
+            meter: Meter::new("MACE audio", &["analog in", "analog out 1", "analog out 2"]),
             st: Mutex::new(State::new()),
             player: Mutex::new(Player::default()),
             config: Mutex::new(None),
@@ -317,11 +324,7 @@ impl MaceAudio {
             gaps: [AtomicU64::new(0), AtomicU64::new(0)],
             gap_items: [AtomicU64::new(0), AtomicU64::new(0)],
             last_report: Mutex::new(None),
-            dump: Mutex::new(
-                std::env::var_os("IRIS_O2_AUDIO_DUMP")
-                    .and_then(|p| std::fs::File::create(p).ok())
-                    .map(std::io::BufWriter::new),
-            ),
+            dump: AudioDump::from_env(),
             irq: std::sync::OnceLock::new(),
         }
     }
@@ -508,11 +511,15 @@ impl MaceAudio {
         match st.adc_rate() {
             Some(rate) if st.ch[0].running() => {
                 let c = &mut st.ch[0];
-                for _ in 0..c.due(now, rate) {
+                let (due, stale) = c.due(now, rate);
+                self.meter.skipped(0, Skip::Stale, stale);
+                let mut moved = 0;
+                for _ in 0..due {
                     let next = (c.wptr + BLOCK) & PTR_MASK;
                     if c.sub == 0 && next == c.rptr {
                         break; // full: the engine never fills the last slot
                     }
+                    moved += 1;
                     let addr = io.ring_base | c.wptr | c.sub * 8;
                     if let Some(o) = ram.dma_offset(addr).map(|o| o as u64) {
                         // Each half: sign extension, the sample, 0xff.
@@ -527,6 +534,8 @@ impl MaceAudio {
                     c.msc = c.msc.wrapping_add(1);
                     c.ust = io.ust;
                 }
+                self.meter.add(0, moved);
+                self.meter.skipped(0, Skip::Full, due - moved);
             }
             _ => st.ch[0].start = None,
         }
@@ -542,9 +551,13 @@ impl MaceAudio {
             let (gain_l, gain_r) = st.dac_gain(n);
             let c = &mut st.ch[n];
             rates[out] = rate;
-            for _ in 0..c.due(now, rate) {
+            let (due, stale) = c.due(now, rate);
+            self.meter.skipped(n, Skip::Stale, stale);
+            let mut dry = 0;
+            for _ in 0..due {
                 let mut item = (0i16, 0i16);
                 if c.depth() == 0 {
+                    dry += 1;
                     c.dry = c.dry.saturating_add(1);
                 } else {
                     if c.dry != 0 && c.dry < rate / 2 {
@@ -572,6 +585,8 @@ impl MaceAudio {
                 c.ust = io.ust;
                 pcm[out].push(item);
             }
+            self.meter.add(n, due - dry);
+            self.meter.skipped(n, Skip::Dry, dry);
         }
         if pcm.iter().any(|p| !p.is_empty()) {
             st.played.push((pcm, rates));
@@ -596,28 +611,13 @@ impl MaceAudio {
         }
     }
 
-    /// Append one record per output that played: the output (u8), its rate
-    /// and pair count (u32 each), then the pairs, all little-endian. Works
-    /// with or without host output, so a muted run can still be checked.
+    /// Record each output that played, with or without host output, so a
+    /// muted run can still be checked.
     fn dump(&self, pcm: &[Vec<(i16, i16)>; 2], rates: &[u32; 2]) {
-        use std::io::Write;
-        let mut dump = self.dump.lock();
-        let Some(w) = dump.as_mut() else { return };
+        let Some(dump) = self.dump.as_ref() else { return };
         for out in 0..2 {
-            if pcm[out].is_empty() {
-                continue;
-            }
-            let mut rec = Vec::with_capacity(9 + pcm[out].len() * 4);
-            rec.push(out as u8);
-            rec.extend_from_slice(&rates[out].to_le_bytes());
-            rec.extend_from_slice(&(pcm[out].len() as u32).to_le_bytes());
-            for &(l, r) in &pcm[out] {
-                rec.extend_from_slice(&l.to_le_bytes());
-                rec.extend_from_slice(&r.to_le_bytes());
-            }
-            let _ = w.write_all(&rec);
+            dump.record(out as u8, rates[out], pcm[out].iter().copied());
         }
-        let _ = w.flush();
     }
 
     /// Write each channel's pairs to its host stream at the channel's rate.
@@ -757,34 +757,26 @@ impl crate::traits::Device for MaceAudio {
     fn is_running(&self) -> bool { true }
     fn get_clock(&self) -> u64 { 0 }
 
+    fn audio_report(&self) -> Option<String> {
+        let st = self.st.lock();
+        let rate = |n: usize| st.dac_rate(n).filter(|_| st.ch[n].running());
+        let rates = [st.adc_rate().filter(|_| st.ch[0].running()), rate(1), rate(2)];
+        let player = self.player.lock();
+        let outs: Vec<&Output> = player.out.iter().flatten().collect();
+        Some(self.meter.report(&rates, &outs))
+    }
+
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("audio".to_string(), "MACE audio + AD1843: audio status | audio codec".to_string())]
+        vec![("audio".to_string(), "MACE audio: audio codec (the AD1843 registers; audio status is the monitor's)".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         use std::io::Write;
-        if cmd != "audio" {
-            return Err("Command not found".to_string());
+        if cmd != "audio" || args != ["codec"] {
+            return Err("Usage: audio codec".to_string());
         }
-        let st = self.st.lock();
-        match args.first().copied().unwrap_or("status") {
-            "status" => {
-                writeln!(w, "MACE audio: control {:#x}, codec control {:#x}, mask {:#x}, host output {}",
-                    st.ctl, st.codec_ctl, st.mask, if self.player.lock().out.is_some() { "open" } else { "closed" }).ok();
-                for (n, name) in ["input", "output 1", "output 2"].iter().enumerate() {
-                    let c = &st.ch[n];
-                    writeln!(w, "  {name}: control {:#x} read {:#05x} write {:#05x} depth {} MSC {} {}",
-                        c.ctl, c.rptr, c.wptr, c.depth(), c.msc, if c.running() { "running" } else { "stopped" }).ok();
-                }
-                let rate = |r: Option<u32>| r.map_or("off".to_string(), |r| format!("{r} Hz"));
-                writeln!(w, "  rates: DAC1 {} DAC2 {} ADC {}", rate(st.dac_rate(1)), rate(st.dac_rate(2)), rate(st.adc_rate())).ok();
-            }
-            "codec" => {
-                for (i, v) in st.codec.iter().enumerate() {
-                    writeln!(w, "  AD1843 reg {i:2}: {v:#06x}").ok();
-                }
-            }
-            _ => return Err("Usage: audio status | codec".to_string()),
+        for (i, v) in self.st.lock().codec.iter().enumerate() {
+            writeln!(w, "  AD1843 reg {i:2}: {v:#06x}").ok();
         }
         Ok(())
     }
@@ -847,13 +839,79 @@ mod tests {
     fn a_rate_change_restarts_the_pacing() {
         let mut c = Chan { ctl: CTRL_ENABLE, ..Chan::RESET };
         let t0 = Instant::now();
-        assert_eq!(c.due(t0, 48000), 0);
+        assert_eq!(c.due(t0, 48000).0, 0);
         let t1 = t0 + std::time::Duration::from_millis(100);
-        assert_eq!(c.due(t1, 48000), 4800);
+        assert_eq!(c.due(t1, 48000).0, 4800);
         let t2 = t1 + std::time::Duration::from_millis(1);
-        assert_eq!(c.due(t2, 32000), 0, "new rate: count starts again");
+        assert_eq!(c.due(t2, 32000).0, 0, "new rate: count starts again");
         let t3 = t2 + std::time::Duration::from_millis(10);
-        assert_eq!(c.due(t3, 32000), 320);
+        assert_eq!(c.due(t3, 32000).0, 320);
+    }
+
+    /// Every frame the clock made due is moved or skipped: a stall past the
+    /// quarter second the clock replays is stale, the ring's shortfall dry.
+    #[test]
+    fn a_stall_and_an_empty_ring_are_skipped_not_moved() {
+        let ram = O2Memory::single(8 << 20);
+        let a = MaceAudio::new();
+        a.write(MACE_AUDIO, 0);
+        write_codec(&a, 28, 0x0800);
+        write_codec(&a, 17, 8000);
+        write_codec(&a, 15, 1 << 8);
+        write_codec(&a, 27, 1 << 8);
+        a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+        a.write(MACE_AUDIO + 0x50, 32 * u64::from(BLOCK)); // 32 blocks of 4 frames
+        let io = AudioIo { ram: &ram, ring_base: 0x0010_0000, ust: 0 };
+        let t0 = Instant::now();
+        a.poll_at(&io, t0);
+        a.poll_at(&io, t0 + std::time::Duration::from_secs(2));
+        // 2 s at 8 kHz: the last 2000 frames replayed, the ring held 128.
+        let text = a.meter.report(&[None, Some(8000), None], &[]);
+        assert!(text.contains("analog out 1: 128 moved, guest rate 8000 Hz\n    skipped: stale 14000, dry 1872, ring full 0"), "{text}");
+    }
+
+    /// The dump holds, per DAC, the frames it played: the ring's samples,
+    /// then the silence of a ring that ran dry, with no host stream.
+    #[test]
+    fn the_dump_holds_the_frames_each_dac_played() {
+        let ram = O2Memory::single(8 << 20);
+        let (dump, bytes) = crate::dev::audio_dump::tests::dump();
+        let mut a = MaceAudio::new();
+        a.dump = Some(dump);
+        a.write(MACE_AUDIO, 0);
+        write_codec(&a, 28, 0x0800);
+        write_codec(&a, 9, 0x0c0c); // 6 dB down: the dump follows the DAC gain
+        write_codec(&a, 17, 8000);
+        write_codec(&a, 15, 1 << 8);
+        write_codec(&a, 27, 1 << 8);
+        let ring_base = 0x0010_0000u32;
+        let ring = |i: u32| ((i as i32 + 1) * 100, -(i as i32 + 1) * 50);
+        for i in 0..8u32 {
+            let o = ram.dma_offset(ring_base | 0x1000 | i * 8).unwrap();
+            ram.put_be(o, 4, (ring(i).0 << 8) as u32);
+            ram.put_be(o + 4, 4, (ring(i).1 << 8) as u32);
+        }
+        a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+        a.write(MACE_AUDIO + 0x50, 2 * u64::from(BLOCK)); // 8 frames
+        let io = AudioIo { ram: &ram, ring_base, ust: 0 };
+        let t0 = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        a.poll_at(&io, t0);
+        a.poll_at(&io, t0 + ms(1)); // 8 frames due at 8 kHz: the ring's
+        a.poll_at(&io, t0 + ms(2)); // 8 more: the ring is empty
+        let want = |frames: Vec<(i16, i16)>| {
+            let mut rec = vec![0u8]; // the first DAC
+            rec.extend_from_slice(&8000u32.to_le_bytes());
+            rec.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+            rec.extend(frames.iter().flat_map(|&(l, r)| [l.to_le_bytes(), r.to_le_bytes()]).flatten());
+            rec
+        };
+        let (gl, gr) = a.st.lock().dac_gain(1);
+        assert!(gl < 0.6 && gr < 0.6, "the gain is not unity");
+        let scale = |v: i32, g: f32| (v as f32 * g).round() as i16;
+        let tone: Vec<(i16, i16)> = (0..8).map(|i| (scale(ring(i).0, gl), scale(ring(i).1, gr))).collect();
+        assert_eq!(tone[1], (100, -50), "200 and -100 at about half");
+        assert_eq!(bytes.get(), [want(tone), want(vec![(0, 0); 8])].concat());
     }
 
     /// With the ADC running, the input ring fills with silence (0xff in
@@ -1049,8 +1107,12 @@ mod tests {
         assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} pairs in {wall:.3} s");
         let heard = sounding(&pcm, 2);
         let frames = (heard.len() / 2) as u64;
-        // The rate converter's filter rings for a few frames past the mute.
-        assert!(frames + skipped + 9600 >= loud && frames <= loud + 48,
+        // The rate converter's filter rings for a few frames at each end of
+        // a stretch of sound: one stretch, or more where a busy host kept
+        // this test from refilling the ring in time.
+        // The stream also follows the card's clock, by up to 0.5% slower.
+        let most = loud + loud / 200 + 48 * bursts(&pcm, 2) as u64;
+        assert!(frames + skipped + 9600 >= loud && frames <= most,
             "{frames} pairs heard of {loud} played before the mute ({skipped} skipped by the host stream)");
         assert_tones(&heard, 2, 48000, left, right, 15000);
     }
@@ -1064,7 +1126,9 @@ mod tests {
     fn both_outputs_play_at_their_own_rates_into_one_stream() {
         use crate::host_audio::test_signal::*;
         let a = MaceAudio::new();
-        let (cfg, path) = file_config("o2-two-outputs");
+        let (mut cfg, path) = file_config("o2-two-outputs");
+        // Room for what the outputs play while the file's thread is held up.
+        cfg.prebuf_ms = 300;
         a.enable_output(cfg);
         let rates = [48000u32, 22050];
         let tone = |rate: u32, hz: f64, n: u64| (16000.0 * (std::f64::consts::TAU * hz * n as f64 / f64::from(rate)).sin()).round() as i16;
@@ -1082,7 +1146,14 @@ mod tests {
         }
         // Before what is queued plays out and both run dry.
         assert_eq!(a.underruns(), 0, "neither output ran dry while both were fed");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // The file is written by its own thread, which a busy host can hold up
+        // past any fixed wait: wait until both outputs have played out.
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let played_out = |o: &Output| { let s = o.stats(); s.played > 0 && !s.playing && s.queued.is_zero() };
+        while !a.player.lock().out.iter().flatten().all(played_out) {
+            assert!(Instant::now() < deadline, "the file stopped taking frames");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         // Dropping the outputs completes the file.
         *a.player.lock() = Player::default();
         let (rate, channels, pcm) = read_wav(&path.0);

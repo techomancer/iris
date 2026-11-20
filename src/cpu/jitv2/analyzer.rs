@@ -34,7 +34,7 @@ pub type WordOffset = u16;
 static FALLBACK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Enable/disable interpreter-fallback region admission (see
-/// [`FALLBACK_ENABLED`]). The caller is responsible for flushing already-
+/// `FALLBACK_ENABLED`). The caller is responsible for flushing already-
 /// compiled regions afterward (`Jitv2::mega_flush`) so the change takes effect.
 pub fn set_fallback_enabled(on: bool) {
     FALLBACK_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);

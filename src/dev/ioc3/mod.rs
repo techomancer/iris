@@ -18,7 +18,7 @@
 //!   generator and 256 KiB of Ethernet buffer RAM, in this module; and
 //! * the Ethernet MAC (`eth`), whose registers sit at 0xf0.
 //!
-//! Which children a board fits is a row of the table in `board`. Behaviour follows the
+//! Which children a board has is a row of the table in `board`. Behaviour follows the
 //! public Linux and OpenBSD drivers and measured guest register traces; where
 //! the model approximates, the comment says so.
 //!
@@ -28,9 +28,10 @@
 //! line in its [`PciFunctionState`]); everything else (serial, PS/2,
 //! parallel, the interrupt-output pulse) is gated by the status and enable
 //! pair at 0x1c/0x20 and drives a second line the board wires to a Bridge
-//! input ([`Ioc3::connect_superio_interrupt`]). The pair and the level last
-//! driven sit under one lock: a child changes its bit and the line is driven
-//! inside it, and the Bridge is called only when the output changes.
+//! input ([`Ioc3::connect_superio_interrupt`]). The pair sits under one
+//! [`IrqMutex`], which remembers the level last driven: a child changes its
+//! bit and the guard drives the line before the lock is let go, and the
+//! Bridge is called only when the output changes.
 //!
 //! # Byte order
 //!
@@ -522,7 +523,7 @@ struct Shared {
     int_out: Mutex<IntOut>,
     /// The interrupt output's next transition, where the timers can see it.
     io_due: AtomicU64,
-    /// The clock on the byte bus, on a board that fits the DS1685.
+    /// The clock on the byte bus, on a board that has the DS1685.
     rtc: Option<Arc<Ds1685>>,
     ssram: Mutex<Vec<u32>>,
     eth: Option<Arc<Ioc3Eth>>,
@@ -674,6 +675,8 @@ impl Shared {
                 if !sh.running.load(Ordering::SeqCst) {
                     return;
                 }
+                // Under `gate`, so a reset cannot fall between pump and latch.
+                let _gate = sh.gate.lock();
                 if let Some(s) = &sh.serial[port] {
                     s.pump();
                 }
@@ -972,6 +975,7 @@ impl Shared {
 
     /// A PCI reset of the chip (not of the clock or the buffer RAM).
     fn reset(&self) {
+        let _gate = self.gate.lock();
         if self.board.reset_pci_on_power_on {
             self.pci.config().reset();
         }
@@ -1016,7 +1020,7 @@ impl Ioc3 {
     /// part and the clock the machine built for the byte bus.
     pub fn new(board: &'static Ioc3Board, mac: [u8; 6], byte_bus: ByteBus) -> Ioc3 {
         let cells = &board.cells;
-        assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus fits {:?}", board.name, cells.byte_bus);
+        assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus has {:?}", board.name, cells.byte_bus);
         let core = Arc::new(Core::new());
         let sio = (cells.serial || cells.parallel)
             .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel)));
@@ -1113,7 +1117,7 @@ impl Ioc3 {
         self.sh.gpio.set_heartbeat(heartbeat);
     }
 
-    /// The Ethernet MAC, on a board that fits one.
+    /// The Ethernet MAC, on a board that has one.
     pub fn eth(&self) -> Option<&Arc<Ioc3Eth>> {
         self.sh.eth.as_ref()
     }

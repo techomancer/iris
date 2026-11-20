@@ -53,5 +53,5 @@ dialog-create-disk-subtitle =
 dialog-create-disk-exists = ⚠ { $file } already exists ({ $size } MB). Creating the image erases it.
 dialog-create-disk-overwrite = Erase the existing image
 dialog-create-disk-create = Create
-dialog-new-machine-octane-note = The Octane runs the built-in IP30 PROM unless you choose an image above. It has the R10000 at 195 MHz and Solid IMPACT graphics.
-dialog-new-machine-o2-note = The O2 runs the built-in IP32 PROM unless you choose an image above. It has an R5000 or an R10000 at 180 MHz, and its memory is DIMM-pair kits of 32, 64, 128 or 256 MB.
+dialog-new-machine-octane-note = The Octane runs the built-in IP30 PROM unless you choose an image. Choose a compatible processor and IMPACT or VPro graphics above.
+dialog-new-machine-o2-note = The O2 runs the built-in IP32 PROM unless you choose an image. Choose an R5000, R10000 or R12000 module above. Its memory uses DIMM-pair kits of 32, 64, 128 or 256 MB.

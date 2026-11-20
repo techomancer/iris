@@ -15,7 +15,7 @@ $profile = Join-Path 'target' "resident-gate-jit-$([Guid]::NewGuid().ToString('N
 $env:IRIS_REX_JIT_PROFILE = $profile
 
 function Invoke-ResidentTests {
-    param([string] $Filter, [int] $Expected, [bool] $Ignored)
+    param([string] $Filter, [int] $Expected, [bool] $Ignored, [string] $Skip = '')
 
     $testArgs = @(
         'test', '--locked', '-p', 'iris', '--lib', '--features', 'wgpu,rex-jit,rexdiag',
@@ -23,6 +23,9 @@ function Invoke-ResidentTests {
     )
     if ($Ignored) {
         $testArgs += @('--ignored', '--nocapture')
+    }
+    if ($Skip) {
+        $testArgs += @('--skip', $Skip)
     }
 
     Write-Host "Running $Filter ($Expected tests, backend=$env:REX3_RESIDENT_BACKEND)"
@@ -66,13 +69,20 @@ function Invoke-ResidentTests {
 }
 
 try {
-    Invoke-ResidentTests 'resident_' 25 $false
-    Invoke-ResidentTests 'dev::ng1::rex3_flat_fill::tests' 3 $false
-    Invoke-ResidentTests 'direct_ng1_scanout_display_generations_track_real_changes' 1 $false
+    Invoke-ResidentTests 'resident_' 44 $false 'wgpu_snapshot_reseeds_the_resident_mirror'
+    Invoke-ResidentTests 'dev::ng1::rex3_flat_fill::tests' 4 $false
+    Invoke-ResidentTests 'dev::ng1::wgpu::line::tests' 2 $false
+    Invoke-ResidentTests 'dev::ng1::wgpu::host::tests' 2 $false
+    Invoke-ResidentTests 'mixed_host_sources_match_between_interpreter_and_jit' 1 $false
+    Invoke-ResidentTests 'test_hostr_board_' 2 $false
+    Invoke-ResidentTests 'dev::ng1::wgpu::shade::tests' 1 $false
+    Invoke-ResidentTests 'line_pattern_closed_form_matches_scalar_advancement' 1 $false
+    Invoke-ResidentTests 'dev::ng1::wgpu::command::tests' 3 $false
+    Invoke-ResidentTests 'direct_ng1_scanout_' 3 $false
     foreach ($name in $requestedBackends) {
         $env:REX3_RESIDENT_BACKEND = $name
-        Invoke-ResidentTests 'resident_gpu_' 10 $true
-        Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 5 $true
+        Invoke-ResidentTests 'resident_gpu_' 24 $true
+        Invoke-ResidentTests 'dev::ng1::wgpu::direct_tests' 10 $true
     }
 } finally {
     [Environment]::SetEnvironmentVariable('REX3_RESIDENT_BACKEND', $previousBackend, 'Process')

@@ -126,6 +126,38 @@ impl DestMem {
             overlay: Rows::new(mem, d.overlay),
         }
     }
+
+    /// The same fields, storing quietly: for a draw whose tiles mark what
+    /// they drew (`ring::QuadRing`).
+    pub fn quiet(&self) -> DestMem {
+        DestMem {
+            colour: [self.colour[0].quiet(), self.colour[1].quiet()],
+            depth: self.depth.quiet(),
+            stencil: self.stencil.quiet(),
+            did: self.did.quiet(),
+            overlay: self.overlay.quiet(),
+        }
+    }
+
+    /// Mark a draw's stores in `rect` (plane pixels) for the display: the
+    /// surface, and the bytes of a pixel the draw can change there, which
+    /// are the colour fields of `targets`, depth and stencil.
+    #[inline]
+    pub fn mark(&self, targets: [bool; 2], rect: crate::display::Rect) {
+        let mem = self.colour[0].mem();
+        let Some(marks) = mem.marks() else {
+            return;
+        };
+        let mut bytes = self.depth.v.pixel_bytes() | self.stencil.v.pixel_bytes();
+        for (b, rows) in self.colour.iter().enumerate() {
+            if targets[b] {
+                bytes |= rows.v.pixel_bytes();
+            }
+        }
+        // The fields are one surface's (`DestViews::of`).
+        let v = if self.colour[0].v.kind != Kind::None { &self.colour[0].v } else { &self.depth.v };
+        marks.mark(v.store_key(), bytes, rect);
+    }
 }
 
 // Packers: an 8:8:8:8 colour word from its components, red highest, and

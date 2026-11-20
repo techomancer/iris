@@ -1,15 +1,10 @@
 //! Fuel's L1 system controller and its processor-side UART.
 //!
-//! The internal L1 connection is separate from IOC3's external serial ports.
-//! The Ns16550 owns the UART registers, FIFO, timeout and interrupt state;
-//! this device keeps the controller protocol and its eight-byte register stride.
-//! It answers the requests the stock PROM and IRIX send and refuses the rest
-//! as unknown, with a log line. Power requests take effect at once: power
-//! down (0x2005) turns the node off, and a power cycle (0x2006) turns it off
-//! and on again, which restarts it. Remote routing and controller
-//! diagnostics are absent. A configured router interpreter answers
-//! the single-fragment `brick` request for the Chimera brick types; other
-//! interpreter commands and multi-fragment messages are refused and logged.
+//! The Ns16550 owns the UART state; this device keeps the controller protocol
+//! and its eight-byte register stride. It answers the requests the stock PROM
+//! and IRIX send and logs the rest as unknown. Power down (0x2005) and power
+//! cycle (0x2006) act at once. Remote routing and diagnostics are absent; a
+//! router interpreter answers only the single-fragment `brick` request.
 //!
 //! Ported from hw/misc/sgi-l1.c in jamesbraid/qemu-sgi-origami.
 
@@ -55,32 +50,6 @@ fn encode(payload: &[u8]) -> Vec<u8> {
 const UART_BAUDBASE: u32 = 115200;
 const UART_WINDOW_SIZE: u64 = 0x40;
 
-mod uart_offset {
-    use super::com_reg;
-    pub const DATA: u64 = 0x00;
-    pub const IER: u64 = 0x08;
-    pub const IIR_FCR: u64 = 0x10;
-    pub const LCR: u64 = 0x18;
-    pub const MCR: u64 = 0x20;
-    pub const LSR: u64 = 0x28;
-    pub const MSR: u64 = 0x30;
-    pub const SCR: u64 = 0x38;
-
-    pub fn register(offset: u64) -> u32 {
-        match offset {
-            DATA => com_reg::THR,
-            IER => com_reg::IER,
-            IIR_FCR => com_reg::IIR_FCR,
-            LCR => com_reg::LCR,
-            MCR => com_reg::MCR,
-            LSR => com_reg::LSR,
-            MSR => com_reg::MSR,
-            SCR => com_reg::SCR,
-            _ => unreachable!("validated L1 UART offset"),
-        }
-    }
-}
-
 type EventHandler = Arc<dyn Fn(L1Event) + Send + Sync>;
 
 #[derive(Default)]
@@ -111,9 +80,8 @@ impl SerialBackend for ProtocolBackend {
     }
 }
 
-/// The internal L1 connection is independent of IOC3's external serial ports.
-/// Register offsets are relative to the 0x40-byte UART window. Only aligned
-/// 64-bit accesses are decoded; register values occupy the low eight bits.
+/// Register offsets are relative to the 0x40-byte UART window; only aligned
+/// 64-bit accesses decode, values in the low eight bits.
 pub struct L1 {
     // UART RX takes UART -> protocol queue. Model replies take state -> protocol
     // queue. No path holds the protocol queue while acquiring either lock.
@@ -149,14 +117,14 @@ impl L1 {
             .as_ref()
             .is_some_and(|s| s.len() > 37 || s.as_bytes().contains(&0))
         {
-            return Err("L1 brick serial must fit a 37-byte text field".into());
+            return Err("L1 brick serial is longer than its 37-byte field".into());
         }
         if config
             .system_serial
             .as_ref()
             .is_some_and(|s| s.len() > 37 || s.as_bytes().contains(&0))
         {
-            return Err("L1 system serial must fit a 37-byte text field".into());
+            return Err("L1 system serial is longer than its 37-byte field".into());
         }
 
         let protocol_rx = Arc::new(Mutex::new(VecDeque::new()));
@@ -344,7 +312,7 @@ impl BusDevice for L1 {
         if addr >= UART_WINDOW_SIZE || addr & 7 != 0 {
             return BusRead64::err();
         }
-        let value = self.uart.lock().read(uart_offset::register(addr));
+        let value = self.uart.lock().read((addr >> 3) as u32);
         self.flush();
         BusRead64::ok(value as u64)
     }
@@ -353,7 +321,8 @@ impl BusDevice for L1 {
         if addr >= UART_WINDOW_SIZE || addr & 7 != 0 {
             return BUS_ERR;
         }
-        let register = uart_offset::register(addr);
+        // The eight registers sit at an eight-byte stride.
+        let register = (addr >> 3) as u32;
         let value = value as u8;
         if register == com_reg::IIR_FCR && value & com_reg::FCR_RFR != 0 {
             self.state.lock().queue.lock().clear();

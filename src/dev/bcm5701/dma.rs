@@ -87,7 +87,7 @@ const RX_LATENCY_DEPTH: usize = 256;
 pub const RX_ARRIVAL_LATENCY_DEFAULT: Duration = Duration::from_micros(200);
 /// The default minimum in processor cycles: how far the processor that rang
 /// the send doorbell must have run past it before a frame arriving after it is
-/// reported. See [`HeldCompletion`].
+/// reported. See `HeldCompletion`.
 pub const RX_ARRIVAL_CYCLES_DEFAULT: u64 = 20_000;
 /// How soon a completion whose host-time deadline has passed looks again at
 /// whether the sending processor has run far enough.
@@ -984,7 +984,7 @@ impl State {
         };
         let framelen = buf.len() as u32;
 
-        // Pick the ring by what the frame fits in. The standard ring's Max_Len
+        // Pick the ring by which buffer holds the frame. The standard ring's Max_Len
         // is the driver's statement of how much room its buffers hold; a
         // larger frame goes to the jumbo ring when it is enabled, and is
         // dropped rather than written past the end of someone's buffer when
@@ -996,7 +996,7 @@ impl State {
         let jumbo_enabled = self.jumbo_ring_enabled();
         let (ring, ring_base, idx) = if framelen <= std_size {
             if std_empty {
-                // The frame fits a standard buffer and the chip holds none; it
+                // The frame is within the standard buffer size and the chip holds none; it
                 // cannot take a jumbo one, because a frame's ring is chosen by
                 // its length against the standard ring's Max_Len. Discard
                 // rather than refuse: refusing stops the backend reading and

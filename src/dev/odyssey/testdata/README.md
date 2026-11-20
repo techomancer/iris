@@ -7,7 +7,7 @@ shown here. The tests live in `src/dev/odyssey/golden/`.
 
 | Net | What it pins | Data | Runs |
 |---|---|---|---|
-| Frames | 78 scenes drawn through `Board::gl_draw`: flat, smooth and textured triangles, quads and polygons (modes, stipple, smoothing, culling, offset), lines (width, stipple, smoothing), points, lights of every kind, fog, depth, stencil, alpha test, blending (factors, equations, constant colour, logic op, colour mask), scissor, frustum and user-plane clipping, w at and behind the eye, projection and window-matrix modes, texture formats, environments, filters, wraps and detail | `golden/scenes.tsv`, `golden/frames/*.png` | `cargo test --release --lib odyssey::golden` |
+| Frames | 75 scenes drawn through `Board::gl_draw`: flat, smooth and textured triangles, quads and polygons (modes, stipple, smoothing, culling, offset), lines (width, stipple, smoothing), points, lights of every kind, fog, depth, stencil, alpha test, blending (factors, equations, constant colour, logic op, colour mask), scissor, frustum and user-plane clipping, w at and behind the eye, projection and window-matrix modes, texture formats, environments, filters, wraps and detail | `golden/scenes.tsv`, `golden/frames/*.png` | `cargo test --release --lib odyssey::golden` |
 | Vertices | Object-space points through six matrix and viewport setups (eye, clip and window positions) and six light setups (lit colour) | `golden/vertices.txt` | same |
 | Replay | Recorded guest sessions (Smoke & Mirrors and perfly, from power-on): the bus stores replayed through a fresh board, its DMA reads answered from the recording, both colour buffers, depth, stencil and object memory hashed every 500,000 records | `replay/*.hashes`; the recordings are not in git | same, with the recordings in place |
 
@@ -57,6 +57,10 @@ replays one file; `VPRO_REPLAY_THREADS=1` replays it with the raster thread and 
 running, as a live machine draws (`IRIS_ODSY_BACKEND=inline` stores on the
 raster thread with no pool; `VPRO_REPLAY_POOL=<threads>,<tile>` sets the
 pool's workers and tile size, default 2 and 32); `VPRO_REPLAY_GPU=1` draws on the GPU raster unit (a build with the `wgpu` feature; `VPRO_REPLAY_LAZY=1` skips the readbacks between checkpoints to time the GPU path alone); `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks the checkpoints reached;
+`IRIS_ODSY_TRACE=<file>` writes the annotated trace of the replay, as `vpro trace` does on a
+running machine (a build with the `gputrace` feature; a test that replays several sessions writes
+the first to `<file>`, the next to `<file>.1` and so on, so name the test in full with `--exact`:
+`dev::odyssey::golden::replay::recorded_sessions_replay_to_their_checkpoints`);
 `VPRO_REPLAY_OUT=<png>` saves the final colour buffer
 (unmapped: no colour map, window ids or cursor, so it is the planes, not the
 screen). `VPRO_REPLAY_SHOTS=<dir>` saves the composed screen at each mark as

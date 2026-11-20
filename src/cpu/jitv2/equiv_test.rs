@@ -227,6 +227,10 @@ mod tests {
             let counter = gens.entry(page).or_insert_with(|| Box::new(AtomicU64::new(0)));
             counter.as_ref() as *const AtomicU64
         }
+        #[cfg(feature = "jitv2")]
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr)))
+        }
     }
 
     fn make_r(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
@@ -1162,7 +1166,7 @@ mod tests {
     }
 
     /// `BC1F`/`BC1T`/`BC1FL`/`BC1TL`. `rt` is not a register: bits are
-    /// `cc<<2 | nd<<1 | tf`, sitting at raw[20:16].
+    /// `cc<<2 | nd<<1 | tf`, sitting at raw\[20:16\].
     fn make_bc1(cc: u32, tf: bool, nd: bool, imm: u16) -> u32 {
         let rt = (cc << 2) | ((nd as u32) << 1) | (tf as u32);
         (crate::cpu::mips_isa::OP_COP1 << 26) | (crate::cpu::mips_isa::RS_BC1 << 21) | (rt << 16) | (imm as u32)
@@ -1911,7 +1915,7 @@ mod tests {
     // stale core.pc has something real to diverge from.
 
     /// word 0: `ADDIU r5, r0, 1` (runway — retires cleanly, marks that it
-    /// ran via gpr[5], and is exactly the kind of instruction whose body
+    /// ran via gpr\[5\], and is exactly the kind of instruction whose body
     /// never used to touch core.pc). word 1: the faulting instruction.
     /// `entry_word=0, max_instrs=2` compiles both into one region;
     /// `steps=2` matches the interpreter dispatching both in turn.
@@ -5330,6 +5334,8 @@ mod tests {
         assert_ne!(jit.pc, pc, "trap must vector via handle_exception");
     }
 
+    /// On one CPU SYNC compiles to nothing (the multiprocessor case is the
+    /// next test).
     #[test]
     fn sync_is_a_true_noop_matches_interpreter() {
         let mut gpr = [0u64; 32];
@@ -5643,13 +5649,13 @@ mod tests {
     /// (independent-branch-target) pass is never reached at all (the fault
     /// vectors away before the taken branch at word 0 -- word 3, the branch
     /// that would have taken it back to word 1 a second time -- ever runs).
-    /// Isolates `exception_other_word_block`'s `bd=true` literal path
+    /// Isolates `emit_exception_exit_const`'s `bd=true` literal path
     /// (`emit_slot_semantics` sets `ctx.bd = true` before calling into the
     /// slot's own semantics emitter) -- the sibling test above never
     /// actually exercises `bd=true` reaching `emit_exception_exit` at all
     /// (its slot pass is deliberately harmless), so without this test,
-    /// `exception_other_word_block`'s `bd` param could regress to always
-    /// writing `false` (or never be wired up at all) without any test
+    /// the exception call's `bd` argument could regress to always
+    /// passing `false` (or never be wired up at all) without any test
     /// catching it, since EPC/BD would still happen to come out right for
     /// the (only ever tested) `bd=false` occurrence.
     #[test]
@@ -7238,7 +7244,7 @@ mod tests {
 
     /// Values that bracket every branch of the to-int path: in range, the
     /// four boundary values the identical range test turns on (including
-    /// +2^31, the first single that does not fit a word), values just
+    /// +2^31, the first single out of a word's range), values just
     /// outside them, subnormals, NaN and both infinities.
     const CVT_TO_INT_EDGES: &[f64] = &[
         0.0, -0.0, 0.25, -0.25, 0.5, -0.5, 0.999_999_9, -0.999_999_9,

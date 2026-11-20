@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::record::tests::{live_board, poll_until, read, replay_recs, write};
+use super::record::tests::{live_board, live_board_of, poll_until, read, replay_recs, write};
 use super::record::load_text;
 use super::Mgras;
+use crate::config::GraphicsBoard;
 use crate::traits::{BusDevice, BusRead32, BusRead8, BUS_OK};
 
 const CFIFO: u32 = 0x70080;
@@ -113,6 +114,89 @@ fn fifo_and_direct_writes_keep_program_order() {
     block(&m, 2, 1, 2, 1);
     assert_eq!(m.fb_pixel(1, 1), 5);
     assert_eq!(m.fb_pixel(2, 1), 9);
+    m.stop_engines();
+}
+
+#[test]
+fn snapshots_round_trip_and_drawing_continues_on_every_impact_product() {
+    for kind in [GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact] {
+        let m = live_board_of(kind);
+        x_server(&m);
+        direct_rss(&m, FILLMODE, FILL_FAST, false);
+        direct_rss(&m, FILL_COLOR_R, 0x12, false);
+        block(&m, 30, 40, 30, 40);
+        assert_eq!(m.fb_pixel(30, 40), 0x12, "{kind:?}");
+        m.stop_engines();
+        let (metadata, mut parts) = m.snapshot_parts().unwrap();
+
+        m.start_engines();
+        direct_rss(&m, FILL_COLOR_R, 0x56, false);
+        block(&m, 30, 40, 30, 40);
+        assert_eq!(m.fb_pixel(30, 40), 0x56, "{kind:?}");
+        m.stop_engines();
+
+        let hq = parts.iter().position(|(name, _)| name == "hq3").unwrap();
+        let saved = std::mem::take(&mut parts[hq].1);
+        let error = m.restore_snapshot_parts(&metadata, &parts).unwrap_err();
+        assert!(error.contains("hq3"), "{error}");
+        assert_eq!(m.fb_pixel(30, 40), 0x56, "invalid restore changed {kind:?}");
+        parts[hq].1 = saved;
+
+        m.restore_snapshot_parts(&metadata, &parts).unwrap();
+        assert_eq!(m.fb_pixel(30, 40), 0x12, "{kind:?}");
+        m.start_engines();
+        block(&m, 31, 40, 31, 40);
+        assert_eq!(m.fb_pixel(31, 40), 0x12, "continued {kind:?}");
+        m.stop_engines();
+    }
+}
+
+#[test]
+fn snapshot_preserves_a_partial_command_fifo_packet() {
+    let m = live_board();
+    x_server(&m);
+    direct_rss(&m, FILLMODE, FILL_FAST, false);
+    let command = 0x1000 | FILL_COLOR_R;
+    write(&m, 32, CFIFO, ((command << 8) | 4) as u64);
+    m.stop_engines();
+    let (metadata, parts) = m.snapshot_parts().unwrap();
+
+    m.restore_snapshot_parts(&metadata, &parts).unwrap();
+    m.start_engines();
+    write(&m, 32, CFIFO, 0x2A);
+    fifo_rss(&m, IR_ALIAS, 0x18, false);
+    fifo_rss(&m, BLOCKXYSTARTI, 12 << 16 | 13, false);
+    fifo_rss(&m, BLOCKXYENDI, 12 << 16 | 13, true);
+    assert_eq!(m.fb_pixel(12, 13), 0x2A);
+    m.stop_engines();
+}
+
+#[cfg(feature = "wgpu")]
+#[test]
+fn wgpu_snapshot_reseeds_the_resident_mirror() {
+    let m = super::record::tests::live_board_raster(
+        GraphicsBoard::HighImpact,
+        crate::config::RasterUnit::Wgpu,
+    );
+    x_server(&m);
+    direct_rss(&m, FILLMODE, FILL_FAST, false);
+    direct_rss(&m, FILL_COLOR_R, 0x21, false);
+    block(&m, 45, 55, 45, 55);
+    assert_eq!(m.fb_pixel(45, 55), 0x21);
+    m.stop_engines();
+    let (metadata, parts) = m.snapshot_parts().unwrap();
+
+    m.start_engines();
+    direct_rss(&m, FILL_COLOR_R, 0x65, false);
+    block(&m, 45, 55, 45, 55);
+    assert_eq!(m.fb_pixel(45, 55), 0x65);
+    m.stop_engines();
+    m.restore_snapshot_parts(&metadata, &parts).unwrap();
+    assert_eq!(m.fb_pixel(45, 55), 0x21);
+
+    m.start_engines();
+    block(&m, 46, 55, 46, 55);
+    assert_eq!(m.fb_pixel(46, 55), 0x21);
     m.stop_engines();
 }
 
@@ -390,6 +474,85 @@ fn ge11_microcode_reads_back_as_the_driver_verifies_it() {
     let words: Vec<u32> = (0..3).map(|_| read(&m, 32, 0x5022C) as u32).collect();
     assert_eq!(words, [0x1111_1111, 0x33, 0x5555_5555]);
     assert_eq!(read(&m, 32, FLAGS) as u32 & 1 << 18, 0, "drained");
+    m.stop_engines();
+}
+
+#[test]
+fn geometry_diagnostics_follow_the_fitted_engine_count() {
+    use crate::config::GraphicsBoard;
+
+    for (kind, second_present) in [
+        (GraphicsBoard::SolidImpact, false),
+        (GraphicsBoard::HighImpact, false),
+        (GraphicsBoard::MaxImpact, true),
+    ] {
+        let m = super::record::tests::live_board_of(kind);
+        let (data, addr) = (0x50048, 0x5004C);
+        write(&m, 32, addr, 0x20_0000);
+        for w in [0x1111_1111u32, 0x2222_2222, 0x33, 0x4444_4444, 0x5555_5555, 0x66] {
+            write(&m, 32, data, w as u64);
+        }
+        write(&m, 32, addr, 0x20_0000);
+        write(&m, 32, addr, 0x8000_0002);
+        assert_eq!(
+            read(&m, 32, FLAGS) as u32 & 1 << 18 != 0,
+            second_present,
+            "{kind:?}"
+        );
+        assert_eq!(
+            read(&m, 32, 0x5022C) as u32,
+            if second_present { 0x1111_1111 } else { 0 },
+            "{kind:?}"
+        );
+        m.stop_engines();
+    }
+}
+
+#[test]
+fn maximum_impact_config_routes_work_to_one_raster_engine() {
+    let m = super::record::tests::live_board_of(crate::config::GraphicsBoard::MaxImpact);
+    x_server(&m);
+    direct_rss(&m, FILLMODE, FILL_FAST, false);
+
+    direct_rss(&m, CONFIG, 0xCA8, false);
+    direct_rss(&m, FILL_COLOR_R, 0x11, false);
+    direct_rss(&m, CONFIG, 0xCA9, false);
+    direct_rss(&m, FILL_COLOR_R, 0x22, false);
+    direct_rss(&m, CONFIG, 0xCAC, false);
+    block(&m, 19, 10, 19, 13);
+    assert_eq!(
+        (10..=13).map(|y| m.fb_pixel(19, y)).collect::<Vec<_>>(),
+        [0x22, 0x11, 0x22, 0x11],
+        "each RE keeps its selected register state"
+    );
+
+    direct_rss(&m, CONFIG, 0xCA8, false);
+    block(&m, 20, 10, 20, 13);
+    assert_eq!(
+        (10..=13).map(|y| m.fb_pixel(20, y)).collect::<Vec<_>>(),
+        [0, 0x11, 0, 0x11],
+        "RE0 receives only its alternating scanlines"
+    );
+
+    direct_rss(&m, CONFIG, 0xCA9, false);
+    block(&m, 21, 10, 21, 13);
+    assert_eq!(
+        (10..=13).map(|y| m.fb_pixel(21, y)).collect::<Vec<_>>(),
+        [0x22, 0, 0x22, 0],
+        "RE1 receives the other alternating scanlines"
+    );
+
+    // DestRE = all (bit 2) with bits 11:10 clear, as in the PROM's 0x4,
+    // reaches both RE4s: issue 777, where reading DestRE from bits 11:10
+    // left every other row of the PROM screen unpainted.
+    direct_rss(&m, CONFIG, 0x0AC, false);
+    direct_rss(&m, FILL_COLOR_R, 0x33, false);
+    block(&m, 22, 10, 22, 13);
+    assert_eq!(
+        (10..=13).map(|y| m.fb_pixel(22, y)).collect::<Vec<_>>(),
+        [0x33, 0x33, 0x33, 0x33],
+        "DestRE 4 broadcasts"
+    );
     m.stop_engines();
 }
 
@@ -2801,9 +2964,9 @@ fn gl_point_size_draws_a_square() {
     m.stop_engines();
 }
 
-/// GL_POINT_SMOOTH (token 0x06C [1]): a 9-pixel point is a disc, so the
+/// GL_POINT_SMOOTH (token 0x06C \[1\]): a 9-pixel point is a disc, so the
 /// corners of its 9x9 box stay clear while the edge middles are drawn;
-/// [0] gives the square back.
+/// \[0\] gives the square back.
 #[test]
 fn gl_smooth_point_is_round() {
     let m = gl_board([0.0, 0.0, 0.0]);
@@ -3809,7 +3972,7 @@ fn real_board_smooth_lines_and_points() {
     // so no point reaches another's 16 x 16 square. Smoothing goes off
     // first, so the size and smoothing are set in the order a fresh board
     // would see them.
-    assert!(keys.len() <= 16 * 16, "{} points do not fit the window's cells", keys.len());
+    assert!(keys.len() <= 16 * 16, "{} points exceed the window's cells", keys.len());
     let m = linetest_board();
     for (cell, (aliased_box, s64, i, j)) in keys.into_iter().enumerate() {
         let (cx, cy) = (cell % 16 * 32, cell / 16 * 32);

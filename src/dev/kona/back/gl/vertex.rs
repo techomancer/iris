@@ -158,7 +158,7 @@ pub fn colour13(c: f32) -> u16 {
 /// as the store-data rule reads it; the operand order is inferred). Within +-16384 of the origin the
 /// result lies in the binade [2^15, 2^16), where one single-precision step is exactly 1/256, so that
 /// subtract is what puts the position on the 12.8 grid. A single-precision subtract rounds to
-/// nearest, ties to even (the one tie test the diagnostic has fits that and truncation alike, so
+/// nearest, ties to even (the one tie test the diagnostic has passes with that and truncation alike, so
 /// nearest-even is assumed, inferred), and 49152 is a multiple of 1/256, so the position rounds to
 /// the nearest 1/256 with ties to even. Beyond +-16384 the engine's grid is coarser or finer and
 /// the clip rejects the vertex first; the model rounds the same way.

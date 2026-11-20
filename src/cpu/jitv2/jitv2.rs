@@ -11,14 +11,16 @@
 //!   hot path avoids an indirect call through the device trait object.
 //!
 //! Threading model: the mips exec thread owns `PhysicalCodePage` management
-//! (arrival, promotion — §6.1) and pushes compile requests to the compile thread
-//! over an SPSC fifo (§6.4); the compile thread publishes finished artifacts back
-//! into the page's `entry_table`/`entry_bits` (§6.1.3), which is why requests carry
-//! a mutable pointer. Only the compile-request queue itself is added in this pass
-//! — the compile thread and publish path land with codegen (Phase 2).
+//! (arrival, promotion — §6.1) and pushes compile requests onto the
+//! [`CompileQueue`] (§6.4), a bounded queue plus a small hot lane that every
+//! worker of the compile pool pops from (one worker per guest CPU unless
+//! `[jitv2] threads` says otherwise). A worker publishes finished artifacts
+//! back into the page's `entry_table`/`entry_bits` (§6.1.3), which is why
+//! requests carry a mutable pointer. `[jitv2] compile = "sync"` instead
+//! compiles on the CPU thread at the dispatch gate, with the pool stopped.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
@@ -27,10 +29,10 @@ use parking_lot::Mutex;
 use crate::cpu::mips_core::MipsCore;
 use crate::cpu::mips_exec::ExecStatus;
 use crate::cpu::jitv2::pool_barrier::PoolBarrier;
-use crate::traits::{BusDevice, Device};
+use crate::traits::{BusDevice, CodeKey, Device};
 
-/// A compile request pushed from the mips exec thread to the compile thread
-/// over the SPSC fifo (§6.4). Carries the page pointer rather than a
+/// A compile request pushed from the mips exec thread to the compile pool
+/// (§6.4). Carries the page pointer rather than a
 /// snapshotted generation: the compile thread reads `gen` itself at snapshot
 /// time (§6.5 step 2, `gen_snap = gen`) and re-reads it at publish time — the
 /// generation at queue time is never consulted, only current-at-compile and
@@ -53,9 +55,89 @@ pub struct CompileRequest {
     /// (same value `exec_decoded` used to run the interpreter fallback for
     /// this same arrival).
     pub compiled_for_fr1: bool,
+    /// The CPU that asked, by its number in the pool: the page's bytes are
+    /// read at that CPU's address for it, through that CPU's bus
+    /// ([`CodeBuses::locate`]).
+    pub cpu: u8,
 }
 
 unsafe impl Send for CompileRequest {}
+
+/// Most CPUs one pool serves: a page keeps an address per CPU.
+pub const POOL_CPUS: usize = crate::cpu::smp::MAX_CPUS;
+
+/// "This CPU has not reached the page", in [`PhysicalCodePage`]'s `addr`.
+const NO_ADDR: u32 = u32::MAX;
+
+/// The two buses a CPU fetches through.
+#[derive(Clone)]
+pub struct CpuBuses {
+    /// The CPU's address space in the pool.
+    pub space: usize,
+    /// Decodes a cached fetch.
+    pub cached: Arc<dyn BusDevice>,
+    /// Decodes an uncached fetch (the CPU's own bus).
+    pub uncached: Arc<dyn BusDevice>,
+}
+
+/// The buses of every CPU that shares a pool, by its number in the pool. A
+/// page is keyed by the memory behind it, which each CPU may reach at its own
+/// address, so a compile reads the bytes at one CPU's address through that
+/// CPU's bus.
+#[derive(Default)]
+pub struct CodeBuses(parking_lot::RwLock<[Option<CpuBuses>; POOL_CPUS]>);
+
+impl CodeBuses {
+    /// One CPU, number 0, that fetches everything through `bus`.
+    pub fn single(bus: Arc<dyn BusDevice>) -> Self {
+        let buses = Self::default();
+        buses.set(0, 0, bus.clone(), bus);
+        buses
+    }
+
+    pub fn set(&self, cpu: usize, space: usize, cached: Arc<dyn BusDevice>, uncached: Arc<dyn BusDevice>) {
+        self.0.write()[cpu] = Some(CpuBuses { space, cached, uncached });
+    }
+
+    /// `bus` for CPU 0 if nothing named its buses (a pool started on its own).
+    fn set_default(&self, bus: Arc<dyn BusDevice>) {
+        let mut g = self.0.write();
+        if g[0].is_none() {
+            g[0] = Some(CpuBuses { space: 0, cached: bus.clone(), uncached: bus });
+        }
+    }
+
+    /// Let go of every bus (the machine is going away).
+    pub fn clear(&self) {
+        *self.0.write() = Default::default();
+    }
+
+    /// A bus and the address on it where `page`'s bytes are right now:
+    /// `first`'s if it has one, else any CPU's. An address a remap has since
+    /// moved other memory under no longer decodes to the page's key and is
+    /// passed over.
+    pub fn locate(&self, page: &PhysicalCodePage, first: usize) -> Option<(Arc<dyn BusDevice>, u64)> {
+        let g = self.0.read();
+        std::iter::once(first).chain(0..POOL_CPUS).find_map(|cpu| {
+            let (pfn, uncached) = page.addr_of(cpu)?;
+            let buses = g.get(cpu)?.as_ref()?;
+            let bus = if uncached { &buses.uncached } else { &buses.cached };
+            let at = pfn as u64 * PAGE_SIZE as u64;
+            // A page keyed by its address is its own space's alone.
+            let mine = !page.key.is_address() || page.key == CodeKey::at_address(buses.space, pfn, uncached);
+            (mine && page_is_at(page, &**bus, at)).then(|| (bus.clone(), at))
+        })
+    }
+}
+
+/// Whether `bus` still decodes `at` to `page`: to its bank's page, or, for a
+/// page no bank names, to no bank still.
+pub fn page_is_at(page: &PhysicalCodePage, bus: &dyn BusDevice, at: u64) -> bool {
+    match bus.code_page(at) {
+        Some(code) => code.key == page.key,
+        None => page.key.is_address(),
+    }
+}
 
 // ============================================================================
 // Tunables & initial settings. Single source of truth: every knob that shapes
@@ -81,11 +163,23 @@ pub fn pfn_of(phys_addr: u64, frames: u64) -> Option<Pfn> {
     (pfn < frames).then_some(pfn as Pfn)
 }
 
-/// Direct-mapped `pfn -> PageSlot` lookup, replacing the `HashMap<Pfn,
-/// PageSlot>` both page pools used to carry.
+/// Where a code page sits in the `PfnMap`: its frame, plus on a `split` machine
+/// (an IP27 or IP35 node, whose uncached fetch can read other bytes) whether it was
+/// fetched uncached.
+#[inline(always)]
+pub fn page_key(pfn: Pfn, uncached: bool, split: bool) -> u32 {
+    if split { pfn << 1 | uncached as u32 } else { pfn }
+}
+
+/// Direct-mapped `pfn -> PageSlot` lookup for one address space: which pool
+/// slot holds the page a CPU of that space reaches at a frame. A cache of the
+/// answer the bus ([`BusDevice::code_page`]) and the pool's key index give,
+/// so a page switch to a frame already reached takes two loads and no lock.
 ///
-/// One `u32` per physical frame: 4 Mi entries x 4 B = 16 MiB, allocated once
-/// and never resized. `PFN_MAP_EMPTY` means "no pool slot for this frame".
+/// One `u32` per physical frame up to the end of the machine's memory
+/// ([`frames_for`]), two on an IP27 or IP35 machine ([`page_key`]). Allocated once, at its
+/// final size, by the pool's first claim. Never resized. `PFN_MAP_EMPTY` means
+/// "no pool slot for this key".
 ///
 /// Why not a hash map: `page_for` is on the page-crossing path (see
 /// `jitv2_track_pcp`), and a profile of a real IRIX boot put it at ~4.5% of
@@ -142,7 +236,7 @@ impl PfnMap {
         self.0[pfn as usize].store(PFN_MAP_EMPTY, Ordering::Release);
     }
 
-    /// Drop every mapping (`mega_flush`). A 16 MiB memset — flushes are rare
+    /// Drop every mapping (`mega_flush`). A memset of the table — flushes are rare
     /// and already far more expensive than this, so no generation-tag
     /// indirection is worth paying for on every lookup to avoid it.
     pub fn clear(&mut self) {
@@ -225,10 +319,132 @@ pub const HOT_PROMOTE_ARRIVALS: u32 = 256;
 /// Requests the hot lane holds (see `CompileQueue::hot`).
 const HOT_QUEUE_CAPACITY: usize = 256;
 
+/// Wake-up channel between the compile-request producers and the compile
+/// pool's workers.
+///
+/// The workers used to poll the request queue on a 200µs timer. That cost a
+/// measurable slice of a host core per worker whenever the guest had nothing
+/// to compile (measured 2026-11-16 on an idle guest: 1.4% of a core for one
+/// worker) and kept a small host from settling into deep C-states — the
+/// same failure the device threads had, and the same fix
+/// (`clanker/perf/idle-poll-backoffs-for-small-hosts.md`): size a wait for
+/// idle cost, and let the producer wake the waiter.
+///
+/// The producers now unpark the workers directly. `park`/`unpark` tokens are
+/// sticky — an `unpark` that arrives while the worker is busy is remembered,
+/// so the next `park` returns immediately instead of sleeping through the
+/// request — so a wakeup cannot be lost. That is what lets the worker's
+/// backstop be long: it only has to cover the periodic pending-publish
+/// sweep, not request latency.
+///
+/// The producer runs on the CPU thread, so it only pays for a wake when a
+/// worker is actually asleep: `sleepers` counts the workers inside
+/// [`Self::park_idle`], and [`Self::wake_if_sleeping`] reads it before
+/// touching the registry. While the pool is busy that is one load per
+/// accepted request.
+pub struct CompileWake {
+    /// The worker threads, registered when a worker starts and cleared when
+    /// the pool stops. A mutex, not an atomic swap: the registry is written
+    /// only at pool start/stop, and the producer reads it only when a worker
+    /// is asleep.
+    workers: Mutex<Vec<std::thread::Thread>>,
+    /// Workers between deciding to park and waking up (see
+    /// [`Self::park_idle`]). Zero means every worker is running and will
+    /// look at the queues again on its own.
+    sleepers: AtomicUsize,
+}
+
+impl CompileWake {
+    fn new() -> Self {
+        Self { workers: Mutex::new(Vec::new()), sleepers: AtomicUsize::new(0) }
+    }
+
+    /// Park the calling worker until a producer wakes it or `backstop`
+    /// expires, unless a request is already waiting in `queue` or `hot`.
+    ///
+    /// The count goes up before the queues are checked again, and the
+    /// producer pushes before it reads the count, with a `SeqCst` fence on
+    /// each side between the write and the read. So either this worker sees
+    /// the request and does not park, or the producer sees the sleeper and
+    /// unparks it (and the token is sticky, so an unpark that lands before
+    /// the `park_timeout` is not lost).
+    fn park_idle(&self, queue: &CompileLane, hot: &CompileLane, backstop: std::time::Duration) {
+        self.sleepers.fetch_add(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if queue.is_empty() && hot.is_empty() {
+            std::thread::park_timeout(backstop);
+        }
+        self.sleepers.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// The producer's wake, after a push was accepted: unpark the workers
+    /// only if one of them is asleep (see [`Self::park_idle`] for why the
+    /// fence makes skipping safe).
+    #[inline]
+    fn wake_if_sleeping(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.sleepers.load(Ordering::SeqCst) != 0 {
+            self.notify_all();
+        }
+    }
+
+    /// Publish this worker's thread handle so a producer can wake it.
+    fn register(&self, thread: std::thread::Thread) {
+        self.workers.lock().push(thread);
+    }
+
+    /// Wake every worker unconditionally. The producer goes through
+    /// [`Self::wake_if_sleeping`]; this is for the rare callers (the flush
+    /// and seal leaders, `stop`) that must reach every worker whatever it is
+    /// doing. A token left on a running worker costs one extra loop
+    /// iteration.
+    fn notify_all(&self) {
+        for thread in self.workers.lock().iter() {
+            thread.unpark();
+        }
+    }
+
+    /// Forget the workers of a stopped pool, so a later `start` does not
+    /// accumulate dead thread handles.
+    fn clear(&self) {
+        self.workers.lock().clear();
+    }
+}
+
+/// One compile-request lane: the bounded queue plus the pool's wake-up
+/// channel, so a producer that pushes a request can wake the workers
+/// without going through `Jitv2`'s mutex — the dispatch gate must not take
+/// that lock (see `MipsExecutor::jitv2_compile_queue_handle`).
+///
+/// Derefs to the queue, so every existing use — `push`, `pop`, `len`,
+/// `is_full` — keeps working unchanged.
+pub struct CompileLane {
+    queue: crossbeam_queue::ArrayQueue<CompileRequest>,
+    wake: Arc<CompileWake>,
+}
+
+impl CompileLane {
+    fn new(capacity: usize, wake: Arc<CompileWake>) -> Self {
+        Self { queue: crossbeam_queue::ArrayQueue::new(capacity), wake }
+    }
+}
+
+impl std::ops::Deref for CompileLane {
+    type Target = crossbeam_queue::ArrayQueue<CompileRequest>;
+    fn deref(&self) -> &Self::Target {
+        &self.queue
+    }
+}
+
 /// Put a copy of a request on the hot lane. A full lane just drops it: the
 /// page's FIFO request is still queued, so nothing is lost but the head start.
-pub fn push_hot_request(hot: &crossbeam_queue::ArrayQueue<CompileRequest>, req: CompileRequest) {
-    let _ = hot.push(req);
+/// An accepted push wakes a sleeping worker, which must see the request now,
+/// not after its backstop expires; a dropped one does not, since a full lane
+/// means the workers have work.
+pub fn push_hot_request(hot: &Arc<CompileLane>, req: CompileRequest) {
+    if hot.push(req).is_ok() {
+        hot.wake.wake_if_sleeping();
+    }
 }
 
 
@@ -282,11 +498,25 @@ const PENDING_FORCE_SEAL_THRESHOLD: usize = 64;
 /// sealing design this backstops.
 const IDLE_FORCE_SEAL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Backoff between empty-queue polls in `worker_loop`. Short enough that
-/// `IDLE_FORCE_SEAL_THRESHOLD`'s wall-clock idle window still resolves in a
-/// handful of ticks, long enough not to spin the compile thread on cycles
-/// while genuinely idle.
-const WORKER_IDLE_POLL_BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
+/// Backstop between empty-queue polls in `worker_loop`. The pool is woken by
+/// the producer (`CompileWake`), so this only has to cover the periodic
+/// pending-publish sweep and the "a worker that missed its wakeup" case;
+/// `park`/`unpark` tokens make a missed wakeup impossible.
+///
+/// Sized for idle cost, not for latency: the old 200µs poll cost a
+/// measurable slice of a host core per worker whenever the guest had nothing
+/// to compile (measured 2026-11-16: 1.4% of a core for one worker) and kept
+/// a small host from settling. Long enough that `IDLE_FORCE_SEAL_THRESHOLD`'s
+/// wall-clock idle window still resolves in a handful of ticks.
+const WORKER_IDLE_PARK_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Backstop for a worker that still has a publish outstanding (its own
+/// range is gap-blocked behind another worker's, so the code is compiled but
+/// not yet sealed and published). The retry has to be prompt — the guest is
+/// running that page interpreted until it lands — so this stays at the old
+/// poll interval. It only applies while something is pending, which the
+/// pending threshold and the idle-timeout force-seal both bound.
+const WORKER_IDLE_PENDING_BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
 
 /// How often a flush leader with several CPUs retries `World::try_lead`
 /// while a CPU leads a flush of its own.
@@ -317,7 +547,7 @@ pub type Pfn = u32;
 /// `reset_to_unclaimed`) — deliberately NOT `0`: pfn 0 is a real, legitimate
 /// physical page (low RAM), so zeroing `pfn` on reset let any stale reference
 /// to a freed slot (a dangling raw pointer held past a `mega_flush` eviction,
-/// or a `pfn_to_slot` entry that wasn't removed before the reset) silently
+/// or a frame-table entry that wasn't removed before the reset) silently
 /// read back as "page 0's real data" instead of something obviously wrong —
 /// undetectable by inspection (`j2 pcp` on a stale pointer would show a
 /// plausible-looking pfn/gen/entry_gen for the wrong page, not a crash or an
@@ -505,6 +735,9 @@ impl RejectReason {
 
 #[derive(Default)]
 pub struct JitStats {
+    /// Times a CPU forgot its addresses because a memory controller moved
+    /// memory (`Jitv2::forget_addresses`). No code is dropped for one.
+    pub remaps: AtomicU64,
     /// Successful `compile_region` calls that got published
     /// (`comp::handle_request`'s `Some(jit_fn)` arm).
     pub compiles: AtomicU64,
@@ -649,7 +882,21 @@ static NEVER_COMPILABLE_GEN: AtomicU64 = AtomicU64::new(0);
 /// has ever been a JIT compilation target; the executor holds a pointer to
 /// the page it is currently executing out of.
 pub struct PhysicalCodePage {
-    pub pfn: Pfn,
+    /// The memory this page is: its bank and the page within it
+    /// ([`CodeKey`]), the same for every CPU and through every remap.
+    /// [`CodeKey::NONE`] while the slot is unclaimed.
+    pub key: CodeKey,
+    /// Where each CPU that shares the pool last reached this page, by the
+    /// CPU's number in the pool: `frame << 1 | uncached`, or `NO_ADDR`. A
+    /// compile reads the bytes there through that CPU's bus
+    /// ([`CodeBuses::locate`]). A remap can leave one stale; nothing trusts it
+    /// without asking the bus for the key there again.
+    addr: [AtomicU32; POOL_CPUS],
+    /// The page's 1024 words in its bank's own storage
+    /// ([`crate::traits::CodePage::words`]), where a compile reads them, or
+    /// null for a bank that hands none out: then the compile reads through a
+    /// CPU's bus at `addr`.
+    words: *const u32,
     /// Free list pointer: singly-linked free list threaded through
     /// `Jitv2::free_head`. `NO_SLOT` when claimed or at tail of free list.
     next: u32,
@@ -719,10 +966,10 @@ pub struct PhysicalCodePage {
     /// page completes (`clear_scheduled`).
     hot_wait: std::sync::atomic::AtomicU32,
     promoted: std::sync::atomic::AtomicBool,
-    /// Pinned FR mode for this page, set once at page-claim time from live
-    /// `STATUS_FR` and held fixed for the page's whole lifetime until the
-    /// next `mega_flush`/`reset_to_unclaimed` (TODO revisit — see below).
-    /// `true` = FR1.
+    /// Pinned FR mode for this page, set at page-claim time from live
+    /// `STATUS_FR` and held until the next `mega_flush`/`reset_to_unclaimed`,
+    /// or until a real invalidation or an FR-guard bail re-pins it (see
+    /// "Re-pinned" below). `true` = FR1.
     ///
     /// **Why pinned, not per-compile** (as it was under the old one-function-
     /// per-entry design, where `CompileRequest::compiled_for_fr1` could
@@ -1198,11 +1445,17 @@ impl PhysicalCodePage {
     ///
     /// `gen` null is accepted here (callers pass it for an as-yet-unclaimed
     /// slot, or when the real device has no gen tracking) and normalized to
-    /// [`NEVER_COMPILABLE_GEN`] — `self.gen` itself is never null, so nothing
+    /// `NEVER_COMPILABLE_GEN` — `self.gen` itself is never null, so nothing
     /// downstream ever needs to check.
+    ///
+    /// A `pfn` other than [`UNCLAIMED_PFN`] makes a page on its own, outside
+    /// a pool (tests): frame `pfn` of a flat bus, reached there by CPU 0.
     pub fn new(pfn: Pfn, gen: *const AtomicU64) -> Self {
+        let claimed = pfn != UNCLAIMED_PFN;
         Self {
-            pfn,
+            key: if claimed { CodeKey::flat(pfn as u64 * PAGE_SIZE as u64) } else { CodeKey::NONE },
+            addr: std::array::from_fn(|cpu| AtomicU32::new(if claimed && cpu == 0 { pfn << 1 } else { NO_ADDR })),
+            words: std::ptr::null(),
             next: NO_SLOT,
             gen: if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen },
             requested: new_bitmap(),
@@ -1292,19 +1545,60 @@ impl PhysicalCodePage {
     ///
     /// `fr1`: live `STATUS_FR` at the moment of first arrival. Pinned, but no
     /// longer for the page's whole lifetime — it is re-derived on a real
-    /// invalidation and on an FR-guard bail (see [`Self::fr1`]'s doc comment).
+    /// invalidation and on an FR-guard bail (see `Self::fr1`'s doc comment).
     #[inline]
     pub fn is_claimed(&self) -> bool {
-        self.pfn != UNCLAIMED_PFN
+        self.key != CodeKey::NONE
     }
 
-    pub fn claim(&mut self, pfn: Pfn, gen: *const AtomicU64, fr1: bool) {
-        debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn == UNCLAIMED_PFN,
-            "claim() called on a slot that wasn't clean (pfn={:#x}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
-            self.pfn);
+    /// Where CPU `cpu` of the pool reaches this page: its frame, and whether
+    /// through an uncached fetch. `None` if it has not, or not since a remap.
+    #[inline]
+    pub fn addr_of(&self, cpu: usize) -> Option<(Pfn, bool)> {
+        match self.addr.get(cpu)?.load(Ordering::Relaxed) {
+            NO_ADDR => None,
+            a => Some((a >> 1, a & 1 != 0)),
+        }
+    }
+
+    /// CPU `cpu` reached this page at frame `pfn`.
+    #[inline]
+    pub fn set_addr(&self, cpu: usize, pfn: Pfn, uncached: bool) {
+        self.addr[cpu].store(pfn << 1 | uncached as u32, Ordering::Relaxed);
+    }
+
+    /// CPU `cpu`'s address for this page no longer holds (a remap).
+    #[inline]
+    pub fn forget_addr(&self, cpu: usize) {
+        self.addr[cpu].store(NO_ADDR, Ordering::Relaxed);
+    }
+
+    /// A frame some CPU reaches this page at, for display: the lowest-numbered
+    /// CPU's that has one, else [`UNCLAIMED_PFN`]. CPUs of different nodes may
+    /// each have their own.
+    pub fn pfn(&self) -> Pfn {
+        (0..POOL_CPUS).find_map(|cpu| self.addr_of(cpu)).map_or(UNCLAIMED_PFN, |(pfn, _)| pfn)
+    }
+
+    /// The page's words in its bank's storage, or null: see the field.
+    #[inline]
+    pub fn words(&self) -> *const u32 {
+        self.words
+    }
+
+    /// [`Self::claim`] for the page a bus answered with.
+    pub fn claim_code(&mut self, code: crate::traits::CodePage, fr1: bool) {
+        self.claim(code.key, code.gen, fr1);
+        self.words = code.words;
+    }
+
+    pub fn claim(&mut self, key: CodeKey, gen: *const AtomicU64, fr1: bool) {
+        debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && !self.is_claimed(),
+            "claim() called on a slot that wasn't clean (key={:?}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
+            self.key);
         debug_assert!(self.func.load(Ordering::Relaxed).is_null(),
             "claim() called on a slot with a still-published function — mega_flush must reset_to_unclaimed before this slot can be reused");
-        self.pfn = pfn;
+        self.key = key;
         self.gen = if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen };
         self.fr1.store(fr1, Ordering::Relaxed);
         // A freshly-claimed slot has no bail outstanding: `fr1` was just set
@@ -1313,7 +1607,7 @@ impl PhysicalCodePage {
         self.fr_unpinned.store(false, Ordering::Relaxed);
     }
 
-    /// This page's pinned FR mode (§13, see [`Self::fr1`]'s own doc comment).
+    /// This page's pinned FR mode (§13, see `Self::fr1`'s own doc comment).
     #[inline]
     pub fn is_fr1(&self) -> bool {
         self.fr1.load(Ordering::Relaxed)
@@ -1345,7 +1639,7 @@ impl PhysicalCodePage {
         self.fr_repin.store(if fr1 { FR_REPIN_FR1 } else { FR_REPIN_FR0 }, Ordering::Relaxed);
     }
 
-    /// Consume any outstanding FR re-pin request, applying it to [`Self::fr1`]
+    /// Consume any outstanding FR re-pin request, applying it to `Self::fr1`
     /// and returning the mode the next compile should target.
     ///
     /// Takes `live_fr1` so a page with no request outstanding keeps its
@@ -1373,16 +1667,20 @@ impl PhysicalCodePage {
     }
 
     /// Return this slot to the fully-unclaimed state (`pfn = UNCLAIMED_PFN`,
-    /// `gen` pointed at the shared [`NEVER_COMPILABLE_GEN`] fallback) —
+    /// `gen` pointed at the shared `NEVER_COMPILABLE_GEN` fallback) —
     /// `Jitv2::mega_flush`'s in-place counterpart to what used to be
     /// `Vec::clear()` dropping every `PhysicalCodePage` outright. `pfn` is
     /// poisoned to [`UNCLAIMED_PFN`], not `0` (see that constant's own doc
-    /// comment) — a dangling raw pointer or leftover `pfn_to_slot` entry that
+    /// comment) — a dangling raw pointer or leftover frame-table entry that
     /// reads this slot after it's been evicted and reused reads back an
     /// obviously-bogus pfn instead of silently aliasing page 0's real data.
     pub fn reset_to_unclaimed(&mut self) {
         self.reset_entries_and_bitmaps();
-        self.pfn = UNCLAIMED_PFN;
+        self.key = CodeKey::NONE;
+        self.words = std::ptr::null();
+        for a in &self.addr {
+            a.store(NO_ADDR, Ordering::Relaxed);
+        }
         self.gen = &NEVER_COMPILABLE_GEN;
     }
 
@@ -1401,7 +1699,7 @@ impl PhysicalCodePage {
     /// Current generation count for this page.    /// Current generation count for this page. `self.gen` is never null (see
     /// its own doc comment) — a page whose backing device has no real gen
     /// tracking (MMIO, etc) reads the shared, never-bumped
-    /// [`NEVER_COMPILABLE_GEN`] fallback here instead, so this is
+    /// `NEVER_COMPILABLE_GEN` fallback here instead, so this is
     /// unconditionally safe to call on any claimed or unclaimed page, no
     /// branch needed on the caller's part.
     #[inline]
@@ -2105,7 +2403,7 @@ impl PhysicalCodePage {
     ///    read them, so they had no influence on the emitted code. This is
     ///    what makes the check pay off on a page whose generation bumps
     ///    because the guest wrote *data* sharing the page with code.
-    /// 3. **The FR mode matches.** See [`CompileSnapshot::fr1`].
+    /// 3. **The FR mode matches.** See `CompileSnapshot::fr1`.
     ///
     /// On success `entry_gen` is advanced to `gen_snap` under
     /// `publish_lock`, which is exactly what makes `is_runnable` start
@@ -2262,7 +2560,7 @@ impl PhysicalCodePage {
     }
 }
 
-/// Slot index into [`Jitv2::pages`].
+/// Slot index into `Jitv2::pages`.
 pub type PageSlot = u32;
 
 /// Sentinel for [`PhysicalCodePage::prev`]/[`PhysicalCodePage::next`]: "no
@@ -2284,7 +2582,7 @@ const _: () = assert!(NO_SLOT == PFN_MAP_EMPTY);
 /// 1024-entry table. Claiming a pre-existing slot in place avoids that
 /// entirely: nothing is ever copied after `Jitv2::new` builds the array.
 ///
-/// Slots are handed out via [`Self::free_head`], a singly-linked free list
+/// Slots are handed out via `Self::free_head`, a singly-linked free list
 /// threaded through every unclaimed slot's `PhysicalCodePage::next`. A slot
 /// is claimed iff its `pfn != UNCLAIMED_PFN` (see
 /// [`PhysicalCodePage::is_claimed`]) — there is no separate recency list:
@@ -2294,7 +2592,10 @@ const _: () = assert!(NO_SLOT == PFN_MAP_EMPTY);
 /// across a flush, threaded on an MRU list; that was removed — preserved
 /// entry points could be stale, and keeping them was at best neutral.)
 ///
-/// Lookup from `pfn` to pool slot goes through `pfn_to_slot` — the design
+/// A page is keyed by the memory it holds ([`CodeKey`]: bank and page within
+/// it), found through `by_key`. Lookup from a CPU's `pfn` to pool slot goes
+/// through its address space's frame table (`spaces`), which caches what the
+/// bus and `by_key` say — the design
 /// doc's dense pfn-indexed alternative (§2.4), now built: page-switch lookup
 /// *did* show up hot in profiling (~4.5% of a real IRIX boot, with the
 /// HashMap's own `RawTable` grow-and-rehash allocation directly above it),
@@ -2323,10 +2624,15 @@ pub struct Jitv2 {
     /// list up front); `page_for` pops from the head on a fresh claim,
     /// `mega_flush` resets the pool and rebuilds the free list.
     free_head: u32,
-    /// pfn -> index into `pages`. Consulted only on a page switch (fetch
-    /// lands on a different PFN than the currently-tracked one) — not on
-    /// every fetch. Direct-mapped, not hashed — see [`PfnMap`].
-    pfn_to_slot: PfnMap,
+    /// The pool's index: which slot holds the page for a key. Consulted when
+    /// a CPU reaches a frame its space's table has no slot for, which is once
+    /// per frame per space between flushes and remaps; sized for the whole
+    /// pool up front, so it never grows or rehashes.
+    by_key: std::collections::HashMap<CodeKey, PageSlot>,
+    /// One frame table per address space: see [`Space`]. A machine whose CPUs
+    /// all see memory at the same addresses has one; a machine of several
+    /// nodes has one per node.
+    spaces: Vec<Space>,
     /// Pool capacity, fixed at construction (== `pages.len()`). Claiming past
     /// this (i.e. with the free list exhausted) triggers `mega_flush` (the
     /// "ran out of PCPs" resource-exhaustion trigger).
@@ -2384,6 +2690,51 @@ pub struct CodeSizeBucket {
     pub max_bytes: u32,
 }
 
+/// One address space's view of the pool: `frame -> slot` for the frames its
+/// CPUs have reached, the lock-free path a page switch takes. It only caches
+/// what the bus and `by_key` say, so a remap empties it and nothing else.
+struct Space {
+    /// Frames of memory the table covers. Zero until a CPU sets it.
+    frames: usize,
+    /// Whether an uncached fetch of a frame has its own entry ([`page_key`]):
+    /// on a machine where it can decode to other memory than a cached one.
+    split: bool,
+    /// Empty until the first claim in this space.
+    map: PfnMap,
+}
+
+impl Default for Space {
+    fn default() -> Self {
+        Space { frames: 0, split: false, map: PfnMap(Box::new([])) }
+    }
+}
+
+impl Space {
+    fn entries(&self) -> usize {
+        if self.split { 2 * self.frames } else { self.frames }
+    }
+}
+
+/// Where a CPU fetched from: what [`Jitv2::claim_page`] finds a page for.
+#[derive(Clone, Copy, Debug)]
+pub struct PageAt {
+    /// The CPU's number in the pool.
+    pub cpu: usize,
+    /// Its address space.
+    pub space: usize,
+    pub pfn: Pfn,
+    /// Fetched uncached, on a machine that keeps that apart.
+    pub uncached: bool,
+}
+
+/// What [`Jitv2::claim_page`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    Page(PageSlot),
+    /// No slot is free: flush and ask again.
+    Full,
+}
+
 /// The workers read `pages` through raw pointers, and the fields drop in
 /// declaration order, so `pages` would be freed ahead of `compile_queue`'s
 /// own drop. Stop and join the workers first.
@@ -2417,7 +2768,9 @@ impl Jitv2 {
                 let _ = w.join();
             }
         }
-        jit.lock().compile_queue.drain_pending_queue();
+        let mut g = jit.lock();
+        g.compile_queue.drain_pending_queue();
+        g.buses().clear();
     }
 
     /// Allocate the full page pool up front, `capacity` slots, every one
@@ -2430,15 +2783,43 @@ impl Jitv2 {
     /// means an earlier flush, not a correctness problem. Does not start the
     /// compile thread — call `compile_queue.start()`.
     pub fn new(capacity: usize) -> Self {
-        Self::with_frames(capacity, PFN_MAP_ENTRIES)
+        Self::with_frames(capacity, PFN_MAP_ENTRIES, false)
     }
 
     /// [`Self::new`] with a page table that covers a machine's memory.
     pub fn for_memory(capacity: usize, memory: &crate::memory_map::MemoryMap) -> Self {
-        Self::with_frames(capacity, frames_for(memory) as usize)
+        Self::with_frames(capacity, frames_for(memory) as usize, false)
     }
 
-    fn with_frames(capacity: usize, frames: usize) -> Self {
+    /// The buses of the CPUs that share this pool: see [`CodeBuses`].
+    pub fn buses(&self) -> &Arc<CodeBuses> {
+        &self.compile_queue.buses
+    }
+
+    /// Describe address space `space`: the frames of memory its table covers,
+    /// and whether an uncached fetch of a frame is kept apart from a cached
+    /// one. Each CPU says so for its own space, before the space holds a page.
+    pub fn set_space(&mut self, space: usize, frames: usize, split: bool) {
+        if self.spaces.len() <= space {
+            self.spaces.resize_with(space + 1, Space::default);
+        }
+        let sp = &mut self.spaces[space];
+        if sp.frames == frames && sp.split == split {
+            return;
+        }
+        assert!(sp.map.0.is_empty(), "an address space is laid out before it holds a page");
+        sp.frames = frames;
+        sp.split = split;
+    }
+
+    /// Keep an uncached page of a frame apart from its cached page, in space 0.
+    /// Before any page is claimed.
+    pub fn split_uncached_code(&mut self) {
+        let frames = self.spaces[0].frames;
+        self.set_space(0, frames, true);
+    }
+
+    fn with_frames(capacity: usize, frames: usize, split: bool) -> Self {
         let mut pages: Box<[PhysicalCodePage]> = (0..capacity).map(|_| PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null())).collect();
         // Thread every slot onto the free list up front, index order —
         // `page_for`'s claim path only ever pops from the head, so initial
@@ -2450,7 +2831,8 @@ impl Jitv2 {
         Self {
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
-            pfn_to_slot: PfnMap::new(frames),
+            by_key: std::collections::HashMap::with_capacity(capacity),
+            spaces: vec![Space { frames, split, map: PfnMap(Box::new([])) }],
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
@@ -2458,42 +2840,98 @@ impl Jitv2 {
         }
     }
 
-    /// Release `slot` back to the free list.
-    fn free_page(&mut self, slot: PageSlot) {
-        let pfn = self.pages[slot as usize].pfn;
-        self.pfn_to_slot.remove(pfn);
-        self.pages[slot as usize].reset_to_unclaimed();
-        self.pages[slot as usize].next = self.free_head;
-        self.free_head = slot;
+    /// The pool slot for frame `pfn` of a flat bus, as CPU 0 in space 0
+    /// reaches it cached: [`Self::claim_page`] for a pool with one CPU.
+    /// `None` if the pool is exhausted.
+    pub fn page_for(&mut self, pfn: Pfn, _phys_addr: u64, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
+        self.page_at(PageAt { cpu: 0, space: 0, pfn, uncached: false }, bus, fr1)
     }
 
-    /// Look up the pool slot for `pfn`, claiming the next unclaimed slot
-    /// in place (`PhysicalCodePage::claim`, `gen_ptr(phys_addr)` on the bus)
-    /// if this is the first arrival at this page. Returns `None` if the pool
-    /// is exhausted — the caller (mips exec thread) is responsible for
-    /// running `mega_flush` and retrying.
-    pub fn page_for(&mut self, pfn: Pfn, phys_addr: u64, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
-        if let Some(slot) = self.pfn_to_slot.get(pfn) {
-            debug_assert_eq!(self.pages[slot as usize].pfn, pfn,
-                "pfn_to_slot[{:#x}] -> slot {} whose own pfn is {:#x} — the map and the slot it points at have                  desynced (a slot was reused/evicted without this map entry being updated to match)",
-                pfn, slot, self.pages[slot as usize].pfn);
-            return Some(slot);
+    /// [`Self::claim_page`] for a caller with nothing to do about a full pool
+    /// (the monitor): the slot, or `None`.
+    pub fn page_at(&mut self, at: PageAt, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
+        match self.claim_page(at, bus, fr1) {
+            Claim::Page(slot) => Some(slot),
+            Claim::Full => None,
         }
-        if self.free_head == NO_SLOT {
-            return None;
-        }
-        let slot = self.free_head;
-        self.free_head = self.pages[slot as usize].next;
-        let gen = bus.gen_ptr(phys_addr);
-        self.pages[slot as usize].claim(pfn, gen, fr1);
-        self.pages[slot as usize].next = NO_SLOT;
-        self.pfn_to_slot.insert(pfn, slot);
-        Some(slot)
     }
 
-    /// Pointers for lock-free `pfn -> *mut PhysicalCodePage` fast lookup.
-    pub fn fast_lookup_ptrs(&mut self) -> (*const AtomicU32, *mut PhysicalCodePage) {
-        (self.pfn_to_slot.as_ptr(), self.pages.as_mut_ptr())
+    /// The pool slot for the page a CPU fetched from at `at`, through `bus`
+    /// (the bus that decodes that fetch: its cached one, or its own for an
+    /// uncached fetch on a machine that keeps those apart). The bus names the
+    /// memory there ([`BusDevice::code_page`]); the page for that memory is
+    /// claimed if no CPU has reached it yet, at whatever address. Where no
+    /// bank answers, the page is keyed by the address, within this space
+    /// ([`CodeKey::at_address`]), and counted as the bus counts it. Records
+    /// where this CPU reaches it and enters it in the space's frame table.
+    ///
+    /// [`Claim::Full`] if the pool is exhausted — the caller (mips exec
+    /// thread) is responsible for running `mega_flush` and retrying.
+    pub fn claim_page(&mut self, at: PageAt, bus: &dyn BusDevice, fr1: bool) -> Claim {
+        let space = &mut self.spaces[at.space];
+        let uncached = at.uncached && space.split;
+        let entry = page_key(at.pfn, uncached, space.split);
+        if space.map.0.is_empty() {
+            space.map = PfnMap::new(space.entries());
+        }
+        if let Some(slot) = space.map.get(entry) {
+            self.pages[slot as usize].set_addr(at.cpu, at.pfn, uncached);
+            return Claim::Page(slot);
+        }
+        let addr = at.pfn as u64 * PAGE_SIZE as u64;
+        let code = bus.code_page(addr).unwrap_or_else(|| crate::traits::CodePage {
+            key: CodeKey::at_address(at.space, at.pfn, uncached),
+            gen: bus.gen_ptr(addr),
+            words: std::ptr::null(),
+        });
+        let slot = match self.by_key.get(&code.key) {
+            Some(&slot) => slot,
+            None => {
+                if self.free_head == NO_SLOT {
+                    return Claim::Full;
+                }
+                let slot = self.free_head;
+                self.free_head = self.pages[slot as usize].next;
+                self.pages[slot as usize].claim_code(code, fr1);
+                self.pages[slot as usize].next = NO_SLOT;
+                self.by_key.insert(code.key, slot);
+                slot
+            }
+        };
+        debug_assert_eq!(self.pages[slot as usize].key, code.key, "the key index and slot {slot} disagree");
+        self.pages[slot as usize].set_addr(at.cpu, at.pfn, uncached);
+        self.spaces[at.space].map.insert(entry, slot);
+        Claim::Page(slot)
+    }
+
+    /// Memory moved under the addresses of `space`: forget which frame holds
+    /// which page there, and where CPU `cpu` reached each page. The pages and
+    /// their code stay: they are keyed by the memory, not by its address, so
+    /// the next fetch finds them again wherever the memory went. Each CPU of
+    /// the space calls this for itself before it runs guest code again.
+    pub fn forget_addresses(&mut self, space: usize, cpu: usize) {
+        self.spaces[space].map.clear();
+        for page in self.pages.iter().filter(|p| p.is_claimed()) {
+            page.forget_addr(cpu);
+        }
+        self.stats.remaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn table_bytes(&self) -> usize {
+        self.spaces.iter().map(Space::entries).sum::<usize>() * size_of::<AtomicU32>()
+    }
+
+    /// Pointers for lock-free `frame -> *mut PhysicalCodePage` fast lookup in
+    /// `space`.
+    pub fn fast_lookup_ptrs(&mut self, space: usize) -> (*const AtomicU32, *mut PhysicalCodePage) {
+        (self.pfn_map_ptr(space), self.pages.as_mut_ptr())
+    }
+
+    /// `space`'s frame table pointer, null before its first claim.
+    pub fn pfn_map_ptr(&self, space: usize) -> *const AtomicU32 {
+        let map = &self.spaces[space].map;
+        if map.0.is_empty() { std::ptr::null() } else { map.as_ptr() }
     }
 
     /// Raw pointer to the page at `slot`. Valid for the process's entire
@@ -2532,6 +2970,23 @@ impl Jitv2 {
             rejected += page.redundant_rejected() as u64;
         }
         (skipped, rejected)
+    }
+
+    /// Pages more than one CPU of the pool has reached, and how many of those
+    /// some CPU reached at another frame than the rest (another node's address
+    /// for the same memory): the sharing a key by memory makes possible.
+    pub fn shared_pages(&self) -> (usize, usize) {
+        let (mut shared, mut apart) = (0, 0);
+        for page in self.pages.iter().filter(|p| p.is_claimed()) {
+            let mut frames = (0..POOL_CPUS).filter_map(|cpu| page.addr_of(cpu)).map(|(pfn, _)| pfn);
+            let Some(first) = frames.next() else { continue };
+            let rest: Vec<Pfn> = frames.collect();
+            if !rest.is_empty() {
+                shared += 1;
+                apart += usize::from(rest.iter().any(|&pfn| pfn != first));
+            }
+        }
+        (shared, apart)
     }
 
     /// Pool capacity, as passed to `new()`.
@@ -2596,9 +3051,8 @@ impl Jitv2 {
     /// Every claimed page in the pool, exposed as a borrowing iterator
     /// rather than folded into an aggregate, for callers (`j2 html`) that
     /// need the raw per-page detail instead of a summary statistic. Not
-    /// necessarily a contiguous `pages[..n]` prefix — `free_page` can return
-    /// an individual slot mid-run, so claimed slots may be scattered anywhere
-    /// in the array — hence the full scan filtered on
+    /// necessarily a contiguous `pages[..n]` prefix, hence the full scan
+    /// filtered on
     /// [`PhysicalCodePage::is_claimed`]. `pages` itself stays private (index
     /// stability, see the field's own doc comment, is an invariant only this
     /// module should rely on).
@@ -2613,7 +3067,7 @@ impl Jitv2 {
     ///
     /// Every slot gets [`PhysicalCodePage::reset_to_unclaimed`] (which clears
     /// `pfn` back to `UNCLAIMED_PFN`, so `pages_used()` reads 0 afterwards),
-    /// `pfn_to_slot` is cleared, and the free list is relinked across the
+    /// every frame table and `by_key` are cleared, and the free list is relinked across the
     /// entire array from slot 0. Slot *indices* stay stable — the array is
     /// reset in place and never reallocates (see the `pages` field's own doc
     /// comment) — but a slot's *contents* do not survive, so any surviving
@@ -2640,7 +3094,10 @@ impl Jitv2 {
     /// compile-queue lifecycle independently of `MipsCpu::stop()`/`start()`).
     fn mega_flush(&mut self) {
         crate::cpu::jitv2::hashstats::FLUSH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.pfn_to_slot.clear();
+        for space in &mut self.spaces {
+            space.map.clear();
+        }
+        self.by_key.clear();
         let cap = self.pages.len();
         for (i, page) in self.pages.iter_mut().enumerate() {
             page.reset_to_unclaimed();
@@ -2717,7 +3174,9 @@ type PoolArena = (
 ///
 /// One shared `crossbeam_queue::ArrayQueue` (`queue`) — the CPU thread
 /// pushes, every worker thread pops from the same instance, no
-/// producer/consumer split needed. Restartable: `stop()` joins every worker
+/// producer/consumer split needed. The queue is wrapped in a [`CompileLane`],
+/// which carries the pool's wake-up channel so a push also wakes the
+/// workers. Restartable: `stop()` joins every worker
 /// thread and collects their `Codegen`s, but the queue itself (an `Arc`) is
 /// never taken apart — it just sits idle (still holding whatever's left
 /// un-popped) between a `stop()` and the next `start()`. This is what lets
@@ -2729,14 +3188,14 @@ type PoolArena = (
 /// and the queue drained, before that clear happens).
 ///
 /// Shared body of `CompileQueue::send`: push `req` onto the raw queue,
-/// recording `stats` counters under `developer`. Free function (not a
-/// `CompileQueue` method) so `MipsExecutor` can call it directly through a
-/// bare `Arc<ArrayQueue<CompileRequest>>` (`CompileQueue::queue_handle`)
+/// record `stats` counters under `developer`, and wake the pool. Free
+/// function (not a `CompileQueue` method) so `MipsExecutor` can call it
+/// directly through a bare `Arc<CompileLane>` (`CompileQueue::queue_handle`)
 /// without going through `Jitv2`'s outer mutex at all — the hot dispatch-gate
 /// path only ever needs this one push, never the pool/codegen state that
 /// mutex actually protects.
 pub(crate) fn push_compile_request(
-    queue: &crossbeam_queue::ArrayQueue<CompileRequest>,
+    queue: &Arc<CompileLane>,
     req: CompileRequest,
     #[allow(unused_variables)] stats: &JitStats,
 ) -> bool {
@@ -2750,6 +3209,14 @@ pub(crate) fn push_compile_request(
         stats.compile_queue_depth_sum.fetch_add(occupancy as u64, Ordering::Relaxed);
     }
     let accepted = queue.push(req).is_ok();
+    // Wake a sleeping worker, or it only notices the request on its next
+    // backstop tick, which is exactly the latency the park replaces. Not on
+    // a dropped push: the queue is full, so no worker is waiting for work,
+    // and a full queue is when this runs most often — every dispatch of an
+    // uncompiled page retries the push, on the CPU thread.
+    if accepted {
+        queue.wake.wake_if_sleeping();
+    }
     #[cfg(feature = "developer")]
     if !accepted {
         stats.compile_queue_full.fetch_add(1, Ordering::Relaxed);
@@ -2776,6 +3243,85 @@ pub fn start_compiling(
         }
         crate::config::JitCompile::Sync => cpu.compile_on_cpu_thread(),
     }
+}
+
+/// Give `cpu`'s JIT its compile pool and start compiling as `mode` asks,
+/// reading code through `bus`. Under lockstep no pool starts.
+pub fn attach_pool(
+    cpu: &Arc<dyn crate::cpu::mips_exec::CpuDevice>,
+    (threads, threads_reason): (usize, String),
+    mode: crate::config::JitCompile,
+    bus: Arc<dyn BusDevice>,
+    world: Option<Arc<crate::cpu::smp::World>>,
+) {
+    // Weak handles only: a strong one would keep the board alive after the machine.
+    let device: Arc<dyn Device> = cpu.clone().as_device();
+    let jit = cpu.jitv2();
+    {
+        let mut g = jit.lock();
+        g.compile_queue.set_thread_count_with_reason(threads.max(1), &threads_reason);
+        g.compile_queue.set_cpu(Arc::downgrade(&device));
+        g.compile_queue.set_owner(Arc::downgrade(&jit));
+        if let Some(world) = world {
+            g.compile_queue.set_world(world);
+        }
+    }
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    start_compiling(&**cpu, &jit, mode, bus);
+    #[cfg(feature = "jitv2_lockstep")]
+    let _ = (mode, bus);
+}
+
+/// What [`share_pool`] needs of one node: its processors, the module they
+/// are, and the bus they read cached code through.
+pub struct PoolNode<'a> {
+    pub cpus: &'a [Arc<dyn crate::cpu::mips_exec::CpuDevice>],
+    pub module: &'a crate::cpu::parts::CpuModule,
+    pub bus: Arc<dyn BusDevice>,
+}
+
+/// Give a machine of several nodes its JIT: one page pool, one compile queue
+/// and one body of compiled code for every processor, whichever node it is
+/// on. A page is keyed by the memory it was compiled from, so the node whose
+/// processor reaches that memory at another address runs the same code. Each
+/// node is an address space of the pool, with its own frame table.
+///
+/// Compiled code is specific to the processor module (its instruction set,
+/// its cache geometry), so nodes with different modules get a pool each.
+pub fn share_pool(
+    nodes: &[PoolNode],
+    pool_size: (usize, String),
+    mode: crate::config::JitCompile,
+    world: &Arc<crate::cpu::smp::World>,
+) -> Result<(), String> {
+    let mut done = vec![false; nodes.len()];
+    for first in 0..nodes.len() {
+        if done[first] {
+            continue;
+        }
+        let members: Vec<usize> = (first..nodes.len()).filter(|&n| !done[n] && nodes[n].module == nodes[first].module).collect();
+        members.iter().for_each(|&n| done[n] = true);
+        let group: Vec<&PoolNode> = members.iter().map(|&n| &nodes[n]).collect();
+        let Some(lead) = group.iter().find_map(|n| n.cpus.first()) else {
+            continue;
+        };
+        let several = group.iter().map(|n| n.cpus.len()).sum::<usize>() > 1;
+        if several {
+            if cfg!(feature = "jitv2_lockstep") {
+                return Err("several processors cannot run with jitv2_lockstep".into());
+            }
+            let jit = lead.jitv2();
+            let mut number = 0;
+            for (space, node) in group.iter().enumerate() {
+                for cpu in node.cpus {
+                    cpu.share_jitv2(jit.clone(), world.clone(), number, space);
+                    number += 1;
+                }
+            }
+        }
+        attach_pool(lead, pool_size.clone(), mode, group[0].bus.clone(), several.then(|| world.clone()));
+    }
+    Ok(())
 }
 
 pub struct CompileQueue {
@@ -2806,13 +3352,21 @@ pub struct CompileQueue {
     /// so this can just be cloned into each worker thread and left there
     /// permanently, alive across `stop()`/`start()` cycles). Bounded, with
     /// `push` returning `Err` on full rather than blocking — preserves
-    /// §6.4's "drop on full, hot pages re-trigger" semantics exactly.
-    queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
+    /// §6.4's "drop on full, hot pages re-trigger" semantics exactly. The
+    /// lane also carries the pool's wake-up channel, so a push wakes the
+    /// workers instead of leaving them to poll.
+    queue: Arc<CompileLane>,
     /// The hot lane: a small second queue the workers drain before `queue`,
     /// for pages executed hard while they wait. One per pool, as `queue` is:
     /// a request holds raw pointers into its own JIT's pages and its own
     /// machine's memory, so another machine's worker must never take it.
-    hot: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
+    hot: Arc<CompileLane>,
+    /// The buses the workers read page bytes through, one pair per CPU that
+    /// shares the pool: see [`CodeBuses`].
+    pub buses: Arc<CodeBuses>,
+    /// The pool's wake-up channel, shared by both lanes — the same workers
+    /// drain both. See [`CompileWake`].
+    wake: Arc<CompileWake>,
     /// One `JoinHandle` per worker thread — empty when not running. Each
     /// thread hands back its own `Codegen` on exit (see `worker_loop`'s
     /// return type); `stop()` collects all of them.
@@ -2857,11 +3411,14 @@ pub struct CompileQueue {
     function_counts: Vec<Arc<AtomicU32>>,
     /// Fixed pool size — read once by `start()`, never changed at runtime
     /// (no "j2 threads N" mutation; see `set_thread_count`'s own doc
-    /// comment). Defaults to 1 so every existing caller (tests,
-    /// `equiv_test.rs`, any non-`Machine::new` construction path) keeps
-    /// today's single-worker behavior without having to know this field
-    /// exists at all.
+    /// comment). Defaults to 1, so a queue built without a machine (tests,
+    /// `equiv_test.rs`) runs one worker unless it asks for more.
     thread_count: usize,
+    /// Why the pool is sized as it is — the configuration's auto-sizing
+    /// explanation ("auto: one worker per guest CPU ...") or "set
+    /// explicitly". `None` for a queue built without a machine (tests,
+    /// `equiv_test.rs`).
+    thread_reason: Option<String>,
     /// The pool's quiesce barrier and run flag, cloned into every worker:
     /// see `pool_barrier`.
     barrier: Arc<PoolBarrier<PoolArena>>,
@@ -2879,18 +3436,22 @@ impl CompileQueue {
     /// Construct the queue without starting any worker threads. Call
     /// [`Self::start`] to spawn the pool.
     pub fn new() -> Self {
+        let wake = Arc::new(CompileWake::new());
         Self {
             mips4: crate::cpu::jitv2::isa::mips4_enabled(),
             dc_geometry: Mutex::new(crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()),
             jit_consts: Mutex::new(crate::cpu::jitv2::codegen::JitConsts::default()),
-            queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
-            hot: Arc::new(crossbeam_queue::ArrayQueue::new(HOT_QUEUE_CAPACITY)),
+            queue: Arc::new(CompileLane::new(COMPILE_QUEUE_CAPACITY, wake.clone())),
+            hot: Arc::new(CompileLane::new(HOT_QUEUE_CAPACITY, wake.clone())),
+            buses: Arc::new(CodeBuses::default()),
+            wake,
             threads: Vec::new(),
             cpu: Mutex::new(None),
             world: Mutex::new(None),
             jitv2: Mutex::new(None),
             function_counts: Vec::new(),
             thread_count: 1,
+            thread_reason: None,
             barrier: Arc::new(PoolBarrier::new()),
         }
     }
@@ -2898,8 +3459,12 @@ impl CompileQueue {
     /// Set the pool's fixed worker-thread count — must be called before the
     /// queue is ever `start()`-ed (later calls are a no-op, guarded by
     /// `debug_assert!`, since the whole point is "fixed at startup, no
-    /// runtime mutation"). `Machine::new` is the only real caller today
-    /// (reading `[jitv2].threads`/`--jitv2-threads` from config, default 1).
+    /// runtime mutation"). Each machine's constructor calls it (`Machine::new`
+    /// and the `ip*_machine` builders) with `[jitv2] threads` /
+    /// `--jitv2-threads`, which when unset is one thread per guest CPU, at
+    /// most `AUTO_JITV2_THREADS_MAX`, and capped by the host's usable CPUs
+    /// with one held back for the device threads
+    /// (`MachineConfig::settle_jitv2_threads`).
     /// `n.max(1)`: a misconfigured 0 would
     /// otherwise silently degrade to "no compile threads at all."
     pub fn set_thread_count(&mut self, n: usize) {
@@ -2907,10 +3472,25 @@ impl CompileQueue {
         self.thread_count = n.max(1);
     }
 
+    /// Set the pool's fixed worker-thread count and why it was chosen — the
+    /// machine builders' way in, so `j2 threads` can say where the number
+    /// came from (auto-sized for the guest and the host, or set explicitly).
+    pub fn set_thread_count_with_reason(&mut self, n: usize, reason: &str) {
+        self.set_thread_count(n);
+        self.thread_reason = Some(reason.to_string());
+    }
+
     /// Configured pool size — `j2 threads`'s read-only report.
     #[inline]
     pub fn thread_count(&self) -> usize {
         self.thread_count
+    }
+
+    /// Why the pool is sized as it is — `j2 threads`'s read-only report.
+    /// `None` for a queue built without a machine.
+    #[inline]
+    pub fn thread_count_reason(&self) -> Option<&str> {
+        self.thread_reason.as_deref()
     }
 
     /// Whether the worker pool is currently spawned — the real signal for
@@ -2970,20 +3550,19 @@ impl CompileQueue {
         self.queue.len()
     }
 
-    /// Clone of the underlying `Arc<ArrayQueue<CompileRequest>>` — lets a
-    /// caller that only ever needs to `push` (the CPU thread's dispatch-gate
-    /// `send`) hold a handle directly, bypassing `Jitv2`'s outer mutex
-    /// entirely on the hot path. Safe to hand out freely: the queue is
-    /// already the shared, `&self`-only primitive every worker thread pops
-    /// from (see the `queue` field's own doc comment), so an extra clone
-    /// here is exactly as sound as the ones `start_inner` already makes per
-    /// worker.
-    pub fn queue_handle(&self) -> Arc<crossbeam_queue::ArrayQueue<CompileRequest>> {
+    /// Clone of the underlying `Arc<CompileLane>` — lets a caller that only
+    /// ever needs to `push` (the CPU thread's dispatch-gate `send`) hold a
+    /// handle directly, bypassing `Jitv2`'s outer mutex entirely on the hot
+    /// path. Safe to hand out freely: the lane is already the shared,
+    /// `&self`-only primitive every worker thread pops from (see the `queue`
+    /// field's own doc comment), so an extra clone here is exactly as sound
+    /// as the ones `start_inner` already makes per worker.
+    pub fn queue_handle(&self) -> Arc<CompileLane> {
         self.queue.clone()
     }
 
     /// The hot lane, as [`Self::queue_handle`] gives the FIFO.
-    pub fn hot_handle(&self) -> Arc<crossbeam_queue::ArrayQueue<CompileRequest>> {
+    pub fn hot_handle(&self) -> Arc<CompileLane> {
         self.hot.clone()
     }
 
@@ -3061,7 +3640,7 @@ impl CompileQueue {
     /// after. `req.page` is still safely dereferenceable here — the pool
     /// hasn't been cleared yet at either call site (see this function's own
     /// doc comment above for exactly why that ordering is guaranteed).
-    fn drain_pending(queue: &crossbeam_queue::ArrayQueue<CompileRequest>, hot: &crossbeam_queue::ArrayQueue<CompileRequest>) {
+    fn drain_pending(queue: &CompileLane, hot: &CompileLane) {
         while let Some(req) = queue.pop() {
             unsafe { (*req.page).clear_scheduled(); }
         }
@@ -3070,7 +3649,7 @@ impl CompileQueue {
         }
     }
 
-    /// Public entry point for [`Self::drain_pending`] when the caller only
+    /// Public entry point for `Self::drain_pending` when the caller only
     /// has `&CompileQueue`, not direct access to the shared queue — see
     /// `drain_pending`'s own doc comment for why this must run and when
     /// it's safe to call (no worker concurrently popping).
@@ -3142,6 +3721,7 @@ impl CompileQueue {
         if !self.threads.is_empty() {
             return;
         }
+        self.buses.set_default(bus);
         // Captured before the spawn loop: each worker builds its own
         // `Analyzer` and needs the level by value, not through `&self`.
         let worker_mips4 = self.mips4;
@@ -3163,7 +3743,7 @@ impl CompileQueue {
             codegen.jit_consts = *self.jit_consts.lock();
             let queue = self.queue.clone();
             let hot = self.hot.clone();
-            let bus = bus.clone();
+            let bus = self.buses.clone();
             let cpu = self.cpu.lock().clone();
             let world = self.world.lock().clone();
             let jitv2 = self.jitv2.lock().clone();
@@ -3171,10 +3751,11 @@ impl CompileQueue {
             let stats = stats.clone();
             let barrier = self.barrier.clone();
             let thread_count = self.thread_count;
+            let wake = self.wake.clone();
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, hot, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, thread_count, worker_mips4))
+                    .spawn(move || Self::worker_loop(queue, hot, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, thread_count, worker_mips4, wake))
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3201,12 +3782,19 @@ impl CompileQueue {
     /// `set_queue_fill` again once no worker is running.
     pub fn stop(&mut self) -> Vec<crate::cpu::jitv2::codegen::Codegen> {
         self.barrier.stop();
+        // Wake any worker parked on its idle backstop so it sees the stop
+        // now, instead of sleeping out the backstop first (and making this
+        // join wait for it).
+        self.wake.notify_all();
         // A worker can hold the last reference for a moment (a flush upgrades
         // its weak handles) and so run this from `Drop`; it is already on
         // its way out and cannot join itself.
         let me = std::thread::current().id();
         let result: Vec<_> = self.threads.drain(..).filter(|h| h.thread().id() != me).filter_map(|h| h.join().ok()).collect();
         self.drain_pending_queue();
+        // The workers are gone: drop their thread handles, so a later
+        // `start` does not accumulate dead ones.
+        self.wake.clear();
         crate::cpu::jit_feedback::JIT_FEEDBACK.set_queue_fill(0, COMPILE_QUEUE_CAPACITY);
         result
     }
@@ -3217,9 +3805,12 @@ impl CompileQueue {
     /// `j2 corpus` walk of this pool, see `jitv2/pcp_dump.rs`). Owns the
     /// `Analyzer` scratch state for the thread's whole lifetime (meant to be
     /// reused across jobs, not rebuilt per request); `codegen` is the shared
-    /// one moved in by `start`. Backs off briefly when the queue is empty
-    /// rather than busy-spinning — compile requests are bursty (arrival
-    /// threshold crossings), not latency-critical.
+    /// one moved in by `start`. Parks when the queue is empty rather than
+    /// busy-spinning or polling on a timer: the producer wakes the worker
+    /// directly (`CompileWake`), and the park's timeout is only a backstop
+    /// for the periodic pending-publish sweep — compile requests are bursty
+    /// (arrival threshold crossings), not latency-critical, but they do not
+    /// need a wakeup either.
     ///
     /// Every compile routes through `comp::handle_request_deferred`, never
     /// `comp::handle_request` — `handle_request`'s forced-seal contract
@@ -3280,19 +3871,19 @@ impl CompileQueue {
     /// within itself), builds one fresh shared arena, rebuilds every
     /// worker's own `Codegen` on top of it
     /// (`Codegen::new_with_shared_arena`/`reset_with_shared_arena`),
-    /// publishes it into the barrier, and restarts the CPU. At today's
-    /// `thread_count == 1` there are never any followers to wait for — the
+    /// publishes it into the barrier, and restarts the CPU. With one worker
+    /// (`thread_count == 1`) there are no followers to wait for — the
     /// leader's own barrier wait is immediately satisfied — so this is
     /// observably identical to the pre-pool `do_flush` sequence; the
-    /// election/park machinery itself is proven separately, with real
-    /// concurrent threads, in `tests::barrier_parks_followers_until_leader_resumes_them`.
+    /// election/park machinery itself is tested with real concurrent threads,
+    /// and modelled under loom, in `pool_barrier`'s tests.
     /// Returns `codegen` on exit so `stop()` can collect it — the shared
     /// `queue` itself is never handed back (it's an `Arc`, cloned into every
     /// worker up front and simply left running/idle after they all exit).
     fn worker_loop(
-        queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
-        hot: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
-        bus: Arc<dyn BusDevice>,
+        queue: Arc<CompileLane>,
+        hot: Arc<CompileLane>,
+        bus: Arc<CodeBuses>,
         mut codegen: crate::cpu::jitv2::codegen::Codegen,
         cpu: Option<Weak<dyn Device>>,
         world: Option<Arc<crate::cpu::smp::World>>,
@@ -3303,7 +3894,14 @@ impl CompileQueue {
         thread_count: usize,
         // The CPU model’s ISA level, for this worker’s `Analyzer`.
         mips4: bool,
+        // The pool's wake-up channel: this worker registers its thread
+        // handle here, so a producer can unpark it instead of the worker
+        // polling the queue.
+        wake: Arc<CompileWake>,
     ) -> crate::cpu::jitv2::codegen::Codegen {
+        // Publish this worker's thread handle so the producer can wake it
+        // out of the idle park below.
+        wake.register(std::thread::current());
         // First worker to get here builds the shared helpers into the arena's
         // lowest range. Startup only — the flush path rebuilds them from the
         // leader while everyone else is parked (see `run_leader_flush`).
@@ -3377,9 +3975,9 @@ impl CompileQueue {
             };
             {
                 // Wait for every OTHER worker to park before touching
-                // anything shared — at thread_count == 1 there are none, so
-                // this is immediately satisfied (parked_count < 0 never
-                // holds for the unsigned saturating_sub(1) below). Bails
+                // anything shared — with one worker there are none
+                // (`followers` is `thread_count - 1`, saturating), so this
+                // is immediately satisfied. Bails
                 // out cleanly (no flush performed) if the pool stops
                 // first — see `followers` above for the `CompileQueue::stop()`
                 // race this guards.
@@ -3487,13 +4085,17 @@ impl CompileQueue {
         // this same check at the top of its next loop iteration) instead
         // drains/discards its own state and parks at the one shared
         // barrier, regardless of which kind of leader it's waiting on — see
-        // `pool_barrier` for why one gate covers both. At thread_count == 1
-        // there is only ever one worker, so this always wins trivially —
-        // real contention is exercised separately, in `pool_barrier`'s tests.
+        // `pool_barrier` for why one gate covers both. With one worker this
+        // always wins trivially; contention is exercised in `pool_barrier`'s
+        // tests.
         let try_flush = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
                           function_count: &Arc<AtomicU32>,
                           pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             if barrier.try_lead() {
+                // The followers may be parked on their idle backstop: wake
+                // them, so they reach the barrier now instead of making
+                // this leader wait out the backstop.
+                wake.notify_all();
                 run_leader_flush(codegen, function_count, pending);
             } else {
                 *pending = 0;
@@ -3507,6 +4109,9 @@ impl CompileQueue {
         let try_force_seal = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
                                pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             if barrier.try_lead() {
+                // Same as `try_flush`: wake the followers off their idle
+                // backstop so they reach the barrier now.
+                wake.notify_all();
                 run_leader_seal(codegen, pending);
             } else {
                 *pending = 0;
@@ -3524,12 +4129,10 @@ impl CompileQueue {
             // `pool_barrier`) must park immediately
             // rather than pop/compile anything new — its own next compile
             // would target a page pool/arena that's about to be cleared out
-            // from under it, or would race the leader's forced seal. At
-            // thread_count == 1 this can only ever be this same thread
-            // mid-leader-sequence, which never reaches back here until it's
-            // done (the flag is cleared before the leader function
-            // returns), so it's a no-op today; real contention is exercised
-            // separately.
+            // from under it, or would race the leader's forced seal. With
+            // one worker the leader can only be this same thread, which
+            // never reaches back here until it's done (the flag is cleared
+            // before the leader function returns), so it is a no-op there.
             if barrier.in_progress() {
                 pending = 0;
                 if let Some((arena, state)) = barrier.park() {
@@ -3651,8 +4254,8 @@ impl CompileQueue {
                     // never grows into a full page still gets published
                     // eventually, but a genuinely busy queue that's just
                     // between two back-to-back bursts doesn't pay for a
-                    // premature forced seal on every backoff tick
-                    // (`WORKER_IDLE_POLL_BACKOFF`).
+                    // premature forced seal on every backstop tick
+                    // (`WORKER_IDLE_PARK_BACKSTOP`).
                     // At N=1 this is behaviorally a no-op relative to
                     // today (nothing here can ever actually be blocked on
                     // another worker), but it's real, reachable machinery —
@@ -3681,7 +4284,27 @@ impl CompileQueue {
                     } else {
                         idle_since = None;
                     }
-                    std::thread::sleep(WORKER_IDLE_POLL_BACKOFF);
+                    // Park until a producer has work, or the backstop
+                    // expires. `park_idle` counts this worker as asleep
+                    // and checks the queues again before parking, so a
+                    // request that arrives after the check above is not
+                    // lost: either the recheck sees it, or the producer
+                    // sees the sleeper and unparks it. Sized for idle cost,
+                    // not for latency — the producer wakes this worker
+                    // directly (see `CompileWake`).
+                    //
+                    // Two backstops: with a publish still outstanding, the
+                    // worker must come back soon to retry it (the compiled
+                    // code reaches the guest on that retry), which is the
+                    // old 200µs poll. With nothing pending the worker is
+                    // idle, and the long backstop is what keeps it off the
+                    // host's cores.
+                    let backstop = if pending > 0 {
+                        WORKER_IDLE_PENDING_BACKOFF
+                    } else {
+                        WORKER_IDLE_PARK_BACKSTOP
+                    };
+                    wake.park_idle(&queue, &hot, backstop);
                 }
             }
         }
@@ -3699,7 +4322,7 @@ mod tests {
     /// `claim` debug-asserts the slot is clean, so it must start unclaimed.
     fn claimed_page(fr1: bool) -> Box<PhysicalCodePage> {
         let mut page = Box::new(PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null()));
-        page.claim(0x1234, std::ptr::null(), fr1);
+        page.claim(CodeKey::flat(0x1234 << 12), std::ptr::null(), fr1);
         page
     }
 
@@ -4040,7 +4663,7 @@ mod tests {
         let mut jit = Jitv2::new(sizes.len());
 
         for (i, sz) in sizes.iter().enumerate() {
-            jit.pages[i].claim(i as Pfn + 1, &counter as *const AtomicU64, false);
+            jit.pages[i].claim(CodeKey::flat((i as u64 + 1) << 12), &counter as *const AtomicU64, false);
             let mut bits = [0u64; BITMAP_WORDS];
             bits[0] |= 1u64;
             assert!(jit.pages[i].publish(&bits, 0x1000 as *const (), 0, 1, *sz, false));
@@ -4905,6 +5528,7 @@ mod tests {
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { crate::traits::BUS_ERR }
         fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr))) }
     }
 
     #[test]
@@ -4959,16 +5583,103 @@ mod tests {
     }
 
     #[test]
+    fn a_page_table_doubles_only_when_split() {
+        use crate::memory_map::{MemKind, MemRange, MemoryMap};
+        let dev = FakeDevice(AtomicU64::new(0));
+        let map = MemoryMap::new(vec![MemRange::new("ram", MemKind::Ram, 0, 64 << 20)]);
+        for (split, entries) in [(false, 1), (true, 2)] {
+            let mut jit = Jitv2::for_memory(1, &map);
+            if split {
+                jit.split_uncached_code();
+            }
+            assert!(jit.fast_lookup_ptrs(0).0.is_null());
+            jit.page_for(1, PAGE_SIZE as u64, &dev, false).unwrap();
+            assert_eq!(jit.table_bytes(), (64 << 20) / PAGE_SIZE as usize * 4 * entries);
+            assert_eq!(size_of_val(&*jit.spaces[0].map.0), jit.table_bytes());
+        }
+    }
+
+    /// One RAM bank answering `base` bytes up a node's bus.
+    struct NodeBus {
+        ram: Arc<crate::dev::mem::Memory>,
+        base: u64,
+    }
+    impl BusDevice for NodeBus {
+        fn read32(&self, a: u64) -> BusRead32 {
+            a.checked_sub(self.base).map_or_else(BusRead32::err, |a| self.ram.read32(a))
+        }
+        fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
+            a.checked_sub(self.base).map_or(std::ptr::null(), |a| self.ram.gen_ptr(a))
+        }
+        fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> {
+            self.ram.code_page(a.checked_sub(self.base)?)
+        }
+    }
+
+    /// Two nodes that reach one bank at different addresses share its page,
+    /// each through its own frame table, and a compile reads it through
+    /// whichever CPU's address still decodes to it.
+    #[test]
+    fn two_address_spaces_share_the_page_of_one_bank() {
+        let ram = Arc::new(crate::dev::mem::Memory::new(1));
+        let near: Arc<dyn BusDevice> = Arc::new(NodeBus { ram: ram.clone(), base: 0 });
+        let far: Arc<dyn BusDevice> = Arc::new(NodeBus { ram: ram.clone(), base: 0x40 * PAGE_SIZE as u64 });
+        let mut jit = Jitv2::new(4);
+        jit.set_space(1, PFN_MAP_ENTRIES, false);
+        jit.buses().set(0, 0, near.clone(), near.clone());
+        jit.buses().set(1, 1, far.clone(), far.clone());
+        let a = jit.claim_page(PageAt { cpu: 0, space: 0, pfn: 3, uncached: false }, &*near, false);
+        let b = jit.claim_page(PageAt { cpu: 1, space: 1, pfn: 0x43, uncached: false }, &*far, false);
+        let Claim::Page(slot) = a else { panic!("{a:?}") };
+        assert_eq!(b, Claim::Page(slot), "the same bank page from the other node is the same slot");
+        // The other node's frame 3 is not this memory, nor any bank: a page
+        // of its own, keyed by that node's address.
+        let Claim::Page(hole) = jit.claim_page(PageAt { cpu: 1, space: 1, pfn: 3, uncached: false }, &*far, false) else { panic!() };
+        assert_ne!(hole, slot);
+        assert_eq!(unsafe { &*jit.page_ptr(hole) }.key, CodeKey::at_address(1, 3, false));
+        let page = unsafe { &*jit.page_ptr(slot) };
+        assert_eq!(page.key, ram.code_page(3 * PAGE_SIZE as u64).unwrap().key);
+        assert_eq!((page.addr_of(0), page.addr_of(1)), (Some((3, false)), Some((0x43, false))));
+        assert!(std::ptr::eq(page.gen, ram.gen_ptr(3 * PAGE_SIZE as u64)), "counted by the bank's own counter");
+
+        let (_, at) = jit.buses().locate(page, 0).unwrap();
+        assert_eq!(at, 3 * PAGE_SIZE as u64);
+        // CPU 0's bus stops decoding that address to the bank: its address
+        // for the page is stale, and the page is read through CPU 1.
+        jit.buses().set(0, 0, far.clone(), far.clone());
+        let (_, at) = jit.buses().locate(page, 0).unwrap();
+        assert_eq!(at, 0x43 * PAGE_SIZE as u64);
+
+        // A compile needs neither: RAM hands out its storage, so the page is
+        // read by its key alone, whatever the buses decode.
+        ram.write32(3 * PAGE_SIZE as u64 + 8, 0x1234_5678);
+        let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
+        assert!(!page.words().is_null());
+        assert!(matches!(crate::cpu::jitv2::comp::snapshot_page(page, None, &mut words), crate::cpu::jitv2::comp::Snapshot::Taken(_)));
+        assert_eq!(words[2], 0x1234_5678);
+
+        // A remap in space 0 forgets its frames and CPU 0's addresses only.
+        jit.forget_addresses(0, 0);
+        assert_eq!((page.addr_of(0), page.addr_of(1)), (None, Some((0x43, false))));
+        assert_eq!(jit.pages_used(), 2, "and drops no page");
+        assert_eq!(jit.claim_page(PageAt { cpu: 0, space: 0, pfn: 0x43, uncached: false }, &*far, false), Claim::Page(slot));
+        jit.mega_flush();
+        assert_eq!(jit.pages_used(), 0);
+        assert!(matches!(jit.claim_page(PageAt { cpu: 1, space: 1, pfn: 0x43, uncached: false }, &*far, false), Claim::Page(_)));
+    }
+
+    #[test]
     fn fast_lookup_ptrs_lookup_hit() {
         let dev = FakeDevice(AtomicU64::new(0));
         let mut jit = Jitv2::new(4);
         let slot = jit.page_for(7, (7 * PAGE_SIZE) as u64, &dev, false).unwrap();
-        let (pfn_map_ptr, pages_base) = jit.fast_lookup_ptrs();
+        let (pfn_map_ptr, pages_base) = jit.fast_lookup_ptrs(0);
         unsafe {
-            let mapped_slot = (*pfn_map_ptr.add(7)).load(Ordering::Acquire);
+            let mapped_slot = (*pfn_map_ptr.add(page_key(7, false, false) as usize)).load(Ordering::Acquire);
             assert_eq!(mapped_slot, slot);
             let page = &*pages_base.add(mapped_slot as usize);
-            assert_eq!(page.pfn, 7);
+            assert_eq!(page.pfn(), 7);
+            assert_eq!(page.key, CodeKey::flat(7 << 12));
         }
     }
 
@@ -5032,7 +5743,7 @@ mod tests {
         let stats = JitStats::default();
         for i in 0..8u16 {
             let _ = i;
-            assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats));
+            assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
         }
         // stop() joins the worker; must return promptly even with requests in flight.
         q.stop();
@@ -5143,6 +5854,7 @@ mod tests {
         fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
         fn write64(&self, _addr: u64, _val: u64) -> u32 { crate::traits::BUS_ERR }
         fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr))) }
     }
 
     #[test]
@@ -5189,7 +5901,7 @@ mod tests {
         // dequeue time.
         page.mark_requested(0);
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats));
+        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
 
         // 30s, not the original 5s: this test passes in ~0.1s in isolation,
         // but the compile-worker thread genuinely needs real CPU time to get
@@ -5244,7 +5956,7 @@ mod tests {
         for page in pages.iter_mut() {
             // §13.2: same as the queue-drain-fallback test above.
             page.mark_requested(0);
-            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats));
+            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
         }
 
         // Poll for the *first* page specifically, well before the full
@@ -5322,7 +6034,7 @@ mod tests {
             // offset must be marked BEFORE sending, or handle_request_deferred
             // finds zero candidates and silently no-ops.
             page.mark_requested(0);
-            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats));
+            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
         }
 
         // catch_unwind for the same reason as the other threaded tests in
@@ -5353,7 +6065,7 @@ mod tests {
         let mut q = CompileQueue::new();
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats));
+        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
         q.start(dev, std::sync::Arc::new(JitStats::default()));
         q.stop();
     }
@@ -5368,7 +6080,7 @@ mod tests {
         let stats = JitStats::default();
         let mut accepted = 0;
         for i in 0..(COMPILE_QUEUE_CAPACITY + 10) {
-            if q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats) {
+            if q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats) {
                 accepted += 1;
             }
         }
@@ -5389,7 +6101,7 @@ mod tests {
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         assert!(page.try_schedule_page());
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true }, &stats));
+        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
         assert!(page.is_scheduled(), "sanity: the send above left the page marked in-flight");
 
         q.drain_pending_queue();
@@ -5406,7 +6118,7 @@ mod tests {
         assert!(page.try_schedule_page());
         let mut ours = CompileQueue::new();
         let mut theirs = CompileQueue::new();
-        push_hot_request(&ours.hot_handle(), CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true });
+        push_hot_request(&ours.hot_handle(), CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 });
         theirs.drain_pending_queue();
         assert!(page.is_scheduled(), "another pool's flush discarded this pool's hot request");
         assert_eq!(theirs.hot_handle().len(), 0);
@@ -5427,5 +6139,93 @@ mod tests {
     fn compile_queue_stop_without_start_is_a_noop() {
         let mut q = CompileQueue::new();
         q.stop(); // must not panic
+    }
+
+    /// The pool's whole idle-cost fix rests on this: a parked worker must
+    /// wake when the producer pushes a request. `park`/`unpark` tokens are
+    /// sticky, so the wakeup cannot be lost even when it arrives before the
+    /// worker actually parks — which is the race the producer and the
+    /// worker are in all the time.
+    #[test]
+    fn a_parked_worker_is_woken_by_the_producer() {
+        let wake = Arc::new(CompileWake::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_wake = wake.clone();
+        let worker = std::thread::spawn(move || {
+            worker_wake.register(std::thread::current());
+            tx.send(()).expect("the test's channel is open");
+            // Parks with no timeout: only the producer's unpark can end this.
+            std::thread::park();
+            tx.send(()).expect("the test's channel is open");
+        });
+        // The worker has registered itself: from here on, notify_all reaches it.
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the worker did not start");
+        wake.notify_all();
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the parked worker was not woken by the producer");
+        worker.join().expect("the worker thread panicked");
+    }
+
+    /// The producer skips the wake while no worker is asleep, so the
+    /// sleeper count has to be visible before a worker parks: a worker in
+    /// `park_idle` must be woken by an accepted push, long before its
+    /// backstop.
+    #[test]
+    fn an_accepted_push_wakes_a_counted_sleeper() {
+        let wake = Arc::new(CompileWake::new());
+        let queue = Arc::new(CompileLane::new(1, wake.clone()));
+        let hot = Arc::new(CompileLane::new(1, wake.clone()));
+        let (w, q, h) = (wake.clone(), queue.clone(), hot.clone());
+        let worker = std::thread::spawn(move || {
+            w.register(std::thread::current());
+            let t = std::time::Instant::now();
+            // The backstop is far longer than the test allows: only the
+            // producer's unpark can end this park in time.
+            while q.is_empty() {
+                w.park_idle(&q, &h, std::time::Duration::from_secs(60));
+            }
+            t.elapsed()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wake.sleepers.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(wake.sleepers.load(Ordering::SeqCst), 1, "the worker never parked");
+        let stats = JitStats::default();
+        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false, cpu: 0 };
+        assert!(push_compile_request(&queue, req, &stats));
+        let waited = worker.join().expect("the worker thread panicked");
+        assert!(waited < std::time::Duration::from_secs(30), "the sleeper waited out its backstop: {waited:?}");
+        assert_eq!(wake.sleepers.load(Ordering::SeqCst), 0);
+        // A dropped push (the lane holds one request already) must not wake
+        // anyone, and must not fail for want of a sleeper.
+        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false, cpu: 0 };
+        assert!(!push_compile_request(&queue, req, &stats));
+    }
+
+    /// A request pushed to a running pool must reach a worker that is
+    /// parked on its idle backstop — the end-to-end shape of the wake-up:
+    /// push, and the worker takes it.
+    #[test]
+    fn a_pushed_request_reaches_a_parked_worker() {
+        let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+        let mut q = CompileQueue::new();
+        q.start(dev, std::sync::Arc::new(JitStats::default()));
+        // Boxed: the request carries a raw pointer to this page, and the
+        // worker dereferences it. The box outlives the pool, which is
+        // stopped before the test returns.
+        let mut page = Box::new(PhysicalCodePage::new(0, std::ptr::null()));
+        assert!(page.try_schedule_page());
+        let stats = JitStats::default();
+        assert!(q.send(CompileRequest { page: &mut *page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+        // The worker pops the request and drops it (the page has no code to
+        // compile), which clears the in-flight flag. Waiting for that proves
+        // the request was taken, not left in the queue.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while page.is_scheduled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!page.is_scheduled(), "the worker never took the request off the queue");
+        q.stop();
     }
 }

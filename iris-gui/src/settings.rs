@@ -172,7 +172,7 @@ pub fn reset_nvram(path: &str) -> std::io::Result<()> {
 
 /// Byte offset of the Ethernet MAC inside the NVRAM *EEPROM* (93CS56) file —
 /// word 0x7D, 2 bytes per word, big-endian (`src/dev/eeprom_93c56.rs`'s
-/// `backdoor_set_mac`: word 0x7D = MAC[0]<<8|MAC[1], …, so the three words'
+/// `backdoor_set_mac`: word 0x7D = `MAC[0]<<8|MAC[1]`, …, so the three words'
 /// raw bytes are the 6 MAC bytes in order). **Indigo2/IP28 read `eaddr` from
 /// here, not from [`NVRAM_MAC_OFFSET`]** — that offset is the DS1386 chip,
 /// which those profiles don't use for the MAC at all. A build that only ever
@@ -330,7 +330,10 @@ impl GuiSettings {
         let path = root.join("gui.json");
         let mut s = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Self>(&text) {
-                Ok(s) => s,
+                Ok(mut s) => {
+                    for cfg in s.machines.values_mut() { cfg.fold_deprecated(); }
+                    s
+                }
                 Err(e) => Self { migration_pending: true, errors: vec![crate::machines::file_error(&path, e)], ..Default::default() },
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),

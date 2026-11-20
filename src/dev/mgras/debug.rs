@@ -350,6 +350,10 @@ impl Mgras {
                 }
                 e(writeln!(w, "  cursor: {:?}  (x, y, size, glyph)", v.cursor()))?;
                 e(writeln!(w, "  display: timing tables {:?}, main DID frame table {} lines", v.timing_size(), v.did_lines()))?;
+                match f.dcb.video_timing() {
+                    Some(t) => e(writeln!(w, "  timing: {} x {} total, {} field(s), {} blank lines, pixel clock {} Hz: {:.3} Hz", t.h_total, t.v_total, t.fields, t.vblank_lines, t.pixel_clock_hz, t.refresh_mhz() as f64 / 1000.0))?,
+                    None => e(writeln!(w, "  timing: none decoded (totals {:?}, pixel clock {:?})", v.totals(), f.dcb.dac.pixel_clock_hz()))?,
+                }
                 let mut runs = Vec::new();
                 for y in [0usize, 512, 1023] {
                     v.main_did_runs(y, &mut runs);
@@ -408,7 +412,10 @@ impl Mgras {
     }
 
     pub(super) fn cmd_rss(&self, args: &[&str], w: &mut dyn Write) -> Result<(), String> {
-        self.mirror_now();
+        self.mirror_now(
+            #[cfg(feature = "wgpu")]
+            super::wgpu::Observation::Debug,
+        );
         let e = |r: std::io::Result<()>| r.map_err(|e| e.to_string());
         // SAFETY: read-only peek at the RSS thread's state (may tear).
         let rss = unsafe { &*self.rss.get() };
@@ -454,7 +461,10 @@ impl Mgras {
     }
 
     fn mgras_status(&self, w: &mut dyn Write) -> std::io::Result<()> {
-        self.mirror_now();
+        self.mirror_now(
+            #[cfg(feature = "wgpu")]
+            super::wgpu::Observation::Debug,
+        );
         // SAFETY: read-only peek at the RSS (may tear while drawing).
         let rss = unsafe { &*self.rss.get() };
         let f = self.front();
@@ -530,6 +540,15 @@ impl Mgras {
             writeln!(w, "GPU unit: {records} records in {batches} batches, {} dropped; {} MiB uploaded, {} MiB read back in {} syncs; scan-out frames presented on the GPU {}, read back {}",
                 u.dropped, u.uploaded >> 20, u.read_back >> 20, u.syncs,
                 self.gpu_frames[0].load(Ordering::Relaxed), self.gpu_frames[1].load(Ordering::Relaxed))?;
+            let observations: Vec<_> = u
+                .observation_counts()
+                .filter(|(_, count, _)| *count != 0)
+                .map(|(name, count, bytes)| format!("{name}:{count}/{bytes}B"))
+                .collect();
+            writeln!(w, "  observations (reason:count/bytes): {}", observations.join(" "))?;
+            if let Some(error) = self.gpu_fault.lock().as_ref() {
+                writeln!(w, "  fault: {error}")?;
+            }
         }
         #[cfg(feature = "gr4-jit")]
         {
@@ -589,7 +608,10 @@ impl Mgras {
     /// overlay.bin: stride 2048, display-height rows, row 0 at the bottom),
     /// and PNG views of them at the displayed size, top-down.
     fn dump_framebuffer(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        self.mirror_now();
+        self.mirror_now(
+            #[cfg(feature = "wgpu")]
+            super::wgpu::Observation::Debug,
+        );
         use rss::WIDTH;
         std::fs::create_dir_all(dir)?;
         // SAFETY: read-only views; tearing tolerated.

@@ -35,9 +35,12 @@ pub fn is_sentinel(ticket: u64) -> bool {
     ticket == CONSUMED || ticket == CLAIMING
 }
 
+/// One CPU's IP7 ticket word, shared between its CPU thread and the hptimer
+/// callback of the deadline it armed (`MipsCore::ip7_seq_shared`).
 pub struct Ip7Ticket(AtomicU64);
 
 impl Ip7Ticket {
+    /// A word with nothing armed (`CONSUMED`).
     pub fn new() -> Self {
         Ip7Ticket(AtomicU64::new(CONSUMED))
     }

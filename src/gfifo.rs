@@ -16,6 +16,12 @@ use crossbeam_utils::CachePadded;
 /// Address marker for the payload entries that follow a `push_batch` token.
 pub const GFIFO_PAYLOAD: u32 = 0xFFFF_0003;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushFailure {
+    Contended,
+    Full,
+}
+
 /// A GFIFO entry: plain addr + val, no synchronization fields.
 /// Ordering is guaranteed by the push spinlock (producers) and the
 /// tail Release store / head Acquire load (consumer).
@@ -219,11 +225,21 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     /// anyway.
     #[inline]
     pub fn try_push(&self, addr: u32, val: u64) -> bool {
+        self.push_one_result(addr, val).is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn try_push_traced(&self, addr: u32, val: u64) -> Result<(), PushFailure> {
+        self.push_one_result(addr, val)
+    }
+
+    #[inline]
+    fn push_one_result(&self, addr: u32, val: u64) -> Result<(), PushFailure> {
         // Acquire the spinlock — uncontested in the common case (one active
         // producer: IRIX only drives DMA for pixmap blits, never while the CPU
         // is writing REX3 registers), so a failure here is rare.
         if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return false;
+            return Err(PushFailure::Contended);
         }
         let tail = self.tail.load(Ordering::Relaxed);
         let next_tail = tail.wrapping_add(1) & Self::MASK;
@@ -235,7 +251,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
                 // Full — release the lock and let the caller retry once the
                 // consumer has drained something.
                 self.lock.store(false, Ordering::Release);
-                return false;
+                return Err(PushFailure::Full);
             }
         }
         // SAFETY: we hold the lock; no other producer touches this slot.
@@ -245,7 +261,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         // Release: consumer's Acquire on tail sees the slot write above.
         self.tail.store(next_tail, Ordering::Release);
         self.lock.store(false, Ordering::Release);
-        true
+        Ok(())
     }
 
     /// Push two consecutive register writes as one atomic unit.
@@ -266,8 +282,18 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     /// pair either lands completely or not at all.
     #[inline]
     pub fn try_push2(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> bool {
+        self.push_pair_result(addr0, val0, addr1, val1).is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn try_push2_traced(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> Result<(), PushFailure> {
+        self.push_pair_result(addr0, val0, addr1, val1)
+    }
+
+    #[inline]
+    fn push_pair_result(&self, addr0: u32, val0: u64, addr1: u32, val1: u64) -> Result<(), PushFailure> {
         if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return false;
+            return Err(PushFailure::Contended);
         }
         let tail = self.tail.load(Ordering::Relaxed);
         let next = tail.wrapping_add(1) & Self::MASK;
@@ -280,7 +306,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
             self.shadow_head.set(cached_head);
             if next == cached_head || next2 == cached_head {
                 self.lock.store(false, Ordering::Release);
-                return false;
+                return Err(PushFailure::Full);
             }
         }
         // SAFETY: we hold the lock; no other producer touches these slots.
@@ -292,7 +318,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         // orders it after every write above.
         self.tail.store(next2, Ordering::Release);
         self.lock.store(false, Ordering::Release);
-        true
+        Ok(())
     }
 
     /// Push `entries` (address, value) as one unit: all of them or, when the
@@ -329,7 +355,9 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         true
     }
 
-    /// Push a batch token followed by its payload words, as one atomic unit.
+    /// Try to push a batch token followed by its payload words as one atomic
+    /// unit. Returns `false` without changing the queue when the producer lock
+    /// is held or there is not room for the complete token and payload.
     ///
     /// The token carries the count; the `vals.len()` entries after it carry the
     /// data, and the consumer streams them into `ctx.hostrw[]`. Payload entries
@@ -340,46 +368,54 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
     /// so this is all-or-nothing in the same way `try_push2` is: the DMA worker
     /// has no EXEC_RETRY, and a partial commit followed by a retry would
     /// duplicate the prefix.
-    ///
-    /// Blocks rather than reporting busy. The batch may be larger than the
-    /// queue, so "wait for room" is the only workable contract; callers are the
-    /// DMA worker, which has nothing better to do, never the CPU store path.
-    pub fn push_batch(&self, token: u32, count_val: u64, vals: &[u64]) {
+    pub fn try_push_batch(&self, token: u32, count_val: u64, vals: &[u64]) -> bool {
+        self.push_batch_result(token, count_val, vals).is_ok()
+    }
+
+    pub(crate) fn try_push_batch_traced(&self, token: u32, count_val: u64, vals: &[u64]) -> Result<(), PushFailure> {
+        self.push_batch_result(token, count_val, vals)
+    }
+
+    #[inline]
+    fn push_batch_result(&self, token: u32, count_val: u64, vals: &[u64]) -> Result<(), PushFailure> {
         let need = vals.len() + 1;
         assert!(need < DEPTH, "batch of {} exceeds GFIFO capacity", vals.len());
-        loop {
-            if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                spin_loop();
-                continue;
-            }
-            let tail = self.tail.load(Ordering::Relaxed);
+        if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return Err(PushFailure::Contended);
+        }
+        let tail = self.tail.load(Ordering::Relaxed);
+        let room = |head: usize| head.wrapping_sub(tail).wrapping_sub(1) & Self::MASK;
+        if room(self.shadow_head.get()) < need {
             let head = self.slowest_head(tail);
             self.shadow_head.set(head);
-            // Free slots, keeping the one-empty-slot invariant the ring uses to
-            // distinguish full from empty.
-            let used = tail.wrapping_sub(head) & Self::MASK;
-            let free = Self::MASK - used;
-            if free < need {
-                // Not enough room yet — drop the lock so the consumer can drain.
+            if room(head) < need {
                 self.lock.store(false, Ordering::Release);
-                spin_loop();
-                continue;
+                return Err(PushFailure::Full);
             }
-            // SAFETY: we hold the lock and have verified capacity for all
-            // `need` slots; no other producer touches them.
-            unsafe {
-                self.slot(tail).write(token, count_val);
-                let mut idx = tail;
-                for &v in vals {
-                    idx = idx.wrapping_add(1) & Self::MASK;
-                    self.slot(idx).write(GFIFO_PAYLOAD, v);
-                }
+        }
+        // SAFETY: we hold the lock and have verified capacity for all `need`
+        // slots; no other producer touches them.
+        unsafe {
+            self.slot(tail).write(token, count_val);
+            let mut idx = tail;
+            for &v in vals {
+                idx = idx.wrapping_add(1) & Self::MASK;
+                self.slot(idx).write(GFIFO_PAYLOAD, v);
             }
-            let new_tail = tail.wrapping_add(need) & Self::MASK;
-            // One Release publishes the token and every payload slot.
-            self.tail.store(new_tail, Ordering::Release);
-            self.lock.store(false, Ordering::Release);
-            return;
+        }
+        let new_tail = tail.wrapping_add(need) & Self::MASK;
+        // One Release publishes the token and every payload slot.
+        self.tail.store(new_tail, Ordering::Release);
+        self.lock.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Push a batch token followed by its payload words, waiting until the
+    /// complete batch fits. Callers that can report back-pressure should use
+    /// [`try_push_batch`](Self::try_push_batch) instead.
+    pub fn push_batch(&self, token: u32, count_val: u64, vals: &[u64]) {
+        while !self.try_push_batch(token, count_val, vals) {
+            spin_loop();
         }
     }
 
@@ -681,6 +717,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resident_gfifo_failure_reason_distinguishes_full_and_contention() {
+        let f: Box<GFifo<8>> = Box::new(GFifo::new());
+        for i in 0..6 {
+            assert_eq!(f.try_push_traced(i, i as u64), Ok(()));
+        }
+        assert_eq!(f.try_push2_traced(10, 10, 11, 11), Err(PushFailure::Full));
+        assert_eq!(f.try_push_batch_traced(12, 1, &[13]), Err(PushFailure::Full));
+        assert_eq!(f.len(), 6, "failed multi-entry reservations must be atomic");
+        assert_eq!(f.try_push_traced(6, 6), Ok(()));
+        assert_eq!(f.try_push_traced(7, 7), Err(PushFailure::Full));
+        f.lock.store(true, Ordering::Release);
+        assert_eq!(f.try_push_traced(8, 8), Err(PushFailure::Contended));
+        assert_eq!(f.try_push2_traced(8, 8, 9, 9), Err(PushFailure::Contended));
+        assert_eq!(f.try_push_batch_traced(8, 1, &[9]), Err(PushFailure::Contended));
+        f.lock.store(false, Ordering::Release);
+        assert_eq!(f.len(), 7);
+    }
+
+    #[test]
     fn every_head_sees_every_entry() {
         let f: Box<GFifo<16, 2>> = Box::new(GFifo::new());
         for i in 0..5 {
@@ -815,6 +870,114 @@ mod tests {
             assert_eq!(out, [1, 2, 3]);
             assert_eq!(f.peek_at(h), None);
         }
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn resident_batch_backpressure_is_all_or_nothing_across_wrap() {
+        let f: Box<GFifo<8>> = Box::new(GFifo::new());
+        for i in 0..5 {
+            assert!(f.try_push(i, i as u64));
+        }
+        let before = (0..5).map(|i| f.peek_nth_at(0, i)).collect::<Vec<_>>();
+        assert!(
+            !f.try_push_batch(0x42, 2, &[0xaa, 0xbb]),
+            "three entries cannot fit in the two free slots"
+        );
+        assert_eq!(f.len(), 5);
+        assert_eq!(
+            (0..5).map(|i| f.peek_nth_at(0, i)).collect::<Vec<_>>(),
+            before,
+            "a refused batch must not publish a token or payload prefix"
+        );
+
+        f.consume_n_at(0, 4);
+        f.flush_head();
+        let payload = [0x10, 0x20, 0x30, 0x40];
+        assert!(f.try_push_batch(0x42, payload.len() as u64, &payload));
+        assert_eq!(f.peek(), Some((4, 4)));
+        f.consume();
+        assert_eq!(f.peek(), Some((0x42, payload.len() as u64)));
+        let mut out = [0; 4];
+        assert_eq!(f.drain_payload(payload.len(), &mut out), payload.len());
+        f.consume();
+        assert_eq!(out, payload);
+        assert!(f.is_empty(), "the wrapped retry must retire exactly once");
+    }
+
+    #[test]
+    fn resident_gfifo_interleaved_producers_preserve_atomic_batches() {
+        use std::sync::{Arc, Barrier};
+
+        const SCALAR: u32 = 0x5100;
+        const BATCH: u32 = 0xb100;
+        const RUNS: usize = 2048;
+
+        let f = Arc::new(GFifo::<64>::new());
+        let start = Arc::new(Barrier::new(3));
+        let scalar_fifo = Arc::clone(&f);
+        let scalar_start = Arc::clone(&start);
+        let scalar = std::thread::spawn(move || {
+            scalar_start.wait();
+            for index in 0..RUNS {
+                while !scalar_fifo.try_push(SCALAR, index as u64) {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+        let batch_fifo = Arc::clone(&f);
+        let batch_start = Arc::clone(&start);
+        let batch = std::thread::spawn(move || {
+            batch_start.wait();
+            for index in 0..RUNS {
+                let base = (index as u64) << 8;
+                let payload = [base, base | 1, base | 2];
+                while !batch_fifo.try_push_batch(BATCH, payload.len() as u64, &payload) {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        start.wait();
+        let mut scalars = vec![false; RUNS];
+        let mut batches = vec![false; RUNS];
+        let (mut scalar_count, mut batch_count) = (0, 0);
+        while scalar_count < RUNS || batch_count < RUNS {
+            match f.peek() {
+                Some((SCALAR, value)) => {
+                    let index = value as usize;
+                    assert!(index < RUNS && !scalars[index]);
+                    scalars[index] = true;
+                    scalar_count += 1;
+                    f.consume();
+                }
+                Some((BATCH, 3)) => {
+                    let mut payload = [0; 3];
+                    assert_eq!(f.drain_payload(payload.len(), &mut payload), payload.len());
+                    f.consume();
+                    let index = (payload[0] >> 8) as usize;
+                    assert!(index < RUNS && !batches[index]);
+                    assert_eq!(
+                        payload,
+                        [
+                            (index as u64) << 8,
+                            ((index as u64) << 8) | 1,
+                            ((index as u64) << 8) | 2,
+                        ]
+                    );
+                    batches[index] = true;
+                    batch_count += 1;
+                }
+                Some((addr, value)) => {
+                    panic!("interleaved stream contained {addr:#x}={value:#x}");
+                }
+                None => std::thread::yield_now(),
+            }
+        }
+        scalar.join().unwrap();
+        batch.join().unwrap();
+        assert!(scalars.into_iter().all(|seen| seen));
+        assert!(batches.into_iter().all(|seen| seen));
         assert!(f.is_empty());
     }
 

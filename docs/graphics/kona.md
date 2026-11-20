@@ -2,7 +2,12 @@
 
 Source: `src/dev/kona/`. Part of [Graphics boards](README.md).
 
-InfiniteReality is the graphics pipe of Onyx and Onyx2 (later Onyx 300 and Onyx 350 as InfiniteReality3/4). Iris models an InfiniteReality2 or InfiniteReality2E pipe with one or two Raster Managers, fitted in the graphics slot of the [Onyx2 deskside](../onyx2-ip27.md). The pipe's window is the machine's display. No other machine takes the board. The product table also holds an InfiniteReality3, which shipped in other chassis than the deskside, so no machine fits it and it has no board name yet.
+Iris models InfiniteReality2 and InfiniteReality2E pipes with one or two
+Raster Managers in the [Onyx2 deskside](../onyx2-ip27.md), and an
+InfiniteReality3 pipe with one Raster Manager on the
+[Onyx 3000 G-brick](../onyx3000-ip35.md). The pipe's window is the machine's
+display. Select the product with `[graphics] board`: `ir2`, `ir2:2rm`, `ir2e`
+or `ir2e:2rm` on Onyx2, and `ir3` on Onyx 3000.
 
 The pipe is a crosstalk widget. The processor stores commands to one command page, in one of three grammars that share the page: the PROM's textport, the kernel and X server's commands, and the GL client's. A Host Interface Processor takes the words, answers the commands about the board itself (identity, configuration, flash, DMA, display lists) and passes everything that draws or changes display state on. The Geometry Distributor, Geometry Engines, Raster Managers and Display Generator behind it are the back end.
 
@@ -23,7 +28,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: Fragment Generator, texture<br/>addressing, filtering, fog, alpha test<br/>Iris: tile workers; fog and smoothing by the model's rules"]
   G["<b>Per-fragment operations</b><br/>Hardware: Image Engines<br/>Iris: tile workers"]
   H[("<b>Frame buffer</b><br/>Hardware: Image Engines, one 256K x 32 SDRAM each<br/>Iris: one u32 array per pixel word")]
-  I["<b>Scan-out</b><br/>Hardware: Display Generator<br/>Iris: kona-display composes at retrace"]
+  I["<b>Scan-out</b><br/>Hardware: Display Generator<br/>Iris: Display-Refresh composes at retrace"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -51,7 +56,7 @@ flowchart LR
   TILES --> WORK["kona-tile-N<br/>shade, test, store"]
   WORK --> STORE
   TEX[("texture store")] --> WORK
-  STORE --> DISP["kona-display<br/>compose at retrace"]
+  STORE --> DISP["Display-Refresh<br/>compose at retrace"]
   DISP --> SCR["GfxDisplay screen"]
   DISP -- "retrace tag, video irq" --> HOST
 ```
@@ -72,7 +77,7 @@ Not modelled: which Raster Manager holds a pixel, raster-bus words and flow-cont
 flowchart LR
   cpu["CPU thread"] -->|ring| hip["kona-hip<br/>front end, token layer, set-up, integer fills"]
   hip -->|tile queues| tile["kona-tile-N<br/>shade and store"]
-  tile -.->|pixel store, read unlocked| disp["kona-display<br/>compose at retrace"]
+  tile -.->|pixel store, read unlocked| disp["Display-Refresh<br/>compose at retrace"]
   hip -.->|pixel store| disp
 ```
 
@@ -160,7 +165,9 @@ The code comments grade each choice. In short:
 - Completion is by draining the tiles. The retrace register changes at the next frame boundary, and the frame rate is a fixed 60 Hz.
 - One pixel store and one texture store stand in for the Raster Managers' memory. The products differ only in what they report (board set, board records, the class word the driver reads, texture size) and in the texture store's size; the three draw alike, because no source shows a difference in how the 2E or 3 renders. The 2E's raster slot word is the 2's (type 6, 64 MB), its geometry identity word is inferred, and its RM9 and TM7 revisions and chip words are unknown (the chip words are the 2's). Every product presents the DG5-8 display generator: the DG5-2 with a GVO option has its identity word checked in a test and is not presented, and presenting it would need the display channel arrays sized by the board. The GL renderer string's letter for the 2E comes from the guest's own reading of board set 4, not from the model.
 
-The pipe saves its own state, the pixel store and the cursor memory as chunks of a snapshot. The Onyx2 machine refuses a snapshot, because the Hubs and node memory have no saved state.
+The pipe can save its own state, pixel store and cursor memory as snapshot
+chunks. Neither host machine supports whole-machine snapshots: Onyx2 lacks
+saved Hub/node state and Onyx 3000 lacks saved Bedrock/node state.
 
 ## Fitting the board
 
@@ -174,11 +181,16 @@ profile = "onyx2_ip27"
 board = "ir2"            # one Raster Manager; "ir2:2rm" for two; "ir2e", "ir2e:2rm" for the 2E
 flash = "kona-flash.bin" # optional; keeps the pipe's flash between runs
 
-[onyx2]
-io_prom = "io6prom.img"  # the I/O PROM from the IRIX 6.5.30 media
+# [onyx2]
+# io_prom = "io6prom.img" # optional; the I/O PROM is built in
 ```
 
-`board` defaults to `none`, which leaves a test widget in the slot. `flash` names a file of exactly the flash's size (512 KiB), made blank when absent. Unset, the flash lives in memory. `io_prom` fits the I/O PROM in the BaseIO's boot flash. The graphics console needs it, because the node PROM's own copy has none. `threads` and `tile` set the tile workers. The [Onyx2 guide](../onyx2-ip27.md) and `FEATURES.md` have the rest.
+`board` defaults to `none`, which leaves a test widget in the slot. `flash` names a file of exactly the flash's size (512 KiB), made blank when absent. Unset, the flash lives in memory. The BaseIO's boot flash holds the I/O PROM built into iris, or the image `[onyx2] io_prom` names. The graphics console needs that PROM, because the node PROM's own copy has none. `threads` and `tile` set the tile workers. The [Onyx2 guide](../onyx2-ip27.md) and `FEATURES.md` have the rest.
+
+For an Onyx 3000, select `profile = "onyx3000_ip35"` and `board = "ir3"`.
+That profile defaults to IR3 and uses the I-brick rather than an Onyx2 BaseIO
+card. Its firmware, storage and graphics-console setup are described in the
+[Onyx 3000 guide](../onyx3000-ip35.md).
 
 ## Monitor commands and tests
 
@@ -190,4 +202,4 @@ Tests run under plain `cargo test`:
 - The back-end modules carry their own tests. `back/golden/` pins scene hashes for GL triangles through set-up, the scheduler and the per-pixel module, and checks a tiled run against an inline one. Those hashes are Iris's own, so they catch regressions and show nothing about correctness.
 - `back/replay.rs` replays recordings of a guest's traffic to the board, made by another emulator's model of it: the PROM, the desktop and the GL demos. It compares replies and interrupts in order, and compares the composed frames with the screen captures that came with the recordings, within a tolerance. Another model's output is not hardware evidence. The recordings are not in the repository. `KONA_RECORDINGS` and `KONA_GL_RECORDING` name them, `KONA_SHOT_DIR` keeps the frame the desktop test composes, and the tests skip with a printed reason when the files are absent.
 - `back/bench.rs` is an ignored fill-rate benchmark for the integer drawing path.
-- `src/ip27_deskside/tests.rs` covers the machine side: the pipe in the graphics slot, the board names, and DMA and interrupts reaching the Hub the guest names.
+- `src/ip27_machine/tests.rs` covers the machine side: the pipe in the graphics slot, the board names, and DMA and interrupts reaching the Hub the guest names.

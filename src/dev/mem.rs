@@ -34,6 +34,9 @@ pub struct Memory {
     /// a page is valid iff its recorded generation still matches this counter (§4.1, §6.5).
     #[cfg(feature = "jitv2")]
     gen: Vec<AtomicU64>,
+    /// JIT v2: this bank's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
 }
 
 // Safety: Memory is safe to share across threads because access is controlled
@@ -55,6 +58,8 @@ impl Memory {
             addr_mask: (size_bytes - 1) as u64,
             #[cfg(feature = "jitv2")]
             gen: (0..size_bytes.div_ceil(JITV2_PAGE_SIZE)).map(|_| AtomicU64::new(0)).collect(),
+            #[cfg(feature = "jitv2")]
+            code_bank: crate::traits::CodeBank::new(),
         }
     }
 
@@ -334,6 +339,18 @@ impl BusDevice for Memory {
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         Memory::gen_ptr(self, addr)
     }
+
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        let offset = addr & self.addr_mask & !(JITV2_PAGE_SIZE as u64 - 1);
+        let mut page = self.code_bank.page(offset, Memory::gen_ptr(self, addr));
+        // The buffer is allocated once and never resized.
+        if offset as usize + JITV2_PAGE_SIZE <= self.size_words * 4 {
+            page.words = unsafe { self.data().as_ptr().add(offset as usize / 4) };
+        }
+        Some(page)
+    }
 }
 
 // Implement BusDevice for Arc<Memory> to allow using Arc-wrapped memory directly
@@ -385,6 +402,11 @@ impl BusDevice for Arc<Memory> {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         (**self).gen_ptr(addr)
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        (**self).code_page(addr)
     }
 }
 

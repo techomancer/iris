@@ -4,7 +4,7 @@
 //! The Octane's boot flash: a 16-bit, big-endian part with the Intel/Sharp
 //! command set, for [`Bridge::attach_flash`], at physical 0x1fc0_0000.
 //!
-//! The fitted chip is not identified. This is a compatibility part chosen to
+//! The chip used is not identified. This is a compatibility part chosen to
 //! satisfy the stock PROM: a 1 MiB array of sixteen 64 KiB erase blocks, manufacturer
 //! `0x00b0` (Sharp) and device `0x66a8` as 16-bit identifier words, and the
 //! command subset the stock PROM drives (identify, read status, clear status,
@@ -89,6 +89,9 @@ pub struct CfiFlash {
     /// jitv2's code-generation counter for the whole part, bumped by every
     /// write cycle: a command changes what a read returns.
     gen: AtomicU64,
+    /// JIT v2: the part's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
 }
 
 /// The name this part had when it was only a PROM store.
@@ -114,10 +117,14 @@ impl CfiFlash {
     /// holding `image` from offset 0 and erased (0xff) above it.
     pub fn new(image: &[u8], size: usize) -> Self {
         assert!(size.is_power_of_two() && size >= BLOCK_SIZE, "flash size must be a power of two of at least one block");
-        assert!(image.len() <= size, "image must fit the part");
+        assert!(image.len() <= size, "image must be within the part's size");
         let mut data = vec![0xff; size];
         data[..image.len()].copy_from_slice(image);
-        Self { st: Mutex::new(State { data, mode: Mode::Array, status: SR_READY, backing: None }), gen: AtomicU64::new(0) }
+        Self { st: Mutex::new(State { data, mode: Mode::Array, status: SR_READY, backing: None }),
+            gen: AtomicU64::new(0),
+            #[cfg(feature = "jitv2")]
+            code_bank: crate::traits::CodeBank::new(),
+        }
     }
 
     /// A reset: back to read-array mode with the status clear. The array
@@ -250,6 +257,11 @@ impl BusDevice for CfiFlash {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
         &self.gen
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        (addr < self.st.lock().data.len() as u64).then(|| self.code_bank.page(addr, &self.gen))
     }
 }
 

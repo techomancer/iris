@@ -69,7 +69,14 @@ struct Selectors {
 }
 
 impl VirtioPci {
+    /// A function on interrupt pin A.
     pub fn new(core: VirtioCore) -> Self {
+        Self::with_pin(core, PCI_INTA)
+    }
+
+    /// A function whose interrupt is on `pin` (1 = INTA .. 4 = INTD), for a
+    /// slot whose INTA line is taken by the board.
+    pub fn with_pin(core: VirtioCore, pin: u8) -> Self {
         let id = core.device_id() as u16;
         // The capability list starts at 0x40: common, notify, ISR, device.
         let mut caps = Vec::new();
@@ -83,11 +90,20 @@ impl VirtioPci {
             CLASS_COMM_OTHER,
             1,
             [Bar::Mem(BAR_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused],
-            PCI_INTA,
+            pin,
         )
         .with_capabilities(16, &caps);
         // Subsystem: vendor and the virtio device ID.
         pci.set_subsystem_identity(((id as u32) << 16) | VENDOR_ID as u32);
+        // The function's DMA goes through the host bridge, where a bus
+        // address need not be the physical one: behind the Octane's Bridge a
+        // physical address below 1 GB is PCI-local space, and memory is
+        // reached through the direct windows. A driver that
+        // knows this flag (Linux) then gives the queue addresses its DMA
+        // mapping returns; without it Linux hands over physical addresses,
+        // which no bridge carries to memory. Not required: a driver that
+        // does not accept it is still taken.
+        core.offer(super::F_ACCESS_PLATFORM);
         Self { core, pci: PciFunctionState::new(pci), sel: Default::default() }
     }
 
@@ -317,6 +333,25 @@ mod tests {
         // BAR size probe.
         c.write(4, 0xffff_ffff);
         assert_eq!(c.read(4), !(BAR_SIZE - 1));
+    }
+
+    /// The PCI transport offers ACCESS_PLATFORM (bit 33) beside VERSION_1,
+    /// and takes a driver that accepts it as well as one that does not.
+    #[test]
+    fn offers_access_platform() {
+        use crate::dev::virtio::F_ACCESS_PLATFORM;
+        for accept in [F_VERSION_1 | F_ACCESS_PLATFORM, F_VERSION_1] {
+            let (dev, ..) = rig();
+            let w = |off: u32, v: u32, n: usize| dev.bar_write(0, off, v, n);
+            let r = |off: u32, n: usize| dev.bar_read(0, off, n);
+            w(0x00, 1, 4); // device_feature_select = 1
+            assert_eq!(r(0x04, 4), ((F_VERSION_1 | F_ACCESS_PLATFORM) >> 32) as u32);
+            w(0x14, 3, 1);
+            w(0x08, 1, 4);
+            w(0x0c, (accept >> 32) as u32, 4);
+            w(0x14, 0xb, 1);
+            assert_eq!(r(0x14, 1) & 8, 8, "FEATURES_OK with {accept:#x}");
+        }
     }
 
     #[test]

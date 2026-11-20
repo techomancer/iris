@@ -8,36 +8,34 @@
 //! Ported from hw/misc/sgi-bedrock-flash.c and hw/mips/sgi/initial-flash.c
 //! in jamesbraid/qemu-sgi-origami.
 
+#![warn(dead_code)]
+
 
 
 use super::sflash::amd::{AmdCore, Effect, SECTOR_SIZE};
 use super::sflash::storage::FlashBacking;
+use crate::cpu::parts;
+use crate::dev::heart::{host_clock, Clock};
 use crate::traits::{
-    BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK,
+    BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK,
 };
 use parking_lot::RwLock;
 use std::io;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 
 pub const PART_SIZE: usize = 8 << 20;
 pub const FLASH_SIZE: usize = 2 * PART_SIZE;
 
-/// The environment records that mark the processor positions `absent` (letters
-/// A to D) disabled, with their offsets in the store: the records the stock
-/// PROM writes itself after its failed-start recovery has given up on each
-/// empty position, at consecutive 64-byte slots from the first. Seeding a
-/// fresh store with them spares the PROM three power cycles per position.
-/// That a board ships in this state is a model policy, not a recovered
-/// factory image. The first two records are the ones a captured Origin 300
-/// PROM wrote for B and D; the offset of a third is extended from them, not
-/// observed.
+/// The environment records marking the processor positions `absent` (letters A to D) disabled, at
+/// consecutive 64-byte slots: what the PROM writes itself after giving up on an empty position,
+/// sparing three power cycles each. A model policy, not a recovered image; the third record's
+/// offset is extended from two captured Origin 300 records.
 ///
-/// Ported from tests/functional/mips64/lib_origin300.py in
-/// jamesbraid/qemu-sgi-origami.
+/// Ported from tests/functional/mips64/lib_origin300.py in jamesbraid/qemu-sgi-origami.
 pub fn disabled_positions_environment(absent: &str) -> Vec<(usize, Vec<u8>)> {
     const VALUE: &[u8] = b"32: CPU failed early init.";
     let record = |position: u8| {
@@ -58,54 +56,19 @@ fn sum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |s, b| s.wrapping_add(*b))
 }
 
-/// The fields of the PROM's configuration block that depend on the board.
-///
-/// The 80-byte record at flash 0x60 holds, in order: +0x00 0x15, +0x04 the
-/// CPU mode word, +0x08 "ip27conf", +0x10 CPU Hz, +0x18 bus Hz, +0x20
-/// 0x1312d0, +0x28 1, +0x2c flash timing 0x10, +0x30 machine type, +0x34 0,
-/// +0x3c write timing 0x10 (established from the PROM). "CPU configuration
-/// values mismatch" compares +0x00, 0x04, 0x08, 0x10, 0x18, 0x28, 0x2c, 0x30
-/// and 0x3c against a reference record the PROM builds from the board
-/// EEPROM's record, or, when it has none, from the speed-table row the
-/// board-id word selects. Either way the machine type in the reference is the
-/// one the board word's class gives. This struct sets the mode word, CPU Hz
-/// and machine type; the PROM image carries the rest, the 200 MHz hub clock
-/// among them (the same in every speed row).
-///
-/// The PROM reads the record before it touches the processor, so it must
-/// agree with the CPU the machine builds: a mismatch in the boot-mode word
-/// sends it to its error routine before it initialises GP. The values are
-/// not a measured flash dump: each field's doc says how far it is known. The
-/// Fuel's word selects its row by class 0x4000 and the processor's nibble.
-/// The Tezro's records reuse the mode words of speed-table rows with the
-/// same clock, cache size and tap, but a Tezro's board word is outside that
-/// class, so the PROM checks them against the node board's record and the
-/// class's machine type, not against a row. A real 800 MHz Fuel's mode word
-/// was 0x549baf85.
+/// The board-dependent fields of the PROM's 80-byte configuration block at flash 0x60. The PROM
+/// checks the mode word against the CPU before initialising it; values are not a flash dump.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirmwareRecord {
-    /// The CPU boot-mode word the PROM compares with the processor's mode.
-    /// Its bits 24:0 are the mode inputs the processor latches into CP0
-    /// Config at reset (the R10000 family's reset-mode inputs). The 500 MHz
-    /// value is chosen: this PROM accepts it with board nibble 4, but it was
-    /// not read from a 500 MHz Fuel. The 800 MHz row's real value, 0x549baf85,
-    /// differs from it in bits 16 and 10:9.
+    /// The CPU boot-mode word the PROM compares with the processor's mode; bits 24:0 are
+    /// latched into Config at reset. The Fuel's 500 MHz value is chosen, not read from a Fuel.
     pub cpu_mode_word: u32,
-    /// The processor clock the PROM reports and times against, in Hz. On the
-    /// Fuel it is the clock of the speed-table row the board-id word selects;
-    /// on the Tezro, the clock of the fitted part.
+    /// The processor clock the PROM reports and times against, in Hz.
     pub cpu_clock_hz: u32,
-    /// The record's word at +0x30, which the PROM's start-up check compares
-    /// with a machine class of its own. When the node board's L1 record
-    /// carries a CPU configuration, the PROM derives that class from the
-    /// board word's top nibble (0x4 gives 2, 0x8 gives 1, any other 0).
-    /// Established from the stock PROM 6.210's code: the class is 2 for every
-    /// row of the class-0x4000 speed table, so the Fuel's record is 2. With 1,
-    /// PROM 6.210 prints "CPU configuration values mismatch", which a real
-    /// Fuel's console does not. The name SN11 for type 2 is inferred from a
-    /// public flash transcript only: a Fuel's PROM flash session takes
-    /// 2 from "(0)SN1 (1)SN10 (2)SN11 (3)SN12" and its IRIX logs "Selecting
-    /// SN11" (just.graphica.com.au/tips/sgi-o350-chimera-notes).
+    /// The record's word at +0x30, the machine class the PROM derives from the board word's top
+    /// nibble (4 gives 2, 8 gives 1, else 0). The Fuel's 2 is established from PROM 6.210; 1 prints
+    /// "CPU configuration values from board EEPROM/PSC did not match". The name SN11 is inferred
+    /// from a public flash transcript.
     pub machine_type: u32,
     /// How the record reaches the configuration block.
     pub header: Header,
@@ -114,104 +77,48 @@ pub struct FirmwareRecord {
 /// How a board's record is put into the configuration block at 0x60.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Header {
-    /// Rewrite the board's fields over the payload's own block, keeping its
-    /// byte sum, whenever a store is formatted or opened. QEMU configures a
-    /// Fuel's flash this way.
+    /// Rewrite the board's fields over the payload's own block, keeping its byte sum, whenever a
+    /// store is opened.
     Refreshed,
-    /// Replace the whole block with the one authored for the board's flash
-    /// seed, once, when a store is formatted, with the compensation byte the
-    /// PROM's editor would choose (the block's byte sum is the replaced
-    /// block's, so the image still sums to zero). An opened store keeps the
-    /// block it holds, so a flash update the PROM wrote survives.
+    /// Replace the whole block once, when a store is formatted, with the PROM editor's compensation
+    /// byte; an opened store keeps its block so a PROM flash update survives.
     Authored,
 }
 
 impl FirmwareRecord {
     /// The Fuel's 500 MHz R14000 with a 2 MiB secondary cache.
     pub const FUEL: Self = Self {
-        cpu_mode_word: 0x549a_a985,
+        cpu_mode_word: parts::R14000_500_SYSCLK_200.mode_word,
         cpu_clock_hz: 500_000_000,
         machine_type: 2,
         header: Header::Refreshed,
     };
-    /// The Tezro's 700 MHz R16000 with a 4 MiB secondary cache. The mode word
-    /// is the row of the stock IP35 PROM's speed table for 700 MHz, 4 MiB and
-    /// cache tap 0xc (established), and its low 25 bits are the Config word the
-    /// Tezro board resets this chip with. The machine type is 0, the class the
-    /// PROM derives from the Tezro's board word 0x2001, so that the block
-    /// agrees with the CPU configuration the node board's L1 record carries
-    /// (see `ip53_machine`). The speed-table row itself carries 2, the class
-    /// of a board word in 0x4000, as the Fuel's is: copying it made the PROM
-    /// print "CPU configuration values mismatch" at every start. The PROM
-    /// derives the machine type from the board word's class: 2 for class 4,
-    /// 1 for class 8, 0 for any other (established for PROM 6.210 and 6.211).
-    /// A real IP53 or IP59 board's class is not 4, 8 or 0xc (established:
-    /// Tezro and Origin 350 PROM banners print neither the IP34 nor the IP45
-    /// mode line and do print the brick-type banner, which the PROM reaches
-    /// only for other classes), so its flash must hold 0; that a real Tezro
-    /// flash holds 0 is inferred (no mismatch notice in two real captures; no
-    /// flash has been read). The speed-table rows that carry 2 are reached
-    /// only through class 4: they are the Fuel's R16000 options, whose tuples
-    /// match Tezro boards because the same tuple means the same mode bits.
-    pub const TEZRO: Self = Self {
-        cpu_mode_word: 0x589b_ad85,
-        cpu_clock_hz: 700_000_000,
-        machine_type: 0,
-        header: Header::Authored,
-    };
-    /// The Tezro's 800 MHz R16000 with a 4 MiB secondary cache: the PROM speed
-    /// table's row for 800 MHz, 4 MiB and tap 0xa (established; the table has a
-    /// second row with tap 0xb and the same low 25 bits, and the 0xa one is
-    /// what 800 MHz Tezro inventories print).
-    pub const TEZRO_800: Self = Self {
-        cpu_mode_word: 0x549b_af85,
-        cpu_clock_hz: 800_000_000,
-        machine_type: 0,
-        header: Header::Authored,
-    };
-    /// The Tezro's 900 MHz R16000 with an 8 MiB secondary cache: the PROM
-    /// speed table's row for 900 MHz (established; it is the table's only 900
-    /// MHz row, tap 0xb, which a 900 MHz inventory prints). That a Tezro was
-    /// ever sold or flashed with this part is not established.
-    pub const TEZRO_900: Self = Self {
-        cpu_mode_word: 0x569c_b185,
-        cpu_clock_hz: 900_000_000,
-        machine_type: 0,
-        header: Header::Authored,
-    };
-    /// The Tezro's 1 GHz R16000 with a 16 MiB secondary cache. The PROM's
-    /// speed table, whose top clock is 900 MHz, has no row for it, and no
-    /// capture records the word: it is computed by formula, so the record is
-    /// approximated. The clock-dependent fields follow the formulas the
-    /// table's rows decode by, and bit 23 is set as in every row of 500 MHz
-    /// and up.
-    /// EC code 9 is 2 * 1000 / 200 - 1, SC code 5 gives the printed 333 MHz
-    /// cache clock (2 * 1000 / (SC + 1)), SS code 5 is 16 MiB, and the printed
-    /// tap 0x15 is 0x5 in bits 28:25 with the fifth bit at bit 22.
-    pub const TEZRO_1000: Self = Self {
-        cpu_mode_word: 0x4aed_b385,
-        cpu_clock_hz: 1_000_000_000,
-        machine_type: 0,
-        header: Header::Authored,
-    };
+    /// The Tezro's 700 MHz R16000, 4 MiB cache: the stock PROM's speed-table mode word
+    /// (established). Machine type 0, the class the PROM derives for the Tezro's board word, not
+    /// the table row's 2, which makes it print "CPU configuration values from board EEPROM/PSC did
+    /// not match" (flash contents inferred).
+    pub const TEZRO: Self = Self::tezro(parts::R16000_700_EARLY_SYSCLK_200.mode_word, 700_000_000);
+    /// The Tezro's 800 MHz R16000, 4 MiB cache: the speed table's tap 0xa row (established).
+    pub const TEZRO_800: Self = Self::tezro(parts::R16000_800_SYSCLK_200.mode_word, 800_000_000);
+    /// The Tezro's 900 MHz R16000, 8 MiB cache: the table's only 900 MHz row; no Tezro is known
+    /// sold with it.
+    pub const TEZRO_900: Self = Self::tezro(parts::R16000_900_SYSCLK_200.mode_word, 900_000_000);
+    /// The Tezro's 1 GHz R16000, 16 MiB cache. The table has no row and no capture records
+    /// the word: approximated by the formulas the other rows decode by, with bit 23 set.
+    pub const TEZRO_1000: Self = Self::tezro(parts::R16000_1000_SYSCLK_200.mode_word, 1_000_000_000);
 
-    /// CP0 Config at reset: the fixed 32 KiB primary cache sizes (fields 3
-    /// in bits 31:29 and 28:26) with the board's mode bits.
-    pub const fn reset_config0(&self) -> u32 {
-        (3 << 29) | (3 << 26) | self.reset_mode()
+    const fn tezro(cpu_mode_word: u32, cpu_clock_hz: u32) -> Self {
+        Self { cpu_mode_word, cpu_clock_hz, machine_type: 0, header: Header::Authored }
     }
+
     /// The mode bits the processor latches into Config at reset: the mode
     /// word's bits 24:0.
     pub const fn reset_mode(&self) -> u32 {
         self.cpu_mode_word & 0x01ff_ffff
     }
 
-    /// The configuration block written into an IP53 seed: the format word,
-    /// the board's mode word, the `ip27conf` magic, the processor and
-    /// 200 MHz controller clocks as 64-bit words, the real-time clock's
-    /// 1,250,000 Hz, the machine type, a zero compensation byte (the caller sets
-    /// it), an edit counter of one, and the PROM's 6.210 version fields.
-    /// The layout is the PROM editor's.
+    /// The block written into an IP53 seed (PROM editor layout; compensation byte left zero for the
+    /// caller).
     fn authored_block(&self) -> [u8; CONFIG_LEN] {
         let mut block = [0u8; CONFIG_LEN];
         let mut put = |offset: usize, bytes: &[u8]| block[offset..offset + bytes.len()].copy_from_slice(bytes);
@@ -247,9 +154,8 @@ fn format_header(data: &mut [u8], record: &FirmwareRecord) {
     match record.header {
         Header::Refreshed => configure(data, record),
         Header::Authored => {
-            // The compensation byte is the PROM editor's rule: the new block
-            // sums, byte for byte, to what the block it replaces did, so the
-            // image still sums to zero (the check the PROM runs on itself).
+            // The compensation byte is the PROM editor's rule: the new block sums to what the old
+            // one did, so the image sums to zero.
             let old = sum(&data[CONFIG_BASE..CONFIG_BASE + CONFIG_LEN]);
             let mut block = record.authored_block();
             block[0x37] = old.wrapping_sub(sum(&block));
@@ -329,15 +235,28 @@ impl State {
 }
 
 pub struct Flash {
-    /// A reader lock: every processor fetches PROM code from the flash at
-    /// once while the boot master runs, and an array read changes nothing.
-    /// Status and query reads toggle a part's state and take the writer
-    /// lock, as do commands, resets and the erase clock.
+    /// A reader lock: every processor fetches PROM code at once. Status and query reads toggle part
+    /// state and take the writer lock, as do commands, resets and the erase clock.
     st: RwLock<State>,
     gen: AtomicU64,
+    /// JIT v2: the flash's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
+    /// The host time the model clock last stood at: [`Self::advance_to`]
+    /// advances it from there.
+    clock: AtomicU64,
+    /// The machine's clock, which stop and start read: a clock of their own would start at zero.
+    machine_clock: OnceLock<Clock>,
 }
 
 impl Flash {
+    /// Read the machine's clock on stop and start.
+    pub fn use_clock(&self, clock: Clock) {
+        let _ = self.machine_clock.set(clock);
+    }
+    fn now(&self) -> u64 {
+        self.machine_clock.get().map_or_else(|| host_clock()(), |c| c())
+    }
     /// Format a fresh two-position store from a decoded payload, with the
     /// board's firmware record.
     pub fn new(payload: &[u8], record: FirmwareRecord) -> io::Result<Self> {
@@ -366,13 +285,16 @@ impl Flash {
         Ok(Self {
             st: RwLock::new(State::new(data)),
             gen: AtomicU64::new(0),
+            #[cfg(feature = "jitv2")]
+            code_bank: crate::traits::CodeBank::new(),
+            clock: AtomicU64::new(0),
+            machine_clock: OnceLock::new(),
         })
     }
 
-    /// Load an exact 16 MiB store, or seed a missing/empty one. Wrong sizes are
-    /// refused without writes. Reopening reapplies a refreshed firmware record
-    /// and leaves an authored one as the store holds it.
-    /// Completed guest programming and erasure write through to this file.
+    /// Load an exact 16 MiB store, or seed a missing or empty one; wrong sizes are refused without
+    /// writes. Reopening reapplies a refreshed record and keeps an authored one. Completed
+    /// programming and erasure write through.
     pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
         Self::with_file_seeded(payload, path, record, &[])
     }
@@ -395,15 +317,9 @@ impl Flash {
         // Opening an existing store loads it before a refreshed record's
         // fields are applied; an empty store was seeded from this same data.
         backing.write_range(0, &data)?;
-        let flash = Self {
-            st: RwLock::new(State {
-                data,
-                parts: std::array::from_fn(|_| AmdCore::default()),
-                backing: Some(backing),
-            }),
-            gen: AtomicU64::new(0),
-        };
-        Ok(flash)
+        let mut st = State::new(data);
+        st.backing = Some(backing);
+        Ok(Self { st: RwLock::new(st), gen: AtomicU64::new(0), #[cfg(feature = "jitv2")] code_bank: crate::traits::CodeBank::new(), clock: AtomicU64::new(0), machine_clock: OnceLock::new() })
     }
 
     pub fn contents(&self) -> Vec<u8> {
@@ -419,10 +335,18 @@ impl Flash {
         }
         self.gen.fetch_add(1, Ordering::Release);
     }
-    /// Advance the model clock independently of flash reads. The boards
-    /// call this from their poll, as often as every CPU batch; with no
-    /// erase in flight it only looks, under the reader lock, so it does not
-    /// stall the processors fetching from the array.
+    /// The machine's clock reads `now` nanoseconds and the flash is to take
+    /// up from there: time while the machine is stopped does not count.
+    pub fn hold_clock(&self, now: u64) {
+        self.clock.store(now, Ordering::Release);
+    }
+    /// Advance the model clock to host time `now`, from where it last stood.
+    pub fn advance_to(&self, now: u64) {
+        let previous = self.clock.swap(now, Ordering::AcqRel);
+        self.advance_ns(now.saturating_sub(previous));
+    }
+    /// Advance the model clock independently of flash reads, from the boards' poll; with no erase
+    /// in flight it only looks, under the reader lock.
     pub fn advance_ns(&self, ns: u64) {
         if !self.st.read().parts.iter().any(AmdCore::busy) {
             return;
@@ -477,6 +401,24 @@ impl Flash {
 impl Resettable for Flash {
     fn power_on(&self) {
         self.reset();
+    }
+}
+
+impl Device for Flash {
+    fn step(&self, _: u64) {}
+    /// The machine starts: time while it was stopped does not count.
+    fn start(&self) {
+        self.hold_clock(self.now());
+    }
+    /// The machine stops: the model clock catches up to host time.
+    fn stop(&self) {
+        self.advance_to(self.now());
+    }
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn get_clock(&self) -> u64 {
+        self.clock.load(Ordering::Acquire)
     }
 }
 
@@ -611,13 +553,16 @@ impl BusDevice for FlashView {
     fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
         &self.flash.gen
     }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        self.offset(addr, 1).map(|off| self.flash.code_bank.page(off as u64, &self.flash.gen))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    // Cases follow tests/qtest/sn1-bedrock-flash-test.c in
-    // jamesbraid/qemu-sgi-origami: program, sector-erase, erase-polling,
-    // reset-states and backing-file.
+    // Cases follow tests/qtest/sn1-bedrock-flash-test.c in jamesbraid/qemu-sgi-origami: program,
+    // sector-erase, erase-polling, reset-states and backing-file.
     use super::*;
     fn unlock(v: &FlashView, part: u64) {
         assert_eq!(v.write64(part + 8 * 0x555, 0xaa), crate::traits::BUS_OK);
@@ -638,10 +583,8 @@ mod tests {
         assert_eq!(v.write64(part + 4 * offset, 0x30), BUS_OK);
     }
 
-    /// A board names the positions it leaves empty: B and D give the two
-    /// records a captured Origin 300 PROM wrote, a one-processor C-brick's B,
-    /// C and D one record each at consecutive slots, and a store that
-    /// already exists keeps what it holds. `new` and `with_file` seed nothing.
+    /// A board names its empty positions (B and D give an Origin 300's two records) and an existing
+    /// store keeps what it holds.
     #[test]
     fn a_board_names_its_empty_positions() {
         let records = disabled_positions_environment("BD");
@@ -670,8 +613,7 @@ mod tests {
         }
     }
 
-    /// A store file that already exists keeps what it holds; a missing one is
-    /// seeded.
+    /// A store file that already exists keeps what it holds; a missing one is seeded.
     #[test]
     fn an_existing_store_file_keeps_what_it_holds() {
         let dir = crate::test_temp::TempPath::dir("flash-seed");
@@ -717,8 +659,7 @@ mod tests {
         image
     }
 
-    /// A refreshed record leaves the block's byte sum unchanged: the check
-    /// adjustment absorbs the difference.
+    /// A refreshed record leaves the block's byte sum unchanged.
     #[test]
     fn a_refreshed_record_configures_the_block_and_keeps_its_byte_sum() {
         let record = FirmwareRecord::FUEL;
@@ -733,61 +674,16 @@ mod tests {
         assert_eq!(sum(block), sum(&image[0x60..0xb0]));
     }
 
-    /// The compensation keeps the image's byte sum whatever block the
-    /// payload carried, and changing any one byte of a seeded block off its
-    /// compensated value breaks the sum.
-    #[test]
-    fn the_compensation_byte_keeps_the_images_sum_and_any_change_breaks_it() {
-        // An image that sums to zero, as the PROM's own does, still sums to
-        // zero once the record's fields are seeded into it.
-        let mut zero = vec![0x21; 0x200];
-        zero[0x60..0xb0].copy_from_slice(&factory_block()[0x60..0xb0]);
-        zero[0x1ff] = 0u8.wrapping_sub(sum(&zero[..0x1ff]));
-        assert_eq!(sum(&zero), 0);
-        assert_eq!(sum(&Flash::new(&zero, FirmwareRecord::FUEL).unwrap().contents()[..0x200]), 0);
-        for payload in [zero.clone(), vec![0x5a; 0x200], factory_block()] {
-            let end = 0x200.min(payload.len());
-            let before = sum(&payload[..end]);
-            let bytes = Flash::new(&payload, FirmwareRecord::FUEL).unwrap().contents();
-            assert_eq!(sum(&bytes[..end]), before, "the image's byte sum");
-            // A record that differs in one field is compensated to the same sum.
-            let other = FirmwareRecord { cpu_mode_word: FirmwareRecord::FUEL.cpu_mode_word ^ 0x0100_0000, ..FirmwareRecord::FUEL };
-            assert_eq!(sum(&Flash::new(&payload, other).unwrap().contents()[..end]), before, "another mode word");
-            for at in 0x60..0xb0 {
-                let mut broken = bytes[..end].to_vec();
-                broken[at] ^= 1;
-                assert_ne!(sum(&broken), before, "byte {at:#x}");
-            }
-        }
-    }
-
-    /// The Config the CPU resets to carries the mode word's low 25 bits under
-    /// the fixed primary cache sizes, so the PROM's check of one against the
-    /// other passes: the Fuel's 500 MHz record gives 0x6c9aa985.
+    /// The CPU's reset Config carries the mode word's low 25 bits, so the PROM's check passes: the
+    /// Fuel gives 0x6c9aa985.
     #[test]
     fn the_reset_config_carries_the_mode_words_low_bits() {
         assert_eq!(FirmwareRecord::FUEL.reset_mode(), 0x009a_a985);
-        assert_eq!(FirmwareRecord::FUEL.reset_config0(), 0x6c9a_a985);
+        assert_eq!(crate::cpu::parts::R14000_500_SYSCLK_200.config(), 0x6c9a_a985);
         let other = FirmwareRecord { cpu_mode_word: 0xfe00_0000 | 0x0012_3456, ..FirmwareRecord::FUEL };
         assert_eq!(other.reset_mode(), 0x0012_3456);
     }
 
-    /// Reopening a store reapplies the record, so a store follows the
-    /// machine that opens it.
-    #[test]
-    fn reopening_a_store_reapplies_the_record() {
-        let dir = std::env::temp_dir().join(format!("bedrock-flash-record-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("fuel.bin");
-        let other = FirmwareRecord { cpu_mode_word: 0x1234_5678, machine_type: 0, ..FirmwareRecord::FUEL };
-        drop(Flash::with_file(&factory_block(), &path, other).unwrap());
-        assert_eq!(&std::fs::read(&path).unwrap()[0x64..0x68], &0x1234_5678u32.to_be_bytes());
-        let fuel = Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap().contents();
-        assert_eq!(&fuel[0x64..0x68], &0x549aa985u32.to_be_bytes());
-        assert_eq!(&fuel[0x90..0x94], &2u32.to_be_bytes(), "machine type: SN11");
-        assert_eq!(std::fs::read(&path).unwrap(), fuel, "the store holds what the machine sees");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
     const TEZRO_RECORDS: [(&str, FirmwareRecord); 4] = [
         ("700", FirmwareRecord::TEZRO),
         ("800", FirmwareRecord::TEZRO_800),
@@ -795,9 +691,8 @@ mod tests {
         ("1000", FirmwareRecord::TEZRO_1000),
     ];
 
-    /// The stock block the PROM ships: the 400 MHz R10000 and R12000 row,
-    /// machine type 0, no compensation, edit counter 0. Built field by field, not
-    /// copied; its byte sum is 0xac, as the PROM's own checksum rule sees it.
+    /// The stock PROM block: 400 MHz R10000/R12000 row, machine type 0, edit counter 0, byte sum
+    /// 0xac; built field by field.
     fn stock_block() -> [u8; CONFIG_LEN] {
         let mut block = FirmwareRecord { cpu_mode_word: 0x5219_a785, cpu_clock_hz: 400_000_000, machine_type: 0, ..FirmwareRecord::TEZRO }
             .authored_block();
@@ -814,14 +709,8 @@ mod tests {
         image
     }
 
-    /// The seed's block follows the PROM editor's layout and rule: the mode
-    /// word, the clock, the Bedrock and real-time clocks, machine type 0 (the
-    /// class the PROM derives from the Tezro's board word) and an edit
-    /// counter of one, and a compensation byte that makes the block sum to
-    /// what the stock block did, 0xac, so the image keeps summing to zero:
-    /// 0xac less the sum of the other bytes. The PROM's editor, copying a
-    /// speed-table row's class 2, computes 0xd8, 0xfd (the 800 MHz row) and
-    /// 0x1c for one edit of a stock-seeded image; class 0 makes each two more.
+    /// The seed follows the PROM editor's layout, machine type 0, and a compensation byte keeping
+    /// the stock sum 0xac.
     #[test]
     fn the_tezro_seed_writes_the_blocks_the_proms_editor_would() {
         let image = stock_image();
@@ -843,22 +732,25 @@ mod tests {
         }
     }
 
-    /// The compensation follows whatever block the payload carried (the whole
-    /// image keeps its sum), and changing any one byte of a seeded block off
-    /// its compensated value breaks the sum.
+    /// The compensation keeps the image's byte sum whatever block the payload carried; changing any
+    /// seeded byte breaks it.
     #[test]
-    fn a_tezro_compensation_byte_keeps_the_images_sum_and_any_change_breaks_it() {
-        // An image that sums to zero, as the PROM's own does, still sums to
-        // zero once a record's block is seeded into it.
-        let mut zero = stock_image();
-        zero[0x1ff] = 0u8.wrapping_sub(sum(&zero[..0x1ff]));
-        assert_eq!(sum(&zero), 0);
-        for (name, record) in TEZRO_RECORDS {
-            assert_eq!(sum(&Flash::new(&zero, record).unwrap().contents()[..0x200]), 0, "{name}: the seeded image sums to zero");
+    fn the_compensation_byte_keeps_the_images_sum_and_any_change_breaks_it() {
+        // An image that sums to zero, as the PROM's own does, still sums to zero once seeded.
+        let mut factory_zero = vec![0x21; 0x200];
+        factory_zero[0x60..0xb0].copy_from_slice(&factory_block()[0x60..0xb0]);
+        let mut stock_zero = stock_image();
+        let records = [("fuel", FirmwareRecord::FUEL)].into_iter().chain(TEZRO_RECORDS);
+        for zero in [&mut factory_zero, &mut stock_zero] {
+            zero[0x1ff] = 0u8.wrapping_sub(sum(&zero[..0x1ff]));
+            assert_eq!(sum(zero), 0);
+            for (name, record) in records.clone() {
+                assert_eq!(sum(&Flash::new(zero, record).unwrap().contents()[..0x200]), 0, "{name}: the seeded image sums to zero");
+            }
         }
         for payload in [stock_image(), vec![0x5a; 0x200], factory_block()] {
             let before = sum(&payload[..0x200.min(payload.len())]);
-            for (name, record) in TEZRO_RECORDS {
+            for (name, record) in records.clone() {
                 let bytes = Flash::new(&payload, record).unwrap().contents();
                 let end = 0x200.min(payload.len());
                 assert_eq!(sum(&bytes[..end]), before, "{name}: the image's byte sum");
@@ -874,21 +766,23 @@ mod tests {
         }
     }
 
-    /// The Tezro records carry the PROM table's mode words and the Config the
-    /// CPU resets to carries the same low 25 bits, so the PROM's check of one
-    /// against the other passes; the mode words of the three chips the PROM's
-    /// speed table lists are its rows, and the 1 GHz one decodes by the
-    /// editor's formulas.
+    /// The Tezro records carry the PROM table's mode words, matching the CPU's reset Config; the 1
+    /// GHz one decodes by the formulas.
     #[test]
     fn the_tezro_records_carry_their_mode_words_and_the_configs_they_imply() {
         // Config bits 24:0 are the mode inputs; the cache sizes above are fixed.
         const CONFIG0_MODE_MASK: u32 = 0x01ff_ffff;
         // (mode word, clock MHz, Bedrock MHz = 200): the PROM table's rows.
         let rows = [(0x589bad85u32, 700u32, 0x6c9b_ad85u32), (0x549baf85, 800, 0x6c9b_af85), (0x569cb185, 900, 0x6c9c_b185)];
-        for ((_, record), (word, mhz, config)) in TEZRO_RECORDS.iter().zip(rows) {
+        let modules = [
+            &crate::cpu::parts::R16000_700_EARLY_SYSCLK_200,
+            &crate::cpu::parts::R16000_800_SYSCLK_200,
+            &crate::cpu::parts::R16000_900_SYSCLK_200,
+        ];
+        for (((_, record), module), (word, mhz, config)) in TEZRO_RECORDS.iter().zip(modules).zip(rows) {
             assert_eq!(record.cpu_mode_word, word);
             assert_eq!(record.cpu_clock_hz, mhz * 1_000_000);
-            assert_eq!(record.reset_config0(), config);
+            assert_eq!(module.config(), config);
         }
         let field = |word: u32, lo: u32, bits: u32| (word >> lo) & ((1 << bits) - 1);
         let decoded = [(350, 4u32 << 20), (400, 4 << 20), (450, 8 << 20), (333, 16 << 20)];
@@ -904,22 +798,20 @@ mod tests {
         let tap = |word: u32| field(word, 25, 4) | (field(word, 22, 1) << 4);
         assert_eq!(TEZRO_RECORDS.map(|(_, r)| tap(r.cpu_mode_word)), [0xc, 0xa, 0xb, 0x15]);
         assert_eq!(FirmwareRecord::TEZRO_1000.cpu_mode_word, 0x4aed_b385);
-        assert_eq!(FirmwareRecord::TEZRO_1000.reset_config0(), 0x6ced_b385);
+        assert_eq!(crate::cpu::parts::R16000_1000_SYSCLK_200.config(), 0x6ced_b385);
     }
 
-    /// Reopening a store reapplies a refreshed record, so a Fuel follows the
-    /// machine that opens it, and leaves an authored block as stored, so a
-    /// block the PROM rewrote on a Tezro survives the next start.
+    /// Reopening reapplies a refreshed record (a Fuel) and keeps an authored block (a Tezro's PROM
+    /// rewrite) as stored.
     #[test]
     fn reopening_keeps_a_tezros_stored_block_and_refreshes_a_fuels() {
-        let dir = std::env::temp_dir().join(format!("bedrock-flash-tezro-record-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_temp::TempPath::dir("flash-record");
         let fuel_path = dir.join("fuel.bin");
         drop(Flash::with_file(&factory_block(), &fuel_path, FirmwareRecord::TEZRO).unwrap());
         let fuel = Flash::with_file(&[], &fuel_path, FirmwareRecord::FUEL).unwrap().contents();
         assert_eq!(&fuel[0x64..0x68], &0x549aa985u32.to_be_bytes());
         assert_eq!(&fuel[0x90..0x94], &2u32.to_be_bytes(), "machine type: SN11");
-
+        assert_eq!(std::fs::read(&fuel_path).unwrap(), fuel, "the store holds what the machine sees");
         let tezro_path = dir.join("tezro.bin");
         let seeded = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
         assert_eq!(std::fs::read(&tezro_path).unwrap(), seeded, "the seed is what the store holds");
@@ -928,10 +820,8 @@ mod tests {
         std::fs::write(&tezro_path, &stored).unwrap();
         let reopened = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
         assert_eq!(reopened, stored);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
-    /// The PROM programs through one view while executable aliases must
-    /// keep reading array bytes.
+    /// The PROM programs through one view while executable aliases keep reading array bytes.
     #[test]
     fn programming_changes_shared_bytes_without_exposing_status_to_instruction_fetches() {
         {
@@ -1008,11 +898,8 @@ mod tests {
             assert_eq!(v.read16(0x20).data, 0xffff);
         }
     }
-    /// Array reads share the reader lock; a status read of a busy part takes
-    /// the writer lock and toggles it exactly once. Three threads fetch
-    /// through the executable alias and the other position, as processors do
-    /// during the PROM phase, while this one polls an erase; every fetch sees
-    /// the stored bytes and every poll sees the toggle bits flip.
+    /// Array reads share the reader lock; a busy part's status read takes the writer lock and
+    /// toggles once.
     #[test]
     fn status_reads_toggle_once_each_while_other_threads_read_the_array() {
         let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
@@ -1051,8 +938,7 @@ mod tests {
         assert_eq!(v.read16(0x200).data, 0xffff, "the erase completed");
         assert_eq!(execute.read16(0x200).data, 0xffff);
     }
-    /// With nothing in flight the board poll's clock advance does not take
-    /// the writer lock: a held reader does not block it.
+    /// With nothing in flight the board poll's clock advance does not take the writer lock.
     #[test]
     fn an_idle_flash_advances_its_clock_under_the_reader_lock() {
         let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
@@ -1064,8 +950,7 @@ mod tests {
         f.advance_ns(50_000 + 512_000_000);
         assert_eq!(v.read16(0x200).data & 0x80, 0x80, "an erase still completes");
     }
-    /// The PROM polls erase completion and can reset the chip before
-    /// selected sectors change.
+    /// The PROM polls erase completion and can reset the chip before selected sectors change.
     #[test]
     fn erase_completes_only_for_selected_sectors_and_reset_cancels_it() {
         let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
@@ -1116,12 +1001,11 @@ mod tests {
         assert_eq!(v.read16(0x200).data, 0xffff);
         assert_eq!(v.read16(0x10000).data, 0x3456);
     }
-    /// Firmware updates must persist across emulator restarts without
-    /// overwriting a supplied image.
+    /// Firmware updates persist across restarts without overwriting a supplied image.
     #[test]
     fn completed_programming_and_erases_survive_reopening_the_backing_file() {
         {
-            let path = std::env::temp_dir().join(format!("iris-bedrock-store-{}", std::process::id()));
+            let path = crate::test_temp::TempPath::new("bedrock-store");
             let mut bytes = vec![0x5a; FLASH_SIZE];
             bytes[PART_SIZE] = 0xc7;
             std::fs::write(&path, &bytes).unwrap();
@@ -1138,10 +1022,9 @@ mod tests {
             assert_eq!(g.contents()[0], 0x34);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), FLASH_SIZE as u64);
             drop(g);
-            std::fs::remove_file(path).unwrap();
         }
         {
-            let path = std::env::temp_dir().join(format!("iris-amd-persist-{}", std::process::id()));
+            let path = crate::test_temp::TempPath::new("amd-persist");
             std::fs::write(&path, []).unwrap();
             let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
@@ -1173,18 +1056,16 @@ mod tests {
                 v.read16(SECOND_POSITION + PART_SIZE as u64 - 2).data,
                 0xffff
             );
-            std::fs::remove_file(path).unwrap();
         }
     }
 
-    /// A host write failure must preserve flash contents and remain visible
-    /// to the guest.
+    /// A host write failure preserves flash contents and is visible to the guest.
     #[test]
     fn failed_backing_writes_leave_array_bytes_unchanged() {
         {
             let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             // A read-only descriptor makes writes fail without a special backend.
-            let path = std::env::temp_dir().join(format!("iris-amd-read-only-{}", std::process::id()));
+            let path = crate::test_temp::TempPath::new("amd-read-only");
             std::fs::write(&path, []).unwrap();
             f.st.write().backing = Some(FlashBacking::from_file(
                 std::fs::File::open(&path).unwrap(),
@@ -1195,14 +1076,13 @@ mod tests {
             assert_eq!(v.write64(8 * 0x555, 0xa0), BUS_OK);
             assert_eq!(v.write64(4 * 0x200, 0x1234), BUS_ERR);
             assert_eq!(v.read16(0x200).data, 0xffff);
-            std::fs::remove_file(path).unwrap();
         }
         {
             let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             program(&v, 0, 0x200, 0);
             let path =
-                std::env::temp_dir().join(format!("iris-amd-erase-failure-{}", std::process::id()));
+                crate::test_temp::TempPath::new("amd-erase-failure");
             std::fs::write(&path, []).unwrap();
             f.st.write().backing = Some(FlashBacking::from_file(
                 std::fs::File::open(&path).unwrap(),
@@ -1214,8 +1094,6 @@ mod tests {
             assert_eq!(f.contents()[0x200], 0);
             assert_eq!(v.write64(0, 0xf0), BUS_OK);
             assert_eq!(v.read16(0x200).data, 0);
-            std::fs::remove_file(path).unwrap();
         }
     }
-
 }

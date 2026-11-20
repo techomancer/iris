@@ -513,22 +513,6 @@ fn reset_returns_the_generators_to_the_default_rate() {
 }
 
 #[test]
-fn the_wav_capture_stays_at_44100_whatever_the_card_rate() {
-    let dir = std::env::temp_dir().join(format!("rad1-wav-rate-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("o.wav");
-    let mut sink = Sink { host: None, wav: Wav::create(path.as_os_str()), tap: None };
-    sink.play(&[0i16; 2 * 2205], 22050, false);
-    sink.play(&[0i16; 2 * 4410], 44100, false);
-    drop(sink);
-    let b = std::fs::read(&path).unwrap();
-    assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 44100);
-    let frames = u32::from_le_bytes(b[40..44].try_into().unwrap()) / 4;
-    assert!((8818..=8822).contains(&frames), "{frames} frames for 200 ms");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn aes_subcode_runs_at_250_hz_without_a_position_latch() {
     let (r, ram) = dma_card();
     program(&r, &RING_AES_SUB, 0x12_0000, 0xffff_f030);
@@ -794,6 +778,8 @@ fn a_long_catch_up_skips_whole_revolutions() {
     assert_eq!(c.offset, (due * 8) % c.len);
     assert!(dma.1.load(Ordering::Relaxed) < 16, "{} transfers", dma.1.load(Ordering::Relaxed));
     assert_eq!(word(&ram, 0x11_0000 + 0x800), 0, "the whole ring is silence");
+    let moved = r.meter.get(CH_IN);
+    assert!(moved < 2 * 512 && r.audio_report().unwrap().contains(&format!("stale {},", due - moved)));
 }
 
 // PCM conversion and host output.
@@ -851,7 +837,8 @@ fn host_frames_encode_into_ring_frames() {
 fn output_ring_reaches_the_sink() {
     let (r, ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
+    let (dump, recorded) = crate::dev::audio_dump::tests::dump();
+    *r.sink.lock() = Some(Sink { host: None, dump: Some(dump), tap: Some(tap.clone()) });
     // A 512-frame ring (4 KiB), each frame left = n, right = -n.
     {
         let mut m = ram.0.lock().unwrap();
@@ -883,37 +870,23 @@ fn output_ring_reaches_the_sink() {
     assert_eq!(t[511 * 2], 511);
     assert_eq!(t[512 * 2], 0, "frame 512 is ring frame 0");
     assert_eq!(t[513 * 2], 1);
+    // The recorder holds those frames and no others, at the card's rate.
+    let recs = recorded.records();
+    assert!(recs.iter().all(|(rate, _)| *rate == 44100));
+    let dumped: Vec<i16> = recs.iter().flat_map(|(_, f)| f.iter().flat_map(|&(l, r)| [l, r])).collect();
+    assert_eq!(dumped, *t);
 }
 
 #[test]
 fn input_ring_is_not_played() {
     let (r, _ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, dump: None, tap: Some(tap.clone()) });
     program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
     wr(&r, 0x4c, 1);
     at(&r, 1_000_000);
     rd(&r, 0x14);
     assert!(tap.lock().is_empty());
-}
-
-#[test]
-fn wav_file_has_a_valid_header_and_data() {
-    let dir = std::env::temp_dir().join(format!("rad1-wav-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("o.wav");
-    let mut w = Wav::create(path.as_os_str()).unwrap();
-    w.append(&[1, -1, 2, -2]);
-    // The sizes are in place once the file is closed.
-    drop(w);
-    let b = std::fs::read(&path).unwrap();
-    assert_eq!(&b[..4], b"RIFF");
-    assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 36 + 8);
-    assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 44100);
-    assert_eq!(u32::from_le_bytes(b[40..44].try_into().unwrap()), 8);
-    assert_eq!(i16::from_le_bytes(b[46..48].try_into().unwrap()), -1);
-    assert_eq!(b.len(), 52);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // Cases from the QEMU PCM conversion unit test: two frames with opposite-sign
@@ -998,7 +971,7 @@ const SEC: i64 = 1_000_000_000;
 
 fn tapped(r: &Rad1) -> Arc<parking_lot::Mutex<Vec<i16>>> {
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, dump: None, tap: Some(tap.clone()) });
     tap
 }
 
@@ -1094,6 +1067,10 @@ fn a_link_to_an_unprogrammed_descriptor_plays_one_lap_and_stops() {
     assert_eq!(tap.lock().len(), TUNE_FRAMES * 2, "the first lap only");
     assert_eq!(rd(&r, 0x58) & 1, 1, "nothing is reported as finished");
     assert!(r.state.lock().chan[CH_OUT].stalled);
+    // What the clock made due after the lap ended is dropped, once.
+    assert_eq!(r.meter.get(CH_OUT), TUNE_FRAMES as u64);
+    let dry = r.state.lock().chan[CH_OUT].frames - TUNE_FRAMES as u64;
+    assert!(r.audio_report().unwrap().contains(&format!("dry {dry},")));
 }
 
 #[test]
@@ -1115,30 +1092,29 @@ fn a_link_loads_the_descriptor_ram_entry_it_names() {
 
 #[test]
 fn the_relay_and_dac_mute_words_silence_the_output_but_not_the_transfer() {
-    let path = std::env::temp_dir().join(format!("rad1-mute-{}.wav", std::process::id()));
     // The relay (0x88) and the DAC (0x8c): the word that mutes, the word that releases.
     for (reg, mute, release) in [(0x88, 2, 3), (0x8c, 3, 2)] {
         let (r, ram, tap) = tune_card();
         ram.0.lock().unwrap()[0x10_0000..0x10_1000].fill(0x55);
-        r.sink.lock().as_mut().unwrap().wav = Wav::create(path.as_os_str());
+        let (dump, recorded) = crate::dev::audio_dump::tests::dump();
+        r.sink.lock().as_mut().unwrap().dump = Some(dump);
         program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
         wr(&r, 0x58, 0x2000_0001);
-        let wav_at = |ms: i64| {
+        let dumped_at = |ms: i64| {
             at(&r, ms * SEC / 1000);
             rd(&r, 0x58);
-            std::fs::read(&path).unwrap()
+            recorded.records().iter().flat_map(|(_, f)| f.iter().flat_map(|&(l, r)| [l, r])).collect::<Vec<i16>>()
         };
-        let a = wav_at(10);
-        assert!(a[44..].iter().any(|&b| b != 0), "not muted at power-on");
+        let a = dumped_at(10);
+        assert!(a.iter().any(|&v| v != 0), "not muted at power-on");
         wr(&r, reg, mute);
-        let b = wav_at(20);
+        let b = dumped_at(20);
         assert!(b.len() > a.len() && b[a.len()..].iter().all(|&x| x == 0), "{reg:#x} silences");
         wr(&r, reg, release);
-        let c = wav_at(30);
+        let c = dumped_at(30);
         assert!(c[b.len()..].iter().any(|&x| x != 0), "{reg:#x} releases");
         assert!(r.state.lock().chan[CH_OUT].running && tap.lock().len() > 2 * 441 * 2);
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 thread_local! {
@@ -1256,6 +1232,35 @@ fn the_clock_never_reads_behind_a_time_it_handed_out() {
     let seen = r.seen_ns.load(Ordering::SeqCst);
     let v = r.save_state();
     assert_eq!(crate::snapshot::field_u64(&v, "clock_ns").unwrap() as i64, seen.max(r.now()));
+}
+
+/// A register read in a hold-up must not carry the output through it, or the
+/// late completion has nothing left to hold.
+#[test]
+fn a_register_read_in_a_hold_up_leaves_the_late_completion_free_to_hold() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1) + 5_000_000);
+    rd(&r, 0x18);
+    assert!(r.state.lock().chan[CH_OUT].frames <= 12, "moved over the hold-up");
+    assert_eq!(r.status_tick(gen), Some(irix_due(2)));
+    assert!(held(&r) >= 5_000_000 - irix_due(1), "held {} ns", held(&r));
+}
+
+/// The timer's reschedule after a long completion must not hand out the time
+/// the next, already late, completion should hold.
+#[test]
+fn rescheduling_after_a_long_completion_leaves_the_next_one_free_to_hold() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1));
+    let next = r.status_tick(gen).unwrap();
+    let frames = r.state.lock().chan[CH_OUT].frames;
+    at(&r, irix_due(1) + 5_000_000);
+    assert_eq!(r.wait_until(next), Duration::ZERO, "the next completion is overdue");
+    r.status_tick(gen).unwrap();
+    assert!(r.state.lock().chan[CH_OUT].frames <= frames + 12, "moved over the hold-up");
+    assert!(held(&r) >= 5_000_000 - 2 * irix_due(1), "held {} ns", held(&r));
 }
 
 #[test]
@@ -1480,7 +1485,7 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
     r.state().connect_dma(ram.clone());
     // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
     let (out, mut host) = detached(44_100, 2);
-    *r.sink.lock() = Some(Sink { host: Some(out), wav: None, tap: None });
+    *r.sink.lock() = Some(Sink { host: Some(out), dump: None, tap: None });
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
     let writes = [(0x8c, 3), (0x8c, 2), (0x8c, 3), (0x88, 2), (0x88, 3), (0x88, 2)];
@@ -1550,9 +1555,12 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
     assert!(moved > loud, "the transfer runs on while muted");
     let heard = sounding(&pcm, 2);
     // Resampled to 48 kHz: as many frames as the card played before the
-    // mute, less what was still in the ring.
+    // mute, less what was still in the ring. At most 0.5% more, the stream
+    // following the card's clock, and the converter's ringing at each end
+    // of a stretch of sound: one, or more where a busy host held the card up.
     let expect = loud as f64 * 48000.0 / 44100.0;
-    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= expect + 48.0, "{} frames heard, {expect:.0} played", heard.len() / 2);
+    let most = expect * 1.005 + 48.0 * bursts(&pcm, 2) as f64;
+    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= most, "{} frames heard, {expect:.0} played", heard.len() / 2);
     assert_tones(&heard, 2, rate, left, right, 15000);
 }
 

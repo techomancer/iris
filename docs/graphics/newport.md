@@ -19,7 +19,7 @@ about 60 times a second.
 Newport has no geometry hardware. The guest's graphics library, running on the
 guest CPU, transforms, lights and clips, and cuts each shape into spans, lines
 and blocks. REX3 receives those as register writes, steps along them one pixel
-at a time, shades, applies its write modes and stores. The board has no hardware depth buffer and no texture hardware. Z buffering is done by the host in system memory. The frame buffer holds pixel planes plus overlay, pop-up and window-ID (CID) planes.
+at a time, shades, applies its write modes and stores. The board has no hardware depth buffer and no texture hardware. Z buffering is done by guest software in the workstation's system memory. The frame buffer holds pixel planes plus overlay, pop-up and window-ID (CID) planes.
 
 ```mermaid
 flowchart LR
@@ -30,7 +30,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: REX3 colour iterators. No texture<br/>Iris: same draw path"]
   G["<b>Per-fragment operations</b><br/>Hardware: REX3 pattern, logic op, blend, dither.<br/>No hardware depth<br/>Iris: same draw path"]
   H[("<b>Frame buffer</b><br/>Hardware: two VRAM planes<br/>Iris: two word arrays, fb_rgb and fb_aux")]
-  I["<b>Scan-out</b><br/>Hardware: RO1 reads VRAM; XMAP9, CMAP and Bt445; VC2 timing<br/>Iris: display thread (REX3-Refresh) composes the frame"]
+  I["<b>Scan-out</b><br/>Hardware: RO1 reads VRAM; XMAP9, CMAP and Bt445; VC2 timing<br/>Iris: display thread (Display-Refresh) composes the frame"]
   A --> B --> C --> D --> E --> G --> H --> I
   classDef absent stroke-dasharray: 4 3
   class A,C absent
@@ -49,7 +49,7 @@ flowchart LR
   LK -- "none" --> GEN["generic pipeline<br/>runtime mode"]
   SHD --> FB[("fb_rgb, fb_aux")]
   GEN --> FB
-  FB --> REF["display thread: REX3-Refresh<br/>Rex3Screen::refresh"]
+  FB --> REF["display thread: Display-Refresh<br/>Rex3Screen::refresh"]
   TAB["RO1, XMAP9, CMAP, Bt445; VC2 timing"] --> REF
   REF --> PRES["installed renderer<br/>or software compositor"]
 ```
@@ -92,13 +92,15 @@ generic pixel pipeline (`rex3_generic.rs`).
 flowchart LR
   cpu["CPU thread"] -->|GFIFO: register writes, GO| proc["REX3-Processor<br/>decode and draw"]
   jit["rex3-jit (optional)"] -.->|compiled shaders| proc
-  proc -.->|fb_rgb, fb_aux, read unlocked| refresh["display thread: REX3-Refresh<br/>compose, VBLANK"]
+  proc -.->|fb_rgb, fb_aux, read unlocked| refresh["display thread: Display-Refresh<br/>VBLANK, compose"]
 ```
 
 - **REX3-Processor.** Applies register writes and draws. It owns the drawing
   context while it runs.
-- **Display thread** (REX3-Refresh, `refresh_loop`). Waits for the XMAP fence, composes the
-  frame, presents it and asserts VBLANK.
+- **Display thread** (Display-Refresh, the machine's display refresh thread; HACKING.md,
+  "The display refresh thread"). It asserts VBLANK at the retrace, and after the blank
+  captures the display state once the processor has passed the XMAP fence, and presents
+  the frame the window's renderer composes from it.
 - **rex3-jit.** The Cranelift compiler, built only with the `rex-jit` feature
   (`rex3_jit/`). It takes requests from a two-lane queue (`rex3_jit_queue.rs`).
   The hot lane holds shapes the draw path is waiting for and is never dropped.
@@ -146,26 +148,36 @@ stays the default. The `wgpu` feature composes the display on the GPU for the
 window (`Ng1Scanout`, in `wgpu/`, used from `src/ui.rs`) when `renderer = "wgpu"`
 is set. That path does not change what the processor does.
 
-An independent resident GPU raster and direct scanout exist only in tests;
-neither a feature flag nor an environment variable selects them in a running
-emulator. Newport rejects `[graphics] raster = "wgpu"` until M3. The tests
-seed full linear RGB and auxiliary planes, execute the supported flat fills
-through the real GFIFO and use a marker to order same-device composition.
-Ordinary test frames do not transfer or access raw CPU planes or fall back to
-CPU raster. Explicit selected-plane observation returns a raw snapshot;
-screenshots, VNC and headless frame capture instead read the composed output.
-Device loss is fatal on this resident path. HOSTR, snapshots and other
-board-level raw consumers, full opcode and lifecycle coverage, and a live
-integration remain future work. Changed decoded DID metadata can still be
-uploaded as a cached 2 MiB map. See [TESTING.md](../../TESTING.md) for the
-gate and [HACKING.md](../../HACKING.md) for the ownership rules.
+A `wgpu` build can select the production GPU-authoritative backend with
+`[graphics] raster = "wgpu"`. Complete linear RGB and auxiliary planes are
+seeded into resident buffers before the board is published. DRAW, SCR2SCR,
+HostW, ordered HostR synchronization and scanout then use the bounded resident
+command stream; ordinary work neither accesses CPU framebuffer shadows nor
+falls back to CPU raster. Unsupported work and device loss stop the machine.
+
+`newport_mode = "direct"` is the default. It requires the standalone window
+to use `renderer = "wgpu"` on the same validated Vulkan or D3D12 device.
+Screenshots, CI and VNC map requested composed output, but ordinary
+presentation performs no readback. Explicit `newport_mode = "readback"` uses
+the ordinary compositor after an attributed 16 MiB two-plane observation and
+is never selected as a fallback. HostR, snapshots and other raw consumers use
+separately attributed observation boundaries.
+
+The exact dual-backend gate covers the command stream, full-plane ownership,
+HostW/HostR, direct scanout and lifecycle behavior. Installed IRIX 6.5
+desktop, Showcase and Atlantis runs additionally pass on Vulkan and D3D12 with
+pixels matching CPU raster, zero unsupported work and no fallback. See
+[TESTING.md](../../TESTING.md) for the gates and measurements and
+[HACKING.md](../../HACKING.md) for the ownership rules.
 
 ## Board memory and scan-out
 
-There is no video memory apart from the frame buffers. In normal operation,
-`fb_rgb` and `fb_aux` are two `Box<[u32]>` of 2048 x 1024 words. Each bit of
-a pixel is one plane. The auxiliary plane carries the overlay, popup and CID
-planes (`CompositorSource`, `src/compositor.rs`).
+There is no video memory apart from the frame buffers. With CPU raster,
+`fb_rgb` and `fb_aux` are two `Box<[u32]>` allocations of 2048 x 1024 words.
+Resident mode instead makes equally sized wgpu buffers authoritative; the CPU
+allocations remain stale compatibility/snapshot storage until an explicit
+observation. Each bit of a pixel is one plane. The auxiliary plane carries the
+overlay, popup and CID planes (`CompositorSource`, `src/compositor.rs`).
 
 `rex-dirty-upload`, off by default, tracks damage in tiles (`rex3_dirty.rs`), so a
 frame uploads only the parts that changed.
@@ -182,17 +194,23 @@ so the frame that follows uses the new mode.
 
 ## Display and presentation
 
-The refresh loop runs at 60 Hz. It composes only when something visible changed:
+The display refresh thread runs the board at the rate the guest programs: the
+VC2's timing tables give the pixel clocks a line and the lines a frame, and the
+Bt445's PLL registers the pixel clock, so `setmon 1280x1024_76` gives 76 Hz.
+It composes only when something visible changed:
 the frame buffer is dirty, a palette or mode changed, a debug overlay is on, a
 screenshot or frame is wanted, or a run of frames has gone by with nothing to do
 (`IDLE_HEARTBEAT_FRAMES`). An idle frame still asserts VBLANK and latches the
 cursor Y, so guest timing does not depend on the host.
 
-The installed renderer composes the CPU-owned planes and draws the result in
-a window with the status bar. Requested screenshots and VNC frames use the
-composed `screen.rgba` (`0xAABBGGRR`). With no renderer, as with `--ci`, the
-software compositor builds a requested frame instead
-(`SwCompositor::compose_pixels`, `src/compositor.rs`).
+CPU raster uses the installed renderer to compose the CPU-owned planes and
+draw the result with the status bar. Resident direct mode composes on the
+board's wgpu device and hands that buffer to the same-device presenter.
+Requested screenshots and VNC frames use explicitly composed output; direct
+presentation does not update stale CPU planes. Resident readback mode first
+observes both complete planes, then uses the ordinary renderer. With no
+renderer, as with `--ci`, the software compositor builds a requested CPU frame
+for CPU raster (`SwCompositor::compose_pixels`, `src/compositor.rs`).
 
 ## Monitor commands
 

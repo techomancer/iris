@@ -40,7 +40,8 @@ The Octane's boards are a Bridge of their own on a Crossbow port
 IRIX finds the card in the hardware graph under that port's `pci` node.
 
 With `bridge = true` the slot holds a PCI-to-PCI bridge (type 1 header) and
-the controller is device 0 on the bus behind it. Firmware numbers the bus and
+the controller is device 0 on the bus behind it, a DEC 21154 with a 32-bit I/O
+window ([docs/pci.md](pci.md#pci-to-pci-bridges)). Firmware numbers the bus and
 opens the bridge's memory window; a pin of the card reaches the bridge's pins
 by the usual swizzle ([docs/pci.md](pci.md)). The card's DMA is the slot's.
 

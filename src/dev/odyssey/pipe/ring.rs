@@ -16,10 +16,12 @@
 //! A slot counts the tiles still to run it; the raster thread retires
 //! slots whose count is zero in order (`tail`), behind which it writes
 //! slots again, and a draw keeps its job and context until the tail is past
-//! its last slot (`hold`, `reclaim`). The display composes each frame from
-//! board memory as it stands, so nobody tracks the rows the stores wrote.
+//! its last slot (`hold`, `reclaim`). A worker marks each command it ran in
+//! a tile for the display (`DestMem::mark`): the bytes of a pixel it could
+//! change and its box in the tile, after its stores.
 
 use super::backend::{DestMem, BackendState, ClearDraw};
+use crate::display::Rect;
 use super::raster::{triangle_quads, RasterState};
 use super::super::gl::{DrawFrame, GlDrawJob};
 use super::setup::{LiveLine, Tri};
@@ -43,11 +45,11 @@ const IDLE_SPINS: u32 = 200;
 
 /// A slot's command.
 /// A triangle: its record in ptr, its bounding box in plane pixels in x, y
-/// and zq[0], zq[1] (the far corner).
+/// and zq\[0\], zq\[1\] (the far corner).
 pub(crate) const KIND_TRI: u8 = 0;
 /// A quad shaded by the raster thread: colours in data, back-end state in ptr.
 pub(crate) const KIND_SHADED: u8 = 1;
-/// A clear's rectangle: x, y to zq[0], zq[1] in plane pixels, the clear's
+/// A clear's rectangle: x, y to zq\[0\], zq\[1\] in plane pixels, the clear's
 /// record (`backend::ClearDraw`) in ptr.
 pub(crate) const KIND_RECT: u8 = 3;
 /// An aliased line: its record (`setup::LiveLine`) in ptr, its box as a
@@ -596,6 +598,7 @@ impl QuadRing {
                     }
                 }
                 (d.state.store)(&d.state, &d.planes, &q);
+                d.planes.mark(d.state.targets, Rect::new(q.x, q.y, q.x + 1, q.y + 1));
             }
             KIND_RECT => {
                 // SAFETY: the clear outlives its slots (QuadRing::hold_clear).
@@ -605,6 +608,7 @@ impl QuadRing {
                     for y in y0.max(ty)..=y1.min(ty + size - 1) {
                         c.span(y, x0.max(tx), x1.min(tx + size - 1));
                     }
+                    c.planes.mark(c.targets, Rect::new(x0.max(tx), y0.max(ty), x1.min(tx + size - 1), y1.min(ty + size - 1)));
                 }
             }
             KIND_LINE => {
@@ -619,6 +623,7 @@ impl QuadRing {
                     let (ox, oy) = (p.raster.ox, p.raster.oy);
                     let tile = (tx.wrapping_sub(ox), ty.wrapping_sub(oy), (tx + size - 1).wrapping_sub(ox), (ty + size - 1).wrapping_sub(oy));
                     d.line_pixels(l, tile, |q| (p.backend.store)(&p.backend, &p.planes, &q));
+                    p.planes.mark(p.backend.targets, Rect::new(x0.max(tx), y0.max(ty), x1.min(tx + size - 1), y1.min(ty + size - 1)));
                 }
             }
             _ => {
@@ -644,6 +649,7 @@ impl QuadRing {
                         d.shade_quad(t, q, &mut out);
                         (p.backend.store)(&p.backend, &p.planes, &out);
                     });
+                    p.planes.mark(p.backend.targets, Rect::new(x0.max(tx), y0.max(ty), x1.min(tx + size - 1), y1.min(ty + size - 1)));
                 }
             }
         }

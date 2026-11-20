@@ -8,6 +8,8 @@
 //! happen on the other side of the stream. This module only turns the
 //! `[audio]` section into a stream.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use iris_audio::{Audio, BackendChoice, OutputConfig};
@@ -59,6 +61,8 @@ pub fn open_outputs(audio: &AudioConfig, who: &str, channels: usize, rates: &[u3
         max_latency: MAX_LATENCY.max(prebuffer * 3),
         device_latency: audio.latency_ms.map(Duration::from_millis),
         null_fallback: true,
+        // A file has no clock of its own to follow.
+        max_adjust: if audio.file.is_some() { 0.0 } else { OutputConfig::default().max_adjust },
         tee: std::env::var_os(capture_var).map(Into::into),
         ..Default::default()
     }).collect();
@@ -73,6 +77,82 @@ pub fn open_outputs(audio: &AudioConfig, who: &str, channels: usize, rates: &[u3
             eprintln!("{who}: no audio output: {e}");
             None
         }
+    }
+}
+
+/// Why a frame the card's clock made due was not moved.
+#[derive(Clone, Copy)]
+pub enum Skip {
+    /// The card fell behind real time and drops the lost time.
+    Stale,
+    /// The guest's ring had nothing to give.
+    Dry,
+    /// An input ring with no room.
+    Full,
+}
+
+/// Per-output frames moved and skipped, by cause, in the card's own frames.
+pub struct Meter {
+    card: &'static str,
+    outputs: &'static [&'static str],
+    moved: Box<[AtomicU64]>,
+    skipped: Box<[[AtomicU64; 3]]>,
+}
+
+impl Meter {
+    pub fn new(card: &'static str, outputs: &'static [&'static str]) -> Arc<Self> {
+        let skipped = outputs.iter().map(|_| Default::default()).collect();
+        Arc::new(Self { card, outputs, moved: outputs.iter().map(|_| AtomicU64::new(0)).collect(), skipped })
+    }
+
+    /// Frames moved by `output`; a channel the card does not report (RAD1's
+    /// subcode channel) is ignored.
+    pub fn add(&self, output: usize, frames: u64) {
+        if let Some(moved) = self.moved.get(output) {
+            moved.fetch_add(frames, Ordering::Relaxed);
+        }
+    }
+
+    /// For a card that keeps its moved count itself.
+    pub fn set(&self, output: usize, frames: u64) {
+        if let Some(moved) = self.moved.get(output) {
+            moved.store(frames, Ordering::Relaxed);
+        }
+    }
+
+    pub fn skipped(&self, output: usize, why: Skip, frames: u64) {
+        let Some(row) = self.skipped.get(output) else { return };
+        if frames != 0 {
+            row[why as usize].fetch_add(frames, Ordering::Relaxed);
+        }
+    }
+
+    pub fn get(&self, output: usize) -> u64 {
+        self.moved[output].load(Ordering::Relaxed)
+    }
+
+    /// The monitor's `audio status` text for one card.
+    pub fn report(&self, rates: &[Option<u32>], outs: &[&Output]) -> String {
+        let mut s = format!("audio: {}\n", self.card);
+        for (i, (name, rate)) in self.outputs.iter().zip(rates).enumerate() {
+            let rate = rate.map_or("off".to_string(), |r| format!("{r} Hz"));
+            s += &format!("  {name}: {} moved, guest rate {rate}\n", self.get(i));
+            let skips = self.skipped[i].each_ref().map(|c| c.load(Ordering::Relaxed));
+            if skips != [0; 3] {
+                s += &format!("    skipped: stale {}, dry {}, ring full {}\n", skips[0], skips[1], skips[2]);
+            }
+        }
+        let all: Vec<_> = outs.iter().map(|o| o.stats()).collect();
+        let Some(st) = all.first() else { return s + "  host output: none\n" };
+        let sum = |f: fn(&iris_audio::Stats) -> u64| all.iter().map(f).sum::<u64>();
+        let ms = |d: Duration| format!("{:.1} ms", d.as_secs_f64() * 1e3);
+        s += &format!(
+            "  host: {} underruns, {} frames skipped, {} dropped, queued {}, delay {}, adjust {:+.3}%\n",
+            sum(|s| s.underruns), sum(|s| s.overruns), sum(|s| s.dropped),
+            ms(all.iter().map(|s| s.queued).max().unwrap_or_default()), st.device_delay.map_or("?".to_string(), ms), st.adjust * 100.0,
+        );
+        let device = outs[0].device().filter(|d| !d.is_empty()).unwrap_or_else(|| "no device yet".into());
+        s + &format!("  host output: {device}{}\n", st.device.map_or(String::new(), |d| format!(" at {} Hz, {} channels", d.rate, d.channels)))
     }
 }
 
@@ -389,11 +469,13 @@ pub(crate) mod test_signal {
         &pcm[first * channels..]
     }
 
-    /// The frequency of a tone from its rising zero crossings: the cycles
-    /// between the first and the last, over the time between them. A
-    /// crossing counts only once the signal has been a quarter of its peak
-    /// below zero: the host stream's rate converter rings faintly around
-    /// zero just before a tone starts and after it stops.
+    /// The frequency of a tone from the samples between its rising zero
+    /// crossings (see [`tone_frequency`]), so the gaps a busy host leaves in
+    /// a stream, and the frames spliced together across them, do not bend
+    /// the pitch measured. A crossing counts only once the signal has been
+    /// a quarter of its peak below zero: the host stream's rate converter
+    /// rings faintly around zero just before a tone starts and after it
+    /// stops.
     pub(crate) fn frequency(s: &[i16], rate: u32) -> f64 {
         let low = -(peak(s) / 4).max(1);
         let (mut ups, mut armed) = (Vec::new(), false);
@@ -405,10 +487,26 @@ pub(crate) mod test_signal {
                 ups.push(i);
             }
         }
-        match (ups.first(), ups.last()) {
-            (Some(&a), Some(&b)) if b > a => (ups.len() - 1) as f64 * f64::from(rate) / (b - a) as f64,
-            _ => 0.0,
+        let mut periods: Vec<usize> = ups.windows(2).map(|w| w[1] - w[0]).collect();
+        tone_frequency(&mut periods, rate)
+    }
+
+    /// The stretches of sound in `pcm`: runs of frames with a sample other
+    /// than zero, a few zero frames apart at least. One, unless the stream
+    /// ran dry; each has the rate converter's ringing at both ends.
+    pub(crate) fn bursts(pcm: &[i16], channels: usize) -> usize {
+        let (mut n, mut quiet) = (0, usize::MAX);
+        for f in pcm.chunks_exact(channels) {
+            if f.iter().all(|&v| v == 0) {
+                quiet = quiet.saturating_add(1);
+            } else {
+                if quiet >= 8 {
+                    n += 1;
+                }
+                quiet = 0;
+            }
         }
+        n
     }
 
     pub(crate) fn peak(s: &[i16]) -> i32 {
@@ -477,6 +575,28 @@ mod tests {
         open_output(cfg, "test", channels, FILE_RATE, "IRIS_TEST_CAPTURE")
     }
 
+    /// One layout for every card: each output's counts, then the stream's.
+    #[test]
+    fn the_report_has_one_layout_for_every_card() {
+        let meter = Meter::new("Example card", &["left", "right"]);
+        meter.add(0, 441);
+        meter.skipped(1, Skip::Stale, 10);
+        meter.skipped(1, Skip::Dry, 2);
+        let text = |outs: &[&Output]| meter.report(&[Some(44100), None], outs);
+        assert_eq!(
+            text(&[]),
+            "audio: Example card\n  left: 441 moved, guest rate 44100 Hz\n\
+             \x20 right: 0 moved, guest rate off\n    skipped: stale 10, dry 2, ring full 0\n  host output: none\n"
+        );
+        let (mut out, _host) = detached(48000, 2);
+        let room = out.space();
+        out.write(&vec![0i16; (room + 3) * 2]); // three frames too many
+        assert!(text(&[&out]).ends_with(
+            "  host: 0 underruns, 0 frames skipped, 3 dropped, queued 0.0 ms, delay ?, adjust +0.000%\n\
+             \x20 host output: no device yet at 48000 Hz, 2 channels\n"
+        ));
+    }
+
     /// A file that cannot be written opens no output.
     #[test]
     fn an_unwritable_file_opens_no_output() {
@@ -498,6 +618,70 @@ mod tests {
         drop(open(&cfg, 6).expect("a file output opens without a sound card"));
         let (rate, channels, _) = read_wav(&path.0);
         assert_eq!((rate, channels), (FILE_RATE, 6));
+    }
+
+    /// Play stereo `pcm` at `rate` into an `[audio] file`; return the file
+    /// from its first sound. Paced by what the file has taken, not a clock.
+    fn played_into_a_file(name: &str, rate: u32, pcm: &[i16]) -> Vec<i16> {
+        let (mut cfg, path) = file_config(name);
+        cfg.prebuf_ms = 300;
+        let mut out = open_output(&cfg, "test", 2, rate, "IRIS_TEST_CAPTURE").expect("a file output opens");
+        let margin = u64::from(rate) * 2 * cfg.prebuf_ms / 1000;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut at = 0;
+        while at < pcm.len() {
+            assert!(Instant::now() < deadline, "the file stopped taking frames");
+            let s = out.stats();
+            let taken = s.played * u64::from(rate) / u64::from(FILE_RATE);
+            if s.written < taken + margin {
+                let end = (at + 256 * 2).min(pcm.len());
+                at += out.write(&pcm[at..end]) * 2;
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        out.idle();
+        while { let s = out.stats(); s.played == 0 || s.playing || s.queued > Duration::ZERO } {
+            assert!(Instant::now() < deadline, "the file stopped taking frames");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let s = out.stats();
+        drop(out);
+        assert_eq!((s.underruns, s.overruns, s.dropped), (0, 0, 0), "{s:?}");
+        let (file_rate, channels, heard) = read_wav(&path.0);
+        assert_eq!((file_rate, channels), (FILE_RATE, 2));
+        from_first_sound(&heard, 2).to_vec()
+    }
+
+    /// At the file's rate the file holds the card's frames unchanged.
+    #[test]
+    fn a_file_at_the_cards_rate_holds_its_frames_exactly() {
+        // A ramp with no zero in it, so the first sound is the first frame.
+        let sent: Vec<i16> = (0..FILE_RATE as i32 * 2).flat_map(|n| [(n % 20000 + 1) as i16, -((n * 7) % 20000 + 1) as i16]).collect();
+        let heard = played_into_a_file("file-exact", FILE_RATE, &sent);
+        assert!(heard[..sent.len()] == sent[..], "the file is not what was written");
+    }
+
+    /// At another rate the file holds a fixed-ratio conversion.
+    #[test]
+    fn a_file_at_another_rate_holds_a_fixed_ratio_conversion() {
+        use iris_audio::{MAX_CHANNELS, Sample};
+        let rate = 44100;
+        let sent = tones(rate as usize * 2, rate, 440.0, 880.0, 16000.0);
+        let heard = played_into_a_file("file-ratio", rate, &sent);
+
+        let mut conv = iris_audio::resample::Resampler::new(2, rate, FILE_RATE);
+        let mut frames = sent.chunks_exact(2);
+        let mut want = vec![0f32; FILE_RATE as usize * 6];
+        let n = conv.process(
+            conv.step(),
+            want.len() / 2,
+            |f: &mut [f32; MAX_CHANNELS]| frames.next().map(|s| (f[0], f[1]) = (s[0].to_f32(), s[1].to_f32())).is_some(),
+            |i, f: &[f32; MAX_CHANNELS]| want[i * 2..i * 2 + 2].copy_from_slice(&f[..2]),
+        );
+        let want: Vec<i16> = want[..n * 2].iter().map(|&v| i16::from_f32(v)).collect();
+        let want = from_first_sound(&want, 2);
+        assert!(heard[..want.len()] == want[..], "the file is not the fixed-ratio conversion");
     }
 
     #[test]

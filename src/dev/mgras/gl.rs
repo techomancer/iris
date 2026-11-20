@@ -97,7 +97,7 @@ pub(super) mod tok {
     /// mgrTM_SendTexmode1: on when the bound texture is complete).
     pub const TEX_ON: u32 = 0x00B;
     pub const TEX_OFF: u32 = 0x00C;
-    /// glEnable / glDisable(GL_POINT_SMOOTH): [1] / [0] (libGLcore's
+    /// glEnable / glDisable(GL_POINT_SMOOTH): \[1\] / \[0\] (libGLcore's
     /// __glMgrim_Enable; traced).
     pub const POINT_SMOOTH: u32 = 0x06C;
     /// Pixel operations and texture loads come between these (libGLcore's
@@ -3114,7 +3114,16 @@ impl Gl {
             };
             sink.trace(format!("TEX reg {r:#05x}{idx} = {v:#x}"));
         }
-        if r == te_reg::TXADDR {
+        if r == re::DEVICE_ADDR || r == re::DEVICE_DATA {
+            // The raster engine's device space (the texture colour tables,
+            // `te1::TEX_LUT_DEV`, among it) is board state, not context
+            // state: RE4 RAM the kernel's context switch does not save.
+            // libGLcore sends the tables as RSS_REG_SHADOW triples outside
+            // any pixel operation; they go straight through, the engine
+            // advancing the address itself.
+            sink.rss_write(r, v, false);
+            return true;
+        } else if r == te_reg::TXADDR {
             self.te_index = v;
         } else if let Some(i) = te1::CONTEXT_REGS.iter().position(|&x| x == r) {
             self.te[i] = v;

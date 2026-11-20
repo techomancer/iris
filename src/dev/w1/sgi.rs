@@ -11,6 +11,7 @@ use crate::dev::w1::crc::crc16 as crc16_seed;
 
 /// Text fields of an SGI board record, as a part's first two 32-byte pages
 /// hold them, each page closed by an inverted CRC-16.
+#[derive(Clone, Copy, Debug)]
 pub struct BoardRecord<'a> {
     pub barcode: &'a str,
     /// Twelve characters: `030-0891-003`.
@@ -39,7 +40,7 @@ const PAGE: usize = 32;
 /// readers substitute those), at most `width` characters.
 fn check_field(what: &str, value: &str, width: usize) -> Result<(), String> {
     if value.is_empty() || value.len() > width {
-        return Err(format!("board record {what} is required and must fit {width} characters"));
+        return Err(format!("board record {what} is required and at most {width} characters"));
     }
     if value.bytes().any(|c| !(0x20..=0x7e).contains(&c) || c == b':' || c == b';') {
         return Err(format!("board record {what} must be printable, without ':' or ';'"));
@@ -48,7 +49,7 @@ fn check_field(what: &str, value: &str, width: usize) -> Result<(), String> {
 }
 
 impl BoardRecord<'_> {
-    /// Whether the fields fit the record: the part number is twelve digits
+    /// Whether the fields are within the record: the part number is twelve digits
     /// and dashes (the readers reject anything else), the barcode at most
     /// ten characters, the revision four, the name fourteen.
     pub fn check(&self) -> Result<(), String> {

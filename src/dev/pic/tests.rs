@@ -17,7 +17,7 @@
 // this model sends a packet only on a rising input, an enable, a reset
 // write or a force write, and has no timer that sends one again.
 use super::*;
-use crate::dev::bedrock::{reg::{pi as pi_reg, PI1_BASE}, Bedrock, BedrockConfig};
+use crate::dev::bedrock::{regs::{pi as pi_reg, PI1_BASE}, Bedrock, BedrockConfig};
 use crate::irq::LevelProbe;
 use crate::traits::Device;
 use crate::pci::{Bar, PciConfig, PciFunctionState, PCI_INTA};
@@ -164,8 +164,8 @@ impl Rig {
         assert_eq!(self.bus.write32(addr, v), BUS_OK, "write32 {addr:#x}");
     }
 
-    /// Fit `card` at `device` of `head` and map its BAR at `BAR_BASE`.
-    fn fit(&self, head: usize, device: u8, card: &Arc<Card>, options: Function) {
+    /// Attach `card` at `device` of `head` and map its BAR at `BAR_BASE`.
+    fn attach(&self, head: usize, device: u8, card: &Arc<Card>, options: Function) {
         self.pic.attach(head, device, card.clone(), options);
         let cfg = config(head, device as u64);
         self.w32(cfg + 0x10, BAR_BASE);
@@ -225,6 +225,7 @@ fn pi_with_clock() -> (Pi, Arc<AtomicU64>) {
         banks_mib: &[64],
         nodes: 1,
         events: None,
+        prom: None,
     })
     .unwrap();
     chip.start();
@@ -232,10 +233,11 @@ fn pi_with_clock() -> (Pi, Arc<AtomicU64>) {
     (Pi { chip, regs, base: 0 }, now)
 }
 
-/// The destination a pin's packet goes to: `level` in bits 63:48 and an
-/// address in the PI's window.
+/// The destination a pin's packet goes to: `level` in bits 63:48 and the
+/// PI's pending-modify register in the register (I/O) view, bit 47, as
+/// IRIX programs it (0x800001a00090 on Tezro).
 fn destination(level: u64) -> u64 {
-    (level << 48) | 0x1800090
+    (level << 48) | (1 << 47) | 0x1800090
 }
 
 /// The PIC's identity is the one thing the PROM checks before it trusts the
@@ -403,7 +405,7 @@ fn type_one_configuration_selects_the_bus_and_device_through_the_register() {
 fn a_conventional_function_sees_cpu_pio_with_its_address_corrected() {
     let r = rig();
     let card = Card::new(0x6001);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.w32(window(0, 0x10), 0x1234_5678);
     assert_eq!(&card.bar.lock()[0x10..0x14], [0x78, 0x56, 0x34, 0x12]);
     assert_eq!(r.r32(window(0, 0x10)), 0x1234_5678);
@@ -426,7 +428,7 @@ fn a_conventional_function_sees_cpu_pio_with_its_address_corrected() {
 fn a_self_ordered_function_keeps_the_processors_byte_sequence() {
     let r = rig();
     let card = Card::new(0x6002);
-    r.fit(1, 1, &card, Function { self_ordered_pio: true, req64: false });
+    r.attach(1, 1, &card, Function { self_ordered_pio: true, req64: false });
     r.w32(window(1, 0x10), 0x1234_5678);
     assert_eq!(&card.bar.lock()[0x10..0x14], [0x12, 0x34, 0x56, 0x78]);
     assert_eq!(r.r32(window(1, 0x10)), 0x1234_5678);
@@ -443,7 +445,7 @@ fn a_self_ordered_function_keeps_the_processors_byte_sequence() {
 fn short_windows_follow_their_device_registers() {
     let r = rig();
     let card = Card::new(0x6003);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     // Window 0 and 1 are 2 MiB and ignore the low bit of the base; windows
     // 2 and 3 are 1 MiB.
     for (window_index, cpu) in [(0u64, 0x20_0000u64), (1, 0x40_0000), (2, 0x60_0000), (3, 0x70_0000)] {
@@ -454,7 +456,7 @@ fn short_windows_follow_their_device_registers() {
         r.w32(cpu + 0x80, 0x1111_1111 * (window_index as u32 + 1));
         assert_eq!(le_value(&card.bar.lock()[0x80..0x84]), 0x1111_1111 * (window_index + 1), "window {window_index}");
     }
-    // The last word of a window fits; a doubleword across its end does not.
+    // The last word of a window lies within; a doubleword across its end does not.
     r.w32(0x70_0000 + 0xf_fffc, 7);
     let before = r.pic.unsupported().len();
     assert_eq!(r.bus.write64(0x70_0000 + 0xf_fffc, 7), BUS_OK);
@@ -489,8 +491,8 @@ fn direct_map_dma_goes_where_each_heads_direct_map_says() {
     let r = rig();
     let a = Card::new(0x7001);
     let b = Card::new(0x7002);
-    r.fit(0, 1, &a, Function::default());
-    r.fit(1, 1, &b, Function::default());
+    r.attach(0, 1, &a, Function::default());
+    r.attach(1, 1, &b, Function::default());
     r.w64(0x80, 10 << 20);
     r.w64(HEAD1 + 0x80, (11 << 20) | 1);
     r.w64(0x200, 0x18001000 | (1 << 19));
@@ -525,7 +527,7 @@ fn direct_map_dma_goes_where_each_heads_direct_map_says() {
 fn bit19_set_keeps_addresses_and_clear_flips_the_byte_address_within_each_word() {
     let r = rig();
     let card = Card::new(0x7003);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.w64(0x80, 10 << 20);
     let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
     r.w64(0x200, 0x18001000 | (1 << 19));
@@ -546,7 +548,7 @@ fn bit19_set_keeps_addresses_and_clear_flips_the_byte_address_within_each_word()
 fn dma_outside_the_direct_window_is_refused_and_a_read_comes_back_zero() {
     let r = rig();
     let card = Card::new(0x7004);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.peer.put(0, 0, &[0xaa; 16]);
     assert_eq!(card.dma().dma_write(0x7fff_f000, &[1; 8]), PciDmaStatus::MasterAbort, "below the window");
     let mut buf = [0xffu8; 8];
@@ -573,7 +575,7 @@ fn dma_outside_the_direct_window_is_refused_and_a_read_comes_back_zero() {
 fn the_bridge_does_not_route_dma_to_a_function() {
     let r = rig();
     let card = Card::new(0x7004);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     card.bar_write(0, 0x10, 0x5a5a_5a5a, 4);
     let mut buf = [0xffu8; 4];
     // At the BAR's own bus address, which is below the window DMA can use.
@@ -600,8 +602,8 @@ fn direct64_dma_keeps_a_stream_and_swaps_the_words_of_a_swap_clear_request() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     let data = [0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
     assert!(narrow.dma().dma_write(direct64(0xa, 1 << 55, 0x3000), &data).is_ok());
     assert_eq!(r.peer.bytes(0xa, 0x3000, 8), data, "ordered bytes unchanged");
@@ -633,8 +635,8 @@ fn a_swap_clear_direct64_transfer_keeps_its_words_whole() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     let data: Vec<u8> = (0x10..0x30).collect();
     for (card, mask, at) in [(&narrow, 3u64, 0x4000u64), (&wide, 7, 0x5000)] {
         r.peer.dma.lock().clear();
@@ -677,8 +679,8 @@ fn no_aligned_field_is_split_between_packets() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     for (card, flags, phase) in [(&narrow, 1u64 << 55, 8u64), (&narrow, 0, 4), (&wide, 0, 8), (&wide, 1 << 55, 8)] {
         for start in 0x20u64..0x28 {
             for len in 1..24usize {
@@ -713,8 +715,8 @@ fn a_long_swap_clear_transfer_keeps_every_covered_word_whole() {
     let r = rig();
     let narrow = Card::new(0x7101);
     let wide = Card::new(0x7102);
-    r.fit(0, 1, &narrow, Function::default());
-    r.fit(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
+    r.attach(0, 1, &narrow, Function::default());
+    r.attach(0, 4, &wide, Function { self_ordered_pio: false, req64: true });
     for (card, mask, start, len) in [
         (&narrow, 3u64, 0x1_0ffdu64, 3 * 4096 + 5),
         (&wide, 7, 0x3_0ffb, 2 * 4096 + 13),
@@ -753,7 +755,7 @@ fn a_long_swap_clear_transfer_keeps_every_covered_word_whole() {
 fn an_unswapped_transfer_goes_as_one_run_of_doublewords() {
     let r = rig();
     let card = Card::new(0x7105);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.w64(0x80, 10 << 20);
     // Bit 19 set is the 32-bit window's unswapped path (bytes keep their
     // addresses); the reset value, clear, flips each byte's address.
@@ -792,7 +794,7 @@ fn an_unswapped_transfer_goes_as_one_run_of_doublewords() {
 fn direct64_refuses_what_it_cannot_carry_before_any_packet_leaves() {
     let r = rig();
     let card = Card::new(0x7103);
-    r.fit(1, 2, &card, Function::default());
+    r.attach(1, 2, &card, Function::default());
     let sentinel = [0xa5u8; 8];
     r.peer.put(0xa, 0x1000, &sentinel);
     for bit in 48..=54 {
@@ -810,7 +812,7 @@ fn direct64_refuses_what_it_cannot_carry_before_any_packet_leaves() {
 fn direct64_splits_at_the_register_space_boundary() {
     let r = rig();
     let card = Card::new(0x7104);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     let boundary = 1u64 << 47;
     let status = card.dma().dma_write(direct64(0xa, 1 << 55, boundary - 2), &[0x90, 0x91, 0x92, 0x93]);
     assert_eq!(status, PciDmaStatus::MasterAbort);
@@ -822,7 +824,7 @@ fn direct64_splits_at_the_register_space_boundary() {
 fn a_refused_direct64_write_leaves_the_target_as_it_was() {
     let r = rig();
     let card = Card::new(0x7105);
-    r.fit(0, 1, &card, Function::default());
+    r.attach(0, 1, &card, Function::default());
     r.peer.put(0xa, 0x3000, &[0xa5; 8]);
     r.peer.refuse.store(true, Ordering::SeqCst);
     for flags in [0, 1 << 55, 1 << 58, (1 << 56) | (1 << 55)] {
@@ -845,7 +847,7 @@ fn a_rising_enabled_pin_sends_a_set_packet_and_a_falling_one_a_clear() {
     assert_eq!(r.r64(0x100), 1 << 3);
     assert!(r.peer.interrupts.lock().is_empty(), "disabled");
     r.w64(0x108, 1 << 3);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x123)], "enabling a pending input sends it");
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x123)], "enabling a pending input sends it");
     assert_eq!(r.pic.request_counts(0, 3), (1, 0));
     r.pic.set_pin(0, 3, false);
     assert_eq!(r.pic.request_counts(0, 3), (1, 0), "no clear without the mode bit");
@@ -853,7 +855,7 @@ fn a_rising_enabled_pin_sends_a_set_packet_and_a_falling_one_a_clear() {
     r.pic.set_pin(0, 3, true);
     r.pic.set_pin(0, 3, false);
     assert_eq!(r.pic.request_counts(0, 3), (2, 1));
-    assert_eq!(r.peer.interrupts.lock().last().copied(), Some((15, 0x1800090, 0x23)));
+    assert_eq!(r.peer.interrupts.lock().last().copied(), Some((15, 0x8000_0180_0090, 0x23)));
     // The status bit stays until software clears it, and a pin that is
     // still high comes back.
     assert_eq!(r.r64(0x100), 1 << 3);
@@ -885,33 +887,48 @@ fn a_clear_write_resends_a_pin_that_is_still_high_and_enabled() {
     assert_eq!(r.pic.request_counts(0, 0), (2, 0));
 }
 
+/// A packet to the register view (the PI's pending-modify register) leaves
+/// only with a level a PI takes, 7 to 127; the register's bits above 55
+/// are not part of the vector.
 #[test]
-fn only_levels_a_pi_can_take_leave_the_chip() {
+fn only_levels_a_pi_can_take_leave_the_chip_for_a_pi() {
     let r = rig();
     r.pic.set_pin(0, 0, true);
-    for level in [0, 6, 128, 0x7fff] {
+    for level in [0, 6, 128, 0xed] {
         r.w64(0x130, destination(level));
         r.w64(0x108, 0);
         r.w64(0x108, 1);
         assert!(r.peer.interrupts.lock().is_empty(), "level {level}");
     }
     assert_eq!(r.pic.request_counts(0, 0).0, 4, "each attempt was counted");
-    for level in [7, 127] {
+    for level in [7, 127, 0x7f07] {
         r.w64(0x130, destination(level));
         r.w64(0x108, 0);
         r.w64(0x108, 1);
     }
     let sent: Vec<_> = r.peer.interrupts.lock().iter().map(|p| p.2).collect();
-    assert_eq!(sent, [0x107, 0x17f]);
+    assert_eq!(sent, [0x107, 0x17f, 0x107]);
     // A peer that refuses is not an error the guest sees, but it is counted.
     r.peer.refuse.store(true, Ordering::SeqCst);
     r.w64(0x108, 0);
     r.w64(0x108, 1);
-    assert_eq!(r.peer.interrupts.lock().len(), 2);
+    assert_eq!(r.peer.interrupts.lock().len(), 3);
+}
+
+/// IRIX's PIO write flush: input 7 points at a word in memory with vector
+/// 0xed, a force-always write sends the packet, and the word becomes 0x1ed.
+/// A destination in memory takes any vector.
+#[test]
+fn a_forced_input_aimed_at_memory_writes_its_vector_there() {
+    let r = rig();
+    r.w64(0x168, 0xed << 48 | 0xafc890);
+    r.w64(0x180 + 8 * 7, 1);
+    let sent: Vec<_> = r.peer.interrupts.lock().iter().map(|p| (p.1, p.2)).collect();
+    assert_eq!(sent, [(0xafc890, 0x1ed)]);
 }
 
 /// A PCI function's INTA reaches the input numbered one less than its
-/// device, whichever functions are fitted, and nothing else raises it.
+/// device, whichever functions are attached, and nothing else raises it.
 #[test]
 fn pci_interrupts_reach_the_input_of_their_device() {
     let r = rig();
@@ -923,7 +940,7 @@ fn pci_interrupts_reach_the_input_of_their_device() {
     r.w64(0x108, 1 << 2);
     card.raise(true);
     assert_eq!(r.r64(0x100), 1 << 2, "device 3 is input 2");
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x131)]);
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x131)]);
     card.raise(false);
     other.raise(true);
     assert_eq!(r.r64(0x100), (1 << 2) | (1 << 3), "device 4 is input 3, which the enable leaves unsent");
@@ -948,7 +965,7 @@ fn a_function_behind_a_bridge_reaches_the_input_of_the_bridges_device() {
     r.w64(0x108, 1 << 1);
     behind.raise(true);
     assert_eq!(r.r64(0x100), 1 << 1, "bridge at device 2 is input 1, by INTA or INTC");
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x131)]);
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x131)]);
 }
 
 /// Force-always (0x180 + 8n) sends input n's set packet on any write,
@@ -959,7 +976,7 @@ fn force_always_sends_the_set_packet_whatever_the_input() {
     let r = rig();
     r.w64(0x130 + 3 * 8, destination(0x20));
     r.w64(0x180 + 3 * 8, 0);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x120)], "an inactive input");
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x120)], "an inactive input");
     assert_eq!(r.r64(0x100), 0, "the force leaves status alone");
     r.w64(0x108, 1 << 3);
     r.pic.set_pin(0, 3, true);
@@ -982,7 +999,7 @@ fn force_with_pin_sends_only_while_the_input_is_active() {
     assert!(r.peer.interrupts.lock().is_empty(), "an inactive input sends nothing");
     r.pic.set_pin(0, 3, true);
     r.w64(0x1c0 + 3 * 8, 0);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x120); 2], "rising, then forced");
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x120); 2], "rising, then forced");
     r.pic.set_pin(0, 3, false);
     r.w64(0x1c0 + 3 * 8, 0);
     assert_eq!(r.peer.interrupts.lock().len(), 2, "the input dropped");
@@ -1030,14 +1047,14 @@ fn a_refused_packet_is_dropped_and_a_force_write_sends_it_again() {
     r.peer.refuse.store(false, Ordering::SeqCst);
     assert!(r.peer.interrupts.lock().is_empty(), "no retry of its own");
     r.w64(0x1c0 + 3 * 8, 0);
-    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x1800090, 0x120)]);
+    assert_eq!(r.peer.interrupts.lock().as_slice(), [(15, 0x8000_0180_0090, 0x120)]);
 }
 
 /// Both PIs, told apart the way the node does: by address bit 21.
 struct ToPi([Pi; 2]);
 impl PicPeer for ToPi {
     fn interrupt(&self, _: u8, address: u64, payload: u64) -> Result<(), Refused> {
-        self.0[(address >> 21) as usize & 1].write64(pi_reg::PENDING_MODIFY, payload);
+        self.0[(address >> 21) as usize & 1].write64(pi_reg::INT_PEND_MOD::OFFSET, payload);
         Ok(())
     }
     fn dma_read(&self, _: u8, _: u8, _: u64, _: &mut [u8]) -> Result<(), Refused> {
@@ -1060,16 +1077,16 @@ fn a_force_write_after_dispatch_brings_back_an_active_input() {
     bus.write64(0x130 + 3 * 8, destination(12));
     bus.write64(0x108, 1 << 3);
     pic.set_pin(0, 3, true);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 1 << 12);
-    pi.write64(pi_reg::PENDING_MODIFY, 12);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0);
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 1 << 12);
+    pi.write64(pi_reg::INT_PEND_MOD::OFFSET, 12);
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0);
     bus.write64(0x1c0 + 3 * 8, 0);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 1 << 12, "the force write re-delivers");
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 1 << 12, "the force write re-delivers");
     // With the input dropped, the same write leaves the level clear.
-    pi.write64(pi_reg::PENDING_MODIFY, 12);
+    pi.write64(pi_reg::INT_PEND_MOD::OFFSET, 12);
     pic.set_pin(0, 3, false);
     bus.write64(0x1c0 + 3 * 8, 0);
-    assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0);
+    assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0);
 }
 
 /// A processor on another thread that takes and clears the level the moment
@@ -1077,8 +1094,8 @@ fn a_force_write_after_dispatch_brings_back_an_active_input() {
 struct TakenAtOnce(Pi);
 impl PicPeer for TakenAtOnce {
     fn interrupt(&self, _: u8, _: u64, payload: u64) -> Result<(), Refused> {
-        self.0.write64(pi_reg::PENDING_MODIFY, payload);
-        self.0.write64(pi_reg::PENDING_MODIFY, payload & !SET);
+        self.0.write64(pi_reg::INT_PEND_MOD::OFFSET, payload);
+        self.0.write64(pi_reg::INT_PEND_MOD::OFFSET, payload & !SET);
         Ok(())
     }
     fn dma_read(&self, _: u8, _: u8, _: u64, _: &mut [u8]) -> Result<(), Refused> {
@@ -1111,9 +1128,9 @@ fn a_level_cleared_while_its_input_stays_high_waits_for_the_force_write() {
             pic.set_pin(0, 0, true);
         }
         assert_eq!(pic.request_counts(0, 0), (1, 0), "{what}: one packet");
-        assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0, "{what}: the processor took it");
+        assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0, "{what}: the processor took it");
         now.store(1_000_000_000, Ordering::SeqCst);
-        assert_eq!(pi.read64(pi_reg::PENDING_STATUS_A).data, 0, "{what}: nothing comes back by itself");
+        assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0, "{what}: nothing comes back by itself");
         assert_eq!(pic.request_counts(0, 0), (1, 0), "{what}: no packet of the chip's own");
         bus.write64(0x1c0, 0);
         assert_eq!(pic.request_counts(0, 0), (2, 0), "{what}: the force write sends it");
@@ -1195,7 +1212,7 @@ fn two_pics_are_independent_devices() {
     bus_a.write64(0x130, destination(9));
     bus_a.write64(0x108, 1);
     a.set_pin(0, 0, true);
-    assert_eq!(peer_a.interrupts.lock().as_slice(), [(5, 0x1800090, 0x109)], "the packet carries the control widget field");
+    assert_eq!(peer_a.interrupts.lock().as_slice(), [(5, 0x8000_0180_0090, 0x109)], "the packet carries the control widget field");
     assert!(peer_b.interrupts.lock().is_empty());
     let card = Card::new(1);
     a.attach(0, 1, card.clone(), Function::default());
@@ -1311,8 +1328,8 @@ fn overlapping_bars_go_to_the_lower_device() {
     let r = rig();
     let first = Card::new(0x8001);
     let second = Card::new(0x8002);
-    r.fit(0, 1, &first, Function::default());
-    r.fit(0, 2, &second, Function::default());
+    r.attach(0, 1, &first, Function::default());
+    r.attach(0, 2, &second, Function::default());
     let at = window(0, 0x10);
     r.w32(at, 0x40);
     assert_eq!(le_value(&first.bar.lock()[0x10..0x14]), 0x40, "device 1 answers");

@@ -1,60 +1,184 @@
-//! The IP35 processor bus: Bedrock's four XKPHYS access-space views.
+//! The IP35 node shared by the Fuel, the Tezro and the Origin 3200 and Onyx 3000 C-bricks: the
+//! Bedrock chip with its memory and boot flash, the processor bus over its uncached spaces
+//! ([`crate::sn::UncachedBus`]) and the reset PROM's window.
 //!
-//! Raw address bits 58:57 select Hub-special, I/O, fetch operations or uncached
-//! RAM. Each view has a small fixed set of MMIO apertures, decoded by sorted
-//! windows rather than a full physical-address table. Maps replace whole 4 KiB
-//! pages as Physical does, while each endpoint still rejects padding and
-//! enforces its cell permission.
+//! # The machines
 //!
-//! Cached RAM alone uses Physical, including its direct bank pointers, ppmem
-//! and generation mappings. The MMIO views and register sub-bus need none of
-//! those RAM facilities. Giving each its own full table would consume several
-//! entries in the process-wide fault-handler registry per machine.
+//! [`Machine<Bedrock, Flash>`] is shared by every IP35 product: C-bricks, each a Bedrock node with its
+//! processors, and the base I/O a product connects to them. A product is the facts about each node
+//! ([`NodeSpec`]) and how its I/O is built on the first, as plain functions in its file: the
+//! Origin 3200 and Onyx 3000 ([`crate::ip35_machine`]), the Fuel ([`crate::ip34_machine`]) and the
+//! Tezro ([`crate::ip53_machine`]).
 //!
-//! Ported from hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
+//! Two C-bricks are joined by NUMAlink ([`Bedrock::connect_peer`]) and number their processors
+//! across the machine. Each node's Physical shows every node's memory at its number, and one
+//! [`World`] holds every processor still while a store moves memory.
+//!
+//! - Every C-brick runs one processor; the others are listed disabled in the node's flash, as
+//!   the PROM would after three failed starts of each ([`NodeSpec::absent`]).
+//! - A reset or power request from either node resets the machine; a node's reset alone is not modelled.
+//! - Processors on several nodes share memory with no coherence protocol between the nodes.
+//!
+//! Board composition ported from hw/mips/sgi/sn-machine.c and
+//! hw/mips/sgi/sn1-node.c in jamesbraid/qemu-sgi-origami.
 
-use crate::dev::bedrock::RamExtent;
-use crate::physical::Physical;
-use crate::traits::*;
-#[cfg(feature = "jitv2")]
-use std::sync::{atomic::AtomicU64, OnceLock};
+#![warn(dead_code)]
+
+use crate::dev::bedrock::{Bedrock, RamExtent};
+use crate::dev::heart::Clock;
+use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
+use crate::dev::odyssey::Odyssey;
+use crate::dev::ohci::hid::{HidFunction, UsbHidInput};
+use crate::dev::ohci::Ohci;
+use crate::dev::timekeeper::Timekeeper;
+use crate::dev::xbridge::{HEAD_E, HEAD_F, HOST_WIDGET};
+use crate::pci::{BoardIrq, DevFn, PciBus};
+use crate::config::MachineConfig;
+use crate::cpu::build::build_cpu;
+use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
+use crate::cpu::smp::World;
+use crate::dev::bedrock_flash::Flash;
+use crate::dev::l1::L1;
+use crate::dev::heart::host_clock;
+use crate::dev::prom_image;
+use crate::dev::serial_host::CiSerialBackend;
+use crate::hptimer::TimerManager;
+use crate::sn::{BoardIo, Machine, NodeBoard, MAX_NODES};
+use crate::traits::Device;
+use crate::workstation::Workstation;
+use node::{connect_cpus, NodeSpec};
+use serial::SerialPort;
+use std::path::PathBuf;
+use std::sync::mpsc::channel;
+
+use crate::dev::odyssey::PacketSender;
+use crate::dev::xbridge::XBridge;
+use crate::traits::BusDevice;
+use crate::xtalk::XtalkHost;
 use std::sync::Arc;
 
-pub(crate) use crate::window_map::{map_device, SparseWindowMap, Window, CPU_PHYS_MASK, PA_MASK};
+pub(crate) use crate::window_map::SparseWindowMap;
 
+pub(crate) use crate::sn::RESET_WINDOW;
 /// The reset PROM's compatibility window: the processor's reset vector and
-/// the PROM's own code are at 0x1fc00000, fetched uncached.
-pub(crate) const RESET_WINDOW: u64 = 0x1fc0_0000;
-pub(crate) const RESET_WINDOW_SIZE: u64 = 0x40_0000;
-/// Where an uncached instruction fetch of the reset window is presented to
-/// the bus (`MipsExecutor::uncached_fetch_alias`): the same PROM at an
-/// address of its own, below the 16 GiB the JIT's frame map covers and where
-/// no RAM is.
-///
-/// That is the last 4 MiB of the second node's eighth slot. The second node of
-/// a cabled pair holds its memory at node number 1, from 8 GiB, so any lower
-/// address would be that node's RAM seen from either processor: the JIT would
-/// compile the PROM's bytes where the second node's kernel text lies. A
-/// C-brick's banks are at most 512 MiB, so its eighth slot never reaches this
-/// far, and a single node has nothing above 8 GiB at all.
-///
-/// The split is inferred. The hardware selects a space by the processor's
-/// uncached attribute (established: ip35-address-map.md, "Processor-side
-/// address spaces"), so an uncached attribute-0 access and a cached one are
-/// different requests to Bedrock. What attribute 0 returns at 0x1fc00000 is
-/// not established: no public source says how the reset request reaches flash
-/// (ip35-address-map.md, reset vector), and the cached side is likewise open.
-/// The reset PROM answering uncached fetches while cached accesses reach RAM
-/// is what PROM 6.210's memory test needs, and that is all this decode rests on.
-pub(crate) const RESET_WINDOW_FETCH: u64 = 0x4_0000_0000 - RESET_WINDOW_SIZE;
+/// the PROM's own code, fetched uncached.
+pub(crate) use crate::dev::bedrock::RESET_WINDOW_SIZE;
 
-/// Where a Bedrock node has memory: each 1 GiB software slot `extent` says
-/// can hold RAM, as far as its largest bank reaches, and the reset PROM.
-/// Which bank lands in which slot of a group of four depends on how the PROM
-/// programs the memory controller; the Fuel's two 256 MiB banks can be in any
-/// of the first four, and a Tezro's banks 4 and 5 in any of the next four. Uncached fetches of the PROM's own code land in its
-/// range. A slot 0 larger than 508 MiB reaches the PROM's range, which the
-/// node maps over it, so its RAM is listed on either side.
+/// Bedrock's crossbar port: widget 10, taking interrupt packets at any
+/// address (the address picks the processor interface).
+pub(crate) const BEDROCK_PORT: XtalkHost =
+    XtalkHost { widget: crate::dev::xbridge::HOST_WIDGET, int_packet: 0, int_packet_mask: 0, vectors: 256 };
+
+/// An XBridge whose DMA and interrupt packets enter `bedrock` as each widget's inbound traffic,
+/// answering at widget 0, the host port and its two heads.
+pub(crate) fn xbridge_on(bedrock: &Bedrock) -> Arc<XBridge> {
+    let xbridge = XBridge::new(BEDROCK_PORT, &|widget| {
+        let port = bedrock.inbound(widget);
+        (port.clone() as Arc<dyn BusDevice>, port as Arc<dyn crate::irq::InterruptController>)
+    });
+    for widget in [0, HOST_WIDGET, HEAD_E, HEAD_F] {
+        bedrock.io.connect_widget(widget, xbridge.widget(widget).expect("the XBridge's ports"));
+    }
+    xbridge
+}
+
+/// The IOC3 of `board` at device 4 of head `pci`, with its SuperIO interrupt, and the board's serial
+/// connections in console order: the L1 (on `l1_port`, named by `l1_setting`, logging to `l1_log`),
+/// then the IOC3's two ports.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_ioc3(
+    cfg: &MachineConfig,
+    pci: &PciBus,
+    board: &'static Ioc3Board,
+    l1: &Arc<L1>,
+    timekeeper: &Arc<Timekeeper>,
+    l1_port: u16,
+    l1_setting: &'static str,
+    l1_log: Option<String>,
+) -> (Arc<Ioc3>, Vec<SerialPort>) {
+    let ioc3 = Arc::new(Ioc3::new(board, l1.station_mac(), ByteBus::M48t35(timekeeper.clone())));
+    pci.attach(DevFn { device: 4, function: 0 }, ioc3.clone());
+    ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
+    let serial: [Arc<CiSerialBackend>; 3] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
+    l1.set_serial_backend(serial[0].clone());
+    ioc3.set_serial_backend(0, serial[1].clone());
+    ioc3.set_serial_backend(1, serial[2].clone());
+    let [a, b] = cfg.serial_ports();
+    let (l1, ioc3_a, ioc3_b) = (l1.clone(), ioc3.clone(), ioc3.clone());
+    let ports = vec![
+        SerialPort {
+            label: "L1",
+            port: l1_port,
+            setting: l1_setting,
+            ci: serial[0].clone(),
+            log: l1_log,
+            socket: None,
+            connect: Box::new(move |backend| l1.set_serial_backend(backend)),
+        },
+        SerialPort {
+            label: "IOC3 A",
+            port: a,
+            setting: "serial_port_a",
+            ci: serial[1].clone(),
+            log: cfg.serial_log_a.clone(),
+            socket: cfg.serial_socket_a.clone().map(|p| (p, "serial_socket_a")),
+            connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
+        },
+        SerialPort {
+            label: "IOC3 B",
+            port: b,
+            setting: "serial_port_b",
+            ci: serial[2].clone(),
+            log: cfg.serial_log_b.clone(),
+            socket: cfg.serial_socket_b.clone().map(|p| (p, "serial_socket_b")),
+            connect: Box::new(move |backend| ioc3_b.set_serial_backend(1, backend)),
+        },
+    ];
+    (ioc3, ports)
+}
+
+/// The OHCI controller at device 5 of head `pci`. With `input`, a USB keyboard and mouse sit on its
+/// first two root ports and take the host's input instead of `ioc3`'s PS/2 pair, or a guest that
+/// opened both would see every key twice.
+pub(crate) fn attach_usb(pci: &PciBus, ioc3: &Ioc3, clock: &Clock, input: bool) -> Result<Arc<Ohci>, String> {
+    let usb = Ohci::new();
+    usb.set_clock(clock.clone());
+    if input {
+        let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
+        usb.attach(0, keyboard.clone())?;
+        usb.attach(1, mouse.clone())?;
+        ioc3.ps2().redirect_input(UsbHidInput::new(keyboard, mouse));
+    }
+    pci.attach(DevFn { device: 5, function: 0 }, usb.clone());
+    Ok(usb)
+}
+
+/// A VPro at crossbar `widget` of `bedrock`'s node: its DMA enters Bedrock as that widget's inbound
+/// traffic and its interrupt packets leave by `packets`. `attach` puts it behind the board's crossbar and returns what the
+/// node's I/O space reaches it by.
+pub(crate) fn attach_vpro(
+    cfg: &MachineConfig,
+    bedrock: &Bedrock,
+    widget: u8,
+    packets: PacketSender,
+    status: &Arc<crate::disp::StatusSource>,
+    attach: impl FnOnce(Arc<Odyssey>) -> Result<Arc<dyn BusDevice>, String>,
+) -> Result<Arc<Odyssey>, String> {
+    let vpro = Odyssey::new_widget_relative(
+        widget,
+        cfg.graphics_board().as_str(),
+        packets,
+        bedrock.inbound(widget),
+        status.clone(),
+        (cfg.graphics.threads, cfg.graphics.tile),
+        (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
+    )?;
+    bedrock.io.connect_widget(widget, attach(vpro.clone())?);
+    Ok(vpro)
+}
+
+/// Where a Bedrock node has memory: each 1 GiB slot `extent` says can hold RAM, and the reset
+/// PROM. A slot 0 over 508 MiB reaches the PROM's range, so its RAM is listed on either side.
 pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
     use crate::dev::bedrock::{BANK_SPAN, SLOTS};
     use crate::memory_map::{MemKind, MemRange, MemoryMap};
@@ -76,214 +200,140 @@ pub fn memory_map(extent: &RamExtent) -> crate::memory_map::MemoryMap {
             ranges.push(MemRange::new(name, MemKind::Ram, base, end));
         }
     }
-    ranges.push(MemRange::new("prom (uncached fetch)", MemKind::Rom, RESET_WINDOW_FETCH, RESET_WINDOW_FETCH + RESET_WINDOW_SIZE));
     MemoryMap::new(ranges)
 }
 
-struct Unclaimed;
-impl BusDevice for Unclaimed {}
-
-/// The four uncached processor views decode MMIO separately from cached RAM.
-pub struct Ip35Bus {
-    pub phys: Arc<Physical>,
-    views: [SparseWindowMap; 4],
-}
-impl Ip35Bus {
-    pub fn new(phys: Arc<Physical>) -> Self {
-        phys.set_default(Arc::new(Unclaimed), "IP35 unclaimed cached address");
-        Self {
-            phys,
-            views: std::array::from_fn(|_| SparseWindowMap::default()),
-        }
+/// A machine of `cfg`'s product: `node_specs` gives each node's facts and `build_io` builds the
+/// board's I/O around the nodes and their L1s.
+#[allow(clippy::type_complexity)]
+pub(crate) fn machine(
+    cfg: &MachineConfig,
+    node_specs: fn(&MachineConfig) -> Result<Vec<NodeSpec>, String>,
+    build_io: fn(&MachineConfig, &[NodeBoard<Bedrock, Flash>], &[Arc<L1>], &Arc<TimerManager>, &Clock) -> Result<BoardIo, String>,
+) -> Result<Machine<Bedrock, Flash>, String> {
+    cfg.validate()?;
+    let name = cfg.machine.profile.product_name().unwrap_or_default();
+    let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
+        .map_err(|e| format!("{name} {e}"))?
+        .bytes;
+    let timers = Arc::new(TimerManager::new());
+    let clock = host_clock();
+    let specs = node_specs(cfg)?;
+    assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");
+    // Any node's reset or power request reaches the machine's main thread: a
+    // reset of one node alone is not modelled.
+    let (events, receiver) = channel();
+    // The machine numbers its processors once, across its nodes in order.
+    let (mut nodes, mut l1s, mut first_cpu) = (Vec::new(), Vec::new(), 0);
+    for spec in &specs {
+        let l1 = Arc::new(L1::new(spec.l1.clone())?);
+        nodes.push(NodeBoard::<Bedrock, Flash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, &prom, &clock, first_cpu, specs.len(), &events, &l1)?);
+        l1s.push(l1);
+        first_cpu += spec.processors.count();
     }
-    /// Raw XKPHYS bits 58:57 select Hub-special, I/O, fetchop, or uncached RAM.
-    pub fn map(&mut self, raw_uc: u8, base: u64, size: u64, device: Arc<dyn BusDevice>) {
-        assert!(raw_uc < 4);
-        self.views[raw_uc as usize].map(base, size, device);
+    let world = Arc::new(World::new());
+    if let [a, b] = &nodes[..] {
+        a.chip.connect_peer(&b.chip);
+        b.chip.connect_peer(&a.chip);
     }
-    pub fn set_fallback(&mut self, raw_uc: u8, end: u64, device: Arc<dyn BusDevice>) {
-        self.map(raw_uc, 0, end, device);
+    for n in &nodes {
+        n.chip.decode.set_world(world.clone());
     }
-    fn target(&self, a: u64, n: u64) -> Option<(&SparseWindowMap, u64)> {
-        let pa = plain_address(a, n)?;
-        Some((&self.views[(a >> 57) as usize], pa))
+    let io = build_io(cfg, &nodes, &l1s, &timers, &clock)?;
+    let count = nodes.len();
+    // Every processor reaches every node's memory at its number.
+    let maps: Vec<_> = nodes.iter().map(|n| crate::ip35::memory_map(&n.chip.md.ram_extent())).collect();
+    let memory = Arc::new(crate::sn::machine_memory(&maps, crate::dev::bedrock::NODE_SHIFT));
+    let smp = specs.iter().map(|s| s.processors.count()).sum::<usize>() > 1;
+    let mut node_cpus = Vec::new();
+    for (index, (node, spec)) in nodes.iter().zip(&specs).enumerate() {
+        let count_hz = cfg.clock.count_hz(spec.module.part).max(1);
+        let several = spec.processors.count() > 1;
+        let cpus: Vec<_> = (0..spec.processors.count())
+            .map(|n| {
+                // A node's first processor brings its boot flash, and the first node's the
+                // board's devices, up to date; every processor of a node of several joins the
+                // PROM's holds.
+                let flash = (n == 0).then(|| (node.flash.clone(), clock.clone()));
+                let board = (index == 0 && n == 0).then(|| io.poll.clone()).flatten();
+                let held = io.at_batch.clone().filter(|_| several);
+                let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    if let Some((flash, clock)) = &flash {
+                        flash.advance_to(clock());
+                    }
+                    if let Some(board) = &board {
+                        board();
+                    }
+                    if let Some(held) = &held {
+                        held();
+                    }
+                });
+                let fasttick = io.fasttick.clone().filter(|_| index == 0 && n == 0);
+                crate::with_cpu!(spec.module.part, true, false, C => {
+                    let cpu_id = node.first_cpu + n;
+                    let bus = node.bus.clone();
+                    let mut exec = build_cpu::<C>(bus, node.chip.decode.physical().clone(), memory.clone(), spec.module, &timers, count_hz, cpu_id, smp);
+                    if let Some(fasttick) = fasttick {
+                        exec.core.fasttick_count = fasttick;
+                    }
+                    exec.batch_hook = Some(Box::new(move |_| hook()));
+                    Arc::new(MipsCpu::new(*exec)) as Arc<dyn CpuDevice>
+                })
+            })
+            .collect();
+        node_cpus.push(cpus);
     }
-    /// The bus the JIT compiles code through: the cached view, except the
-    /// reset PROM's uncached-fetch window ([`RESET_WINDOW_FETCH`]), which only
-    /// the uncached view holds.
+    let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
+    // One body of park slots for every processor of every node: a store that places
+    // memory on either node holds the others still.
+    world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
+    for (node, cpus) in nodes.iter().zip(&node_cpus) {
+        connect_cpus(&node.chip, cpus)?;
+        node.chip.set_timer_manager(&timers);
+    }
+    // One JIT for the machine: every processor of every node compiles through
+    // one queue into one page pool, each node an address space of it.
     #[cfg(feature = "jitv2")]
-    pub fn code_view(self: &Arc<Self>, cached: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
-        Arc::new(CodeViews { cached, uncached: self.clone() })
+    {
+        let pool: Vec<_> = nodes
+            .iter()
+            .zip(&specs)
+            .zip(&node_cpus)
+            .map(|((node, spec), cpus)| crate::cpu::jitv2::jitv2::PoolNode { cpus, module: spec.module, bus: node.chip.decode.physical().clone() })
+            .collect();
+        crate::cpu::jitv2::jitv2::share_pool(&pool, cfg.jitv2_pool_size(), cfg.jitv2.compile, &world).map_err(|e| format!("{name}: {e}"))?;
     }
-    /// Cached RAM, with `plain_memory` answering wherever `extent` says
-    /// fitted RAM can be.
-    pub fn cached_view(&self, plain_memory: Arc<dyn BusDevice>, extent: RamExtent) -> Arc<dyn BusDevice> {
-        Arc::new(CachedPhysical {
-            phys: self.phys.clone(),
-            plain_memory,
-            extent,
-        })
+    if let Some(hook) = &io.cpus {
+        hook(&cpus);
     }
-}
-fn plain_address(a: u64, n: u64) -> Option<u64> {
-    if a & !CPU_PHYS_MASK != 0 {
-        return None;
+    for c in &cpus {
+        c.register_locks();
     }
-    let pa = a & PA_MASK;
-    (pa.checked_add(n)? <= PA_MASK + 1).then_some(pa)
-}
-/// Whether `a` is in the reset PROM's uncached-fetch window.
-fn in_fetch_window(a: u64) -> bool {
-    a.wrapping_sub(RESET_WINDOW_FETCH) < RESET_WINDOW_SIZE
-}
-/// See [`Ip35Bus::code_view`]. Compiles read instruction words only.
-#[cfg(feature = "jitv2")]
-struct CodeViews {
-    cached: Arc<dyn BusDevice>,
-    uncached: Arc<Ip35Bus>,
-}
-#[cfg(feature = "jitv2")]
-impl BusDevice for CodeViews {
-    fn read32(&self, a: u64) -> BusRead32 {
-        if in_fetch_window(a) {
-            self.uncached.read32(a)
-        } else {
-            self.cached.read32(a)
-        }
+    for node in &nodes {
+        node.flash.register_locks();
+        node.chip.register_locks();
     }
-    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
-        if in_fetch_window(a) { self.uncached.gen_ptr(a) } else { self.cached.gen_ptr(a) }
-    }
-}
-struct CachedPhysical {
-    phys: Arc<Physical>,
-    plain_memory: Arc<dyn BusDevice>,
-    extent: RamExtent,
-}
-impl CachedPhysical {
-    fn memory_target(&self, a: u64, n: u64) -> Option<(&dyn BusDevice, u64)> {
-        self.target(a, n).map(|(physical, pa)| {
-            // MD owns every guest write to a possible fitted-RAM prefix, so
-            // all paths update its stable logical generation counters. PROM
-            // and other devices retain the cached Physical connection.
-            let memory: &dyn BusDevice = if self.extent.contains(pa) {
-                self.plain_memory.as_ref()
-            } else { physical };
-            (memory, pa)
-        })
-    }
-    fn target(&self, a: u64, n: u64) -> Option<(&Physical, u64)> {
-        // UC selectors belong to the uncached SysAd connection. Reject them
-        // here rather than turning a malformed cached request into an alias.
-        if a & !PA_MASK != 0 || a & (n - 1) != 0 {
-            return None;
-        }
-        Some((self.phys.as_ref(), plain_address(a, n)?))
-    }
-}
-macro_rules! processor_access {
-    ($r:ident,$w:ident,$t:ty,$out:ident,$n:expr,$writes:ident) => {
-        fn $r(&self, a: u64) -> $out {
-            self
-                .target(a, $n)
-                .map(|(v, pa)| v.$r(pa))
-                .unwrap_or_else($out::err)
-        }
-        fn $w(&self, a: u64, v: $t) -> u32 {
-            self
-                .$writes(a, $n)
-                .map(|(view, pa)| view.$w(pa, v))
-                .unwrap_or(BUS_ERR)
-        }
-    };
-}
-impl BusDevice for Ip35Bus {
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        // Only the reset PROM's page asks this bus: its generation is the PROM
-        // device's, so a flash command invalidates it and a store to RAM never
-        // does. The counter covers the whole flash, so any flash write
-        // invalidates every PROM page (over-invalidation, safe).
-        if in_fetch_window(address) {
-            return self.views[0].gen_ptr(address);
-        }
-        std::ptr::null()
-    }
-    fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
-        if a & 7 != 0 {
-            return BUS_ERR;
-        }
-        self.target(a, 8)
-            .map(|(view, pa)| view.write64_masked(pa, val, mask))
-            .unwrap_or(BUS_ERR)
-    }
-    fn write_narrow_from(&self, a: u64, size: usize, gpr: u64) -> u32 {
-        self.target(a, size as u64)
-            .map(|(view, pa)| view.write_narrow_from(pa, size, gpr))
-            .unwrap_or(BUS_ERR)
-    }
-    processor_access!(read8, write8, u8, BusRead8, 1, target);
-    processor_access!(read16, write16, u16, BusRead16, 2, target);
-    processor_access!(read32, write32, u32, BusRead32, 4, target);
-    processor_access!(read64, write64, u64, BusRead64, 8, target);
-}
-impl BusDevice for CachedPhysical {
-    fn write64_masked(&self, address: u64, value: u64, mask: u64) -> u32 {
-        self.memory_target(address, 8).map(|(view, pa)| view.write64_masked(pa, value, mask))
-            .unwrap_or(BUS_ERR)
-    }
-    fn mem_ptr(&self, a: u64) -> Option<*const u64> {
-        self.target(a, 8).and_then(|(view, pa)| view.mem_ptr(pa))
-    }
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
-        self.target(a, 1).map(|(view, pa)| {
-            // MD's logical counters belong to a view that names its RAM. A
-            // node of several leaves the extent empty: its stores reach the
-            // banks, which bump their own counters, so a compiled page must
-            // watch those. Handing it a logical counter that only DMA and
-            // uncached stores bump leaves stale code running.
-            let generation = if self.extent.is_empty() { std::ptr::null() } else { self.plain_memory.gen_ptr(pa) };
-            if generation.is_null() { view.gen_ptr(pa) } else { generation }
-        }).unwrap_or(std::ptr::null())
-    }
-    fn read_block(&self, a: u64, out: &mut [u64]) -> u32 {
-        self.target(a, 8)
-            .map(|(view, pa)| view.read_block(pa, out)).unwrap_or(BUS_ERR)
-    }
-    fn write_block(&self, a: u64, data: &[u64]) -> u32 {
-        self.memory_target(a, 8)
-            .map(|(view, pa)| view.write_block(pa, data)).unwrap_or(BUS_ERR)
-    }
-    // A processor's SC to RAM the shadow cache cannot reach directly, such
-    // as a bank smaller than a direct-window region: the swap the store makes atomic,
-    // which matters once a node runs more than one processor.
-    fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> {
-        self.memory_target(a, 4).and_then(|(view, pa)| view.cas32(pa, old, new))
-    }
-    fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> {
-        self.memory_target(a, 8).and_then(|(view, pa)| view.cas64(pa, old, new))
-    }
-    processor_access!(read8, write8, u8, BusRead8, 1, memory_target);
-    processor_access!(read16, write16, u16, BusRead16, 2, memory_target);
-    processor_access!(read32, write32, u32, BusRead32, 4, memory_target);
-    processor_access!(read64, write64, u64, BusRead64, 8, memory_target);
-    fn dma_read64(&self, a: u64) -> BusRead64 {
-        plain_address(a, 8)
-            .map(|pa| self.plain_memory.dma_read64(pa))
-            .unwrap_or_else(BusRead64::err)
-    }
-    fn dma_write64(&self, a: u64, v: u64) -> u32 {
-        plain_address(a, 8)
-            .map(|pa| self.plain_memory.dma_write64(pa, v))
-            .unwrap_or(BUS_ERR)
-    }
+    eprintln!(
+        "iris: {}, {count} node{} of {} MiB, {} x {}",
+        name,
+        if count == 1 { "" } else { "s" },
+        specs[0].banks_mib.iter().sum::<u32>(),
+        cpus.len(),
+        specs[0].module.part.label(),
+    );
+    let memory = nodes.iter().map(|n| n.chip.decode.physical().clone() as Arc<dyn Device>).collect();
+    Machine::new(cfg, nodes, l1s, node_cpus, io, memory, timers, receiver, |bedrock| {
+        // A timer or the other chip can still reach this one's processor.
+        bedrock.clear_cpu_interrupts();
+        bedrock.decode.physical().release_devices();
+    })
 }
 
-pub(crate) mod inbound;
 pub(crate) mod node;
 pub(crate) mod presence;
-pub(crate) mod routed;
 pub(crate) mod serial;
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;
+

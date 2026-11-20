@@ -431,7 +431,7 @@ mod tests {
     /// The engine applies a mask to each of words 4 to 12 before the raster register sees it, so a form
     /// the decoder takes has no bit outside its word's mask.
     #[test]
-    fn the_forms_the_decoder_takes_fit_the_engines_masks() {
+    fn the_forms_the_decoder_takes_match_the_engines_masks() {
         for w in [CI, RGB, DID] {
             ok(&w);
             for (k, mask) in GC_WORD_MASKS.iter().enumerate() {

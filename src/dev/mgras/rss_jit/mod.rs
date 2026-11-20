@@ -189,8 +189,8 @@ pub struct CommonCtx {
     /// The rows this engine draws (`Rss::owns_row`).
     pub engine: u32,
     pub own_mask: u32,
-    /// The window coordinates that land on screen: x in [vis[0], vis[1]),
-    /// y in [vis[2], vis[3]). Triangles skip the rest (they draw nothing
+    /// The window coordinates that land on screen: x in [vis\[0\], vis\[1\]),
+    /// y in [vis\[2\], vis\[3\]). Triangles skip the rest (they draw nothing
     /// there and nothing else depends on visiting them).
     pub vis: [i32; 4],
     pub clip: [ClipRect; 4],
@@ -208,7 +208,9 @@ pub struct GlCtx {
     pub sref: u32,
     pub scmask: u32,
     pub swmask: u32,
-    pub _pad0: u32,
+    /// The texture colour tables enabled, bit k for table k (R, G, B;
+    /// TEXMODE1 bits 15:13).
+    pub lut_mask: u32,
     pub zmask: u64,
     pub poly: [u32; 32],
     pub smp: Sampler,
@@ -239,6 +241,8 @@ pub struct RasterCtx {
     pub words: *mut u64,
     pub cid: *mut u8,
     pub tram: *const u8,
+    /// The texture colour tables (`Rss::tex_lut`).
+    pub tex_lut: *const u8,
     /// Transfer line bytes.
     pub src: *const u8,
     pub common: CommonCtx,
@@ -278,6 +282,7 @@ impl RasterCtx {
         rss.jit_ctx.words = rss.mem.words.as_mut_ptr();
         rss.jit_ctx.cid = rss.cid.as_mut_ptr();
         rss.jit_ctx.tram = rss.te.tram_ptr();
+        rss.jit_ctx.tex_lut = rss.tex_lut.as_ptr();
     }
 }
 
@@ -449,7 +454,9 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
             no_border: m2 & te1::TM2_NO_BORDER != 0,
             depth: te1::depth_nibbles(m2 >> 2) as u8,
             detail: m2 & te1::TM2_DETAIL != 0,
+            lut: m1 & te1::TEXMODE1_LUT != 0,
         });
+        c.lut_mask = (m1 & te1::TEXMODE1_LUT) >> te1::TEXMODE1_LUT_SHIFT;
         c.smp = rss.sampler();
         let (w, h) = c.smp.size();
         c.smp_w = w;

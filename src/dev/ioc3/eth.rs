@@ -1,5 +1,6 @@
-//! The Ethernet MAC inside IOC3, with the Octane ICS1890 or Fuel DP83843
-//! transceiver on its management bus.
+//! The Ethernet MAC inside IOC3, with the board's transceiver on its
+//! management bus: the Octane's ICS1890, the Origin 200, 2000 and Onyx2
+//! boards' DP83840A, or the Fuel's DP83843 (see [`Phy`]).
 //!
 //! The IOC3 forwards the register offsets 0xf0..=0x150 of its register BAR
 //! here. The MAC is a child of the IOC3, as Linux's `ioc3-eth` cell is: the
@@ -21,6 +22,10 @@
 //!
 //! Frames use iris's shared network link. The machine attaches it through
 //! [`Ioc3Eth::attach`].
+//!
+//! The interrupt status and enable pair sit in an [`IrqMutex`] with the rest
+//! of the MAC's state, whose guard drives the PCI pin before the lock is let
+//! go.
 //!
 //! Approximations:
 //! - Receive completions are published as soon as the frame is in memory,
@@ -167,7 +172,7 @@ pub const ORIGIN200_PHY_ADDR: u8 = 31;
 /// How long the synthetic link partner takes to complete negotiation.
 pub const NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
 
-/// The transceiver a board fits on the MAC's management bus.
+/// The transceiver a board has on the MAC's management bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phy {
     /// The Octane's ICS1890, at MII address 1.
@@ -738,7 +743,7 @@ pub struct Ioc3Eth {
 const RX_IDLE: Duration = Duration::from_secs(60);
 
 impl Ioc3Eth {
-    /// The MAC a board fits behind `phy`. `mac` is the station address the
+    /// The MAC a board has behind `phy`. `mac` is the station address the
     /// board's one-wire chip carries; the guest programs the receive filter
     /// itself, and this is kept for the integrator (`mac()`).
     pub(super) fn new(core: Arc<Core>, mac: [u8; 6], phy: Phy) -> Arc<Self> {

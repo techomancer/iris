@@ -35,7 +35,7 @@ use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
 use crate::dev::ng1::rex3::Rex3;
-use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
+use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, Gr2Chunk, MgrasChunk, enabled_features};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
 use crate::workstation::{MachineRef, MachineSlot, SystemController, Workstation};
@@ -173,6 +173,11 @@ pub struct Machine {
     lifecycle: GuestState,
 }
 
+#[cfg(feature = "wgpu")]
+type ResidentCheckpoint = (toml::Value, (Vec<u32>, Vec<u32>));
+type MgrasCheckpoint = (String, Vec<(String, Vec<u32>)>);
+type Gr2Checkpoint = crate::dev::gr2::Gr2SnapshotParts;
+
 /// In-memory snapshot of the just-restored guest state. Populated at the end
 /// of `ci_restore`; consumed by `ci_rollback`. Trades ~270 MB of RSS for
 /// disk-IO-free rollback.
@@ -193,6 +198,8 @@ struct RollbackCheckpoint {
 
     /// Framebuffer contents (RGB, aux). `None` when running headless.
     framebuffers: Option<(Vec<u32>, Vec<u32>)>,
+    #[cfg(feature = "wgpu")]
+    resident_head1_framebuffers: Option<(Vec<u32>, Vec<u32>)>,
 
     /// Parsed device save_state TOMLs. Holding `toml::Value` directly skips
     /// the ~80 ms cpu.toml string-parse cost on every rollback.
@@ -211,6 +218,8 @@ struct RollbackCheckpoint {
     hpc3: toml::Value,
     rex3: Option<toml::Value>,
     rex3_head1: Option<toml::Value>,
+    mgras: Option<MgrasCheckpoint>,
+    gr2: Option<Gr2Checkpoint>,
 }
 
 /// Parse a `cow.toml`/`cow1.toml`-shaped table (`{"scsi<id>": [dirty
@@ -269,6 +278,8 @@ pub(crate) fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> 
 pub(crate) struct LiveCheckpoint {
     bank_words: [Vec<u32>; 4],
     framebuffers: Option<(Vec<u32>, Vec<u32>)>,
+    #[cfg(feature = "wgpu")]
+    resident_head1_framebuffers: Option<(Vec<u32>, Vec<u32>)>,
     cpu: toml::Value,
     mc: toml::Value,
     ioc: toml::Value,
@@ -281,44 +292,81 @@ pub(crate) struct LiveCheckpoint {
     hpc3: toml::Value,
     rex3: Option<toml::Value>,
     rex3_head1: Option<toml::Value>,
+    mgras: Option<MgrasCheckpoint>,
+    gr2: Option<Gr2Checkpoint>,
 }
 
-/// The test device and the ultra64 dev board both decode GIO expansion slot 0,
-/// so only one of them can exist. Panics rather than exiting: `Machine::new`
+/// The test device, the ultra64 dev board and the second Newport head all
+/// decode GIO expansion slot 0, so the test device cannot share a machine
+/// with either. Panics rather than exiting: `Machine::new`
 /// already panics on bad input, and a host that embeds IRIS catches that
 /// (`iris-gui`'s worker wraps construction in `catch_unwind`) — killing the
 /// application over a configuration mistake is not a choice a library gets to
 /// make for its caller.
-fn check_testdev_slot_free(ultra64_present: bool) {
+fn check_testdev_slot_free(ultra64_present: bool, head1_present: bool) {
     if ultra64_present {
         panic!("--test-device and the ultra64 dev board both claim GIO slot 0");
+    }
+    if head1_present {
+        panic!("--test-device and the second graphics head (graphics.heads = 2) both claim GIO slot 0");
     }
 }
 
 /// A virtio device's GIO slot must not be one another device decodes: the
-/// Ultra64 board and `--test-device` take slot 0, the second Newport head
-/// slot 1. Panics for the same reason `check_testdev_slot_free` does.
+/// Ultra64 board, `--test-device` and the second Newport head take slot 0. Panics for the same reason `check_testdev_slot_free` does.
 fn check_virtio_slot_free(section: &str, slot: crate::dev::ioc::GioSlot, ultra64: bool, testdev: bool, head1: bool) {
     use crate::dev::ioc::GioSlot;
     match slot {
-        GioSlot::Exp0 if ultra64 || testdev => {
-            panic!("[{section}] slot = \"exp0\" is taken by the ultra64 board or --test-device; use \"exp1\"")
-        }
-        GioSlot::Exp1 if head1 => {
-            panic!("[{section}] slot = \"exp1\" is taken by the second graphics head; use \"exp0\"")
+        GioSlot::Exp0 if ultra64 || testdev || head1 => {
+            panic!("[{section}] slot = \"exp0\" is taken by the ultra64 board, --test-device or the second graphics head; use \"exp1\"")
         }
         _ => {}
     }
 }
 
+/// One Newport head's monitor commands under numbered names: `rex1`,
+/// `vc21`, `xmap1`, `cmap1`, `bt4451`, `dcb1`, `disp1` for the second head.
+/// Both boards name their commands alike and the monitor gives a name to the
+/// first device that has it, so the plain names reach the first head; it has
+/// the `0` names as well.
+struct HeadCommands { rex: Arc<Rex3>, head: u8 }
+
+impl HeadCommands {
+    /// `rex1` on head 1 is the board's `rex`.
+    fn plain<'a>(&self, cmd: &'a str) -> Option<&'a str> {
+        let digit = (b'0' + self.head) as char;
+        cmd.strip_suffix(digit)
+    }
+}
+
+impl Device for HeadCommands {
+    fn step(&self, _cycles: u64) {}
+    fn stop(&self) {}
+    fn start(&self) {}
+    fn is_running(&self) -> bool { self.rex.is_running() }
+    fn get_clock(&self) -> u64 { 0 }
+
+    fn register_commands(&self) -> Vec<(String, String)> {
+        self.rex.register_commands().into_iter()
+            .map(|(c, _)| (format!("{c}{}", self.head), format!("`{c}` on Newport head {}", self.head)))
+            .collect()
+    }
+
+    fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        let plain = self.plain(cmd).ok_or("Command not found")?;
+        self.rex.execute_command(plain, args, writer)
+    }
+}
+
 impl Machine {
+    /// Build the Indy or Indigo2 `cfg` describes. Panics if its PROM cannot
+    /// be loaded; [`try_new`](Self::try_new) returns the error instead.
     pub fn new(cfg: MachineConfig) -> Self {
         Self::register_host_services();
         Self::new_with_testdev(cfg, None)
     }
 
-    /// `new`, but a `prom` file that cannot be loaded is an error for the caller to
-    /// report, not a panic.
+    /// `new`, but construction errors are returned to the caller instead of panicking.
     pub fn try_new(cfg: MachineConfig) -> Result<Self, String> {
         Self::register_host_services();
         Self::try_new_with_testdev(cfg, None)
@@ -344,23 +392,25 @@ impl Machine {
         cfg: MachineConfig,
         testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
     ) -> Self {
-        Self::try_new_with_testdev(cfg, testdev_override).unwrap_or_else(|e| panic!("{e}"))
+        Self::try_new_with_testdev(cfg, testdev_override)
+            .unwrap_or_else(|error| panic!("machine construction failed: {error}"))
     }
 
-    /// [`new_with_testdev`](Self::new_with_testdev), reporting a `prom` that cannot be loaded.
+    /// [`new_with_testdev`](Self::new_with_testdev), returning construction errors.
     pub fn try_new_with_testdev(
         cfg: MachineConfig,
         testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
     ) -> Result<Self, String> {
         let prom = Prom::for_profile(cfg.machine.profile, &cfg.prom)?;
-        Ok(Self::with_prom(cfg, testdev_override, prom))
+        Self::try_with_prom(cfg, testdev_override, prom)
     }
 
-    fn with_prom(
+    fn try_with_prom(
         mut cfg: MachineConfig,
         testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
         prom: Prom,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        cfg.validate_newport_raster_gate()?;
         // The rig takes any part: `MachineConfig::cpu_part` looks at this.
         cfg.test_device |= testdev_override.is_some();
         // Capture config flags that are needed after the local `cfg` binding
@@ -368,7 +418,7 @@ impl Machine {
         let ci_enabled = cfg.ci;
         let perf = cfg.perf.clone();
         #[cfg(feature = "jitv2")]
-        let jitv2_threads = cfg.jitv2.threads;
+        let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
         #[cfg(feature = "jitv2")]
         let jitv2_compile = cfg.jitv2.compile;
         let display_resolution = cfg.graphics.resolution;
@@ -555,11 +605,59 @@ impl Machine {
             .collect();
         let nvram_provenance = cfg.nvram.clone();
 
+        #[cfg(feature = "wgpu")]
+        let resident_gpu = if newport_active
+            && cfg.graphics.raster == crate::config::RasterUnit::Wgpu
+        {
+            if std::env::var_os("IRIS_REX3_GPU").is_some() {
+                return Err(
+                    "IRIS_REX3_GPU and production Newport graphics.raster = \"wgpu\" are mutually exclusive"
+                        .into(),
+                );
+            }
+            let options = crate::wgpu::GpuOptions {
+                backend: cfg.graphics.gpu_backend.clone(),
+                ..Default::default()
+            };
+            let gpu = crate::wgpu::Gpu::new(&options)
+                .map_err(|error| format!("create Newport resident GPU: {error}"))?;
+            if !matches!(gpu.caps.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12) {
+                return Err(format!(
+                    "Newport resident GPU resolved graphics.gpu_backend = {:?} to unsupported {:?}; \
+                     use Vulkan or D3D12",
+                    cfg.graphics.gpu_backend, gpu.caps.backend
+                ));
+            }
+            gpu.check().map_err(|error| format!("initialize Newport resident GPU: {error}"))?;
+            eprintln!("iris: Newport resident GPU enabled without CPU fallback: {}", gpu.caps);
+            Some(gpu)
+        } else {
+            None
+        };
+
+        #[cfg(feature = "wgpu")]
+        let resident_mode = match cfg.graphics.newport_wgpu_mode() {
+            crate::config::NewportWgpuMode::Direct =>
+                crate::dev::ng1::rex3::ResidentDisplayMode::DirectWgpu,
+            crate::config::NewportWgpuMode::Readback =>
+                crate::dev::ng1::rex3::ResidentDisplayMode::ReadbackCompatibility,
+        };
+
         // REX3 Graphics — Newport only; skipped in headless mode or when non-Newport board selected.
         let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
             None
         } else {
-            let r = Arc::new(Rex3::new(status.clone()));
+            let r = Rex3::new(status.clone());
+            #[cfg(feature = "wgpu")]
+            let r = {
+                let mut r = r;
+                if let Some(gpu) = &resident_gpu {
+                    r.activate_resident_gpu_for_runtime(Arc::clone(gpu), resident_mode)
+                        .map_err(|error| format!("activate primary Newport resident GPU: {error}"))?;
+                }
+                r
+            };
+            let r = Arc::new(r);
             r.set_fatal_sender(fatal_tx.clone());
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
             r.set_vblank_irq(ioc.irq_line(wiring.retrace));
@@ -570,11 +668,33 @@ impl Machine {
         let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.heads < 2 {
             None
         } else {
-            let r = Arc::new(Rex3::new(status.clone()));
+            let r = Rex3::new(status.clone());
+            #[cfg(feature = "wgpu")]
+            let r = {
+                let mut r = r;
+                if let Some(gpu) = &resident_gpu {
+                    r.activate_resident_gpu_for_runtime(Arc::clone(gpu), resident_mode)
+                        .map_err(|error| format!("activate secondary Newport resident GPU: {error}"))?;
+                }
+                r
+            };
+            let r = Arc::new(r);
             r.set_fatal_sender(fatal_tx.clone());
+            r.set_head_index(1);
+            // An Indy baseboard older than revision 4 does not take a second
+            // board: the PROM and IRIX both skip the probe below it.
+            if guinness { ioc.set_board_rev(4); }
+            // Expansion slot 0, the one place IRIX looks for a second board.
+            // On an Indy the slot has one interrupt pin for both sources.
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
-            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
-            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
+            if wiring.retrace == wiring.fifo_full {
+                let [retrace, fifo] = crate::irq::IrqLine::wired_or(ioc.irq_line(wiring.retrace));
+                r.set_vblank_irq(retrace);
+                r.set_fifo_full_irq(fifo);
+            } else {
+                r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+                r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
+            }
             Some(r)
         };
 
@@ -622,7 +742,10 @@ impl Machine {
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
-        let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled {
+        let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled && rex3_head1.is_some() {
+            eprintln!("ultra64: disabled, the second graphics head is in its GIO slot (graphics.heads = 2)");
+            None
+        } else if cfg.ultra64.enabled {
             match crate::dev::ultra64::Ultra64::new(ioc.irq_line(crate::dev::ioc::IocInterrupt::GioExp0)) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
@@ -645,14 +768,10 @@ impl Machine {
         // Bare-metal test device (--test-device): default off, and refused
         // alongside the ultra64 dev board, which claims the same GIO slot.
         let testdev = if let Some(dev) = testdev_override {
-            check_testdev_slot_free(
-                ultra64.is_some(),
-            );
+            check_testdev_slot_free(ultra64.is_some(), rex3_head1.is_some());
             Some(dev)
         } else if cfg.test_device {
-            check_testdev_slot_free(
-                ultra64.is_some(),
-            );
+            check_testdev_slot_free(ultra64.is_some(), rex3_head1.is_some());
             let path = cfg.test_device_dump.clone()
                 .unwrap_or_else(|| crate::dev::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
@@ -728,13 +847,13 @@ impl Machine {
         mc.set_dma_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::McDma));
 
         // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap the banks. Runs
-        // on the CPU thread (the thread that writes MEMCFG). Weak: the MC is
-        // one of the board's devices.
+        // on the one CPU's thread, so there is no other to park.
+        let world = Arc::new(crate::cpu::smp::World::new());
         {
-            let board = Arc::downgrade(&board);
+            let (board, world) = (Arc::downgrade(&board), world.clone());
             mc.set_memcfg_callback(Box::new(move |addrs| {
-                if let Some(board) = board.upgrade() {
-                    board.remap_banks(addrs);
+                if board.upgrade().is_some_and(|board| board.remap_banks(addrs)) {
+                    world.layout_changed();
                 }
             }));
         }
@@ -843,6 +962,7 @@ impl Machine {
         // The developer status bar shows the CPU's Count rate.
         status.set_count_hz(cpu.count_hz_atomic());
 
+        world.set_slots(vec![cpu.park_slot()]);
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
         mc.set_cpu(Arc::downgrade(&cpu_device));
@@ -889,6 +1009,10 @@ impl Machine {
             }
         }
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
+        #[cfg(feature = "ci_clock")]
+        hpc3.rtc().set_cpu_cycles(cpu.cycles_ptr());
+        #[cfg(feature = "ci_clock")]
+        hpc3.ioc().pit().set_cpu_cycles(cpu.cycles_ptr());
 
         // Inject the CPU/self handles jitv2's compile-thread worker needs to
         // pause the CPU around its own memory-growth flush (see
@@ -897,42 +1021,7 @@ impl Machine {
         // default, so this can only happen here, after `Arc::new(MipsCpu::new(..))`,
         // same reasoning as `mc.set_cpu` right above).
         #[cfg(feature = "jitv2")]
-        {
-            let jit = cpu.jitv2();
-            // Fixed at startup, before the queue ever starts — see
-            // CompileQueue::set_thread_count's own doc comment for why this
-            // can't change at runtime.
-            jit.lock().compile_queue.set_thread_count(jitv2_threads.max(1));
-            jit.lock().compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            jit.lock().compile_queue.set_owner(Arc::downgrade(&jit));
-            // Threaded compile is the default (`MipsExecutor::jitv2_inline_compile`
-            // starts `false`) — the queue must actually be running or every
-            // compile request silently vanishes (send()s into a consumer
-            // nothing is popping). `j2 inline on` reverses this later by
-            // stopping the queue and reclaiming its Codegen for the inline
-            // path (see that command's own handler).
-            //
-            // EXCEPT under jitv2_lockstep: the dispatch gate forces inline
-            // compile there (see exec_decoded's `inline_compile`), and inline
-            // compile takes the Codegen from `Jitv2::codegen` on every compile.
-            // If the queue owned it instead, inline's `.take()` would get `None`
-            // and NOTHING would ever compile — the whole run silently degrades
-            // to pure interpreter with lockstep never firing (observed: a
-            // lockstep boot showing `codegen owned by async compile thread`,
-            // `compiles: 0`, running at interpreter speed). So leave the queue
-            // stopped under lockstep and keep the Codegen in `Jitv2::codegen`
-            // for inline to use.
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                // start() now builds its own Codegen internally (no more
-                // shared-arena-across-modes handoff — see CompileQueue::start's
-                // own doc comment) — the idle Jitv2::codegen slot built by
-                // Jitv2::new() stays untouched here, reserved for inline
-                // mode if `j2 inline on` ever switches to it.
-                let bus: Arc<dyn BusDevice> = phys.clone();
-                crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, jitv2_compile, bus);
-            }
-        }
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, (jitv2_threads, jitv2_threads_reason), jitv2_compile, phys.clone(), None);
 
         // Setup DevLog (must be before Monitor so log command is available)
         let devlog = crate::devlog::init_devlog();
@@ -945,7 +1034,11 @@ impl Machine {
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());
         if let Some(rex3) = &board.rex3 { monitor.register_device(rex3.clone()); }
-        if let Some(rex3) = &board.rex3_head1 { monitor.register_device(rex3.clone()); }
+        if let Some(rex3) = &board.rex3_head1 {
+            // With two heads each has numbered commands; the plain ones stay head 0's.
+            if let Some(head0) = &board.rex3 { monitor.register_device(Arc::new(HeadCommands { rex: head0.clone(), head: 0 })); }
+            monitor.register_device(Arc::new(HeadCommands { rex: rex3.clone(), head: 1 }));
+        }
         if let Some(td) = &board.testdev { monitor.register_device(td.clone()); }
         if let Some(gr2) = &board.gr2 { monitor.register_device(gr2.clone()); }
         if let Some(mgras) = &board.mgras { monitor.register_device(mgras.clone()); }
@@ -990,7 +1083,7 @@ impl Machine {
 
         crate::thread_affinity::init(perf);
 
-        Self {
+        Ok(Self {
             memory,            cpu,
             board,
             mc,
@@ -1015,7 +1108,7 @@ impl Machine {
             controller_slot: None,
             controller_registered: false,
             lifecycle: GuestState::Idle,
-        }
+        })
     }
 
     fn apply_host_display_resolution(&self) {
@@ -1034,12 +1127,17 @@ impl Machine {
         } else {
             self.display_resolution
         };
-        if let Some(rex3) = &self.board.rex3 {
+        let apply = |rex3: &Rex3| {
+            #[cfg(feature = "wgpu")]
+            if rex3.resident_active() {
+                rex3.apply_resident_display_resolution(mode, true)
+                    .unwrap_or_else(|error| panic!("REX3 {error}"));
+                return;
+            }
             rex3.apply_display_resolution(mode);
-        }
-        if let Some(rex3) = &self.board.rex3_head1 {
-            rex3.apply_display_resolution(mode);
-        }
+        };
+        if let Some(rex3) = &self.board.rex3 { apply(rex3); }
+        if let Some(rex3) = &self.board.rex3_head1 { apply(rex3); }
     }
 
     /// Path of the configured scratch SCSI volume, if any. Used by the CI
@@ -1153,12 +1251,12 @@ impl Machine {
 
     /// The terminal console: relays stdin to the monitor at `addr` and the
     /// monitor's output to stdout. At a terminal the lines come from a line
-    /// editor (`console_edit`). When the monitor closes the connection
+    /// editor (`console_edit`) that completes `monitor`'s command names. When the monitor closes the connection
     /// (`quit`) `on_eof` ends the process (through
     /// `workstation::exit_process`, which flushes the disks first), so `addr`
     /// must be this process's own monitor (`monitor_addr`): another iris's
     /// would take this one down with it when it quits.
-    pub fn run_console_client(addr: std::net::SocketAddr, on_eof: impl FnOnce() + Send + 'static) {
+    pub fn run_console_client(addr: std::net::SocketAddr, monitor: Arc<Monitor>, on_eof: impl FnOnce() + Send + 'static) {
         println!("IRIS: {}", emulator_name());
         println!("Connecting to monitor socket...");
 
@@ -1178,7 +1276,7 @@ impl Machine {
         #[cfg(feature = "lineedit")]
         let on_eof = {
             let once = crate::console_edit::Once::new(on_eof);
-            if let Some(editor) = crate::console_edit::LineEditor::new() {
+            if let Some(editor) = crate::console_edit::LineEditor::new(monitor) {
                 editor.run(stream, once);
                 return;
             }
@@ -1495,10 +1593,54 @@ impl Machine {
         result
     }
 
+    #[cfg(feature = "wgpu")]
+    fn capture_resident_checkpoint(rex: Option<&Rex3>) -> Result<Option<ResidentCheckpoint>, String> {
+        rex.filter(|rex| rex.resident_active())
+            .map(|rex| rex.snapshot_resident_checkpoint().map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn validate_resident_primary_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
+        if self.board.rex3.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
+            return Err("resident REX3 checkpoint requires registers and both planes".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn validate_resident_head1_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
+        if self.board.rex3_head1.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
+            return Err("resident REX3 head 1 checkpoint requires registers and both planes".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn restore_resident_head1_framebuffers(
+        &self,
+        has_registers: bool,
+        planes: Option<&(Vec<u32>, Vec<u32>)>,
+    ) -> Result<(), String> {
+        if let Some(rex) = self.board.rex3_head1.as_ref().filter(|rex| rex.resident_active()) {
+            if !has_registers {
+                return Err("resident REX3 head 1 checkpoint has no registers".into());
+            }
+            let (rgb, aux) = planes.ok_or("resident REX3 head 1 checkpoint has no planes")?;
+            rex.try_restore_framebuffers_inmem(rgb, aux)
+                .map_err(|error| format!("restore resident REX3 head 1 framebuffers: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// Capture in-memory state for fast rollback. Stops the CPU briefly.
     fn capture_rollback_checkpoint(&mut self, name: &str) -> Result<RollbackCheckpoint, String> {
         self.stop();
 
+        #[cfg(feature = "wgpu")]
+        let resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())?;
+        #[cfg(feature = "wgpu")]
+        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())?;
         let cpu = self.cpu.save_state();
         let mc = self.mc.save_state();
         let ioc = self.hpc3.ioc().save_state();
@@ -1511,8 +1653,18 @@ impl Machine {
         let scsi1 = self.hpc3.scsi1().map(|dev| dev.save_state());
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| {
+            #[cfg(feature = "wgpu")]
+            if let Some((state, _)) = &resident_primary { return state.clone(); }
+            r.save_state()
+        });
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| {
+            #[cfg(feature = "wgpu")]
+            if let Some((state, _)) = &resident_head1 { return state.clone(); }
+            r.save_state()
+        });
+        let mgras = self.board.mgras.as_ref().map(|m| m.snapshot_parts()).transpose()?;
+        let gr2 = self.board.gr2.as_ref().map(|g| g.snapshot_parts()).transpose()?;
 
         let bank_words: [Vec<u32>; 4] = [
             self.board.phys.snapshot_bank_inmem(0),
@@ -1521,8 +1673,15 @@ impl Machine {
             self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self.board.rex3.as_ref()
-            .map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(feature = "wgpu")]
+        let framebuffers = match resident_primary {
+            Some((_, planes)) => Some(planes),
+            None => self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem()),
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let framebuffers = self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(feature = "wgpu")]
+        let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
 
         // Re-read cow.toml (and cow1.toml, for controller 1) so rollback
         // knows which dirty sectors to import back. The files were just
@@ -1542,7 +1701,9 @@ impl Machine {
             overlay_sets1,
             bank_words,
             framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, scsi1, seeq, hpc3, rex3, rex3_head1,
+            #[cfg(feature = "wgpu")]
+            resident_head1_framebuffers,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, scsi1, seeq, hpc3, rex3, rex3_head1, mgras, gr2,
         })
     }
 
@@ -1550,6 +1711,10 @@ impl Machine {
     /// the moment of capture. Skips disk IO and TOML string-parsing.
     fn apply_rollback_checkpoint(&mut self, cp: &RollbackCheckpoint) -> Result<(), String> {
         self.stop();
+        #[cfg(feature = "wgpu")]
+        self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
+        #[cfg(feature = "wgpu")]
+        self.validate_resident_head1_checkpoint(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.is_some())?;
         self.power_on_devices();
 
         self.cpu.load_state(&cp.cpu)?;
@@ -1577,7 +1742,22 @@ impl Machine {
             self.board.phys.restore_bank_inmem(i, words);
         }
         if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
-            rex3.restore_framebuffers_inmem(rgb, aux);
+            rex3.try_restore_framebuffers_inmem(rgb, aux)
+                .map_err(|error| format!("restore REX3 framebuffers: {error}"))?;
+        }
+        #[cfg(feature = "wgpu")]
+        self.restore_resident_head1_framebuffers(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.as_ref())?;
+        match (&self.board.mgras, &cp.mgras) {
+            (Some(mgras), Some((metadata, parts))) => mgras.restore_snapshot_parts(metadata, parts)?,
+            (Some(_), None) => return Err("rollback checkpoint has no state for the configured IMPACT board".into()),
+            (None, Some(_)) => return Err("rollback checkpoint contains IMPACT state but the machine has no IMPACT board".into()),
+            (None, None) => {}
+        }
+        match (&self.board.gr2, &cp.gr2) {
+            (Some(gr2), Some((metadata, parts))) => gr2.restore_snapshot_parts(metadata, parts)?,
+            (Some(_), None) => return Err("rollback checkpoint has no state for the configured GR2 board".into()),
+            (None, Some(_)) => return Err("rollback checkpoint contains GR2 state but the machine has no GR2 board".into()),
+            (None, None) => {}
         }
 
         // Reflink the overlay back into place. saves/<name>/scsi*.overlay is
@@ -1610,6 +1790,12 @@ impl Machine {
     pub(crate) fn capture_live_checkpoint(&mut self) -> LiveCheckpoint {
         self.stop();
 
+        #[cfg(feature = "wgpu")]
+        let resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())
+            .unwrap_or_else(|error| panic!("REX3 {error}"));
+        #[cfg(feature = "wgpu")]
+        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())
+            .unwrap_or_else(|error| panic!("REX3 {error}"));
         let cpu = self.cpu.save_state();
         let mc = self.mc.save_state();
         let ioc = self.hpc3.ioc().save_state();
@@ -1620,8 +1806,30 @@ impl Machine {
         let eeprom = self.hpc3.eeprom().lock().save_state_owned();
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| {
+            #[cfg(feature = "wgpu")]
+            if let Some((state, _)) = &resident_primary { return state.clone(); }
+            r.save_state()
+        });
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| {
+            #[cfg(feature = "wgpu")]
+            if let Some((state, _)) = &resident_head1 { return state.clone(); }
+            r.save_state()
+        });
+        let mgras = self
+            .board
+            .mgras
+            .as_ref()
+            .map(|m| m.snapshot_parts())
+            .transpose()
+            .unwrap_or_else(|error| panic!("IMPACT {error}"));
+        let gr2 = self
+            .board
+            .gr2
+            .as_ref()
+            .map(|g| g.snapshot_parts())
+            .transpose()
+            .unwrap_or_else(|error| panic!("GR2 {error}"));
 
         let bank_words: [Vec<u32>; 4] = [
             self.board.phys.snapshot_bank_inmem(0),
@@ -1630,8 +1838,15 @@ impl Machine {
             self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self.board.rex3.as_ref()
-            .map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(feature = "wgpu")]
+        let framebuffers = match resident_primary {
+            Some((_, planes)) => Some(planes),
+            None => self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem()),
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let framebuffers = self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem());
+        #[cfg(feature = "wgpu")]
+        let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
 
         // Deliberately NOT restart_peripherals()/cpu.start() here — see this
         // function's own doc comment.
@@ -1639,7 +1854,9 @@ impl Machine {
         LiveCheckpoint {
             bank_words,
             framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, rex3, rex3_head1,
+            #[cfg(feature = "wgpu")]
+            resident_head1_framebuffers,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, rex3, rex3_head1, mgras, gr2,
         }
     }
 
@@ -1658,6 +1875,10 @@ impl Machine {
     /// stayed unresponsive after every `jitcheck` for no reason).
     pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
         self.stop();
+        #[cfg(feature = "wgpu")]
+        self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
+        #[cfg(feature = "wgpu")]
+        self.validate_resident_head1_checkpoint(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.is_some())?;
 
         self.cpu.load_state(&cp.cpu)?;
         self.mc.load_state(&cp.mc)?;
@@ -1680,7 +1901,22 @@ impl Machine {
             self.board.phys.restore_bank_inmem(i, words);
         }
         if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
-            rex3.restore_framebuffers_inmem(rgb, aux);
+            rex3.try_restore_framebuffers_inmem(rgb, aux)
+                .map_err(|error| format!("restore REX3 framebuffers: {error}"))?;
+        }
+        #[cfg(feature = "wgpu")]
+        self.restore_resident_head1_framebuffers(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.as_ref())?;
+        match (&self.board.mgras, &cp.mgras) {
+            (Some(mgras), Some((metadata, parts))) => mgras.restore_snapshot_parts(metadata, parts)?,
+            (Some(_), None) => return Err("live checkpoint has no state for the configured IMPACT board".into()),
+            (None, Some(_)) => return Err("live checkpoint contains IMPACT state but the machine has no IMPACT board".into()),
+            (None, None) => {}
+        }
+        match (&self.board.gr2, &cp.gr2) {
+            (Some(gr2), Some((metadata, parts))) => gr2.restore_snapshot_parts(metadata, parts)?,
+            (Some(_), None) => return Err("live checkpoint has no state for the configured GR2 board".into()),
+            (None, Some(_)) => return Err("live checkpoint contains GR2 state but the machine has no GR2 board".into()),
+            (None, None) => {}
         }
 
         // Peripherals back up; CPU deliberately left stopped — see this
@@ -1760,9 +1996,24 @@ impl Machine {
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
         self.stop();
 
+        #[cfg(feature = "wgpu")]
+        let mut resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())?;
+        #[cfg(feature = "wgpu")]
+        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())?;
         let dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&dir);
         snap.ensure_dir().map_err(|e| e.to_string())?;
+        #[cfg(feature = "wgpu")]
+        let incomplete = dir.join("resident_snapshot_incomplete");
+        #[cfg(feature = "wgpu")]
+        let remove_incomplete = {
+            let resident = resident_primary.is_some() || resident_head1.is_some();
+            if resident {
+                std::fs::write(&incomplete, b"resident machine snapshot is incomplete\n")
+                    .map_err(|e| e.to_string())?;
+            }
+            resident || incomplete.try_exists().map_err(|e| e.to_string())?
+        };
 
         // Write the manifest first so `read_manifest` succeeds even if a later
         // step crashes — the partial snapshot is at least diagnosable.
@@ -1801,8 +2052,23 @@ impl Machine {
         // included in the chunks manifest below for v3+; v2 wrote them as
         // standalone .bin files.
         if let Some(rex3) = &self.board.rex3 {
-            snap.write_state("rex3", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
+            #[cfg(feature = "wgpu")]
+            let resident_state = resident_primary.as_ref().map(|(state, _)| state);
+            #[cfg(not(feature = "wgpu"))]
+            let resident_state: Option<&toml::Value> = None;
+            match resident_state {
+                Some(state) => snap.write_state("rex3", state, sv),
+                None => snap.write_state("rex3", &rex3.save_state(), sv),
+            }.map_err(|e| e.to_string())?;
             if sv < 3 {
+                #[cfg(feature = "wgpu")]
+                if let Some((_, (rgb, aux))) = &resident_primary {
+                    Rex3::write_captured_resident_framebuffers(&snap.dir, "rex3", rgb, aux)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+                }
+                #[cfg(not(feature = "wgpu"))]
                 rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
@@ -1810,17 +2076,35 @@ impl Machine {
             snap.write_state("testdev", &td.save_state(), sv).map_err(|e| e.to_string())?;
         }
         if let Some(rex3) = &self.board.rex3_head1 {
-            snap.write_state("rex3_head1", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
-            if sv < 3 {
-                let dir = &snap.dir;
+            #[cfg(feature = "wgpu")]
+            let resident_state = resident_head1.as_ref().map(|(state, _)| state);
+            #[cfg(not(feature = "wgpu"))]
+            let resident_state: Option<&toml::Value> = None;
+            match resident_state {
+                Some(state) => snap.write_state("rex3_head1", state, sv),
+                None => snap.write_state("rex3_head1", &rex3.save_state(), sv),
+            }.map_err(|e| e.to_string())?;
+            // The v3 chunk manifest covers only the primary head. Keep the
+            // second head in the existing named-plane format in every raster
+            // mode so overwriting a snapshot cannot retain stale resident planes.
+            let dir = &snap.dir;
+            #[cfg(feature = "wgpu")]
+            if let Some((_, (rgb, aux))) = &resident_head1 {
+                Rex3::write_captured_resident_framebuffers(dir, "rex3_head1", rgb, aux)
+                    .map_err(|e| e.to_string())?;
+            } else {
                 rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
             }
+            #[cfg(not(feature = "wgpu"))]
+            rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
         }
-        if let Some(gr2) = &self.board.gr2 {
-            snap.write_state("gr2", &gr2.save_state(), sv).map_err(|e| e.to_string())?;
+        let gr2_snapshot = self.board.gr2.as_ref().map(|gr2| gr2.snapshot_parts()).transpose()?;
+        if let Some((metadata, _)) = &gr2_snapshot {
+            snap.write_state("gr2", &toml::Value::String(metadata.clone()), sv).map_err(|e| e.to_string())?;
         }
-        if let Some(mgras) = &self.board.mgras {
-            snap.write_state("mgras", &mgras.save_state(), sv).map_err(|e| e.to_string())?;
+        let mgras_snapshot = self.board.mgras.as_ref().map(|mgras| mgras.snapshot_parts()).transpose()?;
+        if let Some((metadata, _)) = &mgras_snapshot {
+            snap.write_state("mgras", &toml::Value::String(metadata.clone()), sv).map_err(|e| e.to_string())?;
         }
 
         // Bulk memory: v3+ goes to the content-addressable chunk store
@@ -1836,12 +2120,30 @@ impl Machine {
                     .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
             }
             if let Some(rex3) = &self.board.rex3 {
-                let (rgb, aux) = rex3.snapshot_framebuffers_inmem();
+                #[cfg(feature = "wgpu")]
+                let planes = resident_primary.take().map(|(_, planes)| planes);
+                #[cfg(not(feature = "wgpu"))]
+                let planes: Option<(Vec<u32>, Vec<u32>)> = None;
+                let (rgb, aux) = planes.unwrap_or_else(|| rex3.snapshot_framebuffers_inmem());
                 let rgb_chunks = put_words_as_chunks(&store, &rgb)
                     .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
                 let aux_chunks = put_words_as_chunks(&store, &aux)
                     .map_err(|e| format!("CAS rex3 aux put: {}", e))?;
                 chunks.framebuffer_chunks = Some((rgb_chunks, aux_chunks));
+            }
+            if let Some((_, parts)) = mgras_snapshot {
+                for (name, words) in parts {
+                    let hashes = put_words_as_chunks(&store, &words)
+                        .map_err(|e| format!("CAS IMPACT {name} put: {e}"))?;
+                    chunks.mgras_chunks.push(MgrasChunk { name, words: words.len(), hashes });
+                }
+            }
+            if let Some((_, parts)) = gr2_snapshot {
+                for (name, words) in parts {
+                    let hashes = put_words_as_chunks(&store, &words)
+                        .map_err(|e| format!("CAS GR2 {name} put: {e}"))?;
+                    chunks.gr2_chunks.push(Gr2Chunk { name, words: words.len(), hashes });
+                }
             }
             snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
         } else {
@@ -1868,6 +2170,15 @@ impl Machine {
                 .map_err(|e| e.to_string())?;
         }
 
+        #[cfg(feature = "wgpu")]
+        if remove_incomplete {
+            for rex3 in [self.board.rex3.as_ref(), self.board.rex3_head1.as_ref()].into_iter().flatten() {
+                if rex3.resident_active() {
+                    rex3.resident_status().map_err(|error| error.to_string())?;
+                }
+            }
+            std::fs::remove_file(incomplete).map_err(|e| e.to_string())?;
+        }
         self.restart_peripherals();
         // Resume execution so the session feels like it never paused.
         // Without this the user sees JIT shutdown stats and a dead prompt
@@ -1913,6 +2224,12 @@ impl Machine {
     fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
         self.stop();
 
+        let dir = std::path::PathBuf::from("saves").join(name);
+        #[cfg(feature = "wgpu")]
+        if dir.join("resident_snapshot_incomplete").try_exists().map_err(|e| e.to_string())? {
+            return Err("resident machine snapshot is incomplete".into());
+        }
+
         // Any prior in-memory rollback checkpoint is now stale (it described
         // a different snapshot). ci_restore will recapture if reached via
         // that path; the monitor `load` command leaves it cleared.
@@ -1921,7 +2238,6 @@ impl Machine {
         // Reset to clean state before loading
         self.power_on_devices();
 
-        let dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&dir);
 
         // Validate the manifest before reading anything else. Legacy snapshots
@@ -2080,23 +2396,47 @@ impl Machine {
             }
         }
         if let Some(rex3) = &self.board.rex3_head1 {
-            if let Ok(rex3_v) = snap.read_state("rex3_head1", schema_version) {
+            let head1_state = snap.read_state("rex3_head1", schema_version);
+            #[cfg(feature = "wgpu")]
+            if rex3.resident_active() {
+                if let Err(error) = &head1_state {
+                    return Err(format!("resident REX3 head 1 state: {error}"));
+                }
+            }
+            if let Ok(rex3_v) = head1_state {
                 rex3.load_state(&rex3_v)?;
-                if schema_version < 3 {
+                let rgb_path = snap.dir.join("rex3_head1_rgb.bin");
+                let aux_path = snap.dir.join("rex3_head1_aux.bin");
+                let named_planes_present = rgb_path.try_exists().map_err(|e| e.to_string())?
+                    || aux_path.try_exists().map_err(|e| e.to_string())?;
+                #[cfg(feature = "wgpu")]
+                let load_planes = schema_version < 3 || rex3.resident_active() || named_planes_present;
+                #[cfg(not(feature = "wgpu"))]
+                let load_planes = schema_version < 3 || named_planes_present;
+                if load_planes {
                     rex3.load_framebuffers_named(&snap.dir, "rex3_head1").map_err(|e| e.to_string())?;
                 }
             }
         }
-        if let Some(gr2) = &self.board.gr2 {
-            if let Ok(gr2_v) = snap.read_state("gr2", schema_version) {
-                gr2.load_state(&gr2_v)?;
+        let gr2_metadata = if schema_version >= 10 && self.board.gr2.is_some() {
+            let value = snap.read_state("gr2", schema_version).map_err(|e| e.to_string())?;
+            Some(value.as_str().ok_or("GR2 snapshot metadata is not a string")?.to_string())
+        } else {
+            if schema_version < 10 {
+                if let Some(gr2) = &self.board.gr2 {
+                    if let Ok(gr2_v) = snap.read_state("gr2", schema_version) {
+                        gr2.load_state(&gr2_v)?;
+                    }
+                }
             }
-        }
-        if let Some(mgras) = &self.board.mgras {
-            if let Ok(mgras_v) = snap.read_state("mgras", schema_version) {
-                mgras.load_state(&mgras_v)?;
-            }
-        }
+            None
+        };
+        let mgras_metadata = if schema_version >= 8 && self.board.mgras.is_some() {
+            let value = snap.read_state("mgras", schema_version).map_err(|e| e.to_string())?;
+            Some(value.as_str().ok_or("mgras snapshot metadata is not a string")?.to_string())
+        } else {
+            None
+        };
 
         // Bulk memory: v3+ comes from the content-addressable chunk store
         // shared across snapshots; v2 reads raw bank{N}.bin files.
@@ -2104,6 +2444,8 @@ impl Machine {
             let store = ChunkStore::new("saves");
             let chunks = snap.read_chunks_manifest()
                 .map_err(|e| format!("read chunks.bin: {}", e))?;
+            #[cfg(feature = "wgpu")]
+            self.validate_resident_primary_checkpoint(true, chunks.framebuffer_chunks.is_some())?;
             for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
                 if hashes.is_empty() { continue; }
                 let words = get_chunks_as_words(&store, hashes)
@@ -2115,7 +2457,57 @@ impl Machine {
                     .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
                 let aux = get_chunks_as_words(&store, aux_h)
                     .map_err(|e| format!("CAS rex3 aux get: {}", e))?;
-                rex3.restore_framebuffers_inmem(&rgb, &aux);
+                rex3.try_restore_framebuffers_inmem(&rgb, &aux)
+                    .map_err(|error| format!("restore REX3 framebuffer chunks: {error}"))?;
+            }
+            match (&self.board.mgras, mgras_metadata.as_deref(), chunks.mgras_chunks.is_empty()) {
+                (Some(mgras), Some(metadata), false) => {
+                    let mut parts = Vec::with_capacity(chunks.mgras_chunks.len());
+                    for part in &chunks.mgras_chunks {
+                        let words = get_chunks_as_words(&store, &part.hashes)
+                            .map_err(|e| format!("CAS IMPACT {} get: {e}", part.name))?;
+                        if words.len() != part.words {
+                            return Err(format!(
+                                "CAS IMPACT {} has {} words, expected {}",
+                                part.name,
+                                words.len(),
+                                part.words
+                            ));
+                        }
+                        parts.push((part.name.clone(), words));
+                    }
+                    mgras.restore_snapshot_parts(metadata, &parts)?;
+                }
+                (Some(_), Some(_), true) => return Err("snapshot has IMPACT metadata but no IMPACT chunks".into()),
+                (Some(_), None, false) => return Err("snapshot has IMPACT chunks but no IMPACT metadata".into()),
+                (None, _, false) => return Err("snapshot contains IMPACT state but this machine has no IMPACT board".into()),
+                _ => {}
+            }
+            if schema_version >= 10 {
+                match (&self.board.gr2, gr2_metadata.as_deref(), chunks.gr2_chunks.is_empty()) {
+                    (Some(gr2), Some(metadata), false) => {
+                        let mut parts = Vec::with_capacity(chunks.gr2_chunks.len());
+                        for part in &chunks.gr2_chunks {
+                            let words = get_chunks_as_words(&store, &part.hashes)
+                                .map_err(|e| format!("CAS GR2 {} get: {e}", part.name))?;
+                            if words.len() != part.words {
+                                return Err(format!(
+                                    "CAS GR2 {} has {} words, expected {}",
+                                    part.name,
+                                    words.len(),
+                                    part.words
+                                ));
+                            }
+                            parts.push((part.name.clone(), words));
+                        }
+                        gr2.restore_snapshot_parts(metadata, &parts)?;
+                    }
+                    (Some(_), Some(_), true) => return Err("snapshot has GR2 metadata but no GR2 chunks".into()),
+                    (Some(_), None, false) => return Err("snapshot has GR2 chunks but no GR2 metadata".into()),
+                    (Some(_), None, true) => return Err("snapshot has no state for the configured GR2 board".into()),
+                    (None, _, false) => return Err("snapshot contains GR2 state but this machine has no GR2 board".into()),
+                    _ => {}
+                }
             }
         } else {
             for i in 0..4 {
@@ -2186,7 +2578,7 @@ impl Workstation for Machine {
     fn cpu_is_running(&self) -> bool { Machine::cpu_is_running(self) }
     fn machine_slot(&mut self) -> MachineSlot { Machine::machine_slot(self) }
     fn register_system_controller(&mut self) { Machine::register_system_controller(self) }
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { Machine::monitor_addr(self) }
+    fn monitor(&self) -> &Arc<Monitor> { &self.monitor }
     fn lifecycle(&self) -> GuestState { self.lifecycle }
     fn set_lifecycle(&mut self, state: GuestState) { self.lifecycle = state; }
     fn fatal_fault(&self) -> Option<MachineFatal> { self.fatal_fault.clone() }
@@ -2507,6 +2899,117 @@ mod controller_lifetime_tests {
 }
 
 #[cfg(test)]
+mod construction_error_tests {
+    use super::*;
+    use crate::display_stop_tests::big_stack;
+    use crate::test_temp::TempPath;
+
+    #[test]
+    fn checked_constructors_return_explicit_prom_errors() {
+        let path = TempPath::new("machine-prom-missing");
+        let expected = path.display().to_string();
+        let mut cfg = MachineConfig::default();
+        cfg.prom = expected.clone();
+        let with_testdev = cfg.clone();
+
+        let error = big_stack(move || Machine::try_new(cfg).err().expect("missing PROM"));
+        assert!(error.contains(&expected), "{error}");
+        let error = big_stack(move || {
+            Machine::try_new_with_testdev(with_testdev, None).err().expect("missing PROM")
+        });
+        assert!(error.contains(&expected), "{error}");
+    }
+
+    #[test]
+    fn checked_constructor_returns_newport_configuration_errors() {
+        let prom = TempPath::file("machine-prom", &[0, 0, 0, 0]);
+        let mut cfg = MachineConfig::default();
+        cfg.prom = prom.display().to_string();
+        cfg.graphics.newport_mode = Some(crate::config::NewportWgpuMode::Readback);
+
+        let error = big_stack(move || Machine::try_new(cfg).err().expect("invalid Newport mode"));
+        assert!(error.contains("applies only"), "{error}");
+    }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod production_newport_wgpu_tests {
+    use super::*;
+    use crate::config::NewportWgpuMode;
+    use crate::gfx_display::GfxDisplay;
+    use crate::test_temp::{nvram_in, TempPath};
+
+    fn production_config(nv_dir: &std::path::Path) -> MachineConfig {
+        let mut cfg = MachineConfig::default();
+        nvram_in(&mut cfg, nv_dir);
+        cfg.scsi.clear();
+        cfg.no_audio = true;
+        cfg.ci = true;
+        cfg.monitor_port = Some(0);
+        cfg.graphics.raster = crate::config::RasterUnit::Wgpu;
+        cfg.graphics.gpu_backend = std::env::var("REX3_RESIDENT_BACKEND")
+            .unwrap_or_else(|_| "vulkan".into());
+        cfg
+    }
+
+    #[test]
+    #[ignore = "requires a validated Vulkan or D3D12 adapter"]
+    fn production_dual_head_wgpu_shares_device_and_restarts_idempotently() {
+        let nv = TempPath::dir("newport-production-nv");
+        let nv_dir = nv.to_path_buf();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut cfg = production_config(&nv_dir);
+                cfg.graphics.heads = 2;
+
+                let mut machine = Machine::try_new(cfg).expect("construct production resident machine");
+                let primary = machine.get_rex3().expect("primary Newport");
+                let secondary = machine.get_rex3_head1().expect("secondary Newport");
+                let primary_gpu = GfxDisplay::gpu(&*primary).expect("primary resident GPU");
+                let secondary_gpu = GfxDisplay::gpu(&*secondary).expect("secondary resident GPU");
+                assert!(Arc::ptr_eq(&primary_gpu, &secondary_gpu));
+                assert!(GfxDisplay::requires_same_device_wgpu_presenter(&*primary));
+                assert!(GfxDisplay::requires_same_device_wgpu_presenter(&*secondary));
+
+                machine.start();
+                machine.restart_peripherals();
+                for rex in [&primary, &secondary] {
+                    assert!(rex.processor_thread.lock().is_some());
+                    assert!(rex.refresh_thread.lock().is_some());
+                }
+                machine.stop();
+            })
+            .expect("spawn production Newport test")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+
+    #[test]
+    #[ignore = "requires a validated Vulkan or D3D12 adapter"]
+    fn production_readback_mode_raises_frontend_capture_timeout() {
+        let nv = TempPath::dir("newport-readback-nv");
+        let nv_dir = nv.to_path_buf();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut cfg = production_config(&nv_dir);
+                cfg.graphics.newport_mode = Some(NewportWgpuMode::Readback);
+                let machine = Machine::try_new(cfg).expect("construct production resident machine");
+                let rex = machine.get_rex3().expect("primary Newport");
+                assert_eq!(
+                    GfxDisplay::minimum_frame_request_timeout(&*rex),
+                    std::time::Duration::from_secs(2)
+                );
+                assert!(!GfxDisplay::requires_same_device_wgpu_presenter(&*rex));
+            })
+            .expect("spawn production Newport test")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}
+
+#[cfg(test)]
 mod stop_order_tests {
     use super::*;
     use crate::display_stop_tests::{big_stack, Probe};
@@ -2527,12 +3030,152 @@ mod stop_order_tests {
         });
         let hpc3 = machine.hpc3.clone();
         let (probe, overlap) = Probe::watching(move || hpc3.is_running());
-        *machine.board.rex3.clone().expect("a Newport").renderer.lock() = Some(Box::new(probe.clone()));
+        *machine.board.rex3.clone().expect("a Newport").head.renderer_slot().lock() = Some(Box::new(probe.clone()));
         machine.restart_peripherals();
         assert!(machine.hpc3.is_running(), "HPC3 is running");
         machine.stop();
         assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
         assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
+    }
+}
+
+#[cfg(test)]
+mod gr2_checkpoint_tests {
+    use super::*;
+    use crate::config::{GraphicsBoard, MachineProfile};
+    use crate::dev::gr2::re3::{
+        FB_W, IR_FLAT, REG_FUNC, REG_IR, REG_NUMPIX, REG_PIXMASK, REG_R, REG_XMAX, REG_YMAX,
+        REG_YX, ROP_COPY,
+    };
+    use crate::dev::gr2::{Gr2, GR2_BASE};
+    use crate::traits::{BusDevice, Resettable, BUS_BUSY};
+    use std::path::Path;
+
+    fn config(dir: &Path, board: GraphicsBoard) -> MachineConfig {
+        let mut cfg = crate::display_stop_tests::config(dir, MachineProfile::Indigo2Ip22, board);
+        cfg.headless = true;
+        cfg
+    }
+
+    fn re3_reg(reg: usize) -> u32 {
+        if reg < 0x20 { 0x6c200 + reg as u32 * 4 } else { 0x6c280 + (reg as u32 - 0x20) * 4 }
+    }
+
+    fn write(g: &Gr2, reg: usize, value: u32) {
+        while g.write32(GR2_BASE + re3_reg(reg) as u64, value) == BUS_BUSY {
+            std::hint::spin_loop();
+        }
+    }
+
+    fn draw_test_pixel(g: &Gr2, value: u32) {
+        g.start();
+        for (reg, data) in [
+            (REG_FUNC, ROP_COPY),
+            (REG_PIXMASK, 0x00ff_ffff),
+            (REG_XMAX, 1279),
+            (REG_YMAX, 1023),
+            (REG_R, value << 11),
+            (REG_YX, (20 << 12) | 30),
+            (REG_NUMPIX, 1),
+            (REG_IR, IR_FLAT),
+        ] {
+            write(g, reg, data);
+        }
+        g.wait_idle();
+        assert_eq!(g.vram()[20 * FB_W + 30], value);
+        g.stop();
+    }
+
+    #[test]
+    fn gr2_live_and_rollback_checkpoints_restore_complete_state() {
+        crate::display_stop_tests::big_stack(|| {
+            let dir = crate::display_stop_tests::scratch("gr2-memory-checkpoints");
+            let mut machine = Box::new(Machine::new(config(&dir, GraphicsBoard::Xz)));
+            let gr2 = machine.get_gr2().unwrap();
+            draw_test_pixel(&gr2, 0x31);
+
+            let live = machine.capture_live_checkpoint();
+            gr2.power_on();
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0);
+            machine.restore_live_checkpoint(&live).unwrap();
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0x31);
+            machine.stop();
+
+            draw_test_pixel(&gr2, 0x52);
+            let rollback = machine.capture_rollback_checkpoint("gr2-memory-checkpoint").unwrap();
+            machine.stop();
+            gr2.power_on();
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0);
+            machine.apply_rollback_checkpoint(&rollback).unwrap();
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0x52);
+            machine.stop();
+
+            let mut missing = machine.capture_live_checkpoint();
+            missing.gr2 = None;
+            assert!(machine
+                .restore_live_checkpoint(&missing)
+                .unwrap_err()
+                .contains("no state for the configured GR2 board"));
+            machine.stop();
+        });
+    }
+
+    #[test]
+    fn gr2_disk_snapshot_round_trip_and_board_mismatches() {
+        const CHILD: &str = "IRIS_GR2_M15_DISK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Not under the working directory: a relocated target dir leaves no `target/` there.
+            let path = crate::test_temp::TempPath::dir("gr2-m15-disk");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .current_dir(&*path)
+                .env(CHILD, &*path)
+                .args([
+                    "--exact",
+                    "machine::gr2_checkpoint_tests::gr2_disk_snapshot_round_trip_and_board_mismatches",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "GR2 disk snapshot child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        crate::display_stop_tests::big_stack(|| {
+            let path = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+            // The temp dir may sit behind a symlink (macOS /var), so compare resolved paths.
+            assert_eq!(std::env::current_dir().unwrap().canonicalize().unwrap(), path.canonicalize().unwrap());
+
+            let mut xz = Box::new(Machine::new(config(&path, GraphicsBoard::Xz)));
+            let gr2 = xz.get_gr2().unwrap();
+            draw_test_pixel(&gr2, 0x73);
+            xz.save_snapshot("gr2-m15").unwrap();
+            xz.stop();
+            gr2.power_on();
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0);
+            xz.load_snapshot_paused("gr2-m15").unwrap();
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0x73);
+            xz.stop();
+
+            let mut extreme = Box::new(Machine::new(config(&path, GraphicsBoard::Extreme)));
+            assert!(extreme
+                .load_snapshot_paused("gr2-m15")
+                .unwrap_err()
+                .contains("running board"));
+            extreme.stop();
+
+            let mut newport = Box::new(Machine::new(config(&path, GraphicsBoard::Newport)));
+            assert!(newport
+                .load_snapshot_paused("gr2-m15")
+                .unwrap_err()
+                .contains("machine has no GR2 board"));
+            newport.stop();
+        });
     }
 }
 
@@ -2570,6 +3213,54 @@ mod virtio_tests {
                 assert_eq!(phys.read32(base + REG_DEVICE_ID).data, 3);
                 // The window is 64 KB: past it the slot is empty again.
                 assert_ne!(phys.read32(base + 0x1_0000 + REG_MAGIC).data, MAGIC);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// IRIX looks for a second Newport only at 0x1F4F0000 (expansion slot 0)
+    /// and, on an Indy, listens on that slot's one interrupt pin.
+    #[test]
+    fn the_second_head_is_where_irix_looks_for_it() {
+        use crate::dev::ioc::{map_regs, IOC_BASE, IOC_INT3_MAP_STAT};
+        let nv = crate::test_temp::TempPath::dir("head1-nv");
+        let nv_dir = nv.to_path_buf();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut cfg = MachineConfig::default();
+                crate::test_temp::nvram_in(&mut cfg, &nv_dir);
+                cfg.scsi.clear();
+                cfg.machine.profile = MachineProfile::IndyIp24;
+                cfg.graphics.heads = 2;
+                cfg.ultra64.enabled = true;
+                let m = Machine::new(cfg);
+                assert!(m.board.ultra64.is_none(), "the second head has the Ultra64's slot");
+                let sys_id = m.board.phys.read32((IOC_BASE + crate::dev::ioc::IOC_SYS_ID) as u64).data;
+                assert!((sys_id >> 1) & 0xF >= 4, "a baseboard revision that takes a second board");
+                let phys = &m.board.phys;
+                let pin = || phys.read32((IOC_BASE + IOC_INT3_MAP_STAT) as u64).data as u8;
+                let head = m.get_rex3_head1().unwrap();
+                let retrace = head.vblank_cb.lock().clone().unwrap();
+                let fifo = head.fifo_full_cb.lock().clone().unwrap();
+                assert_eq!(pin() & (map_regs::GIO_EXP0 | map_regs::GIO_EXP1), 0);
+                retrace.set(true);
+                fifo.set(true);
+                retrace.set(false);
+                assert_eq!(pin() & (map_regs::GIO_EXP0 | map_regs::GIO_EXP1), map_regs::GIO_EXP0,
+                    "the FIFO still holds the slot's pin");
+                fifo.set(false);
+                assert_eq!(pin() & map_regs::GIO_EXP0, 0);
+
+                // Reading STATUS at the address IRIX probes reaches this board:
+                // it reports the retrace and lets go of the pin.
+                use crate::dev::ng1::rex3::{REX3_STATUS, STATUS_VRINT};
+                head.config.status.fetch_or(STATUS_VRINT, std::sync::atomic::Ordering::Relaxed);
+                retrace.set(true);
+                let status = phys.read32(0x1F4F_0000u64 + REX3_STATUS as u64).data;
+                assert_ne!(status & STATUS_VRINT, 0);
+                assert_eq!(pin() & map_regs::GIO_EXP0, 0);
             })
             .unwrap()
             .join()
@@ -2630,5 +3321,29 @@ mod virtio_tests {
         cfg.virtio_9p.enabled = true;
         cfg.virtio_9p.path = "/tmp".into();
         assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("a GIO slot holds one device"));
+    }
+
+    /// On the Octane the virtio devices take Bridge slots 4 and 5 unless
+    /// `bridge_slot` names one of 4 to 7, and two cannot share one.
+    #[cfg(unix)]
+    #[test]
+    fn octane_virtio_bridge_slots() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::OctaneIp30;
+        cfg.virtio_serial.enabled = true;
+        cfg.virtio_9p.enabled = true;
+        cfg.virtio_9p.path = "/tmp".into();
+        assert_eq!(cfg.octane_virtio_slots(), Ok((7, 5)));
+        cfg.virtio_serial.bridge_slot = Some(6);
+        cfg.virtio_9p.bridge_slot = Some(7);
+        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 7)));
+        assert_eq!(cfg.validate_virtio_9p_for_test(), Ok(()));
+        cfg.virtio_9p.bridge_slot = Some(6);
+        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("both in Bridge slot 6"));
+        cfg.virtio_9p.bridge_slot = Some(3);
+        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("slots 4 to 7"));
+        cfg.virtio_9p.enabled = false;
+        cfg.virtio_9p.bridge_slot = Some(6);
+        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 6)), "a disabled device holds no slot");
     }
 }

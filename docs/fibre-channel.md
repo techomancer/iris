@@ -1,7 +1,8 @@
 # QLogic ISP2200 Fibre Channel adapter
 
-iris can fit one QLogic ISP2200 Fibre Channel host adapter in an Octane's PCI
-module or shoehorn, with a private loop of SCSI disks behind it. IRIX 6.5.30
+iris fits a QLogic ISP2200 Fibre Channel host adapter in an Octane's PCI
+module or shoehorn, or on the I-brick of an Origin 3200 or Onyx 3000, with
+a private loop of SCSI disks behind it. IRIX 6.5.30
 brings it up with its own driver and shows the disks as a SCSI controller of
 their own: the adapter is one controller with one bus, however many disks are
 on the loop.
@@ -13,7 +14,7 @@ kind = "pci-cage"        # or "pci-shoehorn"; see docs/pci.md
 [fibre_channel]
 slot = 2                 # the board's PCI device (the first free one by default)
 # board = 0              # which [[xio_board]] (the first by default)
-# bridge = false         # true: behind a PCI-to-PCI bridge in the slot
+# bridge = false         # true: behind a DEC 21154 PCI-to-PCI bridge in the slot
 
 [fibre_channel.disk.5]   # the loop ID, 0 to 125
 path = "frame0.raw"      # raw or CHD
@@ -30,6 +31,11 @@ An unknown key in `[fibre_channel]` itself is an error, so a misspelt `slot`
 does not move the card without a word. A disk table, like a `[scsi.N]` table,
 ignores a key it does not know.
 
+On Origin 3200 and Onyx 3000 the adapter is already fitted on the I-brick.
+Configure its disks with `[fibre_channel.disk.N]`; omit `board`, `slot` and
+`bridge`, which describe Octane option-board placement. See the
+[Origin 3200 guide](origin3200-ip35.md).
+
 ## What the guest sees
 
 The slot, interrupt and DMA are those of any card on an option board
@@ -38,7 +44,8 @@ the slot's device. It is PCI vendor 1077, device 2200. Its monitor commands are
 `scsi2` and `cow2` (the Octane's own two controllers are 0 and 1), which act on
 the loop's disks as the other controllers' do; `scsi2 notes` lists what a guest
 did that the model does not decode. A snapshot saves the adapter and each
-disk's overlay with the machine.
+disk's overlay with a supported Octane snapshot. Origin 3200 and Onyx 3000
+whole-machine snapshots are not supported.
 
 ## What it models
 
@@ -54,9 +61,11 @@ and the comment in `src/dev/isp2200.rs` says so.
 
 ## Limits
 
-- Only IRIX 6.5.30 has been tried. Linux logs in through request-ring mailbox
-  entries the model does not serve, so mainline Linux cannot bring a port
-  online.
+- IRIX 6.5.30 and Linux 7.3 (qla2xxx, with the stock `ql2200_fw.bin`) have
+  been tried. Linux logs in to each port with Login Loop Port and with
+  mailbox commands it puts in the request ring (login, logout and the port
+  database for ADISC); the model answers those four in a ring entry and
+  refuses any other command sent that way.
 - Commands run one at a time. An abort or reset matches the command running,
   not the ones queued behind it.
 - A disk attached or removed after start is not announced; there is no loop

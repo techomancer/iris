@@ -83,7 +83,7 @@ pub(super) const DG5_8: Display = Display {
 /// "4MB external" FIFO RAM, as the ported model reports.
 const FIFO_RAM_4MB_EXTERNAL: u32 = 1;
 
-/// The chassis a pipe fits in. Iris builds the Onyx2 deskside alone; the
+/// The chassis a pipe installs in. Iris builds the Onyx2 deskside alone; the
 /// others are recorded so a row says where its product shipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Host {
@@ -148,19 +148,19 @@ impl ProductSpec {
         self.texture_mb
     }
 
-    pub fn fits(&self, host: Host) -> bool {
+    pub fn installs_in(&self, host: Host) -> bool {
         self.hosts.contains(&host)
     }
 
     /// Whether the product may go in `host`, or why not. A chassis the table
     /// leaves out is one no manual or capture places the product in.
     pub fn check_host(&self, host: Host) -> Result<(), String> {
-        if self.fits(host) {
+        if self.installs_in(host) {
             return Ok(());
         }
         let shipped: Vec<_> = self.hosts.iter().map(|h| h.name()).collect();
         Err(format!(
-            "{} is not modelled in the {}: no manual or capture places it there (it fits the {})",
+            "{} is not modelled in the {}: no manual or capture places it there (it installs in the {})",
             self.label,
             host.name(),
             shipped.join(", ")
@@ -262,7 +262,7 @@ impl Product {
 /// The configuration a pipe presents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KonaConfig {
-    /// The product the pipe is, a row of [`PRODUCTS`].
+    /// The product the pipe is, a row of `PRODUCTS`.
     pub product: Product,
     /// Raster managers: the deskside holds one or two.
     pub rm_count: u32,

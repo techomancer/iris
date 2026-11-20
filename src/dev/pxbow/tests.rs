@@ -55,8 +55,7 @@ impl PicPeer for Peer {
     }
 }
 
-/// Widget zero names itself PXBOW, not Crossbow and not the PIC, and shows
-/// the host's and the PIC's links up.
+/// Widget zero names itself PXBOW and shows the host's and the PIC's links up.
 #[test]
 fn widget_zero_identifies_as_pxbow_with_the_host_and_pic_links_up() {
     let p = Pxbow::new(10, 15, clock().0).unwrap();
@@ -93,10 +92,9 @@ fn status_reads_carry_the_hosts_widget_as_their_source() {
     assert_eq!((other.widget_zero().read32(STATUS).data >> 6) & 0xf, 11);
 }
 
-/// PROM 6.210's crossbar check on the Tezro writes 0xdeadbeef to the
-/// read-only lower error address and 0 to the upper one. The store
-/// completes, the registers keep their value, and widget 0's status reports
-/// the access error (NEC U10278EJ4V0UM p.104).
+/// PROM 6.210's crossbar check writes 0xdeadbeef to the read-only lower error address and 0 to the
+/// upper: the registers keep their value and status reports the access error (NEC U10278EJ4V0UM
+/// p.104).
 #[test]
 fn the_proms_error_address_writes_complete_and_are_reported() {
     let p = Pxbow::new(10, 15, clock().0).unwrap();
@@ -109,8 +107,8 @@ fn the_proms_error_address_writes_complete_and_are_reported() {
     assert_ne!(w.write32(0x04, 0), BUS_OK, "the identification register still refuses");
 }
 
-/// Revision 5 decodes the fences and the lock; the lock takes a write only
-/// while it reads zero and any write to its clear alias releases it.
+/// Revision 5 decodes fences and lock; the lock takes a write only while zero, its clear alias
+/// releases it.
 #[test]
 fn fences_and_the_lock_are_stored_and_read_back() {
     let p = Pxbow::new(10, 15, clock().0).unwrap();
@@ -139,8 +137,8 @@ fn fences_and_the_lock_are_stored_and_read_back() {
     assert!(!w.read64(0x78).is_ok());
 }
 
-/// Widget zero's own error interrupt is a packet to the host, with the
-/// vector and address its destination registers hold.
+/// Widget zero's error interrupt is a packet to the host with its destination registers' vector and
+/// address.
 #[test]
 fn a_widget_zero_error_sends_an_interrupt_packet_to_the_host() {
     let pic = Pic::new(15);
@@ -164,8 +162,8 @@ fn a_widget_zero_error_sends_an_interrupt_packet_to_the_host() {
     assert_eq!(peer.0.lock().len(), 2);
 }
 
-/// The V12's widget is absent until the machine fits it, then forwards to
-/// the endpoint with the widget-relative address unchanged.
+/// The V12's widget is absent until attached, then forwards with the widget-relative address
+/// unchanged.
 #[test]
 fn a_widget_is_unreachable_until_an_endpoint_is_attached() {
     let p = Pxbow::new(10, 15, clock().0).unwrap();
@@ -173,7 +171,7 @@ fn a_widget_is_unreachable_until_an_endpoint_is_attached() {
     assert!(!w12.read32(0x40).is_ok());
     assert_eq!(w12.write32(0x40, 1), BUS_ERR);
     let stub = Arc::new(Stub(Mutex::new(0)));
-    p.attach_endpoint(12, stub.clone()).unwrap();
+    p.attach_widget(12, stub.clone()).unwrap();
     assert_eq!(p.endpoint_widgets(), 1 << 12);
     let wz = p.widget_zero();
     assert_ne!(wz.read32(link(12, 0x10)).data & LINK_STATUS_ALIVE, 0, "its link comes up");
@@ -189,16 +187,16 @@ fn a_widget_is_unreachable_until_an_endpoint_is_attached() {
 fn attachment_refuses_the_host_a_taken_widget_and_a_non_link() {
     let p = Pxbow::new(10, 15, clock().0).unwrap();
     let stub: Arc<dyn BusDevice> = Arc::new(Stub(Mutex::new(0)));
-    assert_eq!(p.attach_endpoint(10, stub.clone()), Err(AttachError::Host(10)));
-    assert_eq!(p.attach_endpoint(3, stub.clone()), Err(AttachError::NotALink(3)));
-    assert_eq!(p.attach_endpoint(12, stub.clone()), Ok(()));
-    assert_eq!(p.attach_endpoint(12, stub.clone()), Err(AttachError::Occupied(12)));
+    assert_eq!(p.attach_widget(10, stub.clone()), Err(AttachError::Host(10)));
+    assert_eq!(p.attach_widget(3, stub.clone()), Err(AttachError::NotALink(3)));
+    assert_eq!(p.attach_widget(12, stub.clone()), Ok(()));
+    assert_eq!(p.attach_widget(12, stub.clone()), Err(AttachError::Occupied(12)));
     assert!(Pxbow::new(10, 10, clock().0).is_err());
     assert!(Pxbow::new(10, 2, clock().0).is_err());
 }
 
-/// The PIC that owns IO9 supplies widget 0; the other PIC does not, and
-/// the PIC's own widget is reached through the switch.
+/// The PIC that owns IO9 supplies widget 0; the other does not; the PIC's own widget is reached
+/// through the switch.
 #[test]
 fn only_the_pic_that_enables_it_has_a_pxbow_and_it_forwards_to_the_pic() {
     let with = Pic::new(15);
@@ -206,7 +204,6 @@ fn only_the_pic_that_enables_it_has_a_pxbow_and_it_forwards_to_the_pic() {
     assert!(with.pxbow().is_none());
     let p = with.enable_pxbow(10, clock().0).unwrap();
     assert!(without.pxbow().is_none());
-    assert_eq!(p.pic_widget(), 15);
     assert_eq!(p.endpoint_widgets(), 1 << 15);
     assert!(Arc::ptr_eq(with.pxbow().unwrap(), &p));
     assert!(with.enable_pxbow(10, clock().0).is_err(), "once");
@@ -217,8 +214,8 @@ fn only_the_pic_that_enables_it_has_a_pxbow_and_it_forwards_to_the_pic() {
     assert!(Pic::new(15).enable_pxbow(15, clock().0).is_err(), "host and PIC differ");
 }
 
-/// A link reset on the host's link or the PIC's takes the PIC out of reach
-/// for the pulse and brings it back, as the qtest's 20 ns clock step does.
+/// A link reset on the host's link or the PIC's takes the PIC out of reach for the pulse, then
+/// back.
 #[test]
 fn a_link_reset_makes_the_pic_unreachable_for_the_pulse() {
     let (c, now) = clock();

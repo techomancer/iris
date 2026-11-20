@@ -12,7 +12,7 @@
 //!
 //! The crossbar's reset fences are kept but gate nothing: no warm reset
 //! travels through it. Link training is not modelled; a link reset brings a
-//! fitted link back alive at once, as on the Crossbow.
+//! attached link back alive at once, as on the Crossbow.
 //!
 //! Ported from hw/pci-host/sgi-xbridge.c and hw/misc/sgi-xbridge-xbow.c
 //! in jamesbraid/qemu-sgi-origami, revision
@@ -128,7 +128,7 @@ impl XBridge {
         self.xbow.clone()
     }
 
-    /// The PCI bus behind head `widget`: functions are fitted with
+    /// The PCI bus behind head `widget`: functions are attached with
     /// [`PciBus::attach`] and the SuperIO interrupt is `bus.board_irq(BoardIrq(0))`.
     pub fn bus(&self, widget: u8) -> &PciBus {
         self.heads[Self::index(widget)].bus()
@@ -145,12 +145,12 @@ impl XBridge {
         self.heads[Self::index(widget)].dma_for(slot)
     }
 
-    /// Fit a board at crossbar port `widget`, its link up. What the host
+    /// Attach a board at crossbar port `widget`, its link up. What the host
     /// connects at that port is returned: the board while its link is up.
     pub fn attach_widget(&self, widget: u8, board: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         assert!((8..HEAD_E).contains(&widget) && widget != HOST_WIDGET);
         self.xbow.attach(widget);
-        self.xbow.port(widget, board)
+        self.xbow.attach_widget(widget, board)
     }
 
     /// Told of each port's link reset, after a head's own reset and RST# on

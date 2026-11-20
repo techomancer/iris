@@ -121,6 +121,8 @@ below apply to the Octane, O2 and Indy/Indigo2 only.
 - **Guest-visible changes:**
   - **PROM images:** Indy, Indigo2 and Octane PROMs load through `prom_image`.
     - Indy/Indigo2: a PROM file over 1 MiB falls back to the embedded PROM.
+      (Superseded 2026-11-12, `22848336`: every machine has a built-in PROM
+      and a named `prom` that will not load is an error everywhere.)
     - O2: a raw file must be exactly 512 KiB.
   - **NVRAM:** a blank Indy/Indigo2 NVRAM is seeded with PROM defaults, so the first boot chimes.
 - **CI:** tests run under nextest, cpu-tests and the benchmark accuracy check run under `cargo test`, and test temp files go through `TempPath`. Nothing found that lets a test pass silently. The exception is the KONA replay tests (K3).

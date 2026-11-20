@@ -17,7 +17,7 @@ use super::super::pixmem::{PAGE_WORDS, RES, RE_WORDS};
 use super::super::rss::{self, reg, Rss, WIDTH};
 use super::super::te1::reg as te;
 use super::super::test_gen::{self, hilo, pos, Prim, Regs, Rng};
-use super::{xline_step, GpuLink, GpuRaster};
+use super::{xline_step, GpuLink, GpuRaster, Observation};
 use crate::wgpu::{Gpu, GpuOptions};
 
 fn gpu() -> Option<Arc<Gpu>> {
@@ -84,6 +84,7 @@ impl Pair {
             cpu.jit.mode = super::super::rss_jit::MODE_OFF;
             gpu.jit.mode = super::super::rss_jit::MODE_OFF;
         }
+
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         for b in cpu.te.tram_mut().iter_mut() {
             *b = rng.next() as u8;
@@ -271,6 +272,27 @@ impl Pair {
         }
         self.write(reg::XFRCONTROL, 0);
     }
+}
+
+#[test]
+fn observation_accounting_and_faults_are_sticky() {
+    let Some(g) = gpu() else { return };
+    let mut p = Pair::new(&g, 1);
+    assert_eq!(
+        p.unit.sync(&mut p.gpu.mem, &mut p.gpu.cid, Observation::Validation).unwrap(),
+        0
+    );
+    assert_eq!(
+        p.unit.observation_counts().find(|(name, _, _)| *name == "validation"),
+        Some(("validation", 1, 0))
+    );
+
+    p.unit.dirty_pages[0] = 1;
+    let dirty = p.unit.dirty_pages.clone();
+    p.unit.fault = Some("injected readback failure".into());
+    assert!(p.unit.sync(&mut p.gpu.mem, &mut p.gpu.cid, Observation::Snapshot).is_err());
+    assert_eq!(p.unit.dirty_pages, dirty, "a failed readback keeps every dirty page");
+    assert_eq!(p.unit.fault(), Some("injected readback failure"));
 }
 
 /// `MGRAS_GPU_CHECK_EACH=1`: compare after every primitive, not every step.
@@ -676,7 +698,7 @@ fn transfer_reads_see_the_drawing() {
             p.exec(reg::IR, 0x8);
             for line in 0..p.rng.range(1, 8) as u32 {
                 let want = p.cpu.dma_read_line(line);
-                p.gpu.gpu_sync_transfer();
+                p.gpu.gpu_sync_transfer(Observation::DmaRead).unwrap();
                 let got = p.gpu.dma_read_line(line);
                 assert_eq!(got, want, "step {step}, line {line}: the read differs\n{}", p.recent());
                 lines_read += 1;

@@ -76,7 +76,7 @@ fn board_with(prom: &[u8], banks_mb: [u32; 4]) -> Board {
     let xbow = Arc::new(Xbow::new(XBOW_REVISION, 1 << WIDGET_HEART | 1 << WIDGET_BRIDGE));
     xbow.connect_host(HEART_HOST, heart.clone());
     let bridge = Bridge::new(Upstream::single(HEART_HOST, ram.dma_view(), heart.clone()), &PIN_WIRING);
-    bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
+    bridge.attach_flash(0, Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
     let phys = Ip30Bus::new(ram);
     phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
     phys.map(widget_small_base(WIDGET_XBOW), widget_small_base(WIDGET_XBOW) + WIDGET_SMALL_SIZE, xbow.clone(), "xbow");
@@ -241,7 +241,7 @@ fn map_a_valid_descriptor_over_an_empty_bank_reads_zero_and_drops_writes() {
     let b = board(&[]);
     let p = &b.phys;
     let dma = b.bus.memory();
-    // Bank 1 is not fitted. Its descriptor claims 64 MiB at the third unit.
+    // Bank 1 is not installed. Its descriptor claims 64 MiB at the third unit.
     set_bank(p, 1, 0x8001_0002);
     let at = 0x2000_0000 + 2 * 0x200_0000 + 0x100;
     assert_eq!(p.write64(at, u64::MAX), BUS_OK, "the write is accepted");
@@ -298,7 +298,7 @@ fn map_the_proms_bank_size_probe_gets_each_size_s_answer() {
         assert_eq!(word, want, "{mib} MiB");
         set_bank(p, 0, word);
         assert_eq!(b.heart.memcfg()[0], want);
-        // The descriptor it settles on holds the fitted memory where the probe was, nothing past it.
+        // The descriptor it settles on holds the installed memory where the probe was, nothing past it.
         let end = PROBE + ((mib as u64) << 20);
         assert_eq!(p.write64(end - 8, 3), BUS_OK, "{mib} MiB: last doubleword");
         assert_eq!(p.read64(end - 8).data, 3);
@@ -1092,7 +1092,7 @@ fn ioc3_superio_interrupt_arrives_on_bridge_input_4() {
 fn flash_first_words(image: &[u8]) {
     let o = Octane::new();
     let f = Arc::new(RawFlash::new(image, 0x10_0000));
-    o.bridge.attach_flash(f, 0x10_0000);
+    o.bridge.attach_flash(0, f, 0x10_0000);
     let w = FLASH_BASE;
     let be = |n: usize| u32::from_be_bytes(image[n..n + 4].try_into().unwrap());
     // The processor's word load at the reset vector (physical 0x1fc0_0000)
@@ -1125,7 +1125,7 @@ fn flash_serves_the_stock_prom_as_the_processor_sees_it() {
     assert_eq!(image[0] >> 2, 0b000010);
     flash_first_words(&image);
     let o = Octane::new();
-    o.bridge.attach_flash(Arc::new(RawFlash::new(&image, 0x10_0000)), 0x10_0000);
+    o.bridge.attach_flash(0, Arc::new(RawFlash::new(&image, 0x10_0000)), 0x10_0000);
     assert_eq!(o.bridge.read32(u64::from(FLASH_BASE)).data, 0x0bf0_00f0);
 }
 

@@ -19,7 +19,7 @@
 //! resource lock; the fences are kept but gate nothing, since no warm reset
 //! travels through the modelled switch.
 //!
-//! Two approximations: a link reset on a fitted link brings the link back
+//! Two approximations: a link reset on an attached link brings the link back
 //! alive as it was before the reset (link training is not modelled, and the
 //! stock PROM resets each link it finds and expects it back), and register
 //! accesses are 32-bit at the data half of each eight-byte slot only.
@@ -462,7 +462,7 @@ impl Xbow {
         ret
     }
 
-    /// Fit a board on `widget` after construction (graphics), alive.
+    /// Attach a board on `widget` after construction (graphics), alive.
     pub fn attach(&self, widget: u8) {
         if let Some(bit) = link_bit(widget) {
             self.locked(|r, _| {
@@ -777,7 +777,7 @@ impl Xbow {
     }
 
     /// A link reset. Without a clock the pulse is over before the
-    /// processor can look again, so it is not kept. A fitted link that was
+    /// processor can look again, so it is not kept. An attached link that was
     /// alive comes back alive with an alive event, as the Octane's
     /// restore-alive policy has it; one that was down stays down, still
     /// initializing; an empty port fails initialization.
@@ -809,7 +809,7 @@ impl Xbow {
     }
 
     /// A link reset with a clock: the link drops now and the pulse ends
-    /// two core cycles on. A fitted link that was alive comes back alive
+    /// two core cycles on. An attached link that was alive comes back alive
     /// then, with an alive event; one that was down comes out of
     /// initialization still down; an empty port fails initialization and
     /// stays failed.
@@ -980,7 +980,7 @@ impl Xbow {
     }
 
     /// `dev` as the widget behind port `widget` (8 to 15).
-    pub fn port(self: &Arc<Self>, widget: u8, dev: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+    pub fn attach_widget(self: &Arc<Self>, widget: u8, dev: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         assert!(link_bit(widget).is_some(), "widget {widget} is not a Crossbow port");
         Arc::new(Port { xbow: self.clone(), widget, dev })
     }
@@ -1027,7 +1027,7 @@ impl BusDevice for Xbow {
 }
 
 // The crossbow's state for a snapshot: its registers and each link's
-// state. Which links are fitted is the board's, and a load onto other
+// state. Which links are attached is the board's, and a load onto other
 // links is refused. The interrupt the crossbow drives into HEART is
 // HEART's own saved state.
 impl Saveable for Xbow {
@@ -1058,7 +1058,7 @@ impl Saveable for Xbow {
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         if field_u8(v, "present")? != self.present.load(Ordering::Acquire) {
-            return Err("the saved crossbow has other links fitted".into());
+            return Err("the saved crossbow has other links attached".into());
         }
         if field_u32(v, "revision")? != self.revision {
             return Err("the saved crossbow is another revision".into());
@@ -1408,14 +1408,14 @@ mod tests {
     }
 
     /// Link reset is a pulse of two core cycles: the link is down and not
-    /// initializing-failed while it lasts, then a fitted live link returns
+    /// initializing-failed while it lasts, then an attached live link returns
     /// with an alive event. (sn0-xbow-test link-reset-pulse)
     #[test]
     fn a_link_reset_holds_the_link_down_for_twenty_nanoseconds() {
         let (x, now) = timed(4);
         let status = |link| LINK_BASE + LINK_STRIDE * link + LINK_STATUS + 4;
         now.store(1000, Ordering::SeqCst);
-        assert!(x.write(LINK_BASE + LINK_STRIDE * 3 + LINK_RESET + 4, 4, 0), "widget 11 has nothing fitted");
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 3 + LINK_RESET + 4, 4, 0), "widget 11 has nothing attached");
         assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
         assert!(!x.carries_timed(15));
         assert_eq!(x.read(status(7), 4), Some(0), "initializing shows none of the three bits");
@@ -1522,11 +1522,11 @@ mod tests {
         }));
         x.attach(11);
         assert_eq!(*seen.lock(), [(11, true)]);
-        // A reset of a fitted live link changes nothing; of an empty port neither.
+        // A reset of an attached live link changes nothing; of an empty port neither.
         assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
         assert!(x.write(LINK_BASE + LINK_STRIDE * 5 + LINK_RESET + 4, 4, 0));
         assert_eq!(seen.lock().len(), 1);
-        // Power-on drops nothing it fitted.
+        // Power-on drops nothing it attached.
         crate::traits::Resettable::power_on(&*x);
         assert_eq!(seen.lock().len(), 1);
     }
@@ -1600,7 +1600,7 @@ mod tests {
         assert_eq!(dst.regs.lock().link_event[2], 7);
         assert_eq!(dst.read(FENCE_BASE + 8 * 3 + 4, 4), Some(0x3c));
         assert_eq!(dst.read(LOCK + 4, 4), Some(9));
-        assert!(Xbow::new(5, 0x8400).load_state(&v).is_err(), "other links fitted");
+        assert!(Xbow::new(5, 0x8400).load_state(&v).is_err(), "other links attached");
         assert!(Xbow::new(4, 0x8100).load_state(&v).is_err(), "another revision");
     }
 
@@ -1618,11 +1618,11 @@ mod tests {
     #[test]
     fn a_port_passes_accesses_while_its_link_is_up_and_fails_them_otherwise() {
         let x = Arc::new(octane());
-        let fitted = x.port(15, Arc::new(Marker));
-        assert_eq!(fitted.read32(0x10).data, 0x1234_0010);
-        assert_eq!(fitted.write32(0x10, 0), BUS_OK);
+        let attached = x.attach_widget(15, Arc::new(Marker));
+        assert_eq!(attached.read32(0x10).data, 0x1234_0010);
+        assert_eq!(attached.write32(0x10, 0), BUS_OK);
         // Widget 11 has nothing attached, so its link is down.
-        let empty = x.port(11, Arc::new(Marker));
+        let empty = x.attach_widget(11, Arc::new(Marker));
         assert_eq!(empty.read32(0x10).status, BUS_ERR);
         assert_eq!(empty.write32(0x10, 0), BUS_ERR);
     }
@@ -1630,7 +1630,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not a Crossbow port")]
     fn only_the_eight_link_widgets_are_ports() {
-        let _ = Arc::new(octane()).port(7, Arc::new(Marker));
+        let _ = Arc::new(octane()).attach_widget(7, Arc::new(Marker));
     }
 
     #[test]

@@ -35,6 +35,7 @@ names. Notes elsewhere in `docs/` and `clanker/` cite them by path.
 
 ## Indy and Indigo2
 
+- [CS4216.PDF](indy/CS4216.PDF): Crystal Semiconductor CS4216 16-bit stereo audio codec, the Indy's and Indigo2's audio converter behind HAL2.
 - [DQ8003_SeeqTechnology.pdf](indy/DQ8003_SeeqTechnology.pdf): Seeq Technology DQ8003. No text layer, so its function is not confirmed here.
 - [Dallas 1386 Indy.pdf](indy/Dallas%201386%20Indy.pdf): DS1386 watchdog timekeeper with NVRAM.
 - [FM93CS56.pdf](indy/FM93CS56.pdf): 2048-bit MICROWIRE serial EEPROM.

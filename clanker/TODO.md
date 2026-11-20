@@ -4,6 +4,9 @@ Reviewed against repository code through `862d0fe` on **2026-10-07**;
 re-audited through `3a3caeb0` on **2026-10-21**. No item was found complete
 at that review. IMPACT buffer formats made real progress and its entry now
 lists only what is left; the Ethernet FIXME moved to `src/net/engine.rs`.
+Checked again against `83c8dddc` on **2026-11-15**: the Ethernet race item is
+closed (the FIXME went with `9049e072`), and the items below that the
+November commits moved forward say so in a "Progress" line.
 
 The old scratch list (`TODO_archive.md`) has been deleted. Its entries marked
 DONE were done; its open reports are quoted in the items below that cite
@@ -12,11 +15,12 @@ locks, possibly switch to spin" (device locks now use `SpinLock` where it
 paid off, see `HACKING.md` §5) and "logicop=src fast path" (an unmeasured
 REX3 optimisation idea, folded into the Newport item).
 
-The target is functional completeness for the existing Indy IP24, Indigo2 IP22,
-and Indigo2 IMPACT IP28 profiles, their runtime CPU/graphics choices, and the
-features exposed by the CLI and iris-gui. Cycle-accurate R10000 execution, new
-machine families, and instruction-level GE7/GE11 microcode emulation are separate
-projects. High-level graphics emulation is the current implementation strategy.
+This backlog originated with Indy IP24 and Indigo2 IP22/IP28. The emulator
+now includes O2, Octane, SN0 and IP35 machines; older entries below apply to
+the profiles and devices they name, and are not a complete inventory of the
+newer families. See their machine guides and plans for current limits.
+Cycle accuracy and instruction-level GE7/GE11 microcode emulation remain
+outside the functional-emulation approach.
 
 **Implementation** identifies a gap visible in current source. **Validation**
 identifies behavior that needs an observed guest/host test before it can be
@@ -28,22 +32,31 @@ guide and changelog when it lands.
 
 ## First: complete restore and CPU correctness
 
-- [ ] **Implementation — GR2 snapshots and rollback.** Serialize RE3 VRAM,
-  raster registers, HQ2 parser/geometry/context state, and pending work at a
-  defined quiescent boundary. Current `Saveable` only saves selected registers,
-  microcode, SRAM, and display tables. Add equivalent support to the in-memory
-  checkpoint path. Complete when a restored X/irisGL scene, framebuffer hash,
-  and subsequent drawing match uninterrupted execution.
+- [x] **Implementation — GR2 snapshots and rollback.** Schema 10 stores exact
+  named state, VRAM and Z/stencil parts after draining accepted HQ2 and RE3
+  work. It preserves partial HQ2/GL commands, full RE3 continuation, FIN2 waits
+  and unread GEDMA output. Disk, rollback and live checkpoints share the same
+  validated representation; XZ/Extreme and board-presence mismatches fail.
+  Full XZ/Extreme round trips, continued drawing, reset, invalid late state,
+  named-part errors and machine-level disk/in-memory paths have regressions.
   Sources: [GR2 save/load](../src/dev/gr2/mod.rs),
   [machine snapshots/checkpoints](../src/machine.rs).
-- [ ] **Implementation — IMPACT snapshots and rollback.** `Mgras::save_state`
-  returns an empty table and `load_state` is a no-op. Include HQ3/GE state,
-  ERAM contexts, RSS registers, tiled pixel memory, TE1 texture memory, DCB
-  tables, and interrupt state; include the same board state in checkpoints.
-  Complete when save/load and rollback survive context eviction, textured
-  drawing, and guest resolution changes with matching output.
+- [x] **Implementation — IMPACT snapshots and rollback.** Schema 8 stores
+  named content-addressed Front/DCB/GE, HQ3, RSS, pixel/clip-ID and TE1 parts,
+  plus HQ4/MicroLAN state on Octane. Indigo2 disk snapshots and CI/live
+  checkpoints, and Octane disk snapshots, restore the same validated state.
+  Restore invalidates runtime JIT state and reseeds the wgpu mirror without
+  serializing host GPU objects. Product round trips, partial-CFIFO
+  continuation, invalid-state rollback, Octane lifecycle and Vulkan/D3D12
+  reseeding have regressions.
   Sources: [MGRAS save/load](../src/dev/mgras/mod.rs),
   [board design](mgras/DESIGN.md).
+- [ ] **Validation — IMPACT snapshot workload matrix.** Extend the structural
+  and drawing-continuation regressions to guest context eviction, textured
+  scenes and guest-programmed resolution changes, with framebuffer/readback
+  comparisons before and after disk restore and in-memory rollback.
+  Sources: [MGRAS tests](../src/dev/mgras/mgras_tests.rs),
+  [Octane HQ4](../src/dev/mgras/hq4.rs).
 - [ ] **Implementation/validation — snapshot every active device.** Audit
   HAL2, VINO/CDMC, DaynaPort, Ultra64, host networking, and HostGL against the
   state actually captured in `Machine`. Define reset/reconnect behavior for
@@ -79,13 +92,15 @@ guide and changelog when it lands.
   64-entry TLBs, shadow CACHE/tag/data/ECC operations, MIPS IV, FR modes, and
   exception behavior in both engines. Complete when IP28 PROM diagnostics,
   IRIX boot, and guest CPU tests have recorded, reproducible expectations.
+  Progress 2026-11: unit tests per R10000-family part (TLB, Config, LWR,
+  posted stores, `d707147e`) and CACHE operand translation (`621b1295`).
   Sources: [R10000 shadow cache](../src/cpu/mips_cache_shadow.rs),
   [CPU suite](../cpu-tests/README.md), [IP28 guide](../docs/indigo2-ip28.md).
 - [ ] **Implementation — R5000 secondary cache, if kept as a supported target.**
   `r5ksc` deliberately refuses to compile because its L1I behavior fails
   tests. Fix the cache tests and validate a real supported Indy SC layout
   before exposing it. Decide whether to retain or remove `r5ksc_triton`;
-  that O2 variant is outside the current machine scope. Complete when every
+  the supported O2 profile does not use that disabled cache implementation. Complete when every
   advertised cache variant works or is clearly retired.
   Sources: [build guards](../src/lib.rs),
   [L1I investigation](cpu/r5k-l1i-cache-bugs.md).
@@ -113,7 +128,9 @@ guide and changelog when it lands.
   cross-CPU/FR/host-architecture cache rejection, and interrupted cache writes.
   Complete when stress runs show no stale execution, deadlocks, or acceptance
   of incompatible cached objects. Existing unit tests and historical cache
-  benchmarks alone do not close this item.
+  benchmarks alone do not close this item. Progress 2026-11: the pool's stop
+  barrier wakes every waiter and is modelled under loom (`f4087258`), and
+  `[jitv2] cache` stores pages with the default settings (`4eac4192`).
   Sources: [cache design](../docs/jitv2-persistent-cache.md),
   [compile pool](../src/cpu/jitv2/jitv2.rs).
 - [ ] **Triage — interrupt/reset and R5000 IRIX 5.3 reports.** Reproduce the
@@ -122,7 +139,10 @@ guide and changelog when it lands.
   repeated warm resets, and R5000 5.3 desktop startup. Complete when the old
   reports have reproduction evidence or an explicit resolved/not-reproduced
   result. Old scratch list: "IP7 interrupt weirdness after reset/reboot" and
-  "Xsgi crash in irix 5.3 R5K", both without further detail.
+  "Xsgi crash in irix 5.3 R5K", both without further detail. Progress
+  2026-11: a race that let a timer delivery set IP7 after the Compare write
+  that acknowledged it was fixed from reading the code (`8b4b6ba4`); it is
+  not known to explain the old report.
 
 ## Graphics
 
@@ -184,16 +204,20 @@ guide and changelog when it lands.
   base and spans by tile runs, keep the branchy path as the reference.
   Done when the specialised paths match it bit-exact and the Quake replay
   time is measured against it. Plan: `clanker/plans/odyssey-board-memory.md`
-  (follow-ups).
+  (follow-ups). Progress 2026-11: stores are specialised per format and
+  blend, and the display is composed through monomorphised readers.
 
 - [ ] **Implementation — IMPACT buffer formats and 3D state.** Landed since
   the 2026-10-07 review: DRBpointers' second buffer (`[19:10]`), 12-bit RGB
   double buffering in the halves of one word, colour-index double buffering
-  by pixel type, stencil and depth reads and clears, and two raster engines
-  for Maximum IMPACT (rows split by `y % 2`). Still open: per-window
-  front/back selection and swaps in general, the remaining 36-bit pixel
-  formats, the raw RDRAM window (device space is still a register map), and
-  the GE count and destination-RE selection on Maximum IMPACT.
+  by pixel type, 4:4:4, 5:5:5 and 12:12:12 RGB, per-window front/back bank
+  selection and swaps, stencil and depth reads and clears, and two raster
+  engines for Maximum IMPACT (rows split by `y % 2`). Solid/High now expose
+  one fitted GE11, Maximum exposes two, and CONFIG.DestRE routes ordinary
+  register state and execution to either RE or both. Still open: the raw
+  RDRAM diagnostic window, whose physical swizzle has no available oracle;
+  independent per-RSS texture subsystems; the DMA line-count mask; and gaps
+  found by broader hardware/application validation.
   Complete when independent guest diagnostics and depth/stencil/double-buffer
   workloads pass on Solid, High, and Maximum configurations.
   Sources: [recorded gaps](mgras/DESIGN.md),
@@ -238,15 +262,20 @@ guide and changelog when it lands.
 - [ ] **Implementation — HAL2 input and remaining modes.** Codec B currently
   writes silence; quad output discards rear channels; AES uses an internal
   loopback rather than host digital I/O. Define and implement supported host
-  input/quad/AES behavior, endian handling, CTRL2 gain/mute effects, recovered
-  AES clock, and timestamp DMA. Complete when guest diagnostics and channel
+  input/quad/AES behavior, endian handling, recovered AES clock, and
+  timestamp DMA. Output volume (the MDAC) and Codec A's mute and DAC
+  attenuation are done (`9e452715`). Complete when guest diagnostics and channel
   recordings verify the advertised modes, or unsupported physical modes are
   explicitly scoped out. Sources: [HAL2](../src/dev/hal2.rs), [guide](../docs/dev/hal2.md).
 - [ ] **Validation — audio lifecycle.** Check boot chimes, IRIX playback,
   rate changes, underruns, enable/disable, stop/start, host device changes, and
   restoration on supported hosts. Complete when sound is independently heard
   or recorded with correct duration/pitch and no repeated stale buffers.
-  Source: [HAL2 pacing/output](../src/dev/hal2.rs).
+  Progress 2026-11: host output is the `iris-audio` crate on every machine,
+  which follows default-device changes and runs with no device; CI records
+  each card through a PulseAudio null sink on Linux.
+  Sources: [HAL2 pacing/output](../src/dev/hal2.rs),
+  [host audio](devices/host-audio-is-iris-audio.md).
 - [ ] **Implementation/validation — VINO/IndyCam capture.** Finish the
   existing checklist: observe IRIX 5.3/6.5 capture, both channel routes,
   repeated-start I2C, CDMC controls, interlacing/diagonal artifacts, and
@@ -276,18 +305,25 @@ guide and changelog when it lands.
   changer switching, check conditions, DMA/backpressure, both IP22 controllers,
   raw disks, COW overlays, and CHD sidecars. Complete when install and recovery
   workflows preserve media state and expected sense results across engines.
+  Progress 2026-11: a failed write's data phase reports sense, and `scsi del`
+  refuses the changer's loaded disc (`c1b7efdb`, `447ef11f`).
   Sources: [SCSI](../src/scsi.rs),
   [controller](../src/dev/wd33c93a.rs).
 - [ ] **Validation — disk durability and snapshot coordination.** Check
   interrupted writes, flush/failure paths, snapshot/load with COW and CHD,
   parent/sidecar mismatches, and restore while DMA is pending. Complete when
   guest filesystem checks pass and base images remain intact in overlay modes.
+  Progress 2026-11: an overlay cut short by a crash reads back, a failed CHD
+  fold restores every drive, a crash between a fold's rename and delete no
+  longer strands the diff (`447ef11f`), and a second iris is refused an
+  overlay in use (`733e5f32`).
   Sources: [storage](../src/scsi.rs), [snapshots](../src/machine.rs),
   [COW/CHD design](plans/cow-chd-sync-plan.md).
-- [ ] **Triage — Ethernet completion interrupt race.** Investigate the FIXME
-  in the SEEQ/NAT control path independently of the already-fixed RX-active
-  refusal bug. Complete when a captured reproducer establishes the race or
-  the stale FIXME is removed with a justified explanation.
+- [x] **Triage — Ethernet completion interrupt race.** Closed 2026-10-31
+  (`9049e072`): IRIX's TX-completion handler writes CLRINT before it reads
+  the receive channel and the model raises a new interrupt for a later
+  frame, so a reply cannot be lost that way. The FIXME and the reply hold it
+  justified were removed; TFTP showed no retransmits without the hold.
   Sources: [network control](../src/net/engine.rs),
   [distinct fixed RX issue](devices/hpc3-rx-channel-refused-while-active.md).
 - [ ] **Validation — network services and PCAP.** Stress TCP/UDP forwards,
@@ -295,7 +331,9 @@ guide and changelog when it lands.
   traffic. Check PCAP capture permissions/installation on each host and record
   supported interface constraints. Document NFSv2's 32-bit size limit rather
   than claiming files over 4 GiB work through v2. Complete when service tests
-  and guest transfers verify data and lifecycle behavior.
+  and guest transfers verify data and lifecycle behavior. Progress 2026-11:
+  port forwards survive a stop/reset on every NIC
+  ([note](net/a-nic-restart-must-join-its-old-backend.md)).
   Sources: [NAT/services](../src/net/mod.rs), [NFS](../src/net/nfsudp.rs),
   [PCAP](../src/net/net_pcap.rs), [GUI capture access](../iris-gui/src/capture_access.rs).
 - [ ] **Validation/implementation — DaynaPort and Ultra64 bridges.** Verify

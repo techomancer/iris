@@ -1,6 +1,6 @@
 //! What differs between the products the pipe can be: the board set and texture
 //! size its configuration block reports, the boards its records name, the word the
-//! driver's attach classes it by, and the chassis it fits. The InfiniteReality2's
+//! driver's attach classes it by, and the chassis it installs in. The InfiniteReality2's
 //! block is checked byte for byte in `config`; these check the fields that move.
 
 use super::config::read_config;

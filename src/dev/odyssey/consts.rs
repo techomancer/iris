@@ -9,7 +9,10 @@ pub(super) const ODSY_PART: u32 = 0xc013;
 pub(super) const ODSY_MANUFACTURER: u32 = 0x023;
 
 // The one modeled scanout mode's retrace period, from the compiled 60 Hz 1280x1024 mode-description file
-pub(super) const ODSY_FRAME_CLOCKS: u32 = 1688 * 1066;
+pub(super) const ODSY_LINE_CLOCKS: u32 = 1688;
+pub(super) const ODSY_FRAME_CLOCKS: u32 = ODSY_LINE_CLOCKS * 1066;
+/// 1280x1024_60's vertical blanking, in lines.
+pub(super) const ODSY_BLANK_LINES: u32 = 42;
 pub(super) const ODSY_PIXEL_CLOCK_HZ: u32 = 107964476;
 
 // The display channel's active size, backend entries 0x2802 (pixels) and 0x2803 (lines).
@@ -194,7 +197,7 @@ pub(super) mod reg {
     // 1,000,000,000 once, after the program load (the doubleword and the single
     // write are ESTABLISHED). That the register is 0x3f0 is INFERRED; its unit
     // and meaning are UNKNOWN: a sync timeout in board clocks, in nanoseconds or
-    // a non-timeout limit all fit. The model accepts the write and records the value, runs no
+    // a non-timeout limit are all possible. The model accepts the write and records the value, runs no
     // timer, and raises no flag because of it.
     pub const SETUP_7F0: u32 = 0x7f0;
     pub const QUICK_FLUSH_ARG: u32 = 0x0443; // 1 operand: 0xfa or 0x96 seen
@@ -248,7 +251,7 @@ pub(super) mod reg {
     // The one-bit pattern-quad text path.
     pub const PATTERN_LOW: u32 = 0x3c4e; // pattern buffer words 0-15
     pub const PATTERN_HIGH: u32 = 0x3c4f; // pattern buffer words 16-31
-    pub const PATTERN_SHAPE: u32 = 0x043f; // 1 operand: 0x4/0x5/0x6, 0x0 = off
+    pub const PATTERN_SHAPE: u32 = 0x043f; // 1 operand: 0x4/0x5/0x6 quad-anchored, 0x0 plane-anchored 32x32; bit 4 opaque
     pub const PATTERN_MODE: u32 = 0x0404; // 1 operand: pattern, GL mode bits
 
     // The line stipple.
@@ -531,7 +534,6 @@ pub(super) mod dma {
     pub const REPORT_SHAPE: u32 = 1 << 6;
     pub const REPORT_WRITE: u32 = 1 << 7;
     pub const REPORT_UPLOAD_SENTINEL: u32 = 1 << 8;
-    pub const REPORT_INDEX_OBJECT: u32 = 1 << 9;
     pub const REPORT_COLOUR_OVER_INDEX: u32 = 1 << 10;
     pub const REPORT_UNLISTED_FIELDS: u32 = 1 << 14;
 }
@@ -935,6 +937,11 @@ pub(super) mod pattern {
     pub const SHAPE_64X16: u32 = 0x5;
     pub const SHAPE_32X32: u32 = 0x4;
     pub const SHAPE_16X64: u32 = 0x6;
+    /// A 32x32 pattern anchored at the plane origin, not at the quad: the
+    /// X server draws a glyph (traced: the check mark of a checked menu
+    /// toggle) by loading it, replicated to 32x32 at its screen position,
+    /// and sending a quad. GL's polygon stipple is the same shape.
+    pub const SHAPE_STIPPLE: u32 = 0x0;
 
     // Bit 4 of the 0x043f operand makes a pattern opaque
     pub const SHAPE_OPAQUE: u32 = 0x10;

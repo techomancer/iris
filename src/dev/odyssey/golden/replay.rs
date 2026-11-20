@@ -180,6 +180,7 @@ fn programs_scan_out(recs: &[Rec]) -> bool {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Opts {
     pub gpu: bool,
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
     pub lazy: bool,
     pub tick: Option<usize>,
 }
@@ -217,6 +218,16 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
     let mem = Arc::new(ReplayMem::new(recs));
     b.guest = Some(mem.clone());
     setup(&mut b);
+    // IRIS_ODSY_TRACE=<file>: the annotated trace of the replay, as the
+    // machine writes it from power-on (`gputrace` builds). A test that
+    // replays several sessions writes the first to <file>, the next to
+    // <file>.1 and so on.
+    if let Ok(path) = std::env::var("IRIS_ODSY_TRACE") {
+        static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = if n == 0 { path } else { format!("{path}.{n}") };
+        b.trace.start(&path, crate::dev::odyssey::trace::TRACE_ALL).expect("IRIS_ODSY_TRACE");
+    }
     // VPRO_REPLAY_GPU=1: draw on the GPU raster unit.
     if opts.gpu {
         #[cfg(feature = "wgpu")]
@@ -354,6 +365,9 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
     {
         let w = mem.writes.lock();
         rep.host_writes = (w.0.clone().finalize().to_hex()[..16].to_string(), w.1);
+    }
+    if let Some(t) = b.trace.stop() {
+        println!("trace: {t}");
     }
     (rep, b)
 }

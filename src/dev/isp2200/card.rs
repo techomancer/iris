@@ -1,5 +1,5 @@
 //! The adapter as `[fibre_channel]` describes it: opened with its loop disks,
-//! then fitted to a slot of an option board.
+//! then attached to a slot of an option board.
 //!
 //! The same shape as the NVMe card's ([`crate::dev::nvme::Card`]). A disk is
 //! attached through [`crate::scsi::attach_table`], the call every `[scsi.N]`
@@ -48,10 +48,10 @@ impl Card {
 
     /// Put the card in `device` of `bus`: in the slot itself, or behind a
     /// PCI-to-PCI bridge there, as device 0 of the bridge's bus.
-    pub fn fit(&self, bus: &PciBus, device: u8) {
+    pub fn attach(&self, bus: &PciBus, device: u8) {
         let at = |device| DevFn { device, function: 0 };
         if self.bridge {
-            let ppb = PciToPciBridge::new(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE);
+            let ppb = PciToPciBridge::with_io32_windows(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE, 0);
             bus.attach(at(device), ppb.clone());
             ppb.secondary().attach(at(0), self.fc.clone());
         } else {

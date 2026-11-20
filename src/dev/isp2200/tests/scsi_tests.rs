@@ -307,7 +307,7 @@ fn scsi_check_condition() {
     assert_eq!(res.scsi_status & 0xff, 0);
     assert_eq!(r.mem.get(BUF, 1)[0] & 0xe0, 0x60);
 
-    // A LUN from 8 to 255 does not fit the CDB's three bits, and is a LUN the
+    // A LUN from 8 to 255 exceeds the CDB's three bits, and is a LUN the
     // disk lacks like LUN 7: it never reads LUN 0's blocks.
     for lun in [8, 200, 255] {
         let before = r.isp.total_commands();

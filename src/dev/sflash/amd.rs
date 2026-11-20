@@ -4,10 +4,10 @@
 //! Array bytes and bus translation belong to the enclosing device. A
 //! [`Geometry`] says what the part is: its bus width, sectors, unlock
 //! addresses, identification codes and which commands it answers. The default
-//! is the 8 MiB x16 part Fuel uses for each boot-flash array; an SN0 node's
+//! is the 8 MiB x16 part Fuel uses for each boot-flash array; an IP27 node's
 //! boot flash (1 MiB x8) and a BaseIO card's (1 MiB x16, read-only) are the
 //! other two. The CFI data and timing are compatibility values; they do not
-//! identify a fitted flash chip. Buffered writes, protection, bypass and erase
+//! identify an attached flash chip. Buffered writes, protection, bypass and erase
 //! suspend are absent.
 //!
 //! Ported from MAME's intelfsh.cpp AMD command path, revision
@@ -273,7 +273,7 @@ impl AmdCore {
     }
 }
 
-// Generic model response; voltage/timing do not identify Fuel's fitted part.
+// Generic model response; voltage/timing do not identify Fuel's part.
 // Field positions/units: AMD publication 21444 rev E+2, pp14-15.
 // Region encoding also follows Renode AMDCFIFlash.cs (MIT), revision
 // 5448105bc7875aa6c5305761d97a371dc640dd7f. No Renode mutation code is used.

@@ -1,7 +1,7 @@
 //! The chip that sits at the top of a widget bus and takes what the widgets
 //! send upstream: interrupt packets and memory transfers.
 //!
-//! Its interrupt inputs are an [`InterruptController`](crate::irq::InterruptController)
+//! Its interrupt inputs are an [`InterruptController`]
 //! like any other. What the widgets also need to know is how it is
 //! addressed: the widget number their requests name, where in that
 //! widget's space an interrupt packet is accepted, and how many
@@ -39,7 +39,7 @@ impl XtalkHost {
 
 /// A host chip as the widgets upstream of it reach it: how it is addressed,
 /// the memory a transfer to it lands in (physical addresses, a bus error for
-/// anything not fitted) and the interrupt inputs a packet to it sets (line =
+/// anything not attached) and the interrupt inputs a packet to it sets (line =
 /// vector).
 pub struct HostPort {
     pub host: XtalkHost,

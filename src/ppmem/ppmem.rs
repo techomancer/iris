@@ -1,5 +1,5 @@
-//! Host-MMU-backed physical memory banks — a drop-in alternative to
-//! [`crate::dev::mem::Memory`].
+//! Host-MMU-backed physical memory banks, in place of
+//! [`crate::dev::mem::Memory`] on every machine (ppmem is unconditional).
 //!
 //! See `docs/ppmem-design.md`. In short: a bank's storage is a shared-memory
 //! object rather than a `Vec<u32>`, which lets the same bank be mapped into
@@ -22,10 +22,13 @@
 //! the inherent methods `physical.rs`/`machine.rs` call on `Memory`, so it
 //! plugs into the existing bus with no changes to the callers.
 //!
-//! [`PpMemSpace`] is the 4GB window that banks get mapped into, and the
-//! `MappedMemory` trait is the extra capability (clear/map/bitmap). The window
-//! is what a future fast path would read through; the bus abstraction keeps
-//! working either way.
+//! [`PpMemSpace`] is the 4GB window that banks get mapped into (16GB with
+//! [`LARGE_WINDOW_SIZE`]), and the `MappedMemory` trait is the extra
+//! capability (clear/map/bitmap). The window is what the direct memory paths
+//! read through: the transparent cache (`set_tcache_window`) and jitv2's
+//! inline loads and stores, with the region bitmap, the fine table and the
+//! generation window saying where they may. Anything the window does not map,
+//! or maps without generation counters ([`map_granule`]), takes the bus.
 
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -211,6 +214,9 @@ pub struct PpMemory {
     gen_base: *mut AtomicU64,
     #[cfg(feature = "jitv2")]
     _gen_own: AddrSpace,
+    /// JIT v2: this bank's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
 }
  
 // Safety: same contract as `Memory` — access is serialized through the bus.
@@ -270,6 +276,8 @@ impl PpMemory {
             gen_base,
             #[cfg(feature = "jitv2")]
             _gen_own: gen_own,
+            #[cfg(feature = "jitv2")]
+            code_bank: crate::traits::CodeBank::new(),
         })
     }
 
@@ -610,6 +618,19 @@ impl BusDevice for PpMemory {
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         PpMemory::gen_ptr(self, addr)
     }
+
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        let offset = self.off(addr) & !0xFFF;
+        let mut page = self.code_bank.page(offset as u64, PpMemory::gen_ptr(self, addr));
+        // The bank's own mapping, where `read32` reads: it does not move when
+        // a window maps the bank elsewhere.
+        if offset + 4096 <= self.size_bytes {
+            page.words = unsafe { (self.base as *const u32).add(offset >> 2) };
+        }
+        Some(page)
+    }
 }
 
 // Mirrors `impl BusDevice for Arc<Memory>` so Arc-wrapped banks work directly.
@@ -645,6 +666,8 @@ impl BusDevice for Arc<PpMemory> {
     #[cfg(feature = "jitv2")]
     #[inline]
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 { (**self).gen_ptr(addr) }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { (**self).code_page(addr) }
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +751,7 @@ pub struct PpMemSpace {
     /// Serializes the paths that change `state`: a remap (`map_bank`,
     /// `map_alias`, `map_range`, `unmap_range`, `clear_mappings`) and a CPU's
     /// held-line changes (`add_cached_view`, `hold_line_page`,
-    /// `release_line_page`). On the SN0 boards one CPU's store to a Hub's
+    /// `release_line_page`). On the IP27 boards one CPU's store to a Hub's
     /// number re-lays another node's window while that node's CPU issues
     /// CACHE instructions, so two threads reach one space. Taken by none of
     /// the paths a load, store or fetch takes: those read the window through
@@ -802,7 +825,7 @@ struct OwnBitmap(Box<u64>);
 //     `map_range`, `map_range_of`, `unmap_range`, through `remapping`, and
 //     `clear_mappings` directly), `set_bitmap_sink2`, `add_key_sink`, `add_cached_view`,
 //     `hold_line_page`, `release_line_page` and `held_line_pages`. Two threads
-//     can reach one space: the SN0 boards re-lay every node's window from the
+//     can reach one space: the IP27 boards re-lay every node's window from the
 //     thread that stored a Hub's node number (`ip27::Windows`), while the
 //     node's own CPU holds and releases lines at CACHE instructions. No
 //     locking call nests inside another. They never read another view, which
@@ -1219,7 +1242,7 @@ impl PpMemSpace {
     /// It also returns `None` for a page past the region bitmap's 64
     /// regions: the bitmap is all a CPU tests for a private page, and memory
     /// beyond it is reached through the fine table with nothing held. On an
-    /// SN0 board with 128 MiB regions that is node numbers 2 and 3 of a
+    /// IP27 board with 128 MiB regions that is node numbers 2 and 3 of a
     /// three- or four-node board; numbers 0 and 1 are unaffected. Lines
     /// there are not modelled as the CPU's alone: a store reaches every
     /// other CPU at once, as it does without views.

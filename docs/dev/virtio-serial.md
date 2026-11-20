@@ -19,7 +19,8 @@ chooses a transport:
 |---|---|---|---|
 | Indy (IP24) | virtio-mmio v2 | GIO expansion slot 1 (`0x1F600000`), or slot 0 (`0x1F400000`) | `GioExp1` / `GioExp0` (IOC local/mappable) |
 | Indigo2 (IP22), Indigo2 IMPACT (IP28) | virtio-mmio v2 | same two slots | the slot's EXT_IO fan-out line (`GioS1Graphics` / `GioS0Graphics`) |
-| Octane (IP30) | virtio-pci (modern) | Bridge slot 4 | INTA through the Bridge |
+| Octane (IP30) | virtio-pci (modern) | Bridge slot 7, or `bridge_slot` (4 to 7) | INTB, the Bridge's pin 3, in slot 7; INTA in any other slot |
+| Tezro (IP53) | virtio-pci (modern) | bus 1 of the IO9's PIC, device 1 | INTA through the PIC |
 | O2 (IP32) | virtio-pci (modern) | **not wired** | the MACE PCI router has no route for a spare slot |
 
 The Indy and Indigo2 have no PCI bus, so they get the memory-mapped transport
@@ -32,7 +33,8 @@ when the configuration is validated.
 The O2's transport is complete and tested but the machine does not use it: its
 bridge routes only the two SCSI slots' pins to CRIME inputs, and which CRIME
 input a third slot would drive is a hardware fact we do not have. `validate()`
-says so rather than silently ignoring the section.
+says so rather than silently ignoring the section. The Fuel, the Origin 200,
+2000 and 3200, the Onyx2 and the Onyx 3000 refuse the section too.
 
 ## Configuration
 
@@ -109,16 +111,28 @@ registers `0x030`..`0x0a4`, `InterruptStatus`/`ACK` `0x060`/`0x064`, `Status`
 - Rings are in guest RAM and are addressed by guest physical address (the
   address the CPU would use through KSEG0/KSEG1, with the top bits removed).
 
-### virtio-pci (Octane)
+### virtio-pci (Octane, Tezro)
 
 Vendor `0x1af4`, device `0x1043` (`0x1040 + 3`), class `0x078000`, BAR0 a
 16 KB memory BAR holding the four structures the vendor capabilities at
 config offsets `0x40`, `0x50`, `0x64`, `0x74` describe: common config
 (`0x0000`), ISR (`0x1000`, read clears), device config (`0x2000`) and
 notifications (`0x3000`, one dword per queue, `notify_off_multiplier` 4).
-Interrupts are INTx on pin A; MSI-X is not offered. Everything in the BAR is
+Interrupts are INTx, level-sensitive (on the Octane pin B, which the slot 7
+swizzle takes to the Bridge's otherwise unused pin 3; the slot's pin A would be
+the AC-fail input, and slot 4's pin A the IOC3's Super I/O interrupt); MSI-X is
+not offered. Everything in the BAR is
 little-endian as the device sees it; the bridge's byte-lane rules apply as for
 any other function on that machine.
+
+On PCI the device also offers `VIRTIO_F_ACCESS_PLATFORM` (bit 33): ring and
+buffer addresses are PCI bus addresses, which go through the host bridge's
+DMA translation like any other function's (on the Octane, the Bridge's direct
+windows; a physical address below 1 GB is PCI-local space and reaches no
+memory). Linux accepts the bit and gives the addresses its DMA mapping
+returns; without the bit it hands over physical addresses and the device never
+sees its rings. A driver that does not accept the bit is still taken. The same
+holds for virtio-9p on PCI.
 
 ## Limits
 

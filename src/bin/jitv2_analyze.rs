@@ -4,7 +4,7 @@
 //! measurements the design doc calls for (§9): region-size histogram,
 //! exclusion-reason counts, 0xFFC hit rate.
 //!
-//! Usage: jitv2-analyze [corpus_dir]   (default: jitv2_corpus)
+//! Usage: `jitv2-analyze [corpus_dir]` (default: `jitv2_corpus`)
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -897,10 +897,10 @@ fn set_time(r: &Rig, [sec, min, hour, date, month, year]: [u8; 6], century: u8) 
     r.w8(CLOCK_CONTROL, century);
 }
 
-/// Ports test_rtc_absent: with no clock fitted the window reads zero and
+/// Ports test_rtc_absent: with no clock attached the window reads zero and
 /// drops a write.
 #[test]
-fn an_unfitted_clock_reads_zero() {
+fn a_missing_clock_reads_zero() {
     let r = Rig::new();
     assert_eq!(r.r8(CLOCK_CONTROL), 0);
     r.w8(CLOCK_CONTROL, 0x55);
@@ -1049,7 +1049,7 @@ fn a_full_ring_does_not_stall_a_loopback_walk() {
 }
 
 /// Ports test_dma_loopback_overrun_reaches_status: with the receive ring
-/// out of room the characters that do not fit are lost to the 16550's
+/// out of room the characters that do not go in are lost to the 16550's
 /// overrun, which shows in the status byte of the next character read.
 #[test]
 fn a_loopback_overrun_reaches_the_status_byte() {
@@ -1555,7 +1555,7 @@ fn the_ps2_adapter_presents_the_controller() {
 /// Ports test_ps2_ports_present: every IOC4 has both ports; there is no
 /// switch to leave them unplugged.
 #[test]
-fn both_ps2_ports_are_always_fitted() {
+fn both_ps2_ports_are_always_present() {
     let r = Rig::with(Ioc4Config::bare(Ioc4Clock::Mhz33));
     r.w32(KBC_KBD_TRANSMIT, 0xff);
     r.w32(KBC_AUX_TRANSMIT, 0xff);

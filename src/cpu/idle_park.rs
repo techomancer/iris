@@ -1,7 +1,9 @@
 //! Kernel idle-loop detection and in-place CPU thread parking.
 //!
 //! Used by the CPU run loop in `mips_exec.rs`. See
-//! `clanker/perf/idle-pause-work.md`.
+//! `clanker/perf/idle-pause-work.md`, and for multiprocessors (slices,
+//! kicks, the shared-loop rule) and jitv2 (probe runs, learned signatures)
+//! `clanker/perf/idle-park-smp-run-queue-polling.md`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -53,8 +55,18 @@ const PROBE_BACKOFF: u32 = 256;
 /// interpreted for good.
 const PROBE_RUN: u32 = 16;
 /// The slice of a parked uniprocessor: how often it looks at `running`
-/// while it waits for a line.
+/// while it waits for a line, and the whole park once a park has ended with
+/// no line at all (see [`UP_PARK_MAX_NS`]).
 const SLICE_NS: u64 = 1_000_000;
+/// The longest park of a uniprocessor. A guest with a running clock wakes
+/// on its tick long before this, so IRIX never reaches it. A guest with no
+/// interrupt source (the IP30 PROM and fx poll the console and the
+/// graphics board with IE set but every HEART source disabled) would
+/// otherwise sleep for good on a loop that only looks idle. Once a park
+/// ends here, the next ones last one [`SLICE_NS`] each until a line wakes
+/// one again: about a thousand short batches a second, enough for a menu
+/// to see a key and a poll loop to see its device.
+const UP_PARK_MAX_NS: u64 = 100_000_000;
 /// The longest park of a multiprocessor's CPU while every CPU is idle. Work
 /// reaches an idle CPU without an interrupt, but only after some CPU has run
 /// an interrupt handler (a disk or network completion, an inter-processor
@@ -166,9 +178,10 @@ pub static PARK_WAKE_SLICE: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Idle-looking windows a multiprocessor's CPU did not park on because no
 /// other CPU was in the same loop.
 pub static PARK_ALONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Interrupt wakes by the lowest pending Cause.IP line (IP0..IP7), and by
-/// CPU: which source keeps parked CPUs from sleeping.
+/// Interrupt wakes by the lowest pending Cause.IP line (IP0..IP7): which
+/// source keeps parked CPUs from sleeping.
 pub static PARK_WAKE_IRQ_LINE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Interrupt wakes by the CPU that woke.
 pub static PARK_WAKE_IRQ_CPU: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Parks a multiprocessor ended because another CPU asked this one to poll.
 pub static PARK_WAKE_KICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -181,6 +194,10 @@ pub static LEARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Batches a jitv2 build ran interpreted to sample the PCs inside a compiled
 /// loop (see [`IdleParkState::wants_probe`]).
 pub static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Detector counters for `idle status`: decisions past the warm-up and
+/// back-off, then why a window was reset (an interrupt ready, a masked line
+/// pending, IM=0, IE=0, a user-dominated ring), then full windows seen and
+/// the sample and distinct-PC counts of the last one's largest cluster.
 pub static UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IRQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static RESET_IP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -303,6 +320,10 @@ pub struct IdleParkState {
     probe_sig_len: usize,
     /// The last park was decided on a learned signature.
     parked_known: bool,
+    /// The last park of this uniprocessor ended on its time bound with no
+    /// line pending: the guest has no interrupt source, so park in single
+    /// slices (see [`UP_PARK_MAX_NS`]).
+    quiet: bool,
     /// `hot.cycles` at the last update: a reset starts it again from zero,
     /// and the signatures of the old kernel go with it.
     last_cycles: u64,
@@ -314,8 +335,8 @@ pub enum IdleDecision {
     /// deliver so the guest should run, not sleep.
     None,
     /// One long kernel cluster dominates the window with interrupts enabled
-    /// and a mask bit set: park the CPU thread; an unmasked interrupt ends the
-    /// park.
+    /// and a mask bit set: park the CPU thread. Any pending line, masked or
+    /// not, ends the park (see [`IdleParkState::park`]).
     Park,
     /// A masked interrupt is already pending (`ip != 0`), so parking would
     /// wait for a line the guest only takes after it drops the spl — which it
@@ -362,6 +383,7 @@ impl IdleParkState {
             probe_sig: [(0, 0); CLUSTER_MIN_DISTINCT],
             probe_sig_len: 0,
             parked_known: false,
+            quiet: false,
             last_cycles: 0,
             park_skip_until_cycle: 0,
             started: *PROCESS_START.get_or_init(Instant::now),
@@ -663,11 +685,14 @@ impl IdleParkState {
 
     /// Update the PC window and decide what to do with the current state.
     ///
-    /// Returns `None` unless the CPU has stayed inside one long, narrow
-    /// kernel code window for [`PC_RING`] samples with no interrupt ready to
-    /// deliver — that is a genuine idle loop. With interrupts enabled and a
-    /// mask bit set the spin is safe to `park`; a pending-but-masked interrupt
-    /// is paced instead (see [`IdleParkState::pace`]).
+    /// Returns [`IdleDecision::None`] unless the CPU has stayed inside one
+    /// long, narrow kernel code window for [`PC_RING`] samples (or a ring of
+    /// compiled region exits matches a learned signature) with no interrupt
+    /// ready to deliver — that is a genuine idle loop. On a multiprocessor
+    /// another CPU must also be idling in the same loop
+    /// (`SHARED_LOOP_BYTES`). With interrupts enabled and a mask bit set
+    /// the spin is safe to `park`; a pending-but-masked interrupt is paced
+    /// instead (see [`IdleParkState::pace`]).
     pub fn update(&mut self, core: &MipsCore) -> IdleDecision {
         // A reset restarts the cycle counter, and may boot another kernel.
         if core.hot.cycles < self.last_cycles {
@@ -707,13 +732,14 @@ impl IdleParkState {
     }
 
     fn decide(&mut self, core: &MipsCore) -> IdleDecision {
-        // A recent park woke on a line the guest could not take: keep
-        // executing for the back-off window instead of re-parking a loop
-        // that is waiting on device progress.
+        // Boot warm-up ([`PARK_WARMUP`]): run at full speed.
         if self.started.elapsed() < self.warmup {
             self.clear_window();
             return IdleDecision::None;
         }
+        // A recent park woke on a line the guest could not take: keep
+        // executing for the back-off window instead of re-parking a loop
+        // that is waiting on device progress.
         if core.hot.cycles < self.park_skip_until_cycle {
             return IdleDecision::None;
         }
@@ -878,6 +904,7 @@ impl IdleParkState {
             // can only do running. (Waiting for `ip & im` slept through the
             // timer for good in such a loop: an IRIX 6.5 hang.)
             if ip != 0 {
+                self.quiet = false;
                 PARK_WAKE_IRQ.fetch_add(1, Ordering::Relaxed);
                 PARK_WAKE_IRQ_LINE[((ip >> 8).trailing_zeros() & 7) as usize].fetch_add(1, Ordering::Relaxed);
                 PARK_WAKE_IRQ_CPU[core.cpu_id as usize % MAX_CPUS].fetch_add(1, Ordering::Relaxed);
@@ -905,7 +932,8 @@ impl IdleParkState {
             // CPUs' run queues, and the IP35 kernel stops an idle CPU's own
             // clock. That CPU kicks the others when it parks again
             // (`kick_peers`), so the slice is only a bound. Alone, sleep on
-            // until a line.
+            // until a line, but not for good: a guest with no interrupt
+            // source never sends one (`UP_PARK_MAX_NS`).
             let peer_running = core.smp && {
                 let others = SEEN.load(Ordering::Relaxed) & !(1 << core.cpu_id);
                 (PARKED.load(Ordering::SeqCst) | IDLE.load(Ordering::Relaxed)) & others != others
@@ -914,15 +942,20 @@ impl IdleParkState {
                 peer_slice_ns() << self.peer_backoff
             } else if core.smp {
                 all_idle_slice_ns()
-            } else {
+            } else if self.quiet {
                 SLICE_NS
+            } else {
+                UP_PARK_MAX_NS
             };
-            // A multiprocessor's park ends when its slice is up. Every device
-            // interrupt unparks all parked CPUs (`wake`), so a wake that was
-            // for another CPU sleeps on for the rest of the slice.
-            let waited = if core.smp { start.elapsed().as_nanos() as u64 } else { 0 };
+            // A park ends when its slice is up. Every device interrupt
+            // unparks all parked CPUs (`wake`), so a wake that was for
+            // another CPU sleeps on for the rest of the slice.
+            let waited = start.elapsed().as_nanos() as u64;
             if waited >= slice {
-                if peer_running {
+                if !core.smp {
+                    self.quiet = true;
+                    PARK_WAKE_SLICE.fetch_add(1, Ordering::Relaxed);
+                } else if peer_running {
                     PARK_WAKE_PEER.fetch_add(1, Ordering::Relaxed);
                     self.peer_backoff = (self.peer_backoff + 1).min(PEER_BACKOFF_MAX);
                 } else {
@@ -933,7 +966,9 @@ impl IdleParkState {
             let t0 = Instant::now();
             // Still a bounded slice — `running` and the ci_clock threshold are
             // only polled — but an interrupt now ends it at once.
-            std::thread::park_timeout(Duration::from_nanos(slice - waited));
+            // A uniprocessor looks at `running` once a `SLICE_NS`.
+            let nap = if core.smp { slice - waited } else { (slice - waited).min(SLICE_NS) };
+            std::thread::park_timeout(Duration::from_nanos(nap));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             PARK_SLEEP_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
             advance_parked(core, elapsed_ns);
@@ -1652,6 +1687,32 @@ mod wake_tests {
         let _ = tx.send(());
         assert!(raiser.join().unwrap(),
             "park slept through a pending interrupt masked only by the spl");
+    }
+
+    /// A uniprocessor guest with no interrupt source (the IP30 PROM's menu
+    /// and fx, IE set but every HEART source off) must not park for good:
+    /// the park ends on its time bound, and the next ones last one slice.
+    /// An interrupt wake restores the long bound.
+    #[test]
+    fn a_park_with_no_interrupt_source_ends_and_then_slices() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 4)) | (1 << (STATUS_IM_SHIFT + 6));
+        let running = AtomicBool::new(true);
+        let mut st = IdleParkState::ready();
+        let t0 = Instant::now();
+        st.park(&mut core, &running);
+        let first = t0.elapsed();
+        assert!(first >= Duration::from_nanos(UP_PARK_MAX_NS), "the first park ended early: {first:?}");
+        assert!(first < Duration::from_secs(2), "the first park did not end on its bound: {first:?}");
+        assert!(st.quiet);
+        let t1 = Instant::now();
+        st.park(&mut core, &running);
+        let second = t1.elapsed();
+        assert!(second < Duration::from_millis(50), "a quiet guest parks one slice at a time: {second:?}");
+        core.hot.interrupts.store(CAUSE_IP7 as u64, Ordering::SeqCst);
+        st.park(&mut core, &running);
+        assert!(!st.quiet, "an interrupt wake ends quiet slicing");
     }
 
     /// A park that wakes on a masked line was a false positive: back off so

@@ -2,9 +2,15 @@
 //! its input comes from.
 //!
 //! A [`SerialBackend`] is a TCP console, a Unix-socket console, the in-process CI backend, a file
-//! tee, or nothing. Every machine's UARTs (the Indy's Z85C30, the O2's MACE
-//! 16550s, the Octane's IOC3) take one, and [`console_backends`] picks them
-//! for the machines whose consoles are configured the same way.
+//! tee, or nothing. Every machine's UARTs (the Indy's and Indigo2's Z85C30,
+//! the O2's MACE 16550s, the IOC3's and IOC4's ports, the L1 console) take
+//! one, and [`console_backends`] picks them for the machines whose consoles
+//! are configured the same way.
+//!
+//! A backend whose host end can fill up refuses a byte through
+//! [`SerialBackend::try_send_byte`] rather than dropping it; the 16550 core
+//! then holds the byte and retries it (`Ns16550::poll_tx`). A backend never
+//! calls back into the UART.
 
 use std::fs::OpenOptions;
 use std::collections::VecDeque;
@@ -51,9 +57,9 @@ impl SerialBackend for NullBackend {
 }
 
 /// Tees guest-emitted bytes to a host file in addition to delegating to an
-/// inner backend.  Used by `--serial-log <file>` to capture the serial
-/// console transcript while the real TCP listener on port 8881 keeps
-/// working unchanged.
+/// inner backend. Used by `serial_log` (`--serial-log <file>`) to capture the
+/// console transcript while the console's own listener keeps working
+/// unchanged.
 pub struct TeeBackend {
     inner: Arc<dyn SerialBackend>,
     log: Arc<SerialLog>,
@@ -628,7 +634,7 @@ pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str) -> Option
     }
 }
 
-/// A serial console on a Unix socket at `path`; see [`UnixSocketBackend`].
+/// A serial console on a Unix socket at `path`; see `UnixSocketBackend`.
 /// Returns `None` when the socket cannot be made, with the reason on stderr,
 /// as a TCP port that is taken does.
 #[cfg(unix)]

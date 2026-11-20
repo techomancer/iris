@@ -88,11 +88,8 @@ fn the_l1_returns_identity_and_validated_eeprom_records() {
     assert_eq!(request(&l1, 5, &[], 0), integer_reply(&[1, 48, 1]));
 }
 
-/// A configured CPU configuration goes into component 0's board area, after
-/// the identity fields, as format 2 with the one-byte selector 3, the Hub mode
-/// bits, Config0 to Config3, the Hub and CPU MHz and three versions, the
-/// unknown ones as empty fields; the I/O board's area and the default record
-/// carry none. The layout is QEMU's (`l1_build_board_area`).
+/// A configured CPU configuration goes in component 0's board area as format 2, selector 3 (QEMU's
+/// `l1_build_board_area` layout); the I/O area and default record carry none.
 #[test]
 fn the_node_board_record_carries_a_configured_cpu_configuration() {
     let plain = L1::new(Default::default()).unwrap().record(0, 2).unwrap();
@@ -114,9 +111,8 @@ fn the_node_board_record_carries_a_configured_cpu_configuration() {
     assert_eq!(l1.record(1, 2), L1::new(Default::default()).unwrap().record(1, 2), "the I/O board's area");
 }
 
-/// A board that names its node board gets that identity in component 0's
-/// board area, empty fields included, and no I/O board record; with none
-/// named the Fuel's placeholder answers in both, as before.
+/// A board naming its node board gets that identity in component 0 and no I/O record; otherwise the
+/// placeholder answers both.
 #[test]
 fn a_named_node_board_answers_in_component_0_alone() {
     let ip53 = BoardIdentity { name: "IP53_4CPU", part: "030-1868-001", revision: "-C" };
@@ -131,8 +127,7 @@ fn a_named_node_board_answers_in_component_0_alone() {
     assert_eq!(l1.record(1, 1), None);
     let empty = BoardIdentity { name: "", part: "", revision: "" };
     let area = L1::new(L1Config { node_board: Some(empty), ..Default::default() }).unwrap().record(0, 2).unwrap();
-    // SYNTHETIC, then an empty name, the serial, an empty part, the FRU file
-    // byte and an empty revision.
+    // SYNTHETIC, empty name, serial, empty part, FRU file byte, empty revision.
     let at = area.windows(10).position(|x| x == b"\xc9SYNTHETIC").unwrap() + 10;
     assert_eq!(&area[at..at + 11], b"\xc0\xc6EMUN00\xc0\x00\xc0");
     let fuel = L1::new(Default::default()).unwrap();
@@ -140,8 +135,7 @@ fn a_named_node_board_answers_in_component_0_alone() {
     assert!(fuel.record(1, 2).is_some());
 }
 
-/// A named graphics board answers an EEPROM read of component 2's board
-/// area; without one the read is refused as not present (-104).
+/// A named graphics board answers a read of component 2; without one it is refused (-104).
 #[test]
 fn a_named_graphics_board_answers_in_component_2() {
     let args = model::ints(&[2, 2, 0, 64]);
@@ -173,31 +167,19 @@ fn text_reply(text: &str) -> Vec<u8> {
     encode(&p)
 }
 
-/// With no configuration the controller reports the labelled model defaults:
-/// firmware 1.48.1 and the synthetic brick serial.
+/// Revision and brick serial default to 1.48.1 and the synthetic serial, and both can be replaced.
 #[test]
-fn the_l1_reports_the_default_revision_and_brick_serial() {
-    let l1 = L1::new(Default::default()).unwrap();
-    l1.power_on();
-    assert_eq!(request(&l1, 5, &[], 0), integer_reply(&[1, 48, 1]));
-    assert_eq!(request(&l1, 4, &[], 0), text_reply("EMUN00"));
-}
-
-/// Both identity values can be replaced.
-#[test]
-fn the_l1_revision_and_brick_serial_can_be_overridden() {
-    let l1 = L1::new(L1Config {
-        revision: Some(parse_revision("2.13.40").unwrap()),
-        brick_serial: Some("EMUN07".into()),
-        ..Default::default()
-    })
-    .unwrap();
-    l1.power_on();
-    assert_eq!(request(&l1, 5, &[], 0), integer_reply(&[2, 13, 40]));
-    assert_eq!(request(&l1, 4, &[], 0), text_reply("EMUN07"));
+fn the_l1_revision_and_brick_serial_default_and_can_be_overridden() {
+    let set = L1Config { revision: Some(parse_revision("2.13.40").unwrap()), brick_serial: Some("EMUN07".into()), ..Default::default() };
+    for (config, rev, serial) in [(Default::default(), [1, 48, 1], "EMUN00"), (set, [2, 13, 40], "EMUN07")] {
+        let l1 = L1::new(config).unwrap();
+        l1.power_on();
+        assert_eq!(request(&l1, 5, &[], 0), integer_reply(&rev));
+        assert_eq!(request(&l1, 4, &[], 0), text_reply(serial));
+    }
     assert_eq!(
         L1::new(L1Config { brick_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
-        Some("L1 brick serial must fit a 37-byte text field")
+        Some("L1 brick serial is longer than its 37-byte field")
     );
 }
 
@@ -210,22 +192,7 @@ fn the_l1_revision_text_is_three_decimal_parts() {
     }
 }
 
-/// Request 0x0008 is the configured station address as twelve uppercase
-/// hexadecimal digits in address order, the text the PROM turns back into the
-/// Ethernet address.
-#[test]
-fn the_l1_system_serial_is_the_station_address_in_hex() {
-    let l1 = L1::new(Default::default()).unwrap();
-    l1.power_on();
-    assert_eq!(request(&l1, 8, &[], 0), text_reply("080069123456"));
-    let l1 = L1::new(L1Config { mac: [0x00, 0xA0, 0xc9, 0x1f, 0x02, 0xbe], ..Default::default() }).unwrap();
-    l1.power_on();
-    assert_eq!(request(&l1, 8, &[], 0), text_reply("00A0C91F02BE"));
-}
-
-/// A configured system serial replaces the address text in request 0x0008
-/// and nothing else: the brick serial and the board serial in the node
-/// board's record, which the PROM ties its NVRAM to, stay the same.
+/// Request 0x0008 is the station address in hex; a configured serial replaces only that text.
 #[test]
 fn a_system_serial_changes_only_the_system_serial_reply() {
     let plain = L1::new(Default::default()).unwrap();
@@ -235,11 +202,14 @@ fn a_system_serial_changes_only_the_system_serial_reply() {
     }
     assert_eq!(request(&set, 8, &[], 0), text_reply("LEMU200420"));
     assert_eq!(request(&plain, 8, &[], 0), text_reply("080069123456"));
+    let mac = L1::new(L1Config { mac: [0x00, 0xA0, 0xc9, 0x1f, 0x02, 0xbe], ..Default::default() }).unwrap();
+    mac.power_on();
+    assert_eq!(request(&mac, 8, &[], 0), text_reply("00A0C91F02BE"));
     assert_eq!(request(&set, 4, &[], 0), request(&plain, 4, &[], 0));
     assert_eq!(set.state.lock().records, plain.state.lock().records);
     assert_eq!(
         L1::new(L1Config { system_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
-        Some("L1 system serial must fit a 37-byte text field")
+        Some("L1 system serial is longer than its 37-byte field")
     );
 }
 
@@ -258,9 +228,8 @@ fn the_l1_resynchronizes_after_bad_frames() {
     assert_eq!(request(&l1, 9, &[], 0), integer_reply(&[0]));
 }
 
-/// The PROM may reset the L1 during boot: the UART and parser restart, and
-/// an event subchannel the operating system set (23) survives while the
-/// PROM's own (3) does not.
+/// A PROM reset restarts the UART and parser; the OS event subchannel (23) survives, the PROM's (3)
+/// does not.
 #[test]
 fn l1_reset_clears_uart_state_but_keeps_the_os_event_channel() {
     for channel in [3, 23] {
@@ -297,8 +266,7 @@ fn l1_reset_clears_uart_state_but_keeps_the_os_event_channel() {
     }
 }
 
-/// Requests neither the stock PROM nor IRIX sends are refused as unknown
-/// (minus 101), with no other effect.
+/// Requests no guest sends are refused as unknown (minus 101).
 #[test]
 fn requests_no_guest_sends_are_refused() {
     let l1 = L1::new(Default::default()).unwrap();
@@ -704,10 +672,8 @@ fn cbrick(index: u8, pimm_mask: u8) -> L1 {
     .unwrap()
 }
 
-/// The I-brick's controller lists the C-brick that asked at port 1 and, when
-/// its other port has a G-brick, that G-brick at port 2: the list the PROM
-/// asks for to tell a graphics brick from a second host. The C-brick's own
-/// list stays empty.
+/// The I-brick's controller lists the asking C-brick at port 1 and a G-brick at port 2; the
+/// C-brick's own list is empty.
 #[test]
 fn an_i_brick_lists_its_c_brick_and_its_g_brick() {
     let l1 = |graphics_bay| {
@@ -731,8 +697,7 @@ fn an_i_brick_lists_its_c_brick_and_its_g_brick() {
     assert_eq!(request(&with, 0xc, &[], 0), integer_reply(&[0; 8]));
 }
 
-/// A C-brick names itself, and answers for the brick on its XIO cable when a
-/// request is addressed there; the PROM's I/O set-up names that brick's letter.
+/// A C-brick names itself and answers for the brick on its XIO cable when addressed there.
 #[test]
 fn a_c_brick_reports_itself_and_relays_to_its_i_brick() {
     let l1 = cbrick(0, 1);
@@ -743,25 +708,23 @@ fn a_c_brick_reports_itself_and_relays_to_its_i_brick() {
         drain(l1)
     };
     assert_eq!(attached(&l1, 3), integer_reply(&[(1 << 6) | 14, 0x49]));
-    // A brick with nothing on the cable refuses the attached form and
-    // answers the I/O set-up as before.
+    // A brick with nothing on the cable refuses the attached form.
     let lone = L1::new(Default::default()).unwrap();
     assert_eq!(attached(&lone, 3), encode(&[0x30, 255, 255, 255, 255, 0, 0, 0, 8]));
     assert_eq!(request(&lone, 0xa, &[], 0), integer_reply(&[0, 0]));
 }
 
-/// The node board is component 0 and the PIMM mask names the fitted PIMMs,
-/// each with a checksummed record carrying the row's identity and its own
-/// synthetic serial; the second node's serials differ from the first's.
+/// Component 0 is the node board; the PIMM mask names populated PIMMs, each with its own synthetic
+/// serial.
 #[test]
-fn a_c_brick_holds_a_node_board_and_the_fitted_pimms() {
+fn a_c_brick_holds_a_node_board_and_the_populated_pimms() {
     let has = |area: &[u8], text: &[u8]| area.windows(text.len()).any(|x| x == text);
     let l1 = cbrick(1, 0b10);
     let node = l1.record(0, 2).unwrap();
     for text in [b"NODE-ROW".as_slice(), b"EMUN01", b"030-NODE-ROW"] {
         assert!(has(&node, text), "{}", String::from_utf8_lossy(text));
     }
-    assert!(l1.record(1, 2).is_none(), "PIMM 0 is not fitted");
+    assert!(l1.record(1, 2).is_none(), "PIMM 0 is not populated");
     let pimm = l1.record(2, 2).unwrap();
     for text in [b"PIMM-ROW".as_slice(), b"EMUD03", b"030-PIMM-ROW"] {
         assert!(has(&pimm, text), "{}", String::from_utf8_lossy(text));
@@ -772,8 +735,7 @@ fn a_c_brick_holds_a_node_board_and_the_fitted_pimms() {
     assert!(l1.record(1, 0).is_none() && cbrick(0, 1).record(1, 2).is_some() && cbrick(0, 1).record(2, 2).is_none());
 }
 
-/// A config with neither new field answers as it did, and a compute node
-/// without a node board is refused rather than given the Fuel's.
+/// A config with neither new field answers as before; a compute node with no node board is refused.
 #[test]
 fn a_config_without_the_c_brick_fields_is_unchanged() {
     let plain = L1Config { node_board: Some(C_BRICK_NODE), ..Default::default() };

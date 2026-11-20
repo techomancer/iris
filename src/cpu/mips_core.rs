@@ -118,8 +118,8 @@ fn claim_ip7(seq: &Ip7Ticket, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
 }
 
 /// Sentinel meaning "the armed deadline has already been delivered". Never a
-/// valid ticket: `arm_ip7_sequence` only ever issues values from a monotonic
-/// counter starting at 1.
+/// valid ticket: `next_ip7_ticket` only ever issues values from a monotonic
+/// counter starting at 1, skipping both sentinels (`ip7_ticket::is_sentinel`).
 const IP7_SEQ_CONSUMED: u64 = ip7_ticket::CONSUMED;
 
 /// Raw pointer to a `MipsCore`'s `hot.interrupts` word, captured by the armed
@@ -341,7 +341,7 @@ pub struct MipsCore {
     /// whenever the MC remaps banks.
     ///
     /// An `AtomicU64` read and written `Relaxed` (the same `mov` as a plain
-    /// word, and the JIT reads it at this field's offset): on the SN0 boards
+    /// word, and the JIT reads it at this field's offset): on the IP27 boards
     /// another node's processor can re-lay this window while this CPU runs.
     /// Zero when ppmem is not in use, which reads as "nothing is directly
     /// mapped" and keeps every access on the bus path.
@@ -631,6 +631,10 @@ pub struct MipsCore {
     /// bug this class of mistake already caused once in this same file.
     #[cfg(feature = "jitv2")]
     pub kill_entry_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
+    /// ci_clock: `fire_compare_if_due`, called by compiled code at a cycle
+    /// flush once `hot.cycles` has reached the Compare deadline.
+    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    pub ci_compare_fn: unsafe extern "C" fn(*mut core::ffi::c_void),
     /// Developer-only per-instruction hook, called by compiled code at the top
     /// of every instruction's block (right where the interrupt preamble runs —
     /// `codegen::emit_dev_trace_bp`), with the synthesized `pc`/`raw` and an
@@ -690,7 +694,7 @@ pub struct MipsCore {
     /// Reprogram the host FPU rounding mode, mirroring
     /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on
     /// an FCSR (reg 31) write. `rm` is the 2-bit MIPS rounding mode (FCSR
-    /// bits [1:0]). Same host-arch-free-function shape as the status hooks
+    /// bits \[1:0\]). Same host-arch-free-function shape as the status hooks
     /// above — the `core` argument is unused.
     #[cfg(feature = "jitv2")]
     pub fpu_set_mode_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
@@ -987,7 +991,7 @@ pub struct MipsCore {
     /// ticket of the currently-armed deadline. Exactly one deliverer --
     /// whichever of the CPU thread (crossing detection / late-deadline
     /// classification) or the timer callback gets there first -- wins the
-    /// compare-exchange that consumes it; the loser does nothing.
+    /// claim that consumes it (`Ip7Ticket::claim`); the loser does nothing.
     ///
     /// This is what makes IP7 delivery exactly-once per armed deadline. The
     /// hptimer's `remove()` cannot retract a callback the timer thread has
@@ -995,8 +999,10 @@ pub struct MipsCore {
     /// armed for a superseded Compare can still execute after the guest has
     /// acked -- re-raising the interrupt it just cleared, which is what
     /// breaks Linux's second `c0_compare_int_usable` verification window.
-    /// Bumping the sequence at the top of the Compare write invalidates any
-    /// such in-flight callback by construction rather than by timing.
+    /// A Compare write arms a new ticket before it clears IP7, waiting out a
+    /// claimer that is still asserting it (`Ip7Ticket::acknowledge`), which
+    /// invalidates any such in-flight callback by construction rather than
+    /// by timing.
     pub(crate) ip7_seq_shared: Arc<Ip7Ticket>,
     /// developer_ip7: Compare writes classified as a pure acknowledgement.
     #[cfg(feature = "developer_ip7")]
@@ -1102,11 +1108,11 @@ mod nutlb_defs {
     #[derive(Clone, Copy, Default)]
     #[repr(C, align(16))]
     pub struct NuTlbEntry {
-        /// VA[63:12]. Validity lives in `MipsCore::nutlb_valid`, not here, so
+        /// VA\[63:12\]. Validity lives in `MipsCore::nutlb_valid`, not here, so
         /// unlike a tagged design a zero tag is NOT self-evidently invalid —
         /// VA 0 is a legal page. Never test this without the bitmask bit.
         pub virttag: u64,
-        /// PA[63:12] in bits [63:12]; hardware C-field (2/3/5) in bits [2:0],
+        /// PA\[63:12\] in bits \[63:12\]; hardware C-field (2/3/5) in bits \[2:0\],
         /// same encoding as `NanoTlbEntry::pa_encoded`.
         pub phys: u64,
     }
@@ -1118,7 +1124,7 @@ mod nutlb_defs {
             (self.phys & !0xFFF) | (va & 0xFFF)
         }
 
-        /// Hardware C-field (2/3/5) for `TranslateResult.status` bits [2:0].
+        /// Hardware C-field (2/3/5) for `TranslateResult.status` bits \[2:0\].
         #[inline(always)]
         pub fn cache_attr_raw(&self) -> u32 {
             (self.phys & 0x7) as u32
@@ -1138,10 +1144,10 @@ pub use nutlb_defs::*;
 ///
 /// `va_tag`     — `(va & !0xFFF) | 1`: page-aligned VA with bit 0 as valid sentinel.
 ///                Zero (default) = invalid. Single compare suffices for both validity and VA match.
-/// `pa_encoded` — bits [63:12] = physical page base (PA & !0xFFF),
-///                bits  [2:0]  = hardware C-field cache attr (2=Uncached, 3=Cacheable, 5=CacheableCoherent).
+/// `pa_encoded` — bits \[63:12\] = physical page base (PA & !0xFFF),
+///                bits  \[2:0\]  = hardware C-field cache attr (2=Uncached, 3=Cacheable, 5=CacheableCoherent).
 ///
-/// C-field stored directly in bits [2:0] so cache_attr_raw() is a plain mask.
+/// C-field stored directly in bits \[2:0\] so cache_attr_raw() is a plain mask.
 /// Validity is encoded in va_tag bit 0 — no separate valid flag needed.
 #[derive(Clone, Copy, Default)]
 pub struct NanoTlbEntry {
@@ -1176,8 +1182,8 @@ impl NanoTlbEntry {
         }
     }
 
-    /// Return the hardware C-field value (2/3/5) for use in TranslateResult.status bits [2:0].
-    /// Bits [2:0] of pa_encoded ARE the C-field — no shift needed.
+    /// Return the hardware C-field value (2/3/5) for use in TranslateResult.status bits \[2:0\].
+    /// Bits \[2:0\] of pa_encoded ARE the C-field — no shift needed.
     #[inline(always)]
     pub fn cache_attr_raw(&self) -> u32 {
         (self.pa_encoded & 0x7) as u32
@@ -1271,6 +1277,10 @@ unsafe extern "C" fn jit_hooks_not_installed_fetch_verify(_ctx: *mut core::ffi::
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_step(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _bd: u32) {}
 #[cfg(feature = "jitv2_lockstep")]
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_compare(_ctx: *mut core::ffi::c_void) -> u32 { crate::cpu::mips_exec::EXEC_COMPLETE }
+#[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+unsafe extern "C" fn jit_hooks_not_installed_ci_compare(_ctx: *mut core::ffi::c_void) {
+    panic!("jitv2: ci_compare hook called before MipsExecutor::install_jit_hooks");
+}
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_fpu_set_mode(_ctx: *mut core::ffi::c_void, _rm: u32) {
     panic!("jitv2: fpu_set_mode hook called before MipsExecutor::install_jit_hooks");
@@ -1378,6 +1388,8 @@ impl MipsCore {
             interp_fallback_fn: jit_hooks_not_installed_interp_fallback,
             #[cfg(feature = "jitv2")]
             kill_entry_fn: jit_hooks_not_installed_kill_entry,
+            #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+            ci_compare_fn: jit_hooks_not_installed_ci_compare,
             #[cfg(all(feature = "jitv2", feature = "developer"))]
             dev_trace_bp_fn: jit_hooks_not_installed_dev_trace_bp,
             #[cfg(feature = "fetchverify")]
@@ -1563,13 +1575,13 @@ impl MipsCore {
         self.hot.interrupts.fetch_and(crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
     }
 
-    /// Read a GPR by index. gpr[0] is always kept at zero.
+    /// Read a GPR by index. gpr\[0\] is always kept at zero.
     #[inline(always)]
     pub fn read_gpr(&self, reg: u32) -> u64 {
         unsafe { *self.gpr.get_unchecked(reg as usize) }
     }
 
-    /// Write a GPR by index. Unconditionally re-zeros gpr[0] to avoid a branch.
+    /// Write a GPR by index. Unconditionally re-zeros gpr\[0\] to avoid a branch.
     #[inline(always)]
     pub fn write_gpr(&mut self, reg: u32, value: u64) {
         // IP28 bring-up: `IRIS_IP28_WATCHGPR=<n>` reports every write to that
@@ -1868,12 +1880,14 @@ impl MipsCore {
         self.count_hz_atomic.store(hz, Ordering::Relaxed);
     }
 
-    /// Issue a fresh IP7 delivery ticket, invalidating any previously armed
-    /// one. Called from the CPU thread at the top of a Compare write, before
-    /// IP7 is cleared, so that a timer callback racing us cannot re-assert
-    /// the interrupt the guest is in the middle of acknowledging. Waits for a
-    /// delivery that already claimed the old ticket to finish asserting IP7,
-    /// so the clear that follows removes it rather than racing it.
+    /// Issue and publish a fresh IP7 delivery ticket, invalidating any
+    /// previously armed one, on the CPU thread. Waits for a delivery that
+    /// already claimed the old ticket to finish asserting IP7. Used where no
+    /// acknowledgement goes with it (`restore_compare_deadline`); a Compare
+    /// write takes `next_ip7_ticket` and arms it through
+    /// `Ip7Ticket::acknowledge`, which clears IP7 after the wait so a timer
+    /// callback racing the write cannot re-assert the interrupt the guest is
+    /// acknowledging.
     ///
     /// Returns the new ticket, which the caller hands to whoever may deliver
     /// this deadline (the armed one-shot, and the CPU thread's own crossing
@@ -1959,6 +1973,23 @@ impl MipsCore {
                     crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
                 },
             ));
+        }
+    }
+
+    /// ci_clock: raise IP7 once `hot.cycles` has reached the Compare
+    /// deadline. A threshold, not an edge, so a caller that looks late still
+    /// delivers it, once.
+    #[cfg(feature = "ci_clock")]
+    #[inline(always)]
+    pub(crate) fn fire_compare_if_due(&mut self) {
+        if self.hot.cycles >= self.count_fire_cycle {
+            // Next architectural match is a full 32-bit Count wrap away;
+            // normally a Compare write re-arms much sooner.
+            let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
+            self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
+            self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+            crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
+            self.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2561,7 +2592,7 @@ pub fn write_fpr_w_fr1_for(core: &mut MipsCore, clears_upper: bool, reg: u32, v:
 impl MipsCore {
 
     /// Pack condition codes cc0..cc7 out of FCSR into an 8-bit FCCR-style value
-    /// (bit i = cc_i): FCSR bit 23 = cc0, bits [31:25] = cc1..cc7.
+    /// (bit i = cc_i): FCSR bit 23 = cc0, bits \[31:25\] = cc1..cc7.
     #[inline]
     fn fccr_from_fcsr(fcsr: u32) -> u32 {
         let cc0 = (fcsr >> 23) & 1;
@@ -2570,7 +2601,7 @@ impl MipsCore {
     }
 
     /// Scatter an 8-bit FCCR-style value (bit i = cc_i) back into FCSR's
-    /// condition-code bits (bit 23 = cc0, bits [31:25] = cc1..cc7).
+    /// condition-code bits (bit 23 = cc0, bits \[31:25\] = cc1..cc7).
     #[inline]
     fn fcsr_with_fccr(fcsr: u32, fccr: u32) -> u32 {
         let cc0 = fccr & 1;
@@ -2618,14 +2649,14 @@ impl MipsCore {
         }
     }
 
-    /// Get FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits [31:25].
+    /// Get FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits \[31:25\].
     #[inline]
     pub fn get_fpu_cc(&self, cc: u32) -> bool {
         let bit = if cc == 0 { 23 } else if cc < 8 { 24 + cc } else { return false; };
         (self.fpu_fcsr >> bit) & 1 != 0
     }
 
-    /// Set FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits [31:25].
+    /// Set FPU condition code bit: cc0 is FCSR bit 23, cc1..cc7 are FCSR bits \[31:25\].
     #[inline]
     pub fn set_fpu_cc(&mut self, cc: u32, value: bool) {
         if cc >= 8 { return; }

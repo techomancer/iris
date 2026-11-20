@@ -20,7 +20,7 @@ pub struct PciToPciBridge {
 }
 
 impl PciToPciBridge {
-    /// A bridge with PCI identity `vendor` and `device`, to be fitted at `at`
+    /// A bridge with PCI identity `vendor` and `device`, to be attached at `at`
     /// on `parent`, and the bus behind it. The caller attaches it with
     /// `parent.attach(at, bridge)`. Only the type 1 header is modelled, not
     /// the registers of any chip, so the identity is the machine's to name.
@@ -32,6 +32,16 @@ impl PciToPciBridge {
     pub fn with_revision(parent: &PciBus, at: DevFn, vendor: u16, device: u16, revision: u8) -> Arc<Self> {
         Arc::new(Self {
             pci: PciFunctionState::new(PciConfig::type1(vendor, device, revision)),
+            sec: PciBus::secondary(parent.clone(), at),
+        })
+    }
+
+    /// As [`Self::with_revision`], with 32-bit I/O addressing: the I/O window
+    /// takes its upper 16 bits from offsets 0x30 and 0x32 (see
+    /// [`PciConfig::type1_io32`]). The DEC 21152/21153/21154 family's window.
+    pub fn with_io32_windows(parent: &PciBus, at: DevFn, vendor: u16, device: u16, revision: u8) -> Arc<Self> {
+        Arc::new(Self {
+            pci: PciFunctionState::new(PciConfig::type1_io32(vendor, device, revision)),
             sec: PciBus::secondary(parent.clone(), at),
         })
     }
@@ -125,15 +135,24 @@ mod tests {
         rig_with(true)
     }
 
+    /// As [`rig`], with a DEC 21154 (32-bit I/O window).
+    fn rig_dec() -> Rig {
+        rig_of(|root| PciToPciBridge::with_io32_windows(root, at(3, 0), 0x1011, 0x0026, 0))
+    }
+
     fn rig_with(wide: bool) -> Rig {
+        if wide {
+            rig_of(|root| PciToPciBridge::with_wide_windows(root, at(3, 0), 0x1234, 0x5678, 0))
+        } else {
+            rig_of(|root| PciToPciBridge::new(root, at(3, 0), 0x1234, 0x5678))
+        }
+    }
+
+    fn rig_of(make: impl FnOnce(&PciBus) -> Arc<PciToPciBridge>) -> Rig {
         let host = Arc::new(TestHost::default());
         let up: Weak<dyn PciHost> = Arc::downgrade(&(host.clone() as Arc<dyn PciHost>));
         let root = PciBus::new(0, &W, up);
-        let bridge = if wide {
-            PciToPciBridge::with_wide_windows(&root, at(3, 0), 0x1234, 0x5678, 0)
-        } else {
-            PciToPciBridge::new(&root, at(3, 0), 0x1234, 0x5678)
-        };
+        let bridge = make(&root);
         root.attach(at(3, 0), bridge.clone());
         root.config_write(at(3, 0), 0x18, 4, 0x0001_0100); // primary 0, secondary 1, subordinate 1
         root.config_write(at(3, 0), 0x20, 4, 0x8000_8000);
@@ -199,6 +218,110 @@ mod tests {
             root.config_write(at(3, 0), off, 4, !0);
             assert_eq!(read(off, 4), stuck, "register {off:#x}");
         }
+    }
+
+    /// The DEC 21154's windows: I/O base and limit read 01h (32-bit I/O),
+    /// the I/O upper 16-bit registers at 0x30 and 0x32 are stored, and the
+    /// prefetchable window stays 32-bit with its upper halves reading zero.
+    /// Linux's probe (a word of 0xe0f0 to 0x1c, `pci_read_bridge_windows`)
+    /// finds the I/O window and its 32-bit type.
+    #[test]
+    fn a_dec_bridge_has_a_32_bit_io_window_and_a_32_bit_prefetchable_one() {
+        let r = rig_dec();
+        let read = |off, w| r.root.config_read(at(3, 0), off, w).unwrap();
+        r.root.reset();
+        assert_eq!((read(0x1c, 2), read(0x24, 4), read(0x28, 4), read(0x2c, 4), read(0x30, 4)), (0x0101, 0, 0, 0, 0), "reset");
+        for (off, stuck) in [(0x1c, 0xf1f1), (0x20, 0xfff0_fff0), (0x24, 0xfff0_fff0), (0x28, 0), (0x2c, 0), (0x30, !0), (0x38, 0)] {
+            r.root.config_write(at(3, 0), off, 4, !0);
+            assert_eq!(read(off, 4), stuck, "register {off:#x}");
+        }
+        r.root.config_write(at(3, 0), 0x1c, 2, 0);
+        assert_eq!(read(0x1c, 2), 0x0101, "the capability nibbles are read-only");
+        r.root.config_write(at(3, 0), 0x1c, 2, 0xe0f0);
+        assert_eq!(read(0x1c, 1) & 0x0f, 1, "PCI_IO_RANGE_TYPE_32");
+        assert_eq!(read(0x1d, 1), 0xe1);
+    }
+
+    /// IRIX 6.5.30 puts the ISP2200's I/O BAR at 0x200000 behind the DEC
+    /// bridge in the Octane's card cage. The window opens there once the
+    /// upper 16 bits are written, whatever order firmware writes the
+    /// registers in: a write to 0x30 alone republishes the bus in front.
+    #[test]
+    fn an_io_bar_above_64k_forwards_through_a_dec_bridge() {
+        let r = rig_dec();
+        let sec = r.bridge.secondary();
+        sec.attach(at(0, 0), TestCard::new([Bar::Io(0x100), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0));
+        sec.config_write(at(0, 0), 0x10, 4, 0x0020_0001);
+        sec.config_write(at(0, 0), 0x04, 2, PCI_COMMAND_IO);
+        r.root.config_write(at(3, 0), 0x04, 2, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
+        r.root.config_write(at(3, 0), 0x1c, 2, 0x0000);
+        let reaches = |addr| r.root.decode(Space::Io, addr).map(|(_, bar, off)| (bar, off));
+        assert_eq!(reaches(0x0020_0010), None, "a window at 0x0000..0x0fff");
+        r.root.config_write(at(3, 0), 0x30, 4, 0x0020_0020);
+        assert_eq!(reaches(0x0020_0010), Some((0, 0x10)), "the slow table is rebuilt at the 0x30 write");
+        r.root.config_write(at(3, 0), 0x32, 2, 0x001f);
+        assert_eq!(reaches(0x0020_0010), None, "the limit's upper half below the base's closes it");
+    }
+
+    /// A plain bridge has no upper I/O registers: the same BAR stays dark.
+    #[test]
+    fn a_16_bit_bridge_does_not_forward_io_above_64k() {
+        let r = rig();
+        let sec = r.bridge.secondary();
+        sec.attach(at(0, 0), TestCard::new([Bar::Io(0x100), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0));
+        sec.config_write(at(0, 0), 0x10, 4, 0x0020_0001);
+        sec.config_write(at(0, 0), 0x04, 2, PCI_COMMAND_IO);
+        r.root.config_write(at(3, 0), 0x04, 2, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
+        r.root.config_write(at(3, 0), 0x1c, 2, 0xf000);
+        r.root.config_write(at(3, 0), 0x30, 4, 0x0020_0020);
+        assert_eq!(r.root.config_read(at(3, 0), 0x30, 4), Some(0));
+        assert!(r.root.decode(Space::Io, 0x0020_0010).is_none());
+    }
+
+    /// ISA enable (bridge control bit 2): inside the first 64 KiB the window
+    /// forwards only the low 256 bytes of each 1 KiB block; above 64 KiB it
+    /// forwards everything. Setting and clearing the bit republishes.
+    #[test]
+    fn isa_enable_keeps_the_top_768_bytes_of_each_kilobyte_below_64k() {
+        let r = rig_dec();
+        let sec = r.bridge.secondary();
+        sec.attach(at(0, 0), TestCard::new([Bar::Io(0x100), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], 0));
+        sec.config_write(at(0, 0), 0x04, 2, PCI_COMMAND_IO);
+        r.root.config_write(at(3, 0), 0x04, 2, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
+        r.root.config_write(at(3, 0), 0x1c, 2, 0xf000); // 0x0000..0xffff, then upper halves
+        let reaches = |bar: u32, upper: u32| {
+            r.root.config_write(at(3, 0), 0x30, 4, upper);
+            sec.config_write(at(0, 0), 0x10, 4, bar | 1);
+            r.root.decode(Space::Io, bar | 0x10).is_some()
+        };
+        for isa in [false, true, false] {
+            r.root.config_write(at(3, 0), 0x3e, 2, if isa { 0x04 } else { 0 });
+            assert!(reaches(0x1000, 0), "isa {isa}: the low 256 bytes of a kilobyte");
+            assert!(reaches(0x1400, 0), "isa {isa}: and of the next one");
+            assert_eq!(reaches(0x1100, 0), !isa, "isa {isa}: bits 9:8 set");
+            assert_eq!(reaches(0x1300, 0), !isa, "isa {isa}: bits 9:8 set");
+            assert!(reaches(0x0002_1100, 0x0002_0002), "isa {isa}: above 64 KiB");
+        }
+        // The bit alone republishes: the BAR is not rewritten.
+        assert!(reaches(0x1100, 0));
+        r.root.config_write(at(3, 0), 0x3e, 2, 0x04);
+        assert!(r.root.decode(Space::Io, 0x1110).is_none());
+    }
+
+    /// A header saved before the bridge reported 32-bit I/O (its 0x1c low
+    /// nibbles 0) reads the capability again once loaded.
+    #[test]
+    fn a_dec_bridge_loads_an_old_header_with_its_io_capability() {
+        use crate::traits::Saveable;
+        let old = rig();
+        let v = {
+            let old_dec = PciToPciBridge::new(&old.root, at(6, 0), 0x1011, 0x0026);
+            old_dec.state().config().write(7, 0x0000_2010);
+            old_dec.state().config().save_state()
+        };
+        let r = rig_dec();
+        r.bridge.state().config().load_state(&v).unwrap();
+        assert_eq!(r.root.config_read(at(3, 0), 0x1c, 2), Some(0x2111));
     }
 
     #[test]

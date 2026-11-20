@@ -234,7 +234,10 @@ const SL_DTABLE: usize = 120;
 const SL_FOGLUT: usize = 152;
 const SL_FOGIK: usize = SL_FOGLUT + super::rss::FOG_LUT_WORDS;
 const SL_FOGIB: usize = SL_FOGIK + 1;
-const SLOT_WORDS: usize = 284;
+/// The texture colour tables (`Rss::tex_lut`, R, G, B), four entries a
+/// word, the first in the low byte, when TEXMODE1 enables any.
+const SL_TEXLUT: usize = 284;
+const SLOT_WORDS: usize = SL_TEXLUT + te1::TEX_LUT_LEN / 4;
 
 /// A state slot, as the kernels read it.
 #[repr(C)]
@@ -296,6 +299,11 @@ impl Slot {
             let d = &smp.detail;
             w[SL_DETAIL..SL_DETAIL + 6].copy_from_slice(&[d.on, d.page, d.log, d.shift_s, d.shift_t, d.last]);
             w[SL_DTABLE..SL_DTABLE + 32].copy_from_slice(&d.table);
+            if w[SL_TM1] & te1::TEXMODE1_LUT != 0 {
+                for (k, e) in r.tex_lut.chunks_exact(4).enumerate() {
+                    w[SL_TEXLUT + k] = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                }
+            }
         }
         if r.reg(reg::FOG_ON) != 0 {
             for n in 0..super::rss::FOG_LUT_WORDS {
@@ -426,6 +434,7 @@ const DEFINES: &[(&str, u32)] = &[
     ("SL_FOGLUT", SL_FOGLUT as u32),
     ("SL_FOGIK", SL_FOGIK as u32),
     ("SL_FOGIB", SL_FOGIB as u32),
+    ("SL_TEXLUT", SL_TEXLUT as u32),
     ("FB_W", WIDTH as u32),
     ("FB_H", HEIGHT as u32),
     ("PAGES", PAGES as u32),
@@ -450,6 +459,49 @@ const MAX_SLOTS: u32 = 1024;
 const TABLE_WORDS: usize = 1024 + 256 + 256;
 /// TRAM pages, as the dirty map counts them (`Te1::dirty`).
 const TRAM_PAGES: usize = te1::TRAM_BYTES / (te1::PAGE_NIBBLES / 2);
+
+#[derive(Clone, Copy)]
+pub(crate) enum Observation {
+    DmaRead,
+    PioRead,
+    Snapshot,
+    Display,
+    HostComposite,
+    Debug,
+    StateHash,
+    Validation,
+}
+
+impl Observation {
+    const COUNT: usize = 8;
+    const ALL: [Observation; Self::COUNT] = [
+        Self::DmaRead,
+        Self::PioRead,
+        Self::Snapshot,
+        Self::Display,
+        Self::HostComposite,
+        Self::Debug,
+        Self::StateHash,
+        Self::Validation,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::DmaRead => "dma-read",
+            Self::PioRead => "pio-read",
+            Self::Snapshot => "snapshot",
+            Self::Display => "display",
+            Self::HostComposite => "host-composite",
+            Self::Debug => "debug",
+            Self::StateHash => "state-hash",
+            Self::Validation => "validation",
+        }
+    }
+}
 
 /// A batch set's own buffers on the board's side and its group 2.
 struct RasterSet {
@@ -488,6 +540,9 @@ pub(crate) struct GpuRaster {
     pub uploaded: u64,
     pub read_back: u64,
     pub syncs: u64,
+    observations: [u64; Observation::COUNT],
+    observation_bytes: [u64; Observation::COUNT],
+    fault: Option<String>,
 }
 
 fn log2_q8_table() -> [u32; 256] {
@@ -548,6 +603,9 @@ impl GpuRaster {
             uploaded: 0,
             read_back: 0,
             syncs: 0,
+            observations: [0; Observation::COUNT],
+            observation_bytes: [0; Observation::COUNT],
+            fault: None,
         })
     }
 
@@ -708,40 +766,52 @@ impl GpuRaster {
     /// `bufs` (a transfer's read): the pages there that drawing marked are
     /// read back, after a wait; the others stay marked. Nothing waits when
     /// none is marked.
-    pub fn sync_box(&mut self, mem: &mut PixMem, bufs: &[Buffer], b: (i32, i32, i32, i32)) -> Result<(), String> {
+    pub fn sync_box(
+        &mut self,
+        mem: &mut PixMem,
+        bufs: &[Buffer],
+        b: (i32, i32, i32, i32),
+        reason: Observation,
+    ) -> Result<u64, String> {
         let mut pages = Vec::new();
         for buf in bufs {
-            let dirty = &mut self.dirty_pages;
+            let dirty = &self.dirty_pages;
             Self::buffer_pages(buf, b, |p| {
                 if dirty[p / 64] & 1 << (p % 64) != 0 {
-                    dirty[p / 64] &= !(1 << (p % 64));
                     pages.push(p);
                 }
             });
         }
+        pages.sort_unstable();
+        pages.dedup();
         if pages.is_empty() {
-            return Ok(());
+            self.observe(reason, 0);
+            return Ok(0);
         }
         self.wait()?;
         self.syncs += 1;
-        pages.sort_unstable();
         let page_bytes = (PAGE_WORDS * 8) as u64;
         let mut runs: Vec<(u64, u64)> = Vec::new();
-        for p in pages {
+        for &p in &pages {
             match runs.last_mut() {
                 Some(r) if r.0 + r.1 == p as u64 * page_bytes => r.1 += page_bytes,
                 _ => runs.push((p as u64 * page_bytes, page_bytes)),
             }
         }
-        let bytes = self.pix.read_ranges(&runs)?;
+        let read = self.pix.read_ranges(&runs);
+        let bytes = self.remember(read)?;
+        for p in pages {
+            self.dirty_pages[p / 64] &= !(1 << (p % 64));
+        }
         self.read_back += bytes.len() as u64;
+        self.observe(reason, bytes.len() as u64);
         let mut at = 0usize;
         for (off, len) in runs {
             let w0 = off as usize / 8;
             mem.words[w0..w0 + len as usize / 8].copy_from_slice(bytemuck::cast_slice(&bytes[at..at + len as usize]));
             at += len as usize;
         }
-        Ok(())
+        Ok(bytes.len() as u64)
     }
 
     /// Note the pages and clip-ID rows a record may write.
@@ -833,52 +903,62 @@ impl GpuRaster {
 
     /// Submit and wait until everything recorded is stored.
     pub fn wait(&mut self) -> Result<(), String> {
-        self.flush();
-        if let Some(sub) = self.pending.take() {
-            self.gpu.wait(Some(sub))?;
+        if let Some(error) = &self.fault {
+            return Err(error.clone());
         }
-        self.gpu.check()
+        self.flush();
+        let result = if let Some(sub) = self.pending.take() {
+            self.gpu.wait(Some(sub)).and_then(|()| self.gpu.check())
+        } else {
+            self.gpu.check()
+        };
+        self.remember(result)
     }
 
     /// Bring the CPU's mirror current: wait, then read back the pages and
     /// clip-ID rows drawing may have changed since the last sync.
-    pub fn sync(&mut self, mem: &mut PixMem, cid: &mut CidPlanes) -> Result<(), String> {
+    pub fn sync(
+        &mut self,
+        mem: &mut PixMem,
+        cid: &mut CidPlanes,
+        reason: Observation,
+    ) -> Result<u64, String> {
         let any = self.dirty_pages.iter().chain(&self.dirty_cid).any(|&w| w != 0);
         if !any && self.batch.is_empty() {
-            return Ok(());
+            self.observe(reason, 0);
+            return Ok(0);
         }
         self.wait()?;
         self.syncs += 1;
         let page_bytes = (PAGE_WORDS * 8) as u64;
+        let mut pages = Vec::new();
         let mut runs: Vec<(u64, u64)> = Vec::new();
         for i in 0..self.dirty_pages.len() {
-            let mut bits = std::mem::take(&mut self.dirty_pages[i]);
+            let mut bits = self.dirty_pages[i];
             while bits != 0 {
                 let p = (i * 64) as u64 + bits.trailing_zeros() as u64;
                 bits &= bits - 1;
+                pages.push(p as usize);
                 match runs.last_mut() {
                     Some(r) if r.0 + r.1 == p * page_bytes => r.1 += page_bytes,
                     _ => runs.push((p * page_bytes, page_bytes)),
                 }
             }
         }
-        if !runs.is_empty() {
-            let bytes = self.pix.read_ranges(&runs)?;
-            self.read_back += bytes.len() as u64;
-            let mut at = 0usize;
-            for (off, len) in runs {
-                let w0 = off as usize / 8;
-                let n = len as usize / 8;
-                mem.words[w0..w0 + n].copy_from_slice(bytemuck::cast_slice(&bytes[at..at + len as usize]));
-                at += len as usize;
-            }
-        }
+        let pixel_bytes = if runs.is_empty() {
+            Vec::new()
+        } else {
+            let read = self.pix.read_ranges(&runs);
+            self.remember(read)?
+        };
+        let mut dirty_rows = Vec::new();
         let mut rows: Vec<(u64, u64)> = Vec::new();
         for i in 0..self.dirty_cid.len() {
-            let mut bits = std::mem::take(&mut self.dirty_cid[i]);
+            let mut bits = self.dirty_cid[i];
             while bits != 0 {
                 let y = (i * 64) as u64 + bits.trailing_zeros() as u64;
                 bits &= bits - 1;
+                dirty_rows.push(y as usize);
                 let row = WIDTH as u64;
                 match rows.last_mut() {
                     Some(r) if r.0 + r.1 == y * row => r.1 += row,
@@ -886,16 +966,69 @@ impl GpuRaster {
                 }
             }
         }
-        if !rows.is_empty() {
-            let bytes = self.cid.read_ranges(&rows)?;
-            self.read_back += bytes.len() as u64;
+        let cid_bytes = if rows.is_empty() {
+            Vec::new()
+        } else {
+            let read = self.cid.read_ranges(&rows);
+            self.remember(read)?
+        };
+        for p in pages {
+            self.dirty_pages[p / 64] &= !(1 << (p % 64));
+        }
+        for y in dirty_rows {
+            self.dirty_cid[y / 64] &= !(1 << (y % 64));
+        }
+        if !runs.is_empty() {
             let mut at = 0usize;
-            for (off, len) in rows {
-                cid[off as usize..(off + len) as usize].copy_from_slice(&bytes[at..at + len as usize]);
+            for (off, len) in runs {
+                let w0 = off as usize / 8;
+                let n = len as usize / 8;
+                mem.words[w0..w0 + n].copy_from_slice(bytemuck::cast_slice(&pixel_bytes[at..at + len as usize]));
                 at += len as usize;
             }
         }
-        Ok(())
+        if !rows.is_empty() {
+            let mut at = 0usize;
+            for (off, len) in rows {
+                cid[off as usize..(off + len) as usize].copy_from_slice(&cid_bytes[at..at + len as usize]);
+                at += len as usize;
+            }
+        }
+        let bytes = (pixel_bytes.len() + cid_bytes.len()) as u64;
+        self.read_back += bytes;
+        self.observe(reason, bytes);
+        Ok(bytes)
+    }
+
+    fn remember<T>(&mut self, result: Result<T, String>) -> Result<T, String> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if self.fault.is_none() {
+                    self.fault = Some(error.clone());
+                }
+                Err(self.fault.as_ref().unwrap().clone())
+            }
+        }
+    }
+
+    fn observe(&mut self, reason: Observation, bytes: u64) {
+        self.observations[reason.index()] += 1;
+        self.observation_bytes[reason.index()] += bytes;
+    }
+
+    pub fn observation_counts(&self) -> impl Iterator<Item = (&'static str, u64, u64)> + '_ {
+        Observation::ALL.into_iter().map(|reason| {
+            (
+                reason.name(),
+                self.observations[reason.index()],
+                self.observation_bytes[reason.index()],
+            )
+        })
+    }
+
+    pub fn fault(&self) -> Option<&str> {
+        self.fault.as_deref()
     }
 
     /// Pixel memory words `range`, after a wait (tests, hashes).

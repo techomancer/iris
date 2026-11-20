@@ -1,86 +1,39 @@
-//! Bedrock's memory and directory controller: bank configuration, memory
-//! self-test, and the directory, ECC and fetch-operation views.
+//! Bedrock's memory and directory controller: bank configuration, memory self-test, and the directory and ECC views.
 //!
-//! Memory is held by [`Memory`]. Cached, uncached and DMA accesses reach the
-//! banks without this controller or its lock; the controller decodes the
-//! banks from its configuration register, which [`Memory`] reads atomically.
-//! CPU coherence requests and hardware protection enforcement are absent;
-//! protection registers retain their words. Known unsupported writes are
-//! counted and ignored, and unmapped accesses return a bus error.
-//!
-//! Plain register words, directory entries and reference counters,
-//! protection entries and written ECC check bytes live in sparse maps. The
-//! guest touches a few of the millions of possible entries, and an entry it
-//! never wrote reads as its default, so a dense table would only cost memory.
+//! Memory accesses reach the banks through the node's Physical without this controller's lock; a configuration store
+//! that moves or resizes a bank asks the chip for a remap. Register words, directory, protection and ECC check bytes
+//! live in sparse maps. CPU coherence and protection enforcement are absent; unsupported writes are counted and ignored.
 //!
 //! # What is approximated here
 //!
-//! Memory never has an error. The ECC view keeps the check byte software
-//! writes for a doubleword and reads it back while the doubleword holds the
-//! data it held then; once the data changes it reads the check byte the data
-//! computes, as the controller's own write would have stored. Directory
-//! entries are stored with the check bits the controller computes, unless
-//! the directory configuration turns that off. Nothing compares stored
-//! check bits with their data, so no access corrects a word, latches a
-//! memory or directory error or interrupts a processor: the error registers
-//! read zero and the ECC scrub window answers reads as the ECC view does and
-//! refuses writes. PROM 6.210's memory test writes and reads back ECC check
-//! bytes and directory entries this way, and in a boot of it and IRIX
-//! 6.5.30 on the Fuel nothing reads memory whose stored check bits disagree
-//! with its data.
+//! Memory never has an error. The ECC view keeps the check byte software writes and reads it back while the data is
+//! unchanged, then reads the byte the data computes; directory entries are stored with computed check bits unless the
+//! directory configuration turns that off. Nothing compares check bits with data, so no access corrects a word or latches
+//! an error, the error registers read zero and the scrub window answers reads as the ECC view and refuses writes. PROM
+//! 6.210's memory test and IRIX 6.5.30 on the Fuel never read memory whose check bits disagree with its data.
 //!
 //! Ported from hw/misc/sgi-bedrock-md.c in jamesbraid/qemu-sgi-origami.
 
-use super::mem::{Memory, RamExtent, BANK_SPAN};
-use super::Bedrock;
-use crate::cpu::smp::World;
+use super::mem::{bank_bytes, bank_of, layout_differs, Memory, RamExtent, BANK_SPAN};
+use super::{Bedrock, Effect};
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
-pub mod reg {
-    pub const CELL: u64 = 0x0;
-    pub const CONFIG: u64 = 0x8;
-    pub const ARBITRATION: u64 = 0x10;
-    pub const MIGRATION_CONFIG: u64 = 0x18;
-    /// Outgoing reply queue sizes: read-only, so a write changes nothing.
-    pub const REPLY_QUEUE_SIZE: u64 = 0x60;
-    pub const PERF_SELECT0: u64 = 0x10000;
-    pub const PERF_SELECT1: u64 = 0x10008;
-    pub const PERF_COUNTER0: u64 = 0x10010;
-    pub const PERF_COUNTER1: u64 = 0x10018;
-    pub const REFRESH: u64 = 0x20000;
-    /// Flash, UART and Synergy timing on the local "junk" bus.
-    pub const JUNK_BUS_TIMING: u64 = 0x20008;
-    pub const SELFTEST_COMMAND: u64 = 0x20030;
-    pub const SELFTEST_DATA: u64 = 0x20038;
-    pub const SELFTEST_ERROR: u64 = 0x20040;
-    pub const SELFTEST_STATUS: u64 = 0x20048;
-    pub const ISSUE_DEBUG: u64 = 0x20060;
-    pub const DIRECTORY_CONFIG: u64 = 0x40000;
-    pub const DIRECTORY_ERROR: u64 = 0x40010;
-    /// Reads the directory error record and clears it.
-    pub const DIRECTORY_ERROR_ALIAS: u64 = 0x40018;
-    pub const MIGRATION_DIFFERENCE: u64 = 0x40040;
-    pub const MIGRATION_VALUE: u64 = 0x40048;
-    /// Outgoing request queue sizes; the model keeps them fixed.
-    pub const REQUEST_QUEUE_SIZE: u64 = 0x40050;
-    pub const DIRECTORY_DEBUG: u64 = 0x40060;
-    pub const ECC_CONFIG: u64 = 0x60000;
-    pub const MEMORY_ERROR: u64 = 0x60010;
-    /// Reads the memory error record and clears it.
-    pub const MEMORY_ERROR_ALIAS: u64 = 0x60018;
-    pub const MEMORY_DEBUG: u64 = 0x60040;
+use super::regs::md as reg;
+/// Reset sizes: 12 entries in each header field and 24 in each data field.
+const REPLY_QUEUE_SIZES: u64 = reg::OUTGOING_REPLY_QUEUE_SIZE::RESET;
+/// Reset sizes: four requests for each of the three queues.
+const REQUEST_QUEUE_SIZES: u64 = reg::OUTGOING_REQUEST_QUEUE_SIZE::RESET;
 
-    /// Reset sizes: 12 entries in each header field and 24 in each data field.
-    pub const REPLY_QUEUE_SIZES: u64 = 0x0018_1818_0c0c_0c00;
-    /// Reset sizes: four requests for each of the three queues.
-    pub const REQUEST_QUEUE_SIZES: u64 = 0x0404_0400;
-}
-
-const CONFIG_MASK: u64 = 0xfbfbfbfb | (3 << 32) | (15 << 44) | (63 << 48) | (7 << 56) | (3 << 60);
+use crate::dev::widths::access_widths;
+const CONFIG_MASK: u64 = field_masks!(
+    reg::MEMORY_CONFIG; RCD_RP_CONFIG, TIMING_HIGH, TIMING_LOW, IGNORE_CPU_PROTECTION, IGNORE_IO_PROTECTION,
+    IO_PROTECTION_ENABLE, CELL_PROTECTION_ENABLE, BANK_SELECT, POS3_SIZE, POS3_WIDTH, POS3_ENABLES, POS2_SIZE,
+    POS2_WIDTH, POS2_ENABLES, POS1_SIZE, POS1_WIDTH, POS1_ENABLES, POS0_SIZE, POS0_WIDTH, POS0_ENABLES
+);
 const ECC_COLUMNS: [u8; 72] = [
     0x13, 0x23, 0x43, 0x83, 0x2f, 0xf1, 0x0d, 0x07, 0xd0, 0x70, 0x4f, 0xf8, 0x61, 0x62, 0x64, 0x68,
     0x1c, 0x2c, 0x4c, 0x8c, 0x15, 0x25, 0x45, 0x85, 0x19, 0x29, 0x49, 0x89, 0x1a, 0x2a, 0x4a, 0x8a,
@@ -122,7 +75,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            cell: u64::MAX,
+            cell: reg::CURRENT_CELL::RESET,
             config: 0,
             refresh: 0,
             directory_config: 0,
@@ -144,30 +97,22 @@ impl Default for State {
     }
 }
 
-pub(super) struct Md {
+pub(crate) struct Md {
     memory: Arc<Memory>,
     clock: crate::dev::heart::Clock,
-    // RAM uses the banks directly. The registers, the diagnostic views and
-    // fetch operations take the state lock.
+    // RAM uses the banks directly. The registers and the diagnostic views
+    // take the state lock.
     state: Mutex<State>,
-    // A bank configuration write and a reset publish their memory maps in
-    // the order they changed the register.
-    remapping: Mutex<()>,
     /// The cell register, published for the checks every register access
     /// and the board's Hub-special windows make. Written under `state`.
     cell: AtomicU64,
     unsupported: AtomicU64,
-    /// The node's processors. A bank configuration write moves memory in
-    /// every processor's cached view, which only a remap with the others
-    /// parked may do (`PpMemSpace`'s contract).
-    world: OnceLock<Arc<World>>,
 }
 #[derive(Clone, Copy)]
 pub(super) enum View {
     Registers,
     Scrub,
     Directory,
-    Fetchop,
     Ecc,
 }
 /// One of MD's diagnostic views as a bus device. Weak: Physical, which the
@@ -184,67 +129,37 @@ impl Md {
             memory: Arc::new(memory),
             clock,
             state: Mutex::new(State::default()),
-            remapping: Mutex::new(()),
             cell: AtomicU64::new(State::default().cell),
             unsupported: AtomicU64::new(0),
-            world: OnceLock::new(),
         }
     }
-    /// The processors a bank configuration write parks while it remaps.
-    pub(super) fn set_world(&self, world: Arc<World>) {
-        let _ = self.world.set(world);
-    }
-    /// Where fitted RAM can answer, for the processor bus's cached view.
-    pub(super) fn ram_extent(&self) -> RamExtent {
+    /// Where installed RAM can answer, for the processor bus's cached view.
+    pub(crate) fn ram_extent(&self) -> RamExtent {
         self.memory.extent()
     }
     pub(super) fn state_locked(&self) -> bool {
         self.state.is_locked()
     }
-    pub(super) fn remapping_locked(&self) -> bool {
-        self.remapping.is_locked()
-    }
     pub(super) fn physical(&self) -> &Arc<crate::physical::Physical> {
         self.memory.physical()
     }
-    /// The memory, for the window code that follows its configuration.
     pub(super) fn memory(&self) -> &Memory {
         &self.memory
     }
+    /// The mappings the configuration places now, for the remap.
+    pub(super) fn mappings(&self) -> Arc<[crate::physical::BankMapping]> {
+        self.memory.mappings(self.state.lock().config)
+    }
     pub(super) fn view(&self, chip: Weak<Bedrock>, view: View) -> Arc<dyn BusDevice> {
         Arc::new(MdBus { chip, view })
-    }
-    /// DMA uses the same Physical entries as the CPU, without accessing
-    /// ppmem's CPU-owned bitmap. Hardware protection remains unsupported.
-    pub(super) fn dma_view(&self) -> Arc<dyn BusDevice> {
-        Arc::new(DmaView(self.memory.clone()))
-    }
-    /// Uncached memory: the bank the configuration register places at an
-    /// address, with no lock and no allocation.
-    pub(super) fn uncached_view(&self) -> Arc<dyn BusDevice> {
-        Arc::new(UncachedView(self.memory.clone()))
-    }
-
-    /// Reinstall RAM after the board sets Physical's default. Call on the
-    /// CPU thread or with the CPU stopped, before installing board overlays.
-    /// A configuration write rebuilds its own changed mapping.
-    pub(super) fn rebuild_memory(&self) {
-        let _remapping = self.remapping.lock();
-        let config = self.state.lock().config;
-        self.memory.remap(config, true);
-    }
-    /// The stable logical-physical counters used by both compiled stores
-    /// and SysAd page claims. Their storage outlives the CPU via its bus.
-    #[cfg(feature = "jitv2")]
-    pub(super) fn generation_base(&self) -> *mut AtomicU64 {
-        self.memory.generations().base()
     }
     fn advance(s: &mut State, elapsed: u64) {
         s.clock_ns = s.clock_ns.saturating_add(elapsed);
         if s.selftest_deadline.is_some_and(|end| s.clock_ns >= end) {
             s.selftest_deadline = None;
-            s.selftest_status = if s.selftest_result { 3 } else { 2 };
-            s.selftest_error = if s.selftest_result { 0 } else { 1 << 48 };
+            let done = reg::SELF_TEST_STATUS::DONE::MASK;
+            s.selftest_status = if s.selftest_result { done | reg::SELF_TEST_STATUS::PASSED::MASK } else { done };
+            s.selftest_error = if s.selftest_result { 0 } else { reg::SELF_TEST_ERROR_ADDR::MEMORY_ERROR::MASK };
         }
     }
     fn catch_up(s: &mut State, now: u64) {
@@ -266,8 +181,8 @@ impl Md {
     /// Cell register bit 0, which gates the register window and the board's
     /// Hub-special windows. One atomic load.
     #[inline]
-    pub(super) fn cell_permits(&self) -> bool {
-        self.cell.load(Ordering::Relaxed) & 1 != 0
+    pub(crate) fn cell_permits(&self) -> bool {
+        self.cell.load(Ordering::Relaxed) & (1 << reg::CURRENT_CELL::REGION_BITS::SHIFT) != 0
     }
     /// Count and log an access the model does not implement; the caller
     /// answers a bus error.
@@ -277,91 +192,67 @@ impl Md {
             "Bedrock MD refused {what} access at {at:#x}");
         None
     }
-    /// An access through `view`.
-    pub(super) fn access(&self, view: View, addr: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
-        self.access_then(view, addr, bytes, write, || {})
-    }
-    /// An access through `view`; `after` runs once it is done and, for a bank
-    /// configuration write, while the other processors are still parked (a
-    /// machine with no `World` has none to park). No unit lock is held then,
-    /// nor `remapping`.
-    pub(super) fn access_then(&self, view: View, addr: u64, bytes: u64, write: Option<u64>, after: impl FnOnce()) -> Option<u64> {
+    /// An access through `view`, and what it changed beyond MD: a bank move asks for a
+    /// remap, self-test for its zero fill.
+    pub(super) fn access(&self, view: View, addr: u64, bytes: u64, write: Option<u64>) -> (Option<u64>, Effect) {
         if ![1, 2, 4, 8].contains(&bytes) || addr % bytes != 0 {
-            return self.refuse("access", addr);
+            return (self.refuse("access", addr), Effect::None);
         }
-        // A bank configuration write remaps memory, on the CPU thread as
-        // HEART's MEMCFG does, with the other processors parked: another
-        // processor's cache instruction changes the pages its view holds,
-        // and the remap walks every view's held pages. Parked before taking
-        // `remapping`, which a processor waiting to park could be waiting for.
-        let reconfigure = write.is_some() && matches!(view, View::Registers) && addr == reg::CONFIG;
-        match self.world.get() {
-            Some(world) if reconfigure => world.stop_others(|| {
-                let result = self.access_inner(view, addr, bytes, write, true);
-                after();
-                result
-            }),
-            _ => {
-                let result = self.access_inner(view, addr, bytes, write, reconfigure);
-                after();
-                result
-            }
-        }
-    }
-    fn access_inner(&self, view: View, addr: u64, bytes: u64, write: Option<u64>, reconfigure: bool) -> Option<u64> {
-        let remapping = reconfigure.then(|| self.remapping.lock());
         // Sample outside state: even an injected clock must not call out under
         // the lock. Only register observations need the self-test timer.
         let now = matches!(view, View::Registers).then(|| (self.clock)());
-        let (result, config) = {
-            let mut s = self.state.lock();
-            if let Some(now) = now {
-                Self::catch_up(&mut s, now);
-            }
-            let result = match view {
-                View::Registers => self.register(&mut s, addr, bytes, write),
-                View::Directory => self.directory(&mut s, addr, bytes, write),
-                View::Ecc => self.ecc(&mut s, addr, bytes, write),
-                View::Scrub if write.is_none() => self.ecc(&mut s, addr, bytes, None),
-                View::Scrub => self.refuse("scrub", addr),
-                View::Fetchop => self.fetchop(&mut s, addr, bytes, write),
-            };
-            self.cell.store(s.cell, Ordering::Relaxed);
-            (result, s.config)
-        };
-        if remapping.is_some() {
-            self.memory.remap(config, false);
+        let mut effect = Effect::None;
+        let mut s = self.state.lock();
+        if let Some(now) = now {
+            Self::catch_up(&mut s, now);
         }
-        result
+        let result = match view {
+            View::Registers => self.register(&mut s, addr, bytes, write, &mut effect),
+            View::Directory => self.directory(&mut s, addr, bytes, write),
+            View::Ecc => self.ecc(&mut s, addr, bytes, write),
+            View::Scrub if write.is_none() => self.ecc(&mut s, addr, bytes, None),
+            View::Scrub => self.refuse("scrub", addr),
+        };
+        self.cell.store(s.cell, Ordering::Relaxed);
+        (result, effect)
     }
-    fn register(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
+    fn register(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>, effect: &mut Effect) -> Option<u64> {
         if bytes != 8 {
             return self.refuse("register", at);
         }
         let old = match at {
-            reg::CELL => s.cell,
-            reg::CONFIG => s.config,
-            reg::REPLY_QUEUE_SIZE => reg::REPLY_QUEUE_SIZES,
-            reg::REFRESH => s.refresh,
-            reg::SELFTEST_ERROR => s.selftest_error,
-            reg::SELFTEST_STATUS => s.selftest_status,
-            reg::DIRECTORY_CONFIG => s.directory_config,
-            reg::ECC_CONFIG => s.ecc_config,
-            reg::REQUEST_QUEUE_SIZE => reg::REQUEST_QUEUE_SIZES,
+            reg::CURRENT_CELL::OFFSET => s.cell,
+            reg::MEMORY_CONFIG::OFFSET => s.config,
+            reg::OUTGOING_REPLY_QUEUE_SIZE::OFFSET => REPLY_QUEUE_SIZES,
+            reg::REFRESH_CONTROL::OFFSET => s.refresh,
+            reg::SELF_TEST_ERROR_ADDR::OFFSET => s.selftest_error,
+            reg::SELF_TEST_STATUS::OFFSET => s.selftest_status,
+            reg::DIR_CONFIG::OFFSET => s.directory_config,
+            reg::MB_ECC_CONFIG::OFFSET => s.ecc_config,
+            reg::OUTGOING_REQUEST_QUEUE_SIZE::OFFSET => REQUEST_QUEUE_SIZES,
             // No error is ever latched: see the module notes.
-            reg::MEMORY_ERROR | reg::MEMORY_ERROR_ALIAS | reg::DIRECTORY_ERROR | reg::DIRECTORY_ERROR_ALIAS => 0,
+            reg::MEM_ERROR::OFFSET | reg::MEM_ERROR_CLR::OFFSET | reg::DIR_ERROR::OFFSET | reg::DIR_ERROR_CLR::OFFSET => 0,
             _ if storage_mask(at).is_some() => *s.storage.get(&at).unwrap_or(&0),
             _ if idle(at) => 0,
             _ => return self.refuse("register", at),
         };
         if let Some(value) = write {
             match at {
-                reg::SELFTEST_COMMAND => return self.selftest(s, value),
-                reg::CELL => s.cell = value,
-                reg::CONFIG => s.config = value & CONFIG_MASK,
-                reg::REFRESH => s.refresh = value & ((1 << 63) | 0xfff),
-                reg::DIRECTORY_CONFIG => s.directory_config = value & 3,
-                reg::ECC_CONFIG => s.ecc_config = value & 1,
+                reg::SELF_TEST_CONTROL::OFFSET => return self.selftest(s, value, effect),
+                reg::CURRENT_CELL::OFFSET => s.cell = value,
+                reg::MEMORY_CONFIG::OFFSET => {
+                    let old = std::mem::replace(&mut s.config, value & CONFIG_MASK);
+                    if layout_differs(old, s.config) {
+                        *effect = Effect::Remap;
+                    }
+                }
+                reg::REFRESH_CONTROL::OFFSET => {
+                    s.refresh = value & (reg::REFRESH_CONTROL::ENABLE::MASK | reg::REFRESH_CONTROL::THRESHOLD::MASK)
+                }
+                reg::DIR_CONFIG::OFFSET => {
+                    s.directory_config = value & field_masks!(reg::DIR_CONFIG; IGNORE_DIR_ECC, PREMIUM)
+                }
+                reg::MB_ECC_CONFIG::OFFSET => s.ecc_config = value & reg::MB_ECC_CONFIG::IGNORE_DATA_ECC::MASK,
                 _ if storage_mask(at).is_some() => {
                     s.storage.insert(at, value & storage_mask(at).unwrap());
                 }
@@ -379,14 +270,14 @@ impl Md {
             return self.refuse("directory", at);
         }
         let software = at / (BANK_SPAN / 8);
-        let bank = software ^ ((s.config >> 32) & 3);
-        if at & 0x7c8 == 0x408 {
-            let fitted = self.memory.fitted(bank);
-            if fitted == 0 {
+        let bank = bank_of(s.config, software);
+        if at & 0x7c8 == reg::PROTECTION_ENTRY_OFFSET {
+            let installed = self.memory.installed(bank);
+            if installed == 0 {
                 return Some(0);
             }
             let within =
-                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % fitted;
+                ((((at % (BANK_SPAN / 8)) >> 11) << 14) | (((at >> 4) & 3) << 7)) % installed;
             let key = ((self.memory.dense_base(bank) + within) >> 14) * 4 + ((within >> 7) & 3);
             let old = *s.protection.get(&key).unwrap_or(&0);
             if let Some(v) = write {
@@ -395,12 +286,7 @@ impl Md {
             return Some(old);
         }
         let within = ((at % (BANK_SPAN / 8)) & !15) * 8;
-        let field = s.config >> (bank / 2 * 8);
-        let code = (field >> 4) & 15;
-        if field & (1 << (bank & 1)) == 0
-            || !(1..=5).contains(&code)
-            || within >= (32 << 20) << code
-        {
+        if within >= bank_bytes(s.config, bank) {
             return self.refuse("directory", at);
         }
         let mask = if at & 8 != 0 || s.directory_config & 1 != 0 {
@@ -410,8 +296,8 @@ impl Md {
         };
         let table;
         let key;
-        let fitted = self.memory.fitted(bank);
-        if within >= fitted {
+        let installed = self.memory.installed(bank);
+        if within >= installed {
             if !s.compat.contains_key(&at) && s.compat.len() >= 74 {
                 return self.refuse("directory", at);
             }
@@ -437,80 +323,34 @@ impl Md {
         }
         Some(old)
     }
-    /// A read or write of `bytes` at node address `address` in the bank the
-    /// configuration places there, for the fetch operations.
-    fn ram(&self, s: &State, address: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
-        let Some((bank, offset)) = self.memory.decode(s.config, address, bytes) else {
-            return self.refuse("ram", address);
-        };
-        let at = offset & !7;
-        let shift = (8 - (offset & 7) - bytes) * 8;
-        let mask = u64::MAX >> ((8 - bytes) * 8);
-        let old = self.memory.raw_read(bank, at);
-        if let Some(value) = write {
-            self.memory.raw_write(bank, at, (old & !(mask << shift)) | ((value & mask) << shift));
-            Some(0)
-        } else {
-            Some((old >> shift) & mask)
-        }
-    }
-    fn fetchop(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>) -> Option<u64> {
-        if bytes != 4 && bytes != 8 {
-            return self.refuse("fetchop", at);
-        }
-        let op = at & 0x38;
-        if op > if write.is_some() { 32 } else { 24 } {
-            return self.refuse("fetchop", at);
-        }
-        let address = (at & !63) | (at & 4);
-        let old = self.ram(s, address, bytes, None)?;
-        let next = match (write, op) {
-            (None, 0) => return Some(old),
-            (Some(v), 0) => v,
-            (_, 8) => old.wrapping_add(1),
-            (_, 16) => old.wrapping_sub(1),
-            (None, 24) => 0,
-            (Some(v), 24) => old & v,
-            (Some(v), 32) => old | v,
-            _ => return self.refuse("fetchop", at),
-        };
-        self.ram(s, address, bytes, Some(next))?;
-        Some(old)
-    }
-    // Approximation: report whether the selected fitting covers the
-    // programmed bank, after 1000 guest ns. Only the zero write phase mutates
-    // memory; other patterns have no published transformation here.
-    fn selftest(&self, s: &mut State, command: u64) -> Option<u64> {
-        if command == 2 || command == 4 {
+    // Approximation: report whether the selected installed memory covers the programmed bank, after 1000
+    // guest ns. Only the zero write phase mutates memory.
+    fn selftest(&self, s: &mut State, command: u64, effect: &mut Effect) -> Option<u64> {
+        use reg::SELF_TEST_CONTROL as ctl;
+        if command == ctl::STOP::MASK || command == ctl::RESET::MASK {
             s.selftest_deadline = None;
             s.selftest_status = 0;
             s.selftest_error = 0;
             return Some(0);
         }
-        if command & 7 != 1 || command & !0x71 != 0 {
+        let selection = field_masks!(reg::SELF_TEST_CONTROL; BANK, DIMM);
+        if command & field_masks!(reg::SELF_TEST_CONTROL; START, STOP, RESET) != ctl::START::MASK
+            || command & !(ctl::START::MASK | selection) != 0
+        {
             self.unsupported.fetch_add(1, Ordering::Relaxed);
             crate::dlog!(crate::devlog::LogModule::Bedrock,
                 "Bedrock MD ignored self-test command {command:#x}");
             return Some(0);
         }
-        let selected = (command >> 4) & 7;
-        let configured = selected ^ ((s.config >> 32) & 3);
-        let field = s.config >> ((configured / 2) * 8);
-        let code = (field >> 4) & 15;
-        let size = if (1..=5).contains(&code) {
-            (32 << 20) << code
-        } else {
-            0
-        };
-        let fits = field & (1 << (configured & 1)) != 0
-            && size != 0
-            && size <= self.memory.fitted(selected);
-        s.selftest_result = fits;
+        let selected = (command & selection) >> ctl::BANK::SHIFT;
+        let size = bank_bytes(s.config, bank_of(s.config, selected));
+        let covered = size != 0 && size <= self.memory.installed(selected);
+        s.selftest_result = covered;
         s.selftest_status = 0;
         s.selftest_error = 0;
         s.selftest_deadline = Some(s.clock_ns.saturating_add(1000));
-        if fits && s.storage.get(&reg::SELFTEST_DATA).copied().unwrap_or(0) == 0x80 {
-            self.memory.zero(selected as usize, size);
+        if covered && s.storage.get(&reg::SELF_TEST_DATA::OFFSET).copied().unwrap_or(0) == reg::SELF_TEST_DATA::WRITE_CONTROL::MASK {
+            *effect = Effect::Zero(selected as usize, size);
             // The zero fill writes every doubleword's data and check bits.
             let start = self.memory.dense_base(selected) / 8;
             s.ecc.retain(|&key, _| key < start || key >= start + size / 8);
@@ -556,269 +396,102 @@ impl Md {
     }
 }
 impl Resettable for Md {
+    /// The chip's reset remaps once every unit is back.
     fn power_on(&self) {
-        // Reset is called on the CPU thread or with it stopped.
-        let _remapping = self.remapping.lock();
         let mut s = self.state.lock();
         *s = State::default();
         self.cell.store(s.cell, Ordering::Relaxed);
-        drop(s);
-        self.memory.remap(0, false);
-    }
-}
-/// Resolve each DMA access through the atomic Physical table, as HEART
-/// does. Do not ask Physical for mem_ptr or gen_ptr: those read the inline
-/// CPU bitmap. A block goes to its bank in one call per run (see
-/// [`DmaView::blocks`]); `physical::read_bytes` and `write_bytes` hand it
-/// over a page at a time.
-struct DmaView(Arc<Memory>);
-impl DmaView {
-    fn at(&self, address: u64, bytes: u64) -> Option<&dyn BusDevice> {
-        self.0.decode(self.0.config(), address, bytes)?;
-        self.entry(address)
-    }
-    fn entry(&self, address: u64) -> Option<&dyn BusDevice> {
-        let phys = self.0.physical();
-        let entry = phys.entry_at(address);
-        if crate::ppmem::devmap::entry_eq(entry, phys.default_entry()) {
-            return None;
-        }
-        // SAFETY: the memory this view holds retains Physical, which keeps
-        // every entry alive across remaps.
-        Some(unsafe { &*entry })
-    }
-    /// Walk `words` doublewords from `address`: one decode and one table
-    /// lookup per run of fitted memory, and the stretch inside the run goes
-    /// to its bank in a single call. The split is where the run ends, at
-    /// the bank's limit or its 1 GiB slot; the first non-OK status ends the
-    /// walk and is returned, with what came before it already moved. `f`
-    /// gets the bank, the address and the word range.
-    fn blocks(&self, address: u64, words: usize, mut f: impl FnMut(&dyn BusDevice, u64, std::ops::Range<usize>) -> u32) -> u32 {
-        let mut done = 0usize;
-        while done < words {
-            let at = address.wrapping_add(8 * done as u64);
-            let Some((_, _, left)) = self.0.run(self.0.config(), at) else { return BUS_ERR };
-            let Some(bank) = self.entry(at) else { return BUS_ERR };
-            let n = ((left / 8).max(1) as usize).min(words - done);
-            let status = f(bank, at, done..done + n);
-            if status != BUS_OK {
-                return status;
-            }
-            done += n;
-        }
-        BUS_OK
-    }
-}
-macro_rules! dma_rw {
-    ($read:ident, $write:ident, $result:ident, $ty:ty) => {
-        fn $read(&self, address: u64) -> $result {
-            self.at(address, std::mem::size_of::<$ty>() as u64)
-                .map_or($result::err(), |device| device.$read(address))
-        }
-        fn $write(&self, address: u64, value: $ty) -> u32 {
-            self.at(address, std::mem::size_of::<$ty>() as u64)
-                .map_or(BUS_ERR, |device| {
-                    let result = device.$write(address, value);
-                    if result == BUS_OK { self.0.written(address); }
-                    result
-                })
-        }
-    };
-}
-impl BusDevice for DmaView {
-    dma_rw!(read8, write8, BusRead8, u8);
-    dma_rw!(read16, write16, BusRead16, u16);
-    dma_rw!(read32, write32, BusRead32, u32);
-    dma_rw!(read64, write64, BusRead64, u64);
-    fn cas32(&self, address: u64, old: u32, new: u32) -> Option<bool> {
-        let swapped = self.at(address, 4)?.cas32(address, old, new)?;
-        if swapped { self.0.written(address); }
-        Some(swapped)
-    }
-    fn cas64(&self, address: u64, old: u64, new: u64) -> Option<bool> {
-        let swapped = self.at(address, 8)?.cas64(address, old, new)?;
-        if swapped { self.0.written(address); }
-        Some(swapped)
-    }
-    fn read_block(&self, address: u64, buf: &mut [u64]) -> u32 {
-        self.blocks(address, buf.len(), |bank, at, range| bank.read_block(at, &mut buf[range]))
-    }
-    fn write_block(&self, address: u64, buf: &[u64]) -> u32 {
-        self.blocks(address, buf.len(), |bank, at, range| {
-            let status = bank.write_block(at, &buf[range.clone()]);
-            if status == BUS_OK { self.0.written_block(at, 8 * range.len() as u64); }
-            status
-        })
-    }
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        self.0.gen_ptr(address)
     }
 }
 
-/// Uncached memory, as the processor's uncached memory space and the low
-/// 256 MiB of its Hub-special space reach it: the bank the configuration
-/// register places at the address, read and written directly. An address
-/// no enabled bank holds answers a bus error. No lock and no allocation.
-struct UncachedView(Arc<Memory>);
-macro_rules! uncached_rw {
-    ($read:ident, $write:ident, $result:ident, $ty:ty) => {
-        fn $read(&self, address: u64) -> $result {
-            match self.0.decode(self.0.config(), address, std::mem::size_of::<$ty>() as u64) {
-                Some((bank, offset)) => self.0.physical().banks()[bank].$read(offset),
-                None => $result::err(),
-            }
+impl MdBus {
+    fn access(&self, a: u64, size: usize, value: Option<u64>) -> BusRead64 {
+        match self.chip.upgrade().and_then(|chip| chip.md.access(self.view, a, size as u64, value).0) {
+            Some(data) => BusRead64::ok(data),
+            None => BusRead64::err(),
         }
-        fn $write(&self, address: u64, value: $ty) -> u32 {
-            match self.0.decode(self.0.config(), address, std::mem::size_of::<$ty>() as u64) {
-                Some((bank, offset)) => {
-                    let result = self.0.physical().banks()[bank].$write(offset, value);
-                    if result == BUS_OK { self.0.written(address); }
-                    result
-                }
-                None => BUS_ERR,
-            }
-        }
-    };
-}
-impl BusDevice for UncachedView {
-    uncached_rw!(read8, write8, BusRead8, u8);
-    uncached_rw!(read16, write16, BusRead16, u16);
-    uncached_rw!(read32, write32, BusRead32, u32);
-    uncached_rw!(read64, write64, BusRead64, u64);
-    #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
-        self.0.gen_ptr(address)
     }
 }
-
 impl BusDevice for MdBus {
-    /// Bedrock's ECC view is the one device that sees the whole source register
-    /// of an uncached SH (`BusDevice::write_narrow_from`); every other view
-    /// takes the architectural low bits.
+    /// Bedrock's ECC view alone sees the whole source register of an uncached SH; other views take
+    /// the low bits.
     fn write_narrow_from(&self, addr: u64, size: usize, gpr: u64) -> u32 {
         if size == 2 && matches!(self.view, View::Ecc) {
-            // PROM 6.210's memory test stores each check word with `sh` from a
-            // register whose low 16 bits are zero: the word sits elsewhere in
-            // the register, by the address of the memory it checks. Observed
-            // (memory address mod 0x40, carrier offset mod 8, register bits):
-            //   0x00  6  15:0
-            //   0x10  4  63:48
-            //   0x20  2  47:32
-            //   0x30  0  31:16
-            // The shift below gives exactly these four. Which lanes the R14000
-            // drives for a narrow store, and how Bedrock wires them to the
-            // check bits, is unknown; this matches the PROM, not a hardware
-            // description.
+            // PROM 6.210's memory test stores each check word with `sh` from a register whose low
+            // 16 bits are zero; the shift below matches its four observed lanes, not a known
+            // hardware wiring (unknown for the R14000).
             let memory_address = (addr ^ 6).wrapping_mul(8);
             return self.write16(addr, (gpr >> (memory_address.wrapping_neg() & 63)) as u16);
         }
         if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
     }
 
-    fn read8(&self, a: u64) -> BusRead8 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 1, None))
-            .map_or(BusRead8::err(), |v| BusRead8::ok(v as u8))
-    }
-    fn read16(&self, a: u64) -> BusRead16 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 2, None))
-            .map_or(BusRead16::err(), |v| BusRead16::ok(v as u16))
-    }
-    fn read32(&self, a: u64) -> BusRead32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 4, None))
-            .map_or(BusRead32::err(), |v| BusRead32::ok(v as u32))
-    }
-    fn read64(&self, a: u64) -> BusRead64 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 8, None))
-            .map_or(BusRead64::err(), BusRead64::ok)
-    }
-    fn write8(&self, a: u64, v: u8) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 1, Some(v as u64)))
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
-    fn write16(&self, a: u64, v: u16) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 2, Some(v as u64)))
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
-    fn write32(&self, a: u64, v: u32) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 4, Some(v as u64)))
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
-    fn write64(&self, a: u64, v: u64) -> u32 {
-        self.chip
-            .upgrade()
-            .and_then(|chip| chip.md.access(self.view, a, 8, Some(v)))
-            .map_or(BUS_ERR, |_| BUS_OK)
-    }
+    access_widths!();
 }
 fn storage_mask(at: u64) -> Option<u64> {
     Some(match at {
-        reg::ARBITRATION => 0xff,
-        reg::MIGRATION_CONFIG => 0x3ff | (0xff << 16) | (1 << 32),
-        reg::PERF_SELECT0 | reg::PERF_SELECT1 => {
-            3 | (15 << 4) | (127 << 8) | (15 << 16) | (0xffffffffff << 20) | (1 << 63)
+        reg::ARBITRATION_CONTROL::OFFSET => field_masks!(reg::ARBITRATION_CONTROL; WRITE_GUARANTEE, REPLY_GUARANTEE),
+        reg::MIGRATION_CONFIG::OFFSET => field_masks!(reg::MIGRATION_CONFIG; ENABLE, NODE_MASK, INTERVAL),
+        reg::PERF_SELECT0::OFFSET => field_masks!(reg::PERF_SELECT0; INTERRUPT, COMMAND, CHANNEL, SOURCE, ACTIVITY, MODE),
+        reg::PERF_SELECT1::OFFSET => field_masks!(reg::PERF_SELECT1; INTERRUPT, COMMAND, CHANNEL, SOURCE, ACTIVITY, MODE),
+        reg::PERF_COUNTER0::OFFSET => reg::PERF_COUNTER0::COUNT::MASK,
+        reg::PERF_COUNTER1::OFFSET => reg::PERF_COUNTER1::COUNT::MASK,
+        reg::JUNK_BUS_TIMING::OFFSET => field_masks!(
+            reg::JUNK_BUS_TIMING; SYNERGY_ENABLE, SYNERGY_SETUP_HOLD, UART_ENABLE, UART_SETUP_HOLD, FLASH_ENABLE,
+            FLASH_SETUP_HOLD
+        ),
+        reg::SELF_TEST_DATA::OFFSET => field_masks!(
+            reg::SELF_TEST_DATA; WRITE_CONTROL, CYCLE_CONTROL, BYTE_CONTROL, NIBBLE_CONTROL, INITIAL_PATTERN
+        ),
+        reg::ISSUE_DEBUG_SELECT::OFFSET => reg::ISSUE_DEBUG_SELECT::SELECTION::MASK,
+        reg::MIG_DIFF_THRESH::OFFSET => {
+            field_masks!(reg::MIG_DIFF_THRESH; VALID, SATURATION_ACTION, THRESHOLD_ACTION, THRESHOLD)
         }
-        reg::PERF_COUNTER0 | reg::PERF_COUNTER1 => (1 << 41) - 1,
-        reg::JUNK_BUS_TIMING => 0xffffffffffff,
-        reg::SELFTEST_DATA => 0xff,
-        reg::ISSUE_DEBUG => 3,
-        reg::MIGRATION_DIFFERENCE => 0x7fff | (7 << 32) | (7 << 35) | (1 << 63),
-        reg::MIGRATION_VALUE => 0x7fff | (7 << 32) | (7 << 35) | (3 << 62),
-        reg::DIRECTORY_DEBUG => 3,
-        reg::MEMORY_DEBUG => 1,
+        reg::MIG_VALUE_THRESH::OFFSET => field_masks!(
+            reg::MIG_VALUE_THRESH; VALID, LOCAL_INTERRUPT_ENABLE, SATURATION_ACTION, THRESHOLD_ACTION, THRESHOLD
+        ),
+        reg::DIR_DEBUG_SELECT::OFFSET => reg::DIR_DEBUG_SELECT::SELECTION::MASK,
+        reg::MEM_DEBUG_SELECT::OFFSET => reg::MEM_DEBUG_SELECT::SELECTION::MASK,
         _ => return None,
     })
 }
 fn idle(at: u64) -> bool {
     matches!(
         at,
-        0x20 | 0x28
-            | 0x40
-            | 0x48
-            | 0x58
-            | 0x20010
-            | 0x20018
-            | 0x20020
-            | 0x20028
-            | 0x20030
-            | 0x20040
-            | 0x20048
-            | 0x40020
-            | 0x40028
-            | 0x40030
-            | 0x40038
-            | 0x40058
-            | 0x60020
-            | 0x60028
-            | 0x60030
-            | 0x60038
+        reg::FETCHOP_CACHE_STATUS0::OFFSET
+            | reg::FETCHOP_CACHE_STATUS1::OFFSET
+            | reg::MISC_ERROR0::OFFSET
+            | reg::MISC_ERROR1::OFFSET
+            | reg::MISC_ERROR1_CLR::OFFSET
+            | reg::LED0::OFFSET
+            | reg::LED1::OFFSET
+            | reg::LED2::OFFSET
+            | reg::LED3::OFFSET
+            | reg::SELF_TEST_CONTROL::OFFSET
+            | reg::SELF_TEST_ERROR_ADDR::OFFSET
+            | reg::SELF_TEST_STATUS::OFFSET
+            | reg::PROTOCOL_ERROR::OFFSET
+            | reg::PROTOCOL_ERROR_CLR::OFFSET
+            | reg::MIG_CANDIDATE::OFFSET
+            | reg::MIG_CANDIDATE_CLR::OFFSET
+            | reg::SELFTEST_DIR_ERROR_DATA::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA0::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA1::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA2::OFFSET
+            | reg::SELFTEST_MEM_ERROR_DATA3::OFFSET
     )
 }
 
 #[cfg(test)]
 mod tests {
-    // Cases follow tests/qtest/sn1-bedrock-md-test.c in
-    // jamesbraid/qemu-sgi-origami: memory-banks, reset, queue-sizes,
-    // writable-masks, selftest-phases, fetchop-operations, ecc-carrier and
+    // Cases follow tests/qtest/sn1-bedrock-md-test.c in jamesbraid/qemu-sgi-origami: memory-banks,
+    // reset, queue-sizes, writable-masks, selftest-phases, fetchop-operations, ecc-carrier and
     // directory-storage.
     use super::*;
     use super::super::BedrockConfig;
 
-    /// The controller inside a chip of its own, with the views MD hands out.
+    /// The controller inside a chip of its own, with the views the node hands
+    /// out.
     struct TestMd(Arc<Bedrock>);
     impl std::ops::Deref for TestMd {
         type Target = Md;
@@ -831,46 +504,55 @@ mod tests {
             Self::with_clock(banks, Arc::new(|| 0))
         }
         fn with_clock(banks: &[u32], clock: crate::dev::heart::Clock) -> Result<Arc<Self>, String> {
+            Self::with_world(banks, clock, Arc::new(crate::cpu::smp::World::new()))
+        }
+        /// A chip whose remap parks the processors of `world`.
+        fn with_world(banks: &[u32], clock: crate::dev::heart::Clock, world: Arc<crate::cpu::smp::World>) -> Result<Arc<Self>, String> {
             let chip = Bedrock::new(BedrockConfig { banks_mib: banks, ..super::super::test_config(clock) })?;
+            chip.decode.set_world(world);
             Ok(Arc::new(Self(chip)))
         }
+        /// MD's registers, through the chip's register window, which acts on
+        /// what a store changes.
         fn md_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.md.view(Arc::downgrade(&self.0), View::Registers)
+            struct Md(Arc<dyn BusDevice>);
+            impl BusDevice for Md {
+                fn read64(&self, a: u64) -> BusRead64 {
+                    self.0.read64(super::super::regs::md::BASE + a)
+                }
+                fn write64(&self, a: u64, v: u64) -> u32 {
+                    self.0.write64(super::super::regs::md::BASE + a, v)
+                }
+            }
+            Arc::new(Md(self.0.registers()))
         }
+        /// Uncached memory: the node's Physical.
         fn uncached_view(&self) -> Arc<dyn BusDevice> {
-            self.0.uncached_view()
-        }
-        fn directory_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.directory_bus()
-        }
-        fn ecc_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.ecc_bus()
-        }
-        fn ecc_scrub_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.ecc_scrub_bus()
+            self.0.decode.physical().clone()
         }
         fn fetchop_bus(&self) -> Arc<dyn BusDevice> {
-            self.0.fetchop_bus()
+            Arc::new(crate::sn::FetchOp(self.0.decode.physical().clone()))
         }
+        /// Memory by number, as inbound DMA reaches it.
         fn dma_view(&self) -> Arc<dyn BusDevice> {
-            self.0.dma_view()
+            self.0.decode.clone()
         }
         /// Whether each PI has bank 1 bit 61 (a correctable memory error)
         /// or error-summary bit 24 (an uncorrectable one) set.
         fn reported(&self) -> [(bool, bool); 2] {
             let regs = self.0.registers();
             std::array::from_fn(|n| {
-                let base = n as u64 * super::super::reg::PI1_BASE;
-                let pending = regs.read64(base + super::super::reg::pi::PENDING_STATUS_B).data;
-                let summary = regs.read64(base + super::super::reg::pi::ERROR_SUMMARY).data;
+                let base = n as u64 * super::super::regs::PI1_BASE;
+                let pending = regs.read64(base + super::super::regs::pi::INT_PEND1::OFFSET).data;
+                let summary = regs.read64(base + super::super::regs::pi::ERR_INT_PEND::OFFSET).data;
                 (pending & (1 << 61) != 0, summary & (1 << 24) != 0)
             })
         }
     }
     impl Md {
-        /// Hold both locks, for tests of the paths that must not take them.
+        /// Hold the lock, for tests of the paths that must not take it.
         pub(in crate::dev::bedrock) fn hold(&self) -> impl Sized + '_ {
-            (self.remapping.lock(), self.state.lock())
+            self.state.lock()
         }
         /// Explicit elapsed time, for tests that drive the self-test by hand.
         fn advance_ns(&self, elapsed: u64) {
@@ -881,7 +563,7 @@ mod tests {
         }
     }
     const FUEL_BANKS: [u32; 2] = [256, 256];
-    const FITTED_BANK: u64 = 256 << 20;
+    const INSTALLED_BANK: u64 = 256 << 20;
     fn fuel() -> Arc<TestMd> {
         TestMd::new(&FUEL_BANKS).unwrap()
     }
@@ -896,13 +578,12 @@ mod tests {
     const TEZRO_CONFIG: u64 = 0x53 | (0x43 << 8) | (0x43 << 16);
     fn tezro() -> Arc<TestMd> {
         let md = TestMd::new(&TEZRO_BANKS).unwrap();
-        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG), BUS_OK);
+        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG), BUS_OK);
         md
     }
 
-    /// Cached, uncached and DMA memory take no MD lock: each works while
-    /// both are held. An address no enabled bank holds answers a bus error
-    /// on each.
+    /// Cached, uncached and DMA memory take no MD lock; an address no enabled bank holds is a bus
+    /// error.
     #[test]
     fn cached_uncached_and_dma_memory_do_not_take_the_md_locks() {
         let md = configured();
@@ -920,74 +601,46 @@ mod tests {
         assert_eq!(md.physical().read64(0x1000).data, 0x99227766abcdef01);
         assert_eq!(uncached.read64(BANK_SPAN + 0x1000).data, 0);
         for view in [&dma, &uncached] {
-            assert_eq!(view.read64(FITTED_BANK).status, BUS_ERR);
+            assert_eq!(view.read64(INSTALLED_BANK).status, BUS_ERR);
             assert_eq!(view.write64(2 * BANK_SPAN, 1), BUS_ERR);
         }
     }
 
-    /// Guest code must not keep a compiled page after its backing bank changes.
-    /// page_for deliberately retains its generation pointer. A remap must
-    /// invalidate that page and subsequent writes to its new bank must keep
-    /// invalidating the same pointer, including after swapping back.
+    /// A configuration store that moves a bank flushes every processor's compiled code;
+    /// one that moves nothing does not. Self-test's zero fill counts in the bank's page counters.
     #[cfg(feature = "jitv2")]
     #[test]
-    fn a_claimed_jit_page_tracks_physical_ownership_across_bank_swaps() {
-        use crate::cpu::jitv2::jitv2::Jitv2;
-        let md = configured();
-        let dma = md.dma_view();
-        let mut jit = Jitv2::new(4);
-        let slot = jit.page_for(0, 0, dma.as_ref(), false).unwrap();
-        let page = jit.page_ptr(slot);
-        let generation = || unsafe { (*page).current_gen() };
-        let pointer = dma.gen_ptr(0);
-        let mut entries = [0u64; crate::cpu::jitv2::jitv2::BITMAP_WORDS];
-        entries[0] = 1;
-        // Exercise the JIT publication/invalidation protocol without
-        // executing a synthetic function body.
-        let code = std::ptr::NonNull::<()>::dangling().as_ptr() as *const ();
-        assert!(unsafe { (*page).publish(&entries, code, generation(), 1, 0, false) });
-        assert!(unsafe { (*page).is_runnable(0) });
-        let first = generation();
-        md.md_bus().write64(reg::CONFIG, 0x33 | (1 << 32));
-        assert_eq!(jit.page_for(0, 0, dma.as_ref(), false), Some(slot));
-        assert_eq!(dma.gen_ptr(0), pointer);
-        assert!(generation() > first);
-        assert!(!unsafe { (*page).is_runnable(0) });
-        let swapped = generation();
-        assert!(unsafe { (*page).publish(&entries, code, swapped, 1, 0, false) });
-        assert!(unsafe { (*page).is_runnable(0) });
-        assert_eq!(dma.write64(0, 0x11223344), BUS_OK);
-        assert!(generation() > swapped);
-        assert!(!unsafe { (*page).is_runnable(0) }, "code published after a swap sees new-bank writes");
-        assert_eq!(md.physical().banks()[1].read64(0).data, 0x11223344);
-        let written = generation();
-        md.md_bus().write64(reg::CONFIG, 0x33);
-        assert!(generation() > written, "swapping back cannot lower the logical generation");
-        let restored = generation();
-        md.uncached_view().write64(0, 0x55667788);
-        assert!(generation() > restored);
-        let before_fetchop = generation();
-        md.fetchop_bus().write64(0, 0);
-        assert!(generation() > before_fetchop);
-        md.md_bus().write64(reg::CONFIG, 0x13);
+    fn a_store_that_moves_banks_asks_for_a_flush() {
+        use crate::cpu::smp::{ParkSlot, World, REQUEST_JIT_REMAP};
+        let word = AtomicU64::new(0);
+        let processor = Arc::new(ParkSlot::new(0, &word));
+        let world = Arc::new(World::new());
+        world.set_slots(vec![processor.clone()]);
+        let md = TestMd::with_world(&FUEL_BANKS, Arc::new(|| 0), world).unwrap();
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33);
+        assert!(processor.release(REQUEST_JIT_REMAP), "mapping the banks asks for a flush");
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
+        assert!(processor.release(REQUEST_JIT_REMAP), "the swap asks for a flush");
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
+        assert!(!processor.release(REQUEST_JIT_REMAP), "a write that moves nothing does not");
+        let counter = || unsafe { (*md.physical().banks()[0].gen_ptr(0)).load(Ordering::Relaxed) };
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x13);
         md.md_bus().write64(0x20038, 0x80);
-        let before_zero = generation();
-        md.md_bus().write64(reg::SELFTEST_COMMAND, 1);
-        assert!(generation() > before_zero, "zero self-test invalidates logical code pages");
-        let before_disable = generation();
-        md.power_on();
-        assert!(generation() > before_disable);
-        assert_eq!(dma.gen_ptr(0), pointer, "a disabled bank keeps its logical counter alive");
+        let before = counter();
+        md.md_bus().write64(reg::SELF_TEST_CONTROL::OFFSET, 1);
+        assert!(counter() > before, "the zero fill invalidates the bank's code pages");
+        let _ = processor.release(REQUEST_JIT_REMAP);
+        md.0.power_on();
+        assert!(processor.release(REQUEST_JIT_REMAP), "a reset that moves the banks asks for a flush");
     }
 
-    /// Directory and ECC state is keyed per bank, so banks of different sizes
-    /// never share an entry. Follows directory-bank-translation.
+    /// Directory and ECC state is keyed per bank, so banks of different sizes never share an entry.
     #[test]
     fn directory_entries_of_different_sized_banks_stay_apart() {
         let md = TestMd::new(&[256, 256, 64, 64]).unwrap();
-        md.md_bus().write64(reg::CONFIG, 0x33 | (0x13 << 8));
-        md.md_bus().write64(reg::DIRECTORY_CONFIG, 2);
-        let dir = md.directory_bus();
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (0x13 << 8));
+        md.md_bus().write64(reg::DIR_CONFIG::OFFSET, 2);
+        let dir = md.0.directory_bus();
         // Software bank n's carriers start at n * 128 MiB.
         let at = |bank: u64, offset: u64| bank * (BANK_SPAN / 8) + offset;
         for bank in 0..4 {
@@ -1001,24 +654,17 @@ mod tests {
         assert_eq!(dir.read64(at(4, 0x20)).status, BUS_ERR, "no bank 4");
     }
 
-    /// The board names what it fits; nothing else is accepted. A bank is a
-    /// whole number of direct-window regions and at most the largest size
-    /// code names, and the controller decodes eight.
+    /// The board names what it installs; a bank is a whole number of direct-window regions up to the
+    /// largest size code.
     #[test]
-    fn a_board_may_only_fit_banks_the_controller_can_decode() {
+    fn a_board_may_only_install_banks_the_controller_can_decode() {
         assert!(TestMd::new(&FUEL_BANKS).is_ok());
         assert!(TestMd::new(&TEZRO_BANKS).is_ok());
         assert!(TestMd::new(&[1024; 8]).is_ok());
         for banks in [&[][..], &[0, 256], &[2048], &[100], &[64; 9]] {
             assert!(TestMd::new(banks).is_err(), "{banks:?}");
         }
-    }
-
-    /// A byte lane of the configuration word holds one size code for both
-    /// of its banks, so a board cannot fit them at different sizes; a lane
-    /// with one bank fitted is still a board's to choose.
-    #[test]
-    fn the_two_banks_of_a_lane_share_one_size() {
+        // A byte lane holds one size code for both its banks.
         for banks in [&[1024, 512][..], &[512, 512, 1024, 512], &[1024, 1024, 512, 512, 512, 1024]] {
             assert!(TestMd::new(banks).err().is_some_and(|e| e.contains("share one size")), "{banks:?}");
         }
@@ -1027,15 +673,14 @@ mod tests {
         }
     }
 
-    /// Where RAM can be, for a board's cached view: the swizzle permutes slots
-    /// within groups of four, so a slot reaches as far as the largest bank of
-    /// its group.
+    /// The swizzle permutes slots within groups of four, so a slot reaches as far as its group's
+    /// largest bank.
     #[test]
     fn the_ram_extent_reaches_as_far_as_the_largest_bank_of_a_slot_group() {
         let extent = RamExtent::new(&FUEL_BANKS);
         for slot in 0..4 {
-            assert!(extent.contains(slot * BANK_SPAN + FITTED_BANK - 8), "slot {slot}");
-            assert!(!extent.contains(slot * BANK_SPAN + FITTED_BANK), "slot {slot}");
+            assert!(extent.contains(slot * BANK_SPAN + INSTALLED_BANK - 8), "slot {slot}");
+            assert!(!extent.contains(slot * BANK_SPAN + INSTALLED_BANK), "slot {slot}");
         }
         assert!(!extent.contains(4 * BANK_SPAN));
         let mixed = RamExtent::new(&[64, 512]);
@@ -1050,11 +695,8 @@ mod tests {
         assert_eq!(tezro, TestMd::new(&TEZRO_BANKS).unwrap().ram_extent());
     }
 
-    /// Each Tezro bank answers in its own 1 GiB slot at its own size: a
-    /// 1 GiB bank fills its slot, a 512 MiB bank stops halfway, and the
-    /// slots above bank 5 answer nothing. Banks 4 and 5 sit above 4 GiB,
-    /// inside the node's 16 GiB direct window. Follows the qtest memory-banks and
-    /// memory-size-boundaries cases in tests/qtest/sn1-bedrock-md-test.c.
+    /// Each Tezro bank answers in its own 1 GiB slot at its own size, banks 4 and 5 above 4 GiB
+    /// inside the 16 GiB window.
     #[test]
     fn every_tezro_bank_answers_at_its_own_size_including_above_4_gib() {
         use crate::ppmem::MappedMemory;
@@ -1086,11 +728,23 @@ mod tests {
         assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 4) | (0x3 << 8) | (0x3 << 12) | (0x3 << 16) | (0x3 << 20));
         assert_eq!(md.dma_view().read64(5 * BANK_SPAN).data, 0x1111 * 6, "DMA reaches it too");
         assert_eq!(md.uncached_view().read64(4 * BANK_SPAN).data, 0x1111 * 5, "and uncached");
+        // Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5 trade places
+        // above 4 GiB.
+        assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
+        assert_eq!(md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, TEZRO_CONFIG | (1 << 32)), BUS_OK);
+        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
+        assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
+        // A node whose banks all lie below 4 GiB, as the Fuel's do, keeps the 4 GiB window and 64
+        // MiB regions.
+        let fuel = configured();
+        let space = fuel.physical().ppmem_space().expect("a window");
+        assert_eq!(space.window_size(), crate::ppmem::WINDOW_SIZE);
+        assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 16));
     }
 
-    /// A DMA block moves the words it would move one at a time, goes on into
-    /// the next bank where the first one's slot ends, and stops at the first
-    /// stretch no bank holds with the words before it already moved.
+    /// A DMA block moves what its words would one at a time, crosses into the next bank, and stops
+    /// at the first hole.
     #[test]
     fn a_dma_block_matches_word_accesses_and_stops_where_memory_ends() {
         let md = tezro();
@@ -1123,8 +777,8 @@ mod tests {
         assert_eq!(dma.write_block(6 * BANK_SPAN, &short), BUS_ERR);
         // A bank the configuration disables answers nothing, as for a word.
         let fuel = configured();
-        assert_eq!(fuel.dma_view().write_block(FITTED_BANK - 8, &words[..2]), BUS_ERR);
-        assert_eq!(fuel.dma_view().read64(FITTED_BANK - 8).data, words[0]);
+        assert_eq!(fuel.dma_view().write_block(INSTALLED_BANK - 8, &words[..2]), BUS_ERR);
+        assert_eq!(fuel.dma_view().read64(INSTALLED_BANK - 8).data, words[0]);
         assert_eq!(fuel.dma_view().write_block(2 * BANK_SPAN, &words[..1]), BUS_ERR);
     }
 
@@ -1133,7 +787,7 @@ mod tests {
     #[test]
     fn a_dma_block_invalidates_each_page_it_touches() {
         let md = configured();
-        let dma = md.dma_view();
+        let dma = md.physical().clone();
         let counter = |page: u64| unsafe { (*dma.gen_ptr(page * 4096)).load(Ordering::Relaxed) };
         let before: Vec<u64> = (1..6).map(counter).collect();
         // 2 pages and a bit, from the middle of page 1 to the start of page 3.
@@ -1142,23 +796,33 @@ mod tests {
         assert_eq!(after.iter().zip(&before).map(|(a, b)| a - b).collect::<Vec<_>>(), [1, 1, 1, 0, 0]);
     }
 
-    /// A node whose banks all lie below 4 GiB, as the Fuel's do, keeps the
-    /// 4 GiB window and its 64 MiB regions.
+    /// A word store through DMA or uncached invalidates its page for compiled code once, at every
+    /// width; a hole invalidates nothing.
+    #[cfg(feature = "jitv2")]
     #[test]
-    fn a_node_below_4_gib_keeps_the_4_gib_window() {
-        use crate::ppmem::MappedMemory;
+    fn a_word_store_invalidates_its_page_and_a_miss_does_not() {
         let md = configured();
-        let space = md.physical().ppmem_space().expect("a window");
-        assert_eq!(space.window_size(), crate::ppmem::WINDOW_SIZE);
-        assert_eq!(space.mapped_bitmap(), 0xf | (0xf << 16));
+        let (dma, uncached) = (md.dma_view(), md.uncached_view());
+        let page = md.physical().gen_ptr(0x3000);
+        let counter = || unsafe { (*page).load(Ordering::Relaxed) };
+        for view in [&dma, &uncached] {
+            let before = counter();
+            assert_eq!([view.write8(0x3000, 1), view.write16(0x3002, 1), view.write32(0x3004, 1), view.write64(0x3008, 1)], [BUS_OK; 4]);
+            assert_eq!(counter() - before, 4);
+            let _ = view.read64(0x3008);
+            assert_eq!(counter() - before, 4, "a read invalidates nothing");
+        }
+        let past = 2 * BANK_SPAN;
+        assert_eq!((dma.write32(past, 1), uncached.write32(past, 1)), (BUS_ERR, BUS_ERR));
+        assert_eq!((dma.read8(past).status, uncached.read8(past).status), (BUS_ERR, BUS_ERR));
     }
 
-    /// A processor's SC to a bank above 4 GiB swaps through the DMA view in one step and leaves a failed compare
-    /// alone; a successful one advances the page's logical counter.
+    /// A processor's SC above 4 GiB swaps through the DMA view in one step, leaving a failed
+    /// compare alone.
     #[test]
     fn a_compare_and_swap_above_4_gib_is_one_step() {
         let md = tezro();
-        let view = md.dma_view();
+        let view = md.physical().clone();
         let at = 5 * BANK_SPAN + 0x40;
         assert_eq!(view.write64(at, 7), BUS_OK);
         #[cfg(feature = "jitv2")]
@@ -1174,235 +838,27 @@ mod tests {
         assert_eq!(view.cas64(7 * BANK_SPAN, 0, 1), None, "no bank there");
     }
 
-    /// Selector 1 swaps the two banks of each pair, so the 512 MiB banks 4 and 5
-    /// trade places above 4 GiB. Follows memory-selector-high-bank.
-    #[test]
-    fn the_bank_select_swaps_banks_above_4_gib() {
-        let md = tezro();
-        let bus = md.physical();
-        assert_eq!(bus.write64(4 * BANK_SPAN + 0x28, 0xfedc_ba98_7654_3210), BUS_OK);
-        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0);
-        assert_eq!(md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32)), BUS_OK);
-        assert_eq!(bus.read64(5 * BANK_SPAN + 0x28).data, 0xfedc_ba98_7654_3210);
-        assert_eq!(bus.read64(4 * BANK_SPAN + 0x28).data, 0);
-    }
-
-    /// A fitting that covers the bank under test zero-fills it, whichever slot
-    /// the bank is in; a bank that is not fitted fails. Follows the
-    /// selftest-bank-remap and origin300-selftest-fill cases.
+    /// Installed memory that covers the bank zero-fills it whichever slot it is in; an empty bank
+    /// fails.
     #[test]
     fn selftest_fills_a_tezro_bank_above_4_gib_and_fails_a_missing_bank() {
         let md = TestMd::new(&TEZRO_BANKS).unwrap();
         // Every pair at size code 1 (64 MiB): small enough to fill in a test.
         let regs = md.md_bus();
-        regs.write64(reg::CONFIG, 0x13 | (0x13 << 8) | (0x13 << 16) | (0x13 << 24));
+        regs.write64(reg::MEMORY_CONFIG::OFFSET, 0x13 | (0x13 << 8) | (0x13 << 16) | (0x13 << 24));
         let bus = md.physical();
         bus.write64(4 * BANK_SPAN + 0x40, 0x5555);
-        regs.write64(reg::SELFTEST_DATA, 0x80);
-        regs.write64(reg::SELFTEST_COMMAND, (4 << 4) | 1);
+        regs.write64(reg::SELF_TEST_DATA::OFFSET, 0x80);
+        regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (4 << 4) | 1);
         md.advance_ns(1000);
-        assert_eq!(regs.read64(reg::SELFTEST_STATUS).data, 3, "bank 4 is fitted");
+        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 3, "bank 4 is installed");
         assert_eq!(bus.read64(4 * BANK_SPAN + 0x40).data, 0, "and zeroed");
-        regs.write64(reg::SELFTEST_COMMAND, (6 << 4) | 1);
+        regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (6 << 4) | 1);
         md.advance_ns(1000);
-        assert_eq!(regs.read64(reg::SELFTEST_STATUS).data, 2, "bank 6 is not fitted");
+        assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 2, "bank 6 is not installed");
     }
 
-    /// Code pages above 4 GiB have stable logical generation counters like
-    /// the rest, and a write bumps them.
-    #[cfg(feature = "jitv2")]
-    #[test]
-    fn code_pages_above_4_gib_keep_a_logical_generation() {
-        let md = tezro();
-        let above = 4 * BANK_SPAN + 0x2000;
-        let pointer = md.dma_view().gen_ptr(above);
-        assert!(!pointer.is_null());
-        assert_ne!(pointer, md.dma_view().gen_ptr(5 * BANK_SPAN + 0x2000));
-        assert!(md.dma_view().gen_ptr(8 * BANK_SPAN).is_null(), "past the node's 8 GiB");
-        assert!(md.dma_view().gen_ptr(4 * BANK_SPAN + (512 << 20)).is_null(), "past the largest bank there");
-        let before = unsafe { (*pointer).load(Ordering::Relaxed) };
-        assert_eq!(md.dma_view().write64(above, 1), BUS_OK);
-        assert!(unsafe { (*pointer).load(Ordering::Relaxed) } > before);
-        md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG | (1 << 32));
-        assert_eq!(md.dma_view().gen_ptr(above), pointer, "a bank swap keeps the counter");
-    }
-
-    /// A bank configuration write moves memory under every processor's
-    /// cached view, so the others park for it; another register write
-    /// leaves them running. The other processor holds and drops line
-    /// pages in its view while it runs, as its cache instructions do: the
-    /// remap walks those pages, and doing so unparked panicked a Tezro.
-    /// MD reads its clock inside the write, which is where the test looks.
-    #[test]
-    fn a_bank_configuration_write_parks_the_other_processors() {
-        use crate::cpu::smp::{on_cpu_thread, set_current_cpu, ParkSlot, World, HOST_PARK_BIT};
-        use std::sync::atomic::AtomicBool;
-        let watched: Arc<OnceLock<Arc<ParkSlot>>> = Arc::new(OnceLock::new());
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let clock: crate::dev::heart::Clock = {
-            let (watched, seen) = (watched.clone(), seen.clone());
-            Arc::new(move || {
-                if let Some(slot) = watched.get().filter(|_| on_cpu_thread() == Some(0)) {
-                    seen.lock().push(slot.is_parked());
-                }
-                0
-            })
-        };
-        let md = TestMd::with_clock(&FUEL_BANKS, clock).unwrap();
-        assert_eq!(md.md_bus().write64(reg::CONFIG, 0x33), BUS_OK);
-        let space = md.physical().ppmem_space().expect("a window");
-        let _mine = space.add_cached_view(&[]).unwrap();
-        let theirs = space.add_cached_view(&[]).unwrap();
-        let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
-        let slots: Vec<Arc<ParkSlot>> = words.iter().map(|w| Arc::new(ParkSlot::new(Arc::as_ptr(w)))).collect();
-        let world = Arc::new(World::new());
-        world.set_slots(slots.clone());
-        md.0.set_world(world);
-        let running = Arc::new(AtomicBool::new(true));
-        slots[1].set_active(true);
-        let other = {
-            let (md, slot, word, running) = (md.clone(), slots[1].clone(), words[1].clone(), running.clone());
-            std::thread::spawn(move || {
-                set_current_cpu(1);
-                let space = md.physical().ppmem_space().unwrap();
-                let page = crate::ppmem::map::granularity() as u64;
-                while running.load(Ordering::Relaxed) {
-                    if word.load(Ordering::Relaxed) & HOST_PARK_BIT != 0 {
-                        slot.park(&running);
-                        continue;
-                    }
-                    for n in 0..32 {
-                        space.hold_line_page(theirs, 0x10_0000 + n * page);
-                    }
-                    for n in 0..32 {
-                        space.release_line_page(theirs, 0x10_0000 + n * page);
-                    }
-                }
-                slot.set_active(false);
-            })
-        };
-        let _ = watched.set(slots[1].clone());
-        let regs = md.md_bus();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                set_current_cpu(0);
-                for swap in [1u64, 0, 1, 0] {
-                    assert_eq!(regs.write64(reg::CONFIG, 0x33 | swap << 32), BUS_OK);
-                    assert_eq!(std::mem::take(&mut *seen.lock()), [true], "the other processor parked for the remap");
-                }
-                // Once it runs again, other registers leave it running.
-                while watched.get().unwrap().is_parked() {
-                    std::thread::yield_now();
-                }
-                assert_eq!(regs.write64(reg::REFRESH, 0), BUS_OK);
-                assert_eq!(std::mem::take(&mut *seen.lock()), [false], "a refresh write moves no memory");
-            });
-        });
-        running.store(false, Ordering::Relaxed);
-        other.join().unwrap();
-        assert_eq!(md.physical().read64(BANK_SPAN).status, BUS_OK);
-    }
-
-    /// Processors numbered across two nodes share one `World`, so a bank
-    /// configuration write holds the other node's processor still whichever
-    /// node's thread makes it, whether through the register window or as the
-    /// peer's vector engine: each chip counts a thread of the other node as
-    /// no processor of its own, and the world skips only the writer. The
-    /// windows that show the remapped memory are laid before the other
-    /// processor runs again, not after.
-    #[test]
-    fn a_bank_configuration_write_parks_the_other_nodes_processor() {
-        use crate::cpu::smp::{set_current_cpu, ParkSlot, World, HOST_PARK_BIT};
-        use crate::dev::bedrock::Population;
-        use crate::node_windows::{NodeShape, Windows};
-        use parking_lot::Mutex;
-        use std::sync::atomic::AtomicBool;
-        let chips: Vec<_> = (0..2)
-            .map(|n| {
-                let config = super::super::test_config(Arc::new(|| 0));
-                let config = BedrockConfig { processors: Population::SINGLE.with_first_cpu(n), ..config };
-                Bedrock::new(config).unwrap()
-            })
-            .collect();
-        Bedrock::cable(&chips[0], &chips[1]);
-        let words: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
-        let slots: Vec<Arc<ParkSlot>> = words.iter().map(|w| Arc::new(ParkSlot::new(Arc::as_ptr(w)))).collect();
-        let world = Arc::new(World::new());
-        world.set_slots(slots.clone());
-        for chip in &chips {
-            chip.set_world(world.clone());
-        }
-        // Each node's shape notes, whenever the windows read it, whether its
-        // processor is held at that moment.
-        struct Watched {
-            shape: Arc<dyn NodeShape>,
-            word: Arc<AtomicU64>,
-            seen: Arc<Mutex<Vec<bool>>>,
-        }
-        impl NodeShape for Watched {
-            fn number(&self) -> u16 { self.shape.number() }
-            fn calias(&self) -> u64 { self.shape.calias() }
-            fn routed(&self) -> bool { self.shape.routed() }
-            fn runs(&self) -> Arc<[crate::node_windows::Run]> {
-                self.seen.lock().push(self.word.load(Ordering::SeqCst) & HOST_PARK_BIT != 0);
-                self.shape.runs()
-            }
-        }
-        let windows = Arc::new(Windows::new(33));
-        let seen: Vec<Arc<Mutex<Vec<bool>>>> = (0..2).map(|_| Arc::default()).collect();
-        for (n, chip) in chips.iter().enumerate() {
-            windows.add_node(chip.md.physical(), Arc::new(Watched { shape: chip.shape(), word: words[n].clone(), seen: seen[n].clone() }));
-            chip.set_windows(&windows);
-        }
-        let running = Arc::new(AtomicBool::new(true));
-        // How many times each processor stopped for a hold.
-        let parks: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
-        let spinners: Vec<_> = (0..2usize)
-            .map(|n| {
-                slots[n].set_active(true);
-                let (slot, word, running, parks) = (slots[n].clone(), words[n].clone(), running.clone(), parks[n].clone());
-                std::thread::spawn(move || {
-                    while running.load(Ordering::Relaxed) {
-                        if word.load(Ordering::Relaxed) & HOST_PARK_BIT != 0 {
-                            slot.park(&running);
-                            parks.fetch_add(1, Ordering::SeqCst);
-                        }
-                        std::thread::yield_now();
-                    }
-                    slot.set_active(false);
-                })
-            })
-            .collect();
-        for writer in 0..2usize {
-            let (target, other) = (&chips[1 - writer], 1 - writer);
-            let before: Vec<u64> = parks.iter().map(|p| p.load(Ordering::SeqCst)).collect();
-            seen[other].lock().clear();
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    set_current_cpu(writer as u8);
-                    let regs = target.registers();
-                    assert_eq!(regs.write64(super::super::reg::MD_BASE + reg::CONFIG, 0x33 | (writer as u64) << 32), BUS_OK);
-                });
-            });
-            // The write returns once the world is released; the other
-            // processor has parked and resumes.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while parks[other].load(Ordering::SeqCst) == before[other] && std::time::Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            assert_eq!(parks[other].load(Ordering::SeqCst), before[other] + 1, "CPU {other} was not held for CPU {writer}'s write to the other node");
-            assert_eq!(parks[writer].load(Ordering::SeqCst), before[writer], "the writer, CPU {writer}, held itself");
-            let seen = seen[other].lock();
-            assert!(!seen.is_empty(), "the write did not lay the windows");
-            assert!(seen.iter().all(|&held| held), "CPU {other} ran while the windows were laid after CPU {writer}'s write: {seen:?}");
-        }
-        running.store(false, Ordering::Relaxed);
-        for t in spinners {
-            t.join().unwrap();
-        }
-    }
-
-    /// Guest density settings remap fitted RAM, and reset restores the default map.
+    /// Guest density settings remap installed RAM, and reset restores the default map.
     #[test]
     fn bank_configuration_remaps_memory_and_reset_restores_defaults() {
         let md = configured();
@@ -1411,25 +867,25 @@ mod tests {
         assert_eq!(bus.write64(BANK_SPAN, 0xabcdef), BUS_OK);
         assert_eq!(bus.read8(0).data, 0x11);
         assert_eq!(bus.read32(4).data, 0x55667788);
-        assert_eq!(bus.read64(FITTED_BANK).status, BUS_ERR);
+        assert_eq!(bus.read64(INSTALLED_BANK).status, BUS_ERR);
         assert_eq!(bus.read64(2 * BANK_SPAN).status, BUS_ERR);
         assert_eq!(md.md_bus().write64(8, 0x33 | 1 << 32), BUS_OK);
         assert_eq!(bus.read64(0).data, 0xabcdef);
         assert_eq!(bus.read64(BANK_SPAN).data, 0x1122334455667788);
         assert!(bus.mem_ptr(0).is_some());
-        md.power_on();
+        md.0.power_on();
         assert_eq!(bus.read64(0).status, BUS_ERR);
         bus.map_unmapped(0x1fc00000, 0x1fc01000);
-        for (code, size) in [(1, 64 << 20), (2, 128 << 20), (3, FITTED_BANK),
-            (4, FITTED_BANK), (5, FITTED_BANK)] {
-            md.md_bus().write64(reg::CONFIG, 1 | (code << 4));
+        for (code, size) in [(1, 64 << 20), (2, 128 << 20), (3, INSTALLED_BANK),
+            (4, INSTALLED_BANK), (5, INSTALLED_BANK)] {
+            md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 1 | (code << 4));
             assert_eq!(bus.read64(size - 8).status, BUS_OK);
             assert_eq!(bus.read64(size).status, BUS_ERR);
             assert_eq!(bus.read64(0x1fc00000).status, BUS_OK, "a non-RAM mapping survives");
         }
-        md.md_bus().write64(reg::CONFIG, 0x11);
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x11);
         assert_eq!(bus.read64(64 << 20).status, BUS_ERR, "the old prefix is removed on shrink");
-        md.md_bus().write64(reg::CONFIG, 0x61);
+        md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x61);
         assert_eq!(bus.read64(0).status, BUS_ERR, "unsupported density does not map RAM");
         #[cfg(feature = "jitv2")]
         {
@@ -1454,20 +910,9 @@ mod tests {
             assert_eq!(unsafe { (*bank0).load(Ordering::Relaxed) }, before0);
             assert_eq!(unsafe { (*bank1).load(Ordering::Relaxed) }, before1 + 1);
             assert_eq!(unsafe { (*first).load(Ordering::Relaxed) }, before1 + 1);
-            let view = md.uncached_view();
-            let logical = view.gen_ptr(0);
-            assert_eq!(logical, md.memory.gen_ptr(0));
-            let logical_before = unsafe { (*logical).load(Ordering::Relaxed) };
-            drop(md);
-            assert_eq!(unsafe { (*logical).load(Ordering::Relaxed) }, logical_before,
-                "an external endpoint keeps its logical generation pointers alive");
-            // The endpoint keeps the backing memory alive after MD disappears.
-            assert!(unsafe { (*bank1).load(Ordering::Relaxed) } > 0);
         }
     }
-    /// The guest reads ECC configuration and the error registers, which never
-    /// latch an error: an injected check byte read past with memory raises
-    /// none, and reaches no processor.
+    /// The error registers never latch an error: an injected check byte read past raises none.
     #[test]
     fn guest_registers_expose_ecc_configuration_and_latch_no_error() {
         {
@@ -1486,10 +931,10 @@ mod tests {
                 assert_eq!(r.read64(at).data, value);
                 assert_eq!(md.unsupported(), before + 1);
             }
-            md.ecc_bus().write8(7, 3);
+            md.0.ecc_bus().write8(7, 3);
             assert_eq!(md.uncached_view().read64(0).status, BUS_OK);
             r.write64(0x40000, 2);
-            md.directory_bus().write64(0, 3 << 16);
+            md.0.directory_bus().write64(0, 3 << 16);
             r.write64(0x40000, 0);
             assert_eq!(md.physical().read64(0).status, BUS_OK);
             assert_eq!(md.dma_view().read64(0).status, BUS_OK);
@@ -1523,14 +968,14 @@ mod tests {
             assert_eq!(regs.write8(0x60000, 1), BUS_ERR);
             assert_eq!(regs.write64(0x60001, 1), BUS_ERR);
             regs.write64(0x60000, 1);
-            md.power_on();
+            md.0.power_on();
             assert_eq!(regs.read64(0x60000).data, 0);
             assert_eq!(regs.read64(8).data, 0);
         }
     }
     /// Self-test completion is visible only after its configured clock interval.
     #[test]
-    fn selftest_waits_for_fitted_clock_cycles_and_zero_fills_ram() {
+    fn selftest_waits_for_configured_clock_cycles_and_zero_fills_ram() {
         {
             let now = Arc::new(AtomicU64::new(100));
             let time = now.clone();
@@ -1565,7 +1010,7 @@ mod tests {
             regs.write64(0x20030, 2);
             now.store(20000, Ordering::Relaxed);
             assert_eq!(regs.read64(0x20048).data, 0);
-            md.power_on();
+            md.0.power_on();
             regs.write64(8, 0x33);
             md.start_clock();
             regs.write64(0x20030, 1);
@@ -1594,15 +1039,15 @@ mod tests {
             let r = md.md_bus();
             r.write64(8, 0x13);
             md.physical().write64(0, 0x1234);
-            md.ecc_bus().write8(7, 1);
-            md.ecc_bus().write8(15, 1);
+            md.0.ecc_bus().write8(7, 1);
+            md.0.ecc_bus().write8(15, 1);
             r.write64(0x20038, 0x80);
             r.write64(0x20030, 1);
             md.advance_ns(1000);
             assert_eq!(r.read64(0x20048).data, 3);
             assert_eq!(md.physical().read64(0).data, 0);
-            assert_eq!(md.ecc_bus().read8(7).data, 0);
-            assert_eq!(md.ecc_bus().read8(15).data, 0);
+            assert_eq!(md.0.ecc_bus().read8(7).data, 0);
+            assert_eq!(md.0.ecc_bus().read8(15).data, 0);
         }
     }
     /// Fetch-and-op registers preserve the big-endian lanes used by the processor.
@@ -1626,14 +1071,13 @@ mod tests {
         assert_eq!(f.write64(40, 1), BUS_ERR);
         assert_eq!(f.read16(0).status, BUS_ERR);
     }
-    /// The guest reads back the check bytes it writes, until a doubleword's
-    /// data changes and it reads the check byte the new data computes. The
-    /// scrub window reads as the ECC view and refuses writes.
+    /// The guest reads back check bytes it writes until the data changes; the scrub window reads as
+    /// the ECC view.
     #[test]
     fn ecc_carriers_keep_written_check_bytes_until_the_data_changes() {
         {
             let md = configured();
-            let ecc = md.ecc_bus();
+            let ecc = md.0.ecc_bus();
             for carrier in 0..8 {
                 let source = 0x11223344556677a5u64;
                 assert_eq!(ecc.write8(carrier, source as u8), BUS_OK);
@@ -1648,27 +1092,27 @@ mod tests {
         }
         {
             let md = configured();
-            let (ecc, ram) = (md.ecc_bus(), md.uncached_view());
+            let (ecc, ram) = (md.0.ecc_bus(), md.uncached_view());
             assert_eq!(ecc.read8(7).data, ecc_compute(0), "nothing written: the data's own");
             ecc.write8(7, 3);
             assert_eq!(ecc.read8(7).data, 3);
-            assert_eq!(md.ecc_scrub_bus().read8(7).data, 3);
+            assert_eq!(md.0.ecc_scrub_bus().read8(7).data, 3);
             assert_eq!(ram.read64(0).data, 0, "memory reads raise no error");
             assert_eq!(ram.write8(7, 0x5a), BUS_OK);
             assert_eq!(ecc.read8(7).data, 0x82, "the new data's check byte");
             assert_eq!(ecc_compute(0x5a), 0x82);
             ecc.write8(7, 0x82);
             assert!(md.state.lock().ecc.is_empty(), "a computed byte is not kept");
-            assert_eq!(md.ecc_scrub_bus().write64(0, 0), BUS_ERR);
+            assert_eq!(md.0.ecc_scrub_bus().write64(0, 0), BUS_ERR);
             assert_eq!(md.reported(), [(false, false); 2]);
         }
     }
-    /// The ECC view takes an uncached SH's check word from wherever the PROM
-    /// put it in the source register; other views, and bytes, take the low bits.
+    /// The ECC view takes an uncached SH's check word from wherever the PROM put it in the source
+    /// register.
     #[test]
     fn ecc_view_reads_the_check_word_from_the_whole_source_register() {
         let md = configured();
-        let ecc = md.ecc_bus();
+        let ecc = md.0.ecc_bus();
         // (carrier offset, register bits holding the check word)
         for (carrier, shift) in [(6u64, 0u32), (4, 48), (2, 32), (0, 16)] {
             let source = 0x1111_2222_3333_4444u64 ^ (0xa55a_u64 << shift);
@@ -1683,26 +1127,25 @@ mod tests {
         assert_eq!(view.write_narrow_from(0x40, 2, 0xdead_beef_1234_5678), BUS_OK);
         assert_eq!(md.dma_view().read64(0x40).data >> 48, 0x5678);
     }
-    /// Directory entries are stored with the check bits the controller
-    /// computes unless the configuration turns that off, and read back as
-    /// stored; protection entries and counters keep their words.
+    /// Directory entries are stored with computed check bits unless the configuration turns that
+    /// off; protection keeps its words.
     #[test]
     fn directory_entries_and_protection_words_are_stored() {
         {
             let md = configured();
             let r = md.md_bus();
-            md.directory_bus().write64(0, 1);
-            assert_eq!(md.directory_bus().read64(0).data, 0x001f0001);
+            md.0.directory_bus().write64(0, 1);
+            assert_eq!(md.0.directory_bus().read64(0).data, 0x001f0001);
             r.write64(0x40000, 2);
-            md.directory_bus().write64(0, 0x001e0001);
+            md.0.directory_bus().write64(0, 0x001e0001);
             r.write64(0x40000, 0);
-            assert_eq!(md.directory_bus().read64(0).data, 0x001e0001);
+            assert_eq!(md.0.directory_bus().read64(0).data, 0x001e0001);
             assert_eq!(md.uncached_view().read64(0).status, BUS_OK);
             assert_eq!(r.read64(0x40010).data, 0);
         }
         {
             let md = configured();
-            let d = md.directory_bus();
+            let d = md.0.directory_bus();
             assert_eq!(d.write64(0x408, 0x1234), BUS_OK);
             assert_eq!(d.read64(0x2000408).data, 0x1234);
             assert_eq!(d.write64(0x418, 0x5678), BUS_OK);

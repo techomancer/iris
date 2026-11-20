@@ -1,7 +1,11 @@
 # PCI
 
 The O2 (through MACE) and the Octane (through the onboard Bridge) have PCI
-buses. Both hosts own a `PciBus` (`src/pci/`), which holds the functions on
+buses, and so do the later machines: the Origin 200, Origin 2000 and Onyx2
+through the same Bridge, the Fuel and the Origin 3200's I-brick through the
+XBridge, and the Tezro through the PIC. This page describes the O2 and the
+Octane in detail; the other machines' guides give their buses' contents. Every
+host owns a `PciBus` (`src/pci/`), which holds the functions on
 the bus, decodes their BARs, combines their interrupt pins and resets and
 saves them. A host decides only what is its own: how a CPU access becomes
 configuration cycles and byte order, where an interrupt output goes, and what
@@ -95,26 +99,34 @@ and 90; established as software, and the board's INTB-D wiring is not known).
 | 1 | CRIME 8 | | | | Internal SCSI controller 0 |
 | 2 | CRIME 9 | | | | Internal SCSI controller 1 |
 | 3 | CRIME 10 | CRIME 13 | CRIME 14 | CRIME 15 | The PCI option slot |
-| 4 | CRIME 11 | | | | Not populated on an O2; iris keeps it spare for virtio-serial |
+| 4 | CRIME 11 | | | | Not populated on an O2; iris keeps it spare for virtio-serial, which the O2 configuration does not accept yet |
 
 **Octane**, Bridge bus 0. Outputs are the Bridge's eight pins. Pins A and C of
 device `d` reach pin `d`, B and D reach `d ^ 4`: inferred from software, not
 established. `BoardIrq(i)` is pin `i`, shared with the GPIO inputs; the IOC3's
-SuperIO interrupt is `BoardIrq(4)`. Devices 0 and 1 are the ISP1040s, 2 is the
-IOC3, 3 is the RAD1, and 4 is virtio-serial when enabled.
+SuperIO interrupt is `BoardIrq(4)`, and pins 6 and 7 carry the power switch and
+AC-fail inputs. Devices 0 and 1 are the ISP1040s, 2 is the IOC3, 3 is the RAD1
+(no interrupt), 5 is virtio-9p (INTA, pin 5) and 7 virtio-serial on INTB, which
+reaches pin 3; slot 4, whose INTA is the SuperIO pin, stays empty
+(`bridge_slot` moves the virtio devices within 4 to 7).
 
 ## Octane windows
 
-The CPU reaches PCI memory on the Bridge two ways (Bridge ASIC specification
+The CPU reaches PCI on the Bridge three ways (Bridge ASIC specification
 rev 4.0; offsets in [octane-ip30-address-map.md](octane-ip30-address-map.md), section
-8). A device window in the Bridge's own widget space, set by `Device(x)`; and
+8). A device window in the Bridge's own widget space, set by `Device(x)`;
 the 2 GB window HEART gives widget 15 at `0xF_8000_0000`, whose first 16 MB is
 the widget's small window and whose range from offset `0x4000_0000` is the
-32-bit alias of the low 1 GB of PCI memory. A BAR in either is mapped straight
-to its function. The rest of the 2 GB window (16 MB to 1 GB) is reserved in the
-specification (p. 52), which does not say what an access does; iris ends it in
-a bus error, an approximation. The 64-bit alias and PCI I/O space, reached only
-through the 64 GB window, are not modelled. The external ATE SSRAM (`0x080000`)
+32-bit alias of the low 1 GB of PCI memory; and the 64 GB window at
+`0xF0_0000_0000`, which shows the same and beyond 2 GB the 64-bit alias of that
+memory (offset `0x8000_0000`) and PCI I/O space (offset `0x1_0000_0000`, 4 GB).
+OpenBSD reaches the onboard devices through the 64 GB window. A BAR page in a
+device window or in the 32-bit alias is mapped straight to its function, in
+both of the windows that show it; the other two aliases go through the Bridge.
+The rest of each window (16 MB to 1 GB, and past PCI I/O space) is reserved in
+the specification (p. 52), which does not say what an access does; iris ends
+it in a bus error, an approximation. The option boards' Bridges have the same
+windows on their own ports. The external ATE SSRAM (`0x080000`)
 is not fitted on the Octane and reads as all ones, which is what the PROM
 expects when it sizes it.
 
@@ -171,9 +183,23 @@ widget space, Bridge specification table 43) sends a cycle to the bus and device
 its PCI Type 1 Configuration register names (table 26); a bus number no bridge's
 secondary to subordinate range holds, including 0, ends in a master time-out.
 IRIX 6.5.30 scans a bus behind a bridge this way. The header is the type 1
-header only (the caller names the PCI identity); the upper halves of the
-prefetchable and I/O windows read zero. The NVMe card's `bridge = true` puts
-one in front of the controller.
+header only (the caller names the PCI identity). Each bridge forwards I/O at 4
+KiB granularity; how far up depends on the chip:
+
+| Bridge | Identity | I/O window | Prefetchable window |
+|---|---|---|---|
+| In front of a `bridge = true` NVMe or Fibre Channel card | DEC 21154, `1011:0026` | 32-bit: 0x1c/0x1d read 1 in bits 3:0, upper halves at 0x30/0x32 | 32-bit, upper halves read zero |
+| The Tezro's TI PCI2050 | `104c:ac28` | 32-bit, as above | 32-bit, upper halves stored |
+| Any other (only in unit tests) | named by the caller | 16-bit, upper halves read zero | 32-bit, upper halves read zero |
+
+With ISA enable (bridge control bit 2) set, a bridge forwards I/O in the
+first 64 KiB only in the low 256 bytes of each 1 KiB block; a BAR there that
+reaches past those 256 bytes is not forwarded. VGA enable (bit 3) is stored
+and does nothing. A write to the upper halves or to bridge control updates
+the bus in front at once, as a base or limit write does.
+
+A host whose PCI I/O space starts above 64 KiB, as the PIC's does, needs the
+32-bit I/O window to reach an I/O BAR behind a bridge.
 
 ## Monitor
 

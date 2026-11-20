@@ -363,6 +363,69 @@ pub(crate) fn advance_lspat(ctx: &mut Rex3Context) {
     }
 }
 
+pub(crate) fn ls_pattern_state_after(
+    count: u32,
+    repeat_field: u32,
+    length_field: u32,
+    bit: u8,
+    advances: u64,
+) -> (u32, u8) {
+    let repeat = repeat_field.max(1) as u64;
+    if advances <= count as u64 {
+        return (count - advances as u32, bit);
+    }
+
+    let remaining = advances - count as u64 - 1;
+    let bit_advances = 1 + remaining / repeat;
+    let count = repeat - 1 - remaining % repeat;
+    let length = (length_field + 17) as u64;
+    let offset = (31 - bit as u64 + bit_advances) % length;
+    (count as u32, (31 - offset) as u8)
+}
+
+#[cfg(test)]
+mod pattern_state_tests {
+    use super::ls_pattern_state_after;
+
+    #[test]
+    fn line_pattern_closed_form_matches_scalar_advancement() {
+        for repeat_field in 0..=8 {
+            let repeat = repeat_field.max(1);
+            for length_field in [0, 7, 15] {
+                let length = length_field + 17;
+                for start_offset in 0..length {
+                    let start_bit = (31 - start_offset) as u8;
+                    for start_count in 0..=10 {
+                        for advances in [0, 1, 2, 3, 7, 16, 31, 32, 63, 127, 200] {
+                            let mut count = start_count;
+                            let mut bit = start_bit;
+                            for _ in 0..advances {
+                                if count == 0 {
+                                    count = repeat - 1;
+                                    let wrap = 32 - length;
+                                    bit = if bit as u32 == wrap { 31 } else { bit - 1 };
+                                } else {
+                                    count -= 1;
+                                }
+                            }
+                            assert_eq!(
+                                ls_pattern_state_after(
+                                    start_count,
+                                    repeat_field,
+                                    length_field,
+                                    start_bit,
+                                    advances,
+                                ),
+                                (count, bit),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn rgb4_to_rgb24(val: u32) -> u32 {
     let r = if (val & 1) != 0 { 0xFF } else { 0 };
     let g_raw = (val >> 1) & 3;
@@ -418,7 +481,7 @@ pub(crate) fn rgb24_to_rgb12(val: u32) -> u32 {
 pub(crate) const BAYER_PACKED: u64 = 0x5D7F91B36E4CA280;
 
 /// Pack bayer index into bits 27:24 of color value (top byte unused by 24-bit BGR).
-/// Encoding: bits[3:2] = y&3, bits[1:0] = x&3 → index = (y&3)<<2|(x&3).
+/// Encoding: bits\[3:2\] = y&3, bits\[1:0\] = x&3 → index = (y&3)<<2|(x&3).
 /// Non-dither compress variants ignore these bits.
 #[inline(always)]
 pub(crate) fn bayer_pack(color: u32, x: i32, y: i32) -> u32 {
@@ -862,7 +925,7 @@ pub fn iterate_shade<M: Mode>(ctx: &mut Rex3Context, m: &M) {
     }
 }
 
-/// integer = bits[22:11] & 0x1FF; negative or >= 0x180 clamps to 0, > 0xFF to
+/// integer = bits\[22:11\] & 0x1FF; negative or >= 0x180 clamps to 0, > 0xFF to
 /// the saturation constant.
 #[inline(always)]
 fn clamp_shade(c: u32) -> u32 {
@@ -1710,14 +1773,14 @@ pub fn draw_aline_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
         let yef = (ctx.yend >> 7) & 0xF;
         if xsf != 0 || ysf != 0 {
             let wi = ((xsf + ysf) as usize).min(15);
-            let w = (ctx.aweight0 >> (wi * 4)) & 0xF;
+            let w = ctx.aweight0.checked_shr((wi * 4) as u32).unwrap_or(0) & 0xF;
             if w == 0 {
                 extra_skip_first = true;
             }
         }
         if xef != 0 || yef != 0 {
             let wi = ((xef + yef) as usize).min(15);
-            let w = (ctx.aweight1 >> (wi * 4)) & 0xF;
+            let w = ctx.aweight1.checked_shr((wi * 4) as u32).unwrap_or(0) & 0xF;
             if w == 0 {
                 extra_skip_last = true;
             }
@@ -1770,7 +1833,8 @@ fn draw_line_bresenham<M: Mode>(
     // integer deltas can say the other axis is longer.
     let major = if fract { if y_major { ady } else { adx } } else { adx.max(ady) };
     let mut pixel_count = major + 1;
-    if m.length32() != 0 && pixel_count > 32 {
+    let length32_truncated = m.length32() != 0 && pixel_count > 32;
+    if length32_truncated {
         pixel_count = 32;
     }
 
@@ -1830,7 +1894,7 @@ fn draw_line_bresenham<M: Mode>(
         // implementations only guarantee landing in the endpoint's pixel *column/row*,
         // not its exact minor-axis coordinate).
         debug_assert!(
-            fract || iterate_one || !is_last || (x == x2 && y == y2),
+            fract || iterate_one || length32_truncated || !is_last || (x == x2 && y == y2),
             "I_LINE bres mismatch: pos ({},{}) != end ({},{})", x, y, x2, y2
         );
 

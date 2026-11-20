@@ -25,14 +25,16 @@
 // THE SOFTWARE.
 
 //! The 16550A register interface, as copied by the O2's TI TL16PIR552 (behind
-//! MACE) and the Octane's IOC3.
+//! MACE), the Super I/O behind the IOC3, the IOC4's four ports, and the L1
+//! system controller's console UART on the Fuel and Tezro.
 //!
 //! This is a port of QEMU's `hw/char/serial.c`: the register file, the
 //! 16-byte receive FIFO and its trigger levels, interrupt identification in
 //! priority order, line and modem status, loopback, receive overrun, the
-//! FIFO character timeout and the divisor latch. Both chips wrap it; this
+//! FIFO character timeout and the divisor latch. Each chip wraps it; this
 //! file knows nothing of where its registers sit or what drives its
-//! interrupt. [`crate::dev::mace_uart`] and [`crate::dev::ioc3`] are the shells.
+//! interrupt. [`crate::dev::mace_uart`], [`crate::dev::ioc3`],
+//! [`crate::dev::ioc4`] and [`crate::dev::l1`] are the shells.
 //!
 //! # Differences from the QEMU source
 //!

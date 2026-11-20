@@ -75,7 +75,7 @@ pub fn to_index(c: i32) -> u32 {
 /// A plane (value, d/dx, d/(-y)) at pixel centres, as the triangle
 /// setup's planes are (value at (xs, yref), relative to centres x + 0.5,
 /// y + 0.5), in 12.16 by `conv`: the value at pixel (xs, yref) and the
-/// integer steps. Pixel (i, j) is then `p[0] + p[1] (i - xs) + p[2]
+/// integer steps. Pixel (i, j) is then `p\[0\] + p\[1\] (i - xs) + p\[2\]
 /// (yref - j)`, wrapping.
 pub fn plane(p: [f64; 3], conv: fn(f64) -> i32) -> [i32; 3] {
     [conv(p[0] + 0.5 * p[1] - 0.5 * p[2]), conv(p[1]), conv(p[2])]

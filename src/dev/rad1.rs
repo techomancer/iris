@@ -1,7 +1,9 @@
-//! SGI Octane onboard RAD audio (PCI 10a9:0005, revision 0xc0) on Bridge
-//! slot 3.
+//! SGI RAD1 audio (PCI 10a9:0005): the Octane's onboard part (revision
+//! 0xc0) on Bridge slot 3, and the Onyx2 BaseIO-G's MediaIO daughtercard
+//! (revision 0x70, [`RAD1_REVISION_MEDIAIO`]) at PCI device 7. The register
+//! offsets and fixed words live in `regs.rs`.
 //!
-//! This is the Octane variant of our RAD1 model: the register file the
+//! The model covers the register file the
 //! driver's start-up programs, the free-running UST counter and its control
 //! word, the DMA descriptor words, status-DMA control and the analog output
 //! enable. Behaviour that no source establishes is kept as the model
@@ -16,9 +18,9 @@
 //! * The start-up words, the AES3 subcode window and the descriptor bank
 //!   store what was written and return it. No reset values or masks are
 //!   established beyond zero; the few writes the model refuses (see
-//!   [`Rad1::write`]) are refused because no supported guest makes them.
+//!   `Inner::write`) are refused because no supported guest makes them.
 //! * The analog input and output run at the rates their clock generators
-//!   (0 and 1) are programmed for; see [`Rate`]. Until a guest programs
+//!   (0 and 1) are programmed for; see `Rate`. Until a guest programs
 //!   one, its rate is 44.1 kHz: the power-on rate is unknown.
 //! * The engines move frames at the sample rate. Frames are moved when
 //!   something looks (a position or status read, a status completion) and,
@@ -28,8 +30,8 @@
 //!   silence: host audio input is not connected.
 //! * Output plays as the model's mixer does: each ring frame is two
 //!   little-endian words, left then right, each a 24-bit signed sample in
-//!   bits [23:0]; the host sample is bits [23:8]. The channel order and the
-//!   use of bits [23:8] are the model's inference, not confirmed.
+//!   bits \[23:0\]; the host sample is bits \[23:8\]. The channel order and the
+//!   use of bits \[23:8\] are the model's inference, not confirmed.
 //! * The AES3 subcode channel runs at 48000/192 Hz with empty records: no
 //!   capture times them, the rate is inferred from the record layout.
 //! * UST ticks every 960 ns, a selected board policy; the physical rate is
@@ -42,10 +44,11 @@
 //!   interval late means the host held up the timer thread that also
 //!   delivers the clock interrupt IRIX refills the ring from, so the card's
 //!   clock is set back to the completion's due time (see
-//!   [`CardClock::absorb_stall`]). The clock, output rate and UST fall behind
-//!   wall time by the hold-ups; on-time completions win 1/32 of an interval
-//!   back each, and at most 200 ms is held back. Time the guest has read is
-//!   never taken back.
+//!   [`CardClock::absorb_stall`]). Register accesses and the timer's
+//!   rescheduling are held back the same way. The clock, output rate and UST
+//!   fall behind wall time by the hold-ups; on-time completions win 1/32 of
+//!   an interval back each, and at most 200 ms is held back. Time the guest
+//!   has read is never taken back.
 //! * The relay (0x88 = 2) and DAC (0x8c = 3) mute words silence the host
 //!   output while the transfer runs on. That they mute is inferred from
 //!   when the PROM, IRIX and Linux write them; the power-on state is
@@ -75,9 +78,10 @@ use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::AudioConfig;
-use crate::dev::host_pcm::{CardClock, Sink, Wav, PCM_CHANNELS};
+use crate::dev::audio_dump::AudioDump;
+use crate::dev::host_pcm::{CardClock, Sink, PCM_CHANNELS};
 use crate::devlog::LogModule;
-use crate::host_audio::Output;
+use crate::host_audio::{Meter, Output, Skip};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
@@ -125,18 +129,18 @@ const UST_LATCH_MASK: u32 = 0x3_ffff;
 
 const STATUS_CLOCK_HZ: u64 = 33_000_000;
 
-/// A 16-bit host sample sits in bits [23:8] of its 24-bit ring sample.
+/// A 16-bit host sample sits in bits \[23:8\] of its 24-bit ring sample.
 const SAMPLE_SHIFT: u32 = 8;
 /// The analog rings' words per frame.
 const ANALOG_WORDS: usize = 2;
 
-/// One ring word's 24-bit sample as a 16-bit host sample, bits [23:8].
+/// One ring word's 24-bit sample as a 16-bit host sample, bits \[23:8\].
 fn word_to_sample(word: u32) -> i16 {
     (word >> SAMPLE_SHIFT) as i16
 }
 
-/// One 16-bit host sample as a ring word: bits [23:8], sign-extended
-/// through [31:24], bits [7:0] zero.
+/// One 16-bit host sample as a ring word: bits \[23:8\], sign-extended
+/// through \[31:24\], bits \[7:0\] zero.
 fn sample_to_word(sample: i16) -> u32 {
     (i32::from(sample) << SAMPLE_SHIFT) as u32
 }
@@ -635,11 +639,11 @@ impl Rad1 {
     }
 }
 
-/// Lock order: `tick_pass`, then `stopped_at` (a leaf, taken by `now`; both
-/// in [`CardClock`]),
-/// then `state`. Rings and status slots are moved with `state` held: the
-/// DMA goes down through the Bridge and HEART, which never call back into
-/// the card, and a catch-up moves at most two revolutions of a ring.
+/// Lock order: `tick_pass`, then `state`, then `stopped_at` (a leaf, taken by
+/// `now`; both in [`CardClock`]). Rings and status slots are moved with
+/// `state` held: the DMA goes down through the Bridge and HEART, which never
+/// call back into the card, and a catch-up moves at most two revolutions of a
+/// ring.
 pub struct Inner {
     pci: PciFunctionState,
     state: Mutex<State>,
@@ -651,6 +655,8 @@ pub struct Inner {
     /// `no_audio`) keeps the output channel running silently.
     audio_cfg: Mutex<Option<AudioConfig>>,
     sink: Mutex<Option<Sink>>,
+    /// What the analog channels moved and skipped (`audio status`).
+    meter: Arc<Meter>,
     /// Opens the host stream; tests put their own ring behind it.
     open_host: fn(&Inner, &AudioConfig) -> Option<Output>,
     /// Whether the host stream is full, so each run of dropped output is
@@ -695,6 +701,7 @@ impl Inner {
             timers: OnceLock::new(),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
+            meter: Meter::new(if ust_free_running { "RAD1 (MediaIO)" } else { "RAD1" }, &["analog in", "analog out"]),
             open_host: open_host_output,
             host_full: AtomicBool::new(false),
             mute_words: revision != RAD1_REVISION_MEDIAIO,
@@ -794,13 +801,19 @@ impl Inner {
         let now = Instant::now();
         let host = (self.open_host)(self, &cfg);
         crate::dlog!(LogModule::Rad1, "rad1: host audio open took {:.1} ms ({})", now.elapsed().as_secs_f64() * 1e3, if host.is_some() { "open" } else { "failed" });
-        let wav = std::env::var_os("IRIS_OCTANE_AUDIO_WAV").and_then(|p| Wav::create(&p));
-        *sink = Some(Sink { host, wav, tap: None });
+        *sink = Some(Sink { host, dump: AudioDump::from_env(), tap: None });
     }
 
     /// Times the host stream ran dry while the card was playing.
     pub fn underruns(&self) -> u64 {
         self.sink.lock().as_ref().and_then(|sk| sk.host.as_ref()).map_or(0, |o| o.stats().underruns)
+    }
+
+    /// Frames due that the chain end or DMA failure will never move: dropped
+    /// once, and counted in the channel so they are not owed again.
+    fn lost(&self, s: &mut State, idx: usize, frames: u64) {
+        s.chan[idx].frames += frames;
+        self.meter.skipped(idx, Skip::Dry, frames);
     }
 
     /// Stop the card's clock and hold the timers off guest memory while the
@@ -869,8 +882,8 @@ impl Inner {
     }
 
     fn read(&self, off: u32, width: usize) -> u32 {
-        let now = self.now();
         let mut s = self.state.lock();
+        let now = self.clock_now(&s);
         if width == 4 {
             if let Some(i) = Self::startup_index(off) {
                 return s.startup[i];
@@ -909,8 +922,8 @@ impl Inner {
     /// fails the bus cycle; this bus layer cannot, so a refused write leaves
     /// the register unchanged.
     fn write(&self, off: u32, val: u32, width: usize) {
-        let now = self.now();
         let mut s = self.state.lock();
+        let now = self.clock_now(&s);
         if self.write_locked(&mut s, off, val, width, now).is_none() {
             crate::dlog!(LogModule::Rad1, "rad1: unsupported {width}-byte BAR0 write at {off:#x} value {val:#x}");
         }
@@ -1190,9 +1203,24 @@ impl Inner {
             return TimerReturn::Delete;
         }
         match self.status_tick(gen) {
-            Some(next) => TimerReturn::RescheduleOneShot(Duration::from_nanos((next - self.now()).max(0) as u64)),
+            Some(next) => TimerReturn::RescheduleOneShot(self.wait_until(next)),
             None => TimerReturn::Delete,
         }
+    }
+
+    /// The wait for a completion due at `next`, read through the hold-up rule.
+    fn wait_until(&self, next: i64) -> Duration {
+        let s = self.state.lock();
+        Duration::from_nanos((next - self.clock_now(&s)).max(0) as u64)
+    }
+
+    /// The clock for reads other than completions; see [`CardClock::look`].
+    fn clock_now(&self, s: &State) -> i64 {
+        if !s.status_running {
+            return self.now();
+        }
+        let due = Self::status_deadline(s, s.status_done + 1);
+        self.look(due, Self::status_deadline(s, 1) - s.status_start_ns)
     }
 
     /// When completion `k` of the current schedule is due.
@@ -1335,6 +1363,7 @@ impl Inner {
         if repeats && ring_frames != 0 && frames >= 2 * ring_frames {
             let skip = (frames / ring_frames - 1) * ring_frames;
             s.chan[idx].frames += skip;
+            self.meter.skipped(idx, Skip::Stale, skip);
             s.advance_pos(idx, skip as u32);
             frames -= skip;
         }
@@ -1366,6 +1395,7 @@ impl Inner {
             });
             if !ok {
                 crate::dlog!(LogModule::Rad1, "rad1: {} DMA at {:#x} + {:#x} failed", info.name, c.base, c.offset);
+                self.lost(s, idx, frames);
                 return false;
             }
             if info.output {
@@ -1384,12 +1414,14 @@ impl Inner {
             c.offset += chunk;
             c.frames += n;
             let done = c.offset >= c.len;
+            self.meter.add(idx, n);
             s.advance_pos(idx, n as u32);
             frames -= n;
             if done && !s.descriptor_end(idx) {
                 break;
             }
         }
+        self.lost(s, idx, frames);
         true
     }
 
@@ -1419,6 +1451,17 @@ impl Device for Rad1 {
     fn stop(&self) { self.inner.pause() }
     fn is_running(&self) -> bool { self.inner.armed.load(Ordering::SeqCst) }
     fn get_clock(&self) -> u64 { 0 }
+
+    fn audio_report(&self) -> Option<String> {
+        let i = &self.inner;
+        let rates = {
+            let s = i.state.lock();
+            [CH_IN, CH_OUT].map(|idx| s.chan[idx].running.then(|| s.rate(idx).rounded_hz()))
+        };
+        let sink = i.sink.lock();
+        let outs: Vec<&Output> = sink.iter().filter_map(|sk| sk.host.as_ref()).collect();
+        Some(i.meter.report(&rates, &outs))
+    }
 }
 
 impl PciFunction for Rad1 {

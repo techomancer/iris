@@ -11,9 +11,11 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 ## PROM, NVRAM and storage
 
-- **PROM:** IRIS tries `prom` from the config, then `070-1367-012.bin` in the
-  working directory, then falls back to an embedded Indigo2 PROM
-  (`data/proms/ip22.deflate`) — not the Indy one.
+- **PROM:** iris carries the Indigo2 PROM (5.3 Rev E, not the Indy's). Left
+  at its default, `prom` tries `prom.bin` and then `070-1367-012.bin` in the
+  working directory and otherwise runs the built-in PROM; `prom = "(embedded)"`
+  selects the built-in one outright. A file `prom` names must load, or iris
+  stops with an error rather than falling back.
 - **NVRAM and MAC:** the Indigo2 keeps its PROM environment and Ethernet address
   in a 93CS56 serial EEPROM, not the Indy's DS1386. It is loaded from `nveeprom`
   (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
@@ -41,15 +43,15 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 ## Boot checklist
 
-1. Build: `cargo build --release --features lightning,rex-jit` (same as Indy), or
-   pass `--ip22` on the command line
+1. Build: `cargo build --release --features lightning,rex-jit` (same as Indy);
+   select the profile in the config or with `--machine indigo2_ip22`
 2. **Stop → Start** after changing platform (cold start picks up IRQ + VC2 bootstrap)
 3. Monitor `mc regs` → SYSID `00000010`, GIO64_ARB without `0x400`
 4. Monitor `ioc status` → `sys_id=11`, `gc_select`/`extio` visible on fullhouse
 5. Guest `hinv` → one XL graphics board
 6. X11 login on primary head (`/dev/gfx` / head 0)
 
-With **Guest** display resolution, iris bootstraps **1280×1024** on fullhouse at Start so the GUI shows a framebuffer before IRIX programs VC2 (embedded Indy PROM often delays or skips gfx init on Indigo2-class hardware).
+With **Guest** display resolution, iris bootstraps **1280×1024** on fullhouse at Start so the GUI shows a framebuffer before IRIX programs VC2 (the PROM often delays or skips graphics initialisation on Indigo2-class hardware).
 
 7. Dual-head (`graphics.heads = 2`): guest `hinv` shows two XL boards; iris-gui shows side-by-side heads; CI `screenshot` accepts `"head": 0` or `1`
 
@@ -68,9 +70,18 @@ iris-ci ping
 heads = 2
 ```
 
-Second REX3 maps at GIO slot 1 (`0x1F600000`). Snapshots include `rex3_head1.bin` and `rex3_head1_rgb.bin` / `rex3_head1_aux.bin`.
+The second board sits in GIO expansion slot 0, with its REX3 at `0x1F4F0000`: the one place IRIX looks for a second Newport. The Ultra64 board uses the same slot, so `heads = 2` turns it off, and `test_device` is refused. Snapshots include `rex3_head1.bin` and `rex3_head1_rgb.bin` / `rex3_head1_aux.bin`.
 
-Head 0 vblank → `VerticalRetrace` (Indy direct L1; fullhouse via extio `SG_RETRACE`). Head 1 vblank → `GioExp1` (Indy) or `GioExp0Retrace` / extio `S0_RETRACE` (fullhouse dual-head).
+IRIX's Newport handler reads REX3 STATUS and acts on whatever it finds there, so each board only has to raise an interrupt the driver registered for its slot:
+
+| | Retrace | FIFO |
+|---|---|---|
+| Head 0, Indy | vertical retrace (local 1) | FIFO full (local 0) |
+| Head 1, Indy | slot 0's single pin, `GIO_EXP0` (map status bit 6), shared by both sources | same pin |
+| Head 0, Indigo2 | graphics interrupt, EXT_IO `SG_IRQ_1` | EXT_IO `SG_IRQ_2` |
+| Head 1, Indigo2 | graphics interrupt, EXT_IO `S0_IRQ_1` | EXT_IO `S0_IRQ_2` |
+
+On Indigo2 the two slots share the local 0 bits; each bit is set while either slot's EXT_IO bit is low.
 
 ## IRQ routing (fullhouse)
 
@@ -86,7 +97,7 @@ boards. There is no separate `[impact]` section. See
 [GR2 graphics](graphics/gr2-xz-extreme.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
 
 For the R10000 Indigo2 profile and larger RAM banks, see
-[Indigo2 IP28](indigo2-ip28.md). IP28 has its own embedded PROM fallback.
+[Indigo2 IP28](indigo2-ip28.md). IP28 has its own built-in PROM.
 
 ## Remaining gaps
 

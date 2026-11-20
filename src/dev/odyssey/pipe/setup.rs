@@ -603,9 +603,9 @@ impl Draw<'_> {
     }
 
     /// One aliased line pixel at window pixel (px, py) of the segment
-    /// whose triangle is t (line_tri()), at parameter l1[0], with l1[1]
-    /// and l1[2] the parameter one pixel on in x and in y (the texture's
-    /// level of detail) and l1[3] both: the quad stage of shade_quad() for
+    /// whose triangle is t (line_tri()), at parameter l1\[0\], with l1\[1\]
+    /// and l1\[2\] the parameter one pixel on in x and in y (the texture's
+    /// level of detail) and l1\[3\] both: the quad stage of shade_quad() for
     /// one pixel at barycentrics (l1, 0), with no polygon stipple, then
     /// stored.
     pub(super) fn line_pixel(&self, t: &Tri, px: i32, py: i32, l1: [f32; 4], steps: i64) {

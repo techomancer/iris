@@ -19,13 +19,15 @@ pub(super) const PI_GFX_BIAS: u32 = 2;
 pub(super) const PI_GFX_INT_COUNT: u32 = 3;
 pub(super) const PI_GFX_SLOT_REGS: u32 = 5;
 
-/// Page: bit 40 enables it, bits 39:17 name it; the rest is reserved.
-pub(super) const PI_GFX_PAGE_ENABLE: u64 = 1 << 40;
-pub(super) const PI_GFX_PAGE_ADDRESS: u64 = 0xfffffe0000;
+/// Page: bit 40 enables it, bits 39:17 name it; the rest is reserved. The
+/// field positions are the Bedrock's, and inferred for the Hub.
+use crate::dev::bedrock::regs::pi as reg;
+pub(super) const PI_GFX_PAGE_ENABLE: u64 = reg::GFX_PAGE_A::GPA_EN_GFX_PAGE::MASK;
+pub(super) const PI_GFX_PAGE_ADDRESS: u64 = reg::GFX_PAGE_A::GPA_GFX_PAGE_ADDR::MASK;
 pub(super) const PI_GFX_PAGE_MASK: u64 = PI_GFX_PAGE_ENABLE | PI_GFX_PAGE_ADDRESS;
-pub(super) const PI_GFX_CREDIT_MASK: u32 = 0xfff;
-pub(super) const PI_GFX_BIAS_MASK: u32 = 0xfff;
-pub(super) const PI_GFX_INT_MASK: u32 = 0x3ffffff;
+pub(super) const PI_GFX_CREDIT_MASK: u32 = reg::GFX_CREDIT_CNTR_A::GCCA_GFX_CREDIT_CNTR::MASK as u32;
+pub(super) const PI_GFX_BIAS_MASK: u32 = reg::GFX_BIAS_A::GBA_GFX_BIAS::MASK as u32;
+pub(super) const PI_GFX_INT_MASK: u32 = reg::GFX_INT_CNTR_A::GICA_GFX_INT_CNTR::MASK as u32;
 
 #[derive(Clone, Copy, Default)]
 pub struct PiGfx {

@@ -1,6 +1,6 @@
 # The audio test suite (`test/audiotest`): rates x channels x widths
 
-**Keywords:** audio,rad1,octane,o2,mace,sample rate,alSetParams,playaiff,sfplay,audiotest,sweep,capture,IRIS_OCTANE_AUDIO_WAV,IRIS_O2_AUDIO_DUMP
+**Keywords:** audio,rad1,octane,o2,mace,sample rate,alSetParams,playaiff,sfplay,audiotest,sweep,capture,IRIS_AUDIO_DUMP
 
 A guest program that plays a tone through the IRIX audio library, a sweep
 that runs it and the stock players over every rate and format, and a host
@@ -16,7 +16,7 @@ played at the wrong speed, and so did every sound after it.
 | `irix.sh` | guest | builds it with MIPSpro `cc -mips3 -n32 -laudio -lm` |
 | `sweep.sh` | guest | `cases`, `prep NAME`, `play NAME`, `all` (see its header) |
 | `host.sh` | host | copies the test in, builds it, and plays each case, noting the capture's size before and after |
-| `check.py` | host | slices the capture (Octane WAV or O2 dump) and prints PASS or FAIL per case |
+| `check.py` | host | slices the capture (a WAV or an `IRIS_AUDIO_DUMP` dump) and prints PASS or FAIL per case |
 
 ## Cases
 
@@ -48,20 +48,21 @@ socket on (`ci = true`, `ci_socket`), plus a scratch volume for `iris-ci put`
 (`[scsi.N]` with `scratch = true`). The emulator records the card's output
 to a file:
 
-- Octane: `IRIS_OCTANE_AUDIO_WAV=FILE` writes a 44.1 kHz stereo 16-bit WAV.
-- O2: `IRIS_O2_AUDIO_DUMP=FILE` writes what MACE audio played at the guest's
-  own rate, before resampling, as records of output (u8), rate (u32) and
-  pair count (u32), then the pairs, little-endian. It needs no host sound
-  device. `check.py` measures each case at its records' rate.
+- `IRIS_AUDIO_DUMP=FILE` writes what the card played at its own rate, before
+  resampling, as records of output (u8), rate (u32) and pair count (u32),
+  then the pairs, little-endian (`src/dev/audio_dump.rs`). It needs no host
+  sound device, but RAD1 and the ICE1724 record nothing under `no_audio`.
+  `check.py` measures each case at its records' rate.
+- `[audio] file = "FILE"` writes a 48 kHz stereo 16-bit WAV of what the host
+  stream plays; `check.py` reads the rate from its header.
 
 ```sh
-IRIS_OCTANE_AUDIO_WAV=/path/cap iris --config octane.toml &   # or
-IRIS_O2_AUDIO_DUMP=/path/cap iris --config o2.toml &          # then: iris-ci start
+IRIS_AUDIO_DUMP=/path/cap iris --config octane.toml &   # then: iris-ci start
 sh test/audiotest/host.sh /path/ci.sock /path/cap /path/out [EGREP_PATTERN]
 python3 test/audiotest/check.py /path/cap /path/out/marks.txt
 ```
 
-`check.py` tells the two formats apart by the first four bytes. The O2 needs
+`check.py` tells a WAV from a dump by the first four bytes. The O2 needs
 `overlay = true` on a disk in a writable directory (the disk image must be
 inside the run directory, e.g. hard-linked as `disk.raw`) and `ci = true`
 to run headless. A full run takes about 4 minutes on the O2 and tens of
@@ -128,10 +129,14 @@ one. Register reads now bring the rings up to date first.
 
 Indy and Indigo2 (HAL2): not covered. HAL2 has only the host-side capture
 (`IRIS_HAL2_CAPTURE`, a WAV of what the host device is given, at the
-device's rate). A guest-rate dump like the O2's is planned.
+device's rate) and `IRIS_AUDIO_DUMP`, which `check.py` can read but the
+sweep has not been run against.
 
 
 ## Gotchas
+
+- An O2 capture is about 10.5 dB below its source, on purpose: IRIX leaves
+  the AD1843 DAC1 analog gain at `0x0f0f` and `dac_gain` applies that.
 
 - `cc` prints a MIPSpro license-password notice on this disk and builds
   anyway. `irix.sh` succeeds; check that `audiotest` exists.
@@ -146,7 +151,7 @@ device's rate). A guest-rate dump like the O2's is planned.
   before the first case; `host.sh` counts that as size 0. The O2's dump
   already holds the boot chime (22 MB at 34 and 48 kHz) by login; marks are
   offsets, so it does not matter.
-- The O2 dump's cases are the records that start inside the case's span, in
+- The dump's cases are the records that start inside the case's span, in
   the group (output, rate) with the most non-zero samples. A program that
   sets the rate after it starts leaves records at the old rate: the idle
   channel's silence, 0.4 s of it at 48 kHz before the first case, which

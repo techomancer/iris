@@ -132,7 +132,7 @@ impl Snapshot {
 }
 
 /// A scratch directory under the container's temp dir, removed when dropped.
-/// The name is kept short: the CI socket inside it must fit a UNIX socket path.
+/// The name is kept short: the CI socket inside it must be within a UNIX socket path.
 struct Dir(TempPath);
 
 impl Dir {
@@ -307,8 +307,8 @@ fn with_buses<R>(m: &mut dyn Workstation, f: impl FnOnce(&[&ScsiBus]) -> R) -> R
         let buses: Vec<&ScsiBus> = m.scsi.iter().map(|c| c.bus()).collect();
         return f(&buses);
     }
-    if let Some(m) = any.downcast_mut::<crate::ip53_machine::TezroMachine>() {
-        return f(&m.scsi_buses());
+    if let Some(m) = any.downcast_mut::<crate::sn::Machine<crate::dev::bedrock::Bedrock, crate::dev::bedrock_flash::Flash>>() {
+        return m.with_disks(f);
     }
     panic!("unknown machine type");
 }
@@ -452,7 +452,7 @@ fn guest_power_off(m: &mut dyn Workstation) {
         w8(reg::BYTEBUS_DEV2, 0x10);
         w8(reg::BYTEBUS_DEV1, 0x4a);
         w8(reg::BYTEBUS_DEV2, 0x08);
-    } else if let Some(m) = any.downcast_mut::<crate::ip53_machine::TezroMachine>() {
+    } else if let Some(m) = any.downcast_mut::<crate::sn::Machine<crate::dev::bedrock::Bedrock, crate::dev::bedrock_flash::Flash>>() {
         // The L1 console, which the CI connection drives: Ctrl-T escapes to
         // the L1's prompt for one command, and a console power down takes a
         // second `pwr d` to confirm. The L1 then reports the shutdown that
@@ -698,7 +698,7 @@ impl Workstation for Probe {
     fn cpu_is_running(&self) -> bool { self.0.cpu_is_running() }
     fn machine_slot(&mut self) -> workstation::MachineSlot { self.0.machine_slot() }
     fn register_system_controller(&mut self) { self.0.register_system_controller() }
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { self.0.monitor_addr() }
+    fn monitor(&self) -> &std::sync::Arc<crate::monitor::Monitor> { self.0.monitor() }
     fn lifecycle(&self) -> crate::machine_state::GuestState { self.0.lifecycle() }
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.0.set_lifecycle(state) }
     fn get_display(&self) -> Option<std::sync::Arc<dyn crate::gfx_display::GfxDisplay>> { self.0.get_display() }

@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_variables, unused_imports)]
-#![cfg_attr(any(feature = "rex-gpu", feature = "wgpu"), recursion_limit = "256")]
+// `regs!` recurses once per constant, and the Hub register file has 133.
+#![recursion_limit = "256"]
 
 #[cfg(all(feature = "lightning", feature = "developer"))]
 compile_error!(
@@ -50,15 +51,11 @@ compile_error!(
 
 #[cfg(feature = "r5ksc_triton")]
 compile_error!(
-    "`r5ksc_triton` models the O2's on-die R5000 L2, not a machine IRIS \
-     emulates (IRIS targets Indy/Indigo2; an Indy R5000 board has the \
-     external R4600SC-style secondary cache instead — that's `r5ksc`, which \
-     is ALSO currently broken and separately refused below). It's also \
-     unfinished on its own terms: `cargo test --features r5ksc_triton` \
-     fails mips_cache_v2::tests::cache_op_index_inv_l1i. Refusing to build \
-     rather than silently shipping a broken cache model for a machine this \
-     emulator doesn't target. See src/cpu/mips_cache_v2.rs and \
-     clanker/cpu/r5k-l1i-cache-bugs.md."
+    "`r5ksc_triton` is an unfinished O2/Triton R5000 secondary-cache model. \
+     It is not the cache used by the supported O2 profile and cannot be \
+     enabled: cache_op_index_inv_l1i fails with this model. The separate \
+     external R5000 secondary-cache model (`r5ksc`) is also disabled. See \
+     src/cpu/mips_cache_v2.rs and clanker/cpu/r5k-l1i-cache-bugs.md."
 );
 
 #[cfg(feature = "r5ksc")]
@@ -180,11 +177,11 @@ pub mod ip32_machine;
 /// The SGI Octane (IP30): its bus and machine -- see `docs/octane-ip30-address-map.md`.
 pub mod ip30;
 pub mod ip30_machine;
-/// The SN0 node: its processor bus, memory and uncached views. The Origin 200 and
+/// The IP27 node: its processor bus, memory and uncached views. The Origin 200 and
 /// the Origin 2000 and Onyx2 desksides are built from it.
 pub mod ip27;
 pub mod ip27_machine;
-pub mod ip27_deskside;
+pub mod ip29_machine;
 /// Fuel has an IP34 board and uses the IP35 software platform and processor views.
 pub mod ip35;
 pub mod ip34_machine;
@@ -193,7 +190,8 @@ pub mod ip53_machine;
 /// Bounded MMIO windows and the sparse map of them the SN machines place in
 /// an address map, and the physical address masks they share.
 pub mod window_map;
-pub mod node_windows;
+/// The Scalable Node (SN) layer both IP27 and IP35 boards build on: nodes, their memory and uncached views.
+pub mod sn;
 pub mod machine_state;
 pub mod platform;
 pub mod physical;
@@ -226,6 +224,7 @@ pub mod gfifo;
 pub mod wgpu;
 pub mod trace_writer;
 pub mod gfx_display;
+pub mod display;
 pub mod hostinput;
 pub mod keysym;
 pub mod vnc;
@@ -265,6 +264,8 @@ mod display_stop_tests;
 mod platform_profile_tests;
 #[cfg(test)]
 mod exit_persistence_tests;
+#[cfg(test)]
+mod chime_tests;
 #[cfg(test)]
 mod block_node_sync_bench;
 #[cfg(test)]

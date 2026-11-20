@@ -10,9 +10,10 @@
 // ── Where this sits in IRIS ──────────────────────────────────────────────────
 //
 // This is the same shape as `seeq8003` with a different front end: the device
-// owns the near ends of a `Link`'s two `rtrb` rings and the link's backend (a
-// `NatEngine` or a PcapEngine) runs on its own `daynaN-net` thread. Instead of DMA descriptor rings driven
-// by MMIO registers, the front end is five SCSI CDBs:
+// owns the near ends of a `Link`'s two `rtrb` rings, and its `net::Session`
+// runs the link's backend (a `NatEngine` or a PcapEngine) on its own
+// `daynaN-net` thread, a fresh one each `start`. Instead of DMA descriptor
+// rings driven by MMIO registers, the front end is five SCSI CDBs:
 //
 //     WRITE(6)  → push a frame to `tx_prod`   (guest → world)
 //     READ(6)   → pop frames from `rx_cons`   (world → guest), each wrapped in
@@ -23,7 +24,8 @@
 //
 // ── Concurrency ──────────────────────────────────────────────────────────────
 //
-// `request()` runs on the WD33C93A worker thread with `Wd33c93aState` locked.
+// `request()` runs on the WD33C93A worker thread (only the WD33C93A builds a
+// DaynaPort), with `Wd33c93aState` and the bus's target table locked.
 // Everything it touches is either owned outright (`&mut self`) or lock-free
 // (the rtrb rings, the atomics), so it never blocks and never calls back up
 // into the controller — see HACKING.md on per-device concurrency.
@@ -43,9 +45,9 @@ use crate::net::{eth_summary, mac_str, GatewayConfig, Link, NatControl};
 use crate::scsi::{ScsiRequest, ScsiResponse};
 
 // ── Command set ──────────────────────────────────────────────────────────────
-// NB: 0x08 and 0x0A collide with SCSI READ(6)/WRITE(6). A DaynaPort target is
-// dispatched *before* the storage opcodes in `ScsiDevice::request`, so these
-// never reach the disk path.
+// NB: 0x08 and 0x0A collide with SCSI READ(6)/WRITE(6). A DaynaPort is a
+// `ScsiTarget` of its own (`scsi/bus.rs`), not a `ScsiDevice`, so these never
+// reach the disk path.
 pub mod dp_cmd {
     /// Receive queued packet(s). Device → host.
     pub const READ: u8 = 0x08;

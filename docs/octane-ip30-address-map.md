@@ -248,8 +248,10 @@ which select is active. The flash is written with the usual command set
 (0xFFFF read array, 0x9090 read ID, 0x7070 status, 0x5050 clear status,
 0x4040 program, 0x2020 erase then 0xD0D0 confirm); it identifies as
 manufacturer 0x00B0, device 0x66A8, and the Bridge's control register
-bit 31 is its write enable. snorlax's main PROM is 4.17 (July 2014); the
-shipped `/usr/cpu/firmware/IP30prom.bin` is 4.9.
+bit 31 is its write enable. snorlax's main PROM is 4.17. The
+`/usr/cpu/firmware/IP30prom.bin` the IRIX 6.5.30 media ship, which iris
+carries as its built-in Octane PROM, holds the same main PROM 4.17; the 4.9
+in it is the banner of its first stage.
 
 ## 7. The Bridge's XIO space (widget 15)
 
@@ -469,8 +471,9 @@ smaller than that at the top of memory is reached through the bus.
 
 The bus is 40 bits wide end to end, so memory beyond 4 GB and the 64 GB
 windows at `w << 36` (§2's huge windows, which `src/ip30.rs` calls large)
-are in the table; a widget is attached with or without that window (the
-Bridge's is not). Bus masters
+are in the table; a widget is attached with or without that window, and a
+Bridge's 64 GB window is a view of its XIO space of its own (the small window,
+the PCI memory aliases and PCI I/O space, §8). Bus masters
 (the Bridge's PCI functions, HQ4) do not see the processor's map: they get
 SDRAM only, by 64-bit physical address, through HEART's DMA view; an absent
 bank is a bus error where the CPU reads 0. A device window page that one PCI
@@ -486,9 +489,11 @@ Where IRIS differs from the notes above, or settles what they leave open:
   counters, so code rewritten at the exception vectors is recompiled. Whether
   bus masters reach 0x2000_0000..+16 KB is not known; the DMA view does. See
   `clanker/devices/ip30-low-memory-aliases-sdram.md`.
-- The graphics board is Solid IMPACT on widget 11, not snorlax's GM10 on
-  widget 12. The Crossbow link to it is up when the board is fitted.
-- The Crossbow reports revision 1.3 where snorlax's is 1.2.
+- The graphics board is Solid IMPACT by default, on widget 11, not snorlax's
+  GM10 on widget 12; the other IMPACT and VPro boards sit there too. The
+  Crossbow link to it is up when a board is fitted.
+- The Crossbow reports revision 1.3 where snorlax's is 1.2, or 1.4 with a V10
+  or V12, which shipped only in the Octane2.
 - The board records on the MicroLANs (HEART's processor module, the Bridge's
   system board, IOC3's MAC part) carry synthetic barcodes and serial
   numbers.

@@ -176,6 +176,11 @@ hardware comparison says the model was wrong) and the board comparisons
   paths (clears, 2D fills, image bursts) and texel fetch walk runs of up to
   16 contiguous pixels within a tile. The branchy path stays as the
   reference: check bit-exact against it, and time on the Quake replay.
+  Partly done: `61fcc816` (2026-11-05) made board memory 64-bit words with
+  colour, depth and blend stores specialised per format and blend, and
+  `030a00ee` (2026-11-13) composes the display a tile row at a time through
+  readers monomorphised over the codec and pixel size. Quad addressing and
+  span/texel runs are still open.
 - Settle the order inside a tile and the depth/stencil split on the V10
   with raw `MMxfr` reads at shifted origins (`ignore/odsy/docs/measured.md`
   section 8).

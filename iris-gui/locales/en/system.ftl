@@ -3,7 +3,13 @@
 ## Stop confirmation
 
 # $id is a SCSI ID (a number).
-safestop-writable-disk = SCSI disk { $id } is read-write. Stopping while IRIX is running can corrupt its filesystem.
+# $disk names the disk: SCSI 1 (SCSI 1:3 on controller 1), Fibre Channel 1 or NVMe.
+safestop-writable-disk = { $disk } is read-write. Stopping while IRIX is running can corrupt its filesystem.
+# $id is the disk's Fibre Channel loop ID.
+safestop-fc-disk = Fibre Channel { $id }
+# $id is a SCSI id, or controller:id on the second controller.
+safestop-scsi-disk = SCSI { $id }
+safestop-nvme-disk = NVMe
 
 ## Machine folders
 

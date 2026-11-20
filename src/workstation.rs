@@ -2,9 +2,10 @@
 //!
 //! `main.rs`, the window (`ui.rs`), the CI socket (`ci.rs`), the monitor's
 //! system commands and iris-gui hold a `Box<dyn Workstation>` (or reach one
-//! through a [`MachineSlot`]) rather than a concrete machine type. Today the
-//! one implementation is [`Machine`], the Indy and Indigo2 family; a machine
-//! built around a different chipset implements the same trait.
+//! through a [`MachineSlot`]) rather than a concrete machine type. [`Machine`]
+//! implements the Indy and Indigo2 family; the O2, Octane, Origin 200,
+//! Origin 2000/Onyx2, Fuel, Tezro and Origin 3200/Onyx 3000 machines
+//! implement the same trait, and [`build`] picks one by profile.
 //!
 //! The trait splits in two. The required methods are what every machine has:
 //! starting and stopping, the screen, the keyboard and mouse, the serial
@@ -44,17 +45,24 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
         eprintln!("iris: {line}");
     }
     match cfg.machine.profile {
-        crate::config::MachineProfile::FuelIp34 => Ok(Box::new(crate::ip34_machine::FuelMachine::new(&cfg)?)),
-        crate::config::MachineProfile::TezroIp53 => Ok(Box::new(crate::ip53_machine::TezroMachine::new(&cfg)?)),
-        crate::config::MachineProfile::Origin3200Ip35 => Ok(Box::new(crate::ip35_machine::Origin3200Machine::new(&cfg)?)),
-        crate::config::MachineProfile::Onyx3000Ip35 => Ok(Box::new(crate::ip35_machine::Onyx3000Machine::new(&cfg)?)),
+        crate::config::MachineProfile::FuelIp34 => {
+            Ok(Box::new(crate::ip35::machine(&cfg, crate::ip34_machine::node_specs, crate::ip34_machine::build_io)?))
+        }
+        crate::config::MachineProfile::TezroIp53 => {
+            Ok(Box::new(crate::ip35::machine(&cfg, crate::ip53_machine::node_specs, crate::ip53_machine::build_io)?))
+        }
+        crate::config::MachineProfile::Origin3200Ip35 | crate::config::MachineProfile::Onyx3000Ip35 => {
+            Ok(Box::new(crate::ip35::machine(&cfg, crate::ip35_machine::node_specs, crate::ip35_machine::build_io)?))
+        }
         // The O2 is its own machine (CRIME, MACE, GBE), not an MC/HPC3 one.
         crate::config::MachineProfile::O2Ip32 => Ok(Box::new(crate::ip32_machine::O2Machine::new(&cfg)?)),
         // So is the Octane (HEART, Xbow, Bridge).
         crate::config::MachineProfile::OctaneIp30 => Ok(Box::new(crate::ip30_machine::OctaneMachine::new(&cfg)?)),
-        crate::config::MachineProfile::Origin200Ip29 => Ok(Box::new(crate::ip27_machine::Origin200Machine::new(&cfg)?)),
+        crate::config::MachineProfile::Origin200Ip29 => {
+            Ok(Box::new(crate::ip27::machine(&cfg, crate::ip29_machine::node_specs, crate::ip29_machine::build_io)?))
+        }
         crate::config::MachineProfile::Origin2000Ip27 | crate::config::MachineProfile::Onyx2Ip27 => {
-            Ok(Box::new(crate::ip27_deskside::DesksideMachine::new(&cfg)?))
+            Ok(Box::new(crate::ip27::machine(&cfg, crate::ip27_machine::node_specs, crate::ip27_machine::build_io)?))
         }
         _ => Ok(Box::new(Machine::try_new(cfg)?)),
     }
@@ -62,18 +70,21 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
 
 #[cfg(test)]
 #[test]
-fn build_rejects_newport_resident_wgpu_raster_without_prior_config_validation() {
-    for profile in [
-        crate::config::MachineProfile::IndyIp24,
-        crate::config::MachineProfile::Indigo2Ip22,
-        crate::config::MachineProfile::Indigo2Ip28,
-    ] {
-        let mut cfg = MachineConfig::default();
-        cfg.machine.profile = profile;
-        cfg.graphics.raster = crate::config::RasterUnit::Wgpu;
-        let error = build(cfg).err().expect("Newport raster gate");
-        assert!(error.contains("until M3") && error.contains("IRIS_REX3_GPU"), "{error}");
-    }
+fn build_checks_newport_resident_mode_without_prior_full_validation() {
+    let mut cfg = MachineConfig::default();
+    cfg.graphics.newport_mode = Some(crate::config::NewportWgpuMode::Readback);
+    let error = build(cfg).err().expect("Newport mode gate");
+    assert!(error.contains("applies only"), "{error}");
+}
+
+#[cfg(all(test, not(feature = "wgpu")))]
+#[test]
+fn build_rejects_newport_wgpu_raster_without_the_feature() {
+    let mut cfg = MachineConfig::default();
+    cfg.graphics.raster = crate::config::RasterUnit::Wgpu;
+    cfg.renderer = crate::config::UiRenderer::Wgpu;
+    let error = build(cfg).err().expect("Newport wgpu feature gate");
+    assert!(error.contains("wgpu feature"), "{error}");
 }
 
 /// The line a machine that takes `[machine] emu_id` prints at start-up: the
@@ -139,9 +150,13 @@ pub trait Workstation: Send {
     /// and start the thread that carries out the devices' machine events.
     /// Call once, after the machine is boxed.
     fn register_system_controller(&mut self);
-    /// The address the machine's monitor serves on, or None when it could not
-    /// bind its port or has not started.
-    fn monitor_addr(&self) -> Option<std::net::SocketAddr>;
+    /// The machine's monitor.
+    fn monitor(&self) -> &Arc<crate::monitor::Monitor>;
+    /// The address the monitor serves on, or None when it could not bind its
+    /// port or has not started.
+    fn monitor_addr(&self) -> Option<std::net::SocketAddr> {
+        self.monitor().bound_addr()
+    }
 
     /// Where the machine is in its start/stop lifecycle, as it stores it.
     /// Never `Running`: [`Workstation::status`] derives that from the CPU's

@@ -172,8 +172,14 @@ pub fn gl_regs(rng: &mut Rng, regs: &mut Regs, tex_bias: f64) {
     regs.push((reg::BLENDCOLOR_RG, rng.u32() & 0x0FFF_0FFF));
     regs.push((reg::BLENDCOLOR_BA, rng.u32() & 0x0FFF_0FFF));
     let tex_on = rng.chance(tex_bias);
-    let m1 = (rng.u32() & 0xFFE) | tex_on as u32;
+    // Texture colour tables (bits 15:13) on some.
+    let lut = if rng.chance(0.4) { (rng.below(8) as u32) << super::te1::TEXMODE1_LUT_SHIFT } else { 0 };
+    let m1 = (rng.u32() & 0xFFE) | tex_on as u32 | lut;
     regs.push((te::TEXMODE1, m1));
+    regs.push((reg::INDIRECT_ADDR, super::te1::TEX_LUT_DEV));
+    for _ in 0..super::te1::TEX_LUT_LEN {
+        regs.push((reg::INDIRECT_DATA, rng.u32() & 0xFF));
+    }
     // Detail textures (bit 9) on a quarter of them: the JIT declines them.
     let detail = rng.chance(0.25);
     regs.push((te::TEXMODE2, rng.u32() & 0xFFDFF | (detail as u32) << 9));

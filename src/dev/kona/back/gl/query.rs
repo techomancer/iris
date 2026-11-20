@@ -79,7 +79,7 @@ pub struct Feed {
     /// would write are the stack's now.
     pub open: Option<(u32, u32)>,
     pub words: Vec<u32>,
-    /// The buffer the client gave: words that fit. None: no start seen.
+    /// The buffer the client gave: words it holds. None: no start seen.
     pub limit: Option<usize>,
     pub overflow: bool,
     /// A bracket was opened (a start) while a feedback or select mode was current: its finish
@@ -738,7 +738,7 @@ mod tests {
         let v = Fv { x: 1.0, y: 2.0, z: 0.5, ..Fv::default() };
         mode_command(&mut gl, &mut c, INSERT_FEEDBACK_PASS_THROUGH_MARKER, &[3.0f32.to_bits()]);
         gl.feed.primitive(LINE, &[v, v]);
-        // Two words of the pass-through, then the line's code and the first vertex (3 words); the rest does not fit.
+        // Two words of the pass-through, then the line's code and the first vertex (3 words); the rest is left out.
         let (w, overflow) = gl.feed.take();
         assert!(overflow);
         assert_eq!(w.len(), 8);

@@ -133,19 +133,32 @@ impl PcpDump {
     /// a live SMC race are an acceptable, clearly-labeled-by-context
     /// possibility for a debugging dump, not a correctness-critical path).
     /// Returns `Err` with the failing physical address if any word read fails.
-    pub fn capture(page: &PhysicalCodePage, bus: &dyn BusDevice) -> Result<Self, u64> {
-        let phys_base = page.pfn as u64 * PAGE_SIZE as u64;
+    ///
+    /// The bytes are read in the bank's own storage when it hands that out,
+    /// else where a CPU of the pool reaches the page (`CodeBuses::locate`);
+    /// `Err(u64::MAX)` if none does right now.
+    pub fn capture(page: &PhysicalCodePage, buses: &crate::cpu::jitv2::jitv2::CodeBuses) -> Result<Self, u64> {
+        // The bank's own storage when it hands that out, else a CPU's bus.
         let mut words = [0u32; ENTRIES_PER_PAGE];
-        for (i, w) in words.iter_mut().enumerate() {
-            let addr = phys_base + i as u64 * 4;
-            let r = bus.read32(addr);
-            if !r.is_ok() {
-                return Err(addr);
+        let pfn = if !page.words().is_null() {
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = unsafe { std::ptr::read_volatile(page.words().add(i)) };
             }
-            *w = r.data;
-        }
+            page.pfn()
+        } else {
+            let (bus, phys_base) = buses.locate(page, 0).ok_or(u64::MAX)?;
+            for (i, w) in words.iter_mut().enumerate() {
+                let addr = phys_base + i as u64 * 4;
+                let r = bus.read32(addr);
+                if !r.is_ok() {
+                    return Err(addr);
+                }
+                *w = r.data;
+            }
+            (phys_base / PAGE_SIZE as u64) as u32
+        };
         Ok(Self {
-            pfn: page.pfn,
+            pfn,
             current_gen: page.current_gen(),
             entry_gen: page.dump_entry_gen(),
             fr1: page.dump_fr1(),

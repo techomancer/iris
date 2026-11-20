@@ -4,9 +4,9 @@
 //! Ported from include/hw/misc/sgi-odyssey.h in jamesbraid/qemu-sgi-origami.
 
 use super::consts::{
-    clip, config, flctl, gl_cmd, intr, nic, write, ODSY_CONTROL_WIDGET_MASK,
-    ODSY_DEPTH_FUNC_RESET, ODSY_DRAW_MASK_RESET, ODSY_F32_ONE, ODSY_F32_POINT_EIGHT,
-    ODSY_F32_POINT_TWO, ODSY_XT_REQ_TIMEOUT_RESET,
+    clip, cmd as hw_cmd, config, flctl, gl_cmd, intr, nic, pattern, write,
+    ODSY_CONTROL_WIDGET_MASK, ODSY_DEPTH_FUNC_RESET, ODSY_DRAW_MASK_RESET, ODSY_F32_ONE,
+    ODSY_F32_POINT_EIGHT, ODSY_F32_POINT_TWO, ODSY_XT_REQ_TIMEOUT_RESET,
 };
 use super::fifo::CommandFifo;
 use super::geometry::LightScratch;
@@ -61,7 +61,7 @@ pub(super) const ODSY_GL_WINDOW_ENTRIES: u32 = 0xc7;
 pub(super) const ODSY_WIDTH: u32 = 1280;
 pub(super) const ODSY_HEIGHT: u32 = 1024;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct OpenVertex {
     pub word: u32,
     pub operands: [u32; 4],
@@ -120,6 +120,7 @@ pub(super) struct Reports {
 /// The vertex side's texture registers: the current texture coordinate
 /// and the linear texgen planes. The fragment side's are in the draw state
 /// slots (pipe::texture::TexRegs).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct TexState {
     pub coord: [u32; 2],
     pub coord_r: u32,
@@ -131,6 +132,7 @@ pub(super) struct TexState {
 }
 
 /// The current-query and raster-position records the kernel reads back.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Query {
     // The command-FIFO interpreter (0x110000).
     pub current: [[u32; 5]; 5],
@@ -186,6 +188,7 @@ pub(super) struct ImageRaster {
 
 /// The command-FIFO interpreter (0x110000): the word being parsed and its
 /// operands.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct CommandParse {
     pub state: u32,
     pub tag: u32,
@@ -197,6 +200,7 @@ pub(super) struct CommandParse {
 
 /// Where the current context's window is, and the window as the kernel last
 /// pushed it on its own port.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Window {
     // Where the current context's window is.
     pub origin: [i32; 2],
@@ -218,6 +222,7 @@ pub(super) struct Window {
 /// The widget's configuration and the host-side registers that live on the
 /// board: the properties, the modelled registers and the back end's indexed
 /// file.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Widget {
     // Properties.
     pub revision: u32,
@@ -312,6 +317,7 @@ pub(super) struct Geometry {
 
 /// The 2D stream's GL immediate-mode subset, the X server's and greeter's
 /// drawing: points, lines, polygons and the one-bit text pattern.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Stream2d {
     // The 2D stream's GL immediate-mode subset.
     pub primitive: u32,
@@ -334,6 +340,7 @@ pub(super) struct Stream2d {
 
 /// The GL primitive in flight between glBegin and glEnd, and what a context
 /// switch needs to restart it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct OpenPrimitive {
     pub in_prim: bool,
     pub begin_open: bool,
@@ -374,6 +381,8 @@ pub(super) struct Board {
     /// The queue to BUZZ's raster unit (raster_unit.rs), which owns the
     /// planes below while it has jobs.
     pub raster: std::sync::Arc<RasterQueue>,
+    /// Sticky host-GPU failure shared with the raster unit and scanout.
+    pub gpu_fault: super::reader::GpuFault,
     /// Guest memory as the board's DMA reaches it (HEART's RAM on the
     /// Octane).
     pub guest: GuestMemory,
@@ -512,12 +521,14 @@ impl Default for Board {
         let fifo = front.lock().fifo.clone();
         let raster: std::sync::Arc<RasterQueue> = Default::default();
         let display = std::sync::Arc::new(DisplayShared::new(front.clone()));
+        let gpu_fault = display.gpu_fault.clone();
         let display_fifo = std::sync::Arc::new(parking_lot::Mutex::new(DisplayFifo::new(display.clone())));
         Board {
             slot: 0,
             front,
             fifo,
             raster,
+            gpu_fault,
             guest: None,
             nic_bus: None,
             widget: Widget {
@@ -805,7 +816,7 @@ impl Board {
         let mut rom = [0u8; nic::ROM_SIZE];
 
         if self.widget.nic_serial & !nic::SERIAL_MASK != 0 {
-            return Err(format!("the sgi-odyssey one-wire serial {:#x} does not fit in 48 bits", self.widget.nic_serial));
+            return Err(format!("the sgi-odyssey one-wire serial {:#x} is wider than 48 bits", self.widget.nic_serial));
         }
         self.build_nic_rom(&mut rom);
         let mut bus = crate::dev::w1::Bus::new();
@@ -1218,7 +1229,7 @@ impl Board {
     pub fn configure(&mut self) -> Result<(), String> {
         self.resolve_product()?;
         if self.widget.revision > 0xf {
-            return Err(format!("sgi-odyssey revision must fit in four bits, not {}", self.widget.revision));
+            return Err(format!("sgi-odyssey revision must be at most four bits wide, not {}", self.widget.revision));
         }
         self.compose_memory_config()?;
         self.reset_registers();
@@ -1250,6 +1261,7 @@ impl Board {
         self.work_reset();
         // The raster unit finishes what it was given before the planes clear.
         self.raster_wait();
+        *self.gpu_fault.lock() = None;
         self.reset_registers();
         self.front.lock().update_irq();
         // Board::configure() also calls Board::reset_registers(), before
@@ -1318,6 +1330,7 @@ impl Board {
         }
         let gpu = crate::wgpu::Gpu::new(opts)?;
         let mut unit = GpuRaster::new(&gpu, self.vram.size(), PLANE_SPAN, PLANE_SPAN)?;
+        unit.attach_fault(self.gpu_fault.clone());
         self.vram.track_dirty();
         unit.attach_mirror(self.vram.ptr());
         // The display composes on the GPU too, from the same memory.
@@ -1366,5 +1379,549 @@ impl Board {
             }
         }
         s
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct BoardSnapshot {
+    widget: Widget,
+    draw_mask: u32,
+    draw_word: u32,
+    read_word: u32,
+    dest_base: u32,
+    pixel_mode: [u32; 4],
+    slots: Vec<u8>,
+    tex: TexState,
+    dma_seq: u64,
+    query: Query,
+    cmd: CommandParse,
+    win: Window,
+    stream: Stream2d,
+    assembly: Assembly,
+    prim: OpenPrimitive,
+    gl_matrix_slot: u32,
+    gl_matrix: [u32; 16],
+    gl_texture_matrix: [u32; 16],
+    gl_rect: [u32; 10],
+    gl_depth_func: u32,
+    gl_write_mask: u32,
+    alpha_word: u32,
+    stencil_word: u32,
+    logic_op_word: u32,
+    polygon_mode_word: u32,
+    polygon_offset_word: u32,
+    line_point_words: [u32; 2],
+    gl_combined: [u32; 16],
+    gl_block16: [u32; 4],
+    gl_clip_box: [u32; 2],
+    gl_fog: [u32; 6],
+    geom: GeometrySnapshot,
+    gl_color_index: u32,
+    gl_color_is_index: bool,
+    colour_mode: [u32; 2],
+    dest_buffer_word: u32,
+    plane_write_mask: u32,
+    const_colour: [u32; 2],
+    blend_word: u32,
+    image: ImageSnapshot,
+    nic: Option<crate::snapshot::BinValue>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GeometrySnapshot {
+    constants: Vec<u32>,
+    constant_index: u32,
+    entry: Vec<u32>,
+    light_colour: Vec<u32>,
+    light_vec: Vec<u32>,
+    light_colour_sel: u32,
+    light_vec_sel: u32,
+    material: [u32; 16],
+    back_material: [u32; 16],
+    shininess_sqrt: u32,
+    back_shininess_sqrt: u32,
+    colour: [u32; 4],
+    normal: [u32; 3],
+    normal_matrix: [u32; 16],
+    modelview: [u32; 16],
+    clip_eye: [u32; CLIP_PLANES as usize * 4],
+    colour_material: u32,
+    lit: bool,
+    two_sided: bool,
+    separate_specular: bool,
+    local_viewer: bool,
+    normalize: bool,
+    colour_overridden: bool,
+    program_mem: Vec<u16>,
+    program_addr: u32,
+    regs_20_35: Vec<u32>,
+    program_half: u32,
+    linear_texgen: u32,
+    sphere_texgen: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ImageSnapshot {
+    active: bool,
+    x1: u32,
+    y1: u32,
+    x2: u32,
+    y2: u32,
+    box_words: [u32; 10],
+    cur_x: u32,
+    cur_y: u32,
+    fmt: u32,
+    group_len: u32,
+    group_painted: u32,
+    code: u32,
+    write_code: u32,
+    swap: bool,
+    pixel: [u8; 16],
+    bytes: u32,
+    nbytes: u32,
+}
+
+fn exact_vec<T, const N: usize>(name: &str, values: Vec<T>) -> Result<[T; N], String> {
+    let len = values.len();
+    values
+        .try_into()
+        .map_err(|_| format!("VPro {name} has {len} entries, expected {N}"))
+}
+
+impl GeometrySnapshot {
+    fn capture(geom: &Geometry) -> Self {
+        Self {
+            constants: geom.constants.to_vec(),
+            constant_index: geom.constant_index,
+            entry: geom.entry.to_vec(),
+            light_colour: geom.light_colour.to_vec(),
+            light_vec: geom.light_vec.to_vec(),
+            light_colour_sel: geom.light_colour_sel,
+            light_vec_sel: geom.light_vec_sel,
+            material: geom.material,
+            back_material: geom.back_material,
+            shininess_sqrt: geom.shininess_sqrt,
+            back_shininess_sqrt: geom.back_shininess_sqrt,
+            colour: geom.colour,
+            normal: geom.normal,
+            normal_matrix: geom.normal_matrix,
+            modelview: geom.modelview,
+            clip_eye: geom.clip_eye,
+            colour_material: geom.colour_material,
+            lit: geom.lit,
+            two_sided: geom.two_sided,
+            separate_specular: geom.separate_specular,
+            local_viewer: geom.local_viewer,
+            normalize: geom.normalize,
+            colour_overridden: geom.colour_overridden,
+            program_mem: geom.program_mem.clone(),
+            program_addr: geom.program_addr,
+            regs_20_35: geom.regs_20_35.to_vec(),
+            program_half: geom.program_half,
+            linear_texgen: geom.linear_texgen,
+            sphere_texgen: geom.sphere_texgen,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (name, len, expected) in [
+            (
+                "geometry constants",
+                self.constants.len(),
+                ODSY_GL_CONSTANTS as usize,
+            ),
+            (
+                "geometry entries",
+                self.entry.len(),
+                ODSY_GL_ENTRIES as usize,
+            ),
+            (
+                "geometry light colours",
+                self.light_colour.len(),
+                ODSY_GL_LIGHT_COLOURS as usize * 4,
+            ),
+            (
+                "geometry light vectors",
+                self.light_vec.len(),
+                ODSY_GL_LIGHTS as usize * 16,
+            ),
+            (
+                "geometry program",
+                self.program_mem.len(),
+                (ODSY_GL_PROGRAM_ENTRIES * 6) as usize,
+            ),
+            ("geometry registers", self.regs_20_35.len(), 22),
+        ] {
+            if len != expected {
+                return Err(format!(
+                    "VPro {name} has {len} entries, expected {expected}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn into_geometry(self) -> Result<Geometry, String> {
+        self.validate()?;
+        Ok(Geometry {
+            constants: exact_vec("geometry constants", self.constants)?,
+            constant_index: self.constant_index,
+            entry: exact_vec("geometry entries", self.entry)?,
+            light_colour: exact_vec("geometry light colours", self.light_colour)?,
+            light_vec: exact_vec("geometry light vectors", self.light_vec)?,
+            light_colour_sel: self.light_colour_sel,
+            light_vec_sel: self.light_vec_sel,
+            material: self.material,
+            back_material: self.back_material,
+            shininess_sqrt: self.shininess_sqrt,
+            back_shininess_sqrt: self.back_shininess_sqrt,
+            colour: self.colour,
+            normal: self.normal,
+            normal_matrix: self.normal_matrix,
+            modelview: self.modelview,
+            clip_eye: self.clip_eye,
+            colour_material: self.colour_material,
+            lit: self.lit,
+            two_sided: self.two_sided,
+            separate_specular: self.separate_specular,
+            local_viewer: self.local_viewer,
+            normalize: self.normalize,
+            colour_overridden: self.colour_overridden,
+            program_mem: self.program_mem,
+            program_addr: self.program_addr,
+            regs_20_35: exact_vec("geometry registers", self.regs_20_35)?,
+            program_half: self.program_half,
+            linear_texgen: self.linear_texgen,
+            sphere_texgen: self.sphere_texgen,
+        })
+    }
+}
+
+impl ImageSnapshot {
+    fn capture(image: &ImageRaster) -> Self {
+        Self {
+            active: image.active,
+            x1: image.x1,
+            y1: image.y1,
+            x2: image.x2,
+            y2: image.y2,
+            box_words: image.box_words,
+            cur_x: image.cur_x,
+            cur_y: image.cur_y,
+            fmt: image.fmt,
+            group_len: image.group_len,
+            group_painted: image.group_painted,
+            code: image.code,
+            write_code: image.write_code,
+            swap: image.swap,
+            pixel: image.pixel,
+            bytes: image.bytes,
+            nbytes: image.nbytes,
+        }
+    }
+
+    fn into_image(self) -> ImageRaster {
+        ImageRaster {
+            active: self.active,
+            x1: self.x1,
+            y1: self.y1,
+            x2: self.x2,
+            y2: self.y2,
+            box_words: self.box_words,
+            cur_x: self.cur_x,
+            cur_y: self.cur_y,
+            fmt: self.fmt,
+            group_len: self.group_len,
+            group_painted: self.group_painted,
+            code: self.code,
+            write_code: self.write_code,
+            swap: self.swap,
+            pixel: self.pixel,
+            bytes: self.bytes,
+            nbytes: self.nbytes,
+            fragment: None,
+            gpu_slot: None,
+        }
+    }
+}
+
+impl BoardSnapshot {
+    pub(super) fn capture(board: &Board) -> Result<Self, String> {
+        Ok(Self {
+            widget: board.widget.clone(),
+            draw_mask: board.draw_mask,
+            draw_word: board.draw_word,
+            read_word: board.read_word,
+            dest_base: board.dest_base,
+            pixel_mode: board.pixel_mode,
+            slots: board.slots.snapshot_bytes()?,
+            tex: board.tex.clone(),
+            dma_seq: board.dma_seq,
+            query: board.query.clone(),
+            cmd: board.cmd.clone(),
+            win: board.win.clone(),
+            stream: board.stream.clone(),
+            assembly: board.assembly.clone(),
+            prim: board.prim.clone(),
+            gl_matrix_slot: board.gl_matrix_slot,
+            gl_matrix: board.gl_matrix,
+            gl_texture_matrix: board.gl_texture_matrix,
+            gl_rect: board.gl_rect,
+            gl_depth_func: board.gl_depth_func,
+            gl_write_mask: board.gl_write_mask,
+            alpha_word: board.alpha_word,
+            stencil_word: board.stencil_word,
+            logic_op_word: board.logic_op_word,
+            polygon_mode_word: board.polygon_mode_word,
+            polygon_offset_word: board.polygon_offset_word,
+            line_point_words: board.line_point_words,
+            gl_combined: board.gl_combined,
+            gl_block16: board.gl_block16,
+            gl_clip_box: board.gl_clip_box,
+            gl_fog: board.gl_fog,
+            geom: GeometrySnapshot::capture(&board.geom),
+            gl_color_index: board.gl_color_index,
+            gl_color_is_index: board.gl_color_is_index,
+            colour_mode: board.colour_mode,
+            dest_buffer_word: board.dest_buffer_word,
+            plane_write_mask: board.plane_write_mask,
+            const_colour: board.const_colour,
+            blend_word: board.blend_word,
+            image: ImageSnapshot::capture(&board.image),
+            nic: board
+                .nic_bus
+                .as_ref()
+                .map(|bus| crate::snapshot::BinValue::from_toml(&bus.save_state())),
+        })
+    }
+
+    pub(super) fn validate(&self, board: &Board) -> Result<(), String> {
+        let saved = &self.widget;
+        let running = &board.widget;
+        if (
+            saved.product.as_str(),
+            saved.revision,
+            saved.memory_size,
+            saved.memory_banks,
+            saved.cas_latency,
+            saved.backend_version,
+            saved.nic_serial,
+            saved.nic_record.as_str(),
+            saved.product_record.as_str(),
+        ) != (
+            running.product.as_str(),
+            running.revision,
+            running.memory_size,
+            running.memory_banks,
+            running.cas_latency,
+            running.backend_version,
+            running.nic_serial,
+            running.nic_record.as_str(),
+            running.product_record.as_str(),
+        ) {
+            return Err(format!(
+                "VPro snapshot board configuration does not match the running {}",
+                running.product
+            ));
+        }
+        self.geom.validate()?;
+        super::pipe::slot::Slots::decode_snapshot(&self.slots)?;
+        if self.query.stage > 4 {
+            return Err(format!(
+                "VPro query parser stage {} is invalid",
+                self.query.stage
+            ));
+        }
+        use super::dma::{
+            ODSY_CMD_COPY_RECT, ODSY_CMD_GL_RECT, ODSY_CMD_IDLE, ODSY_CMD_IMAGE_BOX_LOAD,
+            ODSY_CMD_IMAGE_BURST, ODSY_CMD_MATRIX_LOAD, ODSY_CMD_OPERANDS, ODSY_CMD_PATTERN_LOAD,
+            ODSY_CMD_SKIP,
+        };
+        let active = |name: &str, expected: Option<u32>| -> Result<(), String> {
+            if let Some(expected) = expected {
+                if self.cmd.operand_count != expected {
+                    return Err(format!(
+                        "VPro {name} parser expects {expected} words, snapshot has {}",
+                        self.cmd.operand_count
+                    ));
+                }
+            }
+            if self.cmd.operand_count == 0 || self.cmd.operand_index >= self.cmd.operand_count {
+                return Err(format!(
+                    "VPro {name} parser is at word {} of {}",
+                    self.cmd.operand_index, self.cmd.operand_count
+                ));
+            }
+            Ok(())
+        };
+        match self.cmd.state {
+            ODSY_CMD_IDLE => {}
+            ODSY_CMD_OPERANDS => {
+                active("operand", None)?;
+                if self.cmd.operand_count > ODSY_CMD_OPERANDS_MAX {
+                    return Err(format!(
+                        "VPro operand parser has {} words, maximum is {ODSY_CMD_OPERANDS_MAX}",
+                        self.cmd.operand_count
+                    ));
+                }
+            }
+            ODSY_CMD_COPY_RECT => {
+                if self.cmd.operand_index >= hw_cmd::COPY_RECT_WORDS {
+                    return Err(format!(
+                        "VPro copy parser is at word {}, maximum is {}",
+                        self.cmd.operand_index,
+                        hw_cmd::COPY_RECT_WORDS - 1
+                    ));
+                }
+            }
+            ODSY_CMD_PATTERN_LOAD => {
+                active("pattern", Some(pattern::WORDS))?;
+                if !matches!(self.stream.pattern_load_offset, 0 | pattern::WORDS) {
+                    return Err(format!(
+                        "VPro pattern load offset {} is invalid",
+                        self.stream.pattern_load_offset
+                    ));
+                }
+            }
+            ODSY_CMD_IMAGE_BOX_LOAD => active("image box", Some(10))?,
+            ODSY_CMD_IMAGE_BURST => active("image burst", None)?,
+            ODSY_CMD_MATRIX_LOAD => active("matrix", Some(gl_cmd::MATRIX_FLOATS))?,
+            ODSY_CMD_GL_RECT => active("rectangle", Some(gl_cmd::RECT_FLOATS))?,
+            ODSY_CMD_SKIP => active("skip", None)?,
+            state => return Err(format!("VPro command parser state {state} is invalid")),
+        }
+        if self.win.clip_kept > ODSY_CLIP_RECTS {
+            return Err(format!(
+                "VPro window keeps too many clip rectangles: {}",
+                self.win.clip_kept
+            ));
+        }
+        if self.prim.open_held > self.prim.open_vertex.len() as u32 {
+            return Err(format!(
+                "VPro open primitive holds too many vertices: {}",
+                self.prim.open_held
+            ));
+        }
+        if self.prim.restart_absorb > self.prim.restart_total || self.prim.restart_total > 3 {
+            return Err(format!(
+                "VPro primitive restart has {} of {} vertices left",
+                self.prim.restart_absorb, self.prim.restart_total
+            ));
+        }
+        if self.image.nbytes >= self.image.pixel.len() as u32 {
+            return Err(format!(
+                "VPro image parser holds too many bytes: {}",
+                self.image.nbytes
+            ));
+        }
+        if self.image.group_len != 0 && self.image.group_painted > self.image.group_len {
+            return Err(format!(
+                "VPro image group painted {} of {} pixels",
+                self.image.group_painted, self.image.group_len
+            ));
+        }
+        let expected_marks = ODSY_WIDTH as usize * ODSY_HEIGHT as usize;
+        if self.stream.poly_marks.len() != expected_marks {
+            return Err(format!(
+                "VPro polygon marks have {} entries, expected {expected_marks}",
+                self.stream.poly_marks.len()
+            ));
+        }
+        if self.stream.poly_row_lo > ODSY_HEIGHT
+            || self.stream.poly_row_hi > ODSY_HEIGHT
+            || self.stream.poly_col_lo > ODSY_WIDTH
+        {
+            return Err(format!(
+                "VPro polygon bounds ({}, {}) from column {} exceed {}x{}",
+                self.stream.poly_row_lo,
+                self.stream.poly_row_hi,
+                self.stream.poly_col_lo,
+                ODSY_WIDTH,
+                ODSY_HEIGHT
+            ));
+        }
+        let polygon_floats = (self.assembly.polygon.count as usize)
+            .checked_mul(vtx::FLOATS)
+            .ok_or("VPro polygon vertex count overflows")?;
+        if polygon_floats > self.assembly.polygon.vertices.len()
+            || self.assembly.polygon.vertices.len() % vtx::FLOATS != 0
+        {
+            return Err(format!(
+                "VPro polygon buffer has {} floats for {} vertices",
+                self.assembly.polygon.vertices.len(),
+                self.assembly.polygon.count
+            ));
+        }
+        if self.assembly.nheld > super::assembly::HELD_VERTICES {
+            return Err(format!(
+                "VPro assembly holds too many vertices: {}",
+                self.assembly.nheld
+            ));
+        }
+        match (&board.nic_bus, &self.nic) {
+            (Some(bus), Some(nic)) => bus.validate_state(&nic.clone().into_toml())?,
+            (None, None) => {}
+            _ => return Err("VPro snapshot 1-Wire configuration does not match the board".into()),
+        }
+        Ok(())
+    }
+}
+
+impl Board {
+    pub(super) fn restore_snapshot(&mut self, snapshot: BoardSnapshot) -> Result<(), String> {
+        snapshot.validate(self)?;
+        let geom = snapshot.geom.into_geometry()?;
+        let (slot_tex, slot_dirty) = super::pipe::slot::Slots::decode_snapshot(&snapshot.slots)?;
+        if let (Some(bus), Some(nic)) = (&mut self.nic_bus, snapshot.nic) {
+            bus.load_state(&nic.into_toml())?;
+        }
+        self.widget = snapshot.widget;
+        self.draw_mask = snapshot.draw_mask;
+        self.draw_word = snapshot.draw_word;
+        self.read_word = snapshot.read_word;
+        self.dest_base = snapshot.dest_base;
+        self.pixel_mode = snapshot.pixel_mode;
+        self.slots.apply_snapshot(slot_tex, slot_dirty);
+        self.tex = snapshot.tex;
+        self.dma_seq = snapshot.dma_seq;
+        self.query = snapshot.query;
+        self.cmd = snapshot.cmd;
+        self.win = snapshot.win;
+        self.stream = snapshot.stream;
+        self.assembly = snapshot.assembly;
+        self.prim = snapshot.prim;
+        self.gl_matrix_slot = snapshot.gl_matrix_slot;
+        self.gl_matrix = snapshot.gl_matrix;
+        self.gl_texture_matrix = snapshot.gl_texture_matrix;
+        self.gl_rect = snapshot.gl_rect;
+        self.gl_depth_func = snapshot.gl_depth_func;
+        self.gl_write_mask = snapshot.gl_write_mask;
+        self.alpha_word = snapshot.alpha_word;
+        self.stencil_word = snapshot.stencil_word;
+        self.logic_op_word = snapshot.logic_op_word;
+        self.polygon_mode_word = snapshot.polygon_mode_word;
+        self.polygon_offset_word = snapshot.polygon_offset_word;
+        self.line_point_words = snapshot.line_point_words;
+        self.gl_combined = snapshot.gl_combined;
+        self.gl_block16 = snapshot.gl_block16;
+        self.gl_clip_box = snapshot.gl_clip_box;
+        self.gl_fog = snapshot.gl_fog;
+        self.geom = geom;
+        self.gl_color_index = snapshot.gl_color_index;
+        self.gl_color_is_index = snapshot.gl_color_is_index;
+        self.colour_mode = snapshot.colour_mode;
+        self.dest_buffer_word = snapshot.dest_buffer_word;
+        self.plane_write_mask = snapshot.plane_write_mask;
+        self.const_colour = snapshot.const_colour;
+        self.blend_word = snapshot.blend_word;
+        self.image = snapshot.image.into_image();
+        self.gl_light_scratch = None;
+        self.dest_cache.set(None);
+        self.slot_cache.set(None);
+        self.fifo.set_threshold_6b2(self.widget.fifo_setup[2]);
+        if self.image.active {
+            self.image_box_loaded();
+        }
+        Ok(())
     }
 }

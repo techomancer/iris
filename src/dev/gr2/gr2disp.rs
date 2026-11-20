@@ -1,107 +1,90 @@
-//! GR2 display thread: vertical retrace, composition, presentation.
+//! GR2 on the display refresh thread: vertical retrace and composition.
 //!
-//! Every ~16.7 ms the thread composes VRAM into `screen.fb_rgb` (`prebuilt`)
-//! when something visible changed, or on a periodic heartbeat for the status
-//! bar, presents through the installed renderer, and then pulses the retrace
-//! line, so a flip the guest makes in the blank shows from the next frame.
-//! The IOC latches the retrace until the host acknowledges: PORT_CONFIG on
-//! Indigo2, HPC3_GEN_CONTROL on Indy (GR2.h "INTERRUPTS").
+//! The refresh thread (`crate::display`) runs the frame. The retrace line
+//! goes up for the blanking interval; the IOC latches the retrace until the
+//! host acknowledges: PORT_CONFIG on Indigo2, HPC3_GEN_CONTROL on Indy
+//! (GR2.h "INTERRUPTS"). The vertical status level (EXTIO SG_STAT_0) is
+//! held for the blank: the kernel's retrace handler polls it before it
+//! writes a pending swap's display mode, and a polling PROM sees both
+//! edges. After the blank, when something visible changed, the frame is
+//! composed from VRAM into `screen.fb_rgb` (`prebuilt`): the handler has
+//! flipped, and the client draws its next frame in the other buffer.
 
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::{Duration, Instant};
+use crate::disp::Rex3Screen;
+use crate::display::{Composed, Head, Want};
 
 use super::gr2comp;
 use super::re3::{FB_H, FB_W};
 use super::Gr2;
 
-/// Vertical blanking interval.
-const VBLANK: Duration = Duration::from_micros(700);
-/// Minimum refresh rate while idle, so the status bar keeps moving.
-const IDLE_HEARTBEAT_FRAMES: u32 = 6;
-
-impl Gr2 {
-    pub(super) fn display_loop(&self) {
-        let frame = Duration::from_micros(16667);
-        let mut status_bar = crate::disp::StatusBar::new();
-        let mut overlay = crate::debug_overlay::DebugOverlay::new();
-        let mut sbtex = crate::disp::StatusBarTexture::new();
-        let mut frames_since_render = u32::MAX;
-        let mut sized = false;
-
-        while self.running.load(Ordering::Relaxed) {
-            let start = Instant::now();
-
-            let dirty = self.dirty.swap(false, Ordering::Acquire);
-            let shot = self.screenshot_pending.load(Ordering::Relaxed);
-            if dirty || shot || frames_since_render >= IDLE_HEARTBEAT_FRAMES {
-                frames_since_render = 0;
-                let stats = self.status.snapshot(start, self.hq_fifo.len());
-
-                let mut screen = self.screen.lock();
-                if dirty || !sized {
-                    let r = self.regs();
-                    gr2comp::compose(self.vram(), &r.vc1, &r.xmap, &r.dac, &mut screen.fb_rgb);
-                    // The frame is already final RGB, so keep `rgba` (what CI
-                    // screenshots read) current without needing a renderer
-                    // readback. This also makes screenshots work headless.
-                    let screen = &mut *screen;
-                    for y in 0..FB_H {
-                        let row = y * gr2comp::OUT_STRIDE;
-                        screen.rgba[row..row + FB_W].copy_from_slice(&screen.fb_rgb[row..row + FB_W]);
-                    }
-                    screen.frame_seq = screen.frame_seq.wrapping_add(1);
-                }
-                screen.prebuilt = true;
-                screen.width = FB_W;
-                screen.height = FB_H;
-                screen.status_bar_only = !dirty && sized && !shot;
-
-                let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-                let mut renderer = self.renderer.lock();
-                if let Some(r) = renderer.as_mut() {
-                    if !sized {
-                        r.resize(FB_W, FB_H);
-                    }
-                    r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, take_shot, None, None);
-                }
-                sized = true;
-
-                if take_shot {
-                    let pixels = screen.rgba.clone();
-                    let n = self.screenshot_counter.fetch_add(1, Ordering::Relaxed);
-                    let path = format!("screenshot_{:04}.png", n);
-                    thread::spawn(move || match crate::disp::save_screenshot(&path, &pixels, FB_W, FB_H) {
-                        Ok(()) => println!("iris: screenshot saved to {}", path),
-                        Err(e) => println!("iris: screenshot failed: {}", e),
-                    });
-                }
-            } else {
-                frames_since_render = frames_since_render.saturating_add(1);
-            }
-
-            // Vertical retrace, after the frame is composed: scanout reads
-            // VRAM during the frame, and the guest flips buffers in the
-            // blank. Composed after the pulse, the copy raced the flip and
-            // the next frame's drawing into the buffer just shown. The
-            // interrupt stays latched in the IOC until the guest clears it.
-            // The vertical status level (EXTIO SG_STAT_0) is held for the
-            // blanking interval (~40 of 1066 lines at 60 Hz), long enough
-            // for a polling CPU to see both edges.
-            if let Some(cb) = self.retrace_cb.lock().clone() {
-                cb(true);
-                thread::sleep(VBLANK);
-                cb(false);
-            }
-
-            self.trace_flush(false);
-
-            let elapsed = start.elapsed();
-            if elapsed < frame {
-                thread::sleep(frame - elapsed);
-            }
+impl Head for Gr2 {
+    fn vblank_start(&self, _field: u32, _t_ns: u64) {
+        // The refresh rate is the guest's: the VC1's table totals at the
+        // clock the PLL was programmed for. Anything that does not decode
+        // (the early boards' clock generator, tables half loaded) leaves
+        // the last timing.
+        let timing = {
+            let r = self.regs();
+            r.vc1.totals().zip(super::debug::pll_hz(&r.pll_last)).map(|(t, pixel_clock_hz)| {
+                let fields = t.fields.clamp(1, 2);
+                let blank = t.v_total.saturating_sub(t.visible_lines) / fields;
+                crate::display::VideoTiming { h_total: t.h_total, v_total: t.v_total, pixel_clock_hz, vblank_lines: if blank != 0 { blank } else { t.v_total / 25 }, fields }
+            })
+        };
+        if let Some(timing) = timing {
+            self.head.set_timing(timing);
         }
+        if let Some(cb) = self.retrace_cb.lock().clone() {
+            cb(true);
+        }
+    }
 
-        self.display_stop.finish(&self.renderer);
+    fn vblank_end(&self, _field: u32, _t_ns: u64) {
+        if let Some(cb) = self.retrace_cb.lock().clone() {
+            cb(false);
+        }
+        self.trace_flush(false);
+    }
+
+    /// There is nothing smaller to take than the composed frame.
+    fn capture(&self, screen: &mut Rex3Screen, _want: Want) -> bool {
+        let r = self.regs();
+        gr2comp::compose(self.vram(), &r.vc1, &r.xmap, &r.dac, &mut screen.fb_rgb);
+        self.presentation_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.presentation_host_read_pixels
+            .fetch_add((FB_W * FB_H) as u64, std::sync::atomic::Ordering::Relaxed);
+        screen.prebuilt = true;
+        screen.width = FB_W;
+        screen.height = FB_H;
+        true
+    }
+
+    fn compose(&self, _screen: &mut Rex3Screen, _want: Want) -> Composed {
+        Composed::Frame
+    }
+
+    fn gfifo_pending(&self) -> usize {
+        self.hq_fifo.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::gr2::Gr2Variant;
+
+    #[test]
+    fn ordinary_presentation_scans_the_complete_host_framebuffer() {
+        // Not started: a started board's refresh thread also presents its first frame.
+        let g = crate::test_board::TestBoard::new(Gr2::new(Gr2Variant::Xz, crate::disp::StatusSource::detached()));
+        let mut screen = Rex3Screen::new();
+        let want = Want { readback: false, gpu: true };
+
+        assert!(Head::capture(&*g, &mut screen, want));
+        assert!(matches!(Head::compose(&*g, &mut screen, want), Composed::Frame));
+
+        let telemetry = g.telemetry_snapshot();
+        assert_eq!(telemetry.presentation_frames, 1);
+        assert_eq!(telemetry.presentation_host_read_pixels, (FB_W * FB_H) as u64);
     }
 }

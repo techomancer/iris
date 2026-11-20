@@ -3,7 +3,12 @@
 //! A recognized but malformed container is rejected rather than retried as a
 //! raw image.
 //!
-//! Ported from hw/mips/sgi/prom-image.c in jamesbraid/qemu-sgi-origami.
+//! [`resolve`] picks the PROM a machine runs: the file `prom` names, an
+//! implicit file in the working directory, or the PROM built into iris
+//! ([`crate::dev::embedded_prom`]). [`inspect`], [`nested`] and [`banners`]
+//! describe a file without running it, for `iris-prom show` and `extract`.
+//!
+//! The container decoding is ported from hw/mips/sgi/prom-image.c in jamesbraid/qemu-sgi-origami.
 
 use std::io::{self, Read};
 
@@ -198,7 +203,7 @@ impl Segment {
         Ok(payload)
     }
 
-    /// Whether this looks like a segment record and not data that happens to fit: a
+    /// Whether this looks like a segment record and not data that happens to match: a
     /// name, stored or gzip flags, the 4096-byte offset, and the stored bytes in range.
     /// A gzip segment must also start with the gzip magic; a stored one has nothing
     /// like that to check, so it is the weaker test (`unpack` still checks its sum).

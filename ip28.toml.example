@@ -1,9 +1,10 @@
-# Indigo2 IMPACT R10000 (IP28). Embedded PROM included; supply your own IRIX disk.
+# Indigo2 IMPACT R10000 (IP28). The PROM is built in; supply your own IRIX disk.
 # See docs/indigo2-ip28.md. Paths are relative to the working directory.
 headless   = false
 no_audio   = false
 banks      = [512, 512, 0, 0]
-prom       = "" # optional external path; falls back to 070-1477-002.bin, then embedded IP28 PROM
+# prom     = "ip28/070-1477-002.bin" # optional override; left unset, prom.bin or 070-1477-002.bin in the
+#                                     # working directory is used if present, else the built-in IP28 PROM
 nveeprom   = "ip28/nveeprom-ip28.bin"
 serial_log = "ip28/console-ip28.log"
 [machine]

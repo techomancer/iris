@@ -4,16 +4,17 @@
 CAPTURE is the card's capture, in either of two forms (told apart by the first
 four bytes):
 
-  Octane  a WAV, 44.1 kHz stereo 16-bit (IRIS_OCTANE_AUDIO_WAV). MARKS holds
-          byte offsets into its data chunk.
-  O2      a dump of what MACE audio played at the guest's own rate
-          (IRIS_O2_AUDIO_DUMP): records of out:u8, rate:u32, pairs:u32, then
-          pairs x (l:i16, r:i16), little-endian. MARKS holds byte offsets into
-          the file. A case is the records that start inside its span; they
-          are joined per (output, rate) and the group with the most sound
-          (non-zero samples) is measured at its own rate. A program that
-          sets the rate after it starts leaves records at the old rate:
-          silence from the idle channel, which can outnumber an 8 kHz tone.
+  WAV     a stereo 16-bit WAV (an [audio] file, 48 kHz). The rate comes from
+          its header. MARKS holds byte offsets into its data chunk.
+  dump    what the card played at its own rate (IRIS_AUDIO_DUMP; the layout
+          is in src/dev/audio_dump.rs): records of out:u8, rate:u32,
+          pairs:u32, then pairs x (l:i16, r:i16), little-endian. MARKS holds
+          byte offsets into the file.
+          A case is the records that start inside its span; they are joined
+          per (output, rate) and the group with the most sound (non-zero
+          samples) is measured at its own rate. A program that sets the rate
+          after it starts leaves records at the old rate: silence from the
+          idle channel, which can outnumber an 8 kHz tone.
 
 MARKS has one line per case, written by host.sh: "NAME START END", the offsets
 before and after that case played. Each slice must hold one tone, so a case
@@ -77,12 +78,13 @@ def main():
         data = f.read()
     is_wav = data[:4] == b"RIFF"
     if is_wav:
+        wav_rate = struct.unpack_from("<I", data, 24)[0]
         data = data[44:]
     fails = cases = 0
     for line in open(marks):
         name, a, b = line.split()
         if is_wav:
-            secs, hz, peak = measure(data[int(a) : int(b)])
+            secs, hz, peak = measure(data[int(a) : int(b)], wav_rate)
         else:
             raw, rate = dump_case(data, int(a), int(b))
             secs, hz, peak = measure(raw, rate)

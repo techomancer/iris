@@ -56,10 +56,18 @@
 //! - 1), whatever detail mode GL asked for. Detail applies when
 //! magnifying (LOD <= 0) only (`Sampler::detail`).
 //!
-//! Not yet: sharpen textures, 3D textures, texture lookup tables, video
-//! texture.
+//! Texture colour tables (SGI_texture_color_table): RE4's three 256-entry
+//! 8-bit tables, R then G then B, loaded through the indirect device space
+//! at `TEX_LUT_DEV` (auto-incrementing) and enabled by TEXMODE1 bits 15:13.
+//! They map the filtered texel before the texture environment: an RGB
+//! texel per channel, a luminance or intensity texel through R alone
+//! (`tex_lut`; matched on a real High IMPACT).
+//!
+//! Not yet: sharpen textures, 3D textures, the texture loader's lookup
+//! table, video texture.
 
 use super::fixed;
+use serde::{Deserialize, Serialize};
 
 /// TE1 / texture-related RSS registers.
 pub mod reg {
@@ -127,6 +135,40 @@ pub const ITER_ONE: f64 = 4_294_967_296.0;
 /// blend, alpha-only modulate), components - 1 (4:3), texel class (11:9:
 /// 4 RGB(A), 2 luminance(-alpha), 1 alpha, 3 intensity).
 pub const TEXMODE1_ENABLE: u32 = 1;
+/// TEXMODE1 bits 15:13: the R, G and B texture colour tables on
+/// (libGLcore sets all three for glEnable(GL_TEXTURE_COLOR_TABLE_SGI)).
+pub const TEXMODE1_LUT_SHIFT: u32 = 13;
+pub const TEXMODE1_LUT: u32 = 7 << TEXMODE1_LUT_SHIFT;
+
+/// The texture colour tables in RE4's indirect device space: one 8-bit
+/// entry per DEVICE_DATA write, the address advancing by itself, all of R,
+/// then G, then B.
+pub const TEX_LUT_DEV: u32 = 0x9000_0000;
+pub const TEX_LUT_LEN: usize = 768;
+
+/// The texture colour tables applied to a filtered texel in 12.16, per
+/// TEXMODE1: an RGB(A) texel's R, G and B each through its own table, a
+/// luminance or intensity texel (one or two components) through R; alpha
+/// and alpha-only textures are left alone. The index is the component's
+/// top 8 bits, the entry is widened back to 12 bits.
+pub fn tex_lut(mode1: u32, lut: &[u8; TEX_LUT_LEN], mut tex: [i32; 4]) -> [i32; 4] {
+    let class = (mode1 >> 9) & 7;
+    let nc = ((mode1 >> 3) & 3) + 1;
+    // The classes as `tex_env` reads them.
+    let n = match class {
+        1 => 0,
+        2 | 3 => 1,
+        _ if nc >= 3 => 3,
+        _ => 1,
+    };
+    for (k, v) in tex.iter_mut().enumerate().take(n) {
+        if mode1 & 1 << (TEXMODE1_LUT_SHIFT + k as u32) != 0 {
+            let e = lut[k * 256 + fixed::to_byte(*v) as usize] as u32;
+            *v = (fixed::widen(e, 2) << 16) as i32;
+        }
+    }
+    tex
+}
 
 /// TEXMODE2: magnification / minification within a level linear, mipmaps
 /// (nearest level; with bit 6 blending two), clamp S and T, mipmapping on.
@@ -258,7 +300,56 @@ pub struct Te1 {
     pub dirty: [u64; 4],
 }
 
+#[derive(Serialize, Deserialize)]
+pub(super) struct Te1Snapshot {
+    version: u32,
+    tram: Vec<u8>,
+    tables: Vec<u32>,
+    texels_loaded: u64,
+    owner: Vec<u32>,
+    dirty: [u64; 4],
+}
+
 impl Te1 {
+    pub(super) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        let snapshot = Te1Snapshot {
+            version: 1,
+            tram: self.tram.to_vec(),
+            tables: self.tables.iter().flatten().copied().collect(),
+            texels_loaded: self.texels_loaded,
+            owner: self.owner.to_vec(),
+            dirty: self.dirty,
+        };
+        postcard::to_allocvec(&snapshot).map_err(|e| format!("encode TE1 snapshot: {e}"))
+    }
+
+    pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Te1Snapshot, String> {
+        let s: Te1Snapshot = postcard::from_bytes(bytes).map_err(|e| format!("decode TE1 snapshot: {e}"))?;
+        if s.version != 1 {
+            return Err(format!("TE1 snapshot version {} is not supported", s.version));
+        }
+        if s.tram.len() != TRAM_BYTES {
+            return Err(format!("TE1 TRAM: {} bytes, expected {TRAM_BYTES}", s.tram.len()));
+        }
+        if s.tables.len() != 3 * TABLE_LEN {
+            return Err(format!("TE1 tables: {} words, expected {}", s.tables.len(), 3 * TABLE_LEN));
+        }
+        if s.owner.len() != 256 {
+            return Err(format!("TE1 ownership table: {} entries, expected 256", s.owner.len()));
+        }
+        Ok(s)
+    }
+
+    pub(super) fn apply_snapshot(&mut self, s: Te1Snapshot) {
+        self.tram.copy_from_slice(&s.tram);
+        for (dst, src) in self.tables.iter_mut().flatten().zip(s.tables) {
+            *dst = src;
+        }
+        self.texels_loaded = s.texels_loaded;
+        self.owner.copy_from_slice(&s.owner);
+        self.dirty = s.dirty;
+    }
+
     /// TRAM, for the JIT's texel fetches.
     pub fn tram_ptr(&self) -> *const u8 {
         self.tram.as_ptr()
@@ -983,5 +1074,36 @@ mod tests {
             }
         }
         assert!(fast.tram == slow.tram);
+    }
+
+    /// The texture colour tables as a real High IMPACT applies them (test
+    /// texlut on purple): tables R = 255 - i, G = i, B = (i & 15) << 4.
+    /// A luminance texel goes through R only, an RGB texel per channel,
+    /// an alpha texel not at all; only the enabled tables apply.
+    #[test]
+    fn texture_colour_tables_follow_the_board() {
+        let mut lut = [0u8; TEX_LUT_LEN];
+        for i in 0..256 {
+            lut[i] = 255 - i as u8;
+            lut[256 + i] = i as u8;
+            lut[512 + i] = ((i & 15) << 4) as u8;
+        }
+        let c = |v: u32| (fixed::widen(v, 2) << 16) as i32;
+        let all = TEXMODE1_LUT | TEXMODE1_ENABLE;
+        // L8: class 2, one component.
+        let l = all | 2 << 9;
+        assert_eq!(tex_lut(l, &lut, [c(64), 0, 0, 0]), [c(191), 0, 0, 0]);
+        // LA: alpha untouched.
+        let la = all | 1 << 3 | 2 << 9;
+        assert_eq!(tex_lut(la, &lut, [c(200), c(9), 0, 0]), [c(55), c(9), 0, 0]);
+        // RGB: class 4, three components, each through its own table.
+        let rgb = all | 2 << 3 | 4 << 9;
+        assert_eq!(tex_lut(rgb, &lut, [c(200), c(55), c(88), 0]), [c(55), c(55), c(0x80), 0]);
+        // Alpha textures are not looked up.
+        let a = all | 1 << 9;
+        assert_eq!(tex_lut(a, &lut, [c(64), 0, 0, 0]), [c(64), 0, 0, 0]);
+        // Only the enabled tables: B alone leaves R.
+        let b = TEXMODE1_ENABLE | 1 << (TEXMODE1_LUT_SHIFT + 2) | 2 << 3 | 4 << 9;
+        assert_eq!(tex_lut(b, &lut, [c(200), c(55), c(88), 0]), [c(200), c(55), c(0x80), 0]);
     }
 }

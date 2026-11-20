@@ -1,4 +1,4 @@
-//! Octane main memory: the DIMMs that are fitted, where HEART's bank
+//! Octane main memory: the DIMMs that are installed, where HEART's bank
 //! descriptors (MEMCFG) put them, and the alias of their start at physical 0.
 //!
 //! HEART has four banks (a DIMM pair each) and a 32-bit descriptor per
@@ -9,7 +9,7 @@
 //! Each fitted bank is one of the machine's `Physical` RAM banks, and HEART
 //! is the memory controller that places them, as CRIME is on the O2: a
 //! descriptor write points every 32 MiB unit it claims at the bank run that
-//! answers there (`Physical::bank_view`), so the CPU and every bus master
+//! answers there (`Physical::map_banks`), so the CPU and every bus master
 //! reach memory through the decode table with no lock, and the ppmem window
 //! the CPU's cache and the JIT read is laid out from the same placement.
 //! Memory that runs past 4 GiB gets a 16 GiB window; a descriptor placing
@@ -31,13 +31,12 @@
 //! Ported from hw/misc/sgi-heart.c in jamesbraid/qemu-sgi-origami.
 
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-
-use crate::physical::{Physical, RamBank};
-use crate::ppmem::devmap::{entry_eq, Entry, SLOT_SHIFT};
-use crate::ppmem::{MappedMemory, LARGE_WINDOW_SIZE, WINDOW_SIZE};
+use crate::physical::{BankMapping, Physical, RamBank};
+use crate::ppmem::devmap::{entry_eq, SLOT_SHIFT};
+use crate::ppmem::{LARGE_WINDOW_SIZE, WINDOW_SIZE};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ERR, BUS_OK};
 
 /// Where SDRAM space starts. Descriptors count from here in [`UNIT`]s.
@@ -58,13 +57,13 @@ const LOW_WINDOW: u64 = 0x1_0000;
 
 const DESC_VALID: u32 = 0x8000_0000;
 
-/// Where a byte offset into a fitted bank lands for an address `offset` into
+/// Where a byte offset into an installed bank lands for an address `offset` into
 /// a descriptor's span.
 ///
 /// The stock PROM sizes a bank by writing through a temporary 2 GiB density-6
 /// descriptor (`0x81bf0040`) and checking which address bits alias. Real
 /// HEART's address wiring for that probe is not documented; this projection
-/// is an approximation that makes each fitted size give the PROM the answer
+/// is an approximation that makes each installed size give the PROM the answer
 /// it needs to pick the right descriptor. Every other descriptor wraps at
 /// the bank's size. All of them keep the low 25 bits, so a 32 MiB unit maps
 /// to one 32 MiB run of the bank.
@@ -94,22 +93,9 @@ fn desc_span(d: u32) -> u64 {
     (((d >> 16) & 0x3f) as u64 + 1) * UNIT
 }
 
-/// Where a physical address in SDRAM space lands.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Decode {
-    /// Byte `offset` of fitted bank `bank`.
-    Ram { bank: usize, offset: u64 },
-    /// A valid descriptor for a bank with nothing fitted: from the
-    /// processor, reads are zero and writes go nowhere.
-    Absent,
-    /// No descriptor claims it: a bus error.
-    None,
-}
-
-/// The four descriptors, published whole: a seqlock, so an access on any
-/// thread decodes against one MEMCFG or the next, never half of each.
-/// Writers are serialised by `HeartRam::remap`. Kept for the monitor and
-/// for `decode`; accesses go through the decode table.
+/// The four descriptors, published whole: a seqlock, so an access on any thread decodes against one
+/// MEMCFG or the next, never half of each. Writers are serialised by the machine's remap, with the
+/// other CPUs stopped. Kept for the monitor; accesses go through the decode table.
 #[derive(Default)]
 struct Placement {
     seq: AtomicU64,
@@ -173,8 +159,6 @@ pub struct HeartRam {
     size: [u64; BANKS],
     index: [Option<usize>; BANKS],
     desc: Placement,
-    /// Units placed by the last remap, to put back to the default.
-    placed: Mutex<Vec<u64>>,
 }
 
 impl HeartRam {
@@ -208,7 +192,7 @@ impl HeartRam {
         let window = if RAM_BASE + size.iter().sum::<u64>() > WINDOW_SIZE { LARGE_WINDOW_SIZE } else { WINDOW_SIZE };
         let phys = Physical::with_window(banks, window);
         phys.set_default(Arc::new(NoMemory), "bus error");
-        let m = Self { phys, size, index, desc: Placement::default(), placed: Mutex::new(Vec::new()) };
+        let m = Self { phys, size, index, desc: Placement::default() };
         m.rebuild();
         Ok(m)
     }
@@ -224,12 +208,13 @@ impl HeartRam {
     ///
     /// A write that leaves the decode as it was does nothing to the window
     /// or the page generations: the PROM rewrites the same descriptors, and
-    /// a rebuild empties the window under a running CPU.
+    /// a rebuild bumps every page's generation.
     pub fn set_memcfg(&self, words: [u32; 4]) {
-        let same = Self::decoded(&self.desc.load()) == Self::decoded(&words);
+        let old = self.desc.load();
+        let same = Self::decoded(&old) == Self::decoded(&words);
         self.desc.store(words);
         if !same {
-            self.rebuild();
+            self.place(old);
         }
     }
 
@@ -239,70 +224,56 @@ impl HeartRam {
         words.map(|d| if d & DESC_VALID == 0 { 0 } else { d & (DESC_VALID | 0x7 << 22 | 0x3f << 16 | 0x1ff) })
     }
 
-    /// Place the banks as the descriptors in force say: after `set_memcfg`,
-    /// and after the machine sets the bus's default device.
+    /// Place the banks as the descriptors in force say, after the machine sets
+    /// the bus's default device.
     pub fn rebuild(&self) {
-        let mut placed = self.placed.lock();
+        self.place(self.desc.load());
+    }
+
+    /// Place the banks as the descriptors in force say, given the ones they
+    /// replace: an absent bank's units are not banks, so only `old` says
+    /// which of them to put back to the default.
+    fn place(&self, old: [u32; BANKS]) {
         let phys = &*self.phys;
-        let words = self.desc.load();
         let default = phys.default_entry();
-        let sp = phys.ppmem_space();
-        if let Some(sp) = sp {
-            sp.clear_mappings();
+        let (was, units) = (self.units(&old), self.units(&self.desc.load()));
+        for at in was.iter().filter(|(at, run)| run.is_none() && !units.contains_key(at)).map(|(at, _)| at) {
+            phys.fill_slots(at >> SLOT_SHIFT, UNIT >> SLOT_SHIFT, default);
         }
-        // A bank now answering where another did must look changed to the
-        // JIT even if the two pages' counters happen to be equal.
-        #[cfg(feature = "jitv2")]
-        for b in phys.banks() {
-            b.bump_gen_all();
+        for (&at, _) in units.iter().filter(|(_, run)| run.is_none()) {
+            phys.map_unmapped(at, at + UNIT);
         }
-        // Unit address -> (entry, the bank run for the window). Lower banks
-        // first, so a higher one overrides them as in the decode.
-        let mut units: std::collections::BTreeMap<u64, (Entry, Option<(usize, u64)>)> = Default::default();
-        for (bank, &d) in words.iter().enumerate() {
-            if d & DESC_VALID == 0 {
-                continue;
-            }
-            let base = desc_base(d);
-            for unit in 0..desc_span(d) / UNIT {
-                let at = base + unit * UNIT;
-                let v = match self.index[bank] {
-                    Some(i) => {
-                        let src = bank_offset(d, self.size[bank], unit * UNIT);
-                        (phys.bank_view(i, at - src), Some((i, src)))
-                    }
-                    None => (phys.unmapped_entry(), None),
-                };
-                units.insert(at, v);
-            }
-        }
-        for &at in placed.iter() {
-            if !units.contains_key(&at) {
-                phys.fill_slots(at >> SLOT_SHIFT, UNIT >> SLOT_SHIFT, default);
-            }
-        }
-        placed.clear();
-        for (&at, &(entry, run)) in &units {
-            phys.fill_slots(at >> SLOT_SHIFT, UNIT >> SLOT_SHIFT, entry);
-            placed.push(at);
-            if let (Some(sp), Some((i, src))) = (sp, run) {
-                if at + UNIT <= sp.window_size() {
-                    if let Err(e) = sp.map_range(i, src, at, UNIT) {
-                        eprintln!("ip30: HEART unit at {at:#x}: window map failed: {e}");
-                    }
-                }
-            }
-        }
+        let banks = |u: &BTreeMap<u64, Option<BankMapping>>| u.values().flatten().copied().collect::<Vec<_>>();
+        phys.map_banks(&banks(&was), &banks(&units));
         // The processor's low memory is the start of SDRAM space; SDRAM's
         // own first 16 KiB are a bus error to it.
         let low = match units.get(&RAM_BASE) {
-            Some(&(_, Some((i, src)))) => phys.bank_view(i, src.wrapping_neg()),
-            Some(&(entry, None)) => entry,
+            Some(Some(m)) => phys.bank_view(m.bank, m.src.wrapping_neg()),
+            Some(None) => phys.unmapped_entry(),
             None => default,
         };
         phys.fill_slots(0, LOW_SIZE >> SLOT_SHIFT, low);
         phys.fill_slots(LOW_SIZE >> SLOT_SHIFT, (LOW_WINDOW - LOW_SIZE) >> SLOT_SHIFT, default);
         phys.fill_slots(GUARD.start >> SLOT_SHIFT, LOW_SIZE >> SLOT_SHIFT, default);
+    }
+
+    /// Where `words` put each 32 MiB unit: the bank run there, `None` for a
+    /// bank with nothing installed. Lower banks first, so a higher one
+    /// overrides them as in the decode.
+    fn units(&self, words: &[u32; BANKS]) -> BTreeMap<u64, Option<BankMapping>> {
+        let mut units = BTreeMap::new();
+        for (bank, &d) in words.iter().enumerate().filter(|(_, d)| **d & DESC_VALID != 0) {
+            for unit in 0..desc_span(d) / UNIT {
+                let at = desc_base(d) + unit * UNIT;
+                units.insert(at, self.index[bank].map(|i| BankMapping {
+                    base: at,
+                    end: at + UNIT,
+                    bank: i,
+                    src: bank_offset(d, self.size[bank], unit * UNIT),
+                }));
+            }
+        }
+        units
     }
 
     /// The descriptors in force, for the monitor.
@@ -315,13 +286,13 @@ impl HeartRam {
         self.size
     }
 
-    /// Bytes fitted.
+    /// Bytes installed.
     pub fn total(&self) -> usize {
         self.size.iter().sum::<u64>() as usize
     }
 
     /// The valid descriptors as placed: (physical base, span, capacity), a
-    /// capacity of 0 for a bank with nothing fitted.
+    /// capacity of 0 for a bank with nothing installed.
     pub fn layout(&self) -> Vec<(u64, u64, u64)> {
         let d = self.desc.load();
         (0..BANKS)
@@ -339,25 +310,6 @@ impl HeartRam {
     /// `physical::read_bytes` and `write_bytes` make them.
     pub fn dma_view(self: &Arc<Self>) -> Arc<dyn BusDevice> {
         Arc::new(DmaView(self.clone()))
-    }
-
-    /// The highest-numbered bank whose descriptor claims `addr` answers.
-    pub fn decode(&self, addr: u64) -> Decode {
-        let d = self.desc.load();
-        for bank in (0..BANKS).rev() {
-            let w = d[bank];
-            if w & DESC_VALID == 0 {
-                continue;
-            }
-            let base = desc_base(w);
-            if addr >= base && addr - base < desc_span(w) {
-                if self.size[bank] == 0 {
-                    return Decode::Absent;
-                }
-                return Decode::Ram { bank, offset: bank_offset(w, self.size[bank], addr - base) };
-            }
-        }
-        Decode::None
     }
 }
 
@@ -415,12 +367,16 @@ impl BusDevice for DmaView {
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         self.at(addr).map_or(std::ptr::null(), |(d, a)| d.gen_ptr(a))
     }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        self.at(addr).and_then(|(d, a)| d.code_page(a))
+    }
 }
 
 // The memory's contents for a snapshot. Where the banks answer is HEART's
 // to restore, from its descriptors; these are the bytes.
 impl HeartRam {
-    /// Each fitted bank's words in bank order, as the host keeps them.
+    /// Each installed bank's words in bank order, as the host keeps them.
     /// Read with the CPU and every DMA master stopped.
     pub fn bank_words(&self) -> Vec<&[u32]> {
         self.phys.banks().iter().map(|bank| {
@@ -451,6 +407,7 @@ impl HeartRam {
 mod tests {
     use super::*;
     use crate::physical::{read_bytes, write_bytes};
+    use crate::ppmem::MappedMemory;
 
     const MIB: u64 = 1 << 20;
     const PROBE_DESC: u32 = 0x81bf_0040;
@@ -476,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptors_find_the_fitted_size() {
+    fn descriptors_find_the_installed_size() {
         for mib in [64u64, 128, 256] {
             let m = ram(mib);
             assert_eq!(m.memcfg(), [0; 4], "nothing valid at power-on");
@@ -588,6 +545,65 @@ mod tests {
         }
     }
 
+    /// ppmem's bitmap for the descriptors the PROM settles on, back to back
+    /// from the bottom of SDRAM, as the layout before `map_banks` computed it.
+    #[test]
+    fn the_window_bitmap_is_what_the_per_unit_layout_gave() {
+        let cases: [([u32; 4], u64); 5] = [
+            ([128, 128, 0, 0], 0xf00),
+            ([64, 0, 0, 0], 0x100),
+            ([128, 0, 0, 0], 0x300),
+            ([256, 256, 0, 0], 0xff00),
+            ([512, 512, 512, 512], 0xff_ffff_ff00),
+        ];
+        for (banks, want) in cases {
+            let m = HeartRam::new(banks);
+            let sp = m.phys().ppmem_space().unwrap();
+            assert_eq!(sp.mapped_bitmap(), 0, "{banks:?}: nothing before a descriptor");
+            let (mut desc, mut base) = ([0u32; 4], 0u32);
+            for (d, &mb) in desc.iter_mut().zip(&banks) {
+                let units = (mb as u64 * MIB / UNIT) as u32;
+                if units != 0 {
+                    *d = DESC_VALID | (units - 1) << 16 | base;
+                    base += units;
+                }
+            }
+            m.set_memcfg(desc);
+            assert_eq!(sp.mapped_bitmap(), want, "{banks:?}");
+        }
+    }
+
+    /// Whatever moves the banks, the guard stays a bus error to the
+    /// processor and low memory stays SDRAM's first 16 KiB.
+    #[test]
+    fn the_guard_and_low_memory_hold_after_every_rebuild() {
+        let m = Arc::new(HeartRam::new([128, 64, 0, 0]));
+        let (p, dma) = (m.phys(), m.dma_view());
+        let steps: [([u32; 4], bool); 5] = [
+            ([DESC_VALID | 3 << 16, 0, 0, 0], false),
+            ([DESC_VALID | 3 << 16, DESC_VALID | 1 << 16 | 4, 0, 0], false),
+            ([DESC_VALID | 1 << 16, 0, 0, 0], false),
+            ([DESC_VALID | 1 << 16, 0, 0, 0], true),
+            ([0, DESC_VALID | 1 << 16, 0, 0], false),
+        ];
+        for (n, (words, again)) in steps.into_iter().enumerate() {
+            m.set_memcfg(words);
+            if again {
+                m.rebuild();
+            }
+            let installed = words.iter().any(|w| w & DESC_VALID != 0);
+            assert_eq!(p.read64(RAM_BASE).status, BUS_ERR, "step {n}: the guard");
+            assert_eq!(p.write32(RAM_BASE + 0x3ffc, 1), BUS_ERR, "step {n}: the guard's end");
+            if installed {
+                assert_eq!(p.write32(0x100, 0x1234_5678 + n as u32), BUS_OK, "step {n}");
+                assert_eq!(dma.read32(RAM_BASE + 0x100).data, 0x1234_5678 + n as u32, "step {n}: low memory is SDRAM's start");
+                assert_eq!(p.read8(0x4000).status, BUS_ERR, "step {n}: and ends at 16 KiB");
+            } else {
+                assert_eq!(p.read64(0).status, BUS_ERR, "step {n}: nothing at SDRAM's start");
+            }
+        }
+    }
+
     #[test]
     fn the_window_follows_the_descriptors() {
         let m = ram(128);
@@ -623,26 +639,6 @@ mod tests {
         assert_ne!(mapped, space.mapped_bitmap());
     }
 
-    /// A rebuild bumps every page's generation, so compiled code from a page
-    /// that now holds other bytes is dropped; a repeated write does not.
-    #[cfg(feature = "jitv2")]
-    #[test]
-    fn a_changed_descriptor_bumps_the_page_generations() {
-        let gen = |p: *const AtomicU64| unsafe { (*p).load(Ordering::Acquire) };
-        let m = ram(128);
-        let d = DESC_VALID | (3 << 16);
-        bank0(&m, d);
-        let g = m.phys().gen_ptr(RAM_BASE + 0x8000);
-        let v = gen(g);
-        bank0(&m, d);
-        assert_eq!(gen(g), v, "the same descriptors leave it");
-        bank0(&m, DESC_VALID | (1 << 16));
-        assert_ne!(gen(g), v, "a change advances it");
-        let v = gen(g);
-        m.set_memcfg([0; 4]);
-        assert_ne!(gen(g), v, "so does taking the memory away");
-    }
-
     #[test]
     fn the_higher_bank_answers_where_two_overlap() {
         let m = HeartRam::new([64, 64, 0, 0]);
@@ -652,7 +648,6 @@ mod tests {
         m.set_memcfg([both, both, 0, 0]);
         w(&m, RAM_BASE + 0x8000, 2);
         assert_eq!(r(&m, RAM_BASE + 0x8000), 2);
-        assert_eq!(m.decode(RAM_BASE + 0x8000), Decode::Ram { bank: 1, offset: 0x8000 });
         m.set_memcfg([both, 0, 0, 0]);
         assert_eq!(r(&m, RAM_BASE + 0x8000), 1);
     }

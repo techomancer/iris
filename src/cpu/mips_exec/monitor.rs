@@ -263,6 +263,7 @@ pub(super) fn is_call_instruction(instr: u32) -> bool {
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     pub fn run_debug_loop(&self, mut count: Option<usize>, wait: bool, mut writer: Box<dyn Write + Send>) {
         self.halt(); // Ensure stopped before running
+        self.take_remap_request(&mut self.executor.lock());
 
         self.running.store(true, Ordering::SeqCst);
 
@@ -2243,7 +2244,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             return Err("j2 threads is read-only — set via iris.toml [jitv2] threads or --jitv2-threads at startup".to_string());
                         }
                         let jit = exec.jitv2.lock();
-                        writeln!(writer, "j2 threads: {}", jit.compile_queue.thread_count()).unwrap();
+                        let q = &jit.compile_queue;
+                        match q.thread_count_reason() {
+                            Some(reason) => {
+                                writeln!(writer, "j2 threads: {} ({reason})", q.thread_count()).unwrap();
+                            }
+                            None => {
+                                writeln!(writer, "j2 threads: {}", q.thread_count()).unwrap();
+                            }
+                        }
                     }
                     "opt" => {
                         // Process-wide, not per-Codegen (opt_level is baked
@@ -2490,7 +2499,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // isn't always available (CPU stopped mid-exception,
                         // page not currently TLB-mapped, or the address came
                         // from a log/j2 pcp dump that already gives phys) —
-                        // reading via `sysad.read32` directly (the same
+                        // reading via `cached_bus.read32` directly (the same
                         // primitive `handle_request` itself uses) sidesteps
                         // needing a live translation at all.
                         if actual_args.len() < 2 {
@@ -2505,7 +2514,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
                         for (i, w) in words.iter_mut().enumerate() {
                             let a = page_base_phys + (i as u64) * 4;
-                            let r = exec.sysad.read32(a);
+                            let r = exec.cached_bus.read32(a);
                             if !r.is_ok() {
                                 return Err(format!("failed to read word at phys {:#010x} (offset {:#x} into page)", a, i * 4));
                             }
@@ -2577,18 +2586,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 return Err(format!("phys {:#x} is above the JIT's physical range", result.phys));
                             };
                             let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                            let sysad = exec.sysad.clone();
+                            let bus = exec.cached_bus.clone();
                             let mut jit = exec.jitv2.lock();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
-                            let slot = jit.page_for(pfn, page_base, sysad.as_ref(), fr1);
-                            match slot {
-                                Some(slot) => jit.page_ptr(slot),
-                                None => return Err("page pool full".to_string()),
+                            let _ = page_base;
+                            let at = crate::cpu::jitv2::jitv2::PageAt { cpu: exec.jitv2_cpu, space: exec.jitv2_space, pfn, uncached: false };
+                            match jit.claim_page(at, bus.as_ref(), fr1) {
+                                crate::cpu::jitv2::jitv2::Claim::Page(slot) => jit.page_ptr(slot),
+                                crate::cpu::jitv2::jitv2::Claim::Full => return Err("page pool full".to_string()),
                             }
                         };
                         let page = unsafe { &*page_ptr };
-                        let sysad = exec.sysad.clone();
-                        let dump = crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref())
+                        let buses = exec.jitv2.lock().buses().clone();
+                        let dump = crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, &buses)
                             .map_err(|st| format!("capture failed: bus status {:#x}", st))?;
                         // A path argument is whichever arg is not the address.
                         let path = actual_args.iter().skip(1)
@@ -2621,7 +2631,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // the bus, and holding the jitv2 lock across a few
                         // thousand of those plus the filesystem would stall
                         // every dispatching CPU thread for the whole dump.
-                        let sysad = exec.sysad.clone();
+                        let bus = exec.cached_bus.clone();
                         let mut unreadable = 0usize;
                         let dumps: Vec<crate::cpu::jitv2::pcp_dump::PcpDump> = {
                             let jit = exec.jitv2.lock();
@@ -2631,7 +2641,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 // now (device unmapped under it, say) is skipped
                                 // rather than failing the whole dump — one bad
                                 // page shouldn't cost the other few thousand.
-                                match crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref()) {
+                                match crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, jit.buses()) {
                                     Ok(d) => v.push(d),
                                     Err(_) => unreadable += 1,
                                 }
@@ -2720,10 +2730,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 return Ok(());
                             };
                             let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                            let sysad = exec.sysad.clone();
+                            let bus = exec.cached_bus.clone();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             let mut jit = exec.jitv2.lock();
-                            match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                            match jit.page_at(crate::cpu::jitv2::jitv2::PageAt { cpu: exec.jitv2_cpu, space: exec.jitv2_space, pfn, uncached: false }, bus.as_ref(), fr1) {
                                 Some(slot) => jit.page_ptr(slot),
                                 None => {
                                     writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and the page pool is full (can't even allocate a fresh lookup entry).").unwrap();
@@ -2750,8 +2760,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // block_include_count (overlap between entries is
                         // structurally impossible under this design, so that
                         // diagnostic no longer applies).
+                        writeln!(writer, "bank={} page={:#x}  ({})", page.key.bank, page.key.page,
+                            (0..crate::cpu::jitv2::jitv2::POOL_CPUS).filter_map(|c| page.addr_of(c).map(|(pfn, unc)| format!("cpu{c} at pfn {pfn:#x}{}", if unc { " uncached" } else { "" })))
+                                .collect::<Vec<_>>().join(", ")).unwrap();
                         writeln!(writer, "pfn={:#010x}  gen={}  entry_gen={}  scheduled(in-flight)={}  compiles_since_flush={}  rejected_compiles={}",
-                            page.pfn, page.current_gen(), page.entry_gen(), page.is_scheduled(), page.compiles_since_flush(), page.rejected_compiles()).unwrap();
+                            page.pfn(), page.current_gen(), page.entry_gen(), page.is_scheduled(), page.compiles_since_flush(), page.rejected_compiles()).unwrap();
                         // §13: one function per page, so FR mode is a single
                         // whole-page value — pinned at page-claim time from the
                         // live STATUS_FR (PhysicalCodePage::fr1) and every
@@ -2882,10 +2895,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         drop(symbols);
                         let pfn = exec.jitv2_monitor_pfn(paddr)?;
                         let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                        let sysad = exec.sysad.clone();
+                        let bus = exec.cached_bus.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
-                        match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                        match jit.page_at(crate::cpu::jitv2::jitv2::PageAt { cpu: exec.jitv2_cpu, space: exec.jitv2_space, pfn, uncached: false }, bus.as_ref(), fr1) {
                             Some(slot) => {
                                 let page_ptr = jit.page_ptr(slot);
                                 unsafe { (*page_ptr).reset_compiled_state(); }
@@ -2930,10 +2943,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let pfn = exec.jitv2_monitor_pfn(paddr)?;
                         let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
                         let offset = (paddr & 0xFFF) as usize >> 2;
-                        let sysad = exec.sysad.clone();
+                        let bus = exec.cached_bus.clone();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
-                        match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                        match jit.page_at(crate::cpu::jitv2::jitv2::PageAt { cpu: exec.jitv2_cpu, space: exec.jitv2_space, pfn, uncached: false }, bus.as_ref(), fr1) {
                             Some(slot) => {
                                 let page_ptr = jit.page_ptr(slot);
                                 unsafe { (*page_ptr).denylist(offset); (*page_ptr).kill(offset); }
@@ -2994,7 +3007,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                         // signal, not a crash risk.
                                         let page = unsafe { &*page_ptr };
                                         writeln!(writer, "    page: pfn={:#010x} phys_base={:#010x}",
-                                            page.pfn, page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64).unwrap();
+                                            page.pfn(), page.pfn() as u64 * crate::cpu::jitv2::PAGE_SIZE as u64).unwrap();
                                     }
                                 };
                                 match jit.compile_queue.seal_queue_entries() {
@@ -3038,6 +3051,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                     "stats" | "status" => {
                         let jit = exec.jitv2.lock();
                         writeln!(writer, "pages: {} / {} used", jit.pages_used(), jit.capacity()).unwrap();
+                        writeln!(writer, "remaps: {} (a CPU forgot its page addresses after memory moved; no code dropped)", jit.stats.remaps.load(Ordering::Relaxed)).unwrap();
+                        let (shared, apart) = jit.shared_pages();
+                        writeln!(writer, "shared pages: {shared} reached by more than one CPU, {apart} of them at different addresses").unwrap();
                         // Churn avoidance: "skipped" is compile work that did not
                         // happen because the page's generation moved without
                         // any word the last compile decoded changing;

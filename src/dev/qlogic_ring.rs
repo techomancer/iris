@@ -18,7 +18,7 @@
 //!
 //! The adapters' timed waits use the clock here, host time less the time the
 //! machine was stopped, because iris has no emulated-time source a device can
-//! read. [`crate::dev::heart::Clock`] does not fit: it has no stopped-time
+//! read. [`crate::dev::heart::Clock`] does not suit: it has no stopped-time
 //! accounting, and the thread must know whether the clock it waits on is the
 //! host's or one a test moves.
 

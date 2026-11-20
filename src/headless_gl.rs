@@ -1,6 +1,6 @@
 //! Minimal hidden-window GL context for off-thread compositor capture (iris-gui).
 //!
-//! OpenGL calls run on the thread that creates this context (REX3-Refresh).
+//! OpenGL calls run on the thread that creates this context (the display refresh thread).
 
 use std::ffi::CString;
 use std::num::NonZeroU32;
@@ -140,7 +140,7 @@ fn api_preference() -> DisplayApiPreference {
     DisplayApiPreference::Wgl(None)
 }
 
-// GL context is owned and used only on the creating thread (REX3-Refresh).
+// GL context is owned and used only on the creating thread (the display refresh thread).
 unsafe impl Send for HeadlessGl {}
 
 #[cfg(test)]

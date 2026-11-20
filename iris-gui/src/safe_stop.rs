@@ -4,10 +4,11 @@ use iris::config::MachineConfig;
 /// Reasons it is risky to force-stop right now.
 #[derive(Debug, Clone, Default)]
 pub struct UnsafeReasons {
-    /// SCSI IDs of attached disks whose guest writes land directly in their
-    /// base image (a plain read-write HDD). Force-stopping mid-write can leave
-    /// the filesystem on these inconsistent.
-    pub writable_disks: Vec<u8>,
+    /// Attached disks whose guest writes land directly in their base image
+    /// (a plain read-write HDD), as named to the user: `SCSI 1` (`SCSI 1:3`
+    /// on controller 1), `Fibre Channel 1` or `NVMe`. Force-stopping
+    /// mid-write can leave the filesystem on these inconsistent.
+    pub writable_disks: Vec<String>,
 }
 
 impl UnsafeReasons {
@@ -16,53 +17,52 @@ impl UnsafeReasons {
     }
 }
 
-/// Evaluate whether stopping the emulator right now is safe.
+/// Whether a disk's guest writes go straight into `path`.
+fn persists_to_base(path: &str, overlay: bool) -> bool {
+    !path.trim().is_empty() && !overlay && !path.ends_with(".chd")
+}
+
+/// Classify whether the GUI should ask before a force-stop.
 ///
-/// If the CPU has halted (clean shutdown / soft power-off, or idle at the PROM),
-/// nothing is writing and stopping is always safe — see the `cpu_halted`
-/// short-circuit below.
-///
-/// Otherwise the core does not expose live dirty-sector state, so we decide
-/// purely from config: an abrupt power-off only risks the on-disk image when some attached
-/// device persists guest writes straight into its **base image** — i.e. a
-/// plain read-write hard disk. Everything else leaves the base image untouched
-/// and is safe to power off without warning:
-///
-/// - **CD-ROM** — read-only.
-/// - **COW overlay** (`overlay = true`) — writes go to a `{path}.overlay`
-///   file and the base image is never modified (delete the overlay and its
-///   `.dirty` record to reset). The overlay records each sector as it is
-///   written, so a force stop, or the process being killed, keeps every
-///   write: the guest sees a power cut and recovers from its log as it would
-///   on a real disk, and a guest that does not can still be reset. Only a
-///   host crash or power loss can lose what came since the last flush.
-/// - **Scratch volume** (`scratch = true`) — a transient host-side file, not a
-///   guest filesystem we need to protect.
-/// - **CHD** (`*.chd`) — writes go to a `.diff.chd` sidecar; the base CHD is
-///   never modified.
-///
-/// So when no attached device writes through to its base image, powering off
-/// will NOT damage the hard disk and we skip the confirmation dialog entirely.
+/// This is a config/status heuristic, not a guest shutdown acknowledgement:
+/// `cpu_halted` includes zero measured throughput. The machine's own disks
+/// are inspected: `[scsi.N]` (not on the IP35 brick machines, which have
+/// none), `[fibre_channel.disk.N]` and `[nvme]`. CD-ROMs, scratch, overlays,
+/// DaynaPort and `.chd` names are excluded from the warning. The filename
+/// check does not distinguish an uncompressed CHD that writes in place from a
+/// compressed parent with a diff. See STORAGE.md for the actual persistence
+/// guarantees of each backend.
 pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
-    // If the CPU has halted — a clean IRIX shutdown / soft power-off, or sitting
-    // idle at the PROM (0 MIPS) — nothing is writing to any disk, so stopping
-    // now cannot corrupt a filesystem. Skip the warning regardless of config.
+    // Preserve the UI's halted/idle short-circuit before classifying disks.
     if status.cpu_halted {
         return UnsafeReasons::default();
     }
 
     let mut r = UnsafeReasons::default();
-    for (id, dev) in &cfg.scsi {
-        let persists_to_base = !dev.cdrom
-            && !dev.overlay
-            && !dev.scratch
-            && !dev.is_daynaport() // no image behind a network adapter
-            && !dev.path.ends_with(".chd");
-        if persists_to_base {
-            r.writable_disks.push(*id);
+    if !cfg.machine.profile.is_ip35_bricks() {
+        let mut keys: Vec<u8> = cfg.scsi.iter()
+            .filter(|(_, dev)| {
+                !dev.is_cdrom()
+                    && !dev.scratch
+                    && !dev.is_daynaport() // no image behind a network adapter
+                    && persists_to_base(&dev.path, dev.overlay)
+            })
+            .map(|(k, dev)| (dev.placement(*k), *k))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        r.writable_disks.extend(keys.drain(..).map(|k| t!("safestop-scsi-disk", id = crate::extra_ui::scsi_name(cfg, k))));
+    }
+    if let Some(fc) = &cfg.fibre_channel {
+        for (id, disk) in &fc.disks {
+            if persists_to_base(&disk.path, disk.overlay) {
+                r.writable_disks.push(t!("safestop-fc-disk", id = *id));
+            }
         }
     }
-    r.writable_disks.sort();
+    if persists_to_base(&cfg.nvme.path, cfg.nvme.overlay) {
+        r.writable_disks.push(t!("safestop-nvme-disk"));
+    }
     r
 }
 
@@ -70,7 +70,7 @@ pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
 pub fn reason_lines(r: &UnsafeReasons) -> Vec<String> {
     r.writable_disks
         .iter()
-        .map(|id| t!("safestop-writable-disk", id = *id))
+        .map(|disk| t!("safestop-writable-disk", disk = disk))
         .collect()
 }
 
@@ -88,13 +88,38 @@ mod tests {
     fn writable_disk_is_unsafe_while_cpu_runs() {
         let r = evaluate(&running(false), &MachineConfig::default());
         assert!(!r.is_empty(), "a live rw disk should warn before force-stop");
-        assert!(r.writable_disks.contains(&1));
+        assert_eq!(r.writable_disks.len(), 1);
+        assert!(r.writable_disks[0].contains('1'));
+    }
+
+    /// The Origin 3200's default `[scsi]` map is not attached; its Fibre
+    /// Channel disks and an NVMe image are what can be written.
+    #[test]
+    fn ip35_warns_for_its_fibre_channel_disks_not_the_scsi_map() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = iris::config::MachineProfile::Origin3200Ip35;
+        let mut fc = iris::config::FibreChannelConfig::default();
+        fc.disks.insert(1, iris::config::ScsiDeviceConfig { path: "root.raw".into(), ..Default::default() });
+        cfg.fibre_channel = Some(fc);
+        let r = evaluate(&running(false), &cfg);
+        assert_eq!(r.writable_disks.len(), 1);
+        assert!(r.writable_disks[0].contains('1'));
+    }
+
+    /// A target on the second controller is named controller:id.
+    #[test]
+    fn second_controller_disk_is_named_controller_and_id() {
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.clear();
+        cfg.scsi.insert(19, iris::config::ScsiDeviceConfig { path: "d.raw".into(), ..Default::default() });
+        let r = evaluate(&running(false), &cfg);
+        assert_eq!(r.writable_disks.len(), 1);
+        assert!(r.writable_disks[0].contains("1:3"), "{:?}", r.writable_disks);
     }
 
     #[test]
     fn halted_cpu_is_always_safe() {
-        // After IRIX shuts down (0 MIPS / power-off) stopping can't corrupt a
-        // disk, so the same config must now evaluate as safe.
+        // A halted status bypasses the disk warning under this UI policy.
         let r = evaluate(&running(true), &MachineConfig::default());
         assert!(r.is_empty(), "a halted CPU must be safe to stop");
     }

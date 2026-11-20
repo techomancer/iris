@@ -132,6 +132,9 @@ pub struct Vc2 {
     pub regs: [u16; 32],
     pub ram: Vec<u16>,
     pub dirty: bool,
+    /// Moves when the video timing tables may have changed: a RAM write,
+    /// or the video entry pointer.
+    pub timing_gen: u32,
 }
 
 impl Vc2 {
@@ -140,6 +143,7 @@ impl Vc2 {
             index: 0,
             regs: [0; 32],
             ram: vec![0; 32768],
+            timing_gen: 0,
             dirty: true,
         }
     }
@@ -200,6 +204,9 @@ impl Vc2 {
             dlog!(LogModule::Vc2, "VC2 Write Reg {:02x} [{}] <- {:04x}{}", idx, reg_name, val, extra);
         }
         self.regs[idx] = val;
+        if idx == VC2_REG_VIDEO_ENTRY_PTR as usize {
+            self.timing_gen = self.timing_gen.wrapping_add(1);
+        }
         if idx == VC2_REG_CURSOR_Y_LOC as usize {
             self.regs[VC2_REG_CURRENT_CURSOR_X as usize] = self.regs[VC2_REG_CURSOR_X_LOC as usize];
         }
@@ -236,6 +243,7 @@ impl Vc2 {
                         self.ram[addr] = w;
                         self.regs[VC2_REG_RAM_ADDR as usize] = (addr.wrapping_add(1) & 0x7FFF) as u16;
                         self.dirty = true;
+                        self.timing_gen = self.timing_gen.wrapping_add(1);
                     }
                 } else if crs == 0 {
                     self.index = (w as u8) & 0x1F;
@@ -256,6 +264,13 @@ impl Vc2 {
             }
             _ => {}
         }
+    }
+
+    /// What the video timing tables add up to (`disp::decode_vc2_totals`);
+    /// a line is in the picture while the composite blank to the XMAPs is
+    /// off.
+    pub fn totals(&self) -> Option<crate::disp::Vc2Totals> {
+        crate::disp::decode_vc2_totals(&self.regs, &self.ram, |_, c| c & VT_CBLANK_XMAP_N != 0)
     }
 
     /// Dump the VC2 RAM as hex words, 16 per line, for offline decoding.

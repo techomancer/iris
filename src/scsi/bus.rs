@@ -1,6 +1,7 @@
 //! The SCSI bus: what sits on it, and the table every controller keeps.
 //!
-//! A controller (the WD33C93A, the AIC-7880, the ISP1040) is registers and
+//! A controller (the WD33C93A, the AIC-7880, the ISP1040, ISP12160 and
+//! ISP2200, and the NVMe controller for its one namespace) is registers and
 //! DMA; the targets behind it do not depend on which chip asks. [`ScsiTarget`]
 //! is what varies on the bus, and [`ScsiBus`] is the shared mechanism: the
 //! id-to-target table with the attach and query methods, which each

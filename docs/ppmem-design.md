@@ -2,8 +2,10 @@
 
 A machine whose memory runs past 4GB (the Octane, up to `0x2_2000_0000`) asks
 for a 16GB window instead, with `PpMemSpace::over_window`. The bitmap stays one
-`u64`, so its regions are 256MB there. The text below describes the 4GB window
-every other machine has; the larger one differs only in those two numbers.
+`u64`, so its regions are 256MB there. Window sizing is machine-specific:
+multinode SN0 and IP35 systems also map node windows. The historical proposal
+below describes the original 4GB window; see `src/ppmem/`, `src/ip27.rs` and
+`src/node_windows.rs` for the current mapping implementation.
 
 Status: **implemented and always on** (August 2026, `src/ppmem/`, with Unix
 and Windows mapping backends; the `ppmem` feature was retired in October 2026).
@@ -284,8 +286,9 @@ stays correct rather than going stale.
 - `PpMemSpace` owns `gen_space` (the 8MB window) and `gen_banks` (each bank's
   gen object), and `map_bank`/`map_alias`/`clear_mappings` operate on both
   windows together.
-- Verified by `gen_window_mirrors_in_lockstep_with_data`: an 8MB bank repeated
-  4× across 32MB has one physical counter per page shared by all four mirrors,
+- Verified by `gen_window_mirrors_in_lockstep_with_data`: a 32MB bank (the
+  largest `map_granule`, Windows') repeated 4× across a 128MB slot has one
+  physical counter per page shared by all four mirrors,
   and a `BusDevice` write through the bank bumps exactly the counter the window
   exposes.
 

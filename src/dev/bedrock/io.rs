@@ -1,25 +1,16 @@
-//! Bedrock's I/O block (the II) routes programmed PIO windows to crossbar
-//! widgets, applies inbound permission checks to requests from widgets and
-//! runs two block-transfer engines. Guests configure the widget masks before
-//! touching devices; a BTE moves 128-byte lines and reports completion by a
-//! memory write or an interrupt packet.
-//!
-//! The permission words and the translation entries every PIO and inbound
-//! access checks are atomics, stored under the block's lock and read without
-//! it.
+//! Bedrock's I/O block (the II): routes PIO windows to crossbar widgets, checks inbound
+//! permissions and runs two block-transfer engines.
 //!
 //! # What is approximated here
 //!
-//! BTE transfers and their completion run synchronously when a start is
-//! written. Timing and unpublished register behavior are not modeled.
-//!
-//! The other register words sit in a sparse map keyed by offset, since the
-//! 0x30010-byte block holds only a few dozen of them.
+//! BTE transfers and their completion run synchronously when a start is written. Timing and
+//! unpublished register behavior are not modeled.
 //!
 //! Ported from hw/misc/sgi-bedrock-io.c in jamesbraid/qemu-sgi-origami.
 
-use super::reg::IIO_PROTECT_OVRRD_KEY;
+use super::regs::{io as reg, IIO_PROTECT_OVRRD_KEY};
 use super::Effect;
+use crate::dev::widths;
 use crate::traits::{BusDevice, BusRead64, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -27,60 +18,26 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 
 /// Length of the block-relative register aperture.
-pub(super) const SIZE: u64 = 0x30010;
+pub(super) const SIZE: u64 = reg::PERFORMANCE_PROFILING::OFFSET + reg::PERFORMANCE_PROFILING::WIDTH as u64 / 8;
 
-pub mod reg {
-    pub const DEVICE_ID: u64 = 0x0;
-    pub const PROTECTION_KEY: u64 = 0x108;
-    pub const PIO_PERMISSION: u64 = 0x100;
-    pub const INBOUND_PERMISSION: u64 = 0x110;
-    pub const INBOUND_DEVICE_PERMISSION: u64 = 0x120;
-    pub const XIO_STATUS: u64 = 0x128;
-    pub const LINK_LOG: u64 = 0x130;
-    pub const LINK_STATUS: u64 = 0x138;
-    pub const BTE1_BASE: u64 = 0x10000;
-    pub const BTE_REGISTER_SIZE: u64 = 0x30;
-    pub const READ_ONLY: u64 = 0x8;
-    pub const BTE2_BASE: u64 = 0x20000;
-    pub const WIDGET_STATUS: u64 = 0x20;
-    pub const WIDGET_PERMISSION: u64 = 0x118;
-    pub const REGISTER_0150: u64 = 0x150;
-    pub const REGISTER_0158: u64 = 0x158;
-    pub const ITTE_BASE: u64 = 0x160;
-    pub const ITTE_LAST: u64 = 0x190;
-    pub const REGISTER_0198_BASE: u64 = 0x198;
-    pub const REGISTER_01D8_LAST: u64 = 0x1d8;
-    pub const READ_ONLY_ALIAS: u64 = 0x1f8;
-    pub const REGISTER_01E0: u64 = 0x1e0;
-    pub const REGISTER_01E8: u64 = 0x1e8;
-    pub const REGISTER_01F0: u64 = 0x1f0;
-    pub const REGISTER_0200: u64 = 0x200;
-    pub const REGISTER_03A8: u64 = 0x3a8;
-    pub const REGISTER_03B0: u64 = 0x3b0;
-    pub const REGISTER_03B8: u64 = 0x3b8;
-    pub const REGISTER_03C0: u64 = 0x3c0;
-    pub const RETAINED_WINDOW_BASE: u64 = 0x308;
-    pub const RETAINED_WINDOW_LAST: u64 = 0x348;
-    pub const RETAINED_CONFIG_BASE: u64 = 0x400;
-    pub const RETAINED_CONFIG_LAST: u64 = 0x5d8;
-    pub const GFX_MAP_BASE: u64 = 0x140;
-}
-pub mod bte_reg {
-    pub const STATUS: u64 = 0x0;
-    pub const SOURCE: u64 = 0x8;
-    pub const DESTINATION: u64 = 0x10;
-    pub const CONTROL: u64 = 0x18;
-    pub const NOTIFICATION: u64 = 0x20;
-    pub const INTERRUPT: u64 = 0x28;
-}
+/// The widget status word, which reads zero, and each engine's span.
+const READ_ONLY: u64 = reg::WIDGET_STATUS::OFFSET;
+const BTE_REGISTER_SIZE: u64 = reg::BTE_REGISTER_SIZE;
+const SCRATCH_1: u64 = reg::SCRATCH::END - reg::SCRATCH::STRIDE;
+const ITTE_LAST: u64 = reg::TRANSLATION_TABLE_ENTRY::END - reg::TRANSLATION_TABLE_ENTRY::STRIDE;
+const PIO_REQUEST_LAST: u64 = reg::PIO_REQUEST_BUFFER_W8::END - reg::PIO_REQUEST_BUFFER_W8::STRIDE;
+const CRB_LAST: u64 = reg::CRB_D::END - reg::CRB_D::STRIDE;
+const RETAINED_WINDOW_END: u64 = reg::PIO_READ_ADDRESS::END;
+const BTE_STRIDE: u64 = reg::BTE_LENGTH_STATUS::STRIDE;
+const GRAPHICS_MAP_1: u64 = reg::GRAPHICS_MAP::at(1);
 
 const ID: u64 = (2 << 28) | (0xc110 << 12) | (0x36 << 1);
-const ADDR_MASK: u64 = 0xffffffff80;
-pub(super) const BUSY: u64 = 1 << 20;
-pub(super) const ERROR: u64 = 1 << 16;
-/// XIO status bit 13: a crossbar peer answers the link.
-const PEER: u64 = 1 << 13;
-const ITTES: usize = 7;
+const ADDR_MASK: u64 = reg::BTE_SOURCE::ADDRESS::MASK;
+pub(super) const BUSY: u64 = reg::BTE_LENGTH_STATUS::BUSY::MASK;
+pub(super) const ERROR: u64 = reg::BTE_LENGTH_STATUS::ERROR::MASK;
+/// The top bit of the XIO link status: a crossbar peer answers the link.
+const PEER: u64 = 1 << (reg::LINK_CONTROL::LINK_STATUS::SHIFT + reg::LINK_CONTROL::LINK_STATUS::LENGTH - 1);
+const ITTES: usize = reg::TRANSLATION_TABLE_ENTRY::COUNT;
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Bte {
@@ -98,7 +55,11 @@ struct Regs {
 impl Default for Regs {
     fn default() -> Self {
         let mut words = BTreeMap::new();
-        for (a, v) in [(0x20, 0xa), (0x128, 0x3fc0fff6403 & !PEER), (0x1e8, 0x111)] {
+        for (a, v) in [
+            (reg::WIDGET_CONTROL::OFFSET, 0xa),
+            (reg::LINK_CONTROL::OFFSET, 0x3fc0fff6403 & !PEER),
+            (reg::MISC_ERROR_MASK::OFFSET, reg::MISC_ERROR_MASK::RESET),
+        ] {
             words.insert(a, v);
         }
         Self { words, bte: [Bte::default(); 2] }
@@ -108,12 +69,12 @@ impl Default for Regs {
 /// Where a finished BTE's interrupt packet goes: the node it names, its PI
 /// and the pending-modify value.
 pub(super) struct Completion {
-    pub node: u8,
+    pub node: crate::sn::NodeId,
     pub pi: usize,
     pub value: u64,
 }
 
-pub(super) struct Io {
+pub(crate) struct Io {
     regs: Mutex<Regs>,
     /// PIO permission (0x100): bit 0 lets PIO through.
     pio_permission: AtomicU64,
@@ -125,9 +86,8 @@ pub(super) struct Io {
     device_permission: AtomicU64,
     /// The large-window translation entries (0x160..0x190).
     itte: [AtomicU64; ITTES],
-    /// Scratch register 0 (0x150), which the IP35 PROM uses to publish each
-    /// interface's processors; an atomic so a board can read it without a
-    /// lock.
+    /// Scratch 0 (0x150), where the IP35 PROM publishes each interface's processors; an atomic,
+    /// read lock-free.
     scratch0: AtomicU64,
     widgets: [OnceLock<Arc<dyn BusDevice>>; 16],
 }
@@ -148,20 +108,21 @@ impl Io {
         io
     }
     fn reset_permissions(&self) {
-        for word in [&self.pio_permission, &self.pio_widgets, &self.widget_permission, &self.device_permission] {
+        for word in [&self.pio_permission, &self.pio_widgets, &self.widget_permission] {
             word.store(!0, Relaxed);
         }
+        self.device_permission.store(reg::INBOUND_DEVICE_ERROR_MASK::RESET, Relaxed);
         for entry in &self.itte {
-            entry.store(0, Relaxed);
+            entry.store(reg::TRANSLATION_TABLE_ENTRY::RESET, Relaxed);
         }
     }
     pub(super) fn locked(&self) -> bool {
         self.regs.is_locked()
     }
     /// Connect crossbar widget `widget`. Once per widget, before the machine runs.
-    pub(super) fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
+    pub(crate) fn connect_widget(&self, widget: u8, dev: Arc<dyn BusDevice>) {
         assert!(self.widgets[usize::from(widget)].set(dev).is_ok(), "Bedrock widget {widget} connected twice");
-        *self.regs.lock().words.entry(reg::XIO_STATUS).or_default() |= PEER;
+        *self.regs.lock().words.entry(reg::LINK_CONTROL::OFFSET).or_default() |= PEER;
     }
     fn peer(&self) -> bool {
         self.widgets.iter().any(|w| w.get().is_some())
@@ -172,9 +133,8 @@ impl Io {
             && self.widget_permission.load(Relaxed) & (1 << widget) != 0
             && (widget < 8 || self.device_permission.load(Relaxed) & (1 << ((widget - 8) * 8 + device)) != 0)
     }
-    /// Whether a request from `widget`'s device `device` is admitted;
-    /// `None` asks for every master on the widget. Widget 0, the crossbar
-    /// itself, is admitted by its widget bit alone.
+    /// Whether `widget`'s device `device` is admitted; `None` asks for every master. Widget 0 by
+    /// its bit alone.
     pub(super) fn admits(&self, widget: u8, device: Option<u8>) -> bool {
         let allowed = match device {
             Some(device) => self.permitted(widget, device),
@@ -189,27 +149,38 @@ impl Io {
     fn retained(a: u64) -> bool {
         matches!(
             a,
-            0x208 | 0x210 | 0x218 | 0x220 | 0x228 | 0x300 | reg::GFX_MAP_BASE | 0x148
+            0x208 | 0x210 | 0x218 | 0x220 | 0x228 | 0x300 | reg::GRAPHICS_MAP::OFFSET | GRAPHICS_MAP_1
                 | 0x388 | 0x390 | 0x398 | 0x3a0 | 0x600 | 0x608 | 0x610 | 0x30000 | 0x30008
-        ) || (reg::RETAINED_WINDOW_BASE..reg::RETAINED_WINDOW_LAST).contains(&a)
-            || (reg::RETAINED_CONFIG_BASE..=reg::RETAINED_CONFIG_LAST).contains(&a)
+        ) || (reg::PIO_READ_ADDRESS::OFFSET..RETAINED_WINDOW_END).contains(&a)
+            || (reg::CRB_A::OFFSET..=CRB_LAST).contains(&a)
     }
     fn mask(a: u64) -> Option<u64> {
         Some(match a {
-            reg::WIDGET_STATUS => 0x7fe01f,
-            reg::PIO_PERMISSION | reg::INBOUND_PERMISSION | reg::WIDGET_PERMISSION | reg::INBOUND_DEVICE_PERMISSION | reg::REGISTER_0150 | reg::REGISTER_0158 => !0,
-            reg::XIO_STATUS => 0x3ff0fff7d3f,
-            reg::LINK_STATUS => 0x101ff7f,
-            reg::ITTE_BASE..=reg::ITTE_LAST => 0x1f1f,
-            reg::REGISTER_0198_BASE..=reg::REGISTER_01D8_LAST => !0,
-            reg::REGISTER_01E0 => 0x3ffffff,
-            reg::REGISTER_01E8 => 0x1111,
-            reg::REGISTER_01F0 => 0x0fffffff03ffffff,
-            reg::REGISTER_0200 => 0x10f,
-            reg::REGISTER_03A8 => 0x13ffffffff30f3,
-            reg::REGISTER_03B0 => 0x1ff0f,
-            reg::REGISTER_03B8 => 0xff,
-            reg::REGISTER_03C0 => 0xffffff,
+            reg::WIDGET_CONTROL::OFFSET => !(reg::WIDGET_CONTROL::RO | reg::WIDGET_CONTROL::RSVD),
+            reg::LOCAL_ACCESS_PROTECTION::OFFSET | reg::OUTBOUND_WIDGET_ACCESS::OFFSET | reg::INBOUND_WIDGET_ACCESS::OFFSET | reg::INBOUND_DEVICE_ERROR_MASK::OFFSET | reg::SCRATCH::OFFSET | SCRATCH_1 => !0,
+            reg::LINK_CONTROL::OFFSET => field_masks!(
+                reg::LINK_CONTROL; MAX_BURST, DATA_AVAILABLE_SELECT, MAX_RETRY, REMOTE_POWER, LINK_STATUS, EIGHT_BIT_MODE,
+                LINK_ENABLE, WARM_RESET, NULL_TIMEOUT
+            ),
+            // SENT and the two FORWARDED_PI bits are status, not stored.
+            reg::INTERRUPT_DESTINATION::OFFSET => field_masks!(reg::INTERRUPT_DESTINATION; ENABLE, NODE, PI_SELECT, LEVEL),
+            reg::TRANSLATION_TABLE_ENTRY::OFFSET..=ITTE_LAST => !(reg::TRANSLATION_TABLE_ENTRY::RO | reg::TRANSLATION_TABLE_ENTRY::RSVD),
+            reg::PIO_REQUEST_BUFFER_W0::OFFSET..=PIO_REQUEST_LAST => !0,
+            reg::CREDIT_COUNT_TIMEOUT::OFFSET => !(reg::CREDIT_COUNT_TIMEOUT::RO | reg::CREDIT_COUNT_TIMEOUT::RSVD),
+            reg::MISC_ERROR_MASK::OFFSET => {
+                field_masks!(reg::MISC_ERROR_MASK; CLEAR_PRECISE, BTE_1_ENABLE, BTE_0_ENABLE, WIDGET_0_ENABLE)
+            }
+            reg::CROSSTALK_TIMEOUT_THRESHOLD::OFFSET => {
+                !(reg::CROSSTALK_TIMEOUT_THRESHOLD::RO | reg::CROSSTALK_TIMEOUT_THRESHOLD::RSVD)
+            }
+            reg::BTE_GLOBAL_CONTROL::OFFSET => !(reg::BTE_GLOBAL_CONTROL::RO | reg::BTE_GLOBAL_CONTROL::RSVD),
+            reg::REQUEST_BUFFER_MANAGEMENT::OFFSET => field_masks!(
+                reg::REQUEST_BUFFER_MANAGEMENT; PRECISE, MARKS, VALID_BITS, FLOW_CONTROL_COUNT, CLEAR_PENDING_BIT_13,
+                CLEAR_PENDING_BIT_12, COUNT, READ_HEADER, SPURIOUS_MESSAGE
+            ),
+            reg::REQUEST_BUFFER_CONTROL::OFFSET => field_masks!(reg::REQUEST_BUFFER_CONTROL; PENDING, COMMAND, ENTRY),
+            reg::CRB_TIMEOUT::OFFSET => !(reg::CRB_TIMEOUT::RO | reg::CRB_TIMEOUT::RSVD),
+            reg::CRB_TIMEOUT_PRESCALER::OFFSET => !(reg::CRB_TIMEOUT_PRESCALER::RO | reg::CRB_TIMEOUT_PRESCALER::RSVD),
             _ if Self::retained(a) => !0,
             _ => return None,
         })
@@ -218,36 +189,30 @@ impl Io {
     /// accesses check.
     fn atomic(&self, a: u64) -> Option<&AtomicU64> {
         match a {
-            reg::PIO_PERMISSION => Some(&self.pio_permission),
-            reg::INBOUND_PERMISSION => Some(&self.pio_widgets),
-            reg::WIDGET_PERMISSION => Some(&self.widget_permission),
-            reg::INBOUND_DEVICE_PERMISSION => Some(&self.device_permission),
-            reg::ITTE_BASE..=reg::ITTE_LAST if a % 8 == 0 => Some(&self.itte[((a - reg::ITTE_BASE) / 8) as usize]),
-            reg::REGISTER_0150 => Some(&self.scratch0),
+            reg::LOCAL_ACCESS_PROTECTION::OFFSET => Some(&self.pio_permission),
+            reg::OUTBOUND_WIDGET_ACCESS::OFFSET => Some(&self.pio_widgets),
+            reg::INBOUND_WIDGET_ACCESS::OFFSET => Some(&self.widget_permission),
+            reg::INBOUND_DEVICE_ERROR_MASK::OFFSET => Some(&self.device_permission),
+            reg::TRANSLATION_TABLE_ENTRY::OFFSET..=ITTE_LAST if a % 8 == 0 => Some(&self.itte[((a - reg::TRANSLATION_TABLE_ENTRY::OFFSET) / 8) as usize]),
+            reg::SCRATCH::OFFSET => Some(&self.scratch0),
             _ => None,
         }
     }
+    /// The engine a BTE register belongs to, and the register's offset in engine 0.
     fn bte_at(a: u64) -> Option<(usize, u64)> {
-        if (reg::BTE1_BASE..reg::BTE1_BASE + reg::BTE_REGISTER_SIZE).contains(&a) {
-            Some((0, a - reg::BTE1_BASE))
-        } else if (reg::BTE2_BASE..reg::BTE2_BASE + reg::BTE_REGISTER_SIZE).contains(&a) {
-            Some((1, a - reg::BTE2_BASE))
-        } else {
-            None
-        }
+        let n = a.checked_sub(reg::BTE_LENGTH_STATUS::OFFSET)? / BTE_STRIDE;
+        (n < reg::BTE_LENGTH_STATUS::COUNT as u64 && (a - n * BTE_STRIDE) < reg::BTE_LENGTH_STATUS::OFFSET + BTE_REGISTER_SIZE)
+            .then_some((n as usize, a - n * BTE_STRIDE))
     }
     /// The widget and widget address a PIO offset below 4 GiB reaches: the
     /// small windows directly, the large ones through their translation entry.
     fn target(&self, offset: u64) -> Option<(u8, u64)> {
-        if offset < 0x1000_0000 {
-            Some(((offset >> 24) as u8, offset & 0xff_ffff))
-        } else if offset >= 0x2000_0000 {
-            let entry = ((offset >> 29) - 1) as usize;
-            let itte = self.itte.get(entry)?.load(Relaxed);
-            Some((
-                ((itte >> 8) & 15) as u8,
-                ((itte & 31) << 29) | (offset & 0x1fff_ffff) | if itte & (1 << 12) != 0 { 1 << 47 } else { 0 },
-            ))
+        use crate::sn::{big_window, BIG_WINDOW_SHIFT, IO_BIG_WINDOWS, SMALL_WINDOW_SHIFT};
+        if offset < 16 << SMALL_WINDOW_SHIFT {
+            Some(((offset >> SMALL_WINDOW_SHIFT) as u8, offset & ((1 << SMALL_WINDOW_SHIFT) - 1)))
+        } else if offset >= IO_BIG_WINDOWS {
+            let itte = self.itte.get(((offset >> BIG_WINDOW_SHIFT) - 1) as usize)?.load(Relaxed);
+            Some(big_window(itte, offset))
         } else {
             None
         }
@@ -267,7 +232,7 @@ impl Io {
             return BusRead64::ok(ID);
         }
         match self.widgets[usize::from(widget)].get() {
-            Some(dev) => access(dev.as_ref(), target, size, value),
+            Some(dev) => widths::access(dev.as_ref(), target, usize::from(size), value),
             None => BusRead64::err(),
         }
     }
@@ -279,23 +244,26 @@ impl Io {
         if let Some((n, a)) = Self::bte_at(a) {
             let b = &mut r.bte[n];
             return match a {
-                bte_reg::STATUS => b.status,
-                bte_reg::SOURCE => b.source,
-                bte_reg::DESTINATION => b.destination,
-                bte_reg::CONTROL => {
+                reg::BTE_LENGTH_STATUS::OFFSET => b.status,
+                reg::BTE_SOURCE::OFFSET => b.source,
+                reg::BTE_DESTINATION::OFFSET => b.destination,
+                reg::BTE_CONTROL::OFFSET => {
                     b.status &= !BUSY;
                     b.control
                 }
-                bte_reg::NOTIFICATION => b.notification,
-                bte_reg::INTERRUPT => b.interrupt,
-                _ => 0,
+                reg::BTE_NOTIFICATION_ADDRESS::OFFSET => b.notification,
+                reg::BTE_INTERRUPT_ADDRESS::OFFSET => b.interrupt,
+                _ => {
+                    crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE{n} unsupported read {a:#x}");
+                    0
+                }
             };
         }
         match a {
-            reg::DEVICE_ID => ID,
-            reg::READ_ONLY | reg::READ_ONLY_ALIAS => 0,
-            reg::LINK_STATUS => r.words.get(&a).copied().unwrap_or(0) & !(1 << 28),
-            reg::LINK_LOG => r.words.get(&a).copied().unwrap_or(0),
+            reg::WIDGET_ID::OFFSET => ID,
+            READ_ONLY | reg::ERROR_CLEAR::OFFSET => 0,
+            reg::INTERRUPT_DESTINATION::OFFSET => r.words.get(&a).copied().unwrap_or(0) & !reg::INTERRUPT_DESTINATION::SENT::MASK,
+            reg::LLP_LOG::OFFSET => r.words.get(&a).copied().unwrap_or(0),
             _ if Self::mask(a).is_some() => r.words.get(&a).copied().unwrap_or(0),
             _ => {
                 crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO unsupported read {a:#x}");
@@ -309,12 +277,12 @@ impl Io {
         if let Some((n, offset)) = Self::bte_at(a) {
             let b = &mut r.bte[n];
             match offset {
-                bte_reg::STATUS => b.status = v & (0xffff | BUSY),
-                bte_reg::SOURCE => b.source = v & ADDR_MASK,
-                bte_reg::DESTINATION => b.destination = v & ADDR_MASK,
-                bte_reg::CONTROL => {
-                    b.control = v & 0x111;
-                    if b.control & 0x100 != 0 {
+                reg::BTE_LENGTH_STATUS::OFFSET => b.status = v & (reg::BTE_LENGTH_STATUS::LENGTH_LINES::MASK | BUSY),
+                reg::BTE_SOURCE::OFFSET => b.source = v & ADDR_MASK,
+                reg::BTE_DESTINATION::OFFSET => b.destination = v & ADDR_MASK,
+                reg::BTE_CONTROL::OFFSET => {
+                    b.control = v & field_masks!(reg::BTE_CONTROL; POISON, NOTIFY, ZERO_FILL);
+                    if b.control & reg::BTE_CONTROL::POISON::MASK != 0 {
                         crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE poison unsupported");
                     } else if b.status & BUSY != 0 {
                         if b.status & 0xffff == 0 {
@@ -325,37 +293,37 @@ impl Io {
                         }
                     }
                 }
-                bte_reg::NOTIFICATION => b.notification = v & ADDR_MASK,
-                bte_reg::INTERRUPT => b.interrupt = v & 0x7f01ff,
-                _ => {}
+                reg::BTE_NOTIFICATION_ADDRESS::OFFSET => b.notification = v & ADDR_MASK,
+                reg::BTE_INTERRUPT_ADDRESS::OFFSET => b.interrupt = v & field_masks!(reg::BTE_INTERRUPT_ADDRESS; LEVEL, NODE, PI_SELECT),
+                _ => crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO BTE{n} unsupported write {a:#x} = {v:#x}"),
             }
             return Effect::None;
         }
         match a {
-            reg::PROTECTION_KEY => {
+            reg::PROTECTION_OVERRIDE::OFFSET => {
                 if v == IIO_PROTECT_OVRRD_KEY {
                     self.pio_permission.fetch_or(1, Relaxed);
                 }
             }
-            reg::INBOUND_DEVICE_PERMISSION => {
+            reg::INBOUND_DEVICE_ERROR_MASK::OFFSET => {
                 self.device_permission.fetch_or(v, Relaxed);
             }
             _ if self.atomic(a).is_some() => self.atomic(a).unwrap().store(v & Self::mask(a).unwrap(), Relaxed),
-            reg::REGISTER_01E8 => {
+            reg::MISC_ERROR_MASK::OFFSET => {
                 *r.words.entry(a).or_default() |= v & Self::mask(a).unwrap();
             }
-            reg::XIO_STATUS => {
+            reg::LINK_CONTROL::OFFSET => {
                 let v = v & Self::mask(a).unwrap() & if self.peer() { !0 } else { !PEER };
                 r.words.insert(a, v);
             }
-            reg::LINK_LOG => {
+            reg::LLP_LOG::OFFSET => {
                 if v == 0 {
                     r.words.insert(a, 0);
                 } else {
                     crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO nonzero link-log write ignored");
                 }
             }
-            reg::READ_ONLY_ALIAS | reg::DEVICE_ID | reg::READ_ONLY => {
+            reg::ERROR_CLEAR::OFFSET | reg::WIDGET_ID::OFFSET | READ_ONLY => {
                 crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock IO read-only or unsupported clear write {a:#x}");
             }
             _ => {
@@ -368,9 +336,8 @@ impl Io {
         }
         Effect::None
     }
-    /// Run engine `n` against `memory`, which the chip names by node number
-    /// when it is cabled. The completion interrupt, if the engine sends one,
-    /// is returned for the chip to deliver to the node it names.
+    /// Run engine `n` against `memory`; the completion interrupt, if any, is returned for the chip
+    /// to deliver.
     pub(super) fn run_bte(&self, n: usize, memory: &dyn BusDevice) -> Option<Completion> {
         let mut b = self.regs.lock().bte[n];
         let count = b.status & 0xffff;
@@ -407,59 +374,35 @@ impl Io {
             }
             return None;
         }
-        Some(Completion { node: ((b.interrupt >> 1) & 255) as u8, pi: (b.interrupt & 1) as usize, value: 0x100 | ((b.interrupt >> 16) & 127) })
+        {
+            use reg::BTE_INTERRUPT_ADDRESS as ia;
+            Some(Completion {
+                node: crate::sn::node_id((b.interrupt & ia::NODE::MASK) >> ia::NODE::SHIFT, super::NODE_SHIFT),
+                pi: (b.interrupt & ia::PI_SELECT::MASK) as usize,
+                value: crate::sn::MODIFY_SET | ((b.interrupt & ia::LEVEL::MASK) >> ia::LEVEL::SHIFT),
+            })
+        }
     }
     pub(super) fn power_on(&self) {
         let mut r = self.regs.lock();
         *r = Regs::default();
         if self.peer() {
-            *r.words.entry(reg::XIO_STATUS).or_default() |= PEER;
+            *r.words.entry(reg::LINK_CONTROL::OFFSET).or_default() |= PEER;
         }
         self.reset_permissions();
         self.scratch0.store(0, Relaxed);
     }
     /// Scratch register 0. One atomic load.
-    pub(super) fn scratch0(&self) -> u64 {
+    pub(crate) fn scratch0(&self) -> u64 {
         self.scratch0.load(Relaxed)
     }
 }
 
-/// An access of `size` bytes to `dev`: a write when `value` is given.
-pub(super) fn access(dev: &dyn BusDevice, a: u64, size: u8, value: Option<u64>) -> BusRead64 {
-    if let Some(v) = value {
-        let status = match size {
-            1 => dev.write8(a, v as u8),
-            2 => dev.write16(a, v as u16),
-            4 => dev.write32(a, v as u32),
-            8 => dev.write64(a, v),
-            _ => BUS_ERR,
-        };
-        return BusRead64 { status, data: 0 };
-    }
-    match size {
-        1 => {
-            let r = dev.read8(a);
-            BusRead64 { status: r.status, data: r.data as u64 }
-        }
-        2 => {
-            let r = dev.read16(a);
-            BusRead64 { status: r.status, data: r.data as u64 }
-        }
-        4 => {
-            let r = dev.read32(a);
-            BusRead64 { status: r.status, data: r.data as u64 }
-        }
-        8 => dev.read64(a),
-        _ => BusRead64::err(),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    // Cases follow tests/qtest/sn1-bedrock-io-test.c in
-    // jamesbraid/qemu-sgi-origami: inbound-protection, bte and
-    // bte-error-termination.
-    use super::super::reg::{md, pi, IO_BASE, MD_BASE, PI1_BASE};
+pub(in crate::dev::bedrock) mod tests {
+    // Cases follow tests/qtest/sn1-bedrock-io-test.c in jamesbraid/qemu-sgi-origami:
+    // inbound-protection, bte and bte-error-termination.
+    use super::super::regs::{md, pi, PI1_BASE};
     use super::super::Rig;
     use super::*;
     use crate::traits::{BusRead64, BUS_BUSY};
@@ -468,7 +411,7 @@ mod tests {
     const BANK: u64 = 64 << 20;
     fn rig() -> Rig {
         let rig = Rig::new();
-        rig.w(MD_BASE + md::CONFIG, 0x11);
+        rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
         rig
     }
     #[derive(Default)]
@@ -491,12 +434,12 @@ mod tests {
             BUS_BUSY
         }
     }
-    fn launch(rig: &Rig, base: u64, count: u64, src: u64, dst: u64, notify: u64, control: u64) {
-        rig.w(IO_BASE + base, count | BUSY);
-        rig.w(IO_BASE + base + 8, src);
-        rig.w(IO_BASE + base + 0x10, dst);
-        rig.w(IO_BASE + base + 0x20, notify);
-        rig.w(IO_BASE + base + 0x18, control);
+    pub(in crate::dev::bedrock) fn launch(rig: &Rig, base: u64, count: u64, src: u64, dst: u64, notify: u64, control: u64) {
+        rig.w(reg::BASE + base, count | BUSY);
+        rig.w(reg::BASE + base + 8, src);
+        rig.w(reg::BASE + base + 0x10, dst);
+        rig.w(reg::BASE + base + 0x20, notify);
+        rig.w(reg::BASE + base + 0x18, control);
     }
 
     /// The guest must enable widget and requester masks before PIO or inbound DMA succeeds.
@@ -506,30 +449,30 @@ mod tests {
             let rig = rig();
             let pio = rig.chip.pio();
             let m = Arc::new(Memory::default());
-            rig.chip.connect_widget(8, m.clone());
-            rig.w(IO_BASE + reg::ITTE_BASE, 0x802);
+            rig.chip.io.connect_widget(8, m.clone());
+            rig.w(reg::BASE + reg::TRANSLATION_TABLE_ENTRY::OFFSET, 0x802);
             assert_eq!(pio.write64(0x20000080, 0xabcd), BUS_OK);
             assert_eq!(m.read64(0x40000080).data, 0xabcd);
             assert_eq!(pio.read64(0x20000080).data, 0xabcd);
-            rig.w(IO_BASE + reg::INBOUND_PERMISSION, 0);
+            rig.w(reg::BASE + reg::OUTBOUND_WIDGET_ACCESS::OFFSET, 0);
             assert_eq!(pio.read64(0x20000080).status, BUS_ERR);
-            rig.w(IO_BASE + reg::INBOUND_PERMISSION, !0);
-            rig.w(IO_BASE + reg::PIO_PERMISSION, 0);
+            rig.w(reg::BASE + reg::OUTBOUND_WIDGET_ACCESS::OFFSET, !0);
+            rig.w(reg::BASE + reg::LOCAL_ACCESS_PROTECTION::OFFSET, 0);
             assert_eq!(pio.read64(0x20000080).status, BUS_ERR);
-            rig.w(IO_BASE + reg::PROTECTION_KEY, IIO_PROTECT_OVRRD_KEY);
+            rig.w(reg::BASE + reg::PROTECTION_OVERRIDE::OFFSET, IIO_PROTECT_OVRRD_KEY);
             assert_eq!(pio.read64(0x20000080).status, BUS_OK);
             assert_eq!(pio.read64(0x10000000).status, BUS_ERR);
-            assert_ne!(rig.r(IO_BASE + reg::XIO_STATUS) & PEER, 0, "a widget answers the link");
+            assert_ne!(rig.r(reg::BASE + reg::LINK_CONTROL::OFFSET) & PEER, 0, "a widget answers the link");
             rig.chip.io.power_on();
-            assert_eq!(rig.r(IO_BASE + reg::PIO_PERMISSION), !0);
-            assert_eq!(rig.r(IO_BASE + reg::REGISTER_01E8), 0x111);
-            assert_ne!(rig.r(IO_BASE + reg::XIO_STATUS) & PEER, 0, "the peer survives reset");
+            assert_eq!(rig.r(reg::BASE + reg::LOCAL_ACCESS_PROTECTION::OFFSET), !0);
+            assert_eq!(rig.r(reg::BASE + reg::MISC_ERROR_MASK::OFFSET), 0x111);
+            assert_ne!(rig.r(reg::BASE + reg::LINK_CONTROL::OFFSET) & PEER, 0, "the peer survives reset");
         }
         {
             let rig = rig();
             let chip = &rig.chip;
             assert_eq!(chip.inbound_write(14, Some(2), 0x80, 8, 42), BUS_OK);
-            assert_eq!(chip.dma_view().read64(0x80).data, 42);
+            assert_eq!(chip.decode.physical().read64(0x80).data, 42);
             chip.io.disable_device(14, 2);
             assert_eq!(chip.inbound_read(14, Some(2), 0x80, 8).status, BUS_ERR);
             assert_eq!(chip.inbound_read(14, None, 0x80, 8).status, BUS_ERR);
@@ -538,15 +481,15 @@ mod tests {
             assert_eq!(chip.inbound_write_block(14, Some(2), 0x2000, &[1, 2]), BUS_ERR);
             assert_eq!(chip.inbound_write_block(14, None, 0x2000, &[1, 2]), BUS_ERR);
             assert_eq!(chip.inbound_read_block(14, Some(2), 0x80, &mut [0]), BUS_ERR);
-            assert_eq!(chip.dma_view().read64(0x2000).data, 0);
+            assert_eq!(chip.decode.physical().read64(0x2000).data, 0);
             assert_eq!(chip.inbound_write_block(14, Some(1), 0x2000, &[1, 2]), BUS_OK);
-            assert_eq!(chip.dma_view().read64(0x2008).data, 2);
+            assert_eq!(chip.decode.physical().read64(0x2008).data, 2);
             // An interrupt packet to PI0's pending-modify register sets bank 0 bit 35.
             let a = (1 << 47) | 0x1800090;
             assert_eq!(chip.inbound_write(15, Some(0), a, 8, 0x123), BUS_OK);
-            assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 35);
+            assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 35);
             assert_eq!(chip.inbound_write(0, None, a + PI1_BASE, 8, 0x101), BUS_OK, "widget 0 is admitted");
-            assert_eq!(rig.r(PI1_BASE + pi::PENDING_STATUS_A), 1 << 1);
+            assert_eq!(rig.r(PI1_BASE + pi::INT_PEND0::OFFSET), 1 << 1);
             assert_eq!(chip.inbound_read(15, Some(0), a, 8).status, BUS_ERR, "only stores reach a PI");
             assert_eq!(chip.inbound_write(15, Some(0), a, 4, 0x123), BUS_ERR, "only doublewords");
             assert_eq!(chip.inbound_read(15, Some(0), a | (1 << 39), 8).status, BUS_ERR, "another node");
@@ -554,29 +497,52 @@ mod tests {
             assert_eq!(chip.inbound_read(15, Some(0), a + 0x800000, 8).status, BUS_ERR);
             assert_eq!(chip.inbound_read(15, Some(0), BANK, 8).status, BUS_ERR, "beyond the bank");
         }
+        // A busy widget answers busy through PIO, so the CPU retries.
+        let rig = rig();
+        rig.chip.io.connect_widget(8, Arc::new(Busy));
+        let pio = rig.chip.pio();
+        assert_eq!(pio.read64(0x8000000).status, BUS_BUSY);
+        assert_eq!(pio.write64(0x8000000, 42), BUS_BUSY);
     }
-    /// The guest observes BTE line copies and zero-fill through its completion registers.
+    /// The guest observes BTE line copies, zero-fill and overlapping copies through its completion
+    /// registers.
     #[test]
     fn the_bte_copies_and_zeroes_lines_before_completion() {
         let rig = rig();
-        let m = rig.chip.dma_view();
+        let m = rig.chip.decode.physical();
         for i in 0..32 {
             m.write64(0x1000 + i * 8, 0xfeed0000 | i);
         }
         m.write64(0x3000, 0xdead);
-        launch(&rig, reg::BTE1_BASE, 2, 0x1000, 0x2000, 0x3000, 0x10);
+        launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET, 2, 0x1000, 0x2000, 0x3000, 0x10);
         for i in 0..32 {
             assert_eq!(m.read64(0x2000 + i * 8).data, 0xfeed0000 | i);
         }
-        assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 0);
-        assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::SOURCE), 0x1100);
+        assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 0);
+        assert_eq!(rig.r(reg::BASE + reg::BTE_SOURCE::OFFSET), 0x1100);
         assert_eq!(m.read64(0x3000).data, 0, "the notification holds the final status");
-        rig.w(IO_BASE + reg::BTE2_BASE + bte_reg::INTERRUPT, 53 << 16);
-        launch(&rig, reg::BTE2_BASE, 1, 0, 0x2000, 0, 1);
+        rig.w(reg::BASE + BTE_STRIDE + reg::BTE_INTERRUPT_ADDRESS::OFFSET, 53 << 16);
+        launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET + BTE_STRIDE, 1, 0, 0x2000, 0, 1);
         for i in 0..16 {
             assert_eq!(m.read64(0x2000 + i * 8).data, 0);
         }
-        assert_eq!(rig.r(pi::PENDING_STATUS_A), 1 << 53, "the completion interrupt");
+        assert_eq!(rig.r(pi::INT_PEND0::OFFSET), 1 << 53, "the completion interrupt");
+        // The copy goes a line at a time, read whole then written whole: a destination one line
+        // above its source repeats the first line down the range.
+        let rig = &Rig::new();
+        rig.w(md::BASE + md::MEMORY_CONFIG::OFFSET, 0x11);
+        let m = rig.chip.decode.physical();
+        let line = |n: u64| 0x1000 + n * 128;
+        for i in 0..16 {
+            m.write64(line(0) + i * 8, 0xa0 + i);
+        }
+        launch(rig, reg::BTE_LENGTH_STATUS::OFFSET, 4, line(0), line(1), 0, 0x10);
+        for n in 1..5 {
+            for i in 0..16 {
+                assert_eq!(m.read64(line(n) + i * 8).data, 0xa0 + i, "line {n} word {i}");
+            }
+        }
+        assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 0);
     }
     /// A failed BTE line stops the transfer and reports the failing source and destination.
     #[test]
@@ -584,58 +550,29 @@ mod tests {
         // The second line runs off the end of the bank, on the read or the write side.
         for (src, dst) in [(BANK - 0x80, 0x2000), (0x1000, BANK - 0x80)] {
             let rig = rig();
-            launch(&rig, reg::BTE1_BASE, 3, src, dst, 0x3000, 0x10);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 2 | ERROR);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::SOURCE), src + 0x80);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::DESTINATION), dst + 0x80);
-            assert_eq!(rig.chip.dma_view().read64(0x3000).data, 2 | ERROR);
+            launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET, 3, src, dst, 0x3000, 0x10);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 2 | ERROR);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_SOURCE::OFFSET), src + 0x80);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_DESTINATION::OFFSET), dst + 0x80);
+            assert_eq!(rig.chip.decode.physical().read64(0x3000).data, 2 | ERROR);
         }
         {
             let rig = rig();
-            launch(&rig, reg::BTE1_BASE, 1, 0x1000, 0x2000, BANK, 0x10);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 0, "a failed notification still completes");
-            launch(&rig, reg::BTE1_BASE, 2, 0xffffffff80, 0x2000, 0x3000, 0x10);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 2 | ERROR);
+            launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET, 1, 0x1000, 0x2000, BANK, 0x10);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 0, "a failed notification still completes");
+            launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET, 2, 0xffffffff80, 0x2000, 0x3000, 0x10);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 2 | ERROR);
         }
         {
             let rig = rig();
-            launch(&rig, reg::BTE1_BASE, 1, 0, 0, 0, 0x100);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 1 | BUSY);
-            rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::CONTROL);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 1);
-            launch(&rig, reg::BTE1_BASE, 0, 0, 0, 0, 0x10);
-            assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 0);
+            launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET, 1, 0, 0, 0, 0x100);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 1 | BUSY);
+            rig.r(reg::BASE + reg::BTE_CONTROL::OFFSET);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 1);
+            launch(&rig, reg::BTE_LENGTH_STATUS::OFFSET, 0, 0, 0, 0, 0x10);
+            assert_eq!(rig.r(reg::BASE + reg::BTE_LENGTH_STATUS::OFFSET), 0);
         }
     }
-    /// The copy goes a line at a time, read whole and then written whole: a
-    /// destination one line above its source repeats the first line down the
-    /// range.
-    #[test]
-    fn the_bte_copies_line_by_line_so_an_overlapping_destination_repeats_the_first_line() {
-        let rig = rig();
-        let m = rig.chip.dma_view();
-        let line = |n: u64| 0x1000 + n * 128;
-        for i in 0..16 {
-            m.write64(line(0) + i * 8, 0xa0 + i);
-        }
-        launch(&rig, reg::BTE1_BASE, 4, line(0), line(1), 0, 0x10);
-        for n in 1..5 {
-            for i in 0..16 {
-                assert_eq!(m.read64(line(n) + i * 8).data, 0xa0 + i, "line {n} word {i}");
-            }
-        }
-        assert_eq!(rig.r(IO_BASE + reg::BTE1_BASE + bte_reg::STATUS), 0);
-    }
-    /// A widget that is busy answers busy through PIO, so the CPU retries.
-    #[test]
-    fn a_busy_widget_answers_busy_through_pio() {
-        let rig = rig();
-        rig.chip.connect_widget(8, Arc::new(Busy));
-        let pio = rig.chip.pio();
-        assert_eq!(pio.read64(0x8000000).status, BUS_BUSY);
-        assert_eq!(pio.write64(0x8000000, 42), BUS_BUSY);
-    }
-
     impl Io {
         /// Hold the block's lock, for tests of the paths that must not take it.
         pub(in crate::dev::bedrock) fn hold(&self) -> impl Sized + '_ {

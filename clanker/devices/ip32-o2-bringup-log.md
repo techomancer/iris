@@ -50,7 +50,7 @@ Diagnostics that remain, all off unless set:
 | `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the control port's `retrace` |
 | `IRIS_IP32_MEC_TRACE` | Ethernet frames sent and received, and why a received one was dropped |
 | `IRIS_O2_AUDIO_TRACE` | audio output activity, and each time a ring ran dry between sounds |
-| `IRIS_O2_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling |
+| `IRIS_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling (every sound card) |
 | `IRIS_O2_AUDIO_CAPTURE=file` | what the host device is given, after rate conversion (a WAV; was raw 16-bit stereo before iris-audio) |
 
 ## The assessment (2026-09-19)
@@ -534,8 +534,9 @@ an address derived from the tag being discarded. Here that address was the
 PROM's own stack.
 
 This was an **IRIS bug, not an IP32 one** — shared CPU code that every guest
-runs through. The fix and its regression testing are in
-[`../pr-drafts/pr-cache-index-store-tag.md`](../pr-drafts/pr-cache-index-store-tag.md).
+runs through. The original PR draft (`pr-cache-index-store-tag.md`) is no
+longer present; the implementation and regression tests are in
+[`src/cpu/mips_cache_v2.rs`](../../src/cpu/mips_cache_v2.rs).
 The L2 path in the same `match` arm already got it right.
 
 ### 3. GBE has to answer
@@ -1640,7 +1641,8 @@ logs in, and 4 MB copied each way with scp came back identical (about 200 KB/s,
 the emulated R5000 doing the encryption), with no interface errors and no
 watchdog timeouts.
 
-Related: [`virtio-mmio-design.md`](virtio-mmio-design.md).
+Related: [virtio-serial device guide](../../docs/dev/virtio-serial.md).
+The original `virtio-mmio-design.md` draft is no longer present.
 
 ## Memory as CRIME banks, and the R10000 (2026-10-17)
 
@@ -1902,6 +1904,6 @@ was wrong, and what it turned out to be:
 Instruments added for it: the control port's `pixel X Y` (one scanned-out
 point: frame-buffer word, DID, mode-table entry, colour map, overlay) and
 `unmapped`; `IRIS_O2_FRAG_PROBE=x,y` (every triangle fragment at a pixel,
-with texture coordinates, LOD and level); `IRIS_O2_AUDIO_DUMP` (each
+with texture coordinates, LOD and level); `IRIS_AUDIO_DUMP` (each
 output's samples at the guest's rate); and the "ring ran dry" count in the
 audio trace.

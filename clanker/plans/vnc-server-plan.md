@@ -3,8 +3,10 @@
 Status: implemented 2026-10-29 on branch `vnc` (phases 1-5): `src/vnc/`,
 `src/hostinput.rs`, `src/keysym.rs`, monitor `screen`/`ptr`/`key`, MCP
 tools, docs. Tested on Indy Newport (window and `--ci`), XZ, IP28 IMPACT,
-Octane, O2, with TigerVNC and `tools/vnc-check.py`. Not done: VNC password,
-second head, CI-socket input commands. Design notes in `clanker/vnc/`.
+Octane, O2, with TigerVNC and `tools/vnc-check.py`. VNC password
+authentication landed 2026-11-12 (`1a88ad2d`: `[vnc] password_file`,
+`IRIS_VNC_PASSWORD`). Not done: second head, CI-socket input commands.
+Design notes in `clanker/vnc/`.
 
 ## Goal
 

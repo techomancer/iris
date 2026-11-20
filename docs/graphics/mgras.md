@@ -28,7 +28,7 @@ flowchart LR
   E["<b>Shading and texture</b><br/>Hardware: TE1 iterates coordinates and LOD;<br/>TRAM fetches and filters; RE4 does texture<br/>environment and fog<br/>Iris: same raster thread, te1.rs sampler"]
   G["<b>Per-fragment operations</b><br/>Hardware: PP1 (alpha, depth and stencil tests,<br/>blend, dither, masking); fog in RE4<br/>Iris: same raster thread"]
   H[("<b>Frame buffer</b><br/>Hardware: RDRAM, 12 MB per raster engine,<br/>behind its two PP1 chips<br/>Iris: pages of 36-bit words per engine")]
-  I["<b>Scan-out</b><br/>Hardware: CMAP colour look-up and gamma, VIO1,<br/>RAMDAC; VC3 timing (inferred). Window-ID and<br/>mode tables not publicly documented<br/>Iris: display thread (MGRAS-Refresh)"]
+  I["<b>Scan-out</b><br/>Hardware: CMAP colour look-up and gamma, VIO1,<br/>RAMDAC; VC3 timing (inferred). Window-ID and<br/>mode tables not publicly documented<br/>Iris: display thread (Display-Refresh)"]
   A --> B --> C --> D --> E --> G --> H --> I
 ```
 
@@ -42,13 +42,13 @@ flowchart LR
   HQ3 -- "register writes" --> RSSF["rss_fifo<br/>one head per engine"]
   RSSF --> RSS["MGRAS-RSS<br/>one per engine"]
   RSS --> MEM[("pixel pages<br/>per engine")]
-  MEM --> REF["display thread: MGRAS-Refresh<br/>snapshot, compose"]
+  MEM --> REF["display thread: Display-Refresh<br/>compose"]
   REF --> SCR["GfxDisplay screen"]
 ```
 
-Iris models the RDRAM as pages of 36-bit words (`pixmem.rs`); a page is one screen tile. The display snapshots the window-ID runs, the mode words and
-the colour tables before each retrace pulse, when the picture changed or every sixth idle frame, then makes one pass over the
-pixels (`frame.rs`). The pixel pipeline has an interpreter and an optional
+Iris models the RDRAM as pages of 36-bit words (`pixmem.rs`); a page is one screen tile. After each vertical blank in which the picture changed, the display makes
+one pass over the pages (`frame.rs` `compose_direct`): a span of one window ID
+at a time through that ID's mode, then the overlay and the cursor. The pixel pipeline has an interpreter and an optional
 Cranelift compiler (`rss_jit/`, cargo feature `gr4-jit`, also in `gpujit`; not
 a default feature), each tested against the other. `IRIS_GR4_JIT` sets the
 start mode (`off`, `sync` or `async`, the default); `IRIS_NO_JIT` forces it off.
@@ -67,10 +67,22 @@ drawn by the MGRAS-RSS raster threads (`mgras/rss.rs`).
 flowchart LR
   cpu["CPU thread"] -->|hq_fifo: commands, raster writes| hq["MGRAS-HQ3<br/>command and GL front end"]
   hq -->|rss_fifo: register writes| rss["MGRAS-RSS, one per raster engine<br/>draws its own rows"]
-  rss -.->|pixel pages, read unlocked| refresh["display thread: MGRAS-Refresh<br/>snapshot, compose"]
+  rss -.->|pixel pages, read unlocked| refresh["display thread: Display-Refresh<br/>compose"]
 ```
 
 The rss FIFO has one head per raster engine. Each engine reads every register write and draws only its own rows.
+
+The display refresh thread raises the retrace at the rate the guest programs:
+it totals the VC3's timing tables (pixel clocks a line, lines a frame) and
+divides the pixel clock the DAC's PLL registers give by them, so a format
+loaded with `setmon` changes the retrace rate. After each blank it composes a
+frame only if the picture can have changed. The raster engines mark each
+primitive with the buffer it drew in, the bit planes its plane mask lets it
+change and its clip box, and the display tests the marks against what each
+window ID in the box shows. A double-buffered window draws into the buffer
+its window ID does not show, so its drawing costs nothing on screen until the
+kernel flips the buffers at a retrace; the flip changes the display state,
+which always composes.
 
 ## From a GL token to pixels
 

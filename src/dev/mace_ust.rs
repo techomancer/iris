@@ -104,7 +104,7 @@ impl MaceUst {
 
     /// The time the guest reads (UST, CRIME's timer): the host's, less what
     /// host stalls cost while the PROM was bit-banging 1-Wire. Then each step
-    /// between two guest reads counts at most [`GUEST_CLOCK_STEP_CAP_US`],
+    /// between two guest reads counts at most `GUEST_CLOCK_STEP_CAP_US`,
     /// so after a stall the PROM goes on spinning to its own deadline and
     /// every slot comes out as wide as it meant. Timed on the host clock, a
     /// stall inside a "1" read as a "0" (or a reset), and on some boots the

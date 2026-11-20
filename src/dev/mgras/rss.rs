@@ -25,7 +25,8 @@
 use super::fixed;
 use super::pixmem::{Buffer, Kind, PixMem};
 use super::plain::{RegMap, Slot};
-use super::te1::{reg as te_reg, tex_env, Sampler, Te1, ITER_ONE, TEXMODE1_ENABLE};
+use super::te1::{self, reg as te_reg, tex_env, Sampler, Te1, ITER_ONE, TEXMODE1_ENABLE};
+use serde::{Deserialize, Serialize};
 
 /// Framebuffer coordinates the model accepts (x and y, 0..2048); where a
 /// pixel lands in memory depends on its buffer (see `pixmem`).
@@ -442,6 +443,11 @@ pub(super) const FILL_LINE_STIPPLE_OPAQUE: u32 = 1 << 6;
 const STATUS_IDLE: u32 = 0x100 | (1 << 4);
 /// Config: Y-flip.
 pub(super) const CONFIG_YFLIP: u32 = 1 << 3;
+/// Config: DestRE, bits 2:0. 0 or 1 sends raster work to that RE4 alone;
+/// bit 2 (4) to all of them, which is what the PROM writes (0x4) and what
+/// IRIX keeps set (0xCAC). Bits 11:10 are not the destination.
+const CONFIG_DEST_RE_MASK: u32 = 7;
+const CONFIG_DEST_RE_ALL: u32 = 4;
 /// Fill mode: fast fill (solid, from the fill colour registers).
 pub(super) const FILL_FAST: u32 = 1 << 20;
 /// Fill mode: char data stipples the block (with block type 1), and the
@@ -938,7 +944,7 @@ pub(super) fn signed16(v: u32) -> i32 {
 
 /// A block, in window coordinates, with its colour.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct Block {
     pub xs: i32,
     pub ys: i32,
@@ -964,7 +970,7 @@ impl Block {
 
 /// A character block being filled with stipple data, one row at a time.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct Stipple {
     pub block: Block,
     pub col: i32,
@@ -974,7 +980,7 @@ pub(super) struct Stipple {
 
 /// An armed pixel transfer.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct Xfer {
     pub block: Block,
     pub read: bool,
@@ -1053,7 +1059,7 @@ pub(crate) fn bytes_per_pixel(xfrmode: u32) -> u32 {
 
 /// What the raster subsystem has done, for `mgras stats`.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct RssStats {
     /// Executed primitives by IR opcode (bits 3:0).
     pub prims: [u64; 16],
@@ -1153,6 +1159,8 @@ impl<T> std::ops::DerefMut for Plane<T> {
 pub struct Rss {
     regs: [u32; 0x400],
     device: RegMap<256>,
+    /// The texture colour tables (`te1::TEX_LUT_DEV`): R, G, B, 256 each.
+    pub tex_lut: [u8; te1::TEX_LUT_LEN],
     /// Pixel memory. In colour-index modes a pixel's low byte is the index.
     pub mem: Plane<PixMem>,
     /// The PIO write line being assembled.
@@ -1208,6 +1216,32 @@ pub struct Rss {
     /// stores. Null on the CPU path.
     #[cfg(feature = "wgpu")]
     pub gpu: super::wgpu::GpuLink,
+    #[cfg(feature = "wgpu")]
+    pub gpu_fault: *const crate::locks::SpinLock<Option<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct RssSnapshot {
+    version: u32,
+    regs: Vec<u32>,
+    device: Vec<(u32, u32)>,
+    device_overflowed: bool,
+    line_buf: Vec<u8>,
+    stipple: Option<Stipple>,
+    xfer: Option<Xfer>,
+    stats: RssStats,
+    gl_line_stipple_pos: u32,
+    gl_stash: Vec<u32>,
+    fillmodes: Vec<u32>,
+    fillmodes_n: usize,
+    stale_events: u32,
+    stale_last: [u32; 2],
+    te_load: u32,
+    te_read: [u32; 3],
+    /// The texture colour tables. Version 2 writes them after the record
+    /// above (version 1 has none: they restore empty).
+    #[serde(skip)]
+    tex_lut: Vec<u8>,
 }
 
 impl Drop for Rss {
@@ -1235,8 +1269,8 @@ pub(super) struct TriSetup {
     pub s1: f64,
     pub s2: f64,
     pub xs: f64,
-    /// Colour planes, 12.16 (`fixed::plane`): pixel (i, j) is `p[0] + p[1]
-    /// (i - xs_i) + p[2] (yref_i - j)`.
+    /// Colour planes, 12.16 (`fixed::plane`): pixel (i, j) is `p\[0\] + p\[1\]
+    /// (i - xs_i) + p\[2\] (yref_i - j)`.
     pub cplanes: [[i32; 3]; 4],
     pub xs_i: i32,
     pub yref_i: i32,
@@ -1381,14 +1415,109 @@ impl Rss {
         std::ptr::addr_of_mut!((*p).cid).write(Plane(std::ptr::addr_of_mut!((*planes).cid)));
         std::ptr::addr_of_mut!((*p).te).write(Plane(std::ptr::addr_of_mut!((*planes).te)));
         std::ptr::addr_of_mut!((*p).te_sync).write(Plane(std::ptr::addr_of_mut!((*planes).te_sync)));
+        (*p).regs[reg::CONFIG as usize] = CONFIG_DEST_RE_ALL;
         #[cfg(feature = "gr4-jit")]
         std::ptr::addr_of_mut!((*p).jit.mode).write(super::rss_jit::default_mode());
+    }
+
+    /// Whether CONFIG.DestRE routes the next raster operation to this RE4.
+    pub fn accepts_destination(&self) -> bool {
+        let dest = self.reg(reg::CONFIG) & CONFIG_DEST_RE_MASK;
+        dest & CONFIG_DEST_RE_ALL != 0 || dest == self.engine
+    }
+
+    /// Registers kept common because this model has one TE1/TRAM shared by
+    /// both RE4s instead of one texture subsystem per engine.
+    pub fn uses_shared_texture_state(r: u32) -> bool {
+        matches!(r, reg::XFRCONTROL | reg::XFRSIZE | reg::XFRMODE | te_reg::TXADDR)
+            || super::te1::CONTEXT_REGS.contains(&r)
+            || super::te1::TABLE_REGS.contains(&r)
     }
 
     /// Draw only the scanlines `y` with `(y ^ engine) & mask == 0`.
     pub fn set_engine(&mut self, engine: u32, mask: u32) {
         self.engine = engine;
         self.own_mask = mask;
+        #[cfg(feature = "gr4-jit")]
+        self.jit.invalidate();
+    }
+
+    pub(super) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
+        let snapshot = RssSnapshot {
+            version: 2,
+            regs: self.regs.to_vec(),
+            device: self.device.iter().collect(),
+            device_overflowed: self.device.overflowed,
+            line_buf: self.line_buf.to_vec(),
+            stipple: self.stipple.get(),
+            xfer: self.xfer.get(),
+            stats: self.stats,
+            gl_line_stipple_pos: self.gl_line_stipple_pos,
+            gl_stash: self.gl_stash.to_vec(),
+            fillmodes: self.fillmodes.to_vec(),
+            fillmodes_n: self.fillmodes_n,
+            stale_events: self.stale_events,
+            stale_last: self.stale_last,
+            te_load: self.te_load,
+            te_read: self.te_read,
+            tex_lut: Vec::new(),
+        };
+        let mut bytes = postcard::to_allocvec(&snapshot).map_err(|e| format!("encode RSS snapshot: {e}"))?;
+        let lut = postcard::to_allocvec(&self.tex_lut.to_vec()).map_err(|e| format!("encode RSS snapshot: {e}"))?;
+        bytes.extend_from_slice(&lut);
+        Ok(bytes)
+    }
+
+    pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<RssSnapshot, String> {
+        let (mut s, rest): (RssSnapshot, _) =
+            postcard::take_from_bytes(bytes).map_err(|e| format!("decode RSS snapshot: {e}"))?;
+        s.tex_lut = match s.version {
+            1 => vec![0; te1::TEX_LUT_LEN],
+            2 => postcard::from_bytes(rest).map_err(|e| format!("decode RSS snapshot: {e}"))?,
+            v => return Err(format!("RSS snapshot version {v} is not supported")),
+        };
+        if s.tex_lut.len() != te1::TEX_LUT_LEN {
+            return Err(format!("RSS texture colour tables: {} entries, expected {}", s.tex_lut.len(), te1::TEX_LUT_LEN));
+        }
+        for (name, got, want) in [
+            ("registers", s.regs.len(), 0x400),
+            ("line buffer", s.line_buf.len(), MAX_LINE_BYTES),
+            ("GL register stash", s.gl_stash.len(), 0x400),
+            ("fill-mode log", s.fillmodes.len(), 32),
+        ] {
+            if got != want {
+                return Err(format!("RSS {name}: {got} entries, expected {want}"));
+            }
+        }
+        if s.device.len() > 256 {
+            return Err(format!("RSS indirect device map has {} entries", s.device.len()));
+        }
+        if s.fillmodes_n > s.fillmodes.len() {
+            return Err(format!("RSS fill-mode count {} exceeds {}", s.fillmodes_n, s.fillmodes.len()));
+        }
+        Ok(s)
+    }
+
+    pub(super) fn apply_snapshot(&mut self, s: RssSnapshot) {
+        self.regs.copy_from_slice(&s.regs);
+        self.device.clear();
+        for (key, value) in s.device {
+            self.device.insert(key, value);
+        }
+        self.device.overflowed = s.device_overflowed;
+        self.line_buf.copy_from_slice(&s.line_buf);
+        self.stipple.set(s.stipple);
+        self.xfer.set(s.xfer);
+        self.stats = s.stats;
+        self.gl_line_stipple_pos = s.gl_line_stipple_pos;
+        self.gl_stash.copy_from_slice(&s.gl_stash);
+        self.fillmodes.copy_from_slice(&s.fillmodes);
+        self.fillmodes_n = s.fillmodes_n;
+        self.stale_events = s.stale_events;
+        self.stale_last = s.stale_last;
+        self.te_load = s.te_load;
+        self.te_read = s.te_read;
+        self.tex_lut.copy_from_slice(&s.tex_lut);
         #[cfg(feature = "gr4-jit")]
         self.jit.invalidate();
     }
@@ -1431,6 +1560,7 @@ impl Rss {
                     wait.snooze();
                 }
             }
+
             f(&mut self.te, &self.regs);
             self.te_sync.done.store(n, Ordering::Release);
         } else {
@@ -1549,10 +1679,19 @@ impl Rss {
         }
         match r {
             reg::INDIRECT_DATA => {
-                self.device.insert(self.regs[reg::INDIRECT_ADDR as usize], val);
-                if self.device.overflowed {
-                    self.device.overflowed = false;
-                    eprintln!("mgras: raster device space full, write to {:#x} dropped", self.regs[reg::INDIRECT_ADDR as usize]);
+                // The texture colour tables take a run of entries after one
+                // address: the address advances with each.
+                let a = self.regs[reg::INDIRECT_ADDR as usize];
+                let i = a.wrapping_sub(te1::TEX_LUT_DEV) as usize;
+                if i < te1::TEX_LUT_LEN {
+                    self.tex_lut[i] = val as u8;
+                    self.regs[reg::INDIRECT_ADDR as usize] = a + 1;
+                } else {
+                    self.device.insert(a, val);
+                    if self.device.overflowed {
+                        self.device.overflowed = false;
+                        eprintln!("mgras: raster device space full, write to {a:#x} dropped");
+                    }
                 }
             }
             reg::IR_ALIAS => self.regs[reg::IR as usize] = val,
@@ -1648,6 +1787,61 @@ impl Rss {
             }
         }
         true
+    }
+
+    /// The box every enabled keep-inside screen mask leaves of the
+    /// framebuffer: no primitive stores outside it (`visible`).
+    fn clip_box(&self) -> crate::display::Rect {
+        let mut r = crate::display::Rect::new(0, 0, WIDTH as i32 - 1, HEIGHT as i32 - 1);
+        let mode = self.reg(reg::CLIP_MODE);
+        for n in 0..4 {
+            if mode & (1 << n) == 0 || mode & (0x10 << n) == 0 {
+                continue;
+            }
+            let (mx, my) = (self.reg(reg::CLIP_X + 2 * n), self.reg(reg::CLIP_Y + 2 * n));
+            r = r.intersect(&crate::display::Rect::new(signed16(mx >> 16), signed16(my >> 16), signed16(mx), signed16(my)));
+        }
+        r
+    }
+
+    /// The planes of a pixel of `b` a store under the present registers
+    /// can change (`put_in`, `put_in36`): the plane mask where the pixel
+    /// type stores through one, every plane otherwise.
+    fn planes_drawn(&self, b: Buffer, back: bool) -> u64 {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA }) as u64;
+        if b.kind != Kind::Wide {
+            u64::MAX
+        } else if self.deep36() {
+            lsb | ((self.reg(reg::COLORMASKMSBS) & 0xF) as u64) << 32
+        } else if Pair::of(pp1).is_some() || (pp1 >> 8) & 7 == 2 {
+            lsb
+        } else if ci_pixtype(pp1) {
+            lsb & 0xFF_FFFF
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// Where the primitive the registers describe stores colour: each
+    /// buffer it reaches, the planes of a pixel it can change there, and
+    /// a box no store of it leaves. For the display, which composes a new
+    /// frame only when what it shows was drawn in (`disp.rs`). Nothing for
+    /// clip-ID drawing, which no frame shows.
+    pub(super) fn drawn(&self, mut f: impl FnMut(Buffer, u64, crate::display::Rect)) {
+        let field = draw_buffer(self.reg(reg::PP1FILLMODE));
+        if field == DRAW_CID {
+            return;
+        }
+        let rect = self.clip_box();
+        let b = self.target();
+        f(b, self.planes_drawn(b, draws_b(field)), rect);
+        if draws_a_and_b(field) {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                f(b2, self.planes_drawn(b2, true), rect);
+            }
+        }
     }
 
     /// The buffer drawing goes to: the page pointer in
@@ -2238,8 +2432,12 @@ impl Rss {
             fixed::deriv(dy(d[0], s), y, n, smp.ls),
             fixed::deriv(dy(d[1], t), y, n, smp.lt),
         );
-        let texel = smp.sample(&self.te, s, t, lambda);
-        tex_env(self.reg(te_reg::TEXMODE1), self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
+        let mode1 = self.reg(te_reg::TEXMODE1);
+        let mut texel = smp.sample(&self.te, s, t, lambda);
+        if mode1 & te1::TEXMODE1_LUT != 0 {
+            texel = te1::tex_lut(mode1, &self.tex_lut, texel);
+        }
+        tex_env(mode1, self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
     }
 
     /// Fog applied to a fragment whose fog depth (`fog_pair_offset`) is
@@ -2920,7 +3118,10 @@ impl Rss {
 
     /// PIO read, high half: takes the next doubleword.
     pub fn pio_read_hi(&mut self) -> u32 {
-        self.gpu_sync_transfer();
+        let _ = self.gpu_sync_transfer(
+            #[cfg(feature = "wgpu")]
+            super::wgpu::Observation::PioRead,
+        );
         let dw = self.pio_doubleword();
         self.stats.pio_read_dw += 1;
         let Some(x) = self.xfer.as_mut() else { return 0 };
@@ -2934,29 +3135,60 @@ impl Rss {
 
     /// Bring the pixel memory and clip IDs current from the GPU unit, if
     /// one draws (its readers: PIO and DMA reads, hashes, the display).
-    pub fn gpu_sync(&mut self) {
+    pub fn gpu_sync(
+        &mut self,
+        #[cfg(feature = "wgpu")] reason: super::wgpu::Observation,
+    ) -> Result<u64, String> {
         #[cfg(feature = "wgpu")]
         if let Some(g) = self.gpu.get() {
-            if let Err(e) = g.sync(&mut self.mem, &mut self.cid) {
-                eprintln!("mgras: GPU raster unit: {e}");
-            }
+            let result = g.sync(&mut self.mem, &mut self.cid, reason);
+            return self.gpu_result("mirror readback", result);
         }
+        Ok(0)
     }
 
     /// With the GPU unit: bring the mirror current where the armed read
     /// transfer reads (its block, in the buffer reads come from): the
     /// guest's pixel reads cost a readback of what they read, not of
     /// everything drawn since the last.
-    pub fn gpu_sync_transfer(&mut self) {
+    pub fn gpu_sync_transfer(
+        &mut self,
+        #[cfg(feature = "wgpu")] reason: super::wgpu::Observation,
+    ) -> Result<u64, String> {
         #[cfg(feature = "wgpu")]
         if let Some(g) = self.gpu.get() {
-            let Some(x) = self.xfer.get().filter(|x| x.read) else { return };
+            let Some(x) = self.xfer.get().filter(|x| x.read) else { return Ok(0) };
             let b = x.block;
             let (ax, ay) = self.to_fb(b.xs, b.ys);
             let (bx, by) = self.to_fb(b.xe, b.ye);
             let src = self.source();
-            if let Err(e) = g.sync_box(&mut self.mem, &[src], (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))) {
-                eprintln!("mgras: GPU raster unit: {e}");
+            let result = g.sync_box(
+                &mut self.mem,
+                &[src],
+                (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)),
+                reason,
+            );
+            return self.gpu_result("transfer readback", result);
+        }
+        Ok(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn gpu_result(&self, operation: &str, result: Result<u64, String>) -> Result<u64, String> {
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                let message = format!("{operation}: {error}");
+                if let Some(fault) = unsafe { self.gpu_fault.as_ref() } {
+                    let mut fault = fault.lock();
+                    if fault.is_none() {
+                        eprintln!("mgras: GPU raster unit failed: {message}");
+                        *fault = Some(message.clone());
+                    }
+                    Err(fault.as_ref().unwrap().clone())
+                } else {
+                    Err(message)
+                }
             }
         }
     }
@@ -3043,6 +3275,26 @@ mod tests {
         r.write(reg::COLORMASKLSBSB, 0xFFF, false);
         r.write(reg::PP1FILLMODE, 0x0C00_4504, false);
         r
+    }
+
+    #[test]
+    fn snapshots_keep_the_texture_colour_tables_and_read_version_1() {
+        let mut r = Rss::new_boxed();
+        r.write(reg::INDIRECT_ADDR, te1::TEX_LUT_DEV, false);
+        for i in 0..te1::TEX_LUT_LEN as u32 {
+            r.write(reg::INDIRECT_DATA, i * 7 + 1, false);
+        }
+        let bytes = r.snapshot_bytes().unwrap();
+        let mut back = Rss::new_boxed();
+        back.apply_snapshot(Rss::decode_snapshot(&bytes).unwrap());
+        assert_eq!(back.tex_lut, r.tex_lut);
+        assert_eq!(back.tex_lut[3], 22);
+
+        // A version 1 snapshot is the record without the tables after it.
+        let mut v1 = postcard::to_allocvec(&Rss::decode_snapshot(&bytes).unwrap()).unwrap();
+        v1[0] = 1;
+        back.apply_snapshot(Rss::decode_snapshot(&v1).unwrap());
+        assert!(back.tex_lut.iter().all(|&e| e == 0));
     }
 
     fn block(r: &mut Rss, x0: u32, y0: u32, x1: u32, y1: u32) {

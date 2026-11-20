@@ -67,8 +67,9 @@ mod rss_jit_tests;
 mod test_gen;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::cell::UnsafeCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as IoWrite;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::mem::MaybeUninit;
@@ -80,7 +81,7 @@ use crate::config::GraphicsBoard;
 use crate::dev::ng1::rex3::Renderer;
 use crate::gfifo::GFifo;
 use crate::locks::SpinLock;
-use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_BUSY, BUS_OK, Device, Saveable};
+use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_BUSY, BUS_ERR, BUS_OK, Device, Saveable};
 
 use ge11::Ge11;
 use hq3::{host, Hq3Engine, Hq3Regs, Hq3Sink};
@@ -140,6 +141,36 @@ fn rss_entry(r: u32, exec: bool) -> u32 {
     (r & 0x3FF) << 1 | exec as u32
 }
 
+fn pack_snapshot_bytes(bytes: &[u8]) -> Vec<u32> {
+    let mut words = Vec::with_capacity(1 + bytes.len().div_ceil(4));
+    words.push(bytes.len() as u32);
+    for chunk in bytes.chunks(4) {
+        let mut word = [0; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        words.push(u32::from_be_bytes(word));
+    }
+    words
+}
+
+fn unpack_snapshot_bytes(name: &str, words: &[u32]) -> Result<Vec<u8>, String> {
+    let Some((&len, body)) = words.split_first() else {
+        return Err(format!("IMPACT snapshot part {name} is empty"));
+    };
+    let len = len as usize;
+    if body.len() != len.div_ceil(4) {
+        return Err(format!(
+            "IMPACT snapshot part {name} has {} payload words for {len} bytes",
+            body.len()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(body.len() * 4);
+    for word in body {
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    bytes.truncate(len);
+    Ok(bytes)
+}
+
 /// CPU-side board state: host interface registers, the geometry engines'
 /// diagnostic ports, the display control bus. Plain data, valid zeroed.
 #[repr(C)]
@@ -178,6 +209,7 @@ impl Front {
             GraphicsBoard::MaxImpact => [0x0A, 0x02],
             _ => [0, 0],
         };
+        self.ge.set_count(if kind == GraphicsBoard::MaxImpact { 2 } else { 1 });
         self.dcb.init(bdvers, [0xFB, 0xFB]);
     }
 
@@ -226,8 +258,9 @@ impl Front {
                 self.dcb.write(t, t.store_data(bits, val));
                 // Display-side state (colormaps, modes, the cursor) changes
                 // what is shown without touching the framebuffer. Index
-                // writes (select 1 and below) change nothing by themselves.
-                t.crs >= 2 || t.dev == dcb::DEV_VC3
+                // writes (select 1 and below) change nothing by themselves,
+                // but the DAC's select 1 is its gamma table's data.
+                t.crs >= 2 || t.dev == dcb::DEV_VC3 || (t.dev == dcb::DEV_DAC && t.crs == 1)
             }
             0x68000..=0x6803F => {
                 let dev = ((off - 0x68000) >> 2) as usize;
@@ -343,6 +376,8 @@ pub struct Mgras {
     /// (and holders of `submit` with the board idle).
     #[cfg(feature = "wgpu")]
     gpu_unit: UnsafeCell<Option<Box<wgpu::GpuRaster>>>,
+    #[cfg(feature = "wgpu")]
+    gpu_fault: SpinLock<Option<String>>,
     /// PIO read advances engine 0 has done; engine 1 waits for each before
     /// it goes on drawing (see `rss_loop`).
     pio_advances: AtomicU64,
@@ -374,21 +409,19 @@ pub struct Mgras {
     /// slot lock. Each on its own cache line.
     hq_asleep: crossbeam_utils::CachePadded<AtomicBool>,
     rss_asleep: [crossbeam_utils::CachePadded<AtomicBool>; MAX_ENGINES],
-    dirty: AtomicBool,
     running: AtomicBool,
-    refresh: SpinLock<Option<thread::JoinHandle<()>>>,
-    renderer: Mutex<Option<Box<dyn Renderer>>>,
-    display_stop: crate::gfx_display::DisplayStop,
-    /// The finished frame, handed to the renderer as a prebuilt picture
+    /// The display channel: screen, renderer slot and frame requests, run
+    /// by the machine's refresh thread (`crate::display`). The finished
+    /// frame is handed to the renderer as a prebuilt picture
     /// (`Rex3Screen::prebuilt`), as GR2 does.
-    screen: Mutex<crate::disp::Rex3Screen>,
-    screenshot_pending: AtomicBool,
-    /// A consumer wants the next frame in `screen.rgba` (`request_frame`),
-    /// and how many keep wanting every frame there (`set_capture`, VNC):
-    /// with the GPU scan-out presenting on the GPU, only then is a frame
-    /// read back.
-    frame_request: AtomicBool,
-    capture: AtomicU32,
+    head: Arc<crate::display::HeadHandle>,
+    /// Where the raster engines drew since the last frame.
+    marks: crate::display::Marks,
+    /// The display bus was written: the video timing is decoded again at
+    /// the next retrace.
+    timing_stale: AtomicBool,
+    /// What the refresh thread keeps between its callbacks (`disp.rs`).
+    scan: Mutex<disp::Scan>,
     /// Frames the GPU scan-out presented on the GPU, and read back.
     gpu_frames: [AtomicU64; 2],
     /// The GPU scan-out over the GPU unit's pixel pages, the display
@@ -404,6 +437,19 @@ pub struct Mgras {
     trace_mask: AtomicU32,
     pf_cfifo_level: crate::PfValue,
     pf_fifo_intr: crate::PfLevel,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MgrasSnapshot {
+    version: u32,
+    board: String,
+    raster_engines: usize,
+    fifo_cfg: u32,
+    flags: u32,
+    pio_advances: u64,
+    ge_upload_fingerprint: [u64; 2],
+    probes: [u64; 8],
+    busy_bound: bool,
 }
 
 // SAFETY: `eng` is touched only by the HQ3 thread, `rss` only by the RSS
@@ -442,7 +488,10 @@ impl Hq3Sink for HqSink<'_> {
     fn dma_read_line(&mut self, line: u32) -> Vec<u8> {
         self.0.drain_rss();
         // SAFETY: the RSS is drained and idle; only the HQ3 feeds it now.
-        unsafe { &mut *self.0.rss.get() }.gpu_sync_transfer();
+        let _ = unsafe { &mut *self.0.rss.get() }.gpu_sync_transfer(
+            #[cfg(feature = "wgpu")]
+            wgpu::Observation::DmaRead,
+        );
         // SAFETY: as in `transfer`.
         unsafe { &*self.0.rss.get() }.dma_read_line(line)
     }
@@ -585,6 +634,7 @@ impl Mgras {
             (*p).rss_fifo.set_heads(nrss);
             #[cfg(feature = "wgpu")]
             {
+                addr_of_mut!((*p).gpu_fault).write(SpinLock::new(None));
                 addr_of_mut!((*p).gpu_scanout).write(UnsafeCell::new(scanout));
                 addr_of_mut!((*p).gpu_device).write(device);
                 addr_of_mut!((*p).gpu_unit).write(UnsafeCell::new(unit));
@@ -593,6 +643,7 @@ impl Mgras {
                     // from the planes as they are (zeroed).
                     u.attach(&(*planes).mem, &(*planes).cid, &mut (*planes).te);
                     addr_of_mut!((*(*p).rss.get()).gpu).write(wgpu::GpuLink::new(u));
+                    addr_of_mut!((*(*p).rss.get()).gpu_fault).write(&(*p).gpu_fault);
                 }
             }
             addr_of_mut!((*p).mem).write(SpinLock::new(None));
@@ -601,15 +652,16 @@ impl Mgras {
             addr_of_mut!((*p).threads).write(SpinLock::new(Vec::new()));
             addr_of_mut!((*p).hq_thread).write(SpinLock::new(None));
             addr_of_mut!((*p).rss_thread).write(std::array::from_fn(|_| SpinLock::new(None)));
-            addr_of_mut!((*p).dirty).write(AtomicBool::new(true));
-            addr_of_mut!((*p).refresh).write(SpinLock::new(None));
-            addr_of_mut!((*p).renderer).write(Mutex::new(None));
-            addr_of_mut!((*p).display_stop).write(Default::default());
-            addr_of_mut!((*p).screen).write(Mutex::new(crate::disp::Rex3Screen::new()));
+            addr_of_mut!((*p).head).write(status.refresh().head(status.clone()));
+            addr_of_mut!((*p).marks).write(crate::display::Marks::new());
+            addr_of_mut!((*p).timing_stale).write(AtomicBool::new(true));
+            addr_of_mut!((*p).scan).write(Mutex::new(disp::Scan::new()));
             addr_of_mut!((*p).status).write(status);
             addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new()));
             a.assume_init()
         };
+        let head: Arc<dyn crate::display::Head> = m.clone();
+        m.head.attach(Arc::downgrade(&head));
         if let Some(path) = std::env::var_os("IRIS_MGRAS_REC") {
             let path = path.to_string_lossy();
             match m.set_recording(Some(&path)) {
@@ -625,6 +677,186 @@ impl Mgras {
             }
         }
         Ok(m)
+    }
+
+    /// Architectural board state split into named word streams for the
+    /// snapshot chunk store. Engine threads must already be stopped.
+    pub fn snapshot_parts(&self) -> Result<(String, Vec<(String, Vec<u32>)>), String> {
+        if self.engines.load(Ordering::Acquire) {
+            return Err("IMPACT engines must be stopped before taking a snapshot".into());
+        }
+        #[cfg(feature = "wgpu")]
+        if let Some(error) = self.gpu_fault.lock().as_ref() {
+            return Err(format!("IMPACT GPU raster unit is faulted: {error}"));
+        }
+        let _submit = self.submit.lock();
+        let front = {
+            let _front = self.front_lock.lock();
+            // Front and all of its members are plain numeric state. The board
+            // is allocated zeroed, so its padding is initialized as well.
+            unsafe {
+                std::slice::from_raw_parts(
+                    self.front.get().cast::<u8>(),
+                    std::mem::size_of::<Front>(),
+                )
+                .to_vec()
+            }
+        };
+        // SAFETY: the engine threads are stopped and submit excludes producers.
+        unsafe {
+            for id in 0..self.nrss {
+                (*self.engine_cell(id).get()).gpu_sync(
+                    #[cfg(feature = "wgpu")]
+                    wgpu::Observation::Snapshot,
+                )?;
+            }
+        }
+        let meta = MgrasSnapshot {
+            version: 1,
+            board: self.kind.as_str().to_string(),
+            raster_engines: self.nrss,
+            fifo_cfg: self.fifo_cfg.load(Ordering::Acquire),
+            flags: self.flags.load(Ordering::Acquire),
+            pio_advances: self.pio_advances.load(Ordering::Acquire),
+            ge_upload_fingerprint: std::array::from_fn(|i| self.ge_upload_fingerprint[i].load(Ordering::Acquire)),
+            probes: std::array::from_fn(|i| self.probe[i].load(Ordering::Acquire)),
+            busy_bound: self.busy_bound.load(Ordering::Acquire),
+        };
+        let metadata = toml::to_string(&meta).map_err(|e| format!("encode IMPACT snapshot metadata: {e}"))?;
+        let mut parts = vec![("front".into(), pack_snapshot_bytes(&front))];
+        let hq = unsafe { &*self.eng.get() }.snapshot_bytes()?;
+        parts.push(("hq3".into(), pack_snapshot_bytes(&hq)));
+        for id in 0..self.nrss {
+            let rss = unsafe { &*self.engine_cell(id).get() }.snapshot_bytes()?;
+            parts.push((format!("rss{id}"), pack_snapshot_bytes(&rss)));
+        }
+        let planes = unsafe { &*self.planes.get() };
+        let mut pixels = Vec::with_capacity(planes.mem.words.len() * 8);
+        for word in &planes.mem.words {
+            pixels.extend_from_slice(&word.to_le_bytes());
+        }
+        parts.push(("pixmem".into(), pack_snapshot_bytes(&pixels)));
+        parts.push(("cid".into(), pack_snapshot_bytes(&planes.cid)));
+        parts.push(("te1".into(), pack_snapshot_bytes(&planes.te.snapshot_bytes()?)));
+        Ok((metadata, parts))
+    }
+
+    /// Restore a complete set of named architectural parts. Every part is
+    /// decoded and checked before any live board state is changed.
+    pub fn restore_snapshot_parts(&self, metadata: &str, parts: &[(String, Vec<u32>)]) -> Result<(), String> {
+        if self.engines.load(Ordering::Acquire) {
+            return Err("IMPACT engines must be stopped before restoring a snapshot".into());
+        }
+        let meta: MgrasSnapshot =
+            toml::from_str(metadata).map_err(|e| format!("decode IMPACT snapshot metadata: {e}"))?;
+        if meta.version != 1 {
+            return Err(format!("IMPACT snapshot version {} is not supported", meta.version));
+        }
+        if meta.board != self.kind.as_str() {
+            return Err(format!(
+                "IMPACT snapshot is for {}, running board is {}",
+                meta.board,
+                self.kind.as_str()
+            ));
+        }
+        if meta.raster_engines != self.nrss {
+            return Err(format!(
+                "IMPACT snapshot uses {} raster engines, running board uses {}",
+                meta.raster_engines, self.nrss
+            ));
+        }
+        let mut named = HashMap::with_capacity(parts.len());
+        for (name, words) in parts {
+            if named.insert(name.as_str(), words.as_slice()).is_some() {
+                return Err(format!("duplicate IMPACT snapshot part {name}"));
+            }
+        }
+        let expected = 5 + self.nrss;
+        if named.len() != expected {
+            return Err(format!("IMPACT snapshot has {} parts, expected {expected}", named.len()));
+        }
+        let mut take = |name: &str| -> Result<Vec<u8>, String> {
+            let words = named.remove(name).ok_or_else(|| format!("IMPACT snapshot part {name} is missing"))?;
+            unpack_snapshot_bytes(name, words)
+        };
+        let front = take("front")?;
+        if front.len() != std::mem::size_of::<Front>() {
+            return Err(format!(
+                "IMPACT front state is {} bytes, expected {}",
+                front.len(),
+                std::mem::size_of::<Front>()
+            ));
+        }
+        let hq = Hq3Engine::decode_snapshot(&take("hq3")?, if self.kind == GraphicsBoard::MaxImpact { 2 } else { 1 })?;
+        let mut rss = Vec::with_capacity(self.nrss);
+        for id in 0..self.nrss {
+            rss.push(Rss::decode_snapshot(&take(&format!("rss{id}"))?)?);
+        }
+        let pixels = take("pixmem")?;
+        let pixel_bytes = unsafe { &*self.planes.get() }.mem.words.len() * 8;
+        if pixels.len() != pixel_bytes {
+            return Err(format!("IMPACT pixel memory is {} bytes, expected {pixel_bytes}", pixels.len()));
+        }
+        let cid = take("cid")?;
+        let cid_bytes = unsafe { &*self.planes.get() }.cid.len();
+        if cid.len() != cid_bytes {
+            return Err(format!("IMPACT clip-ID memory is {} bytes, expected {cid_bytes}", cid.len()));
+        }
+        let te = te1::Te1::decode_snapshot(&take("te1")?)?;
+        if let Some(name) = named.keys().next() {
+            return Err(format!("unknown IMPACT snapshot part {name}"));
+        }
+
+        let _submit = self.submit.lock();
+        {
+            let _front = self.front_lock.lock();
+            // SAFETY: the length was checked and Front is plain numeric state.
+            unsafe {
+                std::ptr::copy_nonoverlapping(front.as_ptr(), self.front.get().cast::<u8>(), front.len());
+            }
+        }
+        unsafe { &mut *self.eng.get() }.apply_snapshot(hq);
+        let planes = unsafe { &mut *self.planes.get() };
+        for (dst, src) in planes.mem.words.iter_mut().zip(pixels.chunks_exact(8)) {
+            *dst = u64::from_le_bytes(src.try_into().unwrap());
+        }
+        planes.cid.copy_from_slice(&cid);
+        planes.te.apply_snapshot(te);
+        for (id, state) in rss.into_iter().enumerate() {
+            let engine = unsafe { &mut *self.engine_cell(id).get() };
+            engine.apply_snapshot(state);
+            engine.share_te(self.nrss as u32);
+        }
+        #[cfg(feature = "wgpu")]
+        unsafe {
+            if let Some(unit) = (*self.gpu_unit.get()).as_mut() {
+                unit.attach(&planes.mem, &planes.cid, &mut planes.te);
+                (*self.rss.get()).gpu = wgpu::GpuLink::new(unit);
+                (*self.rss.get()).gpu_fault = &self.gpu_fault;
+            }
+        }
+        self.fifo_cfg.store(meta.fifo_cfg, Ordering::Release);
+        self.flags.store(meta.flags, Ordering::Release);
+        self.pio_advances.store(meta.pio_advances, Ordering::Release);
+        for (dst, value) in self.ge_upload_fingerprint.iter().zip(meta.ge_upload_fingerprint) {
+            dst.store(value, Ordering::Release);
+        }
+        for (dst, value) in self.probe.iter().zip(meta.probes) {
+            dst.store(value, Ordering::Release);
+        }
+        self.busy_bound.store(meta.busy_bound, Ordering::Release);
+        self.busy_since.store(0, Ordering::Release);
+        self.hq_busy.store(false, Ordering::Release);
+        for busy in &self.rss_busy {
+            busy.store(false, Ordering::Release);
+        }
+        self.hq_fifo.reset();
+        self.rss_fifo.reset();
+        self.timing_stale.store(true, Ordering::Release);
+        self.marks.mark_all();
+        self.head.damage();
+        self.refresh_general();
+        Ok(())
     }
 
     /// Put the board's locks in the `locks` monitor listing.
@@ -647,10 +879,9 @@ impl Mgras {
                 register_spin(format!("mgras::rss_thread[{id}]"), self, get);
             }
         }
-        register_spin("mgras::refresh", self, |m| &m.refresh);
         register_spin("mgras::trace", self, |m| &m.trace);
-        register_mutex_fn("mgras::renderer", self, |m| m.renderer.is_locked());
-        register_mutex_fn("mgras::screen", self, |m| m.screen.is_locked());
+        register_mutex_fn("mgras::renderer", self, |m| m.head.renderer_slot().is_locked());
+        register_mutex_fn("mgras::screen", self, |m| m.head.screen().is_locked());
     }
 
     /// The CPU-side state, locked.
@@ -812,7 +1043,10 @@ impl Mgras {
     fn state_bytes(&self) -> Vec<u8> {
         const RW: u32 = 1280;
         const RH: u32 = 1024;
-        self.mirror_sync();
+        self.mirror_sync(
+            #[cfg(feature = "wgpu")]
+            wgpu::Observation::StateHash,
+        );
         // SAFETY: idle, and the caller holds `submit` (see the Sync impl).
         let rss = unsafe { &*self.rss.get() };
         let f = self.front();
@@ -908,23 +1142,46 @@ impl Mgras {
     /// readback of what drawing changed since the last). Call with the
     /// board idle and `submit` held, or on the HQ3 thread after
     /// `drain_rss`.
-    fn mirror_sync(&self) {
+    fn mirror_sync(
+        &self,
+        #[cfg(feature = "wgpu")] reason: wgpu::Observation,
+    ) {
         #[cfg(feature = "wgpu")]
         // SAFETY: the board is idle (see above): engine 0's thread does not
         // touch its state or the unit.
-        unsafe { &mut *self.rss.get() }.gpu_sync();
+        let _ = unsafe { &mut *self.rss.get() }.gpu_sync(reason);
     }
 
     /// `mirror_sync` from anywhere: holds `submit` and waits for the board
     /// to go idle first. Nothing to do on the CPU raster path. Not with
     /// `submit` or the front lock held.
-    fn mirror_now(&self) {
+    fn mirror_now(
+        &self,
+        #[cfg(feature = "wgpu")] reason: wgpu::Observation,
+    ) {
         #[cfg(feature = "wgpu")]
         if unsafe { (*self.gpu_unit.get()).is_some() } {
             let _sub = self.submit.lock();
             self.wait_idle();
-            self.mirror_sync();
+            self.mirror_sync(reason);
         }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn fail_gpu(&self, operation: &str, error: String) {
+        let mut fault = self.gpu_fault.lock();
+        if fault.is_none() {
+            let message = format!("{operation}: {error}");
+            eprintln!("mgras: GPU raster unit failed: {message}");
+            *fault = Some(message);
+        }
+    }
+
+    fn gpu_failed(&self) -> bool {
+        #[cfg(feature = "wgpu")]
+        return self.gpu_fault.lock().is_some();
+        #[cfg(not(feature = "wgpu"))]
+        false
     }
 
     /// Whether frames are composed on the GPU (the GPU unit's scan-out).
@@ -961,7 +1218,10 @@ impl Mgras {
     pub fn composite(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
         let sub = self.submit.lock();
         self.wait_idle();
-        self.mirror_sync();
+        self.mirror_sync(
+            #[cfg(feature = "wgpu")]
+            wgpu::Observation::HostComposite,
+        );
         // SAFETY: idle with `submit` held.
         let rss = unsafe { &mut *self.rss.get() };
         let ok = disp::composite(rss, &self.front().dcb, x, y, bgra, stride, w, h);
@@ -970,7 +1230,7 @@ impl Mgras {
             if let Some(rec) = sub.as_ref() {
                 rec.lock().put(record::Rec::Composite);
             }
-            self.dirty.store(true, Ordering::Release);
+            self.head.damage();
         }
         ok
     }
@@ -980,7 +1240,10 @@ impl Mgras {
     pub fn composite_index(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize, overlay: bool) -> bool {
         let sub = self.submit.lock();
         self.wait_idle();
-        self.mirror_sync();
+        self.mirror_sync(
+            #[cfg(feature = "wgpu")]
+            wgpu::Observation::HostComposite,
+        );
         // SAFETY: idle with `submit` held.
         let rss = unsafe { &mut *self.rss.get() };
         let ok = disp::composite_index(rss, &self.front().dcb, x, y, bgra, stride, w, h, overlay);
@@ -989,7 +1252,7 @@ impl Mgras {
             if let Some(rec) = sub.as_ref() {
                 rec.lock().put(record::Rec::Composite);
             }
-            self.dirty.store(true, Ordering::Release);
+            self.head.damage();
         }
         ok
     }
@@ -1001,7 +1264,10 @@ impl Mgras {
     pub(crate) fn fb_pixel(&self, x: usize, y: usize) -> u32 {
         let _sub = self.submit.lock();
         self.wait_idle();
-        self.mirror_sync();
+        self.mirror_sync(
+            #[cfg(feature = "wgpu")]
+            wgpu::Observation::Validation,
+        );
         // SAFETY: idle with `submit` held.
         let dcb = &self.front().dcb;
         let h = frame::display_size(dcb).1;
@@ -1033,7 +1299,10 @@ impl Mgras {
     pub(crate) fn compare_scanouts(&self) -> Option<(usize, Vec<(usize, usize, u32, u32)>)> {
         let _sub = self.submit.lock();
         self.wait_idle();
-        self.mirror_sync();
+        self.mirror_sync(
+            #[cfg(feature = "wgpu")]
+            wgpu::Observation::Validation,
+        );
         // SAFETY: idle with `submit` held; no display thread runs in tests.
         let sc = unsafe { &mut *self.gpu_scanout.get() }.as_mut()?;
         let rss = unsafe { &*self.rss.get() };
@@ -1063,7 +1332,10 @@ impl Mgras {
 
     /// A frame snapshot of what is displayed now (monitor, screenshots).
     fn snapshot_frame(&self) -> Box<frame::Frame> {
-        self.mirror_now();
+        self.mirror_now(
+            #[cfg(feature = "wgpu")]
+            wgpu::Observation::Display,
+        );
         let mut f = plain::boxed_zeroed::<frame::Frame>();
         // SAFETY: a read-only view; tearing tolerated.
         let rss = unsafe { &*self.rss.get() };
@@ -1366,7 +1638,10 @@ impl Mgras {
                 // Taking the high half moves the stream on; the RSS does
                 // that, in order (the FIFO is empty, so this fits).
                 // SAFETY: idle with `submit` held.
-                unsafe { &mut *self.rss.get() }.gpu_sync_transfer();
+                let _ = unsafe { &mut *self.rss.get() }.gpu_sync_transfer(
+                    #[cfg(feature = "wgpu")]
+                    wgpu::Observation::PioRead,
+                );
                 let v = unsafe { &*self.rss.get() }.pio_peek_hi();
                 self.hq_fifo.push(tag::PIO_ADVANCE, 0);
                 self.wake_hq();
@@ -1447,7 +1722,12 @@ impl Mgras {
             _ => {
                 let mut f = self.front();
                 if f.write(off, bits, val, &self.flags) {
-                    self.dirty.store(true, Ordering::Release);
+                    self.head.damage();
+                    // The display bus: the timing tables or the pixel
+                    // clock may be among what changed (`vblank_start`).
+                    if (0x60000..=0x67FFF).contains(&off) {
+                        self.timing_stale.store(true, Ordering::Release);
+                    }
                 }
                 if matches!(off, host::INTERRUPT_ENABLE_SET | host::INTERRUPT_ENABLE_CLEAR | host::CFIFO_HIGH_MARK | host::CFIFO_LOW_MARK) {
                     self.sync_fifo_cfg(&f);
@@ -1651,7 +1931,17 @@ impl Mgras {
             }
             let changed = match t {
                 tag::EXIT => break,
-                t if t < 0x1000 => rss.write((t & 0x7FF) >> 1, val as u32, t & 1 != 0),
+                t if t < 0x1000 => {
+                    let reg = (t & 0x7FF) >> 1;
+                    if reg == rss::reg::CONFIG
+                        || rss.accepts_destination()
+                        || Rss::uses_shared_texture_state(reg)
+                    {
+                        rss.write(reg, val as u32, t & 1 != 0)
+                    } else {
+                        false
+                    }
+                }
                 tag::PIO_ADVANCE => {
                     advances += 1;
                     if id == 0 {
@@ -1688,10 +1978,10 @@ impl Mgras {
                 }
                 _ => false,
             };
-            // The refresh thread clears it once a frame; until then a load
-            // keeps the cache line shared instead of taking it each entry.
-            if changed && !self.dirty.load(Ordering::Relaxed) {
-                self.dirty.store(true, Ordering::Release);
+            // After the stores: the display takes the marks once a frame
+            // and composes when what it shows was drawn in (`disp.rs`).
+            if changed {
+                rss.drawn(|b, planes, rect| self.marks.mark(disp::store_key(&b), planes, rect));
             }
             if id == 0 {
                 if self.tracing(debug::TRACE_RSS) {
@@ -1773,23 +2063,14 @@ impl Mgras {
 }
 
 impl crate::gfx_display::GfxDisplay for Mgras {
-    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
-    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
-    fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
-    fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
-    fn request_frame(&self) {
-        if self.presents_on_gpu() {
-            self.frame_request.store(true, Ordering::Release);
-        }
-    }
-    fn frame_pending(&self) -> bool { self.frame_request.load(Ordering::Acquire) }
-    fn set_capture(&self, on: bool) {
-        if on {
-            self.capture.fetch_add(1, Ordering::AcqRel);
-        } else {
-            let _ = self.capture.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-        }
-    }
+    fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { self.head.renderer_slot() }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { self.head.display_stop() }
+    fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { self.head.screen() }
+    fn request_screenshot(&self) { self.head.request_screenshot(); }
+    fn screenshot_pending(&self) -> bool { self.head.screenshot_pending() }
+    fn request_frame(&self) { self.head.request_frame(); }
+    fn frame_pending(&self) -> bool { self.head.frame_pending() }
+    fn set_capture(&self, on: bool) { self.head.set_capture(on); }
     #[cfg(feature = "wgpu")]
     fn gpu(&self) -> Option<Arc<crate::wgpu::Gpu>> { self.gpu_device.clone() }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.status.cycles() }
@@ -1851,25 +2132,45 @@ fn read_status(v: Option<u64>) -> (u32, u64) {
 
 impl BusDevice for Mgras {
     fn read32(&self, addr: u64) -> BusRead32 {
+        if self.gpu_failed() {
+            return BusRead32::err();
+        }
         let (status, data) = read_status(self.do_read(addr, 32));
-        BusRead32 { status, data: data as u32 }
+        if self.gpu_failed() { BusRead32::err() } else { BusRead32 { status, data: data as u32 } }
     }
-    fn write32(&self, addr: u64, val: u32) -> u32 { self.do_write(addr, 32, val as u64) }
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        if self.gpu_failed() { BUS_ERR } else { self.do_write(addr, 32, val as u64) }
+    }
     fn read8(&self, addr: u64) -> BusRead8 {
+        if self.gpu_failed() {
+            return BusRead8::err();
+        }
         let (status, data) = read_status(self.do_read(addr, 8));
-        BusRead8 { status, data: data as u8 }
+        if self.gpu_failed() { BusRead8::err() } else { BusRead8 { status, data: data as u8 } }
     }
-    fn write8(&self, addr: u64, val: u8) -> u32 { self.do_write(addr, 8, val as u64) }
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        if self.gpu_failed() { BUS_ERR } else { self.do_write(addr, 8, val as u64) }
+    }
     fn read16(&self, addr: u64) -> BusRead16 {
+        if self.gpu_failed() {
+            return BusRead16::err();
+        }
         let (status, data) = read_status(self.do_read(addr, 16));
-        BusRead16 { status, data: data as u16 }
+        if self.gpu_failed() { BusRead16::err() } else { BusRead16 { status, data: data as u16 } }
     }
-    fn write16(&self, addr: u64, val: u16) -> u32 { self.do_write(addr, 16, val as u64) }
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        if self.gpu_failed() { BUS_ERR } else { self.do_write(addr, 16, val as u64) }
+    }
     fn read64(&self, addr: u64) -> BusRead64 {
+        if self.gpu_failed() {
+            return BusRead64::err();
+        }
         let (status, data) = read_status(self.do_read(addr, 64));
-        BusRead64 { status, data }
+        if self.gpu_failed() { BusRead64::err() } else { BusRead64 { status, data } }
     }
-    fn write64(&self, addr: u64, val: u64) -> u32 { self.do_write(addr, 64, val) }
+    fn write64(&self, addr: u64, val: u64) -> u32 {
+        if self.gpu_failed() { BUS_ERR } else { self.do_write(addr, 64, val) }
+    }
 }
 
 /// The board as the display host GL presents into: frames land in the

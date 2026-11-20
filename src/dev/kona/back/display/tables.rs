@@ -275,7 +275,7 @@ impl Tables {
 
     /// A 10:10:10 word as the scan-out shows it: each component widened to 12
     /// bits by replicating its top two bits (`c << 2 | c >> 8`, inferred: the only rule the
-    /// board's gamma addressing is known to fit), through the gamma RAM, narrowed to 8 by dropping
+    /// board's gamma addressing is known to match), through the gamma RAM, narrowed to 8 by dropping
     /// the low four. Without a gamma load the RAM is the identity. That the output goes through the
     /// RAM is inferred. The glyph cursor's colours go through it too (inferred); the DAC cursor
     /// does not (`rebake_dac`).
@@ -497,7 +497,7 @@ impl Tables {
             return Window::Cleared;
         }
         let (base, field) = (DisplayIdEntry::COLOUR_MAP_BASE.get(w), DisplayIdEntry::INDEX_PLANES.get(w));
-        let fits = |n: usize| base as usize + n <= ENTRIES;
+        let within = |n: usize| base as usize + n <= ENTRIES;
         match field {
             // A 30-bit RGB window sends no mode bits, and its entry has no map
             // offset, no luminance or grey bit and an index-plane field of 13 (the
@@ -508,8 +508,8 @@ impl Tables {
             // whether the hardware tells them apart by anything but the mode byte
             // is not known.
             13 if base == 0 && DisplayIdEntry::LUMINANCE.get(w) == 0 && DisplayIdEntry::GREY.get(w) == 0 && ModeByte::COLOUR_INDEX.get(mode) == 0 => Window::Direct { bank },
-            7 if fits(256) => Window::Index8 { base },
-            11 if fits(4096) => Window::Index12 { base },
+            7 if within(256) => Window::Index8 { base },
+            11 if within(4096) => Window::Index12 { base },
             7 | 11 => Window::Unsupported(Why::Map),
             15 => Window::Unsupported(Why::Luminance),
             f => Window::Unsupported(Why::Planes(f as u8 + 1)),
@@ -779,7 +779,7 @@ mod gamma_tests {
         assert_eq!(t.snapshot().colour(0), 0xff00_ff7f, "red 4095 -> 2047 -> 127 of 255; green full; blue none");
         assert_eq!(t.snapshot().direct(0x00ff_ffff), 0xff00_ff7f);
         t.load_gamma((1 << 19) - 1, &[1, 2]);
-        assert_eq!(t.dropped, 1, "the last entry fits, the next is past the address space");
+        assert_eq!(t.dropped, 1, "the last entry is within range, the next is past the address space");
     }
 }
 
@@ -906,7 +906,7 @@ mod kind_tests {
         assert_eq!(t.snapshot().window(3), Window::Direct { bank: 0 });
         t.load_mode(3, 8);
         assert_eq!(t.snapshot().window(3), Window::Unsupported(Why::Planes(14)));
-        // 16-plane luminance, and a map that does not fit.
+        // 16-plane luminance, and a map that is out of range.
         t.load_did(4, 0x7e);
         assert_eq!(t.snapshot().window(4), Window::Unsupported(Why::Luminance));
         t.load_did(5, ((ENTRIES as u32 - 8) << 7) | 7 << 3);

@@ -46,7 +46,13 @@
 //! model. A packet the peer refuses is dropped and logged and the status
 //! bit stays set; whether the chip retries one is unknown, and the model
 //! leaves recovery to the next force write. Whether the interrupt enable
-//! gates a forced packet is unknown; the model does not gate it.
+//! gates a forced packet is unknown; the model does not gate it. A packet
+//! is the input's 8-bit vector (host address register bits 55:48) with bit
+//! 8 for set, written to the register's host address, whatever is there:
+//! IRIX flushes posted PIO writes by pointing an input at a word in memory,
+//! forcing it and waiting for the vector to arrive (traced on Tezro, vector
+//! 0xed). A packet to the register view (address bit 47) must carry a
+//! level a PI takes, 7 to 127 (a model choice), or it is refused.
 //!
 //! Direct64 DMA address bit 55 is the swap attribute and bit 19 of a Device
 //! register the 32-bit direct window's (established bit names). The
@@ -153,7 +159,17 @@ const SET: u64 = 0x100;
 const FORCE_ALWAYS: usize = 0x180;
 const FORCE_PIN: usize = 0x1c0;
 const FORCE_END: usize = 0x200;
-const LEVELS: std::ops::RangeInclusive<u64> = 7..=127;
+/// The vector field of an input's host address register, bits 55:48
+/// (`PIC_INT_ADDR_FLD` in the public PIC headers). The chip writes it,
+/// with bit 8 for a set packet, to the host address: the PI's
+/// pending-modify register in normal use, or memory, as IRIX's PIO write
+/// flush does (it points an input at a word in memory, forces it, and
+/// waits for the vector to land there).
+const VECTOR_SHIFT: u32 = 48;
+const VECTOR_MASK: u64 = 0xff;
+/// The levels a PI takes, for a packet to the register (I/O) view. A model
+/// choice: what a PI does with the others is not established.
+const PI_LEVELS: std::ops::RangeInclusive<u64> = 7..=127;
 
 /// The head registers the PIC shares with the Bridge family, as byte offsets
 /// into a head's register block.
@@ -559,12 +575,12 @@ impl Head {
             }
             (st.r(reg::INTERRUPT_HOST_BASE + pin * 8), (st.r(reg::CONTROL) & 0xf) as u8)
         };
-        let level = destination >> 48;
-        if !LEVELS.contains(&level) {
-            crate::dlog!(LogModule::Bedrock, "pic: head {} pin {pin} rejected interrupt level {level:#x}", self.index);
+        let level = (destination >> VECTOR_SHIFT) & VECTOR_MASK;
+        let address = destination & ((1 << PAYLOAD_BITS) - 1);
+        if address & crate::sn::XIO_IO_VIEW != 0 && !PI_LEVELS.contains(&level) {
+            crate::dlog!(LogModule::Bedrock, "pic: head {} pin {pin} rejected interrupt level {level:#x} for a PI", self.index);
             return false;
         }
-        let address = destination & ((1 << PAYLOAD_BITS) - 1);
         let payload = level | if set { SET } else { 0 };
         let sent = self.send_interrupt(source, address, payload);
         if !sent {
@@ -1354,7 +1370,7 @@ impl Pic {
     /// targets the host. Once, before the machine runs.
     pub fn enable_pxbow(self: &Arc<Self>, host_widget: u8, clock: Clock) -> Result<Arc<Pxbow>, AttachError> {
         let pxbow = Pxbow::new(host_widget, self.widget, clock)?;
-        pxbow.attach_endpoint(self.widget, self.widget())?;
+        pxbow.attach_widget(self.widget, self.widget())?;
         pxbow.connect_host(Arc::new(PxbowPackets(self.wiring.clone())));
         self.pxbow.set(pxbow.clone()).map_err(|_| AttachError::Occupied(self.widget))?;
         Ok(pxbow)
