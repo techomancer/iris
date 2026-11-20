@@ -52,7 +52,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [tlb-c-field-uses-the-models-table.md](cpu/tlb-c-field-uses-the-models-table.md) | rule | The TLB decodes EntryLo C with the CPU model's table; C=4 read as uncached sent every Octane user access to the bus |
 | [tlbcheck-vmap-dangling-slot-bug.md](cpu/tlbcheck-vmap-dangling-slot-bug.md) | rule | tlbcheck: vmap fast-path can strand a still-valid TLB entry as a phantom Miss |
 | [tlbcheck-vmap-scan-performance.md](cpu/tlbcheck-vmap-scan-performance.md) | measure | tlbcheck: naive vmap re-derivation cost ~800us/call, dominated boot time |
-| [wait-is-not-a-nop.md](cpu/wait-is-not-a-nop.md) | rule | `WAIT` is not a NOP — and `InstrKind::Nop` never meant "nop" |
+| [wait-is-not-a-nop.md](cpu/wait-is-not-a-nop.md) | rule | `WAIT` is not a NOP — and `InstrKind::Nop` never meant "nop"; with IE clear it completes once an IM-passed interrupt is requested (OpenBSD R5000 idle) |
 | [xtlb-vector-follows-mode-not-address.md](cpu/xtlb-vector-follows-mode-not-address.md) | rule | The XTLB refill vector follows the MODE, not the address shape |
 
 ## jitv2/

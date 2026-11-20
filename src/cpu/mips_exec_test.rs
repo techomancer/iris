@@ -1846,12 +1846,12 @@ mod tests {
             "WAIT graduates — PC must advance so the following `j ra` is reachable");
     }
 
-    /// A WAIT that can never be released — `Status.IE` clear, or `EXL`/`ERL`
-    /// set — must NOT graduate. It returns `EXEC_RETRY` with PC still on the
-    /// instruction, so the guest correctly never progresses (matching hardware,
-    /// which hangs) while the CPU thread keeps returning to its run loop, so
-    /// the monitor, debugger and soft-reset check stay responsive. Spinning
-    /// inside the instruction instead would freeze all three.
+    /// A WAIT whose interrupts cannot be taken — `Status.IE` clear, or
+    /// `EXL`/`ERL` set — with nothing requested must NOT graduate. It returns
+    /// `EXEC_RETRY` with PC still on the instruction, so the guest waits while
+    /// the CPU thread keeps returning to its run loop, so the monitor, debugger
+    /// and soft-reset check stay responsive. Spinning inside the instruction
+    /// instead would freeze all three.
     #[test]
     fn test_wait_with_interrupts_disabled_retries_without_advancing() {
         let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
@@ -1870,6 +1870,34 @@ mod tests {
         exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::STATUS_EXL;
         assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
         assert_eq!(exec.core.pc, pc, "EXL is just as unreleasable as IE=0");
+    }
+
+    /// A requested interrupt the IM bits pass ends a WAIT executed with IE
+    /// clear: the WAIT graduates, no exception is taken, and the interrupt
+    /// waits for software to enable it. OpenBSD's R5000/RM52xx idle
+    /// (`cpu_idle_cycle_rm7k`) clears IE around its WAIT; answering RETRY
+    /// held an idle OpenBSD O2 on the WAIT for good with its clock interrupt
+    /// pending. Fix: WAIT with IE clear.
+    #[test]
+    fn test_wait_with_ie_clear_completes_on_a_requested_interrupt() {
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let (mut exec, _) = create_executor();
+        exec.core.pc = pc;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_IM_MASK;
+        exec.core.cp0_status |= crate::cpu::mips_core::CAUSE_IP7; // IM7
+        exec.core.cp0_cause = 0;
+        let epc = exec.core.cp0_epc;
+        // An interrupt IM masks does not end it.
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
+        assert_eq!(exec.core.pc, pc);
+        // The clock's IP7, which IM passes, does.
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP7 as u64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, pc + 4, "the WAIT graduates");
+        assert_eq!(exec.core.cp0_epc, epc, "and takes no exception");
     }
 
     /// The stall ends as soon as an enabled, unmasked interrupt is pending —
