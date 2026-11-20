@@ -44,10 +44,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Display
 
-<<<<<<< HEAD
 - Display buffers now start smaller and grow only for taller video modes; Newport-only
   planes and debug overlays are allocated on demand. All machines use less host RAM.
-=======
 - VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X
   server now appear, on the CPU raster and the GPU raster unit; LightWave
   Modeler's viewports showed no grid, labels or model.
@@ -55,7 +53,6 @@ hashes are given where a change is easiest to understand by reading the commit.
   out pale and scrambled) and its tabs are grey again, not red and green.
 - VPro: the check mark of a checked menu toggle (IRIS GL pop-up menus, such
   as powerflip's) draws as a check mark, not a black bar twice the box's width.
->>>>>>> 3994fae97bdda1abadc8be4ffc839488f6bfa562
 - Maximum IMPACT: every other screen row stayed black (PROM menus and
   monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables
