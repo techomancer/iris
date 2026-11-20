@@ -352,6 +352,7 @@ The InfiniteReality (KONA) graphics pipe's host interface.
 |---|---|---|
 | [front-end.md](kona/front-end.md) | design | The Host Interface Processor: attach interface, the command queue on `GFifo`, which accesses wait, the job seam to a back end, approximations |
 | [token-census.md](kona/token-census.md) | measurement | The token families two recorded streams (the PROM to its graphics menu, IRIX to the 4Dwm desktop) send, how far a replay into `NullBackend` stays exact, and the selectors QEMU's decoder leaves unresolved |
+| [tile-scheduled-flag-needs-seqcst.md](kona/tile-scheduled-flag-needs-seqcst.md) | rule | The tile scheduler's `tail`/`scheduled` hand-off is a store-buffering pair: SeqCst on all four accesses, or a job is never run and `submit`/`drain` spin forever |
 
 ## hostgl/
 
