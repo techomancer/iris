@@ -164,6 +164,8 @@ or Onyx system with several) adds a choice of which CPU a command means.
 Without a number, `start`, `stop` and the breakpoint commands (`bp`, `b`, `bd`,
 `be`, `bb`) apply to every CPU, `status` answers for each, and everything else
 goes to the selected CPU. A number always means that CPU alone, even for `stop`.
+The CPUs share one symbol table, so a map loaded with `loadsym` names
+breakpoints and addresses on all of them.
 
 **Debugging a running guest on two CPUs is not supported.** The commands run,
 but there is no way to step one CPU that keeps the guest healthy. If the other

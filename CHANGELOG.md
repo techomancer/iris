@@ -281,6 +281,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   `monitor_history` file left by an earlier nightly is no longer read.
 - Tab at the terminal console completes monitor command names, also after
   `cpu` and `cpu <n>`.
+- Machines with more than one CPU: `b <symbol>` and other breakpoint commands
+  accept names from a map loaded with `loadsym` (they failed with "unknown
+  symbol").
 - The terminal is left usable however iris ends (monitor `quit`, a signal, the
   guest powering off, the window closing, a panic), not only after Ctrl-C.
 - The monitor keeps a client that sends non-UTF-8 bytes, refuses a line over

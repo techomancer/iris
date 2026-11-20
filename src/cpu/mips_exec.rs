@@ -11590,6 +11590,13 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// see memory at the same addresses, as the CPUs of one node do).
     fn share_jitv2(&self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>, cpu: usize, space: usize);
     fn monitor_execute(&self, cmd: &str, args: &[&str], writer: Box<dyn Write + Send>) -> Result<(), String>;
+    /// The symbol table this CPU's monitor commands and breakpoints resolve
+    /// names in.
+    fn symbol_table(&self) -> Arc<Mutex<crate::cpu::mips_dis::SymbolTable>>;
+    /// Resolve names in `table` from now on: the CPUs of one machine share
+    /// one, so `loadsym` on any of them serves a breakpoint set on all.
+    /// Before the CPU first runs.
+    fn set_symbol_table(&self, table: Arc<Mutex<crate::cpu::mips_dis::SymbolTable>>);
     fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr;
     fn interrupts_ptr(&self) -> *const AtomicU64;
     /// ppmem: the executor's inline `ppmem_bitmap` field, for
@@ -11672,6 +11679,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn monitor_execute(&self, cmd: &str, args: &[&str], writer: Box<dyn Write + Send>) -> Result<(), String> {
         MipsCpu::monitor_execute(self, cmd, args, writer)
     }
+    fn symbol_table(&self) -> Arc<Mutex<crate::cpu::mips_dis::SymbolTable>> { self.executor.lock().symbols.clone() }
+    fn set_symbol_table(&self, table: Arc<Mutex<crate::cpu::mips_dis::SymbolTable>>) { self.executor.lock().symbols = table; }
     fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
     fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }

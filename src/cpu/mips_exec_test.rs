@@ -7363,6 +7363,35 @@ mod tests {
         crate::cpu::mips_exec::MipsCpu::new(exec)
     }
 
+    /// `loadsym` goes to the selected CPU and a breakpoint to every CPU. With
+    /// a symbol table per CPU the unselected ones refused the name and the
+    /// whole command failed with "unknown symbol".
+    #[test]
+    fn a_symbol_loaded_once_names_a_breakpoint_on_every_cpu() {
+        use crate::traits::Device;
+        let map = std::env::temp_dir().join(format!("iris-symtest-{}.map", std::process::id()));
+        std::fs::write(&map, "ffffffff80001000 T sendsig\n").unwrap();
+        let cpus: Vec<Arc<dyn crate::cpu::mips_exec::CpuDevice>> = vec![Arc::new(nop_cpu()), Arc::new(nop_cpu())];
+        let monitor = crate::cpu::cpu_monitor::CpuMonitor::new(cpus);
+        let run = |line: &str| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let cap = Capture::default();
+            let r = monitor.execute_command(words[0], &words[1..], Box::new(cap.clone()));
+            let out = String::from_utf8_lossy(&cap.0.lock()).into_owned();
+            (r, out)
+        };
+        let (r, _) = run(&format!("loadsym {}", map.display()));
+        std::fs::remove_file(&map).ok();
+        assert!(r.is_ok(), "{:?}", r);
+        let (r, out) = run("b sendsig if a1 == 11");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("sendsig") && out.contains("if a1 == 11"), "{}", out);
+        // The unselected CPU has it too, by name.
+        let (r, out) = run("cpu 1 bl");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("sendsig"), "{}", out);
+    }
+
     // `lightning` compiles breakpoint checks out of the run loop, so nothing
     // would ever stop the CPU at the breakpoint.
     #[cfg(not(feature = "lightning"))]
