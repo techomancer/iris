@@ -13,6 +13,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### InfiniteReality graphics
+
+- The InfiniteReality pipe's tile renderer no longer hangs when one of its
+  jobs is handed to a worker at the same moment that worker goes idle, which
+  happened in about 1 in 15 test runs on Apple Silicon (Onyx2, Origin 3200).
+
 ### Volume headers
 
 - `mkvh build` splits an ELF executable's segments larger than 512 KB, so the
