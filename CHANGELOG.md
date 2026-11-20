@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### NetBSD on the R5000 Indy
+
+- NetBSD/sgimips boots on an Indy with `--cpu r5000`; its kernel
+  stopped with `panic: r5k picache line size 16` before reaching the installer.
+
 ### Volume headers
 
 - `mkvh build` splits an ELF executable's segments larger than 512 KB, so the
