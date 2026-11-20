@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Volume headers
+
+- `mkvh build` splits an ELF executable's segments larger than 512 KB, so the
+  Octane's PROM can load a Linux kernel from the disk's volume header; an
+  11 MB `vmlinux` made it time out or panic. `--no-split` keeps files as
+  they are.
+
 ### virtio
 
 - virtio-serial and virtio-9p on PCI (Octane, Tezro) offer
