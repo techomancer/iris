@@ -13,6 +13,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Octane
+
+- The Bridges' 64 GB windows reach PCI: the 32-bit and 64-bit aliases of PCI
+  memory and PCI I/O space, on the onboard Bridge and on the PCI module's
+  and shoehorn's. OpenBSD 6.9's kernel, which reaches the IOC3 this way,
+  no longer stops with a bus error before its first message.
+- `[virtio_serial] bridge_slot` and `[virtio_9p] bridge_slot` move the
+  Octane's virtio devices within the onboard Bridge's slots 4 to 7.
+- virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
+  the SuperIO interrupt pin: Linux's serial console no longer dies when
+  virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
 ### PCI-to-PCI bridges
 
 - The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes

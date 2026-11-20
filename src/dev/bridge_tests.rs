@@ -698,6 +698,37 @@ fn the_2gb_window_reaches_pci_memory_through_the_32_bit_alias() {
     assert_eq!(r.get(reg::PCI_ERR_LOWER), 0x2000_0000);
 }
 
+/// The widget's 64 GB window shows the 2 GB window's contents, then the
+/// 64-bit alias of the same PCI memory at 0x8000_0000 and PCI I/O space at
+/// 4 GB (Bridge specification p. 52), with Control's swap bits placing the
+/// bytes. OpenBSD's xbridge(4) reaches the Octane's onboard IOC3 this way.
+#[test]
+fn the_64gb_window_reaches_pci_memory_and_io() {
+    let r = Rig::new();
+    let c = r.card(1, PCI_INTA); // memory BAR at PCI 0x1300_0000, I/O at 0x2000
+    let huge = r.bridge.huge_window();
+    let at = |off: u64| 0xf0_0000_0000 + off;
+    assert_eq!(huge.read32(at(u64::from(reg::IDENTIFICATION) + 4)).data, r.get(reg::IDENTIFICATION));
+    let mem32 = |pci: u32| at(u64::from(PIO32_ALIAS + pci));
+    let mem64 = |pci: u32| at(PIO64_ALIAS + u64::from(pci));
+    let io = |pci: u32| at(PIO_IO_ALIAS + u64::from(pci));
+    assert_eq!(huge.read32(mem32(0x1300_0000 + FIXED)).data, 0x1234_5678, "the 32-bit alias");
+    assert_eq!(huge.read32(mem64(0x1300_0000 + FIXED)).data, 0x1234_5678, "the 64-bit alias");
+    assert_eq!(huge.write32(io(0x2000 + SCRATCH), 0x8b7a_6950), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0x8b7a_6950, "PCI I/O space");
+    assert_eq!(huge.read8(io(0x2000 + (FIXED ^ 3))).data, 0x78, "a byte moves to its position");
+    r.set(reg::CONTROL, r.get(reg::CONTROL) | CONTROL_IO_SWAP);
+    assert_eq!(huge.read32(io(0x2000 + FIXED)).data, 0x7856_3412, "I/O swap set: a byte stream");
+    assert_eq!(huge.read32(mem32(0x1300_0000 + FIXED)).data, 0x1234_5678, "memory keeps its own swap bit");
+    // Beyond PCI I/O space and between the small window and the alias,
+    // nothing answers.
+    assert!(!huge.read32(at(0x2_0000_0000)).is_ok());
+    assert!(!huge.read32(at(0x0100_0000)).is_ok());
+    // The 2 GB window stops at 2 GB: its mask folds the 64 GB window's
+    // offsets back into it.
+    assert_eq!(r.bridge.long_window().read32(0xf_8000_0000 + u64::from(PIO32_ALIAS + 0x1300_0000 + FIXED)).data, 0x1234_5678);
+}
+
 /// A BAR the alias decodes whole is published as a run at its alias
 /// offset, and the run answers as the 2 GB window does.
 #[test]

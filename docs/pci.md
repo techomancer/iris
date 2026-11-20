@@ -104,21 +104,29 @@ and 90; established as software, and the board's INTB-D wiring is not known).
 **Octane**, Bridge bus 0. Outputs are the Bridge's eight pins. Pins A and C of
 device `d` reach pin `d`, B and D reach `d ^ 4`: inferred from software, not
 established. `BoardIrq(i)` is pin `i`, shared with the GPIO inputs; the IOC3's
-SuperIO interrupt is `BoardIrq(4)`. Devices 0 and 1 are the ISP1040s, 2 is the
-IOC3, 3 is the RAD1, 4 is virtio-serial and 5 virtio-9p when enabled.
+SuperIO interrupt is `BoardIrq(4)`, and pins 6 and 7 carry the power switch and
+AC-fail inputs. Devices 0 and 1 are the ISP1040s, 2 is the IOC3, 3 is the RAD1
+(no interrupt), 5 is virtio-9p (INTA, pin 5) and 7 virtio-serial on INTB, which
+reaches pin 3; slot 4, whose INTA is the SuperIO pin, stays empty
+(`bridge_slot` moves the virtio devices within 4 to 7).
 
 ## Octane windows
 
-The CPU reaches PCI memory on the Bridge two ways (Bridge ASIC specification
+The CPU reaches PCI on the Bridge three ways (Bridge ASIC specification
 rev 4.0; offsets in [octane-ip30-address-map.md](octane-ip30-address-map.md), section
-8). A device window in the Bridge's own widget space, set by `Device(x)`; and
+8). A device window in the Bridge's own widget space, set by `Device(x)`;
 the 2 GB window HEART gives widget 15 at `0xF_8000_0000`, whose first 16 MB is
 the widget's small window and whose range from offset `0x4000_0000` is the
-32-bit alias of the low 1 GB of PCI memory. A BAR in either is mapped straight
-to its function. The rest of the 2 GB window (16 MB to 1 GB) is reserved in the
-specification (p. 52), which does not say what an access does; iris ends it in
-a bus error, an approximation. The 64-bit alias and PCI I/O space, reached only
-through the 64 GB window, are not modelled. The external ATE SSRAM (`0x080000`)
+32-bit alias of the low 1 GB of PCI memory; and the 64 GB window at
+`0xF0_0000_0000`, which shows the same and beyond 2 GB the 64-bit alias of that
+memory (offset `0x8000_0000`) and PCI I/O space (offset `0x1_0000_0000`, 4 GB).
+OpenBSD reaches the onboard devices through the 64 GB window. A BAR page in a
+device window or in the 32-bit alias is mapped straight to its function, in
+both of the windows that show it; the other two aliases go through the Bridge.
+The rest of each window (16 MB to 1 GB, and past PCI I/O space) is reserved in
+the specification (p. 52), which does not say what an access does; iris ends
+it in a bus error, an approximation. The option boards' Bridges have the same
+windows on their own ports. The external ATE SSRAM (`0x080000`)
 is not fitted on the Octane and reads as all ones, which is what the PROM
 expects when it sizes it.
 

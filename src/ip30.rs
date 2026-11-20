@@ -150,10 +150,14 @@ pub struct Ip30Bus {
     widgets: Mutex<[Option<(Arc<dyn BusDevice>, bool)>; 16]>,
     /// Per port, what answers its 2 GiB window, if anything does.
     long: Mutex<[Option<Arc<dyn BusDevice>>; 16]>,
+    /// Per port, what answers its 64 GiB window when that is a view of the
+    /// widget's XIO space of its own (a Bridge's), not the widget itself.
+    huge: Mutex<[Option<Arc<dyn BusDevice>>; 16]>,
     /// Per port, the runs that a PCI BAR decodes whole (the Bridge's runs),
     /// mapped over the widget while its link is up. A run starting below
-    /// 16 MiB is in the small window, any other in the 2 GiB window; both
-    /// are offsets in XIO space.
+    /// 16 MiB is in the small window, one in the first 2 GiB in the 2 GiB
+    /// window and the 64 GiB window, any other in the 64 GiB window alone;
+    /// all are offsets in XIO space.
     runs: Mutex<[Vec<(Range<u64>, Arc<dyn BusDevice>)>; 16]>,
 }
 
@@ -172,6 +176,7 @@ impl Ip30Bus {
             unmapped,
             widgets: Mutex::new(Default::default()),
             long: Mutex::new(Default::default()),
+            huge: Mutex::new(Default::default()),
             runs: Mutex::new(Default::default()),
         }
     }
@@ -197,6 +202,14 @@ impl Ip30Bus {
     pub fn attach_long_window(&self, w: u8, dev: Arc<dyn BusDevice>) {
         assert!((9..16).contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
         self.long.lock()[w as usize] = Some(dev);
+    }
+
+    /// Put `dev` behind port `w`'s 64 GiB window, gated by the link as the
+    /// small window is. Call before [`Self::init`]; a widget attached with
+    /// its large window takes that window itself.
+    pub fn attach_huge_window(&self, w: u8, dev: Arc<dyn BusDevice>) {
+        assert!((9..16).contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
+        self.huge.lock()[w as usize] = Some(dev);
     }
 
     /// Fill the widget windows as each link stands (dead). Call once, after
@@ -234,6 +247,9 @@ impl Ip30Bus {
         if let Some(long) = &self.long.lock()[w as usize] {
             windows.push((widget_long_base(w), WIDGET_LONG_SIZE, long.clone()));
         }
+        if let Some(huge) = &self.huge.lock()[w as usize] {
+            windows.push((widget_large_base(w), WIDGET_LARGE_SIZE, huge.clone()));
+        }
         for (base, size, dev) in windows {
             if alive {
                 self.phys.map(base, base + size, dev, &format!("widget {w:#x}"));
@@ -262,35 +278,50 @@ impl Ip30Bus {
         if !entry_eq(self.phys.entry_at(widget_small_base(w)), Arc::as_ptr(dev)) {
             return; // link down: `set_widget_link` maps them when it comes up
         }
-        let long = self.long.lock()[w as usize].clone();
+        let views = self.views(w);
         for (r, _) in &old {
-            let Some((base, under)) = Self::run_window(w, r, dev, long.as_ref()) else { continue };
-            self.phys.map(base + r.start, base + r.end, under, &format!("widget {w:#x}"));
+            for (base, under) in Self::run_windows(w, r, dev, &views) {
+                self.phys.map(base + r.start, base + r.end, under, &format!("widget {w:#x}"));
+            }
         }
         self.map_runs(w, &runs[w as usize]);
     }
 
+    /// Port `w`'s 2 GiB and 64 GiB windows, where it has them.
+    fn views(&self, w: u8) -> [Option<Arc<dyn BusDevice>>; 2] {
+        [self.long.lock()[w as usize].clone(), self.huge.lock()[w as usize].clone()]
+    }
+
     /// Where run `r` of widget `w` lies and what answers there without it: a
-    /// run below 16 MiB is in the small window (the widget), any other in the
-    /// 2 GiB window (`long`). None for a run in a 2 GiB window the widget does
-    /// not have, which is not mapped at all.
-    fn run_window(
+    /// run below 16 MiB is in the small window (the widget), one in the first
+    /// 2 GiB in the 2 GiB window (`long`) and the 64 GiB window (`huge`), and
+    /// any other in the 64 GiB window alone. A window the widget does not
+    /// have is left out.
+    fn run_windows(
         w: u8,
         r: &Range<u64>,
         dev: &Arc<dyn BusDevice>,
-        long: Option<&Arc<dyn BusDevice>>,
-    ) -> Option<(u64, Arc<dyn BusDevice>)> {
+        [long, huge]: &[Option<Arc<dyn BusDevice>>; 2],
+    ) -> Vec<(u64, Arc<dyn BusDevice>)> {
         if r.start < WIDGET_SMALL_SIZE {
-            return Some((widget_small_base(w), dev.clone()));
+            return vec![(widget_small_base(w), dev.clone())];
         }
-        long.map(|l| (widget_long_base(w), l.clone()))
+        let mut at = Vec::new();
+        if r.end <= WIDGET_LONG_SIZE {
+            at.extend(long.iter().map(|l| (widget_long_base(w), l.clone())));
+        }
+        if r.end <= WIDGET_LARGE_SIZE {
+            at.extend(huge.iter().map(|h| (widget_large_base(w), h.clone())));
+        }
+        at
     }
 
     fn map_runs(&self, w: u8, runs: &[(Range<u64>, Arc<dyn BusDevice>)]) {
-        let long = self.long.lock()[w as usize].clone();
+        let views = self.views(w);
         for (r, dev) in runs {
-            let Some((base, _)) = Self::run_window(w, r, dev, long.as_ref()) else { continue };
-            self.phys.map(base + r.start, base + r.end, dev.clone(), &format!("widget {w:#x} pci bar"));
+            for (base, _) in Self::run_windows(w, r, dev, &views) {
+                self.phys.map(base + r.start, base + r.end, dev.clone(), &format!("widget {w:#x} pci bar"));
+            }
         }
     }
 
