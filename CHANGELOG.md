@@ -602,6 +602,10 @@ image) where the guest test suites showed they differed:
 - The New machine dialog names the machine after the chosen model (`o2`,
   `octane`) until a name is typed, and asks for a motherboard EEPROM only on
   the Indigo2, as the settings editor now does.
+- The summary shows the machine folder and paths relative to it, cut to the
+  panel's width; coloured buttons (Start, Stop, Create, …) have white text;
+  the status footer says "No network" instead of a network light on a machine
+  with networking off, and names a stream network.
 
 ## October 2026
 

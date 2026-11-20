@@ -353,8 +353,7 @@ impl NewMachineDialog {
                     let name = if self.name.trim().is_empty() { default_name(self.profile) } else { self.name.trim() };
                     let valid = crate::machines::validate_name(name);
                     if let Err(e) = &valid { ui.colored_label(Color32::from_rgb(230, 140, 70), e); }
-                    if ui.add_enabled(valid.is_ok(), egui::Button::new(RichText::new(t!("dialog-new-machine-create")).strong())
-                        .fill(Color32::from_rgb(60, 110, 60))).clicked()
+                    if ui.add_enabled(valid.is_ok(), crate::extra_ui::filled_button(RichText::new(t!("dialog-new-machine-create")).strong(), Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         let mut cfg = MachineConfig::default();
                         cfg.machine.profile = self.profile;

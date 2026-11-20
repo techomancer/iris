@@ -9,6 +9,13 @@ pub fn mc_machine(profile: MachineProfile) -> bool {
     matches!(profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
 }
 
+/// A button filled with `fill` (the green Start, the red Stop, the blue
+/// confirm buttons). Its text is white: the theme's text colour is dark grey
+/// in light mode, which can hardly be read on these fills.
+pub fn filled_button<'a>(text: impl Into<egui::RichText>, fill: egui::Color32) -> egui::Button<'a> {
+    egui::Button::new(text.into().color(egui::Color32::WHITE)).fill(fill)
+}
+
 /// Whether `profile` has the Indigo2's motherboard EEPROM (`nveeprom`). The
 /// Indy keeps its PROM environment in the NVRAM, the O2 in its flash.
 pub fn has_nveeprom(profile: MachineProfile) -> bool {

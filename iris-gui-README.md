@@ -139,8 +139,10 @@ work.
 The window is split into a **control column** on the left and the **emulator
 screen** on the right. The screen shows the live framebuffer once a machine is
 running (with an overlay while it is powered off); while the machine is
-stopped it shows a summary of the selected machine: platform, processor, PROM,
-NVRAM, memory, drives and network. The drives are the ones that machine starts
+stopped it shows a summary of the selected machine: its folder, platform,
+processor, PROM, NVRAM, memory, drives and network. Paths in the machine
+folder are shown relative to it; a path too long for the panel is cut short,
+and its tooltip shows it whole. The drives are the ones that machine starts
 with: SCSI targets by controller and ID (`1:3` is ID 3 on the second bus, such
 as the O2's external connector), the NVMe card and Fibre Channel disks. The
 Origin 3200 and Onyx 3000 show no SCSI targets, as they take none. The **VM screen** scale in
@@ -151,7 +153,8 @@ to fit.
 The control column holds, top to bottom: the drop-down menus, the capture
 button and hint, the configuration editor, and a status footer (run state,
 machine name, MIPS, kernel tick **Hz**, graphics FIFO depth, and the **NET**
-light for the internal network).
+light for the internal network, or "No network" on a machine with
+`[network] mode = "off"`).
 
 ### Menus
 

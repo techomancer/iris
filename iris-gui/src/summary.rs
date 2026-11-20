@@ -50,6 +50,17 @@ pub fn drives(cfg: &MachineConfig) -> Vec<Drive> {
     out
 }
 
+/// `path` as the summary shows it: relative to the machine folder when it is
+/// in it (the folder is the working directory, so a relative path already
+/// is), else as written. The full path is the label's tooltip.
+pub fn shown_path(path: &str, machine_dir: Option<&std::path::Path>) -> String {
+    let p = std::path::Path::new(path);
+    match machine_dir.and_then(|dir| p.strip_prefix(dir).ok()) {
+        Some(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
 /// The summary's Network row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Network {
@@ -249,6 +260,17 @@ mod tests {
             Drive::Cdrom { id: "4".into(), path: "cd.iso".into() },
         ]);
         assert!(expansion_paths(&cfg).is_empty());
+    }
+
+    #[test]
+    fn paths_in_the_machine_folder_are_shown_relative() {
+        let dir = std::path::Path::new("/m/o2");
+        assert_eq!(shown_path("disks/root.img", Some(dir)), "disks/root.img");
+        assert_eq!(shown_path("/m/o2/disks/root.img", Some(dir)), "disks/root.img");
+        assert_eq!(shown_path("/m/o2b/x.img", Some(dir)), "/m/o2b/x.img");
+        assert_eq!(shown_path("/elsewhere/x.iso", Some(dir)), "/elsewhere/x.iso");
+        assert_eq!(shown_path("/m/o2", Some(dir)), "/m/o2");
+        assert_eq!(shown_path("/m/o2/x", None), "/m/o2/x");
     }
 
     #[test]

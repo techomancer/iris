@@ -86,8 +86,7 @@ impl CreateDiskDialog {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button(t!("common-cancel")).clicked() { close = true; }
-                    if ui.add_enabled(!exists || self.overwrite, egui::Button::new(t!("dialog-create-disk-create"))
-                        .fill(Color32::from_rgb(60, 110, 60))).clicked()
+                    if ui.add_enabled(!exists || self.overwrite, crate::extra_ui::filled_button(t!("dialog-create-disk-create"), Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         // Create file on disk now (making the parent dir first,
                         // e.g. the managed <machine dir>/disks on first use).

@@ -827,11 +827,11 @@ impl App {
         // running status footer can report PCAP vs NAT (and which interface)
         // independent of any later edits to the config editor. On a build without
         // PCAP support the runtime forces NAT (even for an imported `mode =
-        // "pcap"`), so reflect that here and never surface PCAP.
-        self.launched_net = Some(if iris::build_features::PCAP {
-            (self.cfg.network.mode, self.cfg.network.pcap_interface.clone())
-        } else {
-            (iris::config::NetMode::Nat, None)
+        // "pcap"`), so reflect that here and never surface PCAP. Off and
+        // stream stay what they are.
+        self.launched_net = Some(match self.cfg.network.mode {
+            iris::config::NetMode::Pcap if !iris::build_features::PCAP => (iris::config::NetMode::Nat, None),
+            mode => (mode, self.cfg.network.pcap_interface.clone()),
         });
         self.started_banks = Some(self.cfg.banks);
         self.started_cpu = Some(self.cfg.cpu());
@@ -1642,13 +1642,11 @@ impl App {
         let running = self.emu.is_running();
         let full = egui::vec2(ui.available_width(), 0.0);
         if !running {
-            if ui.add_sized(full, egui::Button::new(RichText::new(t!("main-start")).size(16.0))
-                .fill(Color32::from_rgb(40, 110, 40))).clicked()
+            if ui.add_sized(full, crate::extra_ui::filled_button(RichText::new(t!("main-start")).size(16.0), Color32::from_rgb(40, 110, 40))).clicked()
             {
                 self.start_emulator();
             }
-        } else if ui.add_sized(full, egui::Button::new(RichText::new(t!("main-stop")).size(16.0))
-            .fill(Color32::from_rgb(160, 60, 60))).clicked()
+        } else if ui.add_sized(full, crate::extra_ui::filled_button(RichText::new(t!("main-stop")).size(16.0), Color32::from_rgb(160, 60, 60))).clicked()
         {
             self.request_stop();
         }
@@ -1894,8 +1892,18 @@ impl App {
                 };
                 (t!("status-net-nat"), tip)
             }
+            (true, Some((NetMode::Stream, _))) => {
+                let tip = match state {
+                    NetState::Active => t!("status-net-stream-active-tip"),
+                    _ => t!("status-net-stream-idle-tip"),
+                };
+                (t!("status-net-stream"), tip)
+            }
             _ => (t!("status-net"), t!("status-net-off-tip")),
         };
+        // A machine with no Ethernet has no light: nothing can carry traffic.
+        let net_mode = if running { backend.as_ref().map(|(m, _)| *m) } else { Some(self.cfg.network.mode) };
+        let unplugged = net_mode == Some(NetMode::Off);
         // "check" diagnoses the guest IP against the NAT subnet — only meaningful
         // in NAT mode, so it's hidden in PCAP.
         let nat_running = running && matches!(backend.as_ref(), Some((NetMode::Nat, _)));
@@ -1903,6 +1911,11 @@ impl App {
         ui.horizontal(|ui| {
             // U+2022 (bullet) as a status light. NOT U+25CF (●), which renders as
             // tofu in egui's font chain. See clanker/gui/egui-…-tofu.md.
+            if unplugged {
+                ui.label(RichText::new(t!("status-net-unplugged")).weak())
+                    .tip(t!("status-net-unplugged-tip"));
+                return;
+            }
             ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).tip(net_tip.clone());
             ui.label(net_label).tip(net_tip);
             if nat_running && ui.small_button(t!("status-net-check")).tip(t!("status-net-check-tip")).clicked() {
@@ -3029,8 +3042,7 @@ impl App {
                     if ui.button(t!("common-cancel")).clicked() {
                         decision = Some(false);
                     }
-                    if ui.add(egui::Button::new(RichText::new(t!("modal-discard-confirm")).color(Color32::WHITE))
-                        .fill(Color32::from_rgb(140, 40, 40))).clicked()
+                    if ui.add(crate::extra_ui::filled_button(RichText::new(t!("modal-discard-confirm")).color(Color32::WHITE), Color32::from_rgb(140, 40, 40))).clicked()
                     {
                         decision = Some(true);
                     }
@@ -3061,8 +3073,21 @@ impl App {
         ui.add_space(8.0);
 
         let ram_line = ram_summary(&self.cfg.banks);
+        // Paths are shown relative to the machine folder (the working
+        // directory) and cut to the panel's width; the tooltip has them whole.
+        let machine_dir = std::env::current_dir().ok();
+        let path_label = |ui: &mut egui::Ui, text: String, path: &str| {
+            ui.add(egui::Label::new(text).truncate()).on_hover_text(abs_path(path));
+        };
+        let shown = |path: &str| summary::shown_path(path, machine_dir.as_deref());
         ui.label(RichText::new(t!("welcome-summary")).strong());
         egui::Grid::new("summary_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label(t!("welcome-folder"));
+            if let Some(dir) = &machine_dir {
+                let dir = dir.to_string_lossy().into_owned();
+                path_label(ui, dir.clone(), &dir);
+            }
+            ui.end_row();
             ui.label(t!("welcome-platform"));
             ui.label(self.cfg.machine.profile.label());
             ui.end_row();
@@ -3079,18 +3104,18 @@ impl App {
                 }
             }
             ui.label(t!("welcome-prom"));
-            ui.label(if crate::extra_ui::builtin_prom(&self.cfg) {
+            let prom = if crate::extra_ui::builtin_prom(&self.cfg) || self.cfg.prom.is_empty() {
                 t!("welcome-prom-builtin")
             } else if std::path::Path::new(&self.cfg.prom).exists() {
-                abs_path(&self.cfg.prom)
-            } else if self.cfg.prom.is_empty() {
-                t!("welcome-prom-builtin")
+                shown(&self.cfg.prom)
             } else {
-                t!("welcome-prom-missing", path = &self.cfg.prom)
-            });
+                let s = shown(&self.cfg.prom);
+                t!("welcome-prom-missing", path = &s)
+            };
+            path_label(ui, prom, &self.cfg.prom);
             ui.end_row();
             ui.label(t!("welcome-nvram"));
-            ui.label(abs_path(&self.cfg.nvram));
+            path_label(ui, shown(&self.cfg.nvram), &self.cfg.nvram);
             ui.end_row();
             ui.label(t!("welcome-memory"));
             ui.label(ram_line);
@@ -3110,15 +3135,16 @@ impl App {
                 }
                 for drive in drives {
                     use summary::Drive;
-                    ui.label(match drive {
-                        Drive::Daynaport { id } => t!("welcome-drive-daynaport", id = &id),
-                        Drive::Cdrom { id, path } if path.is_empty() => t!("welcome-drive-cdrom-empty", id = &id),
-                        Drive::Cdrom { id, path } => { let path = abs_path(&path); t!("welcome-drive-cdrom", id = &id, path = &path) }
-                        Drive::Disk { id, path } if path.is_empty() => t!("welcome-drive-disk-no-image", id = &id),
-                        Drive::Disk { id, path } => { let path = abs_path(&path); t!("welcome-drive-disk", id = &id, path = &path) }
-                        Drive::Nvme { path } => { let path = abs_path(&path); t!("welcome-drive-nvme", path = &path) }
-                        Drive::FibreChannel { id, path } => { let path = abs_path(&path); t!("welcome-drive-fc", id = id, path = &path) }
-                    });
+                    let (text, path) = match drive {
+                        Drive::Daynaport { id } => (t!("welcome-drive-daynaport", id = &id), String::new()),
+                        Drive::Cdrom { id, path } if path.is_empty() => (t!("welcome-drive-cdrom-empty", id = &id), path),
+                        Drive::Cdrom { id, path } => { let s = shown(&path); (t!("welcome-drive-cdrom", id = &id, path = &s), path) }
+                        Drive::Disk { id, path } if path.is_empty() => (t!("welcome-drive-disk-no-image", id = &id), path),
+                        Drive::Disk { id, path } => { let s = shown(&path); (t!("welcome-drive-disk", id = &id, path = &s), path) }
+                        Drive::Nvme { path } => { let s = shown(&path); (t!("welcome-drive-nvme", path = &s), path) }
+                        Drive::FibreChannel { id, path } => { let s = shown(&path); (t!("welcome-drive-fc", id = id, path = &s), path) }
+                    };
+                    path_label(ui, text, &path);
                 }
                 subtitle(ui, t!("welcome-drives-subtitle"));
             });
@@ -3147,8 +3173,7 @@ impl App {
         // Welcome panel is only rendered when the emulator is stopped
         // (the central panel switches to the framebuffer when running),
         // so a single Start button is sufficient here.
-        if ui.add(egui::Button::new(RichText::new(t!("welcome-start")).size(20.0))
-            .fill(Color32::from_rgb(40, 120, 40))
+        if ui.add(crate::extra_ui::filled_button(RichText::new(t!("welcome-start")).size(20.0), Color32::from_rgb(40, 120, 40))
             .min_size(egui::vec2(220.0, 44.0))).clicked()
         {
             self.start_emulator();
@@ -3368,7 +3393,7 @@ impl eframe::App for App {
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        let ok = ui.add(egui::Button::new(t!("modal-rename-confirm")).fill(Color32::from_rgb(60, 90, 140))).clicked();
+                        let ok = ui.add(crate::extra_ui::filled_button(t!("modal-rename-confirm"), Color32::from_rgb(60, 90, 140))).clicked();
                         if (ok || entered) && !buf.trim().is_empty() {
                             rename_result = Some(Some(buf.clone()));
                         }
@@ -3451,8 +3476,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { close_modal = true; }
                         if ui.button(t!("modal-stop-halt")).clicked() { do_halt = true; close_modal = true; }
-                        if ui.add(egui::Button::new(RichText::new(t!("modal-stop-force")).color(Color32::WHITE))
-                            .fill(Color32::from_rgb(140, 40, 40))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(RichText::new(t!("modal-stop-force")).color(Color32::WHITE), Color32::from_rgb(140, 40, 40))).clicked()
                         {
                             do_force = true; close_modal = true;
                         }
@@ -3520,13 +3544,11 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { do_revert = true; close = true; }
-                        if ui.add(egui::Button::new(t!("modal-net-use", subnet = &suggestion))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-net-use", subnet = &suggestion), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             do_suggest = true; close = true;
                         }
-                        if ui.add(egui::Button::new(t!("modal-net-override"))
-                            .fill(Color32::from_rgb(140, 90, 40))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-net-override"), Color32::from_rgb(140, 90, 40))).clicked()
                         {
                             close = true;
                         }
@@ -3555,8 +3577,7 @@ impl eframe::App for App {
                     ui.label(RichText::new(capture_access::permission_hint()).weak());
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(t!("modal-pcap-enable"))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-pcap-enable"), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             do_enable = true;
                         }
@@ -3597,8 +3618,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { choice = MissingChoice::Cancel; }
                         if ui.button(t!("modal-missing-edit")).clicked() { choice = MissingChoice::EditDisks; }
-                        if ui.add(egui::Button::new(t!("modal-missing-detach"))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-missing-detach"), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             choice = MissingChoice::Detach;
                         }
@@ -3682,8 +3702,7 @@ impl eframe::App for App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { chd_choice = ChdGrantChoice::Cancel; }
-                        if ui.add(egui::Button::new(t!("modal-grant-start-anyway"))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-grant-start-anyway"), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             chd_choice = ChdGrantChoice::StartAnyway;
                         }
