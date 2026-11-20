@@ -92,6 +92,31 @@ const WRITE_FORMAT_MASK: u32 = 0x1f;
 const WRITE_FORMAT_COLOR_INDEX: u32 = 1;
 /// Word 7 bit 27.
 const COPY_TRANSFORM: u32 = 1 << 27;
+/// Word 7's write format RGBA (bits 4:0) and its type US_4_4_4_4 (bits 8:5).
+const WRITE_FORMAT_RGBA: u32 = 0xb;
+const WRITE_TYPE_SHIFT: u32 = 5;
+const WRITE_TYPE_MASK: u32 = 0xf;
+const WRITE_TYPE_US_4444: u32 = 6;
+
+/// How the board stores into a colour field of `bytes` bytes, by the write
+/// format and type in the low bits of `word` (a copy's word 7, a DMA
+/// header's control word), where they name the packing whole: a colour
+/// index, or RGBA as 4:4:4:4 in 2 bytes. The library picks the write pair
+/// from the destination's pixel class (`ignore/odsy`,
+/// devices/buzz/pixel-paths.md, the host-to-board table), so it names the
+/// field as the window holds it. The selected pixel mode can belong to
+/// another window by then (traced, Icon Catalog on a 12-bit visual): the X
+/// server puts its 8-bit tab strip with a 4:4:4:4 window's mode still
+/// selected, and its scroll copies (read 4:4:4:4, write RGBA/US_4_4_4_4)
+/// come with an index mode selected. None leaves the packing to the mode.
+pub(super) fn write_codec(bytes: u8, word: u32) -> Option<Codec> {
+    let (format, kind) = (word & WRITE_FORMAT_MASK, (word >> WRITE_TYPE_SHIFT) & WRITE_TYPE_MASK);
+    match (bytes, format, kind) {
+        (2 | 4, WRITE_FORMAT_COLOR_INDEX, _) => Some(Codec::Texel { bytes, field: FIELD_INDEX }),
+        (2, WRITE_FORMAT_RGBA, WRITE_TYPE_US_4444) => Some(Codec::Texel { bytes: 2, field: FIELD_FOUR }),
+        _ => None,
+    }
+}
 
 impl CopyOperands {
     pub fn decode(op: &[u32]) -> CopyOperands {
@@ -221,6 +246,12 @@ impl Board {
             .into_iter()
             .find(|f| f.at == dst.at && !whole_wid)
             .map_or_else(|| source_codec(dst.bytes, 0), |f| f.codec);
+        // Word 7's write pair, where it names the packing, over the mode's
+        // (write_codec); the window-id buffer's bytes stay whole.
+        let dst_codec = match write_codec(dst.bytes, c.w[7]) {
+            Some(w) if !whole_wid && !c.transform() => w,
+            _ => dst_codec,
+        };
         let mem = self.vram.ptr();
         let side_rows = |s: &Side, codec: Codec, base: u32| {
             let surface = Surface::new(base, s.stride, s.pixel_log2);

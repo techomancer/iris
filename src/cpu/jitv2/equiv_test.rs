@@ -227,6 +227,10 @@ mod tests {
             let counter = gens.entry(page).or_insert_with(|| Box::new(AtomicU64::new(0)));
             counter.as_ref() as *const AtomicU64
         }
+        #[cfg(feature = "jitv2")]
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr)))
+        }
     }
 
     fn make_r(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {

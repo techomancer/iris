@@ -19,6 +19,9 @@ struct PromInner {
     /// check against it therefore never fails due to ROM-side invalidation.
     #[cfg(feature = "jitv2")]
     gen: AtomicU64,
+    /// JIT v2: the PROM's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
 }
 
 pub struct PromPort {
@@ -54,6 +57,8 @@ impl Prom {
                 running: AtomicBool::new(false),
                 #[cfg(feature = "jitv2")]
                 gen: AtomicU64::new(0),
+                #[cfg(feature = "jitv2")]
+                code_bank: crate::traits::CodeBank::new(),
             }),
         }
     }
@@ -178,6 +183,19 @@ impl BusDevice for PromPort {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
         &self.inner.gen as *const AtomicU64
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        (PROM_BASE..PROM_BASE + PROM_SIZE).contains(&addr).then(|| {
+            let offset = (addr - PROM_BASE) & !0xFFF;
+            let mut page = self.inner.code_bank.page(offset, &self.inner.gen);
+            // The image is immutable and lives as long as the device.
+            if offset as usize / 4 + 1024 <= self.inner.data.len() {
+                page.words = unsafe { self.inner.data.as_ptr().add(offset as usize / 4) };
+            }
+            page
+        })
     }
 }
 

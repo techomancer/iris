@@ -211,8 +211,8 @@ impl PciBus {
     /// nothing answers on a root bus; behind a bridge the write is discarded by
     /// master abort, as a read of nothing is (see [`PciBus::config_read`]), and
     /// counts as answered. The mappings are updated when the command register,
-    /// a BAR, or a bridge's bus numbers or windows changed, the only registers
-    /// they are built from.
+    /// a BAR, or a bridge's bus numbers, windows or bridge control changed,
+    /// the only registers they are built from.
     pub fn config_write(&self, at: DevFn, off: usize, width: usize, val: u32) -> bool {
         let f = self.function(at);
         crate::dlog!(LogModule::Pci, "pci: bus {} {}.{} write {off:#04x}/{width} {val:#x}{}", self.0.number, at.device, at.function,
@@ -228,8 +228,9 @@ impl PciBus {
         let new = cfg.read(reg);
         f.config_written(reg, old, new);
         // The command register, the BARs and, in a bridge's header, its bus
-        // numbers and windows: the registers the table is built from.
-        if new != old && matches!(reg, 1 | 4..=9) {
+        // numbers, windows, their upper halves and the bridge control
+        // register (ISA enable): the registers the table is built from.
+        if new != old && (matches!(reg, 1 | 4..=9) || (cfg.is_type1() && matches!(reg, 10..=12 | 15))) {
             self.update_mappings(None);
         }
         true

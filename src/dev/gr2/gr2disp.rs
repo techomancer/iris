@@ -72,12 +72,12 @@ impl Head for Gr2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev::gr2::re3_tests::live_gr2;
     use crate::dev::gr2::Gr2Variant;
 
     #[test]
     fn ordinary_presentation_scans_the_complete_host_framebuffer() {
-        let g = live_gr2(Gr2Variant::Xz);
+        // Not started: a started board's refresh thread also presents its first frame.
+        let g = crate::test_board::TestBoard::new(Gr2::new(Gr2Variant::Xz, crate::disp::StatusSource::detached()));
         let mut screen = Rex3Screen::new();
         let want = Want { readback: false, gpu: true };
 

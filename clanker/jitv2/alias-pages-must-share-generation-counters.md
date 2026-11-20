@@ -1,5 +1,10 @@
 # An aliased physical page must share its generation counter
 
+Status: still true for the counters. Since 2026-11-19 an aliased page also
+shares its code page: pages are keyed by the memory behind them
+([pages-are-keyed-by-bank-and-offset.md](pages-are-keyed-by-bank-and-offset.md)),
+and a page's counter comes from `code_page`, the bank's own.
+
 Two independent bugs, one per memory path, both with the same effect: a page
 reachable at two physical addresses had **two different** JIT generation
 counters, so writes through one address never invalidated code compiled through

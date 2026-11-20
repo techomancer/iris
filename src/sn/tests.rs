@@ -1,6 +1,6 @@
 use super::*;
 use crate::dev::{bedrock, hub};
-use crate::cpu::smp::{set_current_cpu, ParkSlot, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
+use crate::cpu::smp::{set_current_cpu, ParkSlot, HOST_PARK_BIT, REQUEST_JIT_REMAP};
 use crate::physical::RamBank;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -221,6 +221,29 @@ fn a_boot_local_node_keeps_its_flash_at_node_field_zero() {
     release(&nodes);
 }
 
+/// With memory of its own behind the boot window a renumbered IP35 node shows no flash there,
+/// and the window is the zero holder's memory like the rest of node field zero: IRIX hands those
+/// pages out, and every processor, DMA master and block transfer has to reach the same bytes.
+#[test]
+fn memory_in_the_boot_window_is_the_zero_holders_for_both_nodes() {
+    let nodes = pair([1024, 1024], Some(0x5a), bedrock::NODE_SHIFT);
+    renumber(&nodes[0], 1);
+    let at = RESET_WINDOW + 0x2000;
+    // The zero holder stores; the renumbered node reads the same memory, and stores back.
+    assert_eq!(nodes[1].physical().write64(at, 0x1122_3344_5566_7788), BUS_OK);
+    assert_eq!(nodes[0].physical().read64(at).data, 0x1122_3344_5566_7788, "the zero holder's memory, not its own");
+    assert_eq!(nodes[0].physical().write64(at + 8, 0xa5a5), BUS_OK);
+    assert_eq!(nodes[1].physical().read64(at + 8).data, 0xa5a5);
+    // Memory by number, as DMA and the block transfer engine reach it, agrees.
+    let dma: &dyn BusDevice = &*nodes[0];
+    assert_eq!(dma.read64(at).data, 0x1122_3344_5566_7788);
+    // The renumbered node's own memory behind the window is at its number.
+    let own = (1u64 << bedrock::NODE_SHIFT) + at;
+    assert_ne!(nodes[0].physical().read64(own).data, 0x1122_3344_5566_7788);
+    assert_eq!(nodes[1].physical().read64(own).data, nodes[0].physical().read64(own).data);
+    release(&nodes);
+}
+
 /// A remap publishes and maps with every other processor parked.
 #[test]
 fn a_remap_publishes_with_the_other_processor_parked() {
@@ -293,7 +316,7 @@ impl ParkProbe {
                 while running.load(Ordering::Relaxed) {
                     if word.load(Ordering::Relaxed) & HOST_PARK_BIT == 0 {
                         std::thread::yield_now();
-                    } else if slot.release(REQUEST_JIT_FLUSH) {
+                    } else if slot.release(REQUEST_JIT_REMAP) {
                         flushes.fetch_add(1, Ordering::SeqCst);
                     } else {
                         slot.park(&running);
@@ -307,13 +330,13 @@ impl ParkProbe {
             s.spawn(|| {
                 set_current_cpu(0);
                 store();
-                if self.slots[0].release(REQUEST_JIT_FLUSH) {
+                if self.slots[0].release(REQUEST_JIT_REMAP) {
                     self.flushes.fetch_add(1, Ordering::SeqCst);
                 }
             });
         });
         // Processor 1 takes a flush posted to it before it stops.
-        while self.slots[1].holds() & REQUEST_JIT_FLUSH != 0 {
+        while self.slots[1].holds() & REQUEST_JIT_REMAP != 0 {
             std::thread::yield_now();
         }
         running.store(false, Ordering::Relaxed);

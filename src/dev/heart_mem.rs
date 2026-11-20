@@ -367,6 +367,10 @@ impl BusDevice for DmaView {
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         self.at(addr).map_or(std::ptr::null(), |(d, a)| d.gen_ptr(a))
     }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        self.at(addr).and_then(|(d, a)| d.code_page(a))
+    }
 }
 
 // The memory's contents for a snapshot. Where the banks answer is HEART's

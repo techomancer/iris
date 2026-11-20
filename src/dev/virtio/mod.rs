@@ -42,7 +42,7 @@ pub mod p9 {
 pub mod pci;
 pub mod queue;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -63,6 +63,10 @@ pub const STATUS_FAILED: u8 = 0x80;
 
 /// `VIRTIO_F_VERSION_1`: the device is a 1.x device. Bit 32.
 pub const F_VERSION_1: u64 = 1 << 32;
+/// `VIRTIO_F_ACCESS_PLATFORM`: the device reaches memory through the
+/// platform's translation, so the driver must give it the addresses the
+/// platform's DMA mapping returns rather than physical ones. Bit 33.
+pub const F_ACCESS_PLATFORM: u64 = 1 << 33;
 
 /// ISR / interrupt-status bits.
 pub const ISR_QUEUE: u32 = 1;
@@ -229,7 +233,9 @@ struct Inner {
 struct Shared {
     inner: Mutex<Inner>,
     device_id: u32,
-    device_features: u64,
+    /// Offered features. Set before the device is attached; a transport
+    /// may add its own bits ([`VirtioCore::offer`]).
+    device_features: AtomicU64,
     mem: OnceLock<Arc<dyn GuestMemory>>,
     irq: Mutex<IrqLine>,
     /// Serialises "compute the level, drive the line" so two threads cannot
@@ -267,7 +273,7 @@ impl VirtioCore {
                     notified: 0,
                 }),
                 device_id,
-                device_features,
+                device_features: AtomicU64::new(device_features),
                 mem: OnceLock::new(),
                 irq: Mutex::new(IrqLine::unconnected()),
                 irq_lock: Mutex::new(()),
@@ -291,6 +297,12 @@ impl VirtioCore {
 
     // ---- identity ----
 
+    /// Offer `bits` as well as the device's own features: a transport's
+    /// bits, added before any driver reads the features.
+    pub fn offer(&self, bits: u64) {
+        self.sh.device_features.fetch_or(bits, Ordering::Relaxed);
+    }
+
     pub fn device_id(&self) -> u32 {
         self.sh.device_id
     }
@@ -298,7 +310,7 @@ impl VirtioCore {
     /// Offered feature bits `32*sel .. 32*sel+32`.
     pub fn device_features_word(&self, sel: u32) -> u32 {
         match sel {
-            0 | 1 => (self.sh.device_features >> (32 * sel)) as u32,
+            0 | 1 => (self.sh.device_features.load(Ordering::Relaxed) >> (32 * sel)) as u32,
             _ => 0,
         }
     }
@@ -337,7 +349,7 @@ impl VirtioCore {
         // offered and the 1.x bit: otherwise the device clears it so the
         // driver reads it back and gives up (§3.1.1).
         if new & STATUS_FEATURES_OK != 0 && g.status & STATUS_FEATURES_OK == 0 {
-            let ok = g.driver_features & !self.sh.device_features == 0 && g.driver_features & F_VERSION_1 != 0;
+            let ok = g.driver_features & !self.sh.device_features.load(Ordering::Relaxed) == 0 && g.driver_features & F_VERSION_1 != 0;
             if !ok {
                 new &= !STATUS_FEATURES_OK;
             }

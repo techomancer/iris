@@ -295,6 +295,15 @@ impl Board {
             // written (GpuRaster::upload_region), below.
             to = Rows::new(to.mem().untracked(), to.v);
         }
+        // Into the screen, the control word's write pair says how the field
+        // holds the pixel where it names the packing (copy::write_codec):
+        // the pixel mode can still be another window's.
+        if !memory {
+            let bytes = 2u8 << ((hdr[dma::HDR_FORMAT] >> 13) & 7);
+            if let (Some(c), super::view::Kind::Coded(_) | super::view::Kind::Rgba8) = (super::copy::write_codec(bytes, hdr[dma::HDR_CONTROL]), to.v.kind) {
+                to = Rows::new(to.mem(), to.v.with_codec(c));
+            }
+        }
         let obj = memory.then_some(());
         let mut e = [DmaEntry::default(); dma::MAX_PAGES];
         let x = hdr[dma::HDR_ORIGIN] & 0xffff;
@@ -314,7 +323,11 @@ impl Board {
         let mut pos: u64 = 0;
 
         let raw = raw || (obj.is_some() && dma_raw64(hdr, bpp));
-        if bpp != 4 && bpp != 3 && bpp != 1 && !texel12 && !lum_alpha && !raw {
+        // A 16-bit colour index, two bytes a pixel: the X server's PutImage
+        // of a colour-index image (traced: LightWave's software-drawn
+        // viewports, into the screen with an index pixel mode selected).
+        let ci16 = bpp == 2 && (hdr[dma::HDR_CONTROL] & image::CODE_MASK) == image::CODE_CI16;
+        if bpp != 4 && bpp != 3 && bpp != 1 && !texel12 && !lum_alpha && !raw && !ci16 {
             if !self.diag.dma_bpp_reported {
                 self.diag.dma_bpp_reported = true;
                 crate::dlog!(

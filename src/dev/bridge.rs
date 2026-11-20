@@ -41,10 +41,11 @@
 //!   SRAM extends it.
 //! * Through the widget's 2 GB window the first 16 MB is the small window
 //!   and 0x4000_0000 on is the 32-bit alias of PCI memory (specification
-//!   p. 52); the rest of that window is a bus error. The 64-bit alias at
-//!   0x8000_0000 and PCI I/O at 4 GB, which only the 64 GB window reaches,
-//!   are not modelled. Which device a master time-out through the alias
-//!   names in the error capture is not in the specification; iris names 0.
+//!   p. 52); the rest of that window is a bus error. The 64 GB window shows
+//!   the same, and beyond 2 GB the 64-bit alias of the same PCI memory at
+//!   0x8000_0000 and PCI I/O space at 4 GB; the rest of it is a bus error
+//!   too. Which device a master time-out through an alias names in the
+//!   error capture is not in the specification; iris names 0.
 //! * A function's DMA address at or above 4 GiB goes through the 64-bit
 //!   direct window: bits 63:60 name the widget and the low 48 bits pass
 //!   through. PCI-local space (below 0x4000_0000), which would reach
@@ -233,6 +234,16 @@ const PIO32_ALIAS_SIZE: u32 = 0x4000_0000;
 /// after the eight device windows.
 pub const LONG_WINDOW_SIZE: u64 = 0x8000_0000;
 const LONG_MASK: u64 = LONG_WINDOW_SIZE - 1;
+/// The widget's 64 GB window, the whole of its XIO space as the Octane's
+/// HEART shows it.
+pub const HUGE_WINDOW_SIZE: u64 = 1 << 36;
+const HUGE_MASK: u64 = HUGE_WINDOW_SIZE - 1;
+/// The 64-bit alias of PCI memory (the same 1 GB as the 32-bit one) and PCI
+/// I/O space, as offsets in the widget's XIO space: only the 64 GB window
+/// reaches them (specification p. 52).
+pub const PIO64_ALIAS: u64 = 0x8000_0000;
+pub const PIO_IO_ALIAS: u64 = 0x1_0000_0000;
+const PIO_IO_ALIAS_SIZE: u64 = 0x1_0000_0000;
 const ALIAS_WINDOW: usize = DEVICES;
 pub const PINS: usize = 8;
 pub const ATE_ENTRIES: usize = 128;
@@ -850,7 +861,13 @@ impl Bridge {
 
     /// What the machine maps over the widget's 2 GB window.
     pub fn long_window(self: &Arc<Self>) -> Arc<dyn BusDevice> {
-        Arc::new(LongWindow(self.clone()))
+        Arc::new(XioWindow { bridge: self.clone(), mask: LONG_MASK })
+    }
+
+    /// What the machine maps over the widget's 64 GB window: the 2 GB
+    /// window's contents, then the 64-bit alias of PCI memory and PCI I/O.
+    pub fn huge_window(self: &Arc<Self>) -> Arc<dyn BusDevice> {
+        Arc::new(XioWindow { bridge: self.clone(), mask: HUGE_MASK })
     }
 
     /// Attach a flash part on chip select `cs` (0 or 1). `part` is addressed from the
@@ -1405,9 +1422,10 @@ impl Bridge {
         val.map(|_| 0)
     }
 
-    /// A processor access to PCI memory address `pci` through the 32-bit
-    /// alias. As through a window, nothing driving device select is a
-    /// master time-out: a read fails and a write posts.
+    /// A processor access to PCI `space` address `pci` through one of the
+    /// aliases of the 2 GB and 64 GB windows. As through a window, nothing
+    /// driving device select is a master time-out: a read fails and a write
+    /// posts.
     fn alias_access(&self, space: Space, pci: u32, size: usize, val: Option<u64>) -> Option<u64> {
         let order = Self::alias_order(self.st.lock().r(reg::CONTROL), space);
         if let Some((f, bar, off)) = self.bus.decode(space, pci) {
@@ -2015,41 +2033,72 @@ impl crate::traits::Resettable for Bridge {
 /// The widget window is decoded from the full physical address.
 const WINDOW_MASK: u32 = WIDGET_SMALL_SIZE - 1;
 
-/// The widget's 2 GB window: the small window's 16 MB, then nothing up to
-/// the 32-bit alias of PCI memory. Runs a BAR decodes whole are mapped over
-/// it; this answers the rest.
-struct LongWindow(Arc<Bridge>);
+/// The widget's 2 GB or 64 GB window, which `mask` tells apart: the small
+/// window's 16 MB, then nothing up to the 32-bit alias of PCI memory, and in
+/// the 64 GB window the 64-bit alias of the same memory and PCI I/O space
+/// beyond it. Runs a BAR decodes whole are mapped over it; this answers the
+/// rest.
+struct XioWindow {
+    bridge: Arc<Bridge>,
+    mask: u64,
+}
 
-impl LongWindow {
-    fn read(&self, addr: u64, size: usize) -> Option<u64> {
-        match (addr & LONG_MASK) as u32 {
-            off @ 0..WIDGET_SMALL_SIZE => self.0.read(off, size),
-            off @ PIO32_ALIAS.. => self.0.alias_access(Space::Mem, off - PIO32_ALIAS, size, None),
+impl XioWindow {
+    /// Where XIO offset `off` goes: the small window, or an alias's PCI
+    /// space and address.
+    fn decode(off: u64) -> Option<Result<u32, (Space, u32)>> {
+        const SMALL: u64 = WIDGET_SMALL_SIZE as u64;
+        const PIO32: u64 = PIO32_ALIAS as u64;
+        const PIO32_END: u64 = PIO32 + PIO32_ALIAS_SIZE as u64;
+        const PIO64_END: u64 = PIO64_ALIAS + PIO32_ALIAS_SIZE as u64;
+        const IO_END: u64 = PIO_IO_ALIAS + PIO_IO_ALIAS_SIZE;
+        match off {
+            0..SMALL => Some(Ok(off as u32)),
+            PIO32..PIO32_END => Some(Err((Space::Mem, (off - PIO32) as u32))),
+            PIO64_ALIAS..PIO64_END => Some(Err((Space::Mem, (off - PIO64_ALIAS) as u32))),
+            PIO_IO_ALIAS..IO_END => Some(Err((Space::Io, (off - PIO_IO_ALIAS) as u32))),
             // Approximation: the specification calls 16 MB to 1 GB reserved
             // (p. 52) and does not say what an access there does; a bus
-            // error here.
+            // error here, as beyond PCI I/O space.
             _ => None,
         }
     }
 
+    fn read(&self, addr: u64, size: usize) -> Option<u64> {
+        match Self::decode(addr & self.mask)? {
+            Ok(off) => self.bridge.read(off, size),
+            Err((space, pci)) => self.bridge.alias_access(space, pci, size, None),
+        }
+    }
+
     fn write(&self, addr: u64, size: usize, val: u64) -> u32 {
-        match (addr & LONG_MASK) as u32 {
-            off @ 0..WIDGET_SMALL_SIZE => self.0.write(off, size, val),
-            off @ PIO32_ALIAS.. => {
-                self.0.alias_access(Space::Mem, off - PIO32_ALIAS, size, Some(val));
+        match Self::decode(addr & self.mask) {
+            Some(Ok(off)) => self.bridge.write(off, size, val),
+            Some(Err((space, pci))) => {
+                self.bridge.alias_access(space, pci, size, Some(val));
                 BUS_OK
             }
-            _ => BUS_ERR,
+            None => BUS_ERR,
         }
     }
 }
 
-impl BusDevice for LongWindow {
+impl BusDevice for XioWindow {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+        let off = addr & self.mask;
+        if off < WIDGET_SMALL_SIZE as u64 { self.bridge.gen_ptr(off) } else { std::ptr::null() }
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        let off = addr & self.mask;
+        if off < WIDGET_SMALL_SIZE as u64 { self.bridge.code_page(off) } else { None }
+    }
     /// A configuration master time-out reached through the window's first
     /// 16 MB is explained as through the small window.
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
-        let off = addr & LONG_MASK;
-        if off < WIDGET_SMALL_SIZE as u64 { self.0.describe_fault(off, size) } else { None }
+        let off = addr & self.mask;
+        if off < WIDGET_SMALL_SIZE as u64 { self.bridge.describe_fault(off, size) } else { None }
     }
     fn read8(&self, addr: u64) -> BusRead8 {
         self.read(addr, 1).map_or(BusRead8::err(), |v| BusRead8::ok(v as u8))
@@ -2077,7 +2126,27 @@ impl BusDevice for LongWindow {
     }
 }
 
+impl Bridge {
+    /// The flash part a widget address reaches and the offset in it, for the
+    /// questions a bus forwards about memory code runs from. The PROM runs
+    /// from the part on chip select 0, at the reset vector.
+    #[cfg(feature = "jitv2")]
+    fn flash_at(&self, off: u32) -> Option<(Arc<dyn BusDevice>, u64)> {
+        let woff = off.checked_sub(FLASH_BASE).filter(|_| off <= 0xff_ffff)?;
+        self.flash_part(woff).map(|(dev, at)| (dev, at as u64))
+    }
+}
+
 impl BusDevice for Bridge {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+        self.flash_at(addr as u32 & WINDOW_MASK).map_or(std::ptr::null(), |(dev, at)| dev.gen_ptr(at))
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        self.flash_at(addr as u32 & WINDOW_MASK).and_then(|(dev, at)| dev.code_page(at))
+    }
+
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
         let off = addr as u32 & WINDOW_MASK;
         if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) {

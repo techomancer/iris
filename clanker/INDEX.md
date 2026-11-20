@@ -62,6 +62,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | Note | Kind | Title |
 |---|---|---|
 | [alias-pages-must-share-generation-counters.md](jitv2/alias-pages-must-share-generation-counters.md) | rule | An aliased physical page must share its generation counter |
+| [pages-are-keyed-by-bank-and-offset.md](jitv2/pages-are-keyed-by-bank-and-offset.md) | design | A code page is keyed by bank:offset (`CodeKey`), found through `code_page` on the bus; frame tables per address space; remaps flush nothing; one pool per machine |
 | [bc1-is-an-ordinary-branch.md](jitv2/bc1-is-an-ordinary-branch.md) | measure | BC1 is an ordinary PC-relative branch, and compiling it is worth ~4x |
 | [block-fragmentation-blocks-cse.md](jitv2/block-fragmentation-blocks-cse.md) | measure | Block fragmentation, not callouts, is what starves `opt_level=speed` |
 | [callout-arg0-is-core-ptr.md](jitv2/callout-arg0-is-core-ptr.md) | rule | JIT→Rust callouts: arg 0 is always the `MipsCore` pointer |
@@ -109,9 +110,11 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [pic-flush-packets-go-to-memory-with-any-vector.md](devices/pic-flush-packets-go-to-memory-with-any-vector.md) | rule | IRIX flushes PIO reads by forcing a PIC input aimed at a memory word (vector 0xed) and spinning for 0x1ed; a level check meant for the PI dropped it and hung Tezro audio programs. `envy` + CPU PC sampling found it |
 | [refreshing-the-generated-register-files.md](devices/refreshing-the-generated-register-files.md) | rule | The Hub and Bedrock register files are byte-for-byte copies of the chips repository's generated files; how to refresh them and what the contract test then catches |
 | [ip35-board-eeprom-cpu-config.md](devices/ip35-board-eeprom-cpu-config.md) | rule | The IP35 PROM checks its flash CPU record against the node board EEPROM's format-3 extended data (`CpuContext`); the field layout and how it was read out of the PROM |
 | [a-dropped-machine-must-free-its-cpus.md](devices/a-dropped-machine-must-free-its-cpus.md) | rule | Never `forget` a CPU `Arc` after handing out a weak one: CPU 0's batch hook holds the board, so the Fuel, Tezro and Origin 3200 kept every disk and the flash open after drop (failed on Windows) |
+| [ip35-boot-window-memory-is-the-zero-holders.md](devices/ip35-boot-window-memory-is-the-zero-holders.md) | rule | Two-node IP35: memory behind the boot window at node field zero is the zero holder's for every node; keeping it on the reader gave node 1 its own RAM for 4 MiB of node 0 and corrupted IRIX (found by bisecting FC, JIT, graphics, second CPU, then diffing a piped disk region) |
 | [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
 | [draw-marks-tell-the-display-what-shows.md](devices/draw-marks-tell-the-display-what-shows.md) | rule | IMPACT and VPro compose only when drawing landed in a buffer the screen shows: a draw marks its store, planes and box after its stores (`display::Marks`); a path that cannot must say "anything"; `IRIS_DISPLAY_VERIFY=1` checks the verdicts; measurements |
 | [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
@@ -119,6 +122,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [hal2-cs4216-volume-and-clocking.md](devices/hal2-cs4216-volume-and-clocking.md) | rule | HAL2 and CS4216: speaker volume is the PBUS PIO ch2 MDAC (`0x1fbd8800`/`0x1fbd8804`), and clocking is SM3-Slave from HAL2 |
 | [sn-node-traps.md](devices/sn-node-traps.md) | rule | Node machines (`hub`, `bedrock`): the uncached attribute selects a decode and is never an address bit; a park slot is not a CPU number (`ip27` CPUs are 0 and 2, and `stop_others` indexed by number waits for itself); a register read after firmware ran is not a reset value; plus a six-point checklist for node code |
 | [sn0-node-zero-and-bridge-hosts.md](devices/sn0-node-zero-and-bridge-hosts.md) | rule | SN0 machines: a renumbered node sends node zero's cached window beyond its alias to the Hub that holds zero (and loses the ppmem fast path); a Bridge behind a Crossbow reaches the host at the widget the guest programs, gated by that port's link |
+| [dec-ppb-decodes-32-bit-io.md](devices/dec-ppb-decodes-32-bit-io.md) | rule | The DEC 21154 in front of a `bridge = true` card decodes 32-bit I/O (0x30/0x32); IRIX puts the ISP2200's I/O BAR at 0x200000; a bridge's upper halves and bridge control must refresh the bus in front; ISA enable |
 | [pci-layer-open.md](devices/pci-layer-open.md) | open | PCI layer open items: restore vs reset and the AIC-7880 chip reset, the O2's RST#, Bridge reset pins and master time-out approximations, the 2 GB window's reserved range, no external ATE SSRAM, MACE 64-bit PIO |
 | [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30, IP53); threading, byte order and open items |
 | [virtio-9p-design.md](devices/virtio-9p-design.md) | design | virtio-9p: 9P2000.L server over a host directory; why every path is walked with `O_NOFOLLOW`, what a fid is, open items |
@@ -145,7 +149,10 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip30-module-name-must-match-active-cpus.md](devices/ip30-module-name-must-match-active-cpus.md) | rule | Octane: the module record must say PM10 for one CPU and PM20 for two, or the PROM fails its NIC diagnostic |
 | [ip30-low-memory-aliases-sdram.md](devices/ip30-low-memory-aliases-sdram.md) | rule | Octane: the 16 KiB at physical 0 is the first 16 KiB of SDRAM, which the processor reaches only there (0x2000_0000..+16 KiB bus-errors, as the stock IDE memory diagnostics expect); shares its JIT page generations; the guard holds on the table path only (the ppmem window maps whole units); DMA reach unknown |
 | [ip30-prom-stores-into-flash-stay-in-cache.md](devices/ip30-prom-stores-into-flash-stay-in-cache.md) | rule | Octane: the PROM's cached stores into its own flash never reach the Bridge; `CachedFlashLines` holds them (approximation: no write-back) |
+| [ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md](devices/ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md) | open | Octane: the PROM loading an 11 MB ELF (Linux vmlinux) from the volume header writes its 16 KB-page DMA list over its adapter list and panics; TFTP boot works |
+| [ip30-linux-7.3-guest.md](devices/ip30-linux-7.3-guest.md) | howto | Octane: mainline Linux 7.3 config, the PROM/Linux PCI window mismatch and the root-bus scan past device 7 (kernel patch), TFTP boot, no power-off |
 | [ip30-device-timing-on-hptimer.md](devices/ip30-device-timing-on-hptimer.md) | design | Octane: IOC3, RAD1 and ISP1040 pace themselves on `hptimer` one-shots, with threads only where something blocks (the ISP1040 ring, serial receive, NVRAM writer) |
+| [ip30-openbsd-needs-64gb-window-and-slot-4-empty.md](devices/ip30-openbsd-needs-64gb-window-and-slot-4-empty.md) | rule | Octane: OpenBSD 6.9 reaches PCI through the Bridges' 64 GB windows (IOC3 at 0xF0_4050_0000) and takes the SuperIO interrupt from the first empty Bridge slot, so virtio goes in slots 6 and 7 (`bridge_slot`); what it attaches |
 | [ip30-ps2-keyboard-runs-set-3.md](devices/ip30-ps2-keyboard-runs-set-3.md) | rule | Octane: PROM 4.17 and IRIX's `ioc3_pckm` put the PS/2 keyboard in scan code set 3 (Linux/OpenBSD use 2); K_RD slot order, CLAMP_THREE, role by F2 answer; how the PROM's keyboard sequence was traced |
 | [ip30-promdrive.py](devices/ip30-promdrive.py) | howto | Drives the Octane PROM on its TCP serial console: waits for the maintenance menu, enters the command monitor, runs commands, echoes everything |
 | [aic7880-emulation-vs-spec.md](devices/aic7880-emulation-vs-spec.md) | open | AIC-7880: where the O2 SCSI model departs from `docs/dev/aic7880.md` (HLE above the sequencer, reset values, wide strap, residuals, interrupt gating, config space) |
@@ -169,10 +176,12 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 |---|---|---|
 | [a-write-cdb-must-outlive-its-data-request.md](scsi/a-write-cdb-must-outlive-its-data-request.md) | rule | A write CDB must outlive the chip's request for its data |
 | [daynaport-target-gotchas.md](scsi/daynaport-target-gotchas.md) | rule | DaynaPort target: the three things that bite |
+| [isp2200-linux-logs-in-through-ring-mailbox-entries.md](scsi/isp2200-linux-logs-in-through-ring-mailbox-entries.md) | rule | Linux qla2xxx logs in to ISP2200 loop ports with 0x0074 and with type 0x39 mailbox entries in the request ring; both must be answered or no FC disk appears |
 | [linux-lun-scan-and-mode-sense-gaps.md](scsi/linux-lun-scan-and-mode-sense-gaps.md) | rule | Linux SCSI probe noise: phantom LUNs, missing Caching page, no MODE SENSE(10) |
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |
 | [windows-cannot-fsync-a-directory.md](scsi/windows-cannot-fsync-a-directory.md) | rule | Windows cannot fsync a directory: raw COW overlays failed every sidecar rewrite |
 | [openbsd.md](scsi/openbsd.md) | rule | OpenBSD SCSI Boot Crash — Investigation Notes |
+| [octane-internal-bus-probes-only-ids-1-3.md](scsi/octane-internal-bus-probes-only-ids-1-3.md) | rule | Octane: the internal SCSI bus is probed only at ids 1-3; CD-ROMs go on controller 1 |
 
 ## net/
 
@@ -301,6 +310,8 @@ Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on
 
 | Note | Kind | Title |
 |---|---|---|
+| [pattern-shape-0-is-plane-anchored-32x32.md](odyssey/pattern-shape-0-is-plane-anchored-32x32.md) | rule | X pattern quads with shape 0 sample a 32x32 pattern at plane coordinates (MSB first); taken for "no pattern", menu check marks filled solid |
+| [write-pair-names-the-field-packing-not-the-pixel-mode.md](odyssey/write-pair-names-the-field-packing-not-the-pixel-mode.md) | rule | Copies and screen DMA puts pack the destination as word 7's write format/type says (COLOR_INDEX, RGBA/US_4_4_4_4), not as the selected pixel mode, which is often another window's: Icon Catalog scroll garbage and red/green tabs |
 | [x-index-reads-by-address-return-the-field-byte.md](odyssey/x-index-reads-by-address-return-the-field-byte.md) | rule | The X server saves screen pixels with colour-index DMA reads of board memory by address (word 0 `0x2000`, format byte `0x41`); refusing them left black blocks where Motif text cursors had been. Answer with the field's byte |
 | [gaps-found-by-the-2026-11-07-sweeps.md](odyssey/gaps-found-by-the-2026-11-07-sweeps.md) | open | Model gaps the full test sweep found on both raster units: CI8 reads return 0, X screen reads over some windows are noise, 10:10:10:2 pbuffers and 12-bit z16 visuals, double-buffered gltest shows only the clear |
 | [video-timing-from-the-vtg-tables-and-clock-part.md](odyssey/video-timing-from-the-vtg-tables-and-clock-part.md) | rule | VPro refresh rate: frame and line tables (VC2-style entries, picture lines by state bit 6) at the I2C clock part's frequency (two parts, 12 MHz reference), sniffed from the two-wire control words; rates checked with `setmon -n` |
@@ -428,6 +439,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
 | [idle-park-smp-run-queue-polling.md](perf/idle-park-smp-run-queue-polling.md) | rule | SMP idle parking: idle IRIX CPUs poll run queues without an IPI and stop their clocks; every park slice ends to poll, a CPU that ran a device/IPI handler or work kicks the others to poll (not on its own CP0 timer tick) so all-idle parks last 10 ms, only the newest batch's samples decide a re-park, a CPU parks only in a loop another idle CPU shares, and under jitv2 a probe run of interpreted batches finds the idle loop and learns its (PC, return address) exit signature |
 | [idle-pause-masked-interrupt-must-wake.md](perf/idle-pause-masked-interrupt-must-wake.md) | rule | idle-pause: a masked interrupt must end the park too |
+| [idle-pause-uniprocessor-park-must-end.md](perf/idle-pause-uniprocessor-park-must-end.md) | rule | idle-pause: a uniprocessor park must end on a time bound, not only on a line |
 | [idle-pause-must-not-park-with-interrupts-masked.md](perf/idle-pause-must-not-park-with-interrupts-masked.md) | rule | The idle-park heuristic must not park when Status.IM is zero |
 | [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice |
 | [idle-pause-work.md](perf/idle-pause-work.md) | history | Idle-pause work — findings & handoff |

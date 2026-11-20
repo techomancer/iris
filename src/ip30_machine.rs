@@ -93,10 +93,6 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
-/// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
-const VIRTIO_SLOT: u8 = 4;
-/// Bridge slot of the virtio-9p device.
-const VIRTIO_9P_SLOT: u8 = 5;
 /// The blank part on the Bridge's second flash select: reads all ones and
 /// keeps no writes, an approximation from one word read on a real Octane2.
 /// The PROM looks for a part there too.
@@ -257,14 +253,14 @@ pub struct OctaneMachine {
     pub scsi: [Arc<Isp1040>; 2],
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
-    /// virtio-serial (`[virtio_serial]`), the next free Bridge slot.
+    /// virtio-serial (`[virtio_serial]`), Bridge slot 7 on INTB by default.
     virtio: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     /// The NVMe card (`[nvme]`), in a slot of an option board.
     nvme: Option<Arc<crate::dev::nvme::Nvme>>,
     /// The Fibre Channel adapter (`[fibre_channel]`), in a slot of an option
     /// board, with its loop of disks.
     fibre: Option<Arc<crate::dev::isp2200::Isp2200>>,
-    /// virtio-9p (`[virtio_9p]`), the slot after it.
+    /// virtio-9p (`[virtio_9p]`), Bridge slot 5 by default.
     virtio_9p: Option<Arc<crate::dev::virtio::pci::VirtioPci>>,
     flash: Arc<CfiFlash>,
     /// The IMPACT board, when `[graphics] board` names one.
@@ -437,20 +433,26 @@ impl OctaneMachine {
             rad.enable_output(cfg.audio.clone());
         }
         pci.attach(slot(3), rad.clone());
+        // Slots 0 and 1 are SCSI, 2 the IOC3, 3 the RAD; the virtio devices
+        // take 7 and 5 unless `bridge_slot` moves them; slot 4 stays empty.
+        let (virtio_slot, virtio_9p_slot) = cfg.octane_virtio_slots()?;
         let virtio = cfg.virtio_serial.enabled.then(|| {
-            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
-                crate::dev::virtio::console::from_config(&cfg.virtio_serial),
+            // Slot 7's INTB reaches Bridge pin 3, which nothing else drives.
+            // INTA elsewhere: a slot's INTA is the pin of its own number.
+            let pin = if virtio_slot == 7 { crate::pci::PCI_INTB } else { crate::pci::PCI_INTA };
+            let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::with_pin(
+                crate::dev::virtio::console::from_config(&cfg.virtio_serial), pin,
             ));
-            pci.attach(slot(VIRTIO_SLOT), dev.clone());
-            eprintln!("iris: virtio-serial on Bridge slot {VIRTIO_SLOT}");
+            pci.attach(slot(virtio_slot), dev.clone());
+            eprintln!("iris: virtio-serial on Bridge slot {virtio_slot}");
             dev
         });
         let virtio_9p = cfg.virtio_9p.enabled.then(|| {
             let dev = Arc::new(crate::dev::virtio::pci::VirtioPci::new(
                 crate::dev::virtio::p9::from_config(&cfg.virtio_9p),
             ));
-            pci.attach(slot(VIRTIO_9P_SLOT), dev.clone());
-            eprintln!("iris: virtio-9p on Bridge slot {VIRTIO_9P_SLOT}");
+            pci.attach(slot(virtio_9p_slot), dev.clone());
+            eprintln!("iris: virtio-9p on Bridge slot {virtio_9p_slot}");
             dev
         });
 
@@ -476,9 +478,11 @@ impl OctaneMachine {
         phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
         phys.attach_long_window(WIDGET_BRIDGE, bridge.long_window());
+        phys.attach_huge_window(WIDGET_BRIDGE, bridge.huge_window());
         for b in &xio_boards {
             phys.attach_widget(b.widget(), b.bridge().clone(), false);
             phys.attach_long_window(b.widget(), b.bridge().long_window());
+            phys.attach_huge_window(b.widget(), b.bridge().huge_window());
         }
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);
@@ -567,8 +571,9 @@ impl OctaneMachine {
             #[cfg(feature = "jitv2_lockstep")]
             return Err("[machine] cpus = 2 cannot run with jitv2_lockstep".into());
             let jit = cpu.jitv2();
-            for c in &cpus {
-                c.share_jitv2(jit.clone(), world.clone());
+            // Every CPU sees memory at the same addresses: one address space.
+            for (n, c) in cpus.iter().enumerate() {
+                c.share_jitv2(jit.clone(), world.clone(), n, 0);
             }
         }
         status.set_cpu_cycles(cpu.cycles_ptr());
@@ -750,11 +755,32 @@ impl OctaneMachine {
         if let Some(d) = attached.daynaports.first() {
             return Err(format!("{}: kind = \"daynaport\" is not available on the Octane", crate::config::scsi_label(d.controller, d.id)));
         }
+        for w in Self::unprobed_internal_ids(&attached.tables) {
+            eprintln!("ip30: warning: {w}");
+        }
         let disks = attached.tables.iter()
             .filter(|t| !t.is_cdrom)
             .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
             .collect();
         Ok((attached.scratch, disks))
+    }
+
+    /// The PROM and IRIX look for devices on the internal bus (controller
+    /// 0) only at ids 1-3, its three drive bays; ids 1-15 are probed on the
+    /// external bus. One warning for each table attached where nothing will
+    /// look for it.
+    fn unprobed_internal_ids(tables: &[crate::scsi::TableRef]) -> Vec<String> {
+        tables.iter()
+            .filter(|t| t.slot < 16 && !(1..=3).contains(&t.slot))
+            .map(|t| {
+                let what = if t.is_cdrom { "CD-ROM" } else { "disk" };
+                format!(
+                    "{}: the Octane probes the internal bus only at ids 1-3, so the guest will not find this {what}; \
+                     put it on the external bus with controller = 1",
+                    crate::config::scsi_label(0, t.slot)
+                )
+            })
+            .collect()
     }
 
     /// IOC3's first port is the console: the CI socket's backend in CI
@@ -1615,6 +1641,17 @@ impl Device for Ip30Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only internal-bus ids outside the three drive bays draw a warning.
+    #[test]
+    fn internal_bus_tables_past_id_3_are_warned_about() {
+        let table = |slot, is_cdrom| crate::scsi::TableRef { slot, is_cdrom, path: String::new(), size_bytes: 0 };
+        let tables = [table(1, false), table(3, false), table(4, true), table(0, false), table(20, true), table(17, false)];
+        let w = OctaneMachine::unprobed_internal_ids(&tables);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with("SCSI ID 4:") && w[0].contains("CD-ROM"), "{}", w[0]);
+        assert!(w[1].starts_with("SCSI ID 0:") && w[1].contains("disk"), "{}", w[1]);
+    }
 
     /// The Octane2 carries its own four identity records, from one reference
     /// unit's inventory, and the Octane keeps the ones it had. The IOC3's

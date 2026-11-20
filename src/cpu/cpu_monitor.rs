@@ -113,6 +113,13 @@ pub struct CpuMonitor {
 impl CpuMonitor {
     pub fn new(cpus: Vec<Arc<dyn CpuDevice>>) -> Self {
         assert!(!cpus.is_empty(), "a machine has at least one CPU");
+        // One symbol table for the machine. `loadsym` goes to the selected
+        // CPU and a breakpoint to every CPU; with a table each, the others
+        // refused the name.
+        let symbols = cpus[0].symbol_table();
+        for cpu in &cpus[1..] {
+            cpu.set_symbol_table(symbols.clone());
+        }
         Self { cpus, selected: AtomicUsize::new(0) }
     }
 

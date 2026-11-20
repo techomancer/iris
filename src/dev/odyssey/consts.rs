@@ -251,7 +251,7 @@ pub(super) mod reg {
     // The one-bit pattern-quad text path.
     pub const PATTERN_LOW: u32 = 0x3c4e; // pattern buffer words 0-15
     pub const PATTERN_HIGH: u32 = 0x3c4f; // pattern buffer words 16-31
-    pub const PATTERN_SHAPE: u32 = 0x043f; // 1 operand: 0x4/0x5/0x6, 0x0 = off
+    pub const PATTERN_SHAPE: u32 = 0x043f; // 1 operand: 0x4/0x5/0x6 quad-anchored, 0x0 plane-anchored 32x32; bit 4 opaque
     pub const PATTERN_MODE: u32 = 0x0404; // 1 operand: pattern, GL mode bits
 
     // The line stipple.
@@ -937,6 +937,11 @@ pub(super) mod pattern {
     pub const SHAPE_64X16: u32 = 0x5;
     pub const SHAPE_32X32: u32 = 0x4;
     pub const SHAPE_16X64: u32 = 0x6;
+    /// A 32x32 pattern anchored at the plane origin, not at the quad: the
+    /// X server draws a glyph (traced: the check mark of a checked menu
+    /// toggle) by loading it, replicated to 32x32 at its screen position,
+    /// and sending a quad. GL's polygon stipple is the same shape.
+    pub const SHAPE_STIPPLE: u32 = 0x0;
 
     // Bit 4 of the 0x043f operand makes a pattern opaque
     pub const SHAPE_OPAQUE: u32 = 0x10;

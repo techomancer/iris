@@ -14,7 +14,7 @@ kind = "pci-cage"        # or "pci-shoehorn"; see docs/pci.md
 [fibre_channel]
 slot = 2                 # the board's PCI device (the first free one by default)
 # board = 0              # which [[xio_board]] (the first by default)
-# bridge = false         # true: behind a PCI-to-PCI bridge in the slot
+# bridge = false         # true: behind a DEC 21154 PCI-to-PCI bridge in the slot
 
 [fibre_channel.disk.5]   # the loop ID, 0 to 125
 path = "frame0.raw"      # raw or CHD
@@ -61,9 +61,11 @@ and the comment in `src/dev/isp2200.rs` says so.
 
 ## Limits
 
-- Only IRIX 6.5.30 has been tried. Linux logs in through request-ring mailbox
-  entries the model does not serve, so mainline Linux cannot bring a port
-  online.
+- IRIX 6.5.30 and Linux 7.3 (qla2xxx, with the stock `ql2200_fw.bin`) have
+  been tried. Linux logs in to each port with Login Loop Port and with
+  mailbox commands it puts in the request ring (login, logout and the port
+  database for ADISC); the model answers those four in a ring entry and
+  refuses any other command sent that way.
 - Commands run one at a time. An abort or reset matches the command running,
   not the ones queued behind it.
 - A disk attached or removed after start is not announced; there is no loop

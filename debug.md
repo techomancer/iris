@@ -164,6 +164,8 @@ or Onyx system with several) adds a choice of which CPU a command means.
 Without a number, `start`, `stop` and the breakpoint commands (`bp`, `b`, `bd`,
 `be`, `bb`) apply to every CPU, `status` answers for each, and everything else
 goes to the selected CPU. A number always means that CPU alone, even for `stop`.
+The CPUs share one symbol table, so a map loaded with `loadsym` names
+breakpoints and addresses on all of them.
 
 **Debugging a running guest on two CPUs is not supported.** The commands run,
 but there is no way to step one CPU that keeps the guest healthy. If the other
@@ -273,7 +275,7 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 | `debug <on\|off\|file <path>>` | Print every executed instruction, or write them to a file **[DEV]** |
 | `trace start <path>` / `trace stop` / `trace status` | Record full per-instruction architectural state to a file **[DEV]** |
 | `idleprof <on\|off\|report [n]\|stats>` | Sample the PC to find idle and spin loops (`idle-pause` builds); `stats` prints park counters |
-| `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks it ended after a slice with every CPU idle, to poll the run queue; `alone`: idle-looking windows not parked because no other CPU was in the same loop; `probes`: batches jitv2 ran interpreted to look inside a compiled loop; `known_parks`: parks decided from a learned compiled exit signature; `learned`: probe runs whose signature was learned; `wake_kick`: parks ended because another CPU asked this one to poll; `kicks`: such requests; then interrupt wakes by Cause.IP line and by CPU), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
+| `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks that ended on their time bound with no line pending — on a multiprocessor after a slice with every CPU idle, to poll the run queue; on a uniprocessor after 100 ms with no interrupt (a PROM or standalone tool polling with every board source disabled), after which it parks 1 ms at a time until a line wakes it again; `alone`: idle-looking windows not parked because no other CPU was in the same loop; `probes`: batches jitv2 ran interpreted to look inside a compiled loop; `known_parks`: parks decided from a learned compiled exit signature; `learned`: probe runs whose signature was learned; `wake_kick`: parks ended because another CPU asked this one to poll; `kicks`: such requests; then interrupt wakes by Cause.IP line and by CPU), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
 | `instrstats [report\|clear\|dump]` | Per-instruction decode/execute counters (`--features instr_stats`) **[DEV]** |
 
 The undo buffer tracks register changes and memory writes. It does not
@@ -305,7 +307,7 @@ take effect after `j2 flush`.
 
 | Command | Effect | Default (release / `developer`) |
 |---|---|---|
-| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons | — |
+| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons, `remaps` (times a CPU forgot its page addresses because memory moved; no code is dropped for one) and `shared pages` (pages more than one CPU has reached, and how many of those at different addresses) | — |
 | `j2 dispatch [on\|off]` | Main switch for JIT dispatch; off = interpreter only | `on` |
 | `j2 inline [on\|off]` | Compile synchronously on the CPU thread instead of the compile pool; a page with code recompiles only when new entries make it hot, as the pool would (`[jitv2] compile = "sync"` at startup). Refused with several CPUs, and `on` is refused in `lightning` builds | `off` (`on` under lockstep) |
 | `j2 threads` | Compile-pool thread count and why (read-only; set with `[jitv2] threads` or `--jitv2-threads`) | one per guest CPU, at most 4, capped by the host's usable CPUs |
@@ -324,7 +326,7 @@ take effect after `j2 flush`.
 | `j2 flush` | Drop all compiled code and reset the arena (stop the CPU first) | — |
 | `j2 clear <paddr>` / `j2 deny <paddr>` | Reset one physical code page / deny one entry point. The address has to be in the machine's memory; the error lists its ranges | — |
 | `j2 analyze <paddr>` | Run the analyzer's walk on live memory and print each word with its classification | — |
-| `j2 pcp [vaddr]` | Physical code page state: entries, generation, compiled code. Takes a virtual address; on an R10000, xkphys (`0x9000000000000000` plus the physical address) reaches any page | — |
+| `j2 pcp [vaddr]` | Code page state: its key (`bank`, `page` within the bank), the frame each CPU reaches it at, entries, generation, compiled code. Takes a virtual address; on an R10000, xkphys (`0x9000000000000000` plus the physical address) reaches any page | — |
 | `j2 dumppcp [vaddr] [path]` | Capture a page and its memory for the offline `jitv2-pcp-dump` | — |
 | `j2 corpus [dir]` | Dump every cached page as `.pcp` files for offline codegen measurement | `jitv2_corpus/` |
 | `j2 html [path]` | Render the physical code page visualiser, with one section per memory range of the machine | — |
@@ -512,7 +514,7 @@ guest. `y = 0` is the top display line throughout.
 | `vpro unimp` | Offsets and command words the board reported as not modelled |
 | `vpro refusals [reset]` | Bus accesses answered busy, by reason, offset and width, with the longest time one access was kept retrying |
 | `vpro gpu [trace on\|off]` | With `[graphics] raster = "wgpu"`: the GPU raster unit's counters (records and batches, how the batches were submitted, bytes uploaded and read back, waits, readbacks and copies the copy kernel took) and the GPU scan-out's (frames composed, bytes read back; with `renderer = "wgpu"` frames are presented from the GPU and only screenshots, frame requests and VNC read them back); `trace on` counts readbacks by the board function that caused them from then on, shown under the counters. The same lines appear in `vpro status`. On the GPU unit the commands that read board memory (`pix`, `raw`, `peek`, `shot`, `fbdump`, `hash`, `mem` and the state commands) first read the unit's memory back into the board's copy, when the board can be quiesced |
-| `vpro trace <file> [fifo,draw,cpu,dma\|all]` / `vpro trace flush\|off` / `vpro trace` | Annotated trace (`gputrace` builds; also `IRIS_ODSY_TRACE=<file>` from power-on): `FIFO` lines are command words as the parser completes them, named, with their operands as words and as floats where the word carries floats, plus copy rects, pattern and matrix loads, image boxes and bursts, queries and unknown words; `DRAW` lines each assembled primitive sent to the raster unit (`draw TRIANGLES n=3 ctx=1 textured depth queued cost 96`) and each clear; `CPU` lines every bus access that is not a command store, repeats collapsed; `DMA` lines the page-table descriptors. `flush` writes the buffer out (it is written at most twice a second otherwise); alone, the trace's state |
+| `vpro trace <file> [fifo,draw,cpu,dma\|all]` / `vpro trace flush\|off` / `vpro trace` | Annotated trace (`gputrace` builds; also `IRIS_ODSY_TRACE=<file>` from power-on): `FIFO` lines are command words as the parser completes them, named, with their operands as words and as floats where the word carries floats, plus copy rects, pattern and matrix loads, image boxes and bursts, queries and unknown words; `DRAW` lines each assembled primitive sent to the raster unit (`draw TRIANGLES n=3 ctx=1 textured depth queued cost 96`) and each clear; `CPU` lines every bus access that is not a command store, repeats collapsed; `DMA` lines the page-table descriptors. `IRIS_ODSY_TRACE` also traces an offline replay of a `vpro rec` recording (see `src/dev/odyssey/testdata/README.md`). `flush` writes the buffer out (it is written at most twice a second otherwise); alone, the trace's state |
 | `vpro rec <file>` / `vpro rec mark\|off` / `vpro rec` | Replayable recording (record.rs; also `IRIS_ODSY_REC=<file>` from power-on): every bus store and load and the DMA reads, gzip. A start, a `mark` and `off` wait for the board to go idle and write the memory hash (`vpro hash`) into the file, so a replay can check board memory at those points; a recording started mid-session cannot reproduce the live memory and says so when replayed, but still replays deterministically. Alone, the recording's state. Replay: `VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture` (see `src/dev/odyssey/testdata/README.md`) |
 
 **InfiniteReality (KONA)**
@@ -585,6 +587,11 @@ devices are [listed below](#sgi-o2-ip32).
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
 | `audio status` | Every sound card's frames moved and skipped (stale, dry, ring full) and its host stream, or `No audio device.` |
+| `ice1724 [status]` | Tezro audio (`[tezro] audio`): the interrupt line (high or low, for how long, rises), the interrupt status and mask registers, the engine start, pause and FIFO-error bits, the pending timer, per engine whether it runs, its buffer address, size, position, interrupt interval, frames moved, times its interrupt fired and latched, and when the guest last read its position; frame and converter counts, PCI command and status |
+| `ice1724 regs` | Hex dump of the controller (CCS, BAR0) and multi-channel (MT, BAR1) registers |
+| `ice1724 log [n]` | The guest's last 64 (or n) register accesses, oldest first, with their age on the card clock; a run of the same access with the same value is one line with a count |
+| `ice1724 clear` | Start the counts and the access log again |
+| `envy ...` | The same as `ice1724 ...` (the chip is the Envy24HT) |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000, and on a Fuel with `[fuel] usb_input = true`, these, `ps2 key` and `ps2 mouse` go to the USB keyboard and mouse, and `ps2 status` still shows the PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |

@@ -13,10 +13,49 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### virtio
+
+- virtio-serial and virtio-9p on PCI (Octane, Tezro) offer
+  `VIRTIO_F_ACCESS_PLATFORM`, so Linux gives them bus addresses they can reach
+  instead of physical ones; Linux's `virtio_console` hung at load.
+
+### Fibre Channel
+
+- Linux's qla2xxx brings the ISP2200's loop online and finds its disks on the
+  Octane (Linux 7.3); it stopped at the port login, which the adapter refused.
+### Octane
+
+- The Bridges' 64 GB windows reach PCI: the 32-bit and 64-bit aliases of PCI
+  memory and PCI I/O space, on the onboard Bridge and on the PCI module's
+  and shoehorn's. OpenBSD 6.9's kernel, which reaches the IOC3 this way,
+  no longer stops with a bus error before its first message.
+- `[virtio_serial] bridge_slot` and `[virtio_9p] bridge_slot` move the
+  Octane's virtio devices within the onboard Bridge's slots 4 to 7.
+- virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
+  the SuperIO interrupt pin: Linux's serial console no longer dies when
+  virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
+### PCI-to-PCI bridges
+
+- The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes
+  32-bit I/O, as the DEC 21154 it reports does, so an I/O BAR above 64 KiB
+  behind it reaches the card. IRIX 6.5.30 on the Octane puts the ISP2200's
+  there and no longer warns `ppb IO base/limit conflict` at boot. The
+  bridge's ISA enable bit now blocks what it blocks on the real part.
+
 ### Display
 
+<<<<<<< HEAD
 - Display buffers now start smaller and grow only for taller video modes; Newport-only
   planes and debug overlays are allocated on demand. All machines use less host RAM.
+=======
+- VPro (Octane, Fuel, Tezro): 16-bit colour-index images put by the X
+  server now appear, on the CPU raster and the GPU raster unit; LightWave
+  Modeler's viewports showed no grid, labels or model.
+- VPro: Icon Catalog on a 12-bit visual scrolls cleanly (scrolled icons came
+  out pale and scrambled) and its tabs are grey again, not red and green.
+- VPro: the check mark of a checked menu toggle (IRIS GL pop-up menus, such
+  as powerflip's) draws as a check mark, not a black bar twice the box's width.
+>>>>>>> 3994fae97bdda1abadc8be4ffc839488f6bfa562
 - Maximum IMPACT: every other screen row stayed black (PROM menus and
   monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables
@@ -122,6 +161,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   volume buttons, NetBSD and the PROM).
 - Tezro: `[tezro] audio = true` adds an ICE1724 audio controller (off by
   default); `[audio] channels` sets its speakers. [Guide](docs/tezro-ip53.md)
+- Tezro, Fuel, Origin 3200 and Onyx 3000: IRIX's flushed PIO reads through the
+  PIC no longer hang the machine; on a Tezro with audio, amesh and other sound
+  programs froze it with their sound repeating.
+- `ice1724` (alias `envy`) shows the Tezro audio controller's own state: the
+  interrupt line, status and mask registers, each engine's buffer and
+  position, a register dump and the guest's last accesses (see `debug.md`).
 - Onyx2: MediaIO sound no longer drops every other second, panics the kernel
   on the first sound, or makes the driver report "RAD UST not incrementing".
 - The monitor's `audio status` lists every sound card (HAL2, MACE audio,
@@ -141,6 +186,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   boots on both from a Fibre Channel disk (`[fibre_channel.disk.N]`).
 - The I-brick has a USB keyboard and mouse, driven by the `ps2` monitor
   commands.
+- Origin 3200 and Onyx 3000 with two C-bricks of 512 MiB or more each: IRIX
+  no longer corrupts memory (processes dying with memory faults and bus
+  errors, kernel panics and hangs under disk load).
 
 ### Onyx 3000
 
@@ -238,6 +286,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   `monitor_history` file left by an earlier nightly is no longer read.
 - Tab at the terminal console completes monitor command names, also after
   `cpu` and `cpu <n>`.
+- Machines with more than one CPU: `b <symbol>` and other breakpoint commands
+  accept names from a map loaded with `loadsym` (they failed with "unknown
+  symbol").
 - The terminal is left usable however iris ends (monitor `quit`, a signal, the
   guest powering off, the window closing, a panic), not only after Ctrl-C.
 - The monitor keeps a client that sends non-UTF-8 bytes, refuses a line over
@@ -245,6 +296,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Storage
 
+- Octane: iris warns at start-up about a device on the internal SCSI bus
+  outside ids 1-3, which the PROM and IRIX never probe (a CD-ROM at
+  `[scsi.4]` was invisible); put such devices on controller 1.
+- `log scsi` shows each mailbox command, request (controller, target, CDB)
+  and completion of the QLogic SCSI adapters (Octane and later machines).
 - A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be an
   `http://` or `https://` URL on a server with range support. See STORAGE.md.
 - New default Cargo feature `http-media` provides those URLs.
@@ -398,6 +454,8 @@ image) where the guest test suites showed they differed:
   replayable recording from the monitor, with no `IRIS_ODSY_REC` at power-on.
 - Replays check the marks' hashes; `VPRO_REPLAY_DUMP=<dir>` writes the
   replayed planes in `vpro fbdump`'s files.
+- `IRIS_ODSY_TRACE=<file>` also traces a replay (`gputrace` builds), and
+  pattern loads in a trace show their words.
 
 ### VPro on the host GPU
 
@@ -457,6 +515,14 @@ image) where the guest test suites showed they differed:
 
 ### jitv2
 
+- jitv2: compiled code is kept when a memory controller moves a bank (the
+  PROM's memory sizing on Indy, O2, Octane and the IP27/IP35 machines no
+  longer flushes it), and addresses that reach the same memory share one
+  compiled page.
+- jitv2 on machines of several nodes (Origin 2000/Onyx2, Origin 3200/Onyx
+  3000): every processor shares one compile pool and one body of compiled
+  code, where each node had its own. `j2 pcp` shows a page's bank and offset;
+  `j2 status` counts remaps.
 - The compile pool no longer polls: an idle worker parks until a request
   arrives, instead of waking every 200µs (which cost about 1.4% of a host
   core per worker), and a small host can now settle. All machines.
@@ -482,6 +548,8 @@ image) where the guest test suites showed they differed:
 
 ### Idle parking
 
+- With `idle-pause`, a single-processor machine whose guest has no interrupt
+  source (the Octane PROM menu, fx) no longer parks for good after a minute.
 - With `idle-pause`, multiprocessors (Octane, Tezro, Origin, Onyx) no longer
   stall at boot; `IRIS_IDLE_PEER_US` and `IRIS_IDLE_SLICE_US` bound a park.
 - An idle multiprocessor under jitv2 wakes far less often, and busy kernel

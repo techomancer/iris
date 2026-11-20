@@ -208,6 +208,10 @@ impl State {
 
 pub struct NodeFlash {
     st: Mutex<State>,
+    /// JIT v2: the part's identity in a page key, and its write counter:
+    /// every write cycle bumps it, since a command changes what a read returns.
+    #[cfg(feature = "jitv2")]
+    code: (crate::traits::CodeBank, std::sync::atomic::AtomicU64),
 }
 
 impl NodeFlash {
@@ -217,6 +221,8 @@ impl NodeFlash {
         }
         Ok(Arc::new(Self {
             st: Mutex::new(State::new(image, None)),
+            #[cfg(feature = "jitv2")]
+            code: Default::default(),
         }))
     }
 
@@ -227,6 +233,8 @@ impl NodeFlash {
         let backing = FlashBacking::open(path, &mut data)?;
         Ok(Arc::new(Self {
             st: Mutex::new(State::new(data, Some(backing))),
+            #[cfg(feature = "jitv2")]
+            code: Default::default(),
         }))
     }
 
@@ -282,7 +290,29 @@ macro_rules! chip_read {
         }
     };
 }
+impl NodeFlash {
+    /// A write cycle reached the part: compiled code read from it is stale.
+    fn wrote(&self) {
+        #[cfg(feature = "jitv2")]
+        self.code.1.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The page holding byte `offset` of the part, for the JIT.
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, offset: usize) -> Option<crate::traits::CodePage> {
+        (offset < SIZE).then(|| self.code.0.page(offset as u64, &self.code.1))
+    }
+}
+
 impl BusDevice for Chip {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _a: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.0.code.1
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> {
+        self.0.code_page(usize::try_from(a).ok()?)
+    }
     chip_read!(read8, u8, BusRead8);
     chip_read!(read16, u16, BusRead16);
     chip_read!(read32, u32, BusRead32);
@@ -291,6 +321,7 @@ impl BusDevice for Chip {
         match usize::try_from(a) {
             Ok(a) if a < SIZE => {
                 self.0.st.lock().write(a, v);
+                self.0.wrote();
                 BUS_OK
             }
             _ => BUS_ERR,
@@ -313,12 +344,22 @@ macro_rules! window_read {
     };
 }
 impl BusDevice for Window {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _a: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.0.code.1
+    }
+    // Reads repeat the image, so the page is the image's, wherever it repeats.
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> {
+        self.0.code_page(a as usize % SIZE)
+    }
     window_read!(read8, u8, BusRead8);
     window_read!(read16, u16, BusRead16);
     window_read!(read32, u32, BusRead32);
     window_read!(read64, u64, BusRead64);
     fn write64(&self, a: u64, v: u64) -> u32 {
         self.0.st.lock().write((a as usize / 8) % SIZE, v as u8);
+        self.0.wrote();
         BUS_OK
     }
     fn write8(&self, a: u64, v: u8) -> u32 {

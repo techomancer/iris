@@ -66,6 +66,16 @@ impl View {
         View::of(s, f.at, kind, height)
     }
 
+    /// The same field holding its word as codec `c`.
+    pub fn with_codec(self, c: Codec) -> View {
+        let kind = match c {
+            Codec::Texel { bytes: 4, field: FIELD_FOUR } => Kind::Rgba8,
+            Codec::Byte => Kind::Byte,
+            c => Kind::Coded(c),
+        };
+        View { kind, ..self }
+    }
+
     /// The depth and stencil fields of layout `l` over `s`.
     pub fn depth_stencil(s: &Surface, l: &Layout, height: u32) -> (View, View) {
         match l.depth {

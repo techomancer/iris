@@ -1205,7 +1205,9 @@ impl Board {
                 if self.cmd.operand_index == self.cmd.operand_count {
                     if self.trace.on(TRACE_FIFO) {
                         let at = self.stream.pattern_load_offset;
-                        self.trace_note(format_args!("pattern load words {at}..{}", at + pattern::WORDS));
+                        let words = &self.stream.pattern_buffer[at as usize..(at + pattern::WORDS) as usize];
+                        let hex = words.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(" ");
+                        self.trace_note(format_args!("pattern load words {at}..{}: {hex}", at + pattern::WORDS));
                     }
                     self.cmd.state = ODSY_CMD_IDLE;
                 }

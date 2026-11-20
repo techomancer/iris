@@ -490,6 +490,7 @@ Needs a Unix host.
 |---|---|---|
 | `virtio_9p.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
 | `virtio_9p.slot` | `"exp1"` | `"exp0"` or `"exp1"`, as for `virtio_serial`, and not the slot that device has. Indy and Indigo2 only. |
+| `virtio_9p.bridge_slot` | `5` | The Octane's onboard Bridge slot, 4 to 7, and not the one virtio-serial has. Octane only. |
 | `virtio_9p.path` | required | The host directory. |
 | `virtio_9p.tag` | `"share"` | The name the guest mounts it by; 1 to 64 bytes. |
 | `virtio_9p.readonly` | `false` | Refuse every write from the guest. |
@@ -507,6 +508,7 @@ table adds a port, in order.
 |---|---|---|
 | `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
 | `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device`, Ultra64 and the second Newport head) or `"exp1"` (`0x1F600000`). Indy and Indigo2 only. |
+| `virtio_serial.bridge_slot` | `7` | The Octane's onboard Bridge slot, 4 to 7. Octane only. In slot 7 the device raises INTB (Bridge pin 3), elsewhere INTA. Keep slot 4 empty: its INTA is the IOC3's SuperIO pin, and OpenBSD's `ioc` driver takes the SuperIO interrupt (the serial console) from the first empty slot's pin. |
 | `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
 | `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); 1 to 200 bytes, unique. |
 | `port.console` | `false` | Tell the guest this port is its console. |
@@ -827,7 +829,7 @@ mistaken for GUI settings.
 | `IRIS_ODSY_BACKEND` | `inline` keeps the VPro fragment pipeline's shading and back end (depth, stencil, blend and stores) on the raster thread, with no worker pool. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
 | `IRIS_ODSY_REC` | Record VPro bus stores, loads and DMA reads from power-on to this path (gzip; replayed by the tests in `src/dev/odyssey/golden/`; `vpro rec` does the same from the monitor). | [src/dev/odyssey/record.rs](src/dev/odyssey/record.rs) |
 | `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
-| `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
+| `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). Also traces an offline replay (`VPRO_REPLAY`); a test that replays several sessions adds `.1`, `.2` and so on for the later ones. | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
 | `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
 | `IRIS_REX3_GPU` | `auto`, `vulkan`, `metal`, `dx12`, or `gl` enables the CPU-canonical legacy live REX3 GPU prototype in a `rex-gpu` build. Unset keeps that prototype off; this does not select production `[graphics] raster = "wgpu"`, and the two modes are mutually exclusive. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |

@@ -141,6 +141,10 @@ impl BusDevice for AliasBus {
     fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
         unsafe { (*self.target).gen_ptr(self.target_addr(addr)) }
     }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        unsafe { (*self.target).code_page(self.target_addr(addr)) }
+    }
     fn cas32(&self, addr: u64, old: u32, new: u32) -> Option<bool> {
         unsafe { (*self.target).cas32(self.target_addr(addr), old, new) }
     }
@@ -190,6 +194,8 @@ impl BusDevice for BankView {
     #[inline] fn write_block(&self, a: u64, buf: &[u64]) -> u32 { self.bank().write_block(self.at(a), buf) }
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 { self.bank().gen_ptr(self.at(a)) }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> { self.bank().code_page(self.at(a)) }
 }
 
 /// RAM bank `bank` (an index into the `Physical`'s banks) answering
@@ -1140,6 +1146,13 @@ impl BusDevice for Physical {
         }
         let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).gen_ptr(addr) }
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        let addr = addr & PHYS_MASK;
+        let device_ptr = self.dev_at(addr);
+        unsafe { (*device_ptr).code_page(addr) }
     }
 
     /// Direct pointer into ppmem's window for a directly-mapped physical

@@ -34,6 +34,10 @@ impl BusDevice for Ram {
     fn gen_ptr(&self, _a: u64) -> *const std::sync::atomic::AtomicU64 {
         &self.1
     }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> {
+        Some(crate::traits::CodeKey::flat_page(a, &self.1))
+    }
     crate::dev::widths::access_widths!();
 }
 
