@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Indy and Indigo2 keyboard
+
+- The Indy and Indigo2 keyboard controller now translates key codes when the
+  guest asks it to. NetBSD's installer and console get working cursor keys,
+  and a key no longer repeats forever after it is pressed
+  ([#765](https://github.com/techomancer/iris/issues/765)).
+
 ### Volume headers
 
 - `mkvh build` splits an ELF executable's segments larger than 512 KB, so the

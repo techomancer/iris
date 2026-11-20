@@ -164,6 +164,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [o2-prom-stack-is-a-cached-page-at-phys-0.md](devices/o2-prom-stack-is-a-cached-page-at-phys-0.md) | design | O2 PROM stack: one tag-installed page at physical 0 that the memory test overwrites through KSEG1. Retired: the CPU's cached view holds it now |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
+| [ip22-8042-translates-when-command-byte-bit-6-is-set.md](devices/ip22-8042-translates-when-command-byte-bit-6-is-set.md) | rule | Indy/Indigo2: the 8042 must translate set 2 to set 1 while command-byte bit 6 is on (NetBSD sysinst cursor keys, endless repeat, #765); direct-port hosts never translate |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
 | [vdma-gio-side-is-always-whole-qwords.md](devices/vdma-gio-side-is-always-whole-qwords.md) | rule | The GIO side of a VDMA transfer is always whole qwords — only memory is ragged |
 | [vdma-transfers-are-always-translated.md](devices/vdma-transfers-are-always-translated.md) | rule | VDMA image transfers are always address-translated |
