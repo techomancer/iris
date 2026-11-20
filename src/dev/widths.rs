@@ -112,6 +112,10 @@ macro_rules! access_widths {
         fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 {
             self.route(a).map_or(std::ptr::null(), |(d, at)| d.gen_ptr(at))
         }
+        #[cfg(feature = "jitv2")]
+        fn code_page(&self, a: u64) -> Option<$crate::traits::CodePage> {
+            self.route(a).and_then(|(d, at)| d.code_page(at))
+        }
     };
 }
 pub(crate) use access_widths;

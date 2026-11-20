@@ -164,6 +164,8 @@ or Onyx system with several) adds a choice of which CPU a command means.
 Without a number, `start`, `stop` and the breakpoint commands (`bp`, `b`, `bd`,
 `be`, `bb`) apply to every CPU, `status` answers for each, and everything else
 goes to the selected CPU. A number always means that CPU alone, even for `stop`.
+The CPUs share one symbol table, so a map loaded with `loadsym` names
+breakpoints and addresses on all of them.
 
 **Debugging a running guest on two CPUs is not supported.** The commands run,
 but there is no way to step one CPU that keeps the guest healthy. If the other
@@ -273,7 +275,7 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 | `debug <on\|off\|file <path>>` | Print every executed instruction, or write them to a file **[DEV]** |
 | `trace start <path>` / `trace stop` / `trace status` | Record full per-instruction architectural state to a file **[DEV]** |
 | `idleprof <on\|off\|report [n]\|stats>` | Sample the PC to find idle and spin loops (`idle-pause` builds); `stats` prints park counters |
-| `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks it ended after a slice with every CPU idle, to poll the run queue; `alone`: idle-looking windows not parked because no other CPU was in the same loop; `probes`: batches jitv2 ran interpreted to look inside a compiled loop; `known_parks`: parks decided from a learned compiled exit signature; `learned`: probe runs whose signature was learned; `wake_kick`: parks ended because another CPU asked this one to poll; `kicks`: such requests; then interrupt wakes by Cause.IP line and by CPU), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
+| `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks that ended on their time bound with no line pending — on a multiprocessor after a slice with every CPU idle, to poll the run queue; on a uniprocessor after 100 ms with no interrupt (a PROM or standalone tool polling with every board source disabled), after which it parks 1 ms at a time until a line wakes it again; `alone`: idle-looking windows not parked because no other CPU was in the same loop; `probes`: batches jitv2 ran interpreted to look inside a compiled loop; `known_parks`: parks decided from a learned compiled exit signature; `learned`: probe runs whose signature was learned; `wake_kick`: parks ended because another CPU asked this one to poll; `kicks`: such requests; then interrupt wakes by Cause.IP line and by CPU), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
 | `instrstats [report\|clear\|dump]` | Per-instruction decode/execute counters (`--features instr_stats`) **[DEV]** |
 
 The undo buffer tracks register changes and memory writes. It does not
@@ -305,7 +307,7 @@ take effect after `j2 flush`.
 
 | Command | Effect | Default (release / `developer`) |
 |---|---|---|
-| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons | — |
+| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons, `remaps` (times a CPU forgot its page addresses because memory moved; no code is dropped for one) and `shared pages` (pages more than one CPU has reached, and how many of those at different addresses) | — |
 | `j2 dispatch [on\|off]` | Main switch for JIT dispatch; off = interpreter only | `on` |
 | `j2 inline [on\|off]` | Compile synchronously on the CPU thread instead of the compile pool; a page with code recompiles only when new entries make it hot, as the pool would (`[jitv2] compile = "sync"` at startup). Refused with several CPUs, and `on` is refused in `lightning` builds | `off` (`on` under lockstep) |
 | `j2 threads` | Compile-pool thread count and why (read-only; set with `[jitv2] threads` or `--jitv2-threads`) | one per guest CPU, at most 4, capped by the host's usable CPUs |
@@ -324,7 +326,7 @@ take effect after `j2 flush`.
 | `j2 flush` | Drop all compiled code and reset the arena (stop the CPU first) | — |
 | `j2 clear <paddr>` / `j2 deny <paddr>` | Reset one physical code page / deny one entry point. The address has to be in the machine's memory; the error lists its ranges | — |
 | `j2 analyze <paddr>` | Run the analyzer's walk on live memory and print each word with its classification | — |
-| `j2 pcp [vaddr]` | Physical code page state: entries, generation, compiled code. Takes a virtual address; on an R10000, xkphys (`0x9000000000000000` plus the physical address) reaches any page | — |
+| `j2 pcp [vaddr]` | Code page state: its key (`bank`, `page` within the bank), the frame each CPU reaches it at, entries, generation, compiled code. Takes a virtual address; on an R10000, xkphys (`0x9000000000000000` plus the physical address) reaches any page | — |
 | `j2 dumppcp [vaddr] [path]` | Capture a page and its memory for the offline `jitv2-pcp-dump` | — |
 | `j2 corpus [dir]` | Dump every cached page as `.pcp` files for offline codegen measurement | `jitv2_corpus/` |
 | `j2 html [path]` | Render the physical code page visualiser, with one section per memory range of the machine | — |

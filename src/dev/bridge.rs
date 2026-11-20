@@ -2084,6 +2084,16 @@ impl XioWindow {
 }
 
 impl BusDevice for XioWindow {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+        let off = addr & self.mask;
+        if off < WIDGET_SMALL_SIZE as u64 { self.bridge.gen_ptr(off) } else { std::ptr::null() }
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        let off = addr & self.mask;
+        if off < WIDGET_SMALL_SIZE as u64 { self.bridge.code_page(off) } else { None }
+    }
     /// A configuration master time-out reached through the window's first
     /// 16 MB is explained as through the small window.
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
@@ -2116,7 +2126,27 @@ impl BusDevice for XioWindow {
     }
 }
 
+impl Bridge {
+    /// The flash part a widget address reaches and the offset in it, for the
+    /// questions a bus forwards about memory code runs from. The PROM runs
+    /// from the part on chip select 0, at the reset vector.
+    #[cfg(feature = "jitv2")]
+    fn flash_at(&self, off: u32) -> Option<(Arc<dyn BusDevice>, u64)> {
+        let woff = off.checked_sub(FLASH_BASE).filter(|_| off <= 0xff_ffff)?;
+        self.flash_part(woff).map(|(dev, at)| (dev, at as u64))
+    }
+}
+
 impl BusDevice for Bridge {
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+        self.flash_at(addr as u32 & WINDOW_MASK).map_or(std::ptr::null(), |(dev, at)| dev.gen_ptr(at))
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        self.flash_at(addr as u32 & WINDOW_MASK).and_then(|(dev, at)| dev.code_page(at))
+    }
+
     fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
         let off = addr as u32 & WINDOW_MASK;
         if (CFG0_BASE..CFG0_BASE + CFG0_SIZE).contains(&off) {

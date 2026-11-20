@@ -214,6 +214,9 @@ pub struct PpMemory {
     gen_base: *mut AtomicU64,
     #[cfg(feature = "jitv2")]
     _gen_own: AddrSpace,
+    /// JIT v2: this bank's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
 }
  
 // Safety: same contract as `Memory` — access is serialized through the bus.
@@ -273,6 +276,8 @@ impl PpMemory {
             gen_base,
             #[cfg(feature = "jitv2")]
             _gen_own: gen_own,
+            #[cfg(feature = "jitv2")]
+            code_bank: crate::traits::CodeBank::new(),
         })
     }
 
@@ -613,6 +618,19 @@ impl BusDevice for PpMemory {
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         PpMemory::gen_ptr(self, addr)
     }
+
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        let offset = self.off(addr) & !0xFFF;
+        let mut page = self.code_bank.page(offset as u64, PpMemory::gen_ptr(self, addr));
+        // The bank's own mapping, where `read32` reads: it does not move when
+        // a window maps the bank elsewhere.
+        if offset + 4096 <= self.size_bytes {
+            page.words = unsafe { (self.base as *const u32).add(offset >> 2) };
+        }
+        Some(page)
+    }
 }
 
 // Mirrors `impl BusDevice for Arc<Memory>` so Arc-wrapped banks work directly.
@@ -648,6 +666,8 @@ impl BusDevice for Arc<PpMemory> {
     #[cfg(feature = "jitv2")]
     #[inline]
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 { (**self).gen_ptr(addr) }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { (**self).code_page(addr) }
 }
 
 // ---------------------------------------------------------------------------

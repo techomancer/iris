@@ -535,6 +535,11 @@ impl BusDevice for CachedFlashLines {
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         self.bus.gen_ptr(addr)
     }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        self.bus.code_page(addr)
+    }
 }
 
 /// Cross-device tests: the chips wired as the machine wires them, no CPU.

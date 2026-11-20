@@ -571,8 +571,9 @@ impl OctaneMachine {
             #[cfg(feature = "jitv2_lockstep")]
             return Err("[machine] cpus = 2 cannot run with jitv2_lockstep".into());
             let jit = cpu.jitv2();
-            for c in &cpus {
-                c.share_jitv2(jit.clone(), world.clone());
+            // Every CPU sees memory at the same addresses: one address space.
+            for (n, c) in cpus.iter().enumerate() {
+                c.share_jitv2(jit.clone(), world.clone(), n, 0);
             }
         }
         status.set_cpu_cycles(cpu.cycles_ptr());

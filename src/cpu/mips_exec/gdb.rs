@@ -61,7 +61,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
         use crate::cpu::mips_exec::{EXEC_BREAKPOINT, EXEC_RETRY};
         self.cpu.stop(); // ensure no thread is running
         let mut exec = self.cpu.executor.lock();
-        self.cpu.take_flush_request(&mut exec);
+        self.cpu.take_remap_request(&mut exec);
         exec.last_bp_hit = None;
 
         // EXEC_RETRY means the instruction did not retire and PC is unmoved, so

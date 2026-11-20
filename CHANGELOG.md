@@ -181,6 +181,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   boots on both from a Fibre Channel disk (`[fibre_channel.disk.N]`).
 - The I-brick has a USB keyboard and mouse, driven by the `ps2` monitor
   commands.
+- Origin 3200 and Onyx 3000 with two C-bricks of 512 MiB or more each: IRIX
+  no longer corrupts memory (processes dying with memory faults and bus
+  errors, kernel panics and hangs under disk load).
 
 ### Onyx 3000
 
@@ -278,6 +281,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   `monitor_history` file left by an earlier nightly is no longer read.
 - Tab at the terminal console completes monitor command names, also after
   `cpu` and `cpu <n>`.
+- Machines with more than one CPU: `b <symbol>` and other breakpoint commands
+  accept names from a map loaded with `loadsym` (they failed with "unknown
+  symbol").
 - The terminal is left usable however iris ends (monitor `quit`, a signal, the
   guest powering off, the window closing, a panic), not only after Ctrl-C.
 - The monitor keeps a client that sends non-UTF-8 bytes, refuses a line over
@@ -504,6 +510,14 @@ image) where the guest test suites showed they differed:
 
 ### jitv2
 
+- jitv2: compiled code is kept when a memory controller moves a bank (the
+  PROM's memory sizing on Indy, O2, Octane and the IP27/IP35 machines no
+  longer flushes it), and addresses that reach the same memory share one
+  compiled page.
+- jitv2 on machines of several nodes (Origin 2000/Onyx2, Origin 3200/Onyx
+  3000): every processor shares one compile pool and one body of compiled
+  code, where each node had its own. `j2 pcp` shows a page's bank and offset;
+  `j2 status` counts remaps.
 - The compile pool no longer polls: an idle worker parks until a request
   arrives, instead of waking every 200µs (which cost about 1.4% of a host
   core per worker), and a small host can now settle. All machines.
@@ -529,6 +543,8 @@ image) where the guest test suites showed they differed:
 
 ### Idle parking
 
+- With `idle-pause`, a single-processor machine whose guest has no interrupt
+  source (the Octane PROM menu, fx) no longer parks for good after a minute.
 - With `idle-pause`, multiprocessors (Octane, Tezro, Origin, Onyx) no longer
   stall at boot; `IRIS_IDLE_PEER_US` and `IRIS_IDLE_SLICE_US` bound a park.
 - An idle multiprocessor under jitv2 wakes far less often, and busy kernel

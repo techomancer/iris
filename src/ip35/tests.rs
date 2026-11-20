@@ -483,7 +483,7 @@ mod code_pages {
     use crate::cpu::jitv2::jitv2::CompileRequest;
     use crate::cpu::mips_isa::{JIT_REGION_BOUNDARY_SENTINEL, OP_ADDIU};
 
-    struct Words(u32, AtomicU64);
+    struct Words(u32, AtomicU64, crate::traits::CodeBank);
     impl BusDevice for Words {
         fn read32(&self, _: u64) -> BusRead32 {
             BusRead32::ok(self.0)
@@ -493,6 +493,9 @@ mod code_pages {
         }
         fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
             &self.1
+        }
+        fn code_page(&self, _: u64) -> Option<crate::traits::CodePage> {
+            Some(self.2.page(0, &self.1))
         }
     }
 
@@ -504,8 +507,8 @@ mod code_pages {
     /// (a region boundary, which compiles to nothing) in the cached one.
     fn rig() -> (Arc<Words>, Arc<Words>, Box<Cpu>) {
         use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
-        let rom = Arc::new(Words(ADDIU_R1, AtomicU64::new(0)));
-        let ram = Arc::new(Words(JIT_REGION_BOUNDARY_SENTINEL, AtomicU64::new(0)));
+        let rom = Arc::new(Words(ADDIU_R1, AtomicU64::new(0), Default::default()));
+        let ram = Arc::new(Words(JIT_REGION_BOUNDARY_SENTINEL, AtomicU64::new(0), Default::default()));
         let physical = Physical::new(Vec::new());
         physical.set_default(Arc::new(crate::sn::NoMemory(crate::devlog::LogModule::Bedrock)), "absent");
         map_device(&physical, RESET, 0x1000, ram.clone(), "RAM over the reset window");
@@ -534,13 +537,14 @@ mod code_pages {
 
     fn compile(cpu: &Cpu, page: &mut crate::cpu::jitv2::PhysicalCodePage) {
         page.mark_requested(0);
-        let req = CompileRequest { page: page as *mut _, compiled_for_fr1: true };
+        let req = CompileRequest { page: page as *mut _, compiled_for_fr1: true, cpu: 0 };
         let mut analyzer = crate::cpu::jitv2::analyzer::Analyzer::new();
         let mut codegen = crate::cpu::jitv2::codegen::Codegen::new();
+        let buses = cpu.jitv2.lock().buses().clone();
         #[cfg(feature = "developer")]
-        crate::cpu::jitv2::comp::handle_request(&req, cpu.cached_bus(), &mut analyzer, &mut codegen, &crate::cpu::jitv2::JitStats::default());
+        crate::cpu::jitv2::comp::handle_request(&req, &buses, &mut analyzer, &mut codegen, &crate::cpu::jitv2::JitStats::default());
         #[cfg(not(feature = "developer"))]
-        crate::cpu::jitv2::comp::handle_request(&req, cpu.cached_bus(), &mut analyzer, &mut codegen);
+        crate::cpu::jitv2::comp::handle_request(&req, &buses, &mut analyzer, &mut codegen);
     }
 
     #[test]
@@ -550,7 +554,8 @@ mod code_pages {
             // The reset vector in KSEG1, then the same frame in KSEG0.
             let prom = page_at(&mut cpu, 0xffff_ffff_bfc0_0000);
             let cached = page_at(&mut cpu, 0xffff_ffff_9fc0_0000);
-            assert_eq!((prom.pfn, cached.pfn), (0x1fc00, 0x1fc00));
+            assert_eq!((prom.addr_of(0), cached.addr_of(0)), (Some((0x1fc00, true)), Some((0x1fc00, false))));
+            assert_ne!(prom.key, cached.key, "the frame decodes to the PROM uncached and to RAM cached");
             assert_ne!(prom as *mut _, cached as *mut _, "the two fetches key two pages");
             compile(&cpu, prom);
             compile(&cpu, cached);
@@ -587,12 +592,12 @@ mod code_pages {
             }
             cpu.jitv2_flush_from_here(false);
             let page = page_at(&mut cpu, 0xffff_ffff_bfc0_0000);
-            assert!(page.uncached.is_some());
+            assert_eq!(page.addr_of(0), Some((0x1fc00, true)));
             page.mark_requested(0);
             let jit = cpu.jitv2.clone();
             let g = jit.lock();
             let stats = g.stats.clone();
-            assert!(g.compile_queue.send(CompileRequest { page: page as *mut _, compiled_for_fr1: true }, &stats));
+            assert!(g.compile_queue.send(CompileRequest { page: page as *mut _, compiled_for_fr1: true, cpu: 0 }, &stats));
             drop(g);
             assert!(wait_runnable(page), "the restarted pool must compile the PROM's page");
             jit.lock().compile_queue.stop();
