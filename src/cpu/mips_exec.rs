@@ -9374,6 +9374,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             cp0_count: self.core.cp0_count,
             cp0_entryhi: self.core.cp0_entryhi,
             cp0_compare: self.core.cp0_compare,
+            count_last_guest_read: self.core.count_last_guest_read,
             cp0_status: self.core.cp0_status,
             cp0_cause: self.core.cause_for_snapshot(),
             cp0_epc: self.core.cp0_epc,
@@ -9422,6 +9423,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.cp0_count = snapshot.cp0_count;
         self.core.cp0_entryhi = snapshot.cp0_entryhi;
         self.core.cp0_compare = snapshot.cp0_compare;
+        self.core.count_last_guest_read = snapshot.count_last_guest_read;
         self.core.cp0_status = snapshot.cp0_status;
         self.core.cp0_cause = snapshot.cp0_cause;
         self.core.cp0_epc = snapshot.cp0_epc;
@@ -11790,6 +11792,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         // intentionally not saved: it's a host-wall anchor, not calibrated
         // state, and must be reset on load.
         cp0u64!(count_hz);
+        // The Count value the guest last read: a Compare write after the
+        // restore is classified against it (an ack, or a deadline a host
+        // stall made it miss). Not a CP0 register, but guest timer state.
+        cp0.insert("count_last_guest_read".into(), hex_u32(c.count_last_guest_read));
         cp0u32!(cp0_status);
         cp0.insert("cp0_cause".into(), hex_u32(c.cause_for_snapshot()));
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u64!(cp0_lladdr);
@@ -11857,6 +11863,17 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             // Mirror count_hz into its atomic shadow (read by the display
             // thread) so the live UI matches the restored core state.
             c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
+            // The reference a Compare write is classified against. Without
+            // it the value left over from before the restore (another
+            // timeline, or 0 in a fresh process) decides whether a deadline
+            // the guest set just before the snapshot, and missed during the
+            // restore, is raised at once or a whole Count wrap later. A
+            // snapshot from before it was saved takes the restored Count:
+            // the guest read Count no later than that.
+            c.count_last_guest_read = match get_field(cp0, "count_last_guest_read") {
+                Some(x) => toml_u32(x).unwrap_or(c.cp0_count as u32),
+                None => c.cp0_count as u32,
+            };
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
             ld32!(cp0_config); ld64!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);

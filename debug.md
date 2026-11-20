@@ -195,7 +195,7 @@ CPUs. The GDB stub sees CPU 0.
 | Command | Description |
 |---|---|
 | `regs` / `r` | GPRs, HI/LO, and the key CP0 registers (Status, Cause, EPC, BadVAddr) |
-| `cop0` | All CP0 registers |
+| `cop0` | All CP0 registers. Reading Count here does not count as a guest read, so it cannot change how the guest's next Compare write is timed |
 | `cop1` | FPU registers, FCSR and FIR |
 | `setreg <reg> <val>` | Set a register (`a0`, `$5`, `r5`, `pc`, `hi`, `lo`, `c0_<n>` or `c0_<name>`) |
 

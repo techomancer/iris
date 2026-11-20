@@ -1279,7 +1279,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                 let mut exec = self.try_lock_executor()?;
                 writeln!(writer, "COP0 Registers:").unwrap();
                 for i in 0..32 {
-                    let val = exec.core.read_cp0(i);
+                    // Count through the debugger's read: the guest's records
+                    // the value as its last read, the reference a later
+                    // Compare write is classified against. A dump between
+                    // the guest's Count read and its Compare write then hid
+                    // a deadline a stall made it miss, and IP7 came a whole
+                    // Count wrap late (issue 302). Random's update only
+                    // brings it up to date with the cycle count.
+                    let val = if i == 9 { exec.core.read_cp0_debug(i) } else { exec.core.read_cp0(i) };
                     let name = mips_dis::cp0_reg_name(i);
                     if name != "?" {
                         write!(writer, "  {:2} {:8}: {:#018x}", i, name, val).unwrap();
