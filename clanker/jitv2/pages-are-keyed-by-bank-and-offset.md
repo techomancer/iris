@@ -67,6 +67,10 @@ level and the D-cache geometry are per pool.
   `Vec<u8>` lifetime and mode-dependent reads were not audited), so their
   pages still read through the bus.
 - `POOL_CPUS` is `smp::MAX_CPUS` (4).
+- `j2 status` prints `shared pages`: pages more than one CPU reached, and
+  how many at different addresses. IRIX replicates kernel text per node, so
+  each node's CPUs run their own copy (different banks, no sharing there);
+  what two nodes share is user and library code.
 - Seen once in five Tezro boots, on the bus-read build: all CPUs spinning in
   the PROM near 0xc00000001fc33614 with 67 pages claimed. Not reproduced, not
   yet compared with main.

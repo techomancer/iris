@@ -181,6 +181,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   boots on both from a Fibre Channel disk (`[fibre_channel.disk.N]`).
 - The I-brick has a USB keyboard and mouse, driven by the `ps2` monitor
   commands.
+- Origin 3200 and Onyx 3000 with two C-bricks of 512 MiB or more each: IRIX
+  no longer corrupts memory (processes dying with memory faults and bus
+  errors, kernel panics and hangs under disk load).
 
 ### Onyx 3000
 

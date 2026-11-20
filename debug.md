@@ -305,7 +305,7 @@ take effect after `j2 flush`.
 
 | Command | Effect | Default (release / `developer`) |
 |---|---|---|
-| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons, and `remaps`: times a CPU forgot its page addresses because memory moved (no code is dropped for one) | — |
+| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons, `remaps` (times a CPU forgot its page addresses because memory moved; no code is dropped for one) and `shared pages` (pages more than one CPU has reached, and how many of those at different addresses) | — |
 | `j2 dispatch [on\|off]` | Main switch for JIT dispatch; off = interpreter only | `on` |
 | `j2 inline [on\|off]` | Compile synchronously on the CPU thread instead of the compile pool; a page with code recompiles only when new entries make it hot, as the pool would (`[jitv2] compile = "sync"` at startup). Refused with several CPUs, and `on` is refused in `lightning` builds | `off` (`on` under lockstep) |
 | `j2 threads` | Compile-pool thread count and why (read-only; set with `[jitv2] threads` or `--jitv2-threads`) | one per guest CPU, at most 4, capped by the host's usable CPUs |

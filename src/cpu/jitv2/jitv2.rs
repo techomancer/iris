@@ -2972,6 +2972,23 @@ impl Jitv2 {
         (skipped, rejected)
     }
 
+    /// Pages more than one CPU of the pool has reached, and how many of those
+    /// some CPU reached at another frame than the rest (another node's address
+    /// for the same memory): the sharing a key by memory makes possible.
+    pub fn shared_pages(&self) -> (usize, usize) {
+        let (mut shared, mut apart) = (0, 0);
+        for page in self.pages.iter().filter(|p| p.is_claimed()) {
+            let mut frames = (0..POOL_CPUS).filter_map(|cpu| page.addr_of(cpu)).map(|(pfn, _)| pfn);
+            let Some(first) = frames.next() else { continue };
+            let rest: Vec<Pfn> = frames.collect();
+            if !rest.is_empty() {
+                shared += 1;
+                apart += usize::from(rest.iter().any(|&pfn| pfn != first));
+            }
+        }
+        (shared, apart)
+    }
+
     /// Pool capacity, as passed to `new()`.
     #[inline]
     pub fn capacity(&self) -> usize {

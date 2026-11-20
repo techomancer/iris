@@ -145,8 +145,10 @@ pub struct Node<C> {
     memory: Arc<Physical>,
     /// The boot flash, mapped at node field zero wherever no bank covers its window.
     boot: Option<Arc<Window>>,
-    /// Whether a cached reference to the boot window at node field zero stays on the
-    /// reader once the node is renumbered: the Bedrock keeps it, the Hub does not.
+    /// Whether the boot flash stays in its window at node field zero for the node's own
+    /// processors once the node is renumbered, where the node has no memory behind the
+    /// window: the Bedrock keeps it, the Hub does not. Memory in the window is never the
+    /// reader's own: it is the zero holder's, as everywhere above the alias.
     boot_local: bool,
     spaces: [OnceLock<Arc<dyn BusDevice>>; 2],
     /// Where the remap shows the boot flash in the node's table, `at` and `len`;
@@ -392,14 +394,25 @@ impl<C> NodeDecode<C> {
         match far {
             Some(f) if n != 0 => {
                 // What stays on the reader at node field zero: the alias, and
-                // on the Bedrock the boot window. The rest is the zero holder's.
+                // on the Bedrock the boot flash in its window. The rest is the
+                // zero holder's. That includes the window itself wherever the
+                // reader has memory of its own behind it and so shows no flash:
+                // a cached reference there is ordinary memory by node number,
+                // the same bytes for every processor, DMA master and block
+                // transfer. Kept on the reader, a node with 512 MiB or more
+                // read and wrote its own memory for four megabytes the kernel
+                // hands out as the zero holder's pages.
                 let local = boot.clone().filter(|_| me.boot_local).unwrap_or(u64::MAX..u64::MAX);
                 own.extend(shifted(&banks, 0, 0..alias));
-                own.extend(shifted(&banks, 0, local.clone()));
                 if f.number() == 0 {
                     let far_banks = far_banks.as_deref().unwrap_or_default();
                     across.extend(shifted(far_banks, 0, alias..local.start.max(alias)));
+                    for mine in shifted(&banks, 0, local.clone()) {
+                        across.extend(shifted(far_banks, 0, mine.base.max(alias)..mine.end));
+                    }
                     across.extend(shifted(far_banks, 0, local.end.max(alias)..u64::MAX));
+                } else {
+                    own.extend(shifted(&banks, 0, local.clone()));
                 }
             }
             _ => own.extend(shifted(&banks, 0, 0..u64::MAX)),

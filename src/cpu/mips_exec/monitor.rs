@@ -3052,6 +3052,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let jit = exec.jitv2.lock();
                         writeln!(writer, "pages: {} / {} used", jit.pages_used(), jit.capacity()).unwrap();
                         writeln!(writer, "remaps: {} (a CPU forgot its page addresses after memory moved; no code dropped)", jit.stats.remaps.load(Ordering::Relaxed)).unwrap();
+                        let (shared, apart) = jit.shared_pages();
+                        writeln!(writer, "shared pages: {shared} reached by more than one CPU, {apart} of them at different addresses").unwrap();
                         // Churn avoidance: "skipped" is compile work that did not
                         // happen because the page's generation moved without
                         // any word the last compile decoded changing;
