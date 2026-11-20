@@ -320,6 +320,10 @@ toml = "1.0.3"
 postcard = { version = "1", features = ["alloc"] }
 blake3 = "1"
 png = "0.18"
+# The host camera's MJPEG decoder. Pure Rust and reports bad frames as
+# errors; nokhwa's mozjpeg decoder unwinds, which aborts a release build.
+zune-jpeg = "0.5"
+zune-core = "0.5"
 # The VNC server's ZRLE encoding (zlib).
 flate2 = "1"
 # The VNC server's password check (RFB "VNC Authentication": DES, random challenge).

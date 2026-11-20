@@ -1,37 +1,52 @@
 //! nokhwa-based capture loop (macOS AVFoundation, Windows MediaFoundation).
+//!
+//! nokhwa hands frames over in the camera's own format: `Buffer::buffer()` is
+//! YUYV only if YUYV was negotiated. Windows MediaFoundation in particular
+//! offers high-resolution cameras mostly as MJPEG and NV12, so we list the
+//! modes, choose one ourselves (`format::choose_mode`), and convert each frame
+//! from the format and size the buffer says it has.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use nokhwa::utils::{CameraFormat, FrameFormat};
 use parking_lot::Mutex;
 
-use super::{Shared, downscale_yuyv_to_uyvy, split_fields};
+use super::format::{self, CaptureMode, PixelFormat};
+use super::{FrameReporter, Shared, publish_frame};
+
+/// Every format nokhwa knows; we can convert all of them.
+const ALL_FORMATS: &[FrameFormat] = &[
+    FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::RAWRGB, FrameFormat::RAWBGR,
+    FrameFormat::GRAY, FrameFormat::MJPEG,
+];
+
+fn pixel_format(f: FrameFormat) -> PixelFormat {
+    match f {
+        FrameFormat::YUYV   => PixelFormat::Yuyv,
+        FrameFormat::NV12   => PixelFormat::Nv12,
+        FrameFormat::RAWRGB => PixelFormat::Rgb24,
+        FrameFormat::RAWBGR => PixelFormat::Bgr24,
+        FrameFormat::GRAY   => PixelFormat::Gray,
+        FrameFormat::MJPEG  => PixelFormat::Mjpeg,
+    }
+}
+
+fn capture_mode(f: &CameraFormat) -> CaptureMode {
+    CaptureMode::new(pixel_format(f.format()), f.width(), f.height(), f.frame_rate())
+}
 
 pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u32,
                             camera_index: u32, running: Arc<AtomicBool>) {
-    use nokhwa::pixel_format::YuyvFormat;
-    use nokhwa::utils::{
-        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-    };
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
     use nokhwa::Camera;
 
-    // Most cameras don't advertise 640×486 (NTSC native isn't a standard
-    // webcam mode), and many only expose NV12 / MJPEG at their native
-    // resolutions.  Ask for the highest-framerate format the camera offers
-    // and let YuyvFormat handle the decode to YUV422 inside nokhwa.  We
-    // downscale to (frame_w × frame_h) ourselves regardless.
-    let _ = CameraFormat::new(
-        Resolution::new(frame_w, frame_h),
-        FrameFormat::YUYV,
-        30,
-    ); // (kept for future fine-grained requests)
-
-    let req = RequestedFormat::new::<YuyvFormat>(
-        RequestedFormatType::AbsoluteHighestFrameRate
-    );
-
+    // Opening needs some request nokhwa can fulfil before we can list the
+    // modes; any format will do, we replace it below.
+    let req = RequestedFormat::with_formats(RequestedFormatType::AbsoluteHighestFrameRate,
+                                            ALL_FORMATS);
     let mut cam = match Camera::new(CameraIndex::Index(camera_index), req) {
         Ok(c) => c,
         Err(e) => {
@@ -39,16 +54,39 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
             return;
         }
     };
+
+    match cam.compatible_camera_formats() {
+        Ok(list) => {
+            let modes: Vec<CaptureMode> = list.iter().map(capture_mode).collect();
+            match format::choose_mode(&modes, frame_w, frame_h) {
+                Some(want) => {
+                    let pick = list.iter().copied().find(|f| capture_mode(f) == want).unwrap();
+                    if pick != cam.camera_format() {
+                        let exact = RequestedFormat::with_formats(
+                            RequestedFormatType::Exact(pick), ALL_FORMATS);
+                        if let Err(e) = cam.set_camera_requset(exact) {
+                            eprintln!("camera: could not switch to {}: {}; staying at {}",
+                                want, e, capture_mode(&cam.camera_format()));
+                        }
+                    }
+                }
+                None => eprintln!("camera: none of the camera's {} modes is usable; \
+                                   staying at {}", modes.len(), capture_mode(&cam.camera_format())),
+            }
+        }
+        Err(e) => eprintln!("camera: could not list modes ({}); staying at {}",
+                            e, capture_mode(&cam.camera_format())),
+    }
+
     if let Err(e) = cam.open_stream() {
         eprintln!("camera: open_stream failed: {} — falling back to black source", e);
         return;
     }
 
-    let res = cam.resolution();
-    let sw  = res.width_x;
-    let sh  = res.height_y;
-    eprintln!("camera: streaming at {}×{} → downscale to {}×{}", sw, sh, frame_w, frame_h);
-    shared.lock().capture_res = Some((sw, sh));
+    let negotiated = capture_mode(&cam.camera_format());
+    eprintln!("camera: streaming {} → downscale to {}×{}", negotiated, frame_w, frame_h);
+    shared.lock().capture_res = Some((negotiated.width, negotiated.height));
+    let mut report = FrameReporter::new(negotiated);
 
     while running.load(Ordering::Relaxed) {
         let buf = match cam.frame() {
@@ -60,20 +98,20 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
             }
         };
 
-        let yuyv = buf.buffer();
-        let expected = (sw * sh * 2) as usize;
-        if yuyv.len() < expected {
-            eprintln!("camera: short frame ({} bytes for {}×{}), skipping",
-                yuyv.len(), sw, sh);
-            continue;
+        // The buffer carries the format and size the backend negotiated for
+        // this frame; trust those, not what we asked for.
+        let fmt = pixel_format(buf.source_frame_format());
+        let res = buf.resolution();
+        let data = buf.buffer();
+        let stride = format::infer_stride(fmt, res.width(), res.height(), data.len());
+        match format::to_yuyv(fmt, res.width(), res.height(), stride, data) {
+            Ok(f) => {
+                report.good_frame(&f);
+                if publish_frame(&shared, &f, frame_w, frame_h) == 1 {
+                    eprintln!("camera: first frame received — capture is live");
+                }
+            }
+            Err(e) => report.bad_frame(&e),
         }
-
-        let frame = downscale_yuyv_to_uyvy(yuyv, sw, sh, frame_w, frame_h);
-        let (even, odd) = split_fields(&frame, frame_w, frame_h);
-
-        let mut s = shared.lock();
-        s.even = Some(Arc::from(even));
-        s.odd  = Some(Arc::from(odd));
-        s.frame_count += 1;
     }
 }
