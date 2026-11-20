@@ -16,6 +16,9 @@ const SEC_STATUS_MASTER_ABORT: u32 = 1 << 29;
 /// Specification 1.2, 3.2.5.6).
 const IO_32BIT: u32 = 0x0101;
 
+/// A type 1 header's bridge control (dword 15 bit 18): ISA enable.
+const BRIDGE_CONTROL_ISA: u32 = 1 << 18;
+
 /// Interrupt pins, as register 0x3d holds them.
 pub const PCI_INTA: u8 = 1;
 pub const PCI_INTB: u8 = 2;
@@ -125,6 +128,10 @@ pub struct PciConfig {
     /// A type 1 header (PCI-to-PCI bridge): no BARs, and dwords 6 to 12 are
     /// bus numbers and forwarding windows.
     type1: bool,
+    /// A type 1 header that decodes 32-bit I/O addresses: the I/O base and
+    /// limit registers read 1 in bits 3:0 and the upper 16 bits of both
+    /// (dword 12) are stored.
+    io32: bool,
     /// A type 1 header with the TI PCI2050's wide windows: 32-bit I/O
     /// addressing and 32-bit upper halves of the prefetchable window.
     wide: bool,
@@ -203,6 +210,7 @@ impl PciConfig {
             writable_masks,
             caps_end: 0,
             type1: false,
+            io32: false,
             wide: false,
         }
     }
@@ -226,28 +234,50 @@ impl PciConfig {
         c
     }
 
-    /// As [`Self::type1`], with the windows of the TI PCI2050 (SCPS053B,
-    /// 4.17, 4.18, 4.26 and 4.27 and the prefetchable upper registers): I/O
-    /// base and limit read 1 in bits 3:0 for 32-bit I/O addressing, the
-    /// upper 16 bits of both (dword 12) are stored, and the upper 32 bits of
-    /// the prefetchable base and limit (dwords 10 and 11) are stored. The
-    /// prefetchable low nibbles stay 0, so the window is 32-bit. A window
-    /// above 4 GiB is stored but never forwarded: what the chip does there is
-    /// unknown.
-    pub fn type1_wide(vendor: u16, device: u16, revision: u8) -> Self {
+    /// As [`Self::type1`], with 32-bit I/O addressing: the I/O base and
+    /// limit registers read 1 in bits 3:0, and the upper 16 bits of both
+    /// (dword 12, offsets 0x30 and 0x32) are stored, so the I/O window has 4
+    /// KiB granularity anywhere in the 4 GiB I/O space. The prefetchable
+    /// window stays 32-bit and its upper halves (dwords 10 and 11) read zero.
+    /// The DEC 21152/21153/21154 family decodes I/O this way: the 21153's
+    /// configuration note (Intel 278070-001, table 2 and table 3) gives I/O
+    /// base and limit a reset value of 01h, the upper 16-bit registers, and
+    /// a 4 GB I/O range at 4 KB granularity.
+    pub fn type1_io32(vendor: u16, device: u16, revision: u8) -> Self {
         let mut c = Self::type1(vendor, device, revision);
-        c.wide = true;
+        c.io32 = true;
         let r = c.regs.get_mut().unwrap();
         r[7] = IO_32BIT;
         c.power_on = *r;
         c
     }
 
+    /// As [`Self::type1_io32`], with the windows of the TI PCI2050
+    /// (SCPS053B, 4.17, 4.18, 4.26 and 4.27 and the prefetchable upper
+    /// registers): the upper 32 bits of the prefetchable base and limit
+    /// (dwords 10 and 11) are stored as well. The prefetchable low nibbles
+    /// stay 0, so the window is 32-bit. A window above 4 GiB is stored but
+    /// never forwarded: what the chip does there is unknown.
+    pub fn type1_wide(vendor: u16, device: u16, revision: u8) -> Self {
+        let mut c = Self::type1_io32(vendor, device, revision);
+        c.wide = true;
+        c
+    }
+
+    /// A type 1 (PCI-to-PCI bridge) header.
+    pub fn is_type1(&self) -> bool {
+        self.type1
+    }
+
     /// Whether this type 1 header forwards the range `base..base + size` of
     /// `space` to its secondary bus: the range lies wholly inside one
     /// enabled window (I/O, memory or prefetchable memory). A range that
     /// straddles a window's edge is not forwarded; what a bridge does with
-    /// one is not defined.
+    /// one is not defined. With ISA enable set in the bridge control
+    /// register, I/O in the first 64 KiB forwards only in the low 256 bytes
+    /// of each 1 KiB block (PCI-to-PCI Bridge Architecture Specification
+    /// 1.2, bridge control bit 2; Intel 278070-001, section 8), so an I/O
+    /// range there forwards only if it lies wholly inside one such quarter.
     pub fn forwards(&self, space: Space, base: u32, size: u32) -> bool {
         let r = self.regs.lock().unwrap();
         let (lo, hi) = (base as u64, base as u64 + size as u64 - 1);
@@ -257,7 +287,9 @@ impl PciConfig {
                 // Bits 15:12 from the base and limit registers, 31:16 from
                 // the upper registers, and 11:0 all zeros or all ones.
                 let (base_hi, limit_hi) = ((r[12] & 0xffff) as u64, (r[12] >> 16) as u64);
+                let isa_blocked = r[15] & BRIDGE_CONTROL_ISA != 0 && lo < 0x1_0000 && (lo & 0x300 != 0 || lo >> 8 != hi >> 8);
                 r[1] & PCI_COMMAND_IO != 0
+                    && !isa_blocked
                     && inside(base_hi << 16 | ((r[7] & 0xf0) as u64) << 8, limit_hi << 16 | ((r[7] >> 8 & 0xf0) as u64) << 8 | 0xfff)
             }
             Space::Mem => {
@@ -347,20 +379,22 @@ impl PciConfig {
             // A bridge's bus numbers and forwarding windows. The low nibbles
             // of the memory base and limit registers are read-only zero (32-bit
             // memory); the I/O secondary status is not kept. The upper halves
-            // of the prefetchable and I/O windows (dwords 10 to 12) are plain
-            // storage in a wide bridge and read-only zero in any other.
+            // of the I/O window (dword 12) are plain storage in a bridge with
+            // 32-bit I/O, those of the prefetchable window (dwords 10 and 11)
+            // in a wide bridge; each reads zero in any other.
             6 if self.type1 => r[reg] = (r[reg] & !mask) | (val & mask),
             10..=12 if self.type1 => {
-                if self.wide {
+                if self.wide || (reg == 12 && self.io32) {
                     r[reg] = (r[reg] & !mask) | (val & mask);
                 }
             }
             // I/O base and limit, whose low nibbles are the read-only 32-bit
-            // capability in a wide bridge; the secondary status above them is
-            // write-one-to-clear, and only received master abort is kept.
+            // capability in a bridge with 32-bit I/O; the secondary status
+            // above them is write-one-to-clear, and only received master
+            // abort is kept.
             7 if self.type1 => {
                 r[reg] = (((r[reg] & !mask) | (val & mask)) & 0x0000_f0f0)
-                    | if self.wide { IO_32BIT } else { 0 }
+                    | if self.io32 { IO_32BIT } else { 0 }
                     | (r[reg] & !(val & mask) & SEC_STATUS_MASTER_ABORT)
             }
             8 | 9 if self.type1 => r[reg] = ((r[reg] & !mask) | (val & mask)) & 0xfff0_fff0,
@@ -468,6 +502,11 @@ impl crate::traits::Saveable for PciConfig {
             return Err(format!("pci: saved header is for {:#010x}, this function is {:#010x}", saved[0], regs[0]));
         }
         *regs = saved;
+        // The 32-bit I/O capability is read-only: a header saved before the
+        // bridge reported it gains it on load.
+        if self.io32 {
+            regs[7] |= IO_32BIT;
+        }
         Ok(())
     }
 }

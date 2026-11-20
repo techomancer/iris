@@ -504,7 +504,7 @@ fn an_empty_slot_config_read_names_the_master_timeout() {
 impl Rig {
     /// A PCI-to-PCI bridge in `slot` with a card at device 0 behind it.
     fn bridge_with_card_behind(&self, slot: u8) -> Arc<Card> {
-        let p2p = PciToPciBridge::new(self.bridge.bus(), DevFn { device: slot, function: 0 }, 0x1011, 0x0026);
+        let p2p = PciToPciBridge::with_io32_windows(self.bridge.bus(), DevFn { device: slot, function: 0 }, 0x1011, 0x0026, 0);
         let c = Card::new(PCI_INTA);
         p2p.secondary().attach(DevFn { device: 0, function: 0 }, c.clone());
         self.attach(slot, p2p);
@@ -638,6 +638,33 @@ fn an_absent_device_behind_a_pci_bridge_master_aborts_at_the_bridge() {
     r.type1_target(0, 9);
     assert_eq!(r.type1_read(0, 0, 4), None);
     assert_ne!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
+}
+
+/// IRIX 6.5.30 places the ISP2200's I/O BAR at PCI I/O 0x200000 behind the
+/// card cage's DEC bridge and opens the bridge's I/O window there with the
+/// upper 16-bit registers. A slot device window aimed at I/O offset 2 MB
+/// then reaches the card's registers through its I/O BAR.
+#[test]
+fn an_io_bar_above_64k_behind_a_dec_bridge_answers() {
+    let r = Rig::new();
+    let c = r.bridge_with_card_behind(1);
+    assert_eq!(r.cfg_read(1, 0x1c, 1) & 0x0f, 1, "32-bit I/O addressing");
+    r.cfg_write(1, 0x18, 4, 0x0001_0100);
+    r.type1_target(1, 0);
+    r.type1_write(0, 0x10, 4, 0x0020_0000);
+    r.type1_write(0, 0x04, 2, PCI_COMMAND_IO);
+    assert_eq!(c.state().config().bar_base(0), 0x0020_0000);
+    r.cfg_write(1, 0x1c, 2, 0x0000);
+    r.cfg_write(1, 0x30, 4, 0x0020_0020);
+    r.cfg_write(1, 0x04, 2, PCI_COMMAND_IO);
+    r.set(reg::device(1), 2); // I/O space, PCI offset 2 MB
+    assert_eq!(r.bridge.read32(u64::from(Rig::win(1) + FIXED)).data, 0x1234_5678);
+    assert_eq!(r.bridge.write32(u64::from(Rig::win(1) + SCRATCH), 0x8b7a_6950), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0x8b7a_6950);
+    // Without the upper halves the window is 0x0000..0x0fff and the BAR is dark.
+    r.cfg_write(1, 0x30, 4, 0);
+    r.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+    assert!(!r.bridge.read32(u64::from(Rig::win(1) + FIXED)).is_ok());
 }
 
 // ---- the 2 GB window ----

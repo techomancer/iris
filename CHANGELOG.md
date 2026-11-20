@@ -24,6 +24,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
   the SuperIO interrupt pin: Linux's serial console no longer dies when
   virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
+### PCI-to-PCI bridges
+
+- The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes
+  32-bit I/O, as the DEC 21154 it reports does, so an I/O BAR above 64 KiB
+  behind it reaches the card. IRIX 6.5.30 on the Octane puts the ISP2200's
+  there and no longer warns `ppb IO base/limit conflict` at boot. The
+  bridge's ISA enable bit now blocks what it blocks on the real part.
 
 ### Display
 
@@ -268,6 +275,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Storage
 
+- Octane: iris warns at start-up about a device on the internal SCSI bus
+  outside ids 1-3, which the PROM and IRIX never probe (a CD-ROM at
+  `[scsi.4]` was invisible); put such devices on controller 1.
+- `log scsi` shows each mailbox command, request (controller, target, CDB)
+  and completion of the QLogic SCSI adapters (Octane and later machines).
 - A CD-ROM image (`scsi.<ID>.path`, `discs`, `--cdrom4`, `scsi add`) can be an
   `http://` or `https://` URL on a server with range support. See STORAGE.md.
 - New default Cargo feature `http-media` provides those URLs.

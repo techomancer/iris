@@ -837,6 +837,11 @@ ids 1–7 on controller 1 (16 slots per controller); `controller = 1` in a low
 key's table is the older spelling and still works. The monitor's `scsi1`
 addresses the second controller.
 
+On the Octane the internal bus (controller 0) has three drive bays, and the
+PROM and IRIX look for devices on it only at ids 1–3. Put a CD-ROM, and any
+fourth disk, on the external bus: `controller = 1`, or `[scsi.20]` for id 4
+there. iris warns at start-up about a device it will never find.
+
 ---
 
 ## Checking a configuration

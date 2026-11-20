@@ -183,15 +183,23 @@ widget space, Bridge specification table 43) sends a cycle to the bus and device
 its PCI Type 1 Configuration register names (table 26); a bus number no bridge's
 secondary to subordinate range holds, including 0, ends in a master time-out.
 IRIX 6.5.30 scans a bus behind a bridge this way. The header is the type 1
-header only (the caller names the PCI identity). A plain bridge has a 16-bit
-I/O window, and the upper halves of its prefetchable and I/O windows read
-zero. The Tezro's TI PCI2050 has the chip's wider windows: it reports 32-bit
-I/O addressing and stores the upper 16 bits of the I/O base and limit and the
-upper 32 bits of the prefetchable base and limit. Its prefetchable window is
-still 32-bit; one placed above 4 GiB is stored and never forwarded. A host
-whose PCI I/O space starts above 64 KiB, as the PIC's does, needs the wide I/O
-window to reach an I/O BAR behind a bridge. The NVMe card's `bridge = true` puts
-one in front of the controller.
+header only (the caller names the PCI identity). Each bridge forwards I/O at 4
+KiB granularity; how far up depends on the chip:
+
+| Bridge | Identity | I/O window | Prefetchable window |
+|---|---|---|---|
+| In front of a `bridge = true` NVMe or Fibre Channel card | DEC 21154, `1011:0026` | 32-bit: 0x1c/0x1d read 1 in bits 3:0, upper halves at 0x30/0x32 | 32-bit, upper halves read zero |
+| The Tezro's TI PCI2050 | `104c:ac28` | 32-bit, as above | 32-bit, upper halves stored |
+| Any other (only in unit tests) | named by the caller | 16-bit, upper halves read zero | 32-bit, upper halves read zero |
+
+With ISA enable (bridge control bit 2) set, a bridge forwards I/O in the
+first 64 KiB only in the low 256 bytes of each 1 KiB block; a BAR there that
+reaches past those 256 bytes is not forwarded. VGA enable (bit 3) is stored
+and does nothing. A write to the upper halves or to bridge control updates
+the bus in front at once, as a base or limit write does.
+
+A host whose PCI I/O space starts above 64 KiB, as the PIC's does, needs the
+32-bit I/O window to reach an I/O BAR behind a bridge.
 
 ## Monitor
 

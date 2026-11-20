@@ -120,6 +120,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [hal2-cs4216-volume-and-clocking.md](devices/hal2-cs4216-volume-and-clocking.md) | rule | HAL2 and CS4216: speaker volume is the PBUS PIO ch2 MDAC (`0x1fbd8800`/`0x1fbd8804`), and clocking is SM3-Slave from HAL2 |
 | [sn-node-traps.md](devices/sn-node-traps.md) | rule | Node machines (`hub`, `bedrock`): the uncached attribute selects a decode and is never an address bit; a park slot is not a CPU number (`ip27` CPUs are 0 and 2, and `stop_others` indexed by number waits for itself); a register read after firmware ran is not a reset value; plus a six-point checklist for node code |
 | [sn0-node-zero-and-bridge-hosts.md](devices/sn0-node-zero-and-bridge-hosts.md) | rule | SN0 machines: a renumbered node sends node zero's cached window beyond its alias to the Hub that holds zero (and loses the ppmem fast path); a Bridge behind a Crossbow reaches the host at the widget the guest programs, gated by that port's link |
+| [dec-ppb-decodes-32-bit-io.md](devices/dec-ppb-decodes-32-bit-io.md) | rule | The DEC 21154 in front of a `bridge = true` card decodes 32-bit I/O (0x30/0x32); IRIX puts the ISP2200's I/O BAR at 0x200000; a bridge's upper halves and bridge control must refresh the bus in front; ISA enable |
 | [pci-layer-open.md](devices/pci-layer-open.md) | open | PCI layer open items: restore vs reset and the AIC-7880 chip reset, the O2's RST#, Bridge reset pins and master time-out approximations, the 2 GB window's reserved range, no external ATE SSRAM, MACE 64-bit PIO |
 | [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30, IP53); threading, byte order and open items |
 | [virtio-9p-design.md](devices/virtio-9p-design.md) | design | virtio-9p: 9P2000.L server over a host directory; why every path is walked with `O_NOFOLLOW`, what a fid is, open items |
@@ -175,6 +176,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |
 | [windows-cannot-fsync-a-directory.md](scsi/windows-cannot-fsync-a-directory.md) | rule | Windows cannot fsync a directory: raw COW overlays failed every sidecar rewrite |
 | [openbsd.md](scsi/openbsd.md) | rule | OpenBSD SCSI Boot Crash — Investigation Notes |
+| [octane-internal-bus-probes-only-ids-1-3.md](scsi/octane-internal-bus-probes-only-ids-1-3.md) | rule | Octane: the internal SCSI bus is probed only at ids 1-3; CD-ROMs go on controller 1 |
 
 ## net/
 

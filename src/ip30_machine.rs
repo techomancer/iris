@@ -754,11 +754,32 @@ impl OctaneMachine {
         if let Some(d) = attached.daynaports.first() {
             return Err(format!("{}: kind = \"daynaport\" is not available on the Octane", crate::config::scsi_label(d.controller, d.id)));
         }
+        for w in Self::unprobed_internal_ids(&attached.tables) {
+            eprintln!("ip30: warning: {w}");
+        }
         let disks = attached.tables.iter()
             .filter(|t| !t.is_cdrom)
             .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
             .collect();
         Ok((attached.scratch, disks))
+    }
+
+    /// The PROM and IRIX look for devices on the internal bus (controller
+    /// 0) only at ids 1-3, its three drive bays; ids 1-15 are probed on the
+    /// external bus. One warning for each table attached where nothing will
+    /// look for it.
+    fn unprobed_internal_ids(tables: &[crate::scsi::TableRef]) -> Vec<String> {
+        tables.iter()
+            .filter(|t| t.slot < 16 && !(1..=3).contains(&t.slot))
+            .map(|t| {
+                let what = if t.is_cdrom { "CD-ROM" } else { "disk" };
+                format!(
+                    "{}: the Octane probes the internal bus only at ids 1-3, so the guest will not find this {what}; \
+                     put it on the external bus with controller = 1",
+                    crate::config::scsi_label(0, t.slot)
+                )
+            })
+            .collect()
     }
 
     /// IOC3's first port is the console: the CI socket's backend in CI
@@ -1619,6 +1640,17 @@ impl Device for Ip30Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only internal-bus ids outside the three drive bays draw a warning.
+    #[test]
+    fn internal_bus_tables_past_id_3_are_warned_about() {
+        let table = |slot, is_cdrom| crate::scsi::TableRef { slot, is_cdrom, path: String::new(), size_bytes: 0 };
+        let tables = [table(1, false), table(3, false), table(4, true), table(0, false), table(20, true), table(17, false)];
+        let w = OctaneMachine::unprobed_internal_ids(&tables);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with("SCSI ID 4:") && w[0].contains("CD-ROM"), "{}", w[0]);
+        assert!(w[1].starts_with("SCSI ID 0:") && w[1].contains("disk"), "{}", w[1]);
+    }
 
     /// The Octane2 carries its own four identity records, from one reference
     /// unit's inventory, and the Octane keeps the ones it had. The IOC3's
