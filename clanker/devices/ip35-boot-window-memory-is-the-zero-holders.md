@@ -65,7 +65,10 @@ alias is legitimate (uncached memory is `0x9600...`); breakpoints do nothing
 in a `lightning` build; the Tezro image has no network on these machines
 until `ifconfig ef0` by hand.
 
-Still open: a node with less than 512 MiB keeps its flash in the window
-even when the zero holder has memory there, so its processors cannot reach
-those pages of node 0. The PROM path that needs the flash there has not
-been separated from the kernel's need for the memory.
+Not a problem: bank 0 smaller than 512 MiB (`banks = [256, 256]`). Each bank
+sits in its own 1 GiB slot and every C-brick gets the same banks, so then no
+node has memory at 0x1fc0_0000: both show flash there and IRIX has no pages
+in the window to hand out. Two nodes of 256 MiB banks, both CPUs, jitv2 on:
+clean boot, raw read and `/usr/lib` sweeps match (2026-11-19). A node showing
+flash over the zero holder's memory would need bricks of different sizes,
+which the configuration does not allow; revisit if it ever does.
