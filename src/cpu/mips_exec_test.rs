@@ -1467,53 +1467,60 @@ mod tests {
         });
     }
 
-    /// 2^31 is a single but not a word, so CVT.W.S of it is Invalid with the
-    /// largest word as the default result, like any other overflow. It was
-    /// taken for in range because `i32::MAX as f32` rounds up to it. -2^31
-    /// still converts exactly.
+    /// 2^31 is a single but not a word, so CVT.W.S of it is unrepresentable
+    /// (Unimplemented Operation on every modelled part). It was taken for in
+    /// range because `i32::MAX as f32` rounds up to it. -2^31 still converts
+    /// exactly.
     #[test]
-    fn cvt_w_s_of_2_to_the_31_is_invalid() {
-        const FCSR_CV: u32 = 0x0001_0000;
+    fn cvt_w_s_of_2_to_the_31_is_unrepresentable() {
+        const FCSR_CE: u32 = 0x0002_0000;
         on_big_stack(|| {
             let mut exec = tlb_exec::<R4400Cache>(Arc::new(MockMemory::new()));
             exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
             let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
-            for (input, want, invalid) in [(2147483648.0f32, i32::MAX, true), (-2147483648.0f32, i32::MIN, false)] {
+            for (input, want, traps) in [(2147483648.0f32, 0x5a5a_5a5a, true), (-2147483648.0f32, i32::MIN, false)] {
                 exec.core.fpu_fcsr = 0;
                 exec.core.fpr[1] = input.to_bits() as u64;
-                assert_eq!(exec.exec(cvt), EXEC_COMPLETE, "{input}");
+                exec.core.fpr[2] = 0x5a5a_5a5a;
+                let s = exec.exec(cvt);
+                assert_eq!(s & EXEC_IS_EXCEPTION != 0, traps, "{input}");
                 assert_eq!(exec.core.fpr[2] as u32, want as u32, "{input} result");
-                assert_eq!(exec.core.fpu_fcsr & FCSR_CV != 0, invalid, "{input} Cause.V");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CE != 0, traps, "{input} Cause.E");
             }
         });
     }
 
     /// A conversion whose result a word cannot hold takes Unimplemented
-    /// Operation on the R10000 family, leaving fd alone (NEC U10278EJ4V0UM
-    /// Appendix B.4, p. 350); the R4400 raises Invalid and writes the default.
+    /// Operation, leaving fd alone, on every modelled part: measured on an
+    /// Indy R4400 (cpu-tests oracle), VR5000 UM 9.4.6, NEC U10278EJ4V0UM
+    /// Appendix B.4, p. 350.
     #[test]
-    fn unrepresentable_conversions_are_unimplemented_on_the_r10000_family() {
+    fn unrepresentable_conversions_are_unimplemented() {
         const FCSR_CE: u32 = 0x0002_0000;
         const FCSR_CV: u32 = 0x0001_0000;
         const OLD: u64 = 0x5a5a_5a5a;
-        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(traps: bool) {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>() {
             let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
             exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
             let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
-            for input in [2147483648.0f32, f32::INFINITY, -1.0e20, f32::NAN] {
+            let trunc_d = make_cop1_compute(RS_D, 0, 1, 2, FUNCT_FTRUNC_W);
+            for (instr, input) in [
+                (cvt, 2147483648.0f32.to_bits() as u64),
+                (cvt, f32::INFINITY.to_bits() as u64),
+                (cvt, (-1.0e20f32).to_bits() as u64),
+                (cvt, 0x7FBF_FFFF), // MIPS quiet NaN
+                (cvt, 0x7FC0_0000), // MIPS signalling NaN
+                (trunc_d, (-2147483649.0f64).to_bits()),
+                (trunc_d, f64::NEG_INFINITY.to_bits()),
+            ] {
                 exec.core.fpu_fcsr = 0;
-                exec.core.fpr[1] = input.to_bits() as u64;
+                exec.core.fpr[1] = input;
                 exec.core.fpr[2] = OLD;
-                let s = exec.exec(cvt);
-                if traps {
-                    assert!(s & EXEC_IS_EXCEPTION != 0, "{input} traps");
-                    assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{input} FPE");
-                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CE, "{input} Cause.E alone");
-                    assert_eq!(exec.core.fpr[2], OLD, "{input} fd untouched");
-                } else {
-                    assert_eq!(s, EXEC_COMPLETE, "{input}");
-                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CV, "{input} Cause.V");
-                }
+                let s = exec.exec(instr);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{input:#x} traps");
+                assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{input:#x} FPE");
+                assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CE, "{input:#x} Cause.E alone");
+                assert_eq!(exec.core.fpr[2], OLD, "{input:#x} fd untouched");
             }
             // A representable value still converts.
             exec.core.fpu_fcsr = 0;
@@ -1522,9 +1529,281 @@ mod tests {
             assert_eq!(exec.core.fpr[2] as u32, 7);
         }
         on_big_stack(|| {
-            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
-            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
-            run::<R4400Cache>(false);
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>();
+            run::<crate::cpu::mips_cache_v2::R5000Cache>();
+            run::<R4400Cache>();
+        });
+    }
+
+    /// One FP conversion on model `C`, FR=1, with FCSR written through CTC1's
+    /// own path (so the host rounding mode follows RM) and a sentinel in fd
+    /// ($f2). The source is $f1. Returns the status, fd and FCSR, and puts
+    /// the host back in round-to-nearest.
+    fn conv_case<C: CpuModel + From<Arc<dyn BusDevice>>>(fmt: u32, funct: u32, src: u64, fcsr: u32) -> (crate::cpu::mips_exec::ExecStatus, u64, u32) {
+        struct RestoreRounding;
+        impl Drop for RestoreRounding {
+            fn drop(&mut self) { crate::platform::set_fpu_mode(0); }
+        }
+        let _restore = RestoreRounding;
+        let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+        exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+        exec.core.write_fpu_control(31, fcsr);
+        exec.core.fpr[1] = src;
+        exec.core.fpr[2] = CONV_OLD;
+        let s = exec.exec(make_cop1_compute(fmt, 0, 1, 2, funct));
+        (s, exec.core.fpr[2], exec.core.fpu_fcsr)
+    }
+    const CONV_OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+    const FCSR_C_E: u32 = 0x0002_0000;
+    const FCSR_C_V: u32 = 0x0001_0000;
+    const FCSR_C_O: u32 = 0x0000_4000;
+    const FCSR_C_U: u32 = 0x0000_2000;
+    const FCSR_C_I: u32 = 0x0000_1000;
+    const FCSR_C_ALL: u32 = 0x0003_f000;
+
+    fn assert_unimplemented(r: (crate::cpu::mips_exec::ExecStatus, u64, u32), what: &str) {
+        let (s, fd, fcsr) = r;
+        assert!(s & EXEC_IS_EXCEPTION != 0, "{what}: traps");
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{what}: FPE");
+        assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_E, "{what}: Cause.E alone");
+        assert_eq!(fcsr & 0x7c, 0, "{what}: no Flag");
+        assert_eq!(fd, CONV_OLD, "{what}: fd untouched");
+    }
+
+    /// CVT.S.L and CVT.D.L on the R4400 and R5000 hand a long outside
+    /// [-2^52, 2^52) to software (VR5000 UM 9.4.6; an Indy R4400 and R5000
+    /// both convert 2^40+1 and trap 2^53+1 and 2^62). The R10000 family
+    /// converts every long. That fixes `fpu/vec_cvt_from_l` on both parts.
+    #[test]
+    fn cvt_from_long_is_unimplemented_past_52_bits_on_the_r4000_class() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(limited: bool) {
+            let cases: [(i64, bool); 8] = [
+                ((1 << 52) - 1, false), (-(1 << 52), false), ((1 << 40) + 1, false), (0, false),
+                (1 << 52, true), (-(1 << 52) - 1, true), ((1 << 53) + 1, true), (i64::MIN, true),
+            ];
+            for (v, out) in cases {
+                for funct in [FUNCT_FCVT_S, FUNCT_FCVT_D] {
+                    let r = conv_case::<C>(RS_L, funct, v as u64, 0);
+                    let what = format!("{} cvt.{}.l {v}", C::NAME, if funct == FUNCT_FCVT_S { 's' } else { 'd' });
+                    if out && limited {
+                        assert_unimplemented(r, &what);
+                    } else {
+                        assert_eq!(r.0, EXEC_COMPLETE, "{what}");
+                        let got = if funct == FUNCT_FCVT_S { f32::from_bits(r.1 as u32) as f64 } else { f64::from_bits(r.1) };
+                        let want = if funct == FUNCT_FCVT_S { v as f32 as f64 } else { v as f64 };
+                        assert_eq!(got, want, "{what}");
+                    }
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<R4400Cache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(true);
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(false);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(false);
+        });
+    }
+
+    /// A long that rounds up to 2^63 is inexact. Comparing a saturating cast
+    /// of the result back to i64 called i64::MAX exact, because 2^63
+    /// saturates to i64::MAX.
+    #[test]
+    fn cvt_from_long_to_2_to_the_63_is_inexact() {
+        on_big_stack(|| {
+            for funct in [FUNCT_FCVT_S, FUNCT_FCVT_D] {
+                for v in [i64::MAX, i64::MAX - 511] {
+                    let (s, fd, fcsr) = conv_case::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(RS_L, funct, v as u64, 0);
+                    assert_eq!(s, EXEC_COMPLETE);
+                    let got = if funct == FUNCT_FCVT_S { f32::from_bits(fd as u32) as f64 } else { f64::from_bits(fd) };
+                    assert_eq!(got, 9223372036854775808.0, "{v} rounds to 2^63");
+                    assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_I, "{v} Cause.I");
+                    assert_eq!(fcsr & 0x7c, 0x04, "{v} Flag.I");
+                }
+            }
+        });
+    }
+
+    /// An enabled Inexact on an integer-to-float conversion traps with Cause.I
+    /// and leaves fd and the Flags alone, as every trapped FP exception does.
+    #[test]
+    fn cvt_from_int_inexact_trap_leaves_fd() {
+        const ENABLE_I: u32 = 0x80;
+        on_big_stack(|| {
+            for (fmt, v) in [(RS_W, 0x0100_0001u64), (RS_L, (1u64 << 40) + 1)] {
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(fmt, FUNCT_FCVT_S, v, ENABLE_I);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{v:#x} traps");
+                assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_I, "{v:#x} Cause.I");
+                assert_eq!(fcsr & 0x7c, 0, "{v:#x} no Flag");
+                assert_eq!(fd, CONV_OLD, "{v:#x} fd untouched");
+            }
+        });
+    }
+
+    /// A long conversion on the R4400 and R5000 hands a result outside
+    /// [-2^53, 2^53) to software (VR5000 UM 9.4.6, inferred for the R4400);
+    /// the R12000 converts the full range.
+    #[test]
+    fn cvt_to_long_is_unimplemented_past_53_bits_on_the_r4000_class() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(limited: bool) {
+            let p53 = (1i64 << 53) as f64;
+            for (instr_fmt, funct, src, want, out) in [
+                (RS_D, FUNCT_FCVT_L, (p53 - 1.0).to_bits(), (1i64 << 53) - 1, false),
+                (RS_D, FUNCT_FCVT_L, (-p53).to_bits(), -(1i64 << 53), false),
+                (RS_D, FUNCT_FCVT_L, p53.to_bits(), 1i64 << 53, true),
+                (RS_D, FUNCT_FROUND_L, (-p53 - 2.0).to_bits(), -(1i64 << 53) - 2, true),
+                (RS_S, FUNCT_FCVT_L, ((1u64 << 60) as f32).to_bits() as u64, 1i64 << 60, true),
+            ] {
+                let r = conv_case::<C>(instr_fmt, funct, src, 0);
+                let what = format!("{} {funct:#x} {want}", C::NAME);
+                if out && limited {
+                    assert_unimplemented(r, &what);
+                } else {
+                    assert_eq!(r.0, EXEC_COMPLETE, "{what}");
+                    assert_eq!(r.1 as i64, want, "{what}");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<R4400Cache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(false);
+        });
+    }
+
+    /// A denormal or quiet-NaN source to a conversion is Unimplemented
+    /// Operation on every part ("only trapped if the instruction is a convert
+    /// or computational operation", R4000 UM 7.x; R10000 UM p. 309 for the
+    /// denormal). The conversions used to round a denormal to 0 or ±1 with
+    /// Inexact and narrow or widen it on the host.
+    #[test]
+    fn conversions_of_denormal_and_quiet_nan_sources_are_unimplemented() {
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let ds: u64 = 0x0000_0000_0000_0001; // smallest double denormal
+            let ss: u64 = 0x8000_0001; // negative single denormal
+            let qd: u64 = 0x7FF7_FFFF_FFFF_FFFF; // MIPS quiet NaN
+            let qs: u64 = 0x7FBF_FFFF;
+            for (fmt, funct, src, name) in [
+                (RS_S, FUNCT_FTRUNC_W, ss, "trunc.w.s denormal"),
+                (RS_S, FUNCT_FCEIL_W, ss, "ceil.w.s denormal"),
+                (RS_D, FUNCT_FCVT_W, ds, "cvt.w.d denormal"),
+                (RS_D, FUNCT_FROUND_L, ds, "round.l.d denormal"),
+                (RS_S, FUNCT_FCVT_D, ss, "cvt.d.s denormal"),
+                (RS_S, FUNCT_FCVT_D, qs, "cvt.d.s quiet NaN"),
+                (RS_D, FUNCT_FCVT_S, ds, "cvt.s.d denormal"),
+                (RS_D, FUNCT_FCVT_S, qd, "cvt.s.d quiet NaN"),
+            ] {
+                // FS set as well: it flushes results, not operands.
+                assert_unimplemented(conv_case::<C>(fmt, funct, src, 0x0100_0000), &format!("{} {name}", C::NAME));
+            }
+        }
+        on_big_stack(|| {
+            run::<R4400Cache>();
+            run::<crate::cpu::mips_cache_v2::R5000Cache>();
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+        });
+    }
+
+    /// A signalling NaN to CVT.D.S is Invalid: the MIPS default NaN untrapped,
+    /// a trap with fd untouched when Enable.V is set. Widening it on the host
+    /// set the fraction MSB, which hands on another signalling NaN.
+    #[test]
+    fn cvt_d_s_of_a_signalling_nan_is_invalid() {
+        on_big_stack(|| {
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_S, FUNCT_FCVT_D, 0x7FC0_0001, 0);
+            assert_eq!(s, EXEC_COMPLETE);
+            assert_eq!(fd, 0x7FF7_FFFF_FFFF_FFFF, "default NaN");
+            assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_V);
+            assert_eq!(fcsr & 0x7c, 0x40);
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_S, FUNCT_FCVT_D, 0x7FC0_0001, 0x800);
+            assert!(s & EXEC_IS_EXCEPTION != 0);
+            assert_eq!(fd, CONV_OLD);
+            assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_V);
+            // Infinities and zeros still widen exactly.
+            for (src, want) in [(0x7F80_0000u64, f64::INFINITY), (0x8000_0000, -0.0)] {
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_S, FUNCT_FCVT_D, src, 0);
+                assert_eq!(s, EXEC_COMPLETE);
+                assert_eq!(fd, want.to_bits());
+                assert_eq!(fcsr & FCSR_C_ALL, 0);
+            }
+        });
+    }
+
+    /// CVT.S.D overflow raises Inexact with Overflow (R4000 UM Table 7-1;
+    /// `fpu/cvt_s_d_rounds`), in every rounding mode, including the modes
+    /// that deliver ±MAX. Between MAX and 2^128 the rounded value with an
+    /// unbounded exponent can still be MAX, which is Inexact alone.
+    #[test]
+    fn cvt_s_d_overflow_raises_inexact_too() {
+        const MAX: u64 = 0x7F7F_FFFF;
+        const INF: u64 = 0x7F80_0000;
+        let big = f64::from_bits(0x4C70_0000_0000_0000); // 2^200
+        let just_over_max = f32::MAX as f64 * (1.0 + 2f64.powi(-30)); // < MAX + half an ulp
+        on_big_stack(move || {
+            for (src, rm, want, cause) in [
+                (big, 0u32, INF, FCSR_C_O | FCSR_C_I),
+                (big, 1, MAX, FCSR_C_O | FCSR_C_I),
+                (big, 2, INF, FCSR_C_O | FCSR_C_I),
+                (big, 3, MAX, FCSR_C_O | FCSR_C_I),
+                (-big, 2, MAX | 0x8000_0000, FCSR_C_O | FCSR_C_I),
+                (just_over_max, 0, MAX, FCSR_C_I),
+                (just_over_max, 1, MAX, FCSR_C_I),
+                (just_over_max, 2, INF, FCSR_C_O | FCSR_C_I),
+            ] {
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), rm);
+                assert_eq!(s, EXEC_COMPLETE, "{src} rm={rm}");
+                assert_eq!(fd as u32 as u64, want, "{src} rm={rm}");
+                assert_eq!(fcsr & FCSR_C_ALL, cause, "{src} rm={rm} Cause");
+                assert_eq!(fcsr & 0x7c, cause >> 10, "{src} rm={rm} Flag");
+            }
+            // Enable.I alone traps an overflow, since it raises Inexact too.
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, big.to_bits(), 0x80);
+            assert!(s & EXEC_IS_EXCEPTION != 0);
+            assert_eq!(fd, CONV_OLD);
+            assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_O | FCSR_C_I);
+        });
+    }
+
+    /// A CVT.S.D result too small for a normal single underflows. With FS
+    /// clear, or Underflow or Inexact enabled, that is Unimplemented
+    /// Operation; with FS set it flushes to a zero of the source's sign with
+    /// Underflow and Inexact, as arithmetic does (`fpu_update_fcsr_full`).
+    #[test]
+    fn cvt_s_d_underflow_follows_the_fs_rules() {
+        const FS: u32 = 0x0100_0000;
+        on_big_stack(|| {
+            for src in [1.0e-40f64, -1.0e-40, 1.0e-300] {
+                assert_unimplemented(conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), 0), &format!("{src} FS=0"));
+                assert_unimplemented(conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), FS | 0x100), &format!("{src} Enable.U"));
+                let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, src.to_bits(), FS);
+                assert_eq!(s, EXEC_COMPLETE, "{src}");
+                assert_eq!(fd as u32, if src < 0.0 { 0x8000_0000 } else { 0 }, "{src} flushed");
+                assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_U | FCSR_C_I, "{src} Cause");
+                assert_eq!(fcsr & 0x7c, 0x0c, "{src} Flag");
+            }
+            // The smallest normal single narrows exactly.
+            let (s, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_S, (f32::MIN_POSITIVE as f64).to_bits(), 0);
+            assert_eq!(s, EXEC_COMPLETE);
+            assert_eq!(fd as u32, f32::MIN_POSITIVE.to_bits());
+            assert_eq!(fcsr & FCSR_C_ALL, 0);
+        });
+    }
+
+    /// ROUND rounds to nearest, ties to even, whatever FCSR.RM says, and
+    /// CVT.W follows RM.
+    #[test]
+    fn round_ignores_rm_and_cvt_follows_it() {
+        on_big_stack(|| {
+            for rm in 0..4u32 {
+                for (x, want) in [(2.5f64, 2i32), (3.5, 4), (-2.5, -2), (-3.5, -4), (0.5, 0), (-0.5, 0), (1.5, 2), (2.4999, 2)] {
+                    let (s, fd, _) = conv_case::<R4400Cache>(RS_D, FUNCT_FROUND_W, x.to_bits(), rm);
+                    assert_eq!(s, EXEC_COMPLETE);
+                    assert_eq!(fd as u32 as i32, want, "round.w.d {x} rm={rm}");
+                }
+                let (_, fd, fcsr) = conv_case::<R4400Cache>(RS_D, FUNCT_FCVT_W, (-2.5f64).to_bits(), rm);
+                assert_eq!(fd as u32 as i32, [-2, -2, -2, -3][rm as usize], "cvt.w.d -2.5 rm={rm}");
+                assert_eq!(fcsr & FCSR_C_ALL, FCSR_C_I, "cvt.w.d -2.5 rm={rm} Inexact");
+            }
         });
     }
 
