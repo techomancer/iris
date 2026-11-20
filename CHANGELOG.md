@@ -13,6 +13,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### virtio
+
+- virtio-serial and virtio-9p on PCI (Octane, Tezro) offer
+  `VIRTIO_F_ACCESS_PLATFORM`, so Linux gives them bus addresses they can reach
+  instead of physical ones; Linux's `virtio_console` hung at load.
+
+### Fibre Channel
+
+- Linux's qla2xxx brings the ISP2200's loop online and finds its disks on the
+  Octane (Linux 7.3); it stopped at the port login, which the adapter refused.
 ### Octane
 
 - The Bridges' 64 GB windows reach PCI: the 32-bit and 64-bit aliases of PCI

@@ -196,6 +196,9 @@ pub mod mbox {
     pub const GET_LINK_STATUS: u16 = 0x006b;
     pub const LIP_RESET: u16 = 0x006c;
     pub const FULL_LOGIN_LIP: u16 = 0x0072;
+    pub const LOGIN_FABRIC_PORT: u16 = 0x006f;
+    pub const LOGOUT_FABRIC_PORT: u16 = 0x0071;
+    pub const LOGIN_LOOP_PORT: u16 = 0x0074;
     pub const PORT_NAME_LIST: u16 = 0x0075;
     pub const GET_ID_LIST: u16 = 0x007c;
     pub const LUN_RESET: u16 = 0x007e;
@@ -223,6 +226,9 @@ const ENTRY_TYPE_CONTINUATION_A64: u8 = 0x0a;
 const ENTRY_TYPE_COMMAND: u8 = 0x11;
 const ENTRY_TYPE_COMMAND_LIST: u8 = 0x15;
 const ENTRY_TYPE_COMMAND_A64: u8 = 0x19;
+/// A mailbox command carried in the request ring (Linux's `MBX_IOCB_TYPE`),
+/// answered by an entry of the same type in the response ring.
+const ENTRY_TYPE_MAILBOX: u8 = 0x39;
 
 /// Entry status flags a response entry can carry.
 const ENTRY_FLAG_BAD_TYPE: u8 = 0x04;
@@ -1741,6 +1747,7 @@ impl Core {
             }
             // A marker resynchronises firmware state; nothing is posted.
             ENTRY_TYPE_MARKER => {}
+            ENTRY_TYPE_MAILBOX => self.mailbox_entry(st, &req),
             ENTRY_TYPE_CONTINUATION | ENTRY_TYPE_CONTINUATION_A64 => st.reject_entry(&req, ENTRY_FLAG_BAD_ORDER),
             _ => st.reject_entry(&req, ENTRY_FLAG_BAD_TYPE),
         }
@@ -1750,6 +1757,48 @@ impl Core {
         }
         st.rqst_out = ((out + consumed) % len) as u16;
         true
+    }
+
+    /// A mailbox command in the request ring (Linux's `struct mbx_entry`:
+    /// handle at 4, loop ID at 8, status at 10, then m0, m1, m2, m3, m6, m7,
+    /// m9 and m10 as words from 24). Linux 7.3 sends its port logins,
+    /// logouts and ADISC this way on the parts before the 24xx
+    /// (qla2x00_login_iocb, qla2x00_logout_iocb, qla2x00_adisc_iocb). The
+    /// answer is the entry itself with the output mailboxes in the same
+    /// places and status 0; a command the ring does not carry comes back
+    /// with an invalid-command m0. Which commands the firmware takes in an
+    /// entry is not public: these are the ones Linux sends, and fabric
+    /// login is answered as a loop port login, since the loop has no fabric.
+    fn mailbox_entry(&self, st: &mut Locked<'_>, req: &[u8; ENTRY_SIZE]) {
+        const SLOTS: [(usize, usize); 8] = [(0, 24), (1, 26), (2, 28), (3, 30), (6, 32), (7, 34), (9, 36), (10, 38)];
+        let mut input: Mailboxes = [0; MAILBOX_COUNT];
+        for (m, off) in SLOTS {
+            input[m] = le16(req, off);
+        }
+        let mut out: Mailboxes = [0; MAILBOX_COUNT];
+        out[0] = match input[0] {
+            mbox::LOGIN_FABRIC_PORT | mbox::LOGIN_LOOP_PORT => {
+                if !st.loop_ready() || !st.target(usize::from(input[1] >> 8)) {
+                    mbox::COMMAND_ERROR
+                } else {
+                    mbox::COMPLETE
+                }
+            }
+            // Nothing is logged out: every port stays logged in.
+            mbox::LOGOUT_FABRIC_PORT => mbox::COMPLETE,
+            mbox::GET_PORT_DB => self.get_port_db(st, &input),
+            cmd => {
+                self.note(format!("mailbox command {cmd:#06x} in a request entry not modelled"));
+                mbox::INVALID
+            }
+        };
+        let mut entry = *req;
+        entry[ENTRY_OFF_STATUS] = 0;
+        entry[10..16].fill(0);
+        for (m, off) in SLOTS {
+            entry[off..off + 2].copy_from_slice(&out[m].to_le_bytes());
+        }
+        st.held.push_back(entry);
     }
 
     /// A command entry and the continuations its entry count claims. The
@@ -1832,8 +1881,8 @@ impl Core {
 
     /// The mailbox commands the loop answers: those it implements, then
     /// those it knows of and refuses (0x0040, 0x0041 and 0x0047, whose use is
-    /// not established here, and the name-server and login commands 0x006e,
-    /// 0x006f, 0x0071 and 0x0074), which `fc_mailbox` notes and fails.
+    /// not established here, and the name-server and fabric login commands
+    /// 0x006e, 0x006f and 0x0071), which `fc_mailbox` notes and fails.
     fn fc_owned(cmd: u16) -> bool {
         matches!(
             cmd,
@@ -1859,9 +1908,9 @@ impl Core {
                 | 0x0041
                 | 0x0047
                 | 0x006e
-                | 0x006f
-                | 0x0071
-                | 0x0074
+                | mbox::LOGIN_FABRIC_PORT
+                | mbox::LOGOUT_FABRIC_PORT
+                | mbox::LOGIN_LOOP_PORT
         )
     }
 
@@ -2070,6 +2119,18 @@ impl Core {
                     return mbox::COMMAND_ERROR;
                 }
                 self.start_bringup(st, false);
+                mbox::COMPLETE
+            }
+            // Login to a port on the loop: every disk is logged in already, so
+            // the login succeeds for any port present; m1 bit 0 (initiator)
+            // and bit 1 (FCP-2 device) stay clear, the FCP target role the port
+            // database gives. A loop ID with no port is the command error
+            // Linux reads as a failed login (qla2x00_local_device_login).
+            mbox::LOGIN_LOOP_PORT => {
+                if !st.loop_ready() || !st.target(usize::from(input[1] >> 8)) {
+                    return mbox::COMMAND_ERROR;
+                }
+                out[1] = 0;
                 mbox::COMPLETE
             }
             // The control block's retry count and delay, the order Linux and
