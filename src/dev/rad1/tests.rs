@@ -1547,6 +1547,10 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
     Device::stop(&r);
     let wall = started.elapsed().as_secs_f64();
     let moved = r.state.lock().chan[CH_OUT].frames;
+    // A file thread held up by a busy host (a loaded CI runner) lets the
+    // queue pass its ceiling, and the stream skips ahead rather than play
+    // late. Those frames reached the host and were let go on purpose.
+    let skipped = r.sink.lock().as_ref().and_then(|sk| sk.host.as_ref()).map_or(0, |o| { let s = o.stats(); s.overruns + s.dropped });
     r.sink.lock().take();
     let (rate, channels, pcm) = read_wav(&path.0);
     assert_eq!((rate, channels), (crate::host_audio::FILE_RATE, 2));
@@ -1560,7 +1564,9 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
     // of a stretch of sound: one, or more where a busy host held the card up.
     let expect = loud as f64 * 48000.0 / 44100.0;
     let most = expect * 1.005 + 48.0 * bursts(&pcm, 2) as f64;
-    assert!((heard.len() / 2) as f64 >= expect - 9600.0 && (heard.len() / 2) as f64 <= most, "{} frames heard, {expect:.0} played", heard.len() / 2);
+    let least = expect - skipped as f64 * 48000.0 / 44100.0 - 9600.0;
+    assert!((heard.len() / 2) as f64 >= least && (heard.len() / 2) as f64 <= most,
+        "{} frames heard, {expect:.0} played ({skipped} card frames skipped by the host stream)", heard.len() / 2);
     assert_tones(&heard, 2, rate, left, right, 15000);
 }
 
