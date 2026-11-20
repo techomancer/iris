@@ -3124,22 +3124,11 @@ mod gr2_checkpoint_tests {
     fn gr2_disk_snapshot_round_trip_and_board_mismatches() {
         const CHILD: &str = "IRIS_GR2_M15_DISK_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            struct Remove(std::path::PathBuf);
-            impl Drop for Remove {
-                fn drop(&mut self) {
-                    let _ = std::fs::remove_dir_all(&self.0);
-                }
-            }
-
-            let path = std::env::current_dir()
-                .unwrap()
-                .join("target")
-                .join(format!("gr2-m15-disk-{}", std::process::id()));
-            std::fs::create_dir(&path).unwrap();
-            let _cleanup = Remove(path.clone());
+            // Not under the working directory: a relocated target dir leaves no `target/` there.
+            let path = crate::test_temp::TempPath::dir("gr2-m15-disk");
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .current_dir(&path)
-                .env(CHILD, &path)
+                .current_dir(&*path)
+                .env(CHILD, &*path)
                 .args([
                     "--exact",
                     "machine::gr2_checkpoint_tests::gr2_disk_snapshot_round_trip_and_board_mismatches",
@@ -3159,7 +3148,8 @@ mod gr2_checkpoint_tests {
 
         crate::display_stop_tests::big_stack(|| {
             let path = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
-            assert_eq!(std::env::current_dir().unwrap(), path);
+            // The temp dir may sit behind a symlink (macOS /var), so compare resolved paths.
+            assert_eq!(std::env::current_dir().unwrap().canonicalize().unwrap(), path.canonicalize().unwrap());
 
             let mut xz = Box::new(Machine::new(config(&path, GraphicsBoard::Xz)));
             let gr2 = xz.get_gr2().unwrap();
