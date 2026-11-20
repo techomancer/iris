@@ -504,7 +504,7 @@ fn an_empty_slot_config_read_names_the_master_timeout() {
 impl Rig {
     /// A PCI-to-PCI bridge in `slot` with a card at device 0 behind it.
     fn bridge_with_card_behind(&self, slot: u8) -> Arc<Card> {
-        let p2p = PciToPciBridge::new(self.bridge.bus(), DevFn { device: slot, function: 0 }, 0x1011, 0x0026);
+        let p2p = PciToPciBridge::with_io32_windows(self.bridge.bus(), DevFn { device: slot, function: 0 }, 0x1011, 0x0026, 0);
         let c = Card::new(PCI_INTA);
         p2p.secondary().attach(DevFn { device: 0, function: 0 }, c.clone());
         self.attach(slot, p2p);
@@ -640,6 +640,33 @@ fn an_absent_device_behind_a_pci_bridge_master_aborts_at_the_bridge() {
     assert_ne!(r.get(reg::INT_STATUS) & INT_PCI_MASTER_TIMEOUT, 0);
 }
 
+/// IRIX 6.5.30 places the ISP2200's I/O BAR at PCI I/O 0x200000 behind the
+/// card cage's DEC bridge and opens the bridge's I/O window there with the
+/// upper 16-bit registers. A slot device window aimed at I/O offset 2 MB
+/// then reaches the card's registers through its I/O BAR.
+#[test]
+fn an_io_bar_above_64k_behind_a_dec_bridge_answers() {
+    let r = Rig::new();
+    let c = r.bridge_with_card_behind(1);
+    assert_eq!(r.cfg_read(1, 0x1c, 1) & 0x0f, 1, "32-bit I/O addressing");
+    r.cfg_write(1, 0x18, 4, 0x0001_0100);
+    r.type1_target(1, 0);
+    r.type1_write(0, 0x10, 4, 0x0020_0000);
+    r.type1_write(0, 0x04, 2, PCI_COMMAND_IO);
+    assert_eq!(c.state().config().bar_base(0), 0x0020_0000);
+    r.cfg_write(1, 0x1c, 2, 0x0000);
+    r.cfg_write(1, 0x30, 4, 0x0020_0020);
+    r.cfg_write(1, 0x04, 2, PCI_COMMAND_IO);
+    r.set(reg::device(1), 2); // I/O space, PCI offset 2 MB
+    assert_eq!(r.bridge.read32(u64::from(Rig::win(1) + FIXED)).data, 0x1234_5678);
+    assert_eq!(r.bridge.write32(u64::from(Rig::win(1) + SCRATCH), 0x8b7a_6950), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0x8b7a_6950);
+    // Without the upper halves the window is 0x0000..0x0fff and the BAR is dark.
+    r.cfg_write(1, 0x30, 4, 0);
+    r.set(reg::INT_ENABLE, INT_PCI_MASTER_TIMEOUT);
+    assert!(!r.bridge.read32(u64::from(Rig::win(1) + FIXED)).is_ok());
+}
+
 // ---- the 2 GB window ----
 
 /// Through the widget's 2 GB window the first 16 MB is the small window
@@ -669,6 +696,37 @@ fn the_2gb_window_reaches_pci_memory_through_the_32_bit_alias() {
     // cycle carried.
     assert_eq!(r.get(reg::PCI_ERR_UPPER), 0);
     assert_eq!(r.get(reg::PCI_ERR_LOWER), 0x2000_0000);
+}
+
+/// The widget's 64 GB window shows the 2 GB window's contents, then the
+/// 64-bit alias of the same PCI memory at 0x8000_0000 and PCI I/O space at
+/// 4 GB (Bridge specification p. 52), with Control's swap bits placing the
+/// bytes. OpenBSD's xbridge(4) reaches the Octane's onboard IOC3 this way.
+#[test]
+fn the_64gb_window_reaches_pci_memory_and_io() {
+    let r = Rig::new();
+    let c = r.card(1, PCI_INTA); // memory BAR at PCI 0x1300_0000, I/O at 0x2000
+    let huge = r.bridge.huge_window();
+    let at = |off: u64| 0xf0_0000_0000 + off;
+    assert_eq!(huge.read32(at(u64::from(reg::IDENTIFICATION) + 4)).data, r.get(reg::IDENTIFICATION));
+    let mem32 = |pci: u32| at(u64::from(PIO32_ALIAS + pci));
+    let mem64 = |pci: u32| at(PIO64_ALIAS + u64::from(pci));
+    let io = |pci: u32| at(PIO_IO_ALIAS + u64::from(pci));
+    assert_eq!(huge.read32(mem32(0x1300_0000 + FIXED)).data, 0x1234_5678, "the 32-bit alias");
+    assert_eq!(huge.read32(mem64(0x1300_0000 + FIXED)).data, 0x1234_5678, "the 64-bit alias");
+    assert_eq!(huge.write32(io(0x2000 + SCRATCH), 0x8b7a_6950), BUS_OK);
+    assert_eq!(c.peek32(SCRATCH as usize), 0x8b7a_6950, "PCI I/O space");
+    assert_eq!(huge.read8(io(0x2000 + (FIXED ^ 3))).data, 0x78, "a byte moves to its position");
+    r.set(reg::CONTROL, r.get(reg::CONTROL) | CONTROL_IO_SWAP);
+    assert_eq!(huge.read32(io(0x2000 + FIXED)).data, 0x7856_3412, "I/O swap set: a byte stream");
+    assert_eq!(huge.read32(mem32(0x1300_0000 + FIXED)).data, 0x1234_5678, "memory keeps its own swap bit");
+    // Beyond PCI I/O space and between the small window and the alias,
+    // nothing answers.
+    assert!(!huge.read32(at(0x2_0000_0000)).is_ok());
+    assert!(!huge.read32(at(0x0100_0000)).is_ok());
+    // The 2 GB window stops at 2 GB: its mask folds the 64 GB window's
+    // offsets back into it.
+    assert_eq!(r.bridge.long_window().read32(0xf_8000_0000 + u64::from(PIO32_ALIAS + 0x1300_0000 + FIXED)).data, 0x1234_5678);
 }
 
 /// A BAR the alias decodes whole is published as a run at its alias

@@ -23,6 +23,24 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - Linux's qla2xxx brings the ISP2200's loop online and finds its disks on the
   Octane (Linux 7.3); it stopped at the port login, which the adapter refused.
+### Octane
+
+- The Bridges' 64 GB windows reach PCI: the 32-bit and 64-bit aliases of PCI
+  memory and PCI I/O space, on the onboard Bridge and on the PCI module's
+  and shoehorn's. OpenBSD 6.9's kernel, which reaches the IOC3 this way,
+  no longer stops with a bus error before its first message.
+- `[virtio_serial] bridge_slot` and `[virtio_9p] bridge_slot` move the
+  Octane's virtio devices within the onboard Bridge's slots 4 to 7.
+- virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
+  the SuperIO interrupt pin: Linux's serial console no longer dies when
+  virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
+### PCI-to-PCI bridges
+
+- The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes
+  32-bit I/O, as the DEC 21154 it reports does, so an I/O BAR above 64 KiB
+  behind it reaches the card. IRIX 6.5.30 on the Octane puts the ISP2200's
+  there and no longer warns `ppb IO base/limit conflict` at boot. The
+  bridge's ISA enable bit now blocks what it blocks on the real part.
 
 ### Display
 

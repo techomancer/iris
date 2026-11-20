@@ -69,7 +69,14 @@ struct Selectors {
 }
 
 impl VirtioPci {
+    /// A function on interrupt pin A.
     pub fn new(core: VirtioCore) -> Self {
+        Self::with_pin(core, PCI_INTA)
+    }
+
+    /// A function whose interrupt is on `pin` (1 = INTA .. 4 = INTD), for a
+    /// slot whose INTA line is taken by the board.
+    pub fn with_pin(core: VirtioCore, pin: u8) -> Self {
         let id = core.device_id() as u16;
         // The capability list starts at 0x40: common, notify, ISR, device.
         let mut caps = Vec::new();
@@ -83,7 +90,7 @@ impl VirtioPci {
             CLASS_COMM_OTHER,
             1,
             [Bar::Mem(BAR_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused],
-            PCI_INTA,
+            pin,
         )
         .with_capabilities(16, &caps);
         // Subsystem: vendor and the virtio device ID.

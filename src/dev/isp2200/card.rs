@@ -51,7 +51,7 @@ impl Card {
     pub fn attach(&self, bus: &PciBus, device: u8) {
         let at = |device| DevFn { device, function: 0 };
         if self.bridge {
-            let ppb = PciToPciBridge::new(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE);
+            let ppb = PciToPciBridge::with_io32_windows(bus, at(device), BRIDGE_VENDOR, BRIDGE_DEVICE, 0);
             bus.attach(at(device), ppb.clone());
             ppb.secondary().attach(at(0), self.fc.clone());
         } else {

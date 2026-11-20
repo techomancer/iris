@@ -471,8 +471,9 @@ smaller than that at the top of memory is reached through the bus.
 
 The bus is 40 bits wide end to end, so memory beyond 4 GB and the 64 GB
 windows at `w << 36` (§2's huge windows, which `src/ip30.rs` calls large)
-are in the table; a widget is attached with or without that window (the
-Bridge's is not). Bus masters
+are in the table; a widget is attached with or without that window, and a
+Bridge's 64 GB window is a view of its XIO space of its own (the small window,
+the PCI memory aliases and PCI I/O space, §8). Bus masters
 (the Bridge's PCI functions, HQ4) do not see the processor's map: they get
 SDRAM only, by 64-bit physical address, through HEART's DMA view; an absent
 bank is a bus error where the CPU reads 0. A device window page that one PCI

@@ -3332,4 +3332,28 @@ mod virtio_tests {
         cfg.virtio_9p.path = "/tmp".into();
         assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("a GIO slot holds one device"));
     }
+
+    /// On the Octane the virtio devices take Bridge slots 4 and 5 unless
+    /// `bridge_slot` names one of 4 to 7, and two cannot share one.
+    #[cfg(unix)]
+    #[test]
+    fn octane_virtio_bridge_slots() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::OctaneIp30;
+        cfg.virtio_serial.enabled = true;
+        cfg.virtio_9p.enabled = true;
+        cfg.virtio_9p.path = "/tmp".into();
+        assert_eq!(cfg.octane_virtio_slots(), Ok((7, 5)));
+        cfg.virtio_serial.bridge_slot = Some(6);
+        cfg.virtio_9p.bridge_slot = Some(7);
+        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 7)));
+        assert_eq!(cfg.validate_virtio_9p_for_test(), Ok(()));
+        cfg.virtio_9p.bridge_slot = Some(6);
+        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("both in Bridge slot 6"));
+        cfg.virtio_9p.bridge_slot = Some(3);
+        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("slots 4 to 7"));
+        cfg.virtio_9p.enabled = false;
+        cfg.virtio_9p.bridge_slot = Some(6);
+        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 6)), "a disabled device holds no slot");
+    }
 }
