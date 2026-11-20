@@ -127,7 +127,8 @@ Selects which 1 MB page of the 16 MB RAMROM is visible through the `0x1F500000` 
 | :---  | :--- |
 | [5:0] | 6-bit payload written by the N64 to `0x18000000` |
 
-Reading this register simultaneously de-asserts the GIO interrupt line on the Indy.
+Reading this register clears the pending N64→host GIO interrupt. The Indy's GIO interrupt
+line falls unless an RDB interrupt (`PROD_ID` bit 30 or 31) is still pending.
 
 ### 2.6 GIO Sync Register (`0x1F400E00` / N64 `0x18000400` — Read/Write both sides)
 

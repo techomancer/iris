@@ -23,12 +23,13 @@
 mod imp {
 
 use crate::devlog::{devlog, devlog_is_active, LogModule};
-use crate::irq::IrqLine;
+use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::traits::{BusDevice, BusRead32, BusRead64, BusRead16, BusRead8, BUS_OK, Device};
 use crate::ultra_proto::{h2n, n2h, rdb_type, rdb_bytes, IpcRing, ShmHeader,
     SHM_MAGIC, SHM_VERSION, EVENT_AREA_SIZE, SHM_HEADER_OFFSET, SHM_RAMROM_OFFSET,
     RAMROM_TOTAL, SHM_TOTAL_SIZE};
 use parking_lot::Mutex;
+use std::sync::OnceLock;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,10 +78,76 @@ struct Ultra64State {
     rdb_n2h_ack:      u32,   // running ACK counter
 }
 
+/// The card has one interrupt pin, GIO expansion slot 0, and three sources
+/// behind it: the N64's GIO interrupt (cleared by reading GIO_INT_ACK) and
+/// the two RDB flags in PROD_ID bits 30 and 31 (each cleared by its own
+/// write). The pin is high while any of them is pending, so acknowledging
+/// one leaves the line up for the others.
+impl IrqLevel for Ultra64State {
+    fn irq_level(&self) -> bool {
+        self.gio_int_pending || self.rdb_r_int || self.rdb_w_int
+    }
+}
+
+/// The state and the line it drives, shared with the n2h listener thread.
+/// Every change to a pending flag happens under the [`IrqMutex`], which
+/// drives the line from all three flags before it lets go, so two threads'
+/// changes reach the IOC in the order they were made.
+struct Shared {
+    state: IrqMutex<Ultra64State>,
+    irq:   OnceLock<IrqLine>,
+}
+
+impl Shared {
+    fn lock(&self) -> crate::irq::IrqGuard<'_, Ultra64State> {
+        self.state.lock(&self.irq)
+    }
+
+    /// One message from the N64 side of the bridge.
+    fn on_n2h(&self, kind: u32, payload: u32) {
+        match kind {
+            n2h::GIO_INT => {
+                dlog!(LogModule::Ultra, "GIO_INT from N64: payload={:#04x}", payload);
+                let mut st = self.lock();
+                st.gio_int_pending = true;
+                st.gio_int_payload = payload & 0x3F;
+            }
+            n2h::GIO_SYNC => {
+                dlog!(LogModule::Ultra, "GIO_SYNC from N64: val={:#04x}", payload);
+                self.lock().gio_sync = payload & 0x3F;
+            }
+            n2h::RDB_READ => {
+                // N64 has read the packet Indy sent via GIO_RDB_BASE_REG.
+                // Set product_id bit 30 (rdb_r_int) and fire GIO interrupt
+                // so u64_giointr()'s bit-30 path calls send_write_buffer().
+                dlog!(LogModule::Ultra, "RDB_READ ACK from N64 → set rdb_r_int, assert GioExp0");
+                self.lock().rdb_r_int = true;
+            }
+            n2h::RDB_WRITE => {
+                // N64 wrote a packet to GIO_RDB_BASE_REG.
+                // Store it and assert rdb_w_int (PROD_ID bit 31) so
+                // IRIX's GIO interrupt handler sees it on GIO_RDB_WRITE_INTR_BIT.
+                let t = rdb_type(payload);
+                let b = rdb_bytes(payload);
+                dlog!(LogModule::Ultra,
+                    "RDB_WRITE from N64: pkt={:#010x} type={} len={} data={:#07x} bytes={:02x}{:02x}{:02x}",
+                    payload, t, (payload >> 18) & 0xFF,
+                    payload & 0x3FFFF, b[0], b[1], b[2]);
+                let mut st = self.lock();
+                st.rdb_n2h   = payload;
+                st.rdb_w_int = true;
+            }
+            _ => {
+                dlog!(LogModule::Ultra, "n2h unknown kind={} payload={:#010x}", kind, payload);
+            }
+        }
+    }
+}
+
 pub struct Ultra64 {
-    state:    Arc<Mutex<Ultra64State>>,
-    /// The board's interrupt: GIO expansion slot 0 on an Indy.
-    irq:      IrqLine,
+    /// The registers, and the board's interrupt (GIO expansion slot 0 on an
+    /// Indy) driven from them.
+    shared:   Arc<Shared>,
     shmem:    shared_memory::Shmem,
     // raw pointers into shmem, valid for its lifetime
     hdr_ptr:    *mut ShmHeader,
@@ -98,16 +165,21 @@ unsafe impl Sync for Ultra64 {}
 
 impl Ultra64 {
     pub fn new(irq: IrqLine) -> Result<Self, String> {
+        Self::with_os_id(irq, SHM_OS_ID)
+    }
+
+    /// Like [`Ultra64::new`], with the bridge's shared memory under `os_id`.
+    fn with_os_id(irq: IrqLine, os_id: &str) -> Result<Self, String> {
         // Unlink any stale shm left by a previous crash before creating fresh.
         // This is safe: the mapping only matters while iris is running, and if
         // gopher64 is already attached it will notice iris restarted via magic check.
         #[cfg(unix)] {
-            let shm_name = std::ffi::CString::new(SHM_OS_ID).unwrap();
+            let shm_name = std::ffi::CString::new(os_id).unwrap();
             unsafe { libc::shm_unlink(shm_name.as_ptr()); } // ignore ENOENT
         }
 
         let shmem = ShmemConf::new()
-            .os_id(SHM_OS_ID)
+            .os_id(os_id)
             .size(SHM_TOTAL_SIZE)
             .create()
             .map_err(|e| format!("ultra64: shm create failed: {e}"))?;
@@ -142,21 +214,23 @@ impl Ultra64 {
             (*hdr_ptr).version = 1;
         }
 
-        let state = Arc::new(Mutex::new(Ultra64State {
+        let state = IrqMutex::new(Ultra64State {
             dram_page: 0, n64_in_reset: false,
             gio_int_pending: false, gio_int_payload: 0,
             gio_sync: 0, cart_int_payload: 0,
             rdb_r_int: false, rdb_w_int: false,
             rdb_h2n: 0, rdb_n2h: 0, rdb_n2h_ack: 0,
-        }));
+        });
+        let shared = Arc::new(Shared { state, irq: OnceLock::from(irq) });
 
         Ok(Ultra64 {
-            state, irq, shmem, hdr_ptr, ramrom_ptr, evt_h2n, evt_n2h,
+            shared, shmem, hdr_ptr, ramrom_ptr, evt_h2n, evt_n2h,
             running: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
         })
     }
 
+    fn lock(&self) -> crate::irq::IrqGuard<'_, Ultra64State> { self.shared.lock() }
     fn hdr(&self) -> &ShmHeader         { unsafe { &*self.hdr_ptr } }
     fn hdr_mut(&self) -> &mut ShmHeader { unsafe { &mut *self.hdr_ptr } }
 }
@@ -175,8 +249,7 @@ impl Device for Ultra64 {
             return; // already running
         }
 
-        let state    = Arc::clone(&self.state);
-        let irq      = self.irq.clone();
+        let shared   = Arc::clone(&self.shared);
         let evt_n2h  = Arc::clone(&self.evt_n2h);
         let running  = Arc::clone(&self.running);
         let hdr_ptr  = self.hdr_ptr as usize;
@@ -193,47 +266,7 @@ impl Device for Ultra64 {
                             // Drain the n2h ring — every message is a discrete event.
                             let hdr = unsafe { &mut *(hdr_ptr as *mut ShmHeader) };
                             while let Some((kind, payload)) = hdr.n2h_ring.pop() {
-                                match kind {
-                                    n2h::GIO_INT => {
-                                        dlog!(LogModule::Ultra, "GIO_INT from N64: payload={:#04x}", payload);
-                                        let mut st = state.lock();
-                                        st.gio_int_pending = true;
-                                        st.gio_int_payload = payload & 0x3F;
-                                        drop(st);
-                                        irq.set(true);
-                                    }
-                                    n2h::GIO_SYNC => {
-                                        dlog!(LogModule::Ultra, "GIO_SYNC from N64: val={:#04x}", payload);
-                                        state.lock().gio_sync = payload & 0x3F;
-                                    }
-                                    n2h::RDB_READ => {
-                                        // N64 has read the packet Indy sent via GIO_RDB_BASE_REG.
-                                        // Set product_id bit 30 (rdb_r_int) and fire GIO interrupt
-                                        // so u64_giointr()'s bit-30 path calls send_write_buffer().
-                                        dlog!(LogModule::Ultra, "RDB_READ ACK from N64 → set rdb_r_int, assert GioExp0");
-                                        state.lock().rdb_r_int = true;
-                                        irq.set(true);
-                                    }
-                                    n2h::RDB_WRITE => {
-                                        // N64 wrote a packet to GIO_RDB_BASE_REG.
-                                        // Store it and assert rdb_w_int (PROD_ID bit 31) so
-                                        // IRIX's GIO interrupt handler sees it on GIO_RDB_WRITE_INTR_BIT.
-                                        let t = rdb_type(payload);
-                                        let b = rdb_bytes(payload);
-                                        dlog!(LogModule::Ultra,
-                                            "RDB_WRITE from N64: pkt={:#010x} type={} len={} data={:#07x} bytes={:02x}{:02x}{:02x}",
-                                            payload, t, (payload >> 18) & 0xFF,
-                                            payload & 0x3FFFF, b[0], b[1], b[2]);
-                                        let mut st = state.lock();
-                                        st.rdb_n2h   = payload;
-                                        st.rdb_w_int = true;
-                                        drop(st);
-                                        irq.set(true);
-                                    }
-                                    _ => {
-                                        dlog!(LogModule::Ultra, "n2h unknown kind={} payload={:#010x}", kind, payload);
-                                    }
-                                }
+                                shared.on_n2h(kind, payload);
                             }
                         }
                         Err(_) => break,
@@ -262,7 +295,7 @@ impl Device for Ultra64 {
     fn execute_command(&self, _cmd: &str, args: &[&str], mut w: Box<dyn IoWrite + Send>) -> Result<(), String> {
         match args.first().copied() {
             Some("status") => {
-                let st  = self.state.lock();
+                let st  = self.lock();
                 let hdr = self.hdr();
                 writeln!(w, "=== Ultra64 Status ===").unwrap();
                 writeln!(w, "  running         : {}", self.running.load(Ordering::Relaxed)).unwrap();
@@ -289,7 +322,7 @@ impl Device for Ultra64 {
                     .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                     .ok_or("usage: ultra send <hex6>")?;
                 let payload = payload & 0x3F;
-                self.state.lock().cart_int_payload = payload;
+                self.lock().cart_int_payload = payload;
                 self.hdr_mut().h2n_ring.push(h2n::CART_INT, payload);
                 let _ = self.evt_h2n.set(EventState::Signaled);
                 writeln!(w, "CART_INT sent: payload={:#04x}", payload).unwrap();
@@ -429,10 +462,10 @@ impl BusDevice for Ultra64 {
                     // Indy reads N64's packet. Bit 31 (rdb_w_int) is cleared by writing
                     // GIO_RDB_WRITE_INTR_REG (+0x8), which the driver does first.
                     // Reading the packet here is the ACK — tell N64 it can send the next one.
-                    let val = self.state.lock().rdb_n2h;
+                    let val = self.lock().rdb_n2h;
                     dlog!(LogModule::Ultra, "rd RDB_BASE (N64→Indy) → {:#010x}", val);
                     let new_ack = {
-                        let mut st = self.state.lock();
+                        let mut st = self.lock();
                         st.rdb_n2h_ack = st.rdb_n2h_ack.wrapping_add(1);
                         st.rdb_n2h_ack
                     };
@@ -450,7 +483,7 @@ impl BusDevice for Ultra64 {
         // RAMROM window (0x1F500000–0x1F5FFFFF)
         if addr >= RAMROM_BASE && addr < RAMROM_BASE + RAMROM_SIZE {
             let win_off = (addr - RAMROM_BASE) as usize;
-            let page    = self.state.lock().dram_page as usize;
+            let page    = self.lock().dram_page as usize;
             let ram_off = page * RAMROM_SIZE as usize + win_off;
             if ram_off + 4 <= RAMROM_TOTAL {
                 // RAMROM bytes are stored big-endian (N64 file order); swap to host.
@@ -463,7 +496,7 @@ impl BusDevice for Ultra64 {
         let offset = addr.wrapping_sub(GIO_SLOT0_BASE);
         match offset {
             0x000 => {
-                let st = self.state.lock();
+                let st = self.lock();
                 let mut v: u32 = 0x0000_0015;
                 if st.rdb_r_int { v |= 1 << 30; }
                 if st.rdb_w_int { v |= 1 << 31; }
@@ -473,31 +506,30 @@ impl BusDevice for Ultra64 {
             // Accept both documented address (0x600, SDK manpage) and kernel struct address
             // (0xA00, u64gio.h padding).  Log both so we can see which the installed driver uses.
             0x600 => {
-                let page = self.state.lock().dram_page;
+                let page = self.lock().dram_page;
                 dlog!(LogModule::Ultra, "rd DRAM_PAGE @+0x600 → page={}", page);
                 BusRead32::ok(page)
             }
             0xA00 => {
-                let page = self.state.lock().dram_page;
+                let page = self.lock().dram_page;
                 dlog!(LogModule::Ultra, "rd DRAM_PAGE @+0xA00 → page={}", page);
                 BusRead32::ok(page)
             }
             0x800 => {
-                let payload = self.state.lock().cart_int_payload & 0x3F;
+                let payload = self.lock().cart_int_payload & 0x3F;
                 dlog!(LogModule::Ultra, "rd CART_INT @+0x800 → {:#04x}", payload);
                 BusRead32::ok(payload)
             }
             0xC00 => {
-                let mut st = self.state.lock();
+                let mut st = self.lock();
                 let payload = st.gio_int_payload & 0x3F;
                 st.gio_int_pending = false;
                 drop(st);
-                self.irq.set(false);
                 dlog!(LogModule::Ultra, "rd GIO_INT_ACK @+0xC00 → {:#04x}", payload);
                 BusRead32::ok(payload)
             }
             0xE00 => {
-                let v = self.state.lock().gio_sync & 0x3F;
+                let v = self.lock().gio_sync & 0x3F;
                 dlog!(LogModule::Ultra, "rd GIO_SYNC @+0xE00 → {:#04x}", v);
                 BusRead32::ok(v)
             }
@@ -518,28 +550,27 @@ impl BusDevice for Ultra64 {
                     // Indy writes RDB packet to N64. rdb_r_int (bit 30) will be set
                     // when N64 reads the packet back (via n2h::RDB_READ from gopher64).
                     dlog!(LogModule::Ultra, "wr RDB_BASE (Indy→N64) val={:#010x}", val);
-                    self.state.lock().rdb_h2n = val;
+                    self.lock().rdb_h2n = val;
                     self.hdr_mut().h2n_ring.push(h2n::RDB_WRITE, val);
                     let _ = self.evt_h2n.set(EventState::Signaled);
                 }
                 0x8 => {
                     // GIO_RDB_WRITE_INTR_REG: W0C — clears product_id bit 31 (rdb_w_int)
-                    // and lowers the GIO interrupt. Driver writes this before reading the packet.
-                    dlog!(LogModule::Ultra, "wr GIO_RDB_WRITE_INTR_REG (clear rdb_w_int, lower GioExp0)");
-                    self.state.lock().rdb_w_int = false;
-                    self.irq.set(false);
+                    // and lowers the GIO interrupt unless another source is pending. Driver
+                    // writes this before reading the packet.
+                    dlog!(LogModule::Ultra, "wr GIO_RDB_WRITE_INTR_REG (clear rdb_w_int)");
+                    self.lock().rdb_w_int = false;
                 }
                 0xC => {
                     // GIO_RDB_READ_INTR_REG: W0C — driver writes 0 to clear product_id bit 30
                     // (Indy-ACKed-N64-read flag). Also sends ACK to N64 (raises N64 CAUSE.IP6).
                     // Driver flow: sees bit30 set → write +0xC to clear it → call send_write_buffer()
                     dlog!(LogModule::Ultra, "wr GIO_RDB_READ_INTR_REG (clear rdb_r_int, ACK N64 → CAUSE.IP6)");
-                    let mut st = self.state.lock();
+                    let mut st = self.lock();
                     st.rdb_r_int  = false;
                     let new_ack   = st.rdb_n2h_ack.wrapping_add(1);
                     st.rdb_n2h_ack = new_ack;
                     drop(st);
-                    self.irq.set(false);
                     self.hdr_mut().h2n_ring.push(h2n::RDB_ACK, new_ack);
                     let _ = self.evt_h2n.set(EventState::Signaled);
                 }
@@ -552,7 +583,7 @@ impl BusDevice for Ultra64 {
 
         if addr >= RAMROM_BASE && addr < RAMROM_BASE + RAMROM_SIZE {
             let win_off = (addr - RAMROM_BASE) as usize;
-            let page    = self.state.lock().dram_page as usize;
+            let page    = self.lock().dram_page as usize;
             let ram_off = page * RAMROM_SIZE as usize + win_off;
             if ram_off + 4 <= RAMROM_TOTAL {
                 // Store big-endian so gopher64's from_be_bytes() reads the correct value.
@@ -567,7 +598,7 @@ impl BusDevice for Ultra64 {
                 let want_reset = val & 0b010 != 0;
                 let want_nmi   = val & 0b100 != 0;
                 dlog!(LogModule::Ultra, "wr RESET_CTRL @+0x400 val={:#04x} → reset={} nmi={}", val, want_reset as u8, want_nmi as u8);
-                let mut st = self.state.lock();
+                let mut st = self.lock();
                 let old_in_reset = st.n64_in_reset;
                 st.n64_in_reset = want_reset;
                 drop(st);
@@ -585,7 +616,7 @@ impl BusDevice for Ultra64 {
             0x800 => {
                 let payload = val & 0x3F;
                 dlog!(LogModule::Ultra, "wr CART_INT @+0x800 → payload={:#04x}", payload);
-                self.state.lock().cart_int_payload = payload;
+                self.lock().cart_int_payload = payload;
                 self.hdr_mut().h2n_ring.push(h2n::CART_INT, payload);
                 let _ = self.evt_h2n.set(EventState::Signaled);
             }
@@ -594,12 +625,12 @@ impl BusDevice for Ultra64 {
             0x600 => {
                 let page = (val >> 20) & 0xF;
                 dlog!(LogModule::Ultra, "wr DRAM_PAGE @+0x600 val={:#010x} → page={}", val, page);
-                self.state.lock().dram_page = page;
+                self.lock().dram_page = page;
             }
             0xA00 => {
                 let page = (val >> 20) & 0xF;
                 dlog!(LogModule::Ultra, "wr DRAM_PAGE @+0xA00 val={:#010x} → page={}", val, page);
-                self.state.lock().dram_page = page;
+                self.lock().dram_page = page;
             }
             0xC00 => {
                 dlog!(LogModule::Ultra, "wr GIO_INT_ACK @+0xC00 val={:#010x} (ignored)", val);
@@ -640,6 +671,81 @@ impl BusDevice for Ultra64 {
     fn write64(&self, addr: u64, val: u64) -> u32 {
         self.write32(addr, (val >> 32) as u32);
         self.write32(addr + 4, val as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::irq::LevelProbe;
+    use std::sync::atomic::AtomicU32;
+
+    const PROD_ID: u64     = GIO_SLOT0_BASE as u64;
+    const GIO_INT_ACK: u64 = GIO_SLOT0_BASE as u64 + 0xC00;
+    const RDB_WRITE_INTR: u64 = RDB_BASE as u64 + 0x8;
+    const RDB_READ_INTR: u64  = RDB_BASE as u64 + 0xC;
+
+    /// A board on its own shared memory, so tests running at once (and an
+    /// iris running on the same host) do not share a bridge.
+    fn board() -> (Arc<LevelProbe>, Ultra64) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let id = format!("iris_u64t_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+        let (probe, line) = LevelProbe::line();
+        (probe, Ultra64::with_os_id(line, &id).expect("ultra64 test board"))
+    }
+
+    #[test]
+    fn rdb_write_ack_keeps_a_pending_gio_int() {
+        let (probe, u) = board();
+        u.shared.on_n2h(n2h::GIO_INT, 0x2A);
+        u.shared.on_n2h(n2h::RDB_WRITE, 0x1234);
+        assert!(probe.level());
+        assert_eq!(u.read32(PROD_ID).data >> 30, 0b10);
+
+        u.write32(RDB_WRITE_INTR, 0);
+        assert!(probe.level(), "GIO_INT still pending after the RDB write ack");
+        assert_eq!(u.read32(PROD_ID).data >> 30, 0);
+
+        assert_eq!(u.read32(GIO_INT_ACK).data, 0x2A);
+        assert!(!probe.level());
+    }
+
+    #[test]
+    fn gio_int_ack_keeps_a_pending_rdb_read() {
+        let (probe, u) = board();
+        u.shared.on_n2h(n2h::RDB_READ, 0);
+        u.shared.on_n2h(n2h::GIO_INT, 0x01);
+        assert!(probe.level());
+
+        u.read32(GIO_INT_ACK);
+        assert!(probe.level(), "rdb_r_int still pending after the GIO_INT ack");
+        assert_eq!(u.read32(PROD_ID).data >> 30, 0b01);
+
+        u.write32(RDB_READ_INTR, 0);
+        assert!(!probe.level());
+    }
+
+    #[test]
+    fn line_falls_once_on_the_last_of_three_acks() {
+        let (probe, u) = board();
+        u.shared.on_n2h(n2h::GIO_INT, 0x05);
+        u.shared.on_n2h(n2h::RDB_READ, 0);
+        u.shared.on_n2h(n2h::RDB_WRITE, 0x99);
+        u.write32(RDB_READ_INTR, 0);
+        u.read32(GIO_INT_ACK);
+        assert!(probe.level());
+        u.write32(RDB_WRITE_INTR, 0);
+        assert!(!probe.level());
+        // One rise for three sources, one fall for three acks.
+        assert_eq!(probe.writes(), vec![true, false]);
+    }
+
+    #[test]
+    fn gio_sync_does_not_raise_the_line() {
+        let (probe, u) = board();
+        u.shared.on_n2h(n2h::GIO_SYNC, 0x07);
+        assert!(!probe.level());
+        assert_eq!(u.read32(GIO_SLOT0_BASE as u64 + 0xE00).data, 0x07);
     }
 }
 

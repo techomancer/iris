@@ -271,6 +271,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - macOS: the Indy now receives the N64 emulator's interrupts and RDB packets;
   the bridge's shared memory grew, so rebuild gopher64 against this IRIS.
+- Indy: acknowledging one of the board's interrupts (GIO, RDB read, RDB
+  write) no longer drops another that is still pending (issue 263).
 
 ### Indy and Indigo2 chime on the first boot
 
