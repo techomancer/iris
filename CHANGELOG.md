@@ -529,6 +529,8 @@ image) where the guest test suites showed they differed:
 
 ### Idle parking
 
+- With `idle-pause`, a single-processor machine whose guest has no interrupt
+  source (the Octane PROM menu, fx) no longer parks for good after a minute.
 - With `idle-pause`, multiprocessors (Octane, Tezro, Origin, Onyx) no longer
   stall at boot; `IRIS_IDLE_PEER_US` and `IRIS_IDLE_SLICE_US` bound a park.
 - An idle multiprocessor under jitv2 wakes far less often, and busy kernel

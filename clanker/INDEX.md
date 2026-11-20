@@ -436,6 +436,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
 | [idle-park-smp-run-queue-polling.md](perf/idle-park-smp-run-queue-polling.md) | rule | SMP idle parking: idle IRIX CPUs poll run queues without an IPI and stop their clocks; every park slice ends to poll, a CPU that ran a device/IPI handler or work kicks the others to poll (not on its own CP0 timer tick) so all-idle parks last 10 ms, only the newest batch's samples decide a re-park, a CPU parks only in a loop another idle CPU shares, and under jitv2 a probe run of interpreted batches finds the idle loop and learns its (PC, return address) exit signature |
 | [idle-pause-masked-interrupt-must-wake.md](perf/idle-pause-masked-interrupt-must-wake.md) | rule | idle-pause: a masked interrupt must end the park too |
+| [idle-pause-uniprocessor-park-must-end.md](perf/idle-pause-uniprocessor-park-must-end.md) | rule | idle-pause: a uniprocessor park must end on a time bound, not only on a line |
 | [idle-pause-must-not-park-with-interrupts-masked.md](perf/idle-pause-must-not-park-with-interrupts-masked.md) | rule | The idle-park heuristic must not park when Status.IM is zero |
 | [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice |
 | [idle-pause-work.md](perf/idle-pause-work.md) | history | Idle-pause work — findings & handoff |
