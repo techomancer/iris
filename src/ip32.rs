@@ -852,6 +852,8 @@ impl crate::traits::Device for Ip32Bus {
 impl BusDevice for Ip32Bus {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 { self.phys.gen_ptr(addr) }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { self.phys.code_page(addr) }
     fn read8(&self, addr: u64) -> BusRead8 { self.phys.read8(addr) }
     fn read16(&self, addr: u64) -> BusRead16 { self.phys.read16(addr) }
     fn read32(&self, addr: u64) -> BusRead32 { self.phys.read32(addr) }

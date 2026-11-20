@@ -62,6 +62,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | Note | Kind | Title |
 |---|---|---|
 | [alias-pages-must-share-generation-counters.md](jitv2/alias-pages-must-share-generation-counters.md) | rule | An aliased physical page must share its generation counter |
+| [pages-are-keyed-by-bank-and-offset.md](jitv2/pages-are-keyed-by-bank-and-offset.md) | design | A code page is keyed by bank:offset (`CodeKey`), found through `code_page` on the bus; frame tables per address space; remaps flush nothing; one pool per machine |
 | [bc1-is-an-ordinary-branch.md](jitv2/bc1-is-an-ordinary-branch.md) | measure | BC1 is an ordinary PC-relative branch, and compiling it is worth ~4x |
 | [block-fragmentation-blocks-cse.md](jitv2/block-fragmentation-blocks-cse.md) | measure | Block fragmentation, not callouts, is what starves `opt_level=speed` |
 | [callout-arg0-is-core-ptr.md](jitv2/callout-arg0-is-core-ptr.md) | rule | JIT→Rust callouts: arg 0 is always the `MipsCore` pointer |

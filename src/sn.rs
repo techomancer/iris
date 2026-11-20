@@ -505,6 +505,10 @@ impl<C: Send + Sync, const IO: bool> BusDevice for NodeQualifiedView<C, IO> {
     fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 {
         self.target(a).map_or(std::ptr::null(), |(d, at)| d.gen_ptr(at))
     }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> {
+        self.target(a).and_then(|(d, at)| d.code_page(at))
+    }
     access_widths!();
 }
 

@@ -326,6 +326,18 @@ pub fn machine(
         cpus.push(cpu);
     }
     world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
+    // One JIT for the machine: both nodes' processors compile through one
+    // queue into one page pool, each node an address space of it.
+    #[cfg(feature = "jitv2")]
+    {
+        let pool: Vec<_> = nodes
+            .iter()
+            .zip(&specs)
+            .zip(cpus.chunks(1))
+            .map(|((node, spec), cpus)| crate::cpu::jitv2::jitv2::PoolNode { cpus, module: spec.module, bus: node.chip.decode.physical().clone() })
+            .collect();
+        crate::cpu::jitv2::jitv2::share_pool(&pool, cfg.jitv2_pool_size(), cfg.jitv2.compile, &world)?;
+    }
     eprintln!(
         "iris: {}, {} node{} of {} MiB, {} x {}",
         cfg.machine.profile.product_name().unwrap_or_default(),
@@ -364,8 +376,6 @@ fn build_cpu(
         Arc::new(MipsCpu::new(*exec)) as Arc<dyn CpuDevice>
     });
     physical.connect_cpu(&*cpu, false)?;
-    #[cfg(feature = "jitv2")]
-    crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, physical.clone(), None);
     Ok(cpu)
 }
 

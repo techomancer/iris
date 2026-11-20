@@ -55,6 +55,109 @@ pub enum Signal {
     Interrupt(u32, bool),
 }
 
+/// What 4 KiB of runnable memory is, whatever address a processor reaches it
+/// at: the device that holds the bytes ([`CodeBank`]) and the page within it.
+/// The JIT keys compiled code by it, so the code follows the bytes when a
+/// memory controller moves a bank, and two processors that see the same bytes
+/// at different addresses share one compiled page.
+#[cfg(feature = "jitv2")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CodeKey {
+    pub bank: u32,
+    /// Page number within the bank: byte offset / 4096.
+    pub page: u32,
+}
+
+#[cfg(feature = "jitv2")]
+impl CodeKey {
+    /// The key of no page.
+    pub const NONE: CodeKey = CodeKey { bank: u32::MAX, page: u32::MAX };
+
+    /// The first of the bank numbers kept for pages no bank names
+    /// ([`Self::at_address`]); no [`CodeBank`] counts that far.
+    const ADDRESS_BANKS: u32 = u32::MAX - 0x100;
+
+    /// The key of a page that no bank on the bus names (a device behind a
+    /// bridge that does not forward the question): its address, in address
+    /// space `space` of the JIT pool. Private to that space, since only its
+    /// CPUs are known to see the same bytes there.
+    pub const fn at_address(space: usize, frame: u32, uncached: bool) -> CodeKey {
+        CodeKey { bank: Self::ADDRESS_BANKS + space as u32, page: frame << 1 | uncached as u32 }
+    }
+
+    /// Whether this is an [`Self::at_address`] key.
+    pub const fn is_address(self) -> bool {
+        self.bank >= Self::ADDRESS_BANKS && self.bank != u32::MAX
+    }
+
+    /// A bus that is one flat memory (a test bus, a tool) names a page by its
+    /// address, in bank 0, which no [`CodeBank`] is ever given.
+    pub const fn flat(addr: u64) -> CodeKey {
+        CodeKey { bank: 0, page: (addr >> 12) as u32 }
+    }
+
+    /// [`Self::flat`] as a bus answers it, counted by `gen`.
+    pub const fn flat_page(addr: u64, gen: *const std::sync::atomic::AtomicU64) -> CodePage {
+        CodePage { key: Self::flat(addr), gen, words: std::ptr::null() }
+    }
+}
+
+/// What a bus answers for a page of runnable memory: its key, and the bank's
+/// own write counter for the page. The counter belongs to the bank, not to an
+/// address: it stays the page's counter wherever a memory controller puts the
+/// bank (a ppmem window's counter for an address does not).
+#[cfg(feature = "jitv2")]
+#[derive(Clone, Copy, Debug)]
+pub struct CodePage {
+    pub key: CodeKey,
+    pub gen: *const std::sync::atomic::AtomicU64,
+    /// The page's 1024 words in the bank's own storage, for a bank that can
+    /// hand them out: the JIT's compile workers read the page there, with no
+    /// bus and no address. Like `gen` it belongs to the bank, stays put when
+    /// the bank moves on the bus, and is valid while the device lives. Null
+    /// for a device that cannot (a flash whose reads depend on its mode, a
+    /// test bus); such a page is read through the bus at a CPU's address.
+    pub words: *const u32,
+}
+
+/// The identity of one device that holds runnable memory: a RAM bank, a PROM,
+/// a flash part. Each takes the next number from one counter when it is built,
+/// so no two in the process share one.
+#[cfg(feature = "jitv2")]
+#[derive(Debug)]
+pub struct CodeBank(u32);
+
+#[cfg(feature = "jitv2")]
+impl CodeBank {
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        CodeBank(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn id(&self) -> u32 {
+        self.0
+    }
+
+    /// The key of the page holding byte `offset` of this bank.
+    #[inline]
+    pub fn key(&self, offset: u64) -> CodeKey {
+        CodeKey { bank: self.0, page: (offset >> 12) as u32 }
+    }
+
+    /// The page holding byte `offset` of this bank, counted by `gen`.
+    #[inline]
+    pub fn page(&self, offset: u64, gen: *const std::sync::atomic::AtomicU64) -> CodePage {
+        CodePage { key: self.key(offset), gen, words: std::ptr::null() }
+    }
+}
+
+#[cfg(feature = "jitv2")]
+impl Default for CodeBank {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Unified bus device interface supporting 8/16/32/64-bit accesses.
 ///
 /// Read methods return `BusRead{N}` with `status == BUS_OK` on success.
@@ -249,6 +352,18 @@ pub trait BusDevice: Send + Sync {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
         std::ptr::null()
+    }
+
+    /// JIT v2: which bank holds the 4 KiB page at `addr` and where in it
+    /// (the page's [`CodeKey`]), with the bank's counter for it, or `None`
+    /// where no bank answers (MMIO, a hole, a device that does not say). The
+    /// JIT keys a page fetched from there by its address and counts it with
+    /// [`Self::gen_ptr`], as it would a ROM. The answer changes when a memory controller
+    /// moves a bank; the bytes and the counter a key names do not. A bus that
+    /// forwards accesses forwards this too. `addr` is the start of the page.
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, _addr: u64) -> Option<CodePage> {
+        None
     }
 }
 

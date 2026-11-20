@@ -77,6 +77,10 @@ impl BusDevice for Window {
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
         self.local(address, 1).map(|local| self.device.gen_ptr(local)).unwrap_or(std::ptr::null())
     }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, address: u64) -> Option<crate::traits::CodePage> {
+        self.local(address, 1).and_then(|local| self.device.code_page(local))
+    }
     fn write64_masked(&self, a: u64, val: u64, mask: u64) -> u32 {
         if a & 7 != 0 {
             return BUS_ERR;
@@ -168,6 +172,10 @@ impl BusDevice for SparseWindowMap {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
         self.target(address).map(|window| window.gen_ptr(address)).unwrap_or(std::ptr::null())
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, address: u64) -> Option<crate::traits::CodePage> {
+        self.target(address).and_then(|window| window.code_page(address))
     }
     fn write64_masked(&self, address: u64, value: u64, mask: u64) -> u32 {
         self.target(address).map(|window| window.write64_masked(address, value, mask))

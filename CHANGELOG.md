@@ -504,6 +504,14 @@ image) where the guest test suites showed they differed:
 
 ### jitv2
 
+- jitv2: compiled code is kept when a memory controller moves a bank (the
+  PROM's memory sizing on Indy, O2, Octane and the IP27/IP35 machines no
+  longer flushes it), and addresses that reach the same memory share one
+  compiled page.
+- jitv2 on machines of several nodes (Origin 2000/Onyx2, Origin 3200/Onyx
+  3000): every processor shares one compile pool and one body of compiled
+  code, where each node had its own. `j2 pcp` shows a page's bank and offset;
+  `j2 status` counts remaps.
 - The compile pool no longer polls: an idle worker parks until a request
   arrives, instead of waking every 200µs (which cost about 1.4% of a host
   core per worker), and a small host can now settle. All machines.

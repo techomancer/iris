@@ -1321,6 +1321,18 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// Whether the JIT keys a code page by uncached fetch too (`set_cached_bus`).
     #[cfg(feature = "jitv2")]
     jitv2_split: bool,
+    /// This CPU's number in the JIT pool it runs on: its slot in each code
+    /// page's addresses and in the pool's buses. 0 with a pool of its own.
+    #[cfg(feature = "jitv2")]
+    jitv2_cpu: usize,
+    /// The pool's frame table this CPU looks pages up in: one per set of CPUs
+    /// that see memory at the same addresses (a node). 0 with a pool of its own.
+    #[cfg(feature = "jitv2")]
+    jitv2_space: usize,
+    /// Whether the tracked code page was fetched uncached (`jitv2_split`):
+    /// with `core.cur_code_pfn`, where this CPU reached `pcp`.
+    #[cfg(feature = "jitv2")]
+    pcp_uncached: bool,
     /// Refused posted stores so far, so `post_refused_store` can log sparsely.
     refused_stores: u64,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
@@ -1828,7 +1840,7 @@ unsafe extern "C" fn jit_fetch_verify<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::
         // address while `expected` is right, which looks like a coherent
         // "shift" but is really two unrelated regions. `tracked_pfn` vs
         // `phys_page` is what tells those apart.
-        let pcp_pfn: i64 = if exec.pcp.is_null() { -1 } else { unsafe { (*exec.pcp).pfn as i64 } };
+        let pcp_pfn: i64 = if exec.pcp.is_null() { -1 } else { exec.core.cur_code_pfn as i64 };
         eprintln!(
             "\n=== STALE COMPILED CODE at {:#018x}{} phys={:#010x} ===\n  compiled-in: {:08x}  {}\n  now in memory: {:08x}  {}\n  live pc={:#018x}  va_page={:#x}  phys_page={:#x}  tracked_pfn={}\n",
             va, sym, tr.phys,
@@ -2681,9 +2693,11 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         #[cfg(feature = "jitv2")]
         if !self.jitv2_split && !Arc::ptr_eq(&bus, &self.sysad) {
             self.jitv2_split = true;
-            self.jitv2.lock().split_uncached_code();
+            self.jitv2.lock().set_space(self.jitv2_space, self.jitv2_frames as usize, true);
         }
         self.cached_bus = bus;
+        #[cfg(feature = "jitv2")]
+        self.jitv2.lock().buses().set(self.jitv2_cpu, self.jitv2_space, self.cached_bus.clone(), self.sysad.clone());
     }
 
     /// Create a new executor from a config and a bus (sysad) and a TLB.
@@ -2968,6 +2982,12 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_frames: crate::cpu::jitv2::jitv2::frames_for(&cfg.memory),
             #[cfg(feature = "jitv2")]
             jitv2_split: false,
+            #[cfg(feature = "jitv2")]
+            jitv2_cpu: 0,
+            #[cfg(feature = "jitv2")]
+            jitv2_space: 0,
+            #[cfg(feature = "jitv2")]
+            pcp_uncached: false,
             refused_stores: 0,
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
@@ -3534,13 +3554,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// structural rather than a convention six call sites have to remember.
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn set_pcp(&mut self, page: *mut crate::cpu::jitv2::PhysicalCodePage) {
+    fn set_pcp(&mut self, page: *mut crate::cpu::jitv2::PhysicalCodePage, pfn: u32, uncached: bool) {
         self.pcp = page;
-        self.core.cur_code_pfn = if page.is_null() {
-            u32::MAX
-        } else {
-            unsafe { (*page).pfn }
-        };
+        self.core.cur_code_pfn = if page.is_null() { u32::MAX } else { pfn };
+        self.pcp_uncached = uncached;
+        // A compile for this CPU's request reads the page here.
+        if let Some(page) = unsafe { page.as_ref() } {
+            page.set_addr(self.jitv2_cpu, pfn, uncached);
+        }
     }
 
     /// Drop the currently tracked code page — the `null` counterpart to
@@ -3549,7 +3570,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[cfg(feature = "jitv2")]
     #[inline]
     fn clear_pcp(&mut self) {
-        self.set_pcp(std::ptr::null_mut());
+        self.set_pcp(std::ptr::null_mut(), u32::MAX, false);
     }
 
     /// Flush the page pool and compiled code from this CPU: every other CPU
@@ -3595,9 +3616,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     #[cfg(feature = "jitv2")]
-    fn jitv2_share(&mut self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>) {
+    fn jitv2_share(&mut self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>, cpu: usize, space: usize) {
+        assert!(cpu < crate::cpu::jitv2::jitv2::POOL_CPUS, "a JIT pool serves at most {} CPUs", crate::cpu::jitv2::jitv2::POOL_CPUS);
+        self.clear_pcp();
+        self.jitv2_cpu = cpu;
+        self.jitv2_space = space;
         {
-            let j = jit.lock();
+            let mut j = jit.lock();
+            j.set_space(space, self.jitv2_frames as usize, self.jitv2_split);
             self.jitv2_compile_queue_handle = j.compile_queue.queue_handle();
             self.jitv2_hot_queue_handle = j.compile_queue.hot_handle();
             self.jitv2_stats = j.stats.clone();
@@ -3611,9 +3637,23 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// `page_for` fast path (`jitv2_pfn_map`/`jitv2_pages_base`).
     #[cfg(feature = "jitv2")]
     pub fn jitv2_bind_fast_lookup(&mut self) {
-        let (map, pages) = self.jitv2.lock().fast_lookup_ptrs();
+        let mut j = self.jitv2.lock();
+        j.buses().set(self.jitv2_cpu, self.jitv2_space, self.cached_bus.clone(), self.sysad.clone());
+        let (map, pages) = j.fast_lookup_ptrs(self.jitv2_space);
         self.jitv2_pfn_map = map;
         self.jitv2_pages_base = pages;
+    }
+
+    /// A memory controller moved memory under this CPU's addresses. Compiled
+    /// code is keyed by the memory it was compiled from, not by its address,
+    /// so none is dropped: the CPU forgets which frame holds which page and
+    /// finds each again, by asking the bus, at its next fetch from it.
+    #[cfg(feature = "jitv2")]
+    pub(crate) fn jitv2_layout_changed(&mut self) {
+        // Translations hold addresses the move may have changed too.
+        self.nanotlb_invalidate();
+        self.clear_pcp();
+        self.jitv2.lock().forget_addresses(self.jitv2_space, self.jitv2_cpu);
     }
 
     /// Lock-free `pfn -> *mut PhysicalCodePage`, or `None` on a miss (which
@@ -3663,7 +3703,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.clear_pcp();
             return;
         };
-        let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn && (!SPLIT || (*self.pcp).uncached.is_some() == uncached) };
+        // Where this CPU reached the tracked page, kept beside the pointer:
+        // the page itself is keyed by its memory and may sit at another
+        // address for another CPU.
+        let same_page = !self.pcp.is_null() && self.core.cur_code_pfn == pfn && (!SPLIT || self.pcp_uncached == uncached);
         if same_page {
             return;
         }
@@ -3702,84 +3745,59 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.core.jit_trigger = true;
         }
 
-        // Lock-free hit path: an already-claimed page needs nothing but the
-        // `pfn -> slot -> page` indirection, which is two loads from arrays that
-        // never move; this skips `jitv2.lock()`.
+        // Lock-free hit path: a frame this address space has already reached
+        // needs nothing but the `frame -> slot -> page` indirection, which is
+        // two loads from arrays that never move; this skips `jitv2.lock()`
+        // and the bus.
         if let Some(page) = self.jitv2_lookup_page_fast(crate::cpu::jitv2::jitv2::page_key(pfn, uncached, SPLIT)) {
-            self.pcp = page;
-            self.core.cur_code_pfn = pfn;
-            debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
-                "jitv2_track_pcp fast path: pfn_map[{:#x}] pointed at a slot whose own pfn is {:#x}",
-                pfn, unsafe { (*self.pcp).pfn });
+            self.set_pcp(page, pfn, uncached);
             return;
         }
 
-        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
         // §13: live FR mode at first-arrival time, pinned into the page for
         // its whole lifetime (PhysicalCodePage::fr1's own doc comment) —
-        // ignored by page_for on a lookup hit (an already-claimed page keeps
-        // whatever it was pinned to).
+        // ignored by `claim_page` on a lookup hit (an already-claimed page
+        // keeps whatever it was pinned to).
         let fr1 = (self.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
-
-        let (mut jit, lookup) = {
-            crate::pf_scope!(crate::perfetto::events::JIT_CPU_TRACK);
-            let mut jit = self.jitv2.lock();
-            let lookup = jit.claim_page(pfn, page_base, self.cached_bus.as_ref(), uncached.then_some(&self.sysad), fr1);
-            // The first claim allocates the table, possibly after this executor bound.
-            if self.jitv2_pfn_map.is_null() {
-                self.jitv2_pfn_map = jit.pfn_map_ptr();
-            }
-            (jit, lookup)
+        let at = crate::cpu::jitv2::jitv2::PageAt { cpu: self.jitv2_cpu, space: self.jitv2_space, pfn, uncached };
+        let claim = self.jitv2_claim(at, fr1);
+        let claim = if claim == crate::cpu::jitv2::jitv2::Claim::Full {
+            // Pool exhausted: `flush_from_cpu_thread` resets to initial
+            // state and retries — always leaves room for at least one
+            // fresh page. Called from the CPU thread itself (this
+            // function), which is "as good as stopped" for its own
+            // purposes — no need to pause it — so this only pauses the
+            // *compile* queue internally, not the CPU.
+            self.jitv2_flush_from_here(true);
+            // `self.pcp` points into the pool the flush just cleared. The
+            // nanotlb's translations are untouched (memory did not move).
+            self.clear_pcp();
+            self.jitv2_claim(at, fr1)
+        } else {
+            claim
         };
-        match lookup {
-            Some(slot) => {
-                // Assigned directly rather than through `set_pcp`: the
-                // `jit` guard is still live here, so a `&mut self` call
-                // would conflict. `pfn` is the value `set_pcp` would have
-                // read back out of the slot anyway — this keeps the mirror
-                // exact without the borrow.
-                self.pcp = jit.page_ptr(slot);
-                self.core.cur_code_pfn = pfn;
-                // `pfn` here is the real physical frame number (`phys_addr`
-                // is post-translation, from nanotlb_translate's successful
-                // result — never a virtual page) — this must match the slot
-                // `page_for` just handed back, or self.pcp is now tracking
-                // the wrong physical page for this fetch (the exact failure
-                // shape `j2 pcp` can otherwise only reveal after the fact).
-                debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
-                    "jitv2_track_pcp: page_for({:#x}) returned a slot whose own pfn is {:#x}",
-                    pfn, unsafe { (*self.pcp).pfn });
+        match claim {
+            crate::cpu::jitv2::jitv2::Claim::Page(slot) => {
+                let page = self.jitv2.lock().page_ptr(slot);
+                self.set_pcp(page, pfn, uncached);
             }
-            None => {
-                // Pool exhausted: `flush_from_cpu_thread` resets to initial
-                // state and retries — always leaves room for at least one
-                // fresh page. Called from the CPU thread itself (this
-                // function), which is "as good as stopped" for its own
-                // purposes — no need to pause it — so this only pauses the
-                // *compile* queue internally, not the CPU.
-                drop(jit); // re-locks internally below; nothing needs it held across that call
-                self.jitv2_flush_from_here(true);
-                // Only `self.pcp` is actually stale here — it's a raw
-                // pointer into the `Vec<PhysicalCodePage>` mega_flush just
-                // cleared. The nanotlb's own translation slots (Fetch/Read/
-                // Write) are untouched by mega_flush (physical memory didn't
-                // move, only the JIT's compiled-code bookkeeping did), so
-                // there's no reason to blow those away too — just null the
-                // dangling pointer directly and re-derive it below for the
-                // exact page this fetch already landed on.
-                self.clear_pcp();
-                let mut jit = self.jitv2.lock();
-                let slot = jit.claim_page(pfn, page_base, self.cached_bus.as_ref(), uncached.then_some(&self.sysad), fr1)
-                    .expect("flush must leave room for at least one page");
-                // Direct assignment for the same borrow reason as the
-                // hit path above; `pfn` is what `set_pcp` would mirror.
-                self.pcp = jit.page_ptr(slot);
-                self.core.cur_code_pfn = pfn;
-                debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
-                    "jitv2_track_pcp (post-flush retry): page_for({:#x}) returned a slot whose own pfn is {:#x}",
-                    pfn, unsafe { (*self.pcp).pfn });
-            }
+            crate::cpu::jitv2::jitv2::Claim::Full => unreachable!("a flush leaves room for at least one page"),
         }
+    }
+
+    /// Ask the pool for the page at `at`, through the bus that decodes the fetch.
+    #[cfg(feature = "jitv2")]
+    #[cold]
+    fn jitv2_claim(&mut self, at: crate::cpu::jitv2::jitv2::PageAt, fr1: bool) -> crate::cpu::jitv2::jitv2::Claim {
+        crate::pf_scope!(crate::perfetto::events::JIT_CPU_TRACK);
+        let bus = if at.uncached { &self.sysad } else { &self.cached_bus };
+        let mut jit = self.jitv2.lock();
+        let claim = jit.claim_page(at, bus.as_ref(), fr1);
+        // The first claim allocates the table, possibly after this executor bound.
+        if self.jitv2_pfn_map.is_null() {
+            self.jitv2_pfn_map = jit.pfn_map_ptr(self.jitv2_space);
+        }
+        claim
     }
 
     /// Re-derive `translate_fn` from the current CP0 Status register.
@@ -4270,6 +4288,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 let req = crate::cpu::jitv2::CompileRequest {
                     page: self.pcp,
                     compiled_for_fr1,
+                    cpu: self.jitv2_cpu as u8,
                 };
                 if inline_compile {
                     // Sync compiles a page with no code, or one this arrival makes hot,
@@ -9513,7 +9532,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
-            let (phys_page_base, uncached) = (page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64, page.uncached.is_some());
+            let (phys_page_base, uncached) = (self.core.cur_code_pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64, self.pcp_uncached);
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.cached_bus.clone()); }
             self.clear_pcp();
             self.jitv2_track(phys_page_base, uncached);
@@ -9533,13 +9552,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // Stamp the L1-D geometry the inline load/store path needs. No
             // helper build here — see the note in Jitv2::worker_loop.
             codegen.dc_geometry = self.cache.jit_dc_geometry();
+            let buses = self.jitv2.lock().buses().clone();
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
-                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.cached_bus, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &buses, &mut self.jitv2_inline_analyzer, codegen, &stats);
             }
             #[cfg(not(feature = "developer"))]
-            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.cached_bus, &mut self.jitv2_inline_analyzer, codegen); }
+            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &buses, &mut self.jitv2_inline_analyzer, codegen); }
         }
         *self.jitv2.lock().codegen.lock() = codegen;
         {
@@ -9549,7 +9569,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
-            let (phys_page_base, uncached) = (page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64, page.uncached.is_some());
+            let (phys_page_base, uncached) = (self.core.cur_code_pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64, self.pcp_uncached);
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.cached_bus.clone()); }
             self.clear_pcp();
             self.jitv2_track(phys_page_base, uncached);
@@ -10891,13 +10911,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         Ok(())
     }
 
-    /// A flush a remap posted while the CPU was not running. It shares the park
+    /// A remap request posted while the CPU was not running. It shares the park
     /// bit, so a stepper must take it or `step_int` retries for ever.
-    pub(crate) fn take_flush_request(&self, exec: &mut MipsExecutor<T, C>) {
+    pub(crate) fn take_remap_request(&self, exec: &mut MipsExecutor<T, C>) {
         #[cfg(feature = "jitv2")]
-        if self.park.release(crate::cpu::smp::REQUEST_JIT_FLUSH) {
-            exec.jitv2_flush_from_here(false);
-            exec.nanotlb_invalidate();
+        if self.park.release(crate::cpu::smp::REQUEST_JIT_REMAP) {
+            exec.jitv2_layout_changed();
         }
         #[cfg(not(feature = "jitv2"))]
         let _ = exec;
@@ -10913,7 +10932,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// reach identical state after the same number of steps.
     pub fn step_n_inline(&self, n: u64) -> Result<u64, String> {
         let mut exec = self.try_lock_executor()?;
-        self.take_flush_request(&mut exec);
+        self.take_remap_request(&mut exec);
         let mut executed = 0u64;
         for _ in 0..n {
             let _status = exec.step_int();
@@ -11359,11 +11378,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 // Another thread is holding this CPU: stop here, between
                 // instructions, outside compiled code, with the executor free.
                 if guard.core.hot.interrupts.load(Ordering::Relaxed) & crate::cpu::smp::HOST_PARK_BIT != 0 {
-                    // A remap moved memory under compiled code: flush, look again.
+                    // A remap moved memory: forget where the code pages are, look again.
                     #[cfg(feature = "jitv2")]
-                    if park.release(crate::cpu::smp::REQUEST_JIT_FLUSH) {
-                        guard.jitv2_flush_from_here(false);
-                        guard.nanotlb_invalidate();
+                    if park.release(crate::cpu::smp::REQUEST_JIT_REMAP) {
+                        guard.jitv2_layout_changed();
                         continue;
                     }
                     #[cfg(feature = "jitv2")]
@@ -11567,7 +11585,10 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// Use this page pool and compiled code, shared with the other CPUs, whose
     /// flushes `world` coordinates. Before the CPU first runs.
     #[cfg(feature = "jitv2")]
-    fn share_jitv2(&self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>);
+    /// Run on `jit`, a pool other CPUs run on too, as its CPU number `cpu`,
+    /// looking pages up in its address space `space` (the same for CPUs that
+    /// see memory at the same addresses, as the CPUs of one node do).
+    fn share_jitv2(&self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>, cpu: usize, space: usize);
     fn monitor_execute(&self, cmd: &str, args: &[&str], writer: Box<dyn Write + Send>) -> Result<(), String>;
     fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr;
     fn interrupts_ptr(&self) -> *const AtomicU64;
@@ -11644,9 +11665,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn monitor_commands(&self) -> Vec<(String, String)> { MipsCpu::monitor_commands(self) }
     fn park_slot(&self) -> Arc<crate::cpu::smp::ParkSlot> { self.park.clone() }
     #[cfg(feature = "jitv2")]
-    fn share_jitv2(&self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>) {
+    fn share_jitv2(&self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>, cpu: usize, space: usize) {
         let mut exec = self.executor.lock();
-        exec.jitv2_share(jit, world);
+        exec.jitv2_share(jit, world, cpu, space);
     }
     fn monitor_execute(&self, cmd: &str, args: &[&str], writer: Box<dyn Write + Send>) -> Result<(), String> {
         MipsCpu::monitor_execute(self, cmd, args, writer)

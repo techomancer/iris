@@ -89,6 +89,9 @@ pub struct CfiFlash {
     /// jitv2's code-generation counter for the whole part, bumped by every
     /// write cycle: a command changes what a read returns.
     gen: AtomicU64,
+    /// JIT v2: the part's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
 }
 
 /// The name this part had when it was only a PROM store.
@@ -117,7 +120,11 @@ impl CfiFlash {
         assert!(image.len() <= size, "image must be within the part's size");
         let mut data = vec![0xff; size];
         data[..image.len()].copy_from_slice(image);
-        Self { st: Mutex::new(State { data, mode: Mode::Array, status: SR_READY, backing: None }), gen: AtomicU64::new(0) }
+        Self { st: Mutex::new(State { data, mode: Mode::Array, status: SR_READY, backing: None }),
+            gen: AtomicU64::new(0),
+            #[cfg(feature = "jitv2")]
+            code_bank: crate::traits::CodeBank::new(),
+        }
     }
 
     /// A reset: back to read-array mode with the status clear. The array
@@ -250,6 +257,11 @@ impl BusDevice for CfiFlash {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
         &self.gen
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        (addr < self.st.lock().data.len() as u64).then(|| self.code_bank.page(addr, &self.gen))
     }
 }
 

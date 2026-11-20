@@ -1598,6 +1598,31 @@ fn flash_sits_where_the_reset_vector_is() {
     assert_eq!(0x1000_0000 + ((WIDGET_BRIDGE as u32) << 24) + FLASH_BASE, 0x1fc0_0000);
 }
 
+/// The PROM runs from the flash behind the Bridge: the Bridge names the part
+/// and the page for the JIT, and hands on the part's counter, by chip select.
+#[cfg(feature = "jitv2")]
+#[test]
+fn the_bridge_names_its_flash_pages_for_the_jit() {
+    use crate::dev::sflash::CfiFlash;
+    let r = Rig::new();
+    let parts = [Arc::new(CfiFlash::new(&image(), 0x10_0000)), Arc::new(CfiFlash::new(&image(), 0x10_0000))];
+    r.bridge.attach_flash(0, parts[0].clone(), 0x10_0000);
+    r.bridge.attach_flash(1, parts[1].clone(), 0x10_0000);
+    let at = |off: u32| r.bridge.code_page((FLASH_BASE + off) as u64).expect("a flash page");
+    let page = at(0x3000);
+    assert_eq!(page.key, parts[0].code_page(0x3000).unwrap().key);
+    assert_eq!(page.gen, parts[0].gen_ptr(0x3000));
+    assert_eq!(r.bridge.gen_ptr((FLASH_BASE + 0x3000) as u64), page.gen);
+    // The part repeats above the address lines it decodes: the same page.
+    assert_eq!(at(0x10_3000).key, page.key);
+    // The second chip select is the other part.
+    assert_eq!(at(FLASH_SELECT_SIZE + 0x3000).key, parts[1].code_page(0x3000).unwrap().key);
+    assert_ne!(at(FLASH_SELECT_SIZE + 0x3000).key, page.key);
+    // Registers are not code.
+    assert!(r.bridge.code_page(0x100).is_none());
+    assert!(r.bridge.gen_ptr(0x100).is_null());
+}
+
 #[test]
 fn dma_above_4_gib_master_aborts_instead_of_wrapping() {
     let r = Rig::new();

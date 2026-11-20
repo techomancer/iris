@@ -239,6 +239,9 @@ pub struct Flash {
     /// state and take the writer lock, as do commands, resets and the erase clock.
     st: RwLock<State>,
     gen: AtomicU64,
+    /// JIT v2: the flash's identity in a page key.
+    #[cfg(feature = "jitv2")]
+    code_bank: crate::traits::CodeBank,
     /// The host time the model clock last stood at: [`Self::advance_to`]
     /// advances it from there.
     clock: AtomicU64,
@@ -282,6 +285,8 @@ impl Flash {
         Ok(Self {
             st: RwLock::new(State::new(data)),
             gen: AtomicU64::new(0),
+            #[cfg(feature = "jitv2")]
+            code_bank: crate::traits::CodeBank::new(),
             clock: AtomicU64::new(0),
             machine_clock: OnceLock::new(),
         })
@@ -314,7 +319,7 @@ impl Flash {
         backing.write_range(0, &data)?;
         let mut st = State::new(data);
         st.backing = Some(backing);
-        Ok(Self { st: RwLock::new(st), gen: AtomicU64::new(0), clock: AtomicU64::new(0), machine_clock: OnceLock::new() })
+        Ok(Self { st: RwLock::new(st), gen: AtomicU64::new(0), #[cfg(feature = "jitv2")] code_bank: crate::traits::CodeBank::new(), clock: AtomicU64::new(0), machine_clock: OnceLock::new() })
     }
 
     pub fn contents(&self) -> Vec<u8> {
@@ -547,6 +552,10 @@ impl BusDevice for FlashView {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
         &self.flash.gen
+    }
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        self.offset(addr, 1).map(|off| self.flash.code_bank.page(off as u64, &self.flash.gen))
     }
 }
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::dev::{bedrock, hub};
-use crate::cpu::smp::{set_current_cpu, ParkSlot, HOST_PARK_BIT, REQUEST_JIT_FLUSH};
+use crate::cpu::smp::{set_current_cpu, ParkSlot, HOST_PARK_BIT, REQUEST_JIT_REMAP};
 use crate::physical::RamBank;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -293,7 +293,7 @@ impl ParkProbe {
                 while running.load(Ordering::Relaxed) {
                     if word.load(Ordering::Relaxed) & HOST_PARK_BIT == 0 {
                         std::thread::yield_now();
-                    } else if slot.release(REQUEST_JIT_FLUSH) {
+                    } else if slot.release(REQUEST_JIT_REMAP) {
                         flushes.fetch_add(1, Ordering::SeqCst);
                     } else {
                         slot.park(&running);
@@ -307,13 +307,13 @@ impl ParkProbe {
             s.spawn(|| {
                 set_current_cpu(0);
                 store();
-                if self.slots[0].release(REQUEST_JIT_FLUSH) {
+                if self.slots[0].release(REQUEST_JIT_REMAP) {
                     self.flushes.fetch_add(1, Ordering::SeqCst);
                 }
             });
         });
         // Processor 1 takes a flush posted to it before it stops.
-        while self.slots[1].holds() & REQUEST_JIT_FLUSH != 0 {
+        while self.slots[1].holds() & REQUEST_JIT_REMAP != 0 {
             std::thread::yield_now();
         }
         running.store(false, Ordering::Relaxed);

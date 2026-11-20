@@ -611,27 +611,27 @@ mod tests {
     #[cfg(feature = "jitv2")]
     #[test]
     fn a_store_that_moves_banks_asks_for_a_flush() {
-        use crate::cpu::smp::{ParkSlot, World, REQUEST_JIT_FLUSH};
+        use crate::cpu::smp::{ParkSlot, World, REQUEST_JIT_REMAP};
         let word = AtomicU64::new(0);
         let processor = Arc::new(ParkSlot::new(0, &word));
         let world = Arc::new(World::new());
         world.set_slots(vec![processor.clone()]);
         let md = TestMd::with_world(&FUEL_BANKS, Arc::new(|| 0), world).unwrap();
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33);
-        assert!(processor.release(REQUEST_JIT_FLUSH), "mapping the banks asks for a flush");
+        assert!(processor.release(REQUEST_JIT_REMAP), "mapping the banks asks for a flush");
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
-        assert!(processor.release(REQUEST_JIT_FLUSH), "the swap asks for a flush");
+        assert!(processor.release(REQUEST_JIT_REMAP), "the swap asks for a flush");
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
-        assert!(!processor.release(REQUEST_JIT_FLUSH), "a write that moves nothing does not");
+        assert!(!processor.release(REQUEST_JIT_REMAP), "a write that moves nothing does not");
         let counter = || unsafe { (*md.physical().banks()[0].gen_ptr(0)).load(Ordering::Relaxed) };
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x13);
         md.md_bus().write64(0x20038, 0x80);
         let before = counter();
         md.md_bus().write64(reg::SELF_TEST_CONTROL::OFFSET, 1);
         assert!(counter() > before, "the zero fill invalidates the bank's code pages");
-        let _ = processor.release(REQUEST_JIT_FLUSH);
+        let _ = processor.release(REQUEST_JIT_REMAP);
         md.0.power_on();
-        assert!(processor.release(REQUEST_JIT_FLUSH), "a reset that moves the banks asks for a flush");
+        assert!(processor.release(REQUEST_JIT_REMAP), "a reset that moves the banks asks for a flush");
     }
 
     /// Directory and ECC state is keyed per bank, so banks of different sizes never share an entry.

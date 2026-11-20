@@ -146,6 +146,7 @@ pub trait BusDevice: Send + Sync {
     fn describe_fault(&self, addr, size) -> Option<String> // why a failed access failed, for the log
     fn mem_ptr(&self, addr: u64) -> Option<*const u64>; // direct backing store, for RAM
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64;  // jitv2 page generation counter
+    fn code_page(&self, addr: u64) -> Option<CodePage>; // jitv2: which bank's page this is (see section 8)
 }
 
 pub trait Device: Send + Sync {
@@ -540,7 +541,9 @@ one `Physical`. `src/cpu/smp.rs` holds what they share:
 - **Getting the machine to yourself.** `World::stop_others` parks every other
   CPU and runs a closure. Call it holding no lock another CPU could be waiting
   on. Two callers take turns, and the one waiting counts as parked. Remapping
-  memory and flushing jitv2 go through it.
+  memory and flushing jitv2 go through it. A remap that moved memory then asks
+  every CPU (`World::layout_changed`) to forget the addresses of its JIT code
+  pages; no compiled code is dropped for it (section 8).
 
 The monitor reaches CPUs through `CpuMonitor` (`src/cpu/cpu_monitor.rs`), on
 every machine: it routes each command and the commands themselves live in
@@ -1335,6 +1338,37 @@ code into host code with Cranelift. The concepts:
   the pool if a worker is asleep (a dropped push, on a full queue, wakes
   nobody), and the park's timeout is only a backstop for the periodic
   pending-publish sweep.
+- **A page is keyed by the memory it holds, not by its address.** Every
+  device that holds runnable memory (a RAM bank, a PROM, a flash part) owns a
+  `CodeBank`, a number taken from one process-wide counter. A bus answers
+  `code_page(addr)` with the page's `CodeKey` (the bank and the page within
+  it), the bank's own generation counter for it, and, where the bank can hand
+  it out, a pointer to the page's words in the bank's storage. Buses forward
+  the question as they forward accesses. A bridge forwards it
+  to the device behind it (the Octane's PROM flash sits behind the Bridge's
+  flash chip select). Where no bank answers (MMIO, or a device that does not
+  say), the page is keyed by its address within its address
+  space and counted by `gen_ptr`, so it compiles as before but is shared
+  only among the CPUs of that space. The pool finds a `PhysicalCodePage` by
+  that key. So code follows its bank when a memory controller moves it
+  (a remap flushes nothing), two addresses for the same bytes share one page,
+  and two fetches of one address that decode to different bytes (cached and
+  uncached on a node board) get a page each.
+- **Finding a page from an address.** Each address space (the CPUs that see
+  memory at the same addresses: every CPU of an Octane, the CPUs of one node)
+  has a direct-mapped frame table, `frame -> slot`, read lock-free on a page
+  switch. It only caches what the bus and the key index say: a miss asks the
+  bus under the pool lock, and a remap empties the table of every CPU that
+  takes the request (`Jitv2::forget_addresses`). Each page also records, per
+  CPU of the pool, the frame that CPU last reached it at; the monitor shows
+  them, and a compile uses one only for a page whose bank hands out no
+  storage (below).
+- **Reading a page to compile it.** A compile worker reads RAM and PROM pages
+  in the bank's own storage, by the pointer the page was claimed with: no bus,
+  no address. A page of a device that gives no pointer (a flash part) is read
+  through the bus of a CPU that reached it, at that CPU's address, and the
+  worker asks the bus for the key there before and after the read, so an
+  address a remap moved other memory under is never compiled as this page.
 - **Invalidation by generation counters.** Every RAM page has a generation
   counter owned by the memory device (`gen_ptr`). Any write to the page, from
   the CPU or from DMA, bumps it; compiled code checks it and stops being
@@ -1358,16 +1392,19 @@ code into host code with Cranelift. The concepts:
   an emitter end the compiled region or call the interpreter's handler. The
   equivalence tests, the cpu-tests suite run on both engines, `jitcheck` and the
   `jitv2_lockstep` feature compare the JIT against the interpreter.
-- **Several CPUs share one pool.** Compiled code reaches CPU state only through
-  its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
-  pfn map publishes a slot after its claim, and inline stores bump generations
+- **Every CPU of a machine shares one pool.** Compiled code reaches CPU state
+  only through its core pointer, and a page is keyed by its memory, so one page
+  pool, one compile queue and one body of code serve every CPU, on whichever
+  node (`share_pool`; nodes with different processor modules get a pool each,
+  because code is specific to the module). Dispatch reads pages lock-free, a
+  frame table publishes a slot after its claim, and inline stores bump generations
   atomically. Compiled code is freed only by a full flush, and every flush parks
   all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`). Compiled loads
   and stores are plain host accesses, so on a multiprocessor a guest `SYNC`
   compiles to a host fence on hosts that are not x86 (the interpreter's
   `SYNC` does the same).
-- **Uncached fetches the board decodes apart.** A page is keyed by the
-  physical address of the fetch. The IP35 reset PROM answers an uncached fetch
+- **Uncached fetches the board decodes apart.** A frame table is indexed by
+  the physical address of the fetch. The IP35 reset PROM answers an uncached fetch
   at 0x1fc00000 whatever RAM sits behind the cached view there, so a board whose
   banks reach that window presents the fetch at an address of its own
   (`uncached_fetch_alias`, which only the R16000 model takes) and the JIT sees

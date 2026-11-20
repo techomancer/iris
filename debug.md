@@ -305,7 +305,7 @@ take effect after `j2 flush`.
 
 | Command | Effect | Default (release / `developer`) |
 |---|---|---|
-| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons | — |
+| `j2 status` (alias `j2 stats`) | Arena use, compile counts, skipped/rejected recompiles, reject reasons, and `remaps`: times a CPU forgot its page addresses because memory moved (no code is dropped for one) | — |
 | `j2 dispatch [on\|off]` | Main switch for JIT dispatch; off = interpreter only | `on` |
 | `j2 inline [on\|off]` | Compile synchronously on the CPU thread instead of the compile pool; a page with code recompiles only when new entries make it hot, as the pool would (`[jitv2] compile = "sync"` at startup). Refused with several CPUs, and `on` is refused in `lightning` builds | `off` (`on` under lockstep) |
 | `j2 threads` | Compile-pool thread count and why (read-only; set with `[jitv2] threads` or `--jitv2-threads`) | one per guest CPU, at most 4, capped by the host's usable CPUs |
@@ -324,7 +324,7 @@ take effect after `j2 flush`.
 | `j2 flush` | Drop all compiled code and reset the arena (stop the CPU first) | — |
 | `j2 clear <paddr>` / `j2 deny <paddr>` | Reset one physical code page / deny one entry point. The address has to be in the machine's memory; the error lists its ranges | — |
 | `j2 analyze <paddr>` | Run the analyzer's walk on live memory and print each word with its classification | — |
-| `j2 pcp [vaddr]` | Physical code page state: entries, generation, compiled code. Takes a virtual address; on an R10000, xkphys (`0x9000000000000000` plus the physical address) reaches any page | — |
+| `j2 pcp [vaddr]` | Code page state: its key (`bank`, `page` within the bank), the frame each CPU reaches it at, entries, generation, compiled code. Takes a virtual address; on an R10000, xkphys (`0x9000000000000000` plus the physical address) reaches any page | — |
 | `j2 dumppcp [vaddr] [path]` | Capture a page and its memory for the offline `jitv2-pcp-dump` | — |
 | `j2 corpus [dir]` | Dump every cached page as `.pcp` files for offline codegen measurement | `jitv2_corpus/` |
 | `j2 html [path]` | Render the physical code page visualiser, with one section per memory range of the machine | — |

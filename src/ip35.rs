@@ -291,26 +291,17 @@ pub(crate) fn machine(
         connect_cpus(&node.chip, cpus)?;
         node.chip.set_timer_manager(&timers);
     }
-    // One JIT for the processors of a node, which share its memory, its
-    // pool parking them with the rest; one of its own for a lone one.
+    // One JIT for the machine: every processor of every node compiles through
+    // one queue into one page pool, each node an address space of it.
     #[cfg(feature = "jitv2")]
-    for (node, cpus) in nodes.iter().zip(&node_cpus) {
-        let several = cpus.len() > 1;
-        if several {
-            if cfg!(feature = "jitv2_lockstep") {
-                return Err(format!("{name}: a node of several processors cannot run with jitv2_lockstep"));
-            }
-            for c in cpus {
-                c.share_jitv2(cpus[0].jitv2(), world.clone());
-            }
-        }
-        crate::cpu::jitv2::jitv2::attach_pool(
-            &cpus[0],
-            cfg.jitv2_pool_size(),
-            cfg.jitv2.compile,
-            node.chip.decode.physical().clone(),
-            several.then(|| world.clone()),
-        );
+    {
+        let pool: Vec<_> = nodes
+            .iter()
+            .zip(&specs)
+            .zip(&node_cpus)
+            .map(|((node, spec), cpus)| crate::cpu::jitv2::jitv2::PoolNode { cpus, module: spec.module, bus: node.chip.decode.physical().clone() })
+            .collect();
+        crate::cpu::jitv2::jitv2::share_pool(&pool, cfg.jitv2_pool_size(), cfg.jitv2.compile, &world).map_err(|e| format!("{name}: {e}"))?;
     }
     if let Some(hook) = &io.cpus {
         hook(&cpus);

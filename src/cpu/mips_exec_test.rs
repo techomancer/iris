@@ -180,6 +180,10 @@ mod tests {
         fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
             std::ptr::null()
         }
+        #[cfg(feature = "jitv2")]
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, std::ptr::null()))
+        }
     }
 
     /// Disable every jitv2 dispatch path on a freshly-constructed executor —
@@ -5871,6 +5875,9 @@ mod tests {
             let counter = gens.entry(page).or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
             counter.as_ref() as *const std::sync::atomic::AtomicU64
         }
+        fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+            Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr)))
+        }
     }
 
     #[test]
@@ -7402,10 +7409,98 @@ mod tests {
         assert!(out.contains("[hits 1]"), "{}", out);
     }
 
-    /// A page compiled before a remap is not dispatched over the new layout.
+    /// Two RAM banks of 1 MiB at 0 and 1 MiB, which a store to nothing swaps:
+    /// a memory controller moving banks.
+    #[cfg(feature = "jitv2")]
+    struct SwapBus {
+        banks: [crate::dev::mem::Memory; 2],
+        swapped: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl SwapBus {
+        fn at(&self, addr: u64) -> (&crate::dev::mem::Memory, u64) {
+            let swapped = self.swapped.load(std::sync::atomic::Ordering::Relaxed);
+            let bank = ((addr >> 20) & 1) as usize ^ swapped as usize;
+            (&self.banks[bank], addr & 0xF_FFFF)
+        }
+    }
+
+    #[cfg(feature = "jitv2")]
+    impl BusDevice for SwapBus {
+        fn read8(&self, a: u64) -> BusRead8 { let (d, a) = self.at(a); d.read8(a) }
+        fn write8(&self, a: u64, v: u8) -> u32 { let (d, a) = self.at(a); d.write8(a, v) }
+        fn read16(&self, a: u64) -> BusRead16 { let (d, a) = self.at(a); d.read16(a) }
+        fn write16(&self, a: u64, v: u16) -> u32 { let (d, a) = self.at(a); d.write16(a, v) }
+        fn read32(&self, a: u64) -> BusRead32 { let (d, a) = self.at(a); d.read32(a) }
+        fn write32(&self, a: u64, v: u32) -> u32 { let (d, a) = self.at(a); d.write32(a, v) }
+        fn read64(&self, a: u64) -> BusRead64 { let (d, a) = self.at(a); d.read64(a) }
+        fn write64(&self, a: u64, v: u64) -> u32 { let (d, a) = self.at(a); d.write64(a, v) }
+        fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 { let (d, a) = self.at(a); d.gen_ptr(a) }
+        fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> { let (d, a) = self.at(a); d.code_page(a) }
+    }
+
+    /// Compiled code is keyed by the bank it was compiled from: when a remap
+    /// puts another bank at its address, the address runs that bank's page,
+    /// and the code is found again, not recompiled, where its bank went.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn compiled_code_follows_its_bank_through_a_remap() {
+        use std::sync::atomic::Ordering;
+        let bus = Arc::new(SwapBus { banks: [crate::dev::mem::Memory::new(1), crate::dev::mem::Memory::new(1)], swapped: Default::default() });
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus.clone() as Arc<dyn BusDevice>, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        exec.install_jit_hooks();
+        // Each bank adds its own number to r2 four times and returns.
+        for (bank, add) in [(0u64, 1u16), (1, 2)] {
+            for i in 0..4 {
+                bus.write32((bank << 20) + 0x1000 + 4 * i, make_i(OP_ADDIU, 2, 2, add));
+            }
+            bus.write32((bank << 20) + 0x1010, make_r(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR));
+        }
+        exec.core.gpr[31] = 0xffff_ffff_8000_f000;
+        let arrive = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, pc: u64| {
+            exec.core.pc = pc;
+            exec.core.in_delay_slot = false;
+            exec.core.jit_trigger = true;
+            exec.step_jit();
+            exec.jitv2_current_page()
+        };
+        let low = arrive(&mut exec, 0xffff_ffff_8000_1000);
+        assert!(!low.is_null());
+        let low = unsafe { &*low };
+        let key0 = bus.banks[0].code_page(0x1000).unwrap().key;
+        let key1 = bus.banks[1].code_page(0x1000).unwrap().key;
+        assert_eq!(low.key, key0, "the page is keyed by its bank, not its address");
+        assert!(low.is_runnable(0));
+        let compiles = low.compiles_since_flush();
+
+        // The controller swaps the banks, and tells the CPU as a machine does.
+        bus.swapped.store(true, Ordering::Relaxed);
+        exec.jitv2_layout_changed();
+        assert!(low.is_runnable(0), "a remap drops no code");
+        assert_eq!(low.addr_of(0), None, "the CPU no longer knows where the page is");
+
+        let other = arrive(&mut exec, 0xffff_ffff_8000_1000);
+        assert!(!std::ptr::eq(other, low), "the address now holds the other bank's page");
+        assert_eq!(unsafe { &*other }.key, key1);
+
+        let moved = arrive(&mut exec, 0xffff_ffff_8010_1000);
+        assert!(std::ptr::eq(moved, low), "the first bank's page is found at its new address");
+        assert_eq!(low.addr_of(0), Some((0x101, false)));
+        assert_eq!(low.compiles_since_flush(), compiles, "and runs the code it already had");
+        let jit = exec.jitv2.clone();
+        assert_eq!(jit.lock().pages_used(), 2);
+    }
+
+    /// A remap request posted while the CPU is stopped is taken by a step,
+    /// and drops no compiled code.
     #[cfg(feature = "jitv2")]
     #[test]
-    fn a_compiled_page_is_not_dispatched_after_a_remap() {
+    fn a_remap_request_keeps_compiled_code() {
         use crate::cpu::mips_exec::CpuDevice;
         let mem = Arc::new(MockMemory::new());
         let bus: Arc<dyn BusDevice> = mem.clone();
@@ -7434,10 +7529,12 @@ mod tests {
         }
         crate::traits::Device::stop(&*cpu);
         let before = page();
-        assert!(unsafe { (*before).is_runnable(0) });
+        let remaps = jit.lock().stats.remaps.load(std::sync::atomic::Ordering::Relaxed);
         world.layout_changed();
         cpu.step_n_inline(0).unwrap();
-        assert!(!unsafe { (*before).is_runnable(0) }, "the page compiled before the remap is still runnable");
+        assert_eq!(jit.lock().stats.remaps.load(std::sync::atomic::Ordering::Relaxed), remaps + 1, "the step took the request");
+        assert!(unsafe { (*before).is_runnable(0) }, "the page keeps its code through a remap");
+        assert_eq!(jit.lock().pages_used(), 1);
     }
 
     /// 64 entries on one page (four adds and a return each), sync compile.

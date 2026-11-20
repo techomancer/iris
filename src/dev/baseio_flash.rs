@@ -35,6 +35,10 @@ const GEOMETRY: Geometry = Geometry {
 pub struct BaseioFlash {
     image: Box<[u8]>,
     core: Mutex<AmdCore>,
+    /// JIT v2: the part's identity in a page key, and its write counter:
+    /// a command cycle changes what a read returns.
+    #[cfg(feature = "jitv2")]
+    code: (crate::traits::CodeBank, std::sync::atomic::AtomicU64),
 }
 
 impl BaseioFlash {
@@ -45,7 +49,12 @@ impl BaseioFlash {
         }
         let mut image = vec![0xff; SIZE].into_boxed_slice();
         image[..file.len()].copy_from_slice(file);
-        Ok(Self { image, core: Mutex::new(AmdCore::new(GEOMETRY)) })
+        Ok(Self {
+            image,
+            core: Mutex::new(AmdCore::new(GEOMETRY)),
+            #[cfg(feature = "jitv2")]
+            code: Default::default(),
+        })
     }
 }
 
@@ -64,10 +73,23 @@ impl BusDevice for BaseioFlash {
     fn write16(&self, addr: u64, val: u16) -> u32 {
         // The engine logs a cycle it does not take, including the program and
         // erase this part refuses.
-        match self.core.lock().write16(addr as usize, val) {
+        let cycle = self.core.lock().write16(addr as usize, val);
+        #[cfg(feature = "jitv2")]
+        self.code.1.fetch_add(1, std::sync::atomic::Ordering::Release);
+        match cycle {
             Ok(_) => BUS_OK,
             Err(()) => BUS_ERR,
         }
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
+        &self.code.1
+    }
+
+    #[cfg(feature = "jitv2")]
+    fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> {
+        ((addr as usize) < self.image.len()).then(|| self.code.0.page(addr, &self.code.1))
     }
 }
 
