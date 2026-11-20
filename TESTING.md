@@ -128,6 +128,20 @@ file holds (its kind, version and segments, each checked) and `extract` writes i
 payload or one segment, such as the BaseIO PROM inside the IP35 file; `download` and
 `pack` rebuild `data/proms` from the catalog.
 
+## Repeated PROM boots
+
+A PROM that fails one start in a hundred needs hundreds of starts to show it.
+`tools/prom-boot-loop.py` starts iris with one config again and again, watches
+the serial log the config names, and counts each start as ok (the PROM menu,
+`Option?`), failed (`SL-9600`, the O2's serial loader, or `EXC`, a PROM
+exception; both can be changed with `--good` and `--bad`), timed out or
+exited. It stops iris with SIGTERM once a start is decided, so use it only on
+a config whose disks the guest cannot write: none, or `overlay = true` on each.
+The serial log and iris's output of every start that was not ok are kept. The
+script's help has an O2 config with no disks that reaches the menu in about
+five seconds. Races between the CPU thread and a device thread show up more
+often when the host is busy, so run it beside a few busy loops.
+
 ## Host audio
 
 A sound card can break anywhere between guest memory and the host's
