@@ -1276,6 +1276,7 @@ mod host_tests {
         let started = Instant::now();
         h.apply_dma_enable(0, DMA_EN_CODECA);
         std::thread::sleep(Duration::from_millis(800));
+        let st = h.ca_state.lock().out.as_ref().map(|o| o.stats()).expect("codec A has a host stream");
         Device::stop(&h);
         let wall = started.elapsed().as_secs_f64();
         let moved = dma.at.load(Ordering::Relaxed) as u64 / 2;
@@ -1284,7 +1285,13 @@ mod host_tests {
         // Half at least: a timer held up by a busy host holds the clock back.
         assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} frames in {wall:.3} s");
         let heard = sounding(&pcm, 2);
-        assert!((heard.len() / 2) as u64 + 9600 >= moved, "{} of {moved} frames reached the file", heard.len() / 2);
+        // A file thread held up by a busy host (a loaded CI runner) lets the
+        // queue pass its ceiling, and the stream skips ahead rather than
+        // play late. Those frames reached the host and were let go on
+        // purpose; the 200 ms is what was still queued at the stop.
+        let skipped = st.overruns + st.dropped;
+        assert!((heard.len() / 2) as u64 + skipped + 9600 >= moved,
+            "{} of {moved} frames reached the file ({skipped} skipped by the host stream)", heard.len() / 2);
         assert_tones(&heard, 2, 48000, left, right, 15000);
     }
 

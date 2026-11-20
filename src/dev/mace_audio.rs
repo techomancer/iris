@@ -1094,6 +1094,11 @@ mod tests {
         run(300);
         let wall = started.elapsed().as_secs_f64();
         let moved = a.msc_ust(1) >> 32;
+        // A file thread held up by a busy host (a loaded CI runner) lets the
+        // queue pass its ceiling, and the stream skips ahead rather than
+        // play late. Those pairs reached the host and were let go on
+        // purpose.
+        let skipped: u64 = a.player.lock().out.iter().flatten().map(|o| { let s = o.stats(); s.overruns + s.dropped }).sum();
         // Dropping the output completes the file.
         *a.player.lock() = Player::default();
         let (rate, channels, pcm) = read_wav(&path.0);
@@ -1107,7 +1112,8 @@ mod tests {
         // this test from refilling the ring in time.
         // The stream also follows the card's clock, by up to 0.5% slower.
         let most = loud + loud / 200 + 48 * bursts(&pcm, 2) as u64;
-        assert!(frames + 9600 >= loud && frames <= most, "{frames} pairs heard of {loud} played before the mute");
+        assert!(frames + skipped + 9600 >= loud && frames <= most,
+            "{frames} pairs heard of {loud} played before the mute ({skipped} skipped by the host stream)");
         assert_tones(&heard, 2, 48000, left, right, 15000);
     }
 
