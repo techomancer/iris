@@ -50,6 +50,10 @@ pub(crate) struct PoolBarrier<A> {
     /// A cycle is in progress: set by the leader's election, cleared by its
     /// release.
     quiesce: AtomicBool,
+    /// Tests: the next worker to look leads an arena flush, as one that filled
+    /// its arena would.
+    #[cfg(all(test, not(loom)))]
+    forced_flush: AtomicBool,
 }
 
 impl<A: Clone> PoolBarrier<A> {
@@ -59,7 +63,21 @@ impl<A: Clone> PoolBarrier<A> {
             cv: Condvar::new(),
             running: AtomicBool::new(false),
             quiesce: AtomicBool::new(false),
+            #[cfg(all(test, not(loom)))]
+            forced_flush: AtomicBool::new(false),
         }
+    }
+
+    /// Tests: have a worker flush the arena at its next look.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn force_flush(&self) {
+        self.forced_flush.store(true, Ordering::SeqCst);
+    }
+
+    /// Tests: a flush was asked for; this caller takes it.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn take_forced_flush(&self) -> bool {
+        self.forced_flush.swap(false, Ordering::SeqCst)
     }
 
     /// Mark the pool running, on the arena its workers are about to build on.

@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### jitv2 flushes
+
+- Under jitv2, a single-processor machine no longer hangs when the CPU runs out
+  of JIT pages (or `j2 flush`, `j2 inline on` or a cache change on the O2 asks
+  for a flush) while a compile worker is flushing its full code arena. A
+  worker's flush no longer restarts a CPU the monitor has stopped.
+
 ### Volume headers
 
 - `mkvh build` splits an ELF executable's segments larger than 512 KB, so the
