@@ -372,8 +372,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Serial logs now add to an existing file on every machine, not only the Indy
   and Indigo2; `serial_log_overwrite` (`--serial-log-overwrite`) starts over.
 - `iris-ci boot-test` sets `serial_log_overwrite` itself.
-- The 16550 ports (Octane, Origins, Onyx2, Fuel, Tezro) no longer lose output
-  when a TCP or Unix-socket console client stops reading for up to two seconds.
+- A TCP or Unix-socket console client that reads slowly or stops never holds
+  the guest up. Each client keeps up to 1 MiB of output it has not read and
+  past that loses the oldest, counted; a TCP client is told how many bytes
+  went. The serial log and the CI capture always have every byte. Output to
+  clients is written in batches, not one syscall per byte.
 - The terminal console has line editing and history (arrows, Ctrl-R, the last
   1000 lines of the session); piped input and the TCP monitor are unchanged. A
   `monitor_history` file left by an earlier nightly is no longer read.

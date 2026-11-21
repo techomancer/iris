@@ -7,10 +7,11 @@
 //! one, and [`console_backends`] picks them for the machines whose consoles
 //! are configured the same way.
 //!
-//! A backend whose host end can fill up refuses a byte through
-//! [`SerialBackend::try_send_byte`] rather than dropping it; the 16550 core
-//! then holds the byte and retries it (`Ns16550::poll_tx`). A backend never
-//! calls back into the UART.
+//! A backend never refuses a byte and never makes a UART wait. The log tee
+//! and the CI capture take every byte first; each socket client then has its
+//! own [`ClientQueue`], which keeps what it has not read, drops the oldest
+//! past [`CLIENT_BACKLOG`], and is written out by [`SerialBackend::flush`]
+//! from the UART's existing poll. A backend never calls back into the UART.
 
 use std::fs::OpenOptions;
 use std::collections::VecDeque;
@@ -27,22 +28,134 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::config::MachineConfig;
 use crate::dev::serial_log::SerialLog;
+use crate::net::telnet::IAC;
 
 pub trait SerialBackend: Send + Sync {
-    /// Send a byte, dropping it where the host end cannot take it now.
+    /// Send a byte. Never blocks and never refuses.
     fn send_byte(&self, byte: u8);
-
-    /// Send a byte if the host end can take it now. A backend that can be
-    /// full (a socket nobody reads) says so here and the 16550 holds the byte
-    /// and retries; the default takes every byte, as the others always did.
-    /// The Unix-socket and TCP consoles refuse while their client's socket
-    /// is full, and a log tee or a fan-out passes that on. A refused byte
-    /// has not been sent anywhere, so retrying it never sends it twice.
-    fn try_send_byte(&self, byte: u8) -> bool {
-        self.send_byte(byte);
-        true
+    /// Write out what socket clients have queued, one write each. The UART's
+    /// receive thread or service loop calls it every poll.
+    fn flush(&self) {}
+    /// True while a flush has output left to write, so a port can skip it when idle.
+    fn queued(&self) -> bool {
+        false
+    }
+    /// Bytes dropped in all for clients that did not read, for the monitor.
+    fn dropped(&self) -> u64 {
+        0
     }
     fn recv_byte(&self) -> io::Result<u8>;
+}
+
+/// The most output a socket client keeps unread before the oldest goes.
+pub const CLIENT_BACKLOG: usize = 1 << 20;
+
+/// Output a socket client has not read yet. Past [`CLIENT_BACKLOG`] the oldest whole units
+/// go and are counted, and a telnet client is told how many.
+pub(crate) struct ClientQueue {
+    buf: VecDeque<u8>,
+    telnet: bool,
+    /// Leading bytes left of a unit the socket took only part of.
+    keep: usize,
+    /// Dropped since the client was last told.
+    gap: u64,
+    /// The notice being written.
+    note: Vec<u8>,
+    total: u64,
+}
+
+impl ClientQueue {
+    pub(crate) fn new(telnet: bool) -> Self {
+        Self { buf: VecDeque::new(), telnet, keep: 0, gap: 0, note: Vec::new(), total: 0 }
+    }
+
+    /// The length of the unit at `i`: a data byte, an escaped 0xff or a
+    /// three-byte telnet reply.
+    fn unit(&self, i: usize) -> usize {
+        match (self.telnet, self.buf[i], self.buf.get(i + 1)) {
+            (true, IAC, Some(251..=254)) => 3,
+            (true, IAC, _) => 2,
+            _ => 1,
+        }
+    }
+
+    pub(crate) fn push(&mut self, unit: &[u8]) {
+        self.buf.extend(unit);
+        while self.buf.len() > CLIENT_BACKLOG {
+            let n = self.unit(self.keep).min(self.buf.len() - self.keep);
+            self.buf.drain(self.keep..self.keep + n);
+            if self.gap == 0 && self.note.is_empty() {
+                log::warn!("serial: a client is not reading; dropping its oldest output");
+            }
+            self.gap += n as u64;
+            self.total += n as u64;
+        }
+    }
+
+    /// One pass of non-blocking writes: a split unit's rest, a dropped-bytes notice, the queue.
+    /// An error means the client has gone.
+    pub(crate) fn flush(&mut self, w: &mut impl Write) -> io::Result<()> {
+        if self.keep > 0 {
+            let n = {
+                let head = self.buf.as_slices().0;
+                write_some(w, &head[..self.keep.min(head.len())])?
+            };
+            self.buf.drain(..n);
+            self.keep -= n;
+            if self.keep > 0 {
+                return Ok(());
+            }
+        }
+        if self.gap > 0 && self.note.is_empty() {
+            if self.telnet {
+                // Until the socket takes some of it, later drops join the same count.
+                let note = format!("\r\n[iris: {} bytes dropped]\r\n", self.gap).into_bytes();
+                let n = write_some(w, &note)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                self.note = note[n..].to_vec();
+            }
+            self.gap = 0;
+        }
+        if !self.note.is_empty() {
+            let n = write_some(w, &self.note)?;
+            self.note.drain(..n);
+            if !self.note.is_empty() {
+                return Ok(());
+            }
+        }
+        let n = write_some(w, self.buf.as_slices().0)?;
+        let mut at = 0;
+        while at < n {
+            at += self.unit(at);
+        }
+        self.buf.drain(..n);
+        self.keep = at - n;
+        Ok(())
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.total
+    }
+
+    /// True while anything is left to write.
+    fn queued(&self) -> bool {
+        !self.buf.is_empty() || !self.note.is_empty() || self.gap > 0
+    }
+}
+
+/// One non-blocking write: how much the socket took, 0 when it is full.
+fn write_some(w: &mut impl Write, bytes: &[u8]) -> io::Result<usize> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    match w.write(bytes) {
+        Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+        Ok(n) => Ok(n),
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => Ok(0),
+        Err(e) => Err(e),
+    }
 }
 
 /// Drops TX bytes and never yields RX. Used as a placeholder when a channel
@@ -76,14 +189,14 @@ impl SerialBackend for TeeBackend {
         self.log.write(&[byte]);
         self.inner.send_byte(byte);
     }
-    /// Logged once the inner end takes it. One the 16550 gives up on comes
-    /// back through `send_byte`, so the log still has every byte.
-    fn try_send_byte(&self, byte: u8) -> bool {
-        let taken = self.inner.try_send_byte(byte);
-        if taken {
-            self.log.write(&[byte]);
-        }
-        taken
+    fn flush(&self) {
+        self.inner.flush();
+    }
+    fn queued(&self) -> bool {
+        self.inner.queued()
+    }
+    fn dropped(&self) -> u64 {
+        self.inner.dropped()
     }
     fn recv_byte(&self) -> io::Result<u8> {
         self.inner.recv_byte()
@@ -100,7 +213,9 @@ pub(crate) struct UnixSocketBackend {
     _port: crate::ports::PortGuard,
     path: std::path::PathBuf,
     listener: UnixListener,
-    stream: Mutex<Option<UnixStream>>,
+    stream: Mutex<Option<(UnixStream, ClientQueue)>>,
+    /// Bytes dropped for clients that have since gone.
+    dropped: AtomicU64,
 }
 
 /// Bind a Unix socket at `path`. A socket file left by an earlier iris is
@@ -132,7 +247,22 @@ impl UnixSocketBackend {
         listener.set_nonblocking(true)?;
         crate::workstation::remove_at_exit(&path);
         let _port = crate::ports::register("unix", path.display(), "serial port");
-        Ok(Self { _port, path, listener, stream: Mutex::new(None) })
+        Ok(Self { _port, path, listener, stream: Mutex::new(None), dropped: AtomicU64::new(0) })
+    }
+
+    /// Write out what the client has queued; one that has gone is let go.
+    fn flush_client(&self, guard: &mut Option<(UnixStream, ClientQueue)>) {
+        if let Some((stream, q)) = guard {
+            if q.flush(stream).is_err() {
+                self.let_go(guard);
+            }
+        }
+    }
+
+    fn let_go(&self, guard: &mut Option<(UnixStream, ClientQueue)>) {
+        if let Some((_, q)) = guard.take() {
+            self.dropped.fetch_add(q.dropped(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -146,26 +276,24 @@ impl Drop for UnixSocketBackend {
 
 #[cfg(unix)]
 impl SerialBackend for UnixSocketBackend {
+    /// With no client the byte goes nowhere: nobody waits for it.
     fn send_byte(&self, byte: u8) {
-        let _ = self.try_send_byte(byte);
+        if let Some((_, q)) = self.stream.lock().as_mut() {
+            q.push(&[byte]);
+        }
     }
 
-    /// Refused while the client's socket buffer is full. With no client, or
-    /// one that has gone, the byte is taken and dropped: nobody waits for it.
-    fn try_send_byte(&self, byte: u8) -> bool {
-        let mut stream_guard = self.stream.lock();
-        let Some(stream) = stream_guard.as_mut() else {
-            return true;
-        };
-        match stream.write(&[byte]) {
-            Ok(1) => true,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => false,
-            // Written nothing without blocking, or failed: the client is gone.
-            _ => {
-                *stream_guard = None;
-                true
-            }
-        }
+    fn flush(&self) {
+        self.flush_client(&mut self.stream.lock());
+    }
+
+    fn queued(&self) -> bool {
+        self.stream.lock().as_ref().is_some_and(|(_, q)| q.queued())
+    }
+
+    fn dropped(&self) -> u64 {
+        let live = self.stream.lock().as_ref().map_or(0, |(_, q)| q.dropped());
+        self.dropped.load(Ordering::Relaxed) + live
     }
 
     fn recv_byte(&self) -> io::Result<u8> {
@@ -175,7 +303,7 @@ impl SerialBackend for UnixSocketBackend {
             match self.listener.accept() {
                 Ok((socket, _)) => {
                     socket.set_nonblocking(true)?;
-                    *guard = Some(socket);
+                    *guard = Some((socket, ClientQueue::new(false)));
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
@@ -184,17 +312,17 @@ impl SerialBackend for UnixSocketBackend {
             }
         }
 
-        if let Some(ref mut stream) = *guard {
+        if let Some((stream, _)) = guard.as_mut() {
             let mut buf = [0u8; 1];
             match stream.read(&mut buf) {
                 Ok(1) => Ok(buf[0]),
                 Ok(_) => { // EOF
-                    *guard = None;
+                    self.let_go(&mut guard);
                     Err(io::Error::new(io::ErrorKind::NotConnected, "EOF"))
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock")),
                 Err(e) => {
-                    *guard = None;
+                    self.let_go(&mut guard);
                     Err(e)
                 }
             }
@@ -207,66 +335,27 @@ impl SerialBackend for UnixSocketBackend {
 /// Several host ends of one serial line (a TCP port and a Unix socket):
 /// the guest's output goes to all of them and its input comes from
 /// whichever has some.
-///
-/// A byte one end refuses while another takes it is owed to the refusing
-/// end, one byte each: the next byte is refused until every end has taken
-/// what it is owed, so the slowest end paces the line and none sees a byte
-/// twice.
-struct FanoutBackend {
-    ends: Vec<Arc<dyn SerialBackend>>,
-    owed: Mutex<Vec<Option<u8>>>,
-}
-
-impl FanoutBackend {
-    fn new(ends: Vec<Arc<dyn SerialBackend>>) -> Self {
-        let owed = Mutex::new(vec![None; ends.len()]);
-        Self { ends, owed }
-    }
-
-    /// Offer each end what it is owed. True when none is owed anything.
-    fn settle(&self, owed: &mut [Option<u8>]) -> bool {
-        let mut clear = true;
-        for (end, o) in self.ends.iter().zip(owed.iter_mut()) {
-            if let Some(b) = *o {
-                if end.try_send_byte(b) {
-                    *o = None;
-                } else {
-                    clear = false;
-                }
-            }
-        }
-        clear
-    }
-}
+struct FanoutBackend(Vec<Arc<dyn SerialBackend>>);
 
 impl SerialBackend for FanoutBackend {
-    /// An end still owed a byte misses this one, as a full socket drops it.
     fn send_byte(&self, byte: u8) {
-        let mut owed = self.owed.lock();
-        self.settle(&mut owed);
-        for (end, o) in self.ends.iter().zip(owed.iter()) {
-            if o.is_none() {
-                end.send_byte(byte);
-            }
+        for b in &self.0 {
+            b.send_byte(byte);
         }
     }
-    fn try_send_byte(&self, byte: u8) -> bool {
-        let mut owed = self.owed.lock();
-        if !self.settle(&mut owed) {
-            return false;
+    fn flush(&self) {
+        for b in &self.0 {
+            b.flush();
         }
-        for (end, o) in self.ends.iter().zip(owed.iter_mut()) {
-            if !end.try_send_byte(byte) {
-                *o = Some(byte);
-            }
-        }
-        true
+    }
+    fn queued(&self) -> bool {
+        self.0.iter().any(|b| b.queued())
+    }
+    fn dropped(&self) -> u64 {
+        self.0.iter().map(|b| b.dropped()).sum()
     }
     fn recv_byte(&self) -> io::Result<u8> {
-        // As for TCP: a byte owed to a slow end goes once it has room, even
-        // if the guest sends nothing more.
-        self.settle(&mut self.owed.lock());
-        for b in &self.ends {
+        for b in &self.0 {
             if let Ok(byte) = b.recv_byte() {
                 return Ok(byte);
             }
@@ -278,35 +367,8 @@ impl SerialBackend for FanoutBackend {
 struct TcpConn {
     stream: TcpStream,
     telnet: crate::net::telnet::TelnetFilter,
-    /// Bytes this client's socket would not take yet: the rest of one
-    /// escaped data byte and any telnet replies, in order. While any wait,
-    /// the next data byte is refused (or, sent without retry, skipped).
-    pending: Vec<u8>,
-}
-
-impl TcpConn {
-    /// Write what is pending as far as the socket takes it. `Ok(true)` when
-    /// nothing is left; an error means the client has gone.
-    fn flush(&mut self) -> io::Result<bool> {
-        while !self.pending.is_empty() {
-            match self.stream.write(&self.pending) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    self.pending.drain(..n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
-
-    /// Queue `bytes` behind what is pending and write what the socket takes.
-    fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.pending.extend_from_slice(bytes);
-        self.flush().map(|_| ())
-    }
+    /// Output and telnet replies, in order, that the socket has not taken.
+    queue: ClientQueue,
 }
 
 pub(crate) struct TcpSocketBackend {
@@ -316,6 +378,8 @@ pub(crate) struct TcpSocketBackend {
     /// Every connected client: each sees all the output and may type, so a
     /// person at the console and a script can share it.
     conns: Mutex<Vec<TcpConn>>,
+    /// Bytes dropped for clients that have since gone.
+    dropped: AtomicU64,
 }
 
 impl TcpSocketBackend {
@@ -341,6 +405,7 @@ impl TcpSocketBackend {
             _port,
             listener,
             conns: Mutex::new(Vec::new()),
+            dropped: AtomicU64::new(0),
         })
     }
 
@@ -357,60 +422,50 @@ impl TcpSocketBackend {
             // segment is acked, which shows up as a stutter on every
             // interaction. Set it on accept, before any byte is written.
             let _ = socket.set_nodelay(true);
-            let mut c = TcpConn { stream: socket, telnet: crate::net::telnet::TelnetFilter::new(), pending: Vec::new() };
+            let mut c = TcpConn { stream: socket, telnet: crate::net::telnet::TelnetFilter::new(), queue: ClientQueue::new(true) };
             if c.stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_ok() {
                 conns.push(c);
             }
         }
     }
+
+    /// Write out what every client has queued; one that has gone is dropped.
+    fn flush_all(&self, conns: &mut Vec<TcpConn>) {
+        conns.retain_mut(|c| {
+            let kept = c.queue.flush(&mut c.stream).is_ok();
+            if !kept {
+                self.dropped.fetch_add(c.queue.dropped(), Ordering::Relaxed);
+            }
+            kept
+        });
+    }
 }
 
 impl SerialBackend for TcpSocketBackend {
-    /// A client whose socket is still full misses this byte.
     fn send_byte(&self, byte: u8) {
-        let mut conns = self.conns.lock();
-        if conns.is_empty() {
-            return;
-        }
         let mut buf = Vec::with_capacity(2);
         crate::net::telnet::escape_byte(byte, &mut buf);
-        conns.retain_mut(|c| match c.flush() {
-            Ok(true) => c.push(&buf).is_ok(),
-            Ok(false) => true,
-            Err(_) => false,
-        });
+        for c in self.conns.lock().iter_mut() {
+            c.queue.push(&buf);
+        }
     }
 
-    /// Refused while any client still has bytes its socket would not take,
-    /// so every client gets every byte once, paced by the slowest. A byte
-    /// taken goes to each client whole: what a socket takes only in part
-    /// waits in that client's pending bytes. A client that has gone is
-    /// dropped; with none the byte is taken and dropped.
-    fn try_send_byte(&self, byte: u8) -> bool {
-        let mut conns = self.conns.lock();
-        let mut clear = true;
-        conns.retain_mut(|c| match c.flush() {
-            Ok(done) => {
-                clear &= done;
-                true
-            }
-            Err(_) => false,
-        });
-        if !clear {
-            return false;
-        }
-        let mut buf = Vec::with_capacity(2);
-        crate::net::telnet::escape_byte(byte, &mut buf);
-        conns.retain_mut(|c| c.push(&buf).is_ok());
-        true
+    fn flush(&self) {
+        self.flush_all(&mut self.conns.lock());
+    }
+
+    fn queued(&self) -> bool {
+        self.conns.lock().iter().any(|c| c.queue.queued())
+    }
+
+    fn dropped(&self) -> u64 {
+        let live: u64 = self.conns.lock().iter().map(|c| c.queue.dropped()).sum();
+        self.dropped.load(Ordering::Relaxed) + live
     }
 
     fn recv_byte(&self) -> io::Result<u8> {
         let mut conns = self.conns.lock();
         self.accept_waiting(&mut conns);
-        // The receive poll also moves output a full socket held back, so the
-        // last byte before the guest falls quiet is not left waiting.
-        conns.retain_mut(|c| c.flush().is_ok());
         if conns.is_empty() {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
         }
@@ -427,11 +482,12 @@ impl SerialBackend for TcpSocketBackend {
                     Ok(1) => {
                         let mut reply = Vec::new();
                         let data = c.telnet.feed(buf[0], &mut reply);
-                        // Behind any pending output, so a reply never lands
+                        // Behind queued output, so a reply never lands
                         // inside an escaped data byte.
-                        if !reply.is_empty() && c.push(&reply).is_err() {
-                            gone = true;
-                            break;
+                        if !reply.is_empty() {
+                            c.queue.push(&reply);
+                            // Nothing else flushes it while the guest is idle.
+                            let _ = c.queue.flush(&mut c.stream);
                         }
                         if let Some(d) = data {
                             return Ok(d);
@@ -450,7 +506,8 @@ impl SerialBackend for TcpSocketBackend {
                 }
             }
             if gone {
-                conns.remove(i);
+                let c = conns.remove(i);
+                self.dropped.fetch_add(c.queue.dropped(), Ordering::Relaxed);
             } else {
                 i += 1;
             }
@@ -695,7 +752,7 @@ pub fn serial_line(
             ci.set_log(log);
         }
         return match socket {
-            Some(socket) => (Arc::new(FanoutBackend::new(vec![ci.clone(), socket])), true),
+            Some(socket) => (Arc::new(FanoutBackend(vec![ci.clone(), socket])), true),
             None => (ci.clone(), true),
         };
     }
@@ -717,7 +774,7 @@ pub fn serial_line(
     let backend: Arc<dyn SerialBackend> = match ends.len() {
         0 => null_serial_backend(),
         1 => ends.remove(0),
-        _ => Arc::new(FanoutBackend::new(ends)),
+        _ => Arc::new(FanoutBackend(ends)),
     };
     match log {
         Some(log) => (Arc::new(TeeBackend::new(backend, log)), served),
@@ -770,7 +827,7 @@ pub fn console_backends(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The console is the CI backend in CI mode and TCP otherwise, either
@@ -883,7 +940,6 @@ mod tests {
         assert_eq!(waiter.join().unwrap().as_deref(), Some(&b"NEEDLE"[..]));
     }
 
-    #[cfg(unix)]
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("iris-serial-host-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -940,6 +996,7 @@ mod tests {
         for b in b"login: " {
             backend.send_byte(*b);
         }
+        backend.flush();
         assert_eq!(read_until(&mut client, b"login: "), b"login: ");
         assert_eq!(std::fs::read(&log_path).unwrap(), b"login: ");
 
@@ -989,6 +1046,7 @@ mod tests {
         let mut client = UnixStream::connect(&sock).unwrap();
         let _ = console.recv_byte();
         console.send_byte(b'k');
+        console.flush();
         assert_eq!(read_until(&mut client, b"k"), b"k");
         assert_eq!(std::fs::read(&log_path).unwrap(), b"k");
         assert_eq!(ci.drain_guest(), b"k");
@@ -1030,159 +1088,375 @@ mod tests {
         let mut client = UnixStream::connect(&sock).unwrap();
         let _ = second.recv_byte();
         second.send_byte(b'b');
+        second.flush();
         assert_eq!(read_until(&mut client, b"b"), b"b");
         assert_eq!(std::fs::read(&log_path).unwrap(), b"b");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A host end that takes bytes only while open; its plain send drops a
-    /// byte while shut, as a full socket's does.
+    /// A client that takes bytes only while open.
     #[derive(Default)]
-    struct Gate {
-        open: std::sync::atomic::AtomicBool,
-        out: Mutex<Vec<u8>>,
+    pub(crate) struct Gate {
+        pub(crate) open: std::sync::atomic::AtomicBool,
+        pub(crate) out: Mutex<Vec<u8>>,
     }
 
-    impl Gate {
-        fn set(&self, open: bool) {
-            self.open.store(open, Ordering::SeqCst);
-        }
-    }
-
-    impl SerialBackend for Gate {
-        fn send_byte(&self, byte: u8) {
-            let _ = self.try_send_byte(byte);
-        }
-        fn try_send_byte(&self, byte: u8) -> bool {
-            let open = self.open.load(Ordering::SeqCst);
-            if open {
-                self.out.lock().push(byte);
+    impl Write for &Gate {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.open.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::WouldBlock.into());
             }
-            open
+            self.out.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A host end with one raw client, a [`Gate`], queued as the sockets are.
+    pub(crate) struct GatedLine {
+        pub(crate) gate: Gate,
+        queue: Mutex<ClientQueue>,
+    }
+
+    impl GatedLine {
+        pub(crate) fn new() -> Arc<GatedLine> {
+            Arc::new(GatedLine { gate: Gate::default(), queue: Mutex::new(ClientQueue::new(false)) })
+        }
+        pub(crate) fn open(&self, yes: bool) {
+            self.gate.open.store(yes, Ordering::SeqCst);
+        }
+    }
+
+    impl SerialBackend for GatedLine {
+        fn send_byte(&self, byte: u8) {
+            self.queue.lock().push(&[byte]);
+        }
+        fn flush(&self) {
+            self.queue.lock().flush(&mut &self.gate).unwrap();
+        }
+        fn queued(&self) -> bool {
+            self.queue.lock().queued()
+        }
+        fn dropped(&self) -> u64 {
+            self.queue.lock().dropped()
         }
         fn recv_byte(&self) -> io::Result<u8> {
-            Err(io::Error::new(io::ErrorKind::WouldBlock, "empty"))
+            Err(io::ErrorKind::WouldBlock.into())
         }
     }
 
-    /// A TCP client that stops reading fills its socket and the backend then
-    /// refuses bytes; once it reads, it gets every byte the backend took
-    /// exactly once and in order, telnet escapes whole, and the refused byte
-    /// goes. The receive poll moves the last held-back byte without another
-    /// send.
+    /// A paused client loses nothing under the cap; past it the oldest whole
+    /// units go, counted exactly, and the rest arrives in order.
     #[test]
-    fn a_tcp_client_that_stops_reading_holds_bytes_back_and_gets_each_once() {
+    fn a_client_queue_drops_its_oldest_whole_units_past_the_cap() {
+        let gate = Gate::default();
+        let mut q = ClientQueue::new(false);
+        let sent: Vec<u8> = (0..CLIENT_BACKLOG + 1000).map(|i| i as u8).collect();
+        for b in &sent[..CLIENT_BACKLOG] {
+            q.push(&[*b]);
+        }
+        q.flush(&mut &gate).unwrap();
+        assert_eq!(q.dropped(), 0, "a whole backlog fits");
+        for b in &sent[CLIENT_BACKLOG..] {
+            q.push(&[*b]);
+        }
+        assert_eq!(q.dropped(), 1000);
+        gate.open.store(true, Ordering::SeqCst);
+        q.flush(&mut &gate).unwrap();
+        assert_eq!(*gate.out.lock(), sent[1000..], "a raw client gets no notice");
+    }
+
+    /// A telnet client's escapes are dropped whole, and it is told how many
+    /// bytes went before the ones that follow, in one notice however many
+    /// polls passed while its socket was full.
+    #[test]
+    fn a_telnet_client_is_told_what_was_dropped_and_no_escape_is_split() {
+        let gate = Gate::default();
+        let mut q = ClientQueue::new(true);
+        let mut wire = Vec::new();
+        for _ in 0..CLIENT_BACKLOG / 2 + 1 {
+            crate::net::telnet::escape_byte(IAC, &mut wire);
+            q.push(&[IAC, IAC]);
+        }
+        q.flush(&mut &gate).unwrap();
+        q.push(b"x");
+        q.flush(&mut &gate).unwrap();
+        assert_eq!(q.dropped(), 4, "two escapes, whole");
+        gate.open.store(true, Ordering::SeqCst);
+        q.flush(&mut &gate).unwrap();
+        let out = gate.out.lock();
+        let note = b"\r\n[iris: 4 bytes dropped]\r\n";
+        assert!(out.starts_with(note));
+        assert_eq!(out[note.len()..out.len() - 1], wire[4..]);
+        assert_eq!(out.last(), Some(&b'x'));
+    }
+
+    /// A socket that takes half an escape keeps the other half for the next
+    /// write, and a drop never takes it.
+    #[test]
+    fn a_split_escape_goes_out_whole_even_past_the_cap() {
+        struct Half(Vec<u8>, usize);
+        impl Write for Half {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let n = buf.len().min(self.1);
+                self.1 -= n;
+                self.0.extend_from_slice(&buf[..n]);
+                if n == 0 { Err(io::ErrorKind::WouldBlock.into()) } else { Ok(n) }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = Half(Vec::new(), 1);
+        let mut q = ClientQueue::new(true);
+        q.push(&[IAC, IAC]);
+        q.flush(&mut w).unwrap();
+        for _ in 0..CLIENT_BACKLOG {
+            q.push(b"y");
+        }
+        w.1 = usize::MAX;
+        q.flush(&mut w).unwrap();
+        assert_eq!(&w.0[..2], [IAC, IAC], "the escape's second half went first");
+        assert!(w.0[2..].starts_with(b"\r\n[iris: 1 bytes dropped]\r\n"));
+    }
+
+    /// A TCP client that stops reading never holds the guest, another client
+    /// or the log, and once it reads it gets everything under the cap.
+    #[test]
+    fn a_stalled_tcp_client_holds_nothing_and_loses_nothing_under_the_cap() {
         use socket2::{Domain, SockRef, Socket, Type};
-        let b = TcpSocketBackend::new(("127.0.0.1", 0)).unwrap();
+        let b = Arc::new(TcpSocketBackend::new(("127.0.0.1", 0)).unwrap());
         let addr = b.listener.local_addr().unwrap();
-        let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        client.set_recv_buffer_size(4096).unwrap();
-        client.connect(&addr.into()).unwrap();
-        let mut client: TcpStream = client.into();
+        let connect = |rcvbuf: usize| {
+            let c = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            c.set_recv_buffer_size(rcvbuf).unwrap();
+            c.connect(&addr.into()).unwrap();
+            let c: TcpStream = c.into();
+            c.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            c
+        };
+        let (mut slow, mut fast) = (connect(4096), connect(1 << 20));
         let t0 = Instant::now();
-        while b.conns.lock().is_empty() {
+        while b.conns.lock().len() < 2 {
             assert!(t0.elapsed() < Duration::from_secs(10), "never accepted");
             let _ = b.recv_byte();
-            std::thread::sleep(Duration::from_millis(1));
         }
-        SockRef::from(&b.conns.lock()[0].stream).set_send_buffer_size(4096).unwrap();
-
-        // Every fourth byte is the telnet escape, which goes out doubled.
-        let byte = |i: usize| if i % 4 == 3 { 0xff } else { i as u8 };
-        let mut taken = 0;
-        while b.try_send_byte(byte(taken)) {
-            taken += 1;
-            assert!(taken < 16 << 20, "a client that never reads must fill up");
-        }
-        assert!(!b.try_send_byte(byte(taken)), "still full");
-
-        let mut want = crate::net::telnet::TelnetFilter::initial_handshake().to_vec();
-        for i in 0..=taken {
-            crate::net::telnet::escape_byte(byte(i), &mut want);
-        }
-        client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
-        let mut got = Vec::new();
-        let mut last_taken = false;
-        while got.len() < want.len() {
-            assert!(t0.elapsed() < Duration::from_secs(20), "only {} of {} bytes arrived", got.len(), want.len());
-            let mut buf = [0u8; 4096];
-            match client.read(&mut buf) {
-                Ok(0) => panic!("the backend hung up"),
-                Ok(n) => got.extend_from_slice(&buf[..n]),
-                Err(e) => assert!(matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "{e}"),
-            }
-            if last_taken {
-                let _ = b.recv_byte();
-            } else {
-                last_taken = b.try_send_byte(byte(taken));
+        let slow_end = slow.local_addr().unwrap();
+        for c in b.conns.lock().iter() {
+            if c.stream.peer_addr().unwrap() == slow_end {
+                SockRef::from(&c.stream).set_send_buffer_size(4096).unwrap();
             }
         }
-        assert!(last_taken);
-        assert!(got == want, "the client saw {} bytes, wanted {}, or not in order", got.len(), want.len());
+        let dir = temp_dir("stall");
+        let log = SerialLog::create(&dir.join("log"), Default::default()).unwrap();
+        let tee = TeeBackend::new(b.clone(), log);
+        let sent: Vec<u8> = (0..CLIENT_BACKLOG / 2).map(|i| (i % 200) as u8).collect();
+        let head = crate::net::telnet::TelnetFilter::initial_handshake().len();
+        let read_all = |c: &mut TcpStream, want: usize| {
+            let mut got = Vec::new();
+            let t0 = Instant::now();
+            while got.len() < want {
+                assert!(t0.elapsed() < Duration::from_secs(20), "only {} of {want}", got.len());
+                let mut buf = [0u8; 65536];
+                if let Ok(n) = c.read(&mut buf) {
+                    got.extend_from_slice(&buf[..n]);
+                }
+                tee.flush();
+            }
+            got
+        };
+        for (i, &x) in sent.iter().enumerate() {
+            tee.send_byte(x);
+            if i % 4096 == 0 {
+                tee.flush();
+            }
+        }
+        assert_eq!(read_all(&mut fast, head + sent.len())[head..], sent[..], "the fast client is not held back");
+        assert_eq!(std::fs::read(dir.join("log")).unwrap(), sent, "the log has every byte");
+        assert_eq!(read_all(&mut slow, head + sent.len())[head..], sent[..], "the slow one loses nothing under the cap");
+        assert_eq!(tee.dropped(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A Unix-socket client that stops reading makes the backend refuse;
-    /// once it reads, the refused byte goes and nothing came twice.
+    /// A Unix-socket client that stops reading is queued the same way, and a
+    /// CI capture on the same line takes every byte at once.
     #[cfg(unix)]
     #[test]
-    fn a_unix_socket_client_that_stops_reading_holds_bytes_back() {
-        let dir = temp_dir("full");
-        let sock = dir.join("full.sock");
-        let b = UnixSocketBackend::new(&sock).unwrap();
-        assert!(b.try_send_byte(b'x'), "with no client a byte is taken and dropped");
-        let mut client = UnixStream::connect(&sock).unwrap();
-        let _ = b.recv_byte();
-        let mut taken = 0usize;
-        while b.try_send_byte(taken as u8) {
-            taken += 1;
-            assert!(taken < 16 << 20, "a client that never reads must fill up");
+    fn a_stalled_unix_client_and_the_ci_capture_on_one_line() {
+        let dir = temp_dir("unix-stall");
+        let socket = Arc::new(UnixSocketBackend::new(dir.join("s.sock")).unwrap());
+        let mut client = UnixStream::connect(dir.join("s.sock")).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let _ = socket.recv_byte();
+        let ci = Arc::new(CiSerialBackend::new());
+        let f = FanoutBackend(vec![ci.clone(), socket]);
+        let sent: Vec<u8> = (0..CLIENT_BACKLOG + 5000).map(|i| (i % 251) as u8).collect();
+        for &x in &sent {
+            f.send_byte(x);
         }
-        let mut got = vec![0u8; taken];
-        client.read_exact(&mut got).unwrap();
-        assert!(got.iter().enumerate().all(|(i, &v)| v == i as u8), "in order, none twice");
-        assert!(b.try_send_byte(taken as u8), "room again");
-        let mut last = [0u8; 1];
-        client.read_exact(&mut last).unwrap();
-        assert_eq!(last[0], taken as u8);
+        assert_eq!(ci.drain_guest(), sent, "the CI capture is complete");
+        let mut got = Vec::new();
+        let want = sent.len() - 5000;
+        assert!(
+            crate::test_board::until(Duration::from_secs(20), || {
+                f.flush();
+                let mut buf = [0u8; 65536];
+                if let Ok(n) = client.read(&mut buf) {
+                    got.extend_from_slice(&buf[..n]);
+                }
+                got.len() >= want
+            }),
+            "only {} of {want}",
+            got.len()
+        );
+        assert_eq!(f.dropped(), 5000, "only the bytes past the cap went");
+        assert_eq!(got, sent[5000..], "the oldest went, the rest in order");
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client that goes away with output unread is let go with its count
+    /// kept, and the next one gets output again from a clean queue.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_client_that_reconnects_gets_output_again() {
+        let dir = temp_dir("unix-reconnect");
+        let b = UnixSocketBackend::new(dir.join("s.sock")).unwrap();
+        let old = UnixStream::connect(dir.join("s.sock")).unwrap();
+        let _ = b.recv_byte();
+        for i in 0..CLIENT_BACKLOG + 1000 {
+            b.send_byte(i as u8);
+        }
+        assert_eq!(b.dropped(), 1000, "the guest was never held, the oldest went");
+        drop(old);
+        assert!(
+            crate::test_board::until(Duration::from_secs(10), || {
+                matches!(b.recv_byte(), Err(e) if e.kind() == io::ErrorKind::NotConnected)
+            }),
+            "the gone client was never let go"
+        );
+        assert_eq!(b.dropped(), 1000, "its count outlives it");
+        let mut client = UnixStream::connect(dir.join("s.sock")).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let _ = b.recv_byte();
+        b.send_byte(b'o');
+        b.send_byte(b'k');
+        let mut got = Vec::new();
+        assert!(
+            crate::test_board::until(Duration::from_secs(10), || {
+                b.flush();
+                let mut buf = [0u8; 16];
+                if let Ok(n) = client.read(&mut buf) {
+                    got.extend_from_slice(&buf[..n]);
+                }
+                got.len() >= 2
+            }),
+            "the new client got nothing"
+        );
+        assert_eq!(got, b"ok", "none of the old client's queue");
+        assert_eq!(b.dropped(), 1000);
         drop(b);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A fan-out owes a refusing end the byte the others took, refuses the
-    /// next until it is paid, and pays it from the receive poll; no end sees
-    /// a byte twice.
+    /// The TCP counterpart: `flush_all` removing a gone client keeps its
+    /// count, and a client that connects after gets only what comes next.
     #[test]
-    fn a_fanout_owes_a_slow_end_its_byte_and_no_end_sees_one_twice() {
-        let (fast, slow) = (Arc::new(Gate::default()), Arc::new(Gate::default()));
-        fast.set(true);
-        let f = FanoutBackend::new(vec![fast.clone(), slow.clone()]);
-        assert!(f.try_send_byte(b'a'), "taken: the slow end is owed it");
-        assert!(!f.try_send_byte(b'b'), "refused while an end is owed");
-        assert_eq!(*fast.out.lock(), b"a");
-        slow.set(true);
-        let _ = f.recv_byte();
-        assert_eq!(*slow.out.lock(), b"a", "the receive poll pays the debt");
-        assert!(f.try_send_byte(b'b'));
-        assert_eq!((&*fast.out.lock(), &*slow.out.lock()), (&b"ab".to_vec(), &b"ab".to_vec()));
+    fn a_tcp_client_that_reconnects_gets_output_again() {
+        let b = TcpSocketBackend::new(("127.0.0.1", 0)).unwrap();
+        let addr = b.listener.local_addr().unwrap();
+        let old = TcpStream::connect(addr).unwrap();
+        assert!(crate::test_board::until(Duration::from_secs(10), || {
+            let _ = b.recv_byte();
+            b.conns.lock().len() == 1
+        }));
+        for i in 0..CLIENT_BACKLOG + 1000 {
+            b.send_byte(i as u8);
+        }
+        let held = b.dropped();
+        assert!(held > 0, "the guest was never held, the oldest went");
+        drop(old);
+        assert!(
+            crate::test_board::until(Duration::from_secs(10), || {
+                b.flush();
+                b.conns.lock().is_empty()
+            }),
+            "the gone client was never removed"
+        );
+        assert_eq!(b.dropped(), held, "its count outlives it");
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        assert!(crate::test_board::until(Duration::from_secs(10), || {
+            let _ = b.recv_byte();
+            b.conns.lock().len() == 1
+        }));
+        b.send_byte(b'o');
+        b.send_byte(b'k');
+        let head = crate::net::telnet::TelnetFilter::initial_handshake().len();
+        let mut got = Vec::new();
+        assert!(
+            crate::test_board::until(Duration::from_secs(10), || {
+                b.flush();
+                let mut buf = [0u8; 64];
+                if let Ok(n) = client.read(&mut buf) {
+                    got.extend_from_slice(&buf[..n]);
+                }
+                got.len() >= head + 2
+            }),
+            "the new client got nothing"
+        );
+        assert_eq!(got[head..], *b"ok", "none of the old client's queue");
+        assert_eq!(b.dropped(), held);
     }
 
-    /// A log tee records a byte once, when the end behind it takes it, and a
-    /// byte given up on when the 16550 hands it to the plain send.
+    /// A UART as the contract drives it, through its own registers.
+    pub(crate) trait Port {
+        /// Write a byte to the transmit register.
+        fn write(&mut self, b: u8);
+        /// The transmitter will take a byte, from the chip's status register.
+        fn tx_ready(&mut self) -> bool;
+        /// One pass of what the chip does between guest accesses.
+        fn poll(&mut self);
+    }
+
+    type MakePort = fn(Arc<dyn SerialBackend>) -> Box<dyn Port>;
+
+    /// No UART waits on a stalled client, and the client gets every byte
+    /// once it reads, under the cap.
+    fn check_port(name: &str, make: MakePort) {
+        let line = GatedLine::new();
+        let mut port = make(line.clone());
+        let sent: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        for &b in &sent {
+            let t0 = Instant::now();
+            while !port.tx_ready() {
+                assert!(t0.elapsed() < Duration::from_secs(1), "{name}: the transmitter waited on the client");
+                port.poll();
+            }
+            port.write(b);
+        }
+        line.open(true);
+        let t0 = Instant::now();
+        while line.gate.out.lock().len() < sent.len() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{name}: the queued bytes never went");
+            port.poll();
+        }
+        assert_eq!(*line.gate.out.lock(), sent, "{name}: every byte once, in order");
+        assert_eq!(line.dropped(), 0, "{name}");
+    }
+
     #[test]
-    fn a_tee_logs_each_byte_once_whether_taken_or_given_up_on() {
-        let dir = std::env::temp_dir().join(format!("iris-serial-host-tee-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let log_path = dir.join("tee.log");
-        let gate = Arc::new(Gate::default());
-        let tee = TeeBackend::new(gate.clone(), SerialLog::create(&log_path, Default::default()).unwrap());
-        assert!(!tee.try_send_byte(b'a'));
-        assert!(!tee.try_send_byte(b'a'), "a retry");
-        tee.send_byte(b'a');
-        gate.set(true);
-        assert!(tee.try_send_byte(b'b'));
-        assert_eq!(std::fs::read(&log_path).unwrap(), b"ab");
-        assert_eq!(*gate.out.lock(), b"b");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn no_uart_waits_on_a_stalled_client_or_loses_its_bytes_under_the_cap() {
+        let ports: [(&str, MakePort); 4] = [
+            ("O2 MACE 16550", crate::dev::mace_uart::tests::contract_port),
+            ("IOC3 16550", crate::dev::ioc3::tests::contract_port),
+            ("IOC4 16550", crate::dev::ioc4::tests::contract_port),
+            ("Z85C30", crate::dev::z85c30::tests::contract_port),
+        ];
+        for (name, make) in ports {
+            check_port(name, make);
+        }
     }
 }

@@ -50,18 +50,16 @@ impl MaceUart {
         self.core().set_backend(backend);
     }
 
-    /// Move whatever the host end has typed into the receive FIFO, retry a
-    /// byte the host end refused, and let the receive timeout run out. The
-    /// machine's service loop calls this, and so does a status read, so a
-    /// driver polling for data sees it at once.
+    /// Move whatever the host end has typed into the receive FIFO, and let
+    /// the receive timeout run out. The machine's service loop calls this,
+    /// and so does a status read, so a driver polling for data sees it at
+    /// once.
     pub fn pump(&self) {
         let changed = {
-            let now = std::time::Instant::now();
             let mut c = self.core();
             let a = c.pump();
-            let sent = c.poll_tx(now);
-            let b = c.check_timeout(now);
-            a || sent || b
+            let b = c.check_timeout(std::time::Instant::now());
+            a || b
         };
         if changed {
             self.update_irq();
@@ -182,12 +180,12 @@ impl Device for MaceUart {
         match args.first().copied().unwrap_or("status") {
             "status" => {
                 let c = self.core();
-                writeln!(w, "{}: IER {:#04x} LCR {:#04x} MCR {:#04x} LSR {:#04x} SCR {:#04x}{}{}{}; {} bytes out, {} waiting in",
+                writeln!(w, "{}: IER {:#04x} LCR {:#04x} MCR {:#04x} LSR {:#04x} SCR {:#04x}{}{}{}; {} bytes out, {} dropped for clients that did not read, {} waiting in",
                     self.name, c.ier(), c.lcr(), c.mcr(), c.lsr(), c.scr(),
                     if c.loopback() { ", loopback" } else { "" },
                     if c.fifos_enabled() { ", FIFOs" } else { "" },
                     if c.irq() { ", interrupting" } else { "" },
-                    c.bytes_out(), c.rx_pending()).ok();
+                    c.bytes_out(), c.host_dropped(), c.rx_pending()).ok();
             }
             "output" => {
                 let n = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(2000);
@@ -250,7 +248,7 @@ impl BusDevice for MaceUart {
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::dev::ns16550::com_reg;
     use crate::irq::LevelProbe;
@@ -284,5 +282,26 @@ mod tests {
         dst.load_state(&saved).expect("load");
         assert_eq!(saved, dst.save_state());
         assert_eq!(dst.read8(MACE_COM0 as u64 + 7).data, b't', "unread input survives");
+    }
+
+    struct Mace(MaceUart);
+
+    impl crate::dev::serial_host::tests::Port for Mace {
+        fn write(&mut self, b: u8) {
+            self.0.write8(MACE_COM0 as u64 + 7, b);
+        }
+        fn tx_ready(&mut self) -> bool {
+            self.0.read8(MACE_COM0 as u64 + ((com_reg::LSR as u64) << 8) + 7).data & com_reg::LSR_THRE != 0
+        }
+        fn poll(&mut self) {
+            self.0.pump();
+        }
+    }
+
+    /// The O2's console UART on `backend`, for the shared serial contract.
+    pub(crate) fn contract_port(backend: Arc<dyn SerialBackend>) -> Box<dyn crate::dev::serial_host::tests::Port> {
+        let u = MaceUart::new();
+        u.set_backend(backend);
+        Box::new(Mace(u))
     }
 }

@@ -2237,3 +2237,24 @@ fn a_reset_racing_the_receive_thread_leaves_no_stale_interrupt() {
     });
     r.c.stop();
 }
+
+struct PortA(Rig);
+
+impl crate::dev::serial_host::tests::Port for PortA {
+    fn write(&mut self, b: u8) {
+        self.0.w8(reg::SERIAL_A, b);
+    }
+    fn tx_ready(&mut self) -> bool {
+        self.0.r8(reg::SERIAL_A + 5) & 0x20 != 0
+    }
+    fn poll(&mut self) {
+        self.0.c.service();
+    }
+}
+
+/// Port A on `backend`, for the shared serial contract.
+pub(crate) fn contract_port(backend: Arc<dyn SerialBackend>) -> Box<dyn crate::dev::serial_host::tests::Port> {
+    let r = Rig::new();
+    r.c.set_serial_backend(0, backend);
+    Box::new(PortA(r))
+}

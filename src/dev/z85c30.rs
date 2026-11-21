@@ -690,6 +690,8 @@ impl Device for Z85c30 {
                 let mut pending: Option<u8> = None;
 
                 while running.load(Ordering::Relaxed) {
+                    // This loop is the line's poll: it writes out queued output too.
+                    rx_backend.flush();
                     let mut byte = match pending.take() {
                         Some(b) => b,
                         // In-process injection (channel B) takes priority over
@@ -771,7 +773,8 @@ impl Device for Z85c30 {
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn IoWrite + Send>) -> Result<(), String> {
         if cmd == "serial" {
             if args.first().copied() == Some("status") || args.is_empty() {
-                for (label, arc) in [("A", &self.channel_a), ("B", &self.channel_b)] {
+                for (label, arc, backend) in [("A", &self.channel_a, &self.backend_a), ("B", &self.channel_b, &self.backend_b)] {
+                    let dropped = backend.lock().dropped();
                     let ch = arc.0.lock();
                     writeln!(writer, "=== Channel {} ===", label).unwrap();
                     writeln!(writer, "  reg_ptr : {}", ch.reg_ptr).unwrap();
@@ -787,6 +790,7 @@ impl Device for Z85c30 {
                     writeln!(writer, "  tx_queue: {} bytes {:?}", ch.tx_queue.len(),
                         ch.tx_queue.iter().copied().collect::<Vec<_>>()).unwrap();
                     writeln!(writer, "  tx_delay: {} µs", ch.tx_delay).unwrap();
+                    writeln!(writer, "  dropped : {dropped} bytes for clients that did not read").unwrap();
                     for (i, v) in ch.regs.iter().enumerate() {
                         if *v != 0 {
                             writeln!(writer, "  WR{:<2}    : {:02x}", i, v).unwrap();
@@ -872,7 +876,7 @@ impl Saveable for Z85c30 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::dev::serial_host::{CiSerialBackend, TcpSocketBackend};
 
@@ -911,6 +915,7 @@ mod tests {
         for &c in b"ok" {
             b.send_byte(c);
         }
+        b.flush();
         let mut out = [0u8; 2];
         one.read_exact(&mut out).unwrap();
         assert_eq!(&out, b"ok");
@@ -1168,5 +1173,36 @@ mod tests {
             drop(ch);
             assert!(woken, "stop notified the TX thread before it waited: the wakeup was lost");
         });
+    }
+
+    struct Scc(Z85c30);
+
+    impl crate::dev::serial_host::tests::Port for Scc {
+        fn write(&mut self, b: u8) {
+            self.0.write_b_data(b);
+        }
+        fn tx_ready(&mut self) -> bool {
+            self.0.read_b_control() & rr0::TX_BUFFER_EMPTY != 0
+        }
+        fn poll(&mut self) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    impl Drop for Scc {
+        fn drop(&mut self) {
+            self.0.stop();
+        }
+    }
+
+    /// Channel B, the console, on `backend` with its transmitter on, for the
+    /// shared serial contract.
+    pub(crate) fn contract_port(backend: Arc<dyn SerialBackend>) -> Box<dyn crate::dev::serial_host::tests::Port> {
+        let s = Z85c30::new(None);
+        s.set_backend_b(backend);
+        s.write_b_control(scc_regs::WR5);
+        s.write_b_control(wr5::TX_ENABLE);
+        s.start();
+        Box::new(Scc(s))
     }
 }
