@@ -1179,84 +1179,6 @@ fn replacing_the_backend_keeps_the_engine_working() {
 }
 
 // ---------------------------------------------------------------------------
-// A backend that cannot take a character
-// ---------------------------------------------------------------------------
-
-/// A line that takes nothing while shut; its plain send drops a character
-/// while shut, as a full socket's does.
-#[derive(Default)]
-struct Gate {
-    open: std::sync::atomic::AtomicBool,
-    out: std::sync::Mutex<Vec<u8>>,
-}
-
-impl SerialBackend for Gate {
-    fn send_byte(&self, b: u8) {
-        let _ = self.try_send_byte(b);
-    }
-    fn try_send_byte(&self, b: u8) -> bool {
-        let open = self.open.load(AtomicOrdering::SeqCst);
-        if open {
-            self.out.lock().unwrap().push(b);
-        }
-        open
-    }
-    fn recv_byte(&self) -> std::io::Result<u8> {
-        Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "empty"))
-    }
-}
-
-/// Ports test_dma_tx_refusing_backend_holds_then_completes: a backend that
-/// never takes a character holds the walk behind it, but only for the
-/// 16550 core's bound. With the FIFO off the port takes two characters, one
-/// in its shift register and one in its holding register, and the third
-/// waits; two seconds on the core gives the held one up and the walk goes
-/// on.
-#[test]
-fn a_refusing_backend_holds_the_walk_then_gives_up() {
-    let r = Rig::new();
-    let gate = Arc::new(Gate::default());
-    r.c.set_serial_backend(0, gate.clone());
-    r.pair_base(0, RINGS, 0x1000);
-    for i in 0..3 {
-        r.tx_entry(0, 0x1000, 8 * i, [0x41, 0, 0, 0], [TX_VALID, 0, 0, 0]);
-    }
-    r.sw(0, sdma_off::CONTROL, ENABLE);
-    r.sw(0, sdma_off::TX_PRODUCE, 24);
-    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 16, "two characters taken, the third waits");
-    r.c.service();
-    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 16, "still refused");
-
-    let late = Instant::now() + Duration::from_secs(3);
-    r.c.sh.with_st(|st| {
-        assert!(st.uart[0].poll_tx(late));
-        st.uart_changed(0);
-    });
-    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 24, "given up on, so the walk goes on");
-    assert!(gate.out.lock().unwrap().is_empty());
-}
-
-/// The walk resumes without a give-up when the backend opens, from the
-/// service pass that retries the held characters.
-#[test]
-fn a_backend_that_opens_releases_the_walk() {
-    let r = Rig::new();
-    let gate = Arc::new(Gate::default());
-    r.c.set_serial_backend(0, gate.clone());
-    r.pair_base(0, RINGS, 0x1000);
-    for i in 0..3 {
-        r.tx_entry(0, 0x1000, 8 * i, [0x41 + i as u8, 0, 0, 0], [TX_VALID, 0, 0, 0]);
-    }
-    r.sw(0, sdma_off::CONTROL, ENABLE);
-    r.sw(0, sdma_off::TX_PRODUCE, 24);
-    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 16);
-    gate.open.store(true, AtomicOrdering::SeqCst);
-    r.c.service();
-    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 24);
-    assert_eq!(*gate.out.lock().unwrap(), b"ABC");
-}
-
-// ---------------------------------------------------------------------------
 // The rest of the ring engine's register cases
 // ---------------------------------------------------------------------------
 
@@ -1771,4 +1693,45 @@ fn undefined_transmit_control_bits_are_reported() {
     r.sw(0, sdma_off::TX_PRODUCE, 8);
     assert_eq!(r.sent(0), b"q", "the slot is obeyed by its type");
     assert!(device_log().contains("undefined TX control bits 0x10 in an entry on port 0"));
+}
+
+struct Port0(Rig);
+
+impl crate::dev::serial_host::tests::Port for Port0 {
+    fn write(&mut self, b: u8) {
+        self.0.uw(0, 0, b);
+    }
+    fn tx_ready(&mut self) -> bool {
+        self.0.ur(0, 5) & 0x20 != 0
+    }
+    fn poll(&mut self) {
+        self.0.c.service();
+    }
+}
+
+/// Port 0 on `backend`, for the shared serial contract.
+pub(crate) fn contract_port(backend: Arc<dyn SerialBackend>) -> Box<dyn crate::dev::serial_host::tests::Port> {
+    let r = Rig::new();
+    r.c.set_serial_backend(0, backend);
+    Box::new(Port0(r))
+}
+
+/// The ring walk never waits on a client that does not read, and the client
+/// gets every character once it does.
+#[test]
+fn a_stalled_client_never_stalls_the_ring_walk() {
+    let r = Rig::new();
+    let line = crate::dev::serial_host::tests::GatedLine::new();
+    r.c.set_serial_backend(0, line.clone());
+    r.pair_base(0, RINGS, 0x1000);
+    for i in 0..3 {
+        r.tx_entry(0, 0x1000, 8 * i, [0x41 + i as u8, 0, 0, 0], [TX_VALID, 0, 0, 0]);
+    }
+    r.sw(0, sdma_off::CONTROL, ENABLE);
+    r.sw(0, sdma_off::TX_PRODUCE, 24);
+    assert_eq!(r.sr(0, sdma_off::TX_CONSUME), 24, "the walk ran to the end");
+    assert!(line.gate.out.lock().is_empty());
+    line.open(true);
+    r.c.service();
+    assert_eq!(*line.gate.out.lock(), b"ABC");
 }

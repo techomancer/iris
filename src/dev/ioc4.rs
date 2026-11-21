@@ -414,14 +414,12 @@ impl St {
         self.sdma_run(p);
     }
 
-    /// Move host input into the port, retry a byte the host end refused and
-    /// let the receive timeout run out. Returns whether anything changed.
+    /// Move host input into the port and let the receive timeout run out.
+    /// Returns whether anything changed.
     fn uart_pump(&mut self, p: usize) -> bool {
-        let now = Instant::now();
         let u = &mut self.uart[p];
         let moved = u.pump();
-        let sent = u.poll_tx(now);
-        u.check_timeout(now) || moved || sent
+        u.check_timeout(Instant::now()) || moved
     }
 
     fn uart_read(&mut self, p: usize, r: u32) -> u8 {
@@ -1021,4 +1019,4 @@ impl PciFunction for Ioc4 {
 
 #[cfg(test)]
 #[path = "ioc4_tests.rs"]
-mod tests;
+pub(crate) mod tests;

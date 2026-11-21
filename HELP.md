@@ -502,8 +502,10 @@ Each serial line can also be served on a Unix socket:
 `--serial-socket-b`). The socket carries raw bytes with no telnet negotiation,
 takes one client at a time. iris removes the socket file when it exits, even
 through power-off, `quit` or a signal; after a crash the next start replaces
-the leftover, and it refuses a file that is not a socket. A
-client that reads too slowly loses output, as on the TCP port. `serial_log`
+the leftover, and it refuses a file that is not a socket. The guest never
+waits for a client: each TCP or socket client keeps up to 1 MiB it has not
+read, and past that loses the oldest output (a TCP client is told how many
+bytes went; `serial status` or `com0 status` counts them). `serial_log`
 writes the console's transcript and `serial_log_a` / `serial_log_b` the other
 line's (the Indy and Indigo2 console is channel B, the Octane's and O2's
 channel A). A log that already exists is added to; `serial_log_overwrite =

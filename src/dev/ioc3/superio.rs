@@ -41,8 +41,7 @@ pub(super) const UART_CRYSTAL_HZ: u32 = 22_118_400;
 
 /// A 16550 as IOC3 has it: the shared core (`ns16550.rs`) with the chip's
 /// own additions around it. Transmit is instantaneous (the byte goes to the
-/// backend inside the write), so the transmitter reads empty unless the
-/// backend refused a byte, which [`Uart::pump`] then retries.
+/// backend inside the write), so the transmitter always reads empty.
 ///
 /// The additions: the auto-flow bit in modem control, which the core's modem
 /// control masks away; factory-test writes to line and modem status; and the
@@ -80,14 +79,11 @@ impl Uart {
         self.core.irq()
     }
 
-    /// Move whatever the host end has typed into the receive FIFO, retry a
-    /// byte the host end refused and let the receive timeout run out.
-    /// Returns whether anything changed.
+    /// Move whatever the host end has typed into the receive FIFO and let
+    /// the receive timeout run out. Returns whether anything changed.
     pub(super) fn pump(&mut self) -> bool {
-        let now = Instant::now();
         let moved = self.core.pump();
-        let sent = self.core.poll_tx(now);
-        self.core.check_timeout(now) || moved || sent
+        self.core.check_timeout(Instant::now()) || moved
     }
 
     /// The 16550 proper: what the ring engine sees.

@@ -215,6 +215,7 @@ impl L1 {
 
     pub fn poll_serial(&self) {
         let backend = self.backend.lock().clone();
+        backend.flush();
         for _ in 0..256 {
             if self.state.lock().queue.lock().len() > 4088 {
                 break;
