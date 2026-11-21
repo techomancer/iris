@@ -226,8 +226,18 @@ the first `[section]`, because TOML tables continue until the next header.
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)), origin3200_ip35 (configured by `[origin3200]`, see [the Origin 3200 guide](docs/origin3200-ip35.md)), onyx3000_ip35 (the Origin 3200 with a G-brick or a V-brick; `[graphics] board` picks it, see [the Onyx 3000 guide](docs/onyx3000-ip35.md)). |
 | `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`), meaning the machine's part of that family, or a part (`r14000_600`); independent of build features. With `test_device` set (the bare-metal benchmark rig) any part is accepted on any machine, `r14000_500` and the R16000 parts among them. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
 | `machine.cache` | `auto` | How the CPU caches are modelled: `full` (tags, line data, LRU and write-back, as on a real R4400 or R5000; transparent in a `tcache` or `jitv2` build, which keeps tags and states but writes through to memory), `shadow` (memory is the only store; tag arrays only answer CACHE instructions, the faster model under jitv2) or `auto` (`shadow` in a `jitv2` build, `full` otherwise). The R10000 family always uses `shadow`. `--cache` overrides. |
-| `machine.cpus` | `1`; `4` on the Tezro | Processors fitted. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro, each run on its own host thread; one selects the one-processor board with one PIC, two or four the board with two PICs. |
+| `machine.cpus` | `1`; `4` on the Tezro | Processors fitted on each node board, each run on its own host thread. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro; one selects the one-processor board with one PIC, two or four the board with two PICs. 1, 2 or 4 on each C-brick of the Origin 3200 and Onyx 3000, so two C-bricks run up to eight. |
 | `machine.emu_id` | `0` | 0 to 4095; only the Fuel and Tezro take it, and other machines refuse a nonzero one. Mints the machine's system id (`sysinfo -s`, `lmhostid`) in iris's layout. When nonzero it gives the station address `08:00:69:e2:<emu_id>`, which is the Fuel's id. The Tezro's L1 system serial is `LEMU2<emu_id>0`, whose fold is the Tezro's id. 0 is the generic id. See [the Fuel guide](docs/fuel-ip34.md) and [the Tezro guide](docs/tezro-ip53.md). |
+
+The keys in the sections below, down to `[onyx3000]`, and those of
+[`[o2]`](#o2) and [`[octane]`](#octane), are `[machine]` keys too: what one
+machine has beyond the shared keys. Write them in `[machine]`; a key the
+profile does not have is refused. Two are named differently there: `nodes`
+(also accepted as `c_bricks`) is the node boards of an Origin 2000 or Onyx2 and
+the C-bricks of an Origin 3200 or Onyx 3000, and `audio_card` is the Tezro's
+`audio`. The tables named for a machine are the older spelling. They are
+still read, a `[machine]` key wins over the same key there, and a config saved
+by iris-gui writes `[machine]`.
 
 ### [origin200], [origin2000] and [onyx2]
 
@@ -297,7 +307,7 @@ Origin 3200 settings apply when `machine.profile = "origin3200_ip35"`.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `c_bricks` | `1` | 1 or 2 C-bricks, each with one processor. Two are joined by the direct NUMAlink cable. |
+| `c_bricks` | `1`; `2` on an Onyx 3000 with a V12 | 1 or 2 C-bricks, each with `machine.cpus` processors. Two are joined by the direct NUMAlink cable. |
 | `flash` | unset | Persistent 16 MiB boot-flash file of the first C-brick; the second keeps its own at the name with `.1` added. Unset, the flash is volatile. |
 | `console` | `l1` | `l1`, `ioc3_a` or `ioc3_b`. Selects the guest console connection. |
 | `l1_port` | `8882` | Host TCP port for the first C-brick's L1 console. |
@@ -313,16 +323,19 @@ written to a saved config only when one of these keys is set. See the
 ### [onyx3000]
 
 Onyx 3000 settings apply when `machine.profile = "onyx3000_ip35"`. The keys are
-those of `[origin3200]` except `c_bricks`, which `[graphics] board` fixes:
-`flash`, `console`, `l1_port`, `l1_log`, `l1_revision` and `brick_serial`, with
-the same defaults. A `[onyx3000]` table is written to a saved config only when
+those of `[origin3200]`, with the same defaults: `c_bricks` (`[machine] nodes`), `flash`, `console`,
+`l1_port`, `l1_log`, `l1_revision` and `brick_serial`. Either graphics board
+takes one or two C-bricks; `c_bricks` left unset is 2 with a V12, whose V-brick
+then has a C-brick of its own. A `[onyx3000]` table is written to a saved config only when
 one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 
 ### [graphics]
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none. `ir2` and `ir2:2rm` are the Onyx2 deskside's InfiniteReality2 pipe with one or two raster managers; `ir2e` and `ir2e:2rm` are the InfiniteReality2E (GE16-4, RM9, 64 MB texture per raster manager), which also fits the deskside. The Onyx2 takes only the first four or `none`; the default is `none`. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI), `v6`, `v8`, `v10`, `v12` (the VPro boards, also `vpro:v12` and so on; need an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision) or `none` (no board: the machine runs on its serial console, with no window). The Fuel takes `v12` or `v10` in its graphics slot, or `none`, its default. The Tezro takes `v12` at widget 12, or `none`, its default. The Onyx 3000 (`onyx3000_ip35`) takes `ir3`, its default, an InfiniteReality3 pipe on a G-brick at widget 11 of the I-brick, or `v12` on a V-brick with a second C-brick (widget 8, an approximation); it has no `none`. |
+| `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none. `ir2` and `ir2:2rm` are the Onyx2 deskside's InfiniteReality2 pipe with one or two raster managers; `ir2e` and `ir2e:2rm` are the InfiniteReality2E (GE16-4, RM9, 64 MB texture per raster manager), which also fits the deskside. The Onyx2 takes only the first four or `none`; the default is `none`. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI), `v6`, `v8`, `v10`, `v12` (the VPro boards, also `vpro:v12` and so on; need an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision) or `none` (no board: the machine runs on its serial console, with no window). The Fuel takes `v12` or `v10` in its graphics slot, or `none`, its default. The Tezro takes `v12` at widget 12, or `none`, its default. The Onyx 3000 (`onyx3000_ip35`) takes `ir3`, its default, an InfiniteReality3 pipe on a G-brick at widget 11 of the I-brick, or `v12`, on a V-brick with a second C-brick (widget 8, an approximation) or with one C-brick at widget 11 of the I-brick; it has no `none`. |
+| `graphics.node` | the machine's placement | Onyx 3000: the C-brick (0 or 1) whose XIO link reaches the graphics board. Unset, a pipe is on the first and a V12 on the last. On node 0 the board is at the I-brick's port B; on node 1 it is in a brick of that C-brick's own. Other machines refuse a value other than 0. |
+| `graphics.widget` | the machine's placement | The Crosstalk widget the board answers at, for experiment. Onyx 3000: 11 on node 0; 8, 9, 11, 12 or 13 in a brick on node 1 (unset: 8 for a V12, 11 for a pipe). Tezro: 8, 9, 12, 13 or 14 (unset: 12, the only one known to work). Other machines refuse it. |
 | `graphics.flash` | unset | InfiniteReality2: the file that keeps the pipe's 512 KiB flash EEPROM between runs; created when absent. Unset keeps it in memory. |
 | `graphics.heads` | `1` | 1 or 2; dual-head requires Newport. The second head takes GIO expansion slot 0, so `ultra64` is turned off and `test_device` is refused. |
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |

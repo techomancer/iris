@@ -347,7 +347,7 @@ impl OctaneMachine {
         // `[octane] flash` they last from run to run.
         let flash = Arc::new(match &cfg.octane.flash {
             Some(path) => {
-                CfiFlash::with_file(&prom, FLASH_SIZE, path).map_err(|e| format!("octane.flash {path}: {e}"))?
+                CfiFlash::with_file(&prom, FLASH_SIZE, path).map_err(|e| format!("machine.flash {path}: {e}"))?
             }
             None => CfiFlash::new(&prom, FLASH_SIZE),
         });

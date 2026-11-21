@@ -246,7 +246,7 @@ impl NodeBoard<Hub, NodeFlash> {
     pub fn build(table: &str, spec: &NodeSpec, index: usize, prom: &[u8], clock: &Clock) -> Result<Self, String> {
         let image = node_flash::initial_image(prom, &spec.firmware)?;
         let flash = match &spec.flash {
-            Some(path) => NodeFlash::with_file(image, path).map_err(|e| format!("{table}.flash {}: {e}", path.display()))?,
+            Some(path) => NodeFlash::with_file(image, path).map_err(|e| format!("machine.flash {}: {e}", path.display()))?,
             None => NodeFlash::new(image)?,
         };
         let hub = Hub::new(spec.hub, clock.clone(), Some(flash.chip()))?;
@@ -314,17 +314,23 @@ pub fn machine(
         n.chip.decode.set_world(world.clone());
     }
     let smp = specs.iter().map(|s| usize::from(s.hub.cpus)).sum::<usize>() > 1;
-    let mut cpus = Vec::new();
+    // A node's processors, slice A first, numbered from the node's first.
+    let mut node_cpus = Vec::new();
     for (node, spec) in nodes.iter().zip(&specs) {
-        let cpu = build_cpu(cfg, spec, node, &memory, &timers, smp)?;
-        // The Hub publishes its lines straight into the processor's
-        // interrupt word, which `Drop` lets go of before the processor goes.
-        node.chip.pi.set_cpu_interrupts(0, cpu.interrupts_ptr());
+        let mut cpus = Vec::new();
+        for slice in 0..usize::from(spec.hub.cpus) {
+            let cpu = build_cpu(cfg, spec, node, slice, &memory, &timers, smp)?;
+            // The Hub publishes its lines straight into the processor's
+            // interrupt word, which `Drop` lets go of before the processor goes.
+            node.chip.pi.set_cpu_interrupts(slice, cpu.interrupts_ptr());
+            cpu.register_locks();
+            cpus.push(cpu);
+        }
         node.chip.set_event_sender(tx.clone());
         node.chip.register_locks();
-        cpu.register_locks();
-        cpus.push(cpu);
+        node_cpus.push(cpus);
     }
+    let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
     world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
     // One JIT for the machine: both nodes' processors compile through one
     // queue into one page pool, each node an address space of it.
@@ -333,7 +339,7 @@ pub fn machine(
         let pool: Vec<_> = nodes
             .iter()
             .zip(&specs)
-            .zip(cpus.chunks(1))
+            .zip(&node_cpus)
             .map(|((node, spec), cpus)| crate::cpu::jitv2::jitv2::PoolNode { cpus, module: spec.module, bus: node.chip.decode.physical().clone() })
             .collect();
         crate::cpu::jitv2::jitv2::share_pool(&pool, cfg.jitv2_pool_size(), cfg.jitv2.compile, &world)?;
@@ -348,7 +354,7 @@ pub fn machine(
         specs[0].module.part.label(),
     );
     let memory = nodes.iter().map(|n| n.chip.decode.physical().clone() as Arc<dyn Device>).collect();
-    Machine::new(cfg, nodes, Vec::new(), cpus.into_iter().map(|c| vec![c]).collect(), io, memory, timers, rx, |hub| {
+    Machine::new(cfg, nodes, Vec::new(), node_cpus, io, memory, timers, rx, |hub| {
         // Another Hub can still reach this one's processor.
         hub.pi.clear_cpu_interrupts();
         hub.decode.physical().release_devices();
@@ -361,6 +367,7 @@ fn build_cpu(
     cfg: &MachineConfig,
     spec: &NodeSpec,
     node: &NodeBoard<Hub, NodeFlash>,
+    slice: usize,
     memory: &Arc<crate::memory_map::MemoryMap>,
     timers: &Arc<TimerManager>,
     smp: bool,
@@ -372,7 +379,7 @@ fn build_cpu(
     // `[clock] fixed_mhz` overrides the module's Count rate.
     let count_hz = cfg.clock.count_hz(module.part).max(1);
     let cpu = crate::with_cpu!(module.part, true, false, C => {
-        let exec = crate::cpu::build::build_cpu::<C>(bus, cached, memory, module, timers, count_hz, node.first_cpu, smp);
+        let exec = crate::cpu::build::build_cpu::<C>(bus, cached, memory, module, timers, count_hz, node.first_cpu + slice, smp);
         Arc::new(MipsCpu::new(*exec)) as Arc<dyn CpuDevice>
     });
     physical.connect_cpu(&*cpu, false)?;
@@ -387,16 +394,16 @@ pub(crate) fn load_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), S
     // "(embedded)" and an unset `io_prom` both mean the built-in PROM; a named file must exist.
     let named = configured.filter(|p| !crate::dev::prom_image::is_embedded_keyword(p));
     let file = match named {
-        Some(path) => std::fs::read(path).map_err(|e| format!("{table}.io_prom {path}: {e}"))?,
+        Some(path) => std::fs::read(path).map_err(|e| format!("machine.io_prom {path}: {e}"))?,
         // Unset, and not built in: leave the flash empty, as before.
         None => match crate::dev::embedded_prom::get(crate::dev::embedded_prom::EmbeddedProm::Io6) {
             Ok(built_in) => built_in,
             Err(_) if configured.is_none() => return Ok(()),
-            Err(e) => return Err(format!("{table}.io_prom: {e}")),
+            Err(e) => return Err(format!("machine.io_prom: {e}")),
         },
     };
     let flash = crate::dev::baseio_flash::BaseioFlash::new(&file)
-        .map_err(|e| format!("{table}.io_prom {}: {e}", named.unwrap_or("(embedded)")))?;
+        .map_err(|e| format!("machine.io_prom {}: {e}", named.unwrap_or("(embedded)")))?;
     bridge.attach_flash(0, Arc::new(flash), crate::dev::baseio_flash::SIZE as u32);
     Ok(())
 }

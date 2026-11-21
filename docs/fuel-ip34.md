@@ -22,7 +22,7 @@ root. The IP35 PROM 6.210 from the IRIX 6.5.30 media is built in. The sample
 selects `machine.profile = "fuel_ip34"`. The machine always runs its one R14000 (`r14000_500`);
 `machine.cpu` may name it or be left out, and any other value is
 refused. The sample sets `banks = [256, 256]`, `headless = true`,
-`no_audio = true` and serial ports 18880 and 18881. The `[fuel]` table
+`no_audio = true` and serial ports 18880 and 18881. `[machine]` also
 selects the boot-flash backing file, the console (`l1`, `ioc3_a` or
 `ioc3_b`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
 lists its keys.
@@ -37,7 +37,7 @@ disk at SCSI ID 1 and writes guest changes to its overlay. `[network]
 mode` defaults to `nat`; `off` disconnects the link.
 
 The L1 reports firmware revision 1.48.1, the one a real Fuel's L1
-prints, and the made-up brick serial `EMUN00`; `[fuel] l1_revision` and
+prints, and the made-up brick serial `EMUN00`; `[machine] l1_revision` and
 `brick_serial` replace them. Its system serial is the machine's Ethernet
 address as twelve uppercase hexadecimal digits, the text the PROM
 converts back into that address, and IRIX's `sysinfo -s` and `lmhostid`
@@ -70,8 +70,8 @@ machine without graphics has no VPro driver in its kernel and runs as before.
 ## Input
 
 The IOC3 carries a PS/2 keyboard and mouse fed from host input, the
-standard pair in the Fuel's manual; `[fuel] ps2_input = false` leaves
-them out. `[fuel] usb_input = true` plugs a USB keyboard and mouse into
+standard pair in the Fuel's manual; `[machine] ps2_input = false` leaves
+them out. `[machine] usb_input = true` plugs a USB keyboard and mouse into
 the USB controller's first two root ports, as the Origin 3200's I-brick
 has, and the host's keyboard and mouse then go to them instead. The PS/2
 pair stays fitted, without input, unless `ps2_input = false` as well; it

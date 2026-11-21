@@ -20,8 +20,6 @@ serial_port_b = 18981
 profile = "origin200_ip29"
 # r10000 (180 MHz, 1 MiB secondary cache) or r12000 (270 MHz, 4 MiB).
 cpu = "r10000"
-
-[origin200]
 # Keep the node boot flash and the module controller's store between runs.
 flash = "ignore/origin200/flash.raw"
 controller_store = "ignore/origin200/controller.raw"

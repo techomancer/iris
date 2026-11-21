@@ -188,6 +188,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   boots on both from a Fibre Channel disk (`[fibre_channel.disk.N]`).
 - The I-brick has a USB keyboard and mouse, driven by the `ps2` monitor
   commands.
+- Origin 3200 and Onyx 3000: `[machine] cpus` fits 1, 2 or 4 processors on
+  each C-brick, up to eight with two C-bricks. A kept flash file follows the
+  new count on the next start. [Guide](docs/origin3200-ip35.md)
+- Onyx 3000: `[machine] nodes` selects one or two C-bricks with either
+  graphics board. Unset, it is as before: one with `ir3`, two with `v12`.
+- Config: what one machine has beyond the shared keys (`nodes`, `flash`,
+  `console`, `l1_port`, `usb_input`, `audio_card` and the rest) is now written
+  in `[machine]`. The tables named for a machine (`[tezro]`, `[onyx3000]`,
+  `[fuel]`, ...) are still read; iris-gui saves the new layout. Error
+  messages name the `machine.` key.
+- `[graphics] node` and `widget` say where the graphics board plugs in on the
+  Onyx 3000 (and `widget` on the Tezro), for trying other placements.
 - Origin 3200 and Onyx 3000 with two C-bricks of 512 MiB or more each: IRIX
   no longer corrupts memory (processes dying with memory faults and bus
   errors, kernel panics and hangs under disk load).

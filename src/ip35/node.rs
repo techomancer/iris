@@ -65,7 +65,7 @@ impl NodeBoard<Bedrock, Flash> {
         let NodeSpec { name, firmware, board_id, processors, .. } = *spec;
         let records = disabled_positions_environment(spec.absent);
         let flash = Arc::new(match &spec.flash {
-            Some(path) => Flash::with_file_seeded(payload, path, firmware, &records).map_err(|e| format!("{table}.flash {}: {e}", path.display())),
+            Some(path) => Flash::with_file_seeded(payload, path, firmware, &records).map_err(|e| format!("machine.flash {}: {e}", path.display())),
             None => Flash::seeded(payload, firmware, &records).map_err(|e| e.to_string()),
         }?);
         flash.use_clock(clock.clone());

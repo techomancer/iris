@@ -14,8 +14,8 @@
 //! across the machine. Each node's Physical shows every node's memory at its number, and one
 //! [`World`] holds every processor still while a store moves memory.
 //!
-//! - Every C-brick runs one processor; the others are listed disabled in the node's flash, as
-//!   the PROM would after three failed starts of each ([`NodeSpec::absent`]).
+//! - A node's empty processor positions are listed disabled in a fresh flash, as the PROM would
+//!   after three failed starts of each ([`NodeSpec::absent`]).
 //! - A reset or power request from either node resets the machine; a node's reset alone is not modelled.
 //! - Processors on several nodes share memory with no coherence protocol between the nodes.
 //!

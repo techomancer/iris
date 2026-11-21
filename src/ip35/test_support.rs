@@ -13,7 +13,7 @@ pub(crate) use crate::sn::tests::headless;
 
 pub(crate) fn config(dir: &Path, c_bricks: u8) -> MachineConfig {
     let mut cfg = headless(dir, MachineProfile::Origin3200Ip35);
-    cfg.origin3200.c_bricks = c_bricks;
+    cfg.origin3200.c_bricks = Some(c_bricks);
     cfg.origin3200.l1_port = Some(0);
     cfg
 }

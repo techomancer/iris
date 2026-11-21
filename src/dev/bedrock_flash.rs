@@ -47,8 +47,31 @@ pub fn disabled_positions_environment(absent: &str) -> Vec<(usize, Vec<u8>)> {
         bytes.extend_from_slice(&[0; 22]);
         bytes
     };
-    let records = PART_SIZE + 0x1e0100;
-    absent.bytes().enumerate().map(|(slot, position)| (records + slot * 0x40, record(position))).collect()
+    absent.bytes().enumerate().map(|(slot, position)| (SEEDED_RECORDS + slot * 0x40, record(position))).collect()
+}
+
+/// Where [`disabled_positions_environment`] puts its first record.
+const SEEDED_RECORDS: usize = PART_SIZE + 0x1e0100;
+
+/// End, in `data` (a store that already existed), the records an earlier seeding left for positions
+/// that `records` (the seeding for the board as it is now) no longer lists: a board repopulated
+/// with more processors would otherwise keep them disabled. A record ends when its tag byte is
+/// programmed to zero; the PROM then reports the position as present and enabled (observed with
+/// PROM 6.210). Only records exactly as the seeding wrote them, where it wrote them, are ended.
+/// Returns the positions ended.
+fn end_stale_seeded_records(data: &mut [u8], records: &[(usize, Vec<u8>)]) -> String {
+    let mut ended = String::new();
+    for slot in 0..3 {
+        let at = SEEDED_RECORDS + slot * 0x40;
+        let position = data[at + 8];
+        let Some((_, seeded)) = disabled_positions_environment(std::str::from_utf8(&[position]).unwrap_or("")).pop() else { continue };
+        let still_absent = records.iter().any(|(_, r)| r.get(8) == Some(&position));
+        if data[at..at + seeded.len()] == seeded[..] && !still_absent {
+            data[at] = 0;
+            ended.push(position as char);
+        }
+    }
+    ended
 }
 pub const SECOND_POSITION: u64 = 32 << 20;
 
@@ -300,10 +323,12 @@ impl Flash {
     }
 
     /// [`Self::with_file`], seeding a missing or empty store with `records`
-    /// as [`Self::seeded`] does. A store that exists keeps what it holds.
+    /// as [`Self::seeded`] does. A store that exists keeps what it holds,
+    /// except seeded records of positions `records` no longer names, which
+    /// are ended ([`end_stale_seeded_records`]).
     pub fn with_file_seeded(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
         let mut data = Self::seeded(payload, record, records)?.st.into_inner().data;
-        let mut backing = FlashBacking::open(path, &mut data).map_err(|error| {
+        let mut backing = FlashBacking::open(path.as_ref(), &mut data).map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -314,6 +339,10 @@ impl Flash {
             }
         })?;
         reopen_header(&mut data, &record);
+        let ended = end_stale_seeded_records(&mut data, records);
+        if !ended.is_empty() {
+            eprintln!("iris: {}: processor position(s) {ended} are populated now; their disable records are ended", path.as_ref().display());
+        }
         // Opening an existing store loads it before a refreshed record's
         // fields are applied; an empty store was seeded from this same data.
         backing.write_range(0, &data)?;
@@ -628,6 +657,29 @@ mod tests {
         let again = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &records).unwrap();
         assert_eq!(again.contents()[0x9e0100 + 8], b'X', "an existing store keeps what it holds");
         drop(again);
+    }
+
+    /// A store seeded for one processor and reopened by a board with more: the records of the
+    /// positions now populated are ended, the others kept, and nothing else is touched.
+    #[test]
+    fn reopening_with_more_processors_ends_the_records_of_the_new_ones() {
+        let dir = crate::test_temp::TempPath::dir("flash-repopulate");
+        let path = dir.join("flash.bin");
+        let at = |slot: usize| 0x9e0100 + slot * 0x40;
+        drop(Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BCD")).unwrap());
+        // Two processors: A and C run, B and D stay empty.
+        let two = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BD")).unwrap().contents();
+        assert_eq!([two[at(0)], two[at(1)], two[at(2)]], [0x10, 0, 0x10]);
+        assert_eq!(&two[at(1) + 1..at(1) + 9], b"DisableC", "an ended record keeps its text");
+        // Four: every record is ended, and a record the PROM wrote in its own words is not.
+        let mut held = std::fs::read(&path).unwrap();
+        held[at(2) + 16] = b'9';
+        std::fs::write(&path, &held).unwrap();
+        let four = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &[]).unwrap().contents();
+        assert_eq!([four[at(0)], four[at(1)], four[at(2)]], [0, 0, 0x10]);
+        // Back to one: nothing is rewritten; the PROM finds the empty positions itself.
+        let one = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BCD")).unwrap().contents();
+        assert_eq!(one, four);
     }
 
     /// The PROM reads CPU configuration and the volume label from its boot flash.

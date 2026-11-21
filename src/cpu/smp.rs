@@ -20,10 +20,11 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-/// Most CPUs one machine runs: the four HEART has slots for (IRIX's Octane
-/// kernel and PROM use two), and a Tezro's four. Per-CPU tables size to it.
-/// The CPU ids it bounds also index the idle parker's `u8` masks.
-pub const MAX_CPUS: usize = 4;
+/// Most CPUs one machine runs: two node boards of four (two C-bricks). HEART
+/// has slots for four (IRIX's Octane kernel and PROM use two) and a Tezro
+/// holds four. Per-CPU tables size to it. The CPU ids it bounds also index the
+/// idle parker's `u8` masks, one bit each, so eight is as far as those go.
+pub const MAX_CPUS: usize = 8;
 
 /// Bit of `MipsCore::hot.interrupts` asking the CPU to stop: it retires
 /// nothing more and parks at its next batch boundary. Bit 63 is the

@@ -360,7 +360,10 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 let s = &mut cfg.origin3200;
                 ui.horizontal(|ui| {
                     ui.label(t!("extra-c-bricks"));
-                    ui.add(DragValue::new(&mut s.c_bricks).range(1..=2));
+                    let mut count = s.c_bricks.unwrap_or(1);
+                    if ui.add(DragValue::new(&mut count).range(1..=2)).changed() {
+                        s.c_bricks = Some(count);
+                    }
                 });
                 text(ui, &t!("extra-flash"), &mut s.flash);
                 choice(
@@ -380,7 +383,14 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
             }
             MachineProfile::Onyx3000Ip35 => {
+                let mut count = cfg.c_bricks() as u8;
                 let s = &mut cfg.onyx3000;
+                ui.horizontal(|ui| {
+                    ui.label(t!("extra-c-bricks"));
+                    if ui.add(DragValue::new(&mut count).range(1..=2)).changed() {
+                        s.c_bricks = Some(count);
+                    }
+                });
                 text(ui, &t!("extra-flash"), &mut s.flash);
                 choice(
                     ui,

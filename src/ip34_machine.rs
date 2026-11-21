@@ -101,7 +101,7 @@ fn build_baseio(
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram))?);
     let pci = xbridge.bus(HEAD_F);
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
-    let (ioc3, serial) = attach_ioc3(cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "fuel.l1_port", cfg.fuel.l1_log.clone());
+    let (ioc3, serial) = attach_ioc3(cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());
     let eth = ioc3.eth().expect("the Fuel's IOC3 has Ethernet").clone();
     let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
     scsi.set_heartbeat(heartbeat.clone());
