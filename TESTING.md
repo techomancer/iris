@@ -637,8 +637,8 @@ trees.
 The lock-free and condition-variable protocols have [loom](https://docs.rs/loom)
 models in `loom_tests` modules beside the code they check: the GFIFO ring
 (`src/gfifo.rs`), the interrupt guard `IrqMutex` (`src/irq.rs`), PCI INTx
-routing (`src/pci/intx.rs`), the IP7 timer ticket (`src/cpu/ip7_ticket.rs`)
-and the jitv2 compile pool's flush barrier (`src/cpu/jitv2/pool_barrier.rs`).
+routing (`src/pci/intx.rs`) and the jitv2 compile pool's flush barrier
+(`src/cpu/jitv2/pool_barrier.rs`).
 They are built only under `--cfg loom`, where `src/sync.rs` swaps
 `parking_lot`'s `Mutex` and `Condvar` for loom's, so the model drives the code
 the device runs rather than a copy of it. Run them all with:
