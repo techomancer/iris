@@ -76,6 +76,8 @@ impl Origin200Controller {
         bus.add(store);
         let i2c = Arc::new(Pcf8584::new(bus, busy));
         hub.attach_i2c(i2c.clone());
+        // Power it on once, here: reset() leaves it running, as on the Origin 2000.
+        elsc.power_on();
         Ok(Arc::new(Self { elsc, i2c }))
     }
 }
