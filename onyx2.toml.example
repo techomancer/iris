@@ -20,8 +20,6 @@ serial_port_b = 18981
 profile = "onyx2_ip27"
 # r10000 (180 MHz, 1 MiB secondary cache) or r12000 (270 MHz, 4 MiB).
 cpu = "r10000"
-
-[onyx2]
 # One or two node boards; two are joined by the direct cable.
 nodes = 1
 flash = "ignore/onyx2/flash.raw"

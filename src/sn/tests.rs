@@ -376,7 +376,7 @@ fn a_bad_flash_file_is_refused_with_its_setting_and_path() {
         let refusals = [crate::ip27::test_support::machine(&origin200).err(), crate::ip35::test_support::machine(&fuel).err()];
         for (table, why) in ["origin200", "fuel"].into_iter().zip(refusals) {
             let why = why.expect("the machine is refused");
-            assert!(why.starts_with(&format!("{table}.flash {shown}: ")), "{why}");
+            assert!(why.starts_with(&format!("machine.flash {shown}: ")), "{why}");
         }
     });
 }

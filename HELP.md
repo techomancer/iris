@@ -690,7 +690,8 @@ profile = "indy_ip24"       # or indigo2_ip22 (--ip22), indigo2_ip28, o2_ip32, o
 cpu     = "r4400"           # unset: the machine's first. Indy, IP22: r4400/r5000; IP28: r10000; O2: r5000/r10000/r12000;
                             # Octane: r10000/r12000/r14000; Origin 200/2000, Onyx2: r10000/r12000; Fuel: r14000;
                             # Tezro: r16000 (or a part, "r16000_800"); Origin 3200, Onyx 3000: r12000
-# cpus  = 2                 # Octane: 1 or 2 (docs/octane-ip30-multiprocessor.md); Tezro: 1, 2 or 4 (default 4)
+# cpus  = 2                 # per node board. Octane: 1 or 2 (docs/octane-ip30-multiprocessor.md); Tezro: 1, 2 or 4 (default 4);
+                            # Origin 3200, Onyx 3000: 1, 2 or 4 on each C-brick
 
 [graphics]
 board      = "newport"      # Indy, Indigo2: "newport", "xz", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); "extreme" on IP22 only
@@ -790,9 +791,13 @@ prebuf_ms = 20              # sound held before playing: the margin against a la
 # enabled = true
 # path = "shared"
 
-# Machine-specific tables ([o2], [octane], [origin200], [origin2000], [onyx2], [fuel],
-# [tezro], [origin3200], [onyx3000]) are described in each machine's guide in docs/:
-# for example [fuel] usb_input = true (a USB keyboard and mouse) and [tezro] audio = true.
+# What one machine has beyond these keys also goes in [machine] and is described in
+# its guide in docs/: for example nodes = 2 (C-bricks or node boards), flash, console,
+# usb_input = true (the Fuel's USB keyboard and mouse) and audio_card = true (the Tezro).
+# The older tables named for a machine ([o2], [octane], [origin200], [origin2000],
+# [onyx2], [fuel], [tezro], [origin3200], [onyx3000]) are still read.
+# [graphics] node and widget say where the graphics board plugs in on the Onyx 3000
+# (and widget on the Tezro); left out, the machine places it.
 
 # ── Host tuning and debugging ────────────────────────────────────────────────
 

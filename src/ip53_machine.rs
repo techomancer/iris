@@ -332,9 +332,11 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     // processors' stores into its graphics page or returns credits for them.
     let vpro = (cfg.graphics_board() == GraphicsBoard::V12)
         .then(|| {
-            attach_vpro(cfg, bedrock, VPRO_WIDGET, bedrock.interrupt_sender(VPRO_WIDGET, Some(INBOUND_DEVICE)), &status, |vpro| {
-                pxbow.attach_widget(VPRO_WIDGET, vpro).map_err(|e| format!("Tezro V12: {e:?}"))?;
-                Ok(pxbow.route(VPRO_WIDGET))
+            let widget = cfg.graphics.widget.unwrap_or(VPRO_WIDGET);
+            check_vpro_widget(widget)?;
+            attach_vpro(cfg, bedrock, widget, bedrock.interrupt_sender(widget, Some(INBOUND_DEVICE)), &status, |vpro| {
+                pxbow.attach_widget(widget, vpro).map_err(|e| format!("Tezro V12: {e:?}"))?;
+                Ok(pxbow.route(widget))
             })
         })
         .transpose()?;
@@ -475,7 +477,7 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
         SerialPort {
             label: "L1",
             port: cfg.tezro.l1_port.unwrap_or(8882),
-            setting: "tezro.l1_port",
+            setting: "machine.l1_port",
             ci: serial[0].clone(),
             log: cfg.tezro.l1_log.clone(),
             socket: None,
@@ -486,7 +488,7 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
         SerialPort {
             label: "IOC4 2",
             port: cfg.tezro.serial_port_c.unwrap_or(8883),
-            setting: "tezro.serial_port_c",
+            setting: "machine.serial_port_c",
             ci: serial[3].clone(),
             log: None,
             socket: None,
@@ -495,7 +497,7 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
         SerialPort {
             label: "IOC4 3",
             port: cfg.tezro.serial_port_d.unwrap_or(8884),
-            setting: "tezro.serial_port_d",
+            setting: "machine.serial_port_d",
             ci: serial[4].clone(),
             log: None,
             socket: None,
@@ -533,6 +535,16 @@ pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
 /// Where the V12 sits: widget 12 behind the PIC that owns widget 0 (QEMU's graphics slot). On the
 /// one-processor board the guide names no widget or route for it; this is inferred.
 const VPRO_WIDGET: u8 = 12;
+
+/// `[graphics] widget`: a port of the crossbar the V12 can take, which the host port, the second
+/// PIC and the IO9 are not. Only 12 is known to work; the others are for experiment.
+pub(crate) fn check_vpro_widget(widget: u8) -> Result<(), String> {
+    if (8..=14).contains(&widget) && widget != HOST_WIDGET && widget != SECOND_PIC_WIDGET {
+        Ok(())
+    } else {
+        Err(format!("graphics.widget {widget} is not a free port of the Tezro's crossbar (valid: 8, 9, 12, 13, 14)"))
+    }
+}
 
 /// The far end of a PIC's link: Bedrock IO, where interrupt packets and DMA arrive as inbound
 /// packets from the PIC's widget. DMA aimed at another widget is refused (no peer-to-peer XIO).

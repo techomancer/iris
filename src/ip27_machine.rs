@@ -290,7 +290,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
         .map(|node| NodeSpec {
             // Hub 2.3 on the deskside node boards.
             hub: HubConfig {
-                cpus: 1,
+                cpus: cfg.machine.cpus(),
                 // Global processor numbers run two to a node slot.
                 first_cpu: 2 * node,
                 ni_revision: 5,

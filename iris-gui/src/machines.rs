@@ -77,7 +77,7 @@ pub fn read(path: &Path) -> Result<MachineConfig, String> {
 pub fn to_toml(cfg: &MachineConfig) -> Result<String, String> {
     // Through text: `toml::Table::try_from` refuses the integer-keyed maps
     // (`[scsi.N]`, `[fibre_channel.disk.N]`) that the document writer accepts.
-    let text = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let text = toml::to_string_pretty(&cfg.for_writing()).map_err(|e| e.to_string())?;
     let unset_banks = !cfg.banks_set && cfg.banks == MachineConfig::default().banks;
     if !unset_banks && cfg.jitv2_threads_set {
         return Ok(text);
