@@ -591,6 +591,8 @@ image) where the guest test suites showed they differed:
 - Nightlies and releases publish only after `build.yml` boots IRIX on an Indy
   and an O2 on Linux, macOS and Windows and matches golden login screens.
 - `iris-ci screen-wait GOLDEN` waits for the screen to match a golden image.
+- `iris-ci boot-test` boots OpenBSD 6.9 on the O2 to its login with
+  `--steps tests/openbsd/boot-openbsd69-o2.toml` (a local disk; see TESTING.md).
 - A failed first phase keeps the PROM's output and the CPU's registers
   (`phase-a.log`, `phase-a-cpu.log`).
 - `iris-ci rtc-save` works on an O2, writing its PROM flash.

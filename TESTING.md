@@ -768,6 +768,26 @@ registers where it stopped (on the O2, also the words at physical 0x1000 and
 0x4000). [clanker/testing/ci-unattended-irix-boot.md](clanker/testing/ci-unattended-irix-boot.md)
 has the details.
 
+### OpenBSD on the O2 (local)
+
+`tests/openbsd/boot-openbsd69-o2.toml` boots an O2 disk with OpenBSD 6.9 on
+it to its serial login. No such disk is published, so the nightly job does not
+run it: install one from the stock `install69.iso` (sd1, a 4 GB raw image)
+and run
+
+```sh
+cp -c openbsd69-o2.raw /tmp/obsd-boot.raw
+target/release/iris-ci boot-test /tmp/obsd-boot.raw --machine o2_ip32 \
+    --steps tests/openbsd/boot-openbsd69-o2.toml --timeout 600 --out boot-openbsd
+```
+
+The disk gets a copy-on-write overlay beside it, so boot a fresh copy each
+time (`cp -c` clones it on APFS). The boot fails when OpenBSD cannot use the
+AIC-7880 (`ahc0: board is not responding`, then `root device:`) or when an
+R5000 never wakes from its first idle `wait` (the console stops after `boot
+device: sd0`). The guest is not checked from inside: the steps file marks no
+variable `guest`, so the readback that needs IRIX's `nvram` is skipped.
+
 ## Disk persistence on exit
 
 `src/exit_persistence_tests.rs` builds the Indy, Indigo2, Indigo2 IMPACT, O2,

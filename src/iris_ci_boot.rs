@@ -1,6 +1,7 @@
 //! `iris-ci boot-test`: boot an installed IRIX disk twice, once with the
 //! console on serial and once on the graphics board, and check that each boot
-//! reaches the login.
+//! reaches the login. A steps file may name only one boot, and one that marks
+//! no NVRAM variable `guest` boots another system (OpenBSD on the O2).
 //!
 //! What to seed and what to check is data, in `tests/irix/boot.toml` (see
 //! [`iris::guest_steps`]). Each boot is a seeding run, a boot, and a quit, and each
@@ -575,13 +576,20 @@ impl Test {
     }
 
     /// Log in on serial and compare the guest's own `nvram` with what was
-    /// seeded, which shows what the kernel booted with. IRIX runs a getty on
+    /// seeded, which shows what the kernel booted with. Skipped when no
+    /// variable is marked `guest`. IRIX runs a getty on
     /// serial whichever console the PROM chose, and a CR makes it print its
     /// login again, so this works after a graphics boot too.
     fn guest_readback(&mut self, vars: &[Nvram], console: &str, login_ok: bool) {
         let name = format!("guest booted with the seeded NVRAM (console={console})");
         if !login_ok {
             self.cases.push(TestCase::skipped_with_cause(&name, "skipped", "the login check failed"));
+            return;
+        }
+        // Only IRIX has an `nvram` command and a passwordless root; a steps
+        // file for another guest marks no variable `guest`.
+        if !vars.iter().any(|v| v.guest) {
+            self.cases.push(TestCase::skipped_with_cause(&name, "skipped", "the steps file checks no variable in the guest"));
             return;
         }
         let start = Instant::now();
@@ -791,6 +799,26 @@ mod tests {
         assert_eq!(boots, [("d", Some("login:"), false), ("g", None, true)]);
         let (label, img) = golden(o2.boot[1].screen.as_ref().unwrap(), None).unwrap();
         assert_eq!((label.as_str(), img.width > 0), ("o2-irix6530.png", true));
+    }
+
+    /// The OpenBSD O2 file seeds the PROM's boot of OpenBSD's own loader,
+    /// boots once on serial, and checks nothing in the guest, which has no
+    /// `nvram` command.
+    #[test]
+    fn the_openbsd_o2_boot_is_one_serial_login_with_no_guest_readback() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/openbsd/boot-openbsd69-o2.toml");
+        let file = guest_steps::load(&path).unwrap();
+        let seeded: Vec<_> = file.nvram.iter().map(|v| (v.name.as_str(), v.value.as_str())).collect();
+        assert_eq!(seeded, [
+            ("SystemPartition", "scsi(0)disk(1)rdisk(0)partition(8)"),
+            ("OSLoadPartition", "scsi(0)disk(1)rdisk(0)partition(0)"),
+            ("OSLoader", "boot"),
+            ("OSLoadFilename", "bsd"),
+            ("AutoLoad", "Yes"),
+        ]);
+        assert!(file.nvram.iter().all(|v| !v.guest));
+        let boots: Vec<_> = file.boot.iter().map(|b| (b.console.as_str(), b.serial.as_deref(), b.screen.is_some())).collect();
+        assert_eq!(boots, [("d", Some("login:"), false)]);
     }
 
     /// The 6.5.22 steps file checks its graphics login against a built-in
