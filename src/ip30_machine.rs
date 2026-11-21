@@ -1240,7 +1240,6 @@ impl OctaneMachine {
         self.restart_peripherals();
         applied?;
         self.start_cpus();
-        self.lifecycle = crate::machine_state::GuestState::Running;
         println!("Snapshot loaded from {}/{name}", saves.display());
         Ok(())
     }
@@ -2264,6 +2263,27 @@ mod snapshot_tests {
             let e = a.load_snapshot_in(&dir.join("saves"), "flash").unwrap_err();
             assert!(e.contains("flash"), "{e}");
             assert_eq!(digest(&a), before, "the machine is as it was");
+        }).unwrap().join().unwrap();
+    }
+
+    /// After a restore, a CPU stopped by a breakpoint or the monitor must show
+    /// as stopped, and `machine-start` must run it again.
+    #[test]
+    fn a_restored_octane_can_be_started_again() {
+        use crate::machine_state::GuestState;
+        use crate::workstation::Workstation;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("restore-state");
+            let prom = empty_prom(&dir);
+            let mut m = machine(&prom, &dir);
+            m.save_snapshot_in(&dir.join("saves"), "s").unwrap();
+            m.load_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert_eq!(m.status().state, GuestState::Running);
+            m.stop_cpus();
+            assert_ne!(m.status().state, GuestState::Running);
+            m.start_guest().unwrap();
+            assert!(m.cpu_is_running());
+            m.stop();
         }).unwrap().join().unwrap();
     }
 }
