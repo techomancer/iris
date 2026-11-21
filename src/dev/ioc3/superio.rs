@@ -22,7 +22,6 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -77,13 +76,6 @@ impl Uart {
     /// The interrupt line: low IIR bit clear.
     pub(super) fn irq(&self) -> bool {
         self.core.irq()
-    }
-
-    /// Move whatever the host end has typed into the receive FIFO and let
-    /// the receive timeout run out. Returns whether anything changed.
-    pub(super) fn pump(&mut self) -> bool {
-        let moved = self.core.pump();
-        self.core.check_timeout(Instant::now()) || moved
     }
 
     /// The 16550 proper: what the ring engine sees.

@@ -302,6 +302,9 @@ impl O2Machine {
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();
+        for com in [&bus.mace.com0, &bus.mace.com1] {
+            com.core().set_clock(timer_manager.clock().clone());
+        }
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
         // CRIME's rendering engine draws on its own thread, fed through

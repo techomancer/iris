@@ -75,7 +75,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::{Mutex, MutexGuard};
 
@@ -296,7 +296,11 @@ impl St {
             error_low: 0,
             error_high: 0,
             ata_readback: 0,
-            uart: std::array::from_fn(|_| Ns16550::new(cfg.clock.hz() / 16)),
+            uart: std::array::from_fn(|_| {
+                let mut u = Ns16550::new(cfg.clock.hz() / 16);
+                u.set_clock(clock.clone());
+                u
+            }),
             sdma: SerialDma::new(PORTS, IOC4_SDMA_PARAMS),
             // Every IO9 brings the keyboard and mouse out.
             kbc: Ioc3Kbc::new(true),
@@ -367,13 +371,14 @@ impl St {
         (self.serial_pending | self.level) & self.serial_enable != 0 || self.other_pending & self.other_enable != 0
     }
 
-    /// The deadlines the engines hold, for the timers.
+    /// The deadlines the engines and the 16550s hold, for the timers.
     fn deadlines(&self) -> Deadlines {
         let mut d = [None; KINDS];
         for p in 0..PORTS {
             d[K_RX + p] = self.sdma.rx_deadline(p);
             d[K_TX_DELAY + p] = self.sdma.tx_delay_deadline(p);
             d[K_LOOP + p] = self.sdma.loop_deadline(p);
+            d[K_UART + p] = self.uart[p].timeout_due();
         }
         d
     }
@@ -414,12 +419,13 @@ impl St {
         self.sdma_run(p);
     }
 
-    /// Move host input into the port and let the receive timeout run out.
-    /// Returns whether anything changed.
-    fn uart_pump(&mut self, p: usize) -> bool {
-        let u = &mut self.uart[p];
-        let moved = u.pump();
-        u.check_timeout(Instant::now()) || moved
+    /// Let the receive timeouts that are due run out.
+    fn uart_timeouts(&mut self) {
+        for p in 0..PORTS {
+            if self.uart[p].check_timeout() {
+                self.uart_changed(p);
+            }
+        }
     }
 
     fn uart_read(&mut self, p: usize, r: u32) -> u8 {
@@ -640,7 +646,8 @@ const RX_IDLE: Duration = Duration::from_millis(2);
 const K_RX: usize = 0;
 const K_TX_DELAY: usize = PORTS;
 const K_LOOP: usize = 2 * PORTS;
-const KINDS: usize = 3 * PORTS;
+const K_UART: usize = 3 * PORTS;
+const KINDS: usize = 4 * PORTS;
 type Deadlines = [Option<u64>; KINDS];
 
 /// Lock order: `gate`, then `line_order`, then `st`; `line` is a
@@ -734,7 +741,10 @@ impl Shared {
     /// thread: short, no waiting beyond the chip's own locks.
     fn fire(&self) {
         let _gate = self.gate.lock();
-        self.with_st(|st| st.sdma_catch_up());
+        self.with_st(|st| {
+            st.sdma_catch_up();
+            st.uart_timeouts();
+        });
     }
 
     /// Feed host input from serial backend `port` into its FIFO until the
@@ -747,7 +757,7 @@ impl Shared {
                     return;
                 }
                 sh.with_st(|st| {
-                    if st.uart_pump(port) {
+                    if st.uart[port].pump() {
                         st.uart_changed(port);
                     }
                 });
@@ -761,9 +771,10 @@ impl Shared {
     fn service(&self) {
         self.with_st(|st| {
             for p in 0..PORTS {
-                st.uart_pump(p);
+                st.uart[p].pump();
                 st.uart_changed(p);
             }
+            st.uart_timeouts();
             st.sdma_catch_up();
             for p in 0..PORTS {
                 st.sdma_run(p);

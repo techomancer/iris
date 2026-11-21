@@ -491,7 +491,8 @@ const K_RX: usize = 0;
 const K_TX_DELAY: usize = 2;
 const K_INT_OUT: usize = 4;
 const K_NVRAM: usize = 5;
-const KINDS: usize = 6;
+const K_UART: usize = 6;
+const KINDS: usize = 8;
 type Deadlines = [Option<u64>; KINDS];
 
 /// Lock order: `gate`, then a child's lock (the serial engine's before the
@@ -553,15 +554,13 @@ impl Shared {
         }
     }
 
-    /// The deadlines the chip holds, for the timers: serial receive and transmit,
+    /// The deadlines the chip holds, for the timers: serial receive, transmit and 16550 timeout,
     /// the interrupt output while it can reach the line, the NVRAM debounce.
     fn deadlines(&self) -> Deadlines {
         let mut d = [None; KINDS];
         for (p, s) in self.serial.iter().enumerate() {
             if let Some(s) = s {
-                let (rx, tx) = s.due();
-                d[K_RX + p] = rx;
-                d[K_TX_DELAY + p] = tx;
+                [d[K_RX + p], d[K_TX_DELAY + p], d[K_UART + p]] = s.due();
             }
         }
         if self.core.enabled() & int::RT_OUTPUT_PULSE != 0 {
