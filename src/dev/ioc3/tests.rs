@@ -1824,6 +1824,27 @@ fn the_receive_timer_fires_with_no_guest_access() {
     r.c.stop();
 }
 
+/// A 16550's receive timeout raises its pass-through source from the chip's
+/// timer once the machine clock is four character times past the
+/// character, with no register access (PC16550D p. 17, Table IV).
+#[test]
+fn a_uart_receive_timeout_comes_from_a_timer() {
+    let r = Rig::new();
+    r.w8(reg::SERIAL_A + 2, 0xc1);
+    r.w8(reg::SERIAL_A + 1, 1);
+    r.c.start();
+    r.wire[0].inp.lock().unwrap().push_back(b'x');
+    assert!(eventually(|| r.c.sh.deadlines()[K_UART].is_some()), "the receive thread took the character");
+    let due = r.c.sh.deadlines()[K_UART].unwrap();
+    assert_eq!(due, r.c.sh.sio.as_ref().unwrap().lock().uart[0].core.char_time().as_nanos() as u64 * 4);
+    r.clock.step(due - 1);
+    let passthrough = || r.c.int_status() & int::serial(0, int::PASSTHROUGH) != 0;
+    assert!(timer_pending(&r, K_UART) && !passthrough());
+    r.clock.step(1);
+    assert!(eventually(passthrough), "the timer raised the source");
+    r.c.stop();
+}
+
 /// The interrupt output's pulse reaches the line from a timer, not from a
 /// read.
 #[test]

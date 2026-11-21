@@ -1179,6 +1179,31 @@ fn replacing_the_backend_keeps_the_engine_working() {
 }
 
 // ---------------------------------------------------------------------------
+/// A 16550's receive timeout reaches the line from the chip's timer once the
+/// machine clock is four character times past the character, with no
+/// register access (PC16550D p. 17, Table IV).
+#[test]
+fn a_uart_receive_timeout_comes_from_a_timer() {
+    let clock = crate::clock::Clock::stepped();
+    let r = Rig::on(Arc::new(TimerManager::with_clock(clock.clone())), Ioc4Config::bare(Ioc4Clock::Mhz33));
+    r.uw(0, 2, 0xc1);
+    r.uw(0, 1, 1);
+    r.c.start();
+    r.wire[0].inp.lock().unwrap().push_back(b'x');
+    let until = |f: &dyn Fn() -> bool| crate::test_board::until(Duration::from_secs(60), f);
+    let due = || r.c.sh.st.lock().uart[0].timeout_due();
+    assert!(until(&|| due().is_some()), "the receive thread took the character");
+    assert_eq!(due(), Some(r.c.sh.st.lock().uart[0].char_time().as_nanos() as u64 * 4));
+    clock.step(due().unwrap() - 1);
+    {
+        let _idle = r.c.sh.gate.lock();
+        assert!(r.c.sh.timers[K_UART].is_armed() && !r.c.sh.st.lock().uart[0].irq());
+    }
+    clock.step(1);
+    assert!(until(&|| r.c.sh.st.lock().level & int::pass(0) != 0), "the timer raised the pass-through source");
+    r.c.stop();
+}
+
 // The rest of the ring engine's register cases
 // ---------------------------------------------------------------------------
 

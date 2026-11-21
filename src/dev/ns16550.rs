@@ -47,8 +47,9 @@
 //!   hold-off machinery is not here. Nothing is paced to the baud rate; the
 //!   divisor and line control only set how long the receive timeout is.
 //! * The host end is a [`SerialBackend`] polled by [`Ns16550::pump`], where
-//!   QEMU's chardev calls back. The receive timeout is a host-time deadline
-//!   that [`Ns16550::check_timeout`] resolves, where QEMU arms a timer.
+//!   QEMU's chardev calls back. The receive timeout is a deadline on the
+//!   machine clock that the owner's timer resolves with
+//!   [`Ns16550::check_timeout`].
 //! * A receive overrun with the FIFOs off keeps the character already in the
 //!   receive register and drops the new one, which is what the part does.
 //!   QEMU overwrites the register.
@@ -67,8 +68,9 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::clock::Clock;
 use crate::dev::serial_host::{null_serial_backend, SerialBackend};
 use crate::snapshot::{get_field, hex_u8, toml_bool, toml_u32, toml_u8};
 
@@ -176,8 +178,9 @@ pub struct Ns16550 {
     recv_fifo_itl: usize,
     thr_ipending: bool,
     timeout_ipending: bool,
-    /// When the receive timeout fires, while characters sit unread.
-    timeout_deadline: Option<Instant>,
+    clock: Clock,
+    /// When the receive timeout fires, in machine ns, while characters sit unread.
+    timeout_at: Option<u64>,
     char_transmit_time: Duration,
     /// Characters a script or the monitor has typed, ahead of what the
     /// backend delivers. They reach the receiver the way the backend's do,
@@ -211,7 +214,8 @@ impl Ns16550 {
             recv_fifo_itl: 1,
             thr_ipending: false,
             timeout_ipending: false,
-            timeout_deadline: None,
+            clock: Clock::new(),
+            timeout_at: None,
             char_transmit_time: RESET_CHAR_TIME,
             typed: VecDeque::new(),
             out: VecDeque::new(),
@@ -239,13 +243,18 @@ impl Ns16550 {
         self.recv_fifo_itl = 1;
         self.char_transmit_time = RESET_CHAR_TIME;
         self.timeout_ipending = false;
-        self.timeout_deadline = None;
+        self.timeout_at = None;
         self.recv_fifo.clear();
         self.thr_ipending = false;
     }
 
     pub fn set_backend(&mut self, backend: Arc<dyn SerialBackend>) {
         self.backend = backend;
+    }
+
+    /// The machine clock the receive timeout runs on.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
     }
 
     /// Change the reference clock the divisor divides (the IOC3 derives it
@@ -388,7 +397,6 @@ impl Ns16550 {
                 }
             }
             IIR_FCR => {
-                self.check_timeout(Instant::now());
                 let ret = self.iir;
                 if ret & IIR_ID == IIR_TX_EMPTY {
                     self.thr_ipending = false;
@@ -400,7 +408,6 @@ impl Ns16550 {
             MCR => self.mcr,
             LSR => {
                 self.pump();
-                self.check_timeout(Instant::now());
                 let ret = self.lsr;
                 // Reading clears the break and overrun latches.
                 if self.lsr & (LSR_BI | LSR_OE) != 0 {
@@ -474,7 +481,7 @@ impl Ns16550 {
         }
         if val & FCR_RFR != 0 {
             self.lsr &= !(LSR_DR | LSR_BI);
-            self.timeout_deadline = None;
+            self.timeout_at = None;
             self.timeout_ipending = false;
             self.recv_fifo.clear();
         }
@@ -551,9 +558,9 @@ impl Ns16550 {
             let ret = self.recv_fifo.pop_front().unwrap_or(0);
             if self.recv_fifo.is_empty() {
                 self.lsr &= !(LSR_DR | LSR_BI);
-                self.timeout_deadline = None;
+                self.timeout_at = None;
             } else {
-                self.timeout_deadline = Some(Instant::now() + self.char_transmit_time * 4);
+                self.timeout_at = Some(self.timeout_from_now());
             }
             self.timeout_ipending = false;
             ret
@@ -602,7 +609,7 @@ impl Ns16550 {
                 }
             }
             self.lsr |= LSR_DR;
-            self.timeout_deadline = Some(Instant::now() + self.char_transmit_time * 4);
+            self.timeout_at = Some(self.timeout_from_now());
         } else {
             if self.lsr & LSR_DR != 0 {
                 // The register keeps the character it has.
@@ -615,11 +622,8 @@ impl Ns16550 {
         self.update_irq();
     }
 
-    /// Write out what the host end has queued and take what it has typed, as
-    /// far as the port will accept it. Returns whether anything arrived.
-    /// Called by the shell's service loop
-    /// and on status and data reads, so a driver polling for data sees it at
-    /// once.
+    /// Write out what the host end has queued and take what it has typed; whether anything
+    /// arrived. The service loop and status and data reads call it.
     pub fn pump(&mut self) -> bool {
         if self.unflushed {
             self.backend.flush();
@@ -666,26 +670,26 @@ impl Ns16550 {
         moved
     }
 
-    /// Resolve the receive timeout at `now`: characters left unread for four
-    /// character times raise the timeout cause. Returns whether it did.
-    pub fn check_timeout(&mut self, now: Instant) -> bool {
-        match self.timeout_deadline {
-            Some(d) if d <= now => {
-                self.timeout_deadline = None;
-                if !self.recv_fifo.is_empty() {
-                    self.timeout_ipending = true;
-                    self.update_irq();
-                    return true;
-                }
-                false
+    fn timeout_from_now(&self) -> u64 {
+        self.clock.now() + self.char_transmit_time.as_nanos() as u64 * 4
+    }
+
+    /// When the receive timeout is due, in machine ns, for the owner's timer.
+    pub fn timeout_due(&self) -> Option<u64> {
+        self.timeout_at
+    }
+
+    /// Raise the timeout cause if characters sat unread for four character times; whether it did.
+    pub fn check_timeout(&mut self) -> bool {
+        match self.timeout_at {
+            Some(d) if d <= self.clock.now() => {
+                self.timeout_at = None;
+                self.timeout_ipending = !self.recv_fifo.is_empty();
+                self.update_irq();
+                self.timeout_ipending
             }
             _ => false,
         }
-    }
-
-    #[cfg(test)]
-    fn timeout_deadline(&self) -> Option<Instant> {
-        self.timeout_deadline
     }
 
     // ----- hooks for a DMA engine in front of the port -----
@@ -769,8 +773,7 @@ impl Ns16550 {
         };
         self.update_parameters();
         // The timeout restarts from the load.
-        self.timeout_deadline = (!self.recv_fifo.is_empty() && !self.timeout_ipending)
-            .then(|| Instant::now() + self.char_transmit_time * 4);
+        self.timeout_at = (!self.recv_fifo.is_empty() && !self.timeout_ipending).then(|| self.timeout_from_now());
         self.update_irq();
     }
 }
@@ -799,6 +802,7 @@ mod tests {
     fn uart() -> (Ns16550, Arc<Wire>) {
         let w = Arc::new(Wire::default());
         let mut u = Ns16550::new(115200);
+        u.set_clock(Clock::stepped());
         u.set_backend(w.clone());
         (u, w)
     }
@@ -949,22 +953,28 @@ mod tests {
         assert_eq!(u.read(IIR_FCR), IIR_NONE);
     }
 
+    /// PC16550D p. 17, Table IV: characters below the trigger level and no
+    /// FIFO access for four character times raise the timeout cause, which
+    /// the owner's timer resolves with no register read.
     #[test]
-    fn the_timeout_restarts_after_a_partial_read_and_a_flush_clears_it() {
+    fn the_timeout_comes_four_character_times_after_the_last_access() {
         let (mut u, _) = uart();
         u.write(IER, IER_RX);
         u.write(IIR_FCR, 0xc1);
         u.receive(&[1, 2]);
-        let first = u.timeout_deadline().expect("armed");
-        assert!(!u.check_timeout(first - Duration::from_micros(1)));
-        assert_eq!(u.read(THR), 1);
-        let second = u.timeout_deadline().expect("a partial read starts it again");
-        assert!(second >= first);
-        assert!(u.check_timeout(second));
+        let four = u.char_transmit_time.as_nanos() as u64 * 4;
+        assert_eq!(u.timeout_due(), Some(four));
+        u.clock.step(four - 1);
+        assert!(!u.check_timeout() && !u.irq(), "two characters are below the trigger level");
+        u.clock.step(1);
+        assert!(u.check_timeout());
         assert_eq!(u.iir & 0x0f, IIR_CTI);
+        assert_eq!(u.read(THR), 1);
+        assert_eq!((u.irq(), u.timeout_due()), (false, Some(2 * four)), "a partial read starts it again");
         u.write(IIR_FCR, 0xc7);
-        assert_eq!((u.irq(), u.timeout_deadline()), (false, None), "a flush clears it");
-        assert_eq!(u.read(IIR_FCR) & 0x0f, IIR_NONE);
+        assert_eq!((u.irq(), u.timeout_due()), (false, None), "a flush clears it");
+        u.clock.step(4 * four);
+        assert!(!u.check_timeout());
         u.write(IER, IER_TX);
         u.write(IIR_FCR, 0xc7);
         assert_eq!(u.iir & 0x0f, IIR_TX_EMPTY, "resetting the transmit FIFO raises the empty cause");

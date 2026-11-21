@@ -64,6 +64,8 @@ struct Engine {
     /// lock: per port the receive timer then the transmit delay, as
     /// machine nanoseconds plus one, zero for none.
     due: [AtomicU64; 4],
+    /// Each 16550's receive timeout, in the same form.
+    uart_due: [AtomicU64; 2],
     clock: Clock,
 }
 
@@ -110,7 +112,9 @@ impl SerialDmaHost for Host<'_> {
     /// status word: the bit follows the 16550's level, set or cleared under
     /// the part's lock so two threads cannot leave it stale.
     fn uart_line_changed(&mut self, port: usize) {
-        let level = self.sio().uart[port].irq();
+        let u = &self.sio().uart[port];
+        let (level, due) = (u.irq(), u.core.timeout_due());
+        self.e.uart_due[port].store(encode(due), Ordering::SeqCst);
         self.e.core.level(int::serial(port, int::PASSTHROUGH), level);
     }
 
@@ -165,21 +169,23 @@ pub(super) struct Serial {
 impl Serial {
     /// Both ports of a chip, over one engine.
     pub(super) fn pair(core: Arc<Core>, sio: Arc<SuperIo>, clock: Clock) -> [Serial; 2] {
+        sio.lock().uart.iter_mut().for_each(|u| u.core.set_clock(clock.clone()));
         let e = Arc::new(Engine {
             core,
             sio,
             st: Mutex::new(SerialDma::new(2, PARAMS)),
             due: std::array::from_fn(|_| AtomicU64::new(0)),
+            uart_due: std::array::from_fn(|_| AtomicU64::new(0)),
             clock,
         });
         [0, 1].map(|p| Serial { p, e: e.clone() })
     }
 
-    /// The receive-timer and transmit-delay deadlines as of the last access,
-    /// without taking the engine's lock.
-    pub(super) fn due(&self) -> (Option<u64>, Option<u64>) {
+    /// The receive-timer, transmit-delay and 16550 receive-timeout deadlines
+    /// as of the last access, without taking the engine's lock.
+    pub(super) fn due(&self) -> [Option<u64>; 3] {
         let at = self.p * 2;
-        (decode(self.e.due[at].load(Ordering::SeqCst)), decode(self.e.due[at + 1].load(Ordering::SeqCst)))
+        [&self.e.due[at], &self.e.due[at + 1], &self.e.uart_due[self.p]].map(|d| decode(d.load(Ordering::SeqCst)))
     }
 
     #[cfg(test)]
@@ -201,9 +207,18 @@ impl Serial {
         self.e.with(|st, h| st.run(self.p, h));
     }
 
-    /// Expiries already due happen before an access.
+    /// The engine's and both 16550s' expiries, from the chip's timer.
     pub(super) fn catch_up(&self, now: u64) {
-        self.e.with(|st, h| st.catch_up(now, h));
+        self.e.with(|st, h| {
+            st.catch_up(now, h);
+            for p in 0..2 {
+                if h.sio().uart[p].core.check_timeout() {
+                    st.run(p, h);
+                }
+                // Also republishes a deadline a reset cleared.
+                h.uart_line_changed(p);
+            }
+        });
     }
 
     /// A register of this port's engine, at `off` bytes from its first.
@@ -257,7 +272,7 @@ impl Serial {
     pub(super) fn pump(&self) -> bool {
         let p = self.p;
         self.e.with(|st, h| {
-            let moved = h.sio().uart[p].pump();
+            let moved = h.sio().uart[p].core.pump();
             h.uart_line_changed(p);
             if moved {
                 st.run(p, h);
@@ -272,7 +287,8 @@ impl Serial {
     pub(super) fn service(&self, now: u64) {
         let p = self.p;
         self.e.with(|st, h| {
-            if h.sio().uart[p].pump() {
+            let u = &mut h.sio().uart[p].core;
+            if u.pump() | u.check_timeout() {
                 st.run(p, h);
             }
             h.uart_line_changed(p);

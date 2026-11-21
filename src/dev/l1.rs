@@ -176,6 +176,11 @@ impl L1 {
         self.state.lock().config.mac
     }
 
+    /// The machine clock the UART's receive timeout runs on.
+    pub fn set_clock(&self, clock: crate::clock::Clock) {
+        self.uart.lock().set_clock(clock);
+    }
+
     #[cfg(test)]
     pub fn config(&self) -> L1Config {
         self.state.lock().config.clone()
@@ -236,7 +241,7 @@ impl L1 {
     fn service_protocol_uart(&self) {
         let mut uart = self.uart.lock();
         uart.pump();
-        uart.check_timeout(std::time::Instant::now());
+        uart.check_timeout();
     }
 
     /// Parse guest transmit only after the UART lock is released. The UART
