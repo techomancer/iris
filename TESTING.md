@@ -784,6 +784,26 @@ the same files and reads every sector back. Another test fails on any
 cargo nextest run --release --lib exit_persistence_tests
 ```
 
+## Offline distribution build
+
+`tools/offline-build-test.sh` builds iris the way a distribution's build host
+does: dependencies vendored, network denied (`sandbox-exec` on macOS, an
+unshared network namespace on Linux), and a fresh `CARGO_HOME`, download cache
+and target directory. It follows the steps in
+[FEATURES.md](FEATURES.md#offline-and-distribution-builds), then checks the
+result: the `chd-extract` it built must unpack a CHD made by MAME's `chdman`
+byte for byte (skipped without `chdman`).
+
+```sh
+tools/offline-build-test.sh --expect-download-failure --gui
+```
+
+`--expect-download-failure` first builds without `LIBCHDMAN_FORCE_SOURCE` and
+requires that build to fail at the prebuilt download. `--gui` also checks
+iris-gui as the release builds it. `--keep` keeps the vendor tree and logs.
+`JOBS` and `BUILD_WRAPPER` (a prefix such as `nice -n 10`) control the cargo
+runs. Two cold release builds take several minutes.
+
 ## Interpreter hot paths
 
 `iris-checks/tests/hot_paths.rs` reads a lightning release binary and fails
