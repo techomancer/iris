@@ -39,12 +39,12 @@ fn missing_parent(what: &str, path: &str, problems: &mut Vec<String>) {
     }
 }
 
-/// What the machine would warn about and carry on: the Tezro's audio card added
+/// What the machine would warn about and carry on: the audio card added
 /// with `no_audio` set.
 pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
     let mut warnings = Vec::new();
-    if cfg.machine.profile == MachineProfile::TezroIp53 && cfg.tezro.audio && cfg.no_audio {
-        warnings.push(crate::ip53_machine::AUDIO_WITH_NO_AUDIO.to_string());
+    if cfg.audio_card() && cfg.no_audio {
+        warnings.push(crate::ip35::AUDIO_WITH_NO_AUDIO.to_string());
     }
     warnings
 }
@@ -253,7 +253,7 @@ mod tests {
         assert!(problems(&cfg).is_empty(), "{:?}", problems(&cfg));
     }
 
-    /// The Tezro's audio card with `no_audio` set is present and silent; that
+    /// The audio card with `no_audio` set is present and silent; that
     /// is worth saying, and not an error.
     #[test]
     fn the_tezro_audio_card_with_no_audio_is_a_warning() {
@@ -265,6 +265,14 @@ mod tests {
         assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")), "{:?}", warnings(&cfg));
         cfg.tezro.audio = false;
         assert!(warnings(&cfg).is_empty());
+        // The same card on the other machines that take it.
+        cfg.machine.profile = MachineProfile::FuelIp34;
+        cfg.fuel.audio = true;
+        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")));
+        cfg.machine.profile = MachineProfile::Onyx3000Ip35;
+        assert!(warnings(&cfg).is_empty());
+        cfg.onyx3000.audio = true;
+        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")));
     }
 
     /// A scratch volume only needs its directory and an empty CD-ROM tray is

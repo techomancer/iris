@@ -331,6 +331,7 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
+                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
                 ui.checkbox(&mut s.ps2_input, t!("extra-ps2"));
                 ui.checkbox(&mut s.usb_input, t!("extra-usb-input"));
             }
@@ -381,6 +382,7 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
+                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
             }
             MachineProfile::Onyx3000Ip35 => {
                 let mut count = cfg.c_bricks() as u8;
@@ -407,6 +409,7 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
+                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
             }
             _ => (),
         }

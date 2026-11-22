@@ -193,6 +193,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   volume buttons, NetBSD and the PROM).
 - Tezro: `[tezro] audio = true` adds an ICE1724 audio controller (off by
   default); `[audio] channels` sets its speakers. [Guide](docs/tezro-ip53.md)
+- Fuel, Origin 3200 and Onyx 3000: `[machine] audio_card = true` fits the same
+  ICE1724 audio card (IRIX's "MAD"), so these machines have sound.
 - Tezro, Fuel, Origin 3200 and Onyx 3000: IRIX's flushed PIO reads through the
   PIC no longer hang the machine; on a Tezro with audio, amesh and other sound
   programs froze it with their sound repeating.

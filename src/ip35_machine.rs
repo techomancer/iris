@@ -61,7 +61,7 @@ use crate::hptimer::TimerManager;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::presence::PresenceHold;
 use crate::ip35::serial::connect_serial_ports;
-use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
+use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, fit_audio_card, xbridge_on};
 use crate::sn::BoardIo;
 use crate::sn::NodeBoard;
 use crate::traits::{Device, Resettable};
@@ -184,6 +184,7 @@ fn build_baseio(
     cfg: &MachineConfig,
     l1s: &[Arc<L1>],
     xbridge: &Arc<XBridge>,
+    timers: &Arc<TimerManager>,
     clock: &Clock,
     link_reset: impl Fn(u8) + Send + Sync + 'static,
 ) -> Result<BoardIo, String> {
@@ -234,7 +235,7 @@ fn build_baseio(
     // `scsi2` and `cow2`: the Fibre Channel loop's disks.
     let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone()];
     let scsi_fibre = fibre.clone();
-    Ok(BoardIo {
+    let mut io = BoardIo {
         devices: vec![ioc3.clone(), usb, fibre],
         reset: Box::new(move || {
             reset_xbridge.power_on();
@@ -259,7 +260,9 @@ fn build_baseio(
         status: None,
         fasttick: None,
         cpus: None,
-    })
+    };
+    fit_audio_card(cfg, pci, timers, &mut io);
+    Ok(io)
 }
 
 /// Where an InfiniteReality pipe sits: widget 11 of the I-brick's XBridge,
@@ -359,10 +362,10 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
 /// The I-brick on the first C-brick, and the Onyx 3000's graphics board where [`placement`] puts it:
 /// a widget of the I-brick's XBridge on the first C-brick, or of an XBridge of its own (no PCI
 /// devices) on another's XIO connector. Its DMA and interrupts go through that C-brick's Bedrock.
-fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
+fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
     let xbridge = xbridge_on(&nodes[0].chip);
     if cfg.machine.profile != MachineProfile::Onyx3000Ip35 {
-        return build_baseio(cfg, l1s, &xbridge, clock, |_| {});
+        return build_baseio(cfg, l1s, &xbridge, timers, clock, |_| {});
     }
     check_placement(cfg)?;
     let Placement { node, widget } = placement(cfg);
@@ -421,11 +424,11 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
         }
     };
     let mut io = if on_ibrick {
-        build_baseio(cfg, l1s, &xbridge, clock, at_port)?
+        build_baseio(cfg, l1s, &xbridge, timers, clock, at_port)?
     } else {
         bridge.set_reset_output(Arc::new(at_port));
         bridge.register_locks();
-        build_baseio(cfg, l1s, &xbridge, clock, |_| {})?
+        build_baseio(cfg, l1s, &xbridge, timers, clock, |_| {})?
     };
     fit(&mut io);
     io.status = Some(status);

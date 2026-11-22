@@ -28,6 +28,29 @@ fn the_ibricks_slots_read_back_as_wired() {
         assert_eq!(pio.read32(widget(u64::from(SPARE_PORT), 0)).status, BUS_ERR, "port B is empty");
     });
 }
+/// `[machine] audio_card` fits the ICE1724 at device 2 of the I-brick's head F, on either product,
+/// with the monitor's audio report; without it the slot is empty.
+#[test]
+fn the_audio_card_sits_at_device_2_of_the_ibrick_when_asked_for() {
+    let dir = TempPath::dir("o3k-audio");
+    let slot = |cfg: MachineConfig| {
+        with_machine(cfg, |m| {
+            let read = m.nodes[0].chip.pio().read32(widget(u64::from(HEAD_F), 0x2_0000 + (u64::from(crate::ip35::AUDIO_CARD_DEVICE) << 12)));
+            ((read.status == BUS_OK).then_some(read.data), m.io.monitor.iter().any(|d| d.audio_report().is_some()))
+        })
+    };
+    let fitted = |mut cfg: MachineConfig| {
+        cfg.no_audio = true;
+        if cfg.machine.profile == MachineProfile::Onyx3000Ip35 { cfg.onyx3000.audio = true } else { cfg.origin3200.audio = true }
+        cfg
+    };
+    for cfg in [config(&dir, 1), onyx_config(&dir, GraphicsBoard::Ir3)] {
+        let (id, report) = slot(cfg.clone());
+        assert!(id.is_none_or(|id| id == u32::MAX) && !report, "{:?}: empty without the key", cfg.machine.profile);
+        assert_eq!(slot(fitted(cfg.clone())), (Some(0x1724_1412), true), "{:?}", cfg.machine.profile);
+    }
+}
+
 /// A processor's thread is a processor of the node it runs on and of no
 /// other: the second node's chip numbers the machine's CPU 1 its own
 /// processor 0, and takes the first node's thread for no processor.

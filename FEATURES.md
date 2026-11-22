@@ -270,8 +270,9 @@ The keys in the sections below, down to `[onyx3000]`, and those of
 machine has beyond the shared keys. Write them in `[machine]`; a key the
 profile does not have is refused. Two are named differently there: `nodes`
 (also accepted as `c_bricks`) is the node boards of an Origin 2000 or Onyx2 and
-the C-bricks of an Origin 3200 or Onyx 3000, and `audio_card` is the Tezro's
-`audio`. The tables named for a machine are the older spelling. They are
+the C-bricks of an Origin 3200 or Onyx 3000, and `audio_card` is the `audio`
+key of the Tezro, Fuel, Origin 3200 and Onyx 3000 tables, which fits the
+ICE1724 audio card. The tables named for a machine are the older spelling. They are
 still read, a `[machine]` key wins over the same key there, and a config saved
 by iris-gui writes `[machine]`.
 

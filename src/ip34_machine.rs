@@ -25,7 +25,7 @@ use crate::dev::odyssey::Odyssey;
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::{XBridge, HEAD_F};
 use crate::hptimer::TimerManager;
-use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
+use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, fit_audio_card, xbridge_on};
 use crate::ip35::node::NodeSpec;
 use crate::ip35::serial::connect_serial_ports;
 use crate::sn::BoardIo;
@@ -60,7 +60,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
 }
 
 /// The Fuel's I/O around its node: the XBridge, the VPro in the graphics slot, and the base I/O.
-pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], _: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
+pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
     let bedrock = &nodes[0].chip;
     let xbridge = xbridge_on(bedrock);
     // The status bar's activity bits, shared with the base I/O's devices.
@@ -75,6 +75,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, heartbeat, vpro.clone())?;
     io.status = Some(status);
     io.fasttick = Some(fasttick);
+    fit_audio_card(cfg, xbridge.bus(HEAD_F), timers, &mut io);
     if let Some(vpro) = vpro {
         io.display = Some(vpro.display());
         io.monitor.push(vpro.clone());

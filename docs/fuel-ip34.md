@@ -27,6 +27,14 @@ selects the boot-flash backing file, the console (`l1`, `ioc3_a` or
 `ioc3_b`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
 lists its keys.
 
+`[machine] audio_card = true` fits an audio card: the IC Ensemble ICE1724 with
+the DMediaPro DM8's converters, the same model as the
+[Tezro's](tezro-ip53.md). It sits at device 2 of head F, beside the base I/O;
+which device a real Fuel's option slots are is not established, so the slot is
+the model's choice. IRIX 6.5.30 lists it as `Iris Audio Processor: version MAD
+revision 1` and plays through it. It plays to the host as `[audio]` sets, or
+silently with `no_audio`.
+
 `prom` overrides the built-in PROM; a file it names must load, and
 `prom = "(embedded)"` selects the built-in one outright. The PROM decoder
 accepts a raw payload or a supported version-six, single-segment stored or
