@@ -105,7 +105,7 @@ pub const NS_PER_GUEST_CYCLE: u64 = 10;
 /// next Compare write re-arms it via `MipsCore::arm_ip7_sequence`, which is
 /// exactly the guest's acknowledgement.
 #[inline]
-fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64) -> bool {
+fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64, _cpu: u8) -> bool {
     if ticket == IP7_SEQ_CONSUMED {
         return false;
     }
@@ -117,7 +117,11 @@ fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
     {
         irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
         seq.store(IP7_SEQ_CONSUMED, Ordering::SeqCst);
-        crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
+        crate::pf_level!(
+            crate::perfetto::events::IP7_LEVEL[_cpu as usize % crate::perfetto::events::IP7_CPUS],
+            crate::perfetto::events::IP7_COMPARE[_cpu as usize % crate::perfetto::events::IP7_CPUS],
+            true
+        );
         #[cfg(feature = "idle-pause")]
         crate::cpu::idle_park::wake();
         fasttick.fetch_add(1, Ordering::Relaxed);
@@ -1856,6 +1860,7 @@ impl MipsCore {
                     self.ip7_seq,
                     &self.hot.interrupts,
                     &self.fasttick_count,
+                    self.cpu_id,
                 );
                 #[cfg(feature = "developer_ip7")]
                 if won {
@@ -1968,6 +1973,7 @@ impl MipsCore {
             let fasttick = self.fasttick_count.clone();
             let ticket = self.ip7_seq;
             let seq_ref = self.ip7_seq_shared.clone();
+            let cpu = self.cpu_id;
             // After firing, hardware would next match Compare again after a
             // full 32-bit Count wrap — self-reschedule that far out. In
             // practice the guest's interrupt handler writes Compare long
@@ -1977,8 +1983,8 @@ impl MipsCore {
             );
             self.timer_id = Some(tm.add_one_shot(
                 std::time::Duration::from_nanos(ns),
-                (irq, fasttick, wrap, ticket, seq_ref),
-                |(irq, fasttick, wrap, ticket, seq_ref)| {
+                (irq, fasttick, wrap, ticket, seq_ref, cpu),
+                |(irq, fasttick, wrap, ticket, seq_ref, cpu)| {
                     // SAFETY: points into the MipsCore owned by the executor's
                     // top-level Arc<Mutex<..>>, which outlives the armed timer
                     // (Drop for MipsCore removes it). Same contract as
@@ -1988,7 +1994,7 @@ impl MipsCore {
                     // Compare write since this one-shot was scheduled has
                     // already issued a new ticket, so this claim fails and the
                     // interrupt the guest just acked is not re-asserted.
-                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick);
+                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick, *cpu);
                     if !won {
                         return crate::hptimer::TimerReturn::Delete;
                     }
@@ -2010,7 +2016,7 @@ impl MipsCore {
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
             self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
             self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
-            crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
+            crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], true);
             self.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2063,7 +2069,7 @@ impl MipsCore {
         self.arm_ip7_sequence();
         self.reanchor_count_and_reschedule();
         if self.cp0_cause & CAUSE_IP7 != 0 {
-            claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count);
+            claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count, self.cpu_id);
         } else {
             self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
         }
@@ -2191,7 +2197,7 @@ impl MipsCore {
                 // re-raise it).
                 self.cp0_cause &= !CAUSE_IP7;
                 self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
-                crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, false);
+                crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], false);
 
                 // Now classify what the guest actually asked for. Count here
                 // is virtual and materialized in lumps from the wall clock,
@@ -2250,6 +2256,7 @@ impl MipsCore {
                             ticket,
                             &self.hot.interrupts,
                             &self.fasttick_count,
+                            self.cpu_id,
                         );
                         #[cfg(feature = "developer_ip7")]
                         if won { self.ip7_late_fires += 1; }
@@ -2950,7 +2957,7 @@ mod ip7_ticket_tests {
         let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
         assert_ne!(shared, IP7_SEQ_CONSUMED, "the restored deadline was armed with the delivered sentinel");
         assert_eq!(shared, core.ip7_seq, "the armed one-shot's ticket must be the live sequence");
-        assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count),
+        assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count, core.cpu_id),
             "the restored deadline's one-shot could not deliver IP7");
     }
 
@@ -3006,7 +3013,7 @@ mod ip7_ticket_tests {
                     }
                     if ticket != tried.load(Ordering::SeqCst) {
                         // SAFETY: the core outlives the scope, as it does the armed timer.
-                        claim_ip7(&seq, ticket, unsafe { &*irq.0 }, &fasttick);
+                        claim_ip7(&seq, ticket, unsafe { &*irq.0 }, &fasttick, 0);
                         tried.store(ticket, Ordering::SeqCst);
                     }
                     std::thread::yield_now();
