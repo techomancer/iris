@@ -267,6 +267,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Onyx2: the BaseIO-G has the MediaIO daughtercard (a second IOC3: serial,
   keyboard, mouse, parallel port, RAD1 audio), and `hinv` lists it all.
 
+### Ultra64 dev board
+
+- macOS: the Indy now receives the N64 emulator's interrupts and RDB packets;
+  the bridge's shared memory grew, so rebuild gopher64 against this IRIS.
+
 ### Indy and Indigo2 chime on the first boot
 
 - A new or blank `nvram.bin` (Indy) or `nveeprom.bin` (Indigo2) no longer makes

@@ -120,10 +120,16 @@ impl Ultra64 {
                 .map_err(|e| format!("ultra64: Event h2n init failed: {e}"))?
         };
         let evt_n2h_offset = EVT_H2N_OFFSET + h2n_used;
-        let (evt_n2h_box, _) = unsafe {
+        let (evt_n2h_box, n2h_used) = unsafe {
             Event::new(base.add(evt_n2h_offset), true)
                 .map_err(|e| format!("ultra64: Event n2h init failed: {e}"))?
         };
+        // The header follows the event area; an event reaching into it is
+        // overwritten by the header and never wakes its waiter.
+        if evt_n2h_offset + n2h_used > EVENT_AREA_SIZE {
+            return Err(format!("ultra64: the bridge's events take {} bytes, more than the {EVENT_AREA_SIZE} reserved",
+                evt_n2h_offset + n2h_used));
+        }
 
         let evt_h2n = Arc::new(SendEvent(evt_h2n_box));
         let evt_n2h = Arc::new(SendEvent(evt_n2h_box));

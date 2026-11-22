@@ -290,15 +290,17 @@ not used by current SDK code.
 ### 5.1 Shared Memory Layout (`/iris_n64_bridge`)
 
 The shm region begins with two embedded `raw_sync` Events (auto-reset, semaphore semantics) in a
-fixed 256-byte area, followed by the header and the 16 MB RAMROM. The layout is defined once, in
-`src/ultra_proto.rs`, which both IRIS and gopher64 compile.
+fixed 512-byte area, followed by the header and the 16 MB RAMROM. The layout is defined once, in
+`src/ultra_proto.rs`, which both IRIS and gopher64 compile, so both sides must be built from the
+same version of it. The area was 256 bytes until November 2026; on macOS the second event ran
+past it into the header and the Indy never woke for an N64 message.
 
 ```
-[0x000–0x0FF]   Event area (256 bytes)
+[0x000–0x1FF]   Event area (512 bytes)
                   EVT_H2N at offset 0    — Indy signals, N64 waits
                   EVT_N2H after h2n      — N64 signals, Indy waits
 
-[0x100– ]       ShmHeader
+[0x200– ]       ShmHeader
                   magic:     u32      0x4E36344D ("N64M")
                   version:   u32      1
                   h2n_ring:  IpcRing  Indy → N64
