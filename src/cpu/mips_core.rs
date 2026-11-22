@@ -925,6 +925,10 @@ pub struct MipsCore {
 
     /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
     pub fasttick_count: Arc<AtomicU64>,
+    /// The tick rate the guest programs through Compare, for the status bar
+    /// (`set_sink` wires it on machines whose clock is Compare). Fed on
+    /// Count reads and writes and Compare writes only.
+    pub tick_rate: crate::cpu::compare_rate::CompareTickRate,
     /// Which processor this is: what HEART's PRID answers it.
     pub cpu_id: u8,
     /// More than one CPU shares this memory, so SC must be a host
@@ -1484,6 +1488,7 @@ impl MipsCore {
             reset_fir: 0x0000_0500,
             cp0_random_cycle: 0,
             fasttick_count: Arc::new(AtomicU64::new(0)),
+            tick_rate: Default::default(),
             cpu_id: 0,
             smp: false,
             ll_value: 0,
@@ -1560,6 +1565,7 @@ impl MipsCore {
                 self.count_fire_cycle = u64::MAX;
             }
             self.disarm_compare_timer();
+            self.tick_rate.reset(0);
             self.cp0_random = self.tlb_entries - 1;
             self.cp0_random_cycle = 0;
             self.cp0_prid = self.reset_prid;
@@ -1692,6 +1698,7 @@ impl MipsCore {
                 // classified relative to this (see write_cp0 reg 11).
                 let c = self.count_now();
                 self.count_last_guest_read = c;
+                self.tick_rate.count_read(c);
                 c as u64
             }
             10 => self.cp0_entryhi,
@@ -2091,6 +2098,7 @@ impl MipsCore {
     /// takes it; a restore over a live core clears any IP7 the snapshot
     /// did not have.
     pub fn restore_compare_deadline(&mut self) {
+        self.tick_rate.reset(self.cp0_count as u32);
         self.arm_ip7_sequence();
         self.reanchor_count_and_reschedule();
         if self.cp0_cause & CAUSE_IP7 != 0 {
@@ -2182,6 +2190,7 @@ impl MipsCore {
                 // timer against the moved count.
                 self.materialize_count(true);
                 self.cp0_count = value as u32 as u64;
+                self.tick_rate.count_write(value as u32);
                 if self.count_write_samples {
                     self.count_last_guest_read = value as u32;
                 }
@@ -2317,6 +2326,11 @@ impl MipsCore {
                 }
                 #[cfg(not(feature = "developer_ip7"))]
                 let _ = new_delta;
+
+                // Cases 2 and 4 are deadlines: they set the clock's rate.
+                if in_future || (compare_u32 != last_read && missed) {
+                    self.tick_rate.deadline(compare_u32, self.count_hz);
+                }
 
                 self.schedule_compare_timer();
             }
@@ -3216,6 +3230,49 @@ mod ip7_ticket_tests {
     #[cfg(not(feature = "ci_clock"))]
     fn ip7(core: &MipsCore) -> bool {
         core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7 != 0
+    }
+
+    /// The tick rate the guest programs reaches the status bar from its
+    /// Compare writes, in both of IRIX's shapes: Count zeroed at every tick
+    /// with Compare the interval less the overrun (Octane, Origin, Fuel,
+    /// Tezro), and Compare advanced by the interval over a free-running
+    /// Count (O2). An acknowledgement is not a deadline.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn compare_writes_publish_the_programmed_tick_rate() {
+        // 1 kHz Count, a deadline every 100 ticks: 10 Hz.
+        const INTERVAL: u32 = 100;
+        let mut core = octane_core();
+        let sink = Arc::new(AtomicU64::new(0));
+        core.tick_rate.set_sink(sink.clone());
+        core.write_cp0(9, 0);
+        core.write_cp0(11, INTERVAL as u64);
+        for late in [3u32, 20, 1, 7, 40] {
+            elapse_ticks(&mut core, (INTERVAL + late) as u64);
+            let c = core.read_cp0(9) as u32;
+            core.write_cp0(9, 0);
+            core.write_cp0(11, (INTERVAL - (c - core.cp0_compare as u32)) as u64);
+        }
+        assert_eq!(sink.load(Ordering::Relaxed), 10_000, "Count reset each tick");
+
+        let mut core = octane_core();
+        core.tick_rate.set_sink(sink.clone());
+        core.reset_registers(false);
+        assert_eq!(sink.load(Ordering::Relaxed), 0, "a reset forgets the rate");
+        core.count_write_samples = true;
+        core.write_cp0(9, 0);
+        let mut compare = INTERVAL;
+        core.write_cp0(11, compare as u64);
+        for late in [5u32, 12, 2] {
+            elapse_ticks(&mut core, (INTERVAL - 1) as u64);
+            elapse_ticks(&mut core, (1 + late) as u64);
+            let c = core.read_cp0(9) as u32;
+            // An acknowledgement in between leaves the rate alone.
+            core.write_cp0(11, c as u64);
+            compare += INTERVAL;
+            core.write_cp0(11, compare as u64);
+        }
+        assert_eq!(sink.load(Ordering::Relaxed), 10_000, "Compare advanced each tick");
     }
 
     /// A Compare just before and just after the 32-bit wrap, with Count

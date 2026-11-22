@@ -11816,6 +11816,10 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn running_flag(&self) -> Arc<AtomicBool>;
     fn fasttick_count(&self) -> Arc<AtomicU64>;
     fn count_hz_atomic(&self) -> Arc<AtomicU64>;
+    /// Publish the clock-tick rate the guest programs through CP0 Compare
+    /// into `sink`, in millihertz (`status::CpuStatus::tick_rate`). For
+    /// machines whose clock interrupt is Compare; call before the CPU runs.
+    fn publish_tick_rate(&self, sink: Arc<AtomicU64>);
     #[cfg(feature = "jitv2")]
     fn jitv2(&self) -> Arc<Mutex<crate::cpu::jitv2::Jitv2>>;
     /// Compile on this CPU's own thread, at the dispatch gate, from now on
@@ -11890,6 +11894,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn fasttick_count(&self) -> Arc<AtomicU64> { Arc::clone(&self.fasttick_count) }
     fn count_hz_atomic(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.executor.lock().core.count_hz_atomic)
+    }
+    fn publish_tick_rate(&self, sink: Arc<AtomicU64>) {
+        self.executor.lock().core.tick_rate.set_sink(sink);
     }
     #[cfg(feature = "jitv2")]
     fn jitv2(&self) -> Arc<Mutex<crate::cpu::jitv2::Jitv2>> { MipsCpu::jitv2(self) }

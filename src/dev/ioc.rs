@@ -564,12 +564,10 @@ struct IocTimerCallback {
 
 impl TimerCallback for IocTimerCallback {
     fn callback(&self) {
-        // Only timer 1, the fast clock: timer 0's 100 Hz system clock on top
-        // of it read as 1100 Hz.
-        if self.source == IocInterrupt::Mappable1 {
-            if let Some(t) = self.ticks.get() {
-                t.fetch_add(1, Ordering::Relaxed);
-            }
+        // Both timers: the system clock and the fast clock. The rate they
+        // are measured against is their sum (`Ioc::set_clock_ticks`).
+        if let Some(t) = self.ticks.get() {
+            t.fetch_add(1, Ordering::Relaxed);
         }
         let mut state = self.state.lock();
         match self.source {
@@ -697,14 +695,16 @@ impl Ioc {
         let _ = self.event_tx.set(tx);
     }
 
-    /// Count the kernel's fast clock into the status bar's Hz counter. IRIX
-    /// keeps time with the 8254 (timer 0 is the 100 Hz system clock, timer 1
-    /// the 1000 Hz fast clock, parked when nothing needs it) unless the IOC's
-    /// 8254 is known broken, in which case the fast clock is CP0 Compare,
-    /// which the CPU already counts. Only timer 1 is counted here, so either
-    /// way the counter shows the fast clock, and never both at once.
-    pub fn set_clock_ticks(&self, ticks: Arc<AtomicU64>) {
+    /// Count the kernel's clock into the status bar's tick counter, and
+    /// publish the rate the guest programs into `rate` (millihertz). IRIX
+    /// keeps time with the 8254: timer 2 divides the 1 MHz input to 5 kHz,
+    /// which clocks timer 0, the 100 Hz system clock, and timer 1, the
+    /// 1000 Hz fast clock (stopped with a zero count when nothing needs it).
+    /// Both timers' interrupts are counted, so the rate is their sum: 1100 Hz
+    /// with the fast clock running, 100 Hz without.
+    pub fn set_clock_ticks(&self, ticks: Arc<AtomicU64>, rate: Arc<AtomicU64>) {
         let _ = self.clock_ticks.set(ticks);
+        self.pit.publish_rate(0b011, rate);
     }
 
     pub fn set_heartbeat(&self, heartbeat: Arc<AtomicU64>) {
@@ -1435,21 +1435,21 @@ mod tests {
         assert_eq!(ioc.state.lock().l0_stat & l0_regs::SCSI0, 0);
     }
 
-    /// Timer 1 feeds the status bar's Hz, timer 0 does not; a tick landing on
-    /// a pending one is merged; TMR_CLR on a set bit is an acknowledgement and
+    /// Both timers feed the status bar's tick counter; a tick landing on a
+    /// pending one is merged; TMR_CLR on a set bit is an acknowledgement and
     /// on a clear bit is not.
     #[test]
-    fn timer_ticks_count_fast_clock_and_acknowledgements() {
+    fn timer_ticks_count_both_clocks_and_acknowledgements() {
         let ioc = Ioc::new(false);
         let hz = Arc::new(AtomicU64::new(0));
-        ioc.set_clock_ticks(hz.clone());
+        ioc.set_clock_ticks(hz.clone(), Arc::new(AtomicU64::new(0)));
         let cb = |source| IocTimerCallback { state: ioc.state.clone(), source, ticks: ioc.clock_ticks.clone() };
         let (t0, t1) = (cb(IocInterrupt::Mappable0), cb(IocInterrupt::Mappable1));
 
         t0.callback();
         t1.callback();
         t1.callback(); // lands on the pending one
-        assert_eq!(hz.load(Ordering::Relaxed), 2, "only timer 1 counts toward Hz");
+        assert_eq!(hz.load(Ordering::Relaxed), 3, "both timers count");
 
         let mut s = ioc.state.lock();
         s.clear_timers(0x2);
@@ -1460,6 +1460,28 @@ mod tests {
         s.clear_timers(0x1);
         assert_eq!(s.ticks[0].acked, 1);
         assert_eq!(s.map_stat & 0x3, 0);
+    }
+
+    /// The rate the status bar measures the ticks against follows the 8254
+    /// as IRIX programs it through the IOC: 100 Hz system clock, plus the
+    /// 1 kHz fast clock while it runs.
+    #[test]
+    fn clock_rate_follows_the_8254() {
+        let ioc = Ioc::new(false);
+        let rate = Arc::new(AtomicU64::new(0));
+        ioc.set_clock_ticks(Arc::new(AtomicU64::new(0)), rate.clone());
+        let program = |ch: u8, count: u16| {
+            ioc.pit().write(3, (ch << 6) | (3 << 4) | (2 << 1));
+            ioc.pit().write(ch as u32, count as u8);
+            ioc.pit().write(ch as u32, (count >> 8) as u8);
+        };
+        program(0, 50);
+        program(2, 200);
+        assert_eq!(rate.load(Ordering::Relaxed), 100_000);
+        program(1, 5);
+        assert_eq!(rate.load(Ordering::Relaxed), 1_100_000);
+        program(1, 0);
+        assert_eq!(rate.load(Ordering::Relaxed), 100_000);
     }
 
     /// `ioc ticks` reports the window and starts a new one.

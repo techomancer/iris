@@ -370,7 +370,8 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
     // The status bar's activity bits and the monitor's `speed` and `ticks`,
     // with a display or without.
     let heartbeat = Arc::new(AtomicU64::new(0));
-    let status = crate::status::MachineStatus::new(heartbeat.clone(), Arc::new(AtomicU64::new(0)));
+    // CPU 0's tick counter is its Compare count, wired with the CPUs (`sn`).
+    let status = crate::status::MachineStatus::without_ticks(heartbeat.clone());
     status.set_scsi_wide(true);
     if cfg.machine.profile != MachineProfile::Onyx3000Ip35 {
         let mut io = build_baseio(cfg, l1s, &xbridge, timers, clock, heartbeat, |_| {})?;

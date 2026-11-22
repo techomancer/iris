@@ -312,6 +312,8 @@ impl O2Machine {
         status.set_scsi_wide(true);
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
+        // The O2's clock is CP0 Compare: publish the rate it programs.
+        cpu.publish_tick_rate(status.cpu(0).tick_rate());
         let paused = Arc::new(AtomicBool::new(false));
         // GBE's timing interrupts come at their lines from the timer thread.
         status.refresh().set_timers(timer_manager.clone());

@@ -537,7 +537,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        ioc.set_clock_ticks(fasttick_count.clone());
+        ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).tick_rate());
         // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
         // target on a controller (`ScsiDeviceConfig::placement`). The disks
         // recorded here, and the scratch volume's path for the CI socket,
