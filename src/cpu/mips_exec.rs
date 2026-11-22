@@ -3738,6 +3738,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         {
             let mut j = jit.lock();
             j.set_space(space, self.jitv2_frames as usize, self.jitv2_split);
+            j.compile_queue.set_world(world.clone());
             self.jitv2_compile_queue_handle = j.compile_queue.queue_handle();
             self.jitv2_hot_queue_handle = j.compile_queue.hot_handle();
             self.jitv2_stats = j.stats.clone();
@@ -10854,6 +10855,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         let ppmem_bitmap_ptr = executor_arc.lock().ppmem_bitmap_ptr();
         #[cfg(feature = "jitv2")]
         executor_arc.lock().install_jit_hooks();
+        let park = Arc::new(crate::cpu::smp::ParkSlot::new(cpu_id, interrupts_ptr));
+        // This CPU's own compile pool stops it the way a shared pool stops
+        // several: by parking it, and taking turns with the CPU's own flushes.
+        // Halting it instead joins the CPU thread, which may itself be joining
+        // the worker for a flush of its own. A machine whose CPUs share a pool,
+        // or that has a world of its own, replaces this one (`share_jitv2`).
+        #[cfg(feature = "jitv2")]
+        {
+            let mut exec = executor_arc.lock();
+            let world = Arc::new(crate::cpu::smp::World::solo(park.clone()));
+            exec.jitv2.lock().compile_queue.set_world(world.clone());
+            exec.jitv2_world = Some(world);
+        }
 
         Self {
             executor: executor_arc,
@@ -10863,7 +10877,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             cycles_ptr,
             interrupts_ptr,
             ppmem_bitmap_ptr,
-            park: Arc::new(crate::cpu::smp::ParkSlot::new(cpu_id, interrupts_ptr)),
+            park,
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
@@ -11408,9 +11422,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // `pcp == null` is an invariant of "CPU is stopped" — established
             // here, unconditionally, rather than left to every caller that
             // stops the CPU around a `jitv2.pages` mutation to remember.
-            // `Jitv2::flush_from_jit_thread` (the compile thread's own
-            // Codegen-growth flush — see `Jitv2::codegen`'s doc comment)
-            // relies on exactly this: it calls `cpu.stop()`, mutates the
+            // A compile worker's own flush (`Jitv2::flush_from_jit_thread`)
+            // parks the CPU through its world instead, and the park path
+            // clears `pcp` the same way; only a bare pool in a test still
+            // relies on this: it calls `cpu.stop()`, mutates the
             // page pool while nothing can race it (the CPU is provably not
             // running), then `cpu.start()` — the next dispatch re-derives
             // `pcp` fresh against whatever the pool looks like now, same as
@@ -11724,12 +11739,13 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn monitor_commands(&self) -> Vec<(String, String)>;
     /// Where another thread holds this CPU still.
     fn park_slot(&self) -> Arc<crate::cpu::smp::ParkSlot>;
-    /// Use this page pool and compiled code, shared with the other CPUs, whose
-    /// flushes `world` coordinates. Before the CPU first runs.
-    #[cfg(feature = "jitv2")]
-    /// Run on `jit`, a pool other CPUs run on too, as its CPU number `cpu`,
+    /// Run on `jit`, a pool other CPUs may run on too, as its CPU number `cpu`,
     /// looking pages up in its address space `space` (the same for CPUs that
-    /// see memory at the same addresses, as the CPUs of one node do).
+    /// see memory at the same addresses, as the CPUs of one node do); `world`
+    /// coordinates the pool's flushes. Before the CPU first runs. `jit` may be
+    /// the CPU's own pool: a machine with a world of its own passes that world,
+    /// since a CPU belongs to one.
+    #[cfg(feature = "jitv2")]
     fn share_jitv2(&self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>, cpu: usize, space: usize);
     fn monitor_execute(&self, cmd: &str, args: &[&str], writer: Box<dyn Write + Send>) -> Result<(), String>;
     /// The symbol table this CPU's monitor commands and breakpoints resolve

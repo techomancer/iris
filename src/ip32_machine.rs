@@ -268,7 +268,10 @@ impl O2Machine {
             Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), part.prid()));
         let world = Arc::new(crate::cpu::smp::World::new());
         world.set_slots(vec![cpu.park_slot()]);
-        bus.ram.set_world(world);
+        bus.ram.set_world(world.clone());
+        // The CPU's pool flushes through this world too: a CPU belongs to one.
+        #[cfg(feature = "jitv2")]
+        cpu.share_jitv2(cpu.jitv2(), world.clone(), 0, 0);
 
         // ppmem: the CPU's cache and the JIT reach RAM through a cached view
         // of the memory's window, publishing its bitmap into the CPU's own
@@ -295,7 +298,7 @@ impl O2Machine {
         // geometry once, as it starts, and without the windows that geometry
         // has no inline load or store path.
         #[cfg(feature = "jitv2")]
-        crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, bus.phys.clone(), None);
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, bus.phys.clone(), world);
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();

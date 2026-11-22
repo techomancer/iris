@@ -565,11 +565,15 @@ impl OctaneMachine {
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
         // One page pool and one body of compiled code: it reaches each CPU's
-        // state through the core pointer it is called with.
+        // state through the core pointer it is called with. A lone CPU shares
+        // its own pool too, so its flushes go through this world: a CPU
+        // belongs to one.
         #[cfg(feature = "jitv2")]
-        if cpu_count > 1 {
+        {
             #[cfg(feature = "jitv2_lockstep")]
-            return Err("[machine] cpus = 2 cannot run with jitv2_lockstep".into());
+            if cpu_count > 1 {
+                return Err("[machine] cpus = 2 cannot run with jitv2_lockstep".into());
+            }
             let jit = cpu.jitv2();
             // Every CPU sees memory at the same addresses: one address space.
             for (n, c) in cpus.iter().enumerate() {
@@ -620,7 +624,7 @@ impl OctaneMachine {
             cfg.jitv2_pool_size(),
             cfg.jitv2.compile,
             phys.phys.clone(),
-            (cpu_count > 1).then(|| world.clone()),
+            world.clone(),
         );
 
         // HEART's levels 0 to 4 are each CPU's IP2 to IP6.

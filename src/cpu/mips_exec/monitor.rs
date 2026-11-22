@@ -2001,13 +2001,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                     // (non-reentrant) mutex — hanging the
                                     // console thread the instant `j2 inline on`
                                     // ran, before the CPU even started.
+                                    //
+                                    // Not joined under that lock either: a
+                                    // worker leading a flush takes it.
                                     {
-                                        let mut jit = exec.jitv2.lock();
-                                        let stopped = jit.compile_queue.stop();
+                                        let jit = exec.jitv2.clone();
+                                        let stopped = crate::cpu::jitv2::Jitv2::stop_pool(&jit);
                                         if let Some(old) = stopped.into_iter().next() {
                                             let (shared, state) = old.shared_arena();
                                             drop(old);
-                                            *jit.codegen.lock() = Some(crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared, state));
+                                            *jit.lock().codegen.lock() = Some(crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared, state));
                                         }
                                     }
                                     exec.jitv2_inline_compile = true;

@@ -886,6 +886,26 @@ registers where it stopped (on the O2, also the words at physical 0x1000 and
 0x4000). [clanker/testing/ci-unattended-irix-boot.md](clanker/testing/ci-unattended-irix-boot.md)
 has the details.
 
+## jitv2 flush race
+
+`tools/jitv2-flush-race.py` boots a single-CPU guest under `--ci` with
+`IRIS_JIT_ARENA_FLUSH_MB=1`, so the compile workers fill their code arena and
+flush it themselves many times during the boot, and meanwhile runs `stop`,
+`j2 flush`, `start` at the monitor in a loop. Each `j2 flush` joins the compile
+workers; one that waits on a worker leading a flush of its own never returns,
+and the script fails with exit status 1 (and, given `--stacks`, saves every
+thread's stack first). It passes when the race ran for `--seconds` with at
+least `--min-worker-flushes` worker-led flushes, and reports how far the guest
+got on its serial log.
+
+```sh
+tools/jitv2-flush-race.py --iris target/release/iris --config ci-ip28.toml \
+    --monitor-port 20300 --seconds 600 --serial-log console.log --stacks stacks.txt
+```
+
+The config is any `iris.toml` for a machine that boots by itself, its disks
+with `overlay = true`: under `--ci` the overlay is kept in `$TMPDIR`, which is
+what makes it safe for the script to kill an iris that hung.
 ### OpenBSD on the O2 (local)
 
 `tests/openbsd/boot-openbsd69-o2.toml` boots an O2 disk with OpenBSD 6.9 on
