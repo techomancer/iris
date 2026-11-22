@@ -2618,7 +2618,8 @@ impl Workstation for Machine {
     }
     fn scratch_path(&self) -> Option<&std::path::Path> { Machine::scratch_path(self) }
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
-        Some(self.hpc3.scsi().clone())
+        let ctls = std::iter::once(self.hpc3.scsi()).chain(self.hpc3.scsi1());
+        Some(Arc::new(crate::workstation::DiscChangers(ctls.map(|c| c.clone() as _).collect())))
     }
     fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
     fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
@@ -3042,6 +3043,30 @@ mod stop_order_tests {
         machine.stop();
         assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
         assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
+    }
+
+    /// A CD-ROM on the Indigo2's second controller is `[scsi.20]`; disc
+    /// changes must reach it by that key.
+    #[test]
+    fn second_controller_cdrom_takes_disc_changes() {
+        use crate::config::{MachineProfile, ScsiDeviceConfig};
+        use crate::workstation::Workstation;
+        let dir = crate::display_stop_tests::scratch("indigo2-disc");
+        let nv = dir.to_path_buf();
+        let machine = big_stack(move || {
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+            crate::test_temp::nvram_in(&mut cfg, &nv);
+            cfg.machine.profile = MachineProfile::Indigo2Ip22;
+            cfg.scsi.insert(20, ScsiDeviceConfig { cdrom: true, controller: 1, ..Default::default() });
+            Box::new(Machine::new(cfg))
+        });
+        let changer = Workstation::disc_changer(&*machine).expect("a disc changer");
+        assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [20]);
+        let iso = dir.join("a.iso");
+        std::fs::write(&iso, vec![0u8; 2048]).unwrap();
+        let path = iso.to_string_lossy().into_owned();
+        assert_eq!(changer.load_disc(20, path.clone()), Ok(path));
+        assert!(changer.load_disc(4, "x.iso".into()).is_err(), "controller 0 has no id 4");
     }
 }
 

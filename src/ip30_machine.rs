@@ -1515,9 +1515,8 @@ impl Workstation for OctaneMachine {
     fn scratch_path(&self) -> Option<&std::path::Path> {
         self.scratch_path.as_deref()
     }
-    /// Disc changes on the internal bus.
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
-        Some(self.scsi[0].clone() as Arc<dyn crate::workstation::DiscChanger>)
+        Some(Arc::new(crate::workstation::DiscChangers(self.scsi.iter().map(|c| c.clone() as _).collect())))
     }
     fn pending_chd_sync_count(&self) -> usize {
         self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()

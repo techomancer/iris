@@ -437,6 +437,39 @@ pub trait DiscChanger: Send + Sync {
     fn eject_to_empty(&self, id: usize) -> Result<(), String>;
 }
 
+/// Every controller's drives behind one changer, each named by its `[scsi.N]`
+/// key, `16 * controller + id`. A bare id below 16 is controller 0.
+pub struct DiscChangers(pub Vec<Arc<dyn DiscChanger>>);
+
+impl DiscChangers {
+    fn split(&self, slot: usize) -> Result<(&dyn DiscChanger, usize), String> {
+        let ctl = self.0.get(slot / 16).ok_or_else(|| format!("No SCSI controller for ID {slot}"))?;
+        Ok((&**ctl, slot % 16))
+    }
+}
+
+impl DiscChanger for DiscChangers {
+    fn disc_status(&self) -> Vec<(usize, String, Vec<String>, u64, u64)> {
+        let each = self.0.iter().enumerate();
+        each.flat_map(|(c, d)| {
+            d.disc_status().into_iter().map(move |(id, cur, discs, p, n)| (16 * c + id, cur, discs, p, n))
+        })
+        .collect()
+    }
+    fn load_disc(&self, id: usize, path: String) -> Result<String, String> {
+        let (ctl, id) = self.split(id)?;
+        ctl.load_disc(id, path)
+    }
+    fn eject_disc(&self, id: usize) -> Result<String, String> {
+        let (ctl, id) = self.split(id)?;
+        ctl.eject_disc(id)
+    }
+    fn eject_to_empty(&self, id: usize) -> Result<(), String> {
+        let (ctl, id) = self.split(id)?;
+        ctl.eject_to_empty(id)
+    }
+}
+
 /// Every controller that lends its targets (the WD33C93A, the Adaptec 7880)
 /// takes disc changes the same way; the operations are `scsi_monitor`'s.
 impl<T: crate::scsi_monitor::ScsiTargets + Send + Sync> DiscChanger for T {

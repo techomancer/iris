@@ -462,7 +462,7 @@ pub(crate) fn pci_devices(
     let ps2 = ioc3.ps2();
     let reset_scsi = scsi.clone();
     let disk_scsi = scsi.clone();
-    let disc_changer = scsi.first().map(|c| c.clone() as Arc<dyn DiscChanger>);
+    let disc_changer = Some(Arc::new(crate::workstation::DiscChangers(scsi.iter().map(|c| c.clone() as _).collect())) as Arc<dyn DiscChanger>);
     let reset_clock = timekeeper.clone();
     let flush = timekeeper.clone();
     let reset: Box<dyn Fn() + Send + Sync> = Box::new(move || {
