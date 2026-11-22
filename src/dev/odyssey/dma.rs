@@ -225,8 +225,8 @@ impl Board {
         // code 0x48 into a format-0xb level; glprim's 256x256 LUMINANCE
         // and INTENSITY textures, code 0x42 into a format-4 level). Packed
         // as 4/4/4/4, a clear texel's alpha came back 0xf0 and every glyph
-        // drew as a box. The board model's packing check
-        // (Board::check_level_packing) found the luminance case.
+        // drew as a box. The board model's packing check (feature
+        // vprodiag, Board::check_level_packing) found the luminance case.
         let one_or_two = if read || drawable || bytes != 2 {
             None
         } else {
@@ -327,6 +327,29 @@ impl Board {
             }
         }
         let obj = memory.then_some(());
+        // The texture packing check: a backing-store page (dma_raw) is
+        // no texture and is not checked.
+        #[cfg(feature = "vprodiag")]
+        let fmt = hdr[dma::HDR_FORMAT];
+        #[cfg(feature = "vprodiag")]
+        let page = hdr[dma::HDR_CONTROL] & image::CODE_MASK == 0 && matches!(fmt, dma::FMT_RAW16 | dma::FMT_RAW32 | dma::FMT_RAW64);
+        #[cfg(feature = "vprodiag")]
+        if memory && !page {
+            use super::packing::{kind_codec, UploadPacking};
+            if let Some(codec) = kind_codec(to.v.kind) {
+                // The surface dma_fields() wrote through.
+                self.note_upload(UploadPacking {
+                    base: if drawable { self.draw_word } else { hdr[dma::HDR_DEST] } & ADDR_MASK,
+                    pitch: hdr[dma::HDR_WIDTH] & PITCH_MASK,
+                    log2: ((fmt >> 16) & 0xf) as u8 + 1,
+                    codec,
+                    word4: fmt,
+                    code: hdr[dma::HDR_CONTROL] & write::CODE_MASK,
+                    how: "DMA",
+                    checked: false,
+                });
+            }
+        }
         let mut e = [DmaEntry::default(); dma::MAX_PAGES];
         let x = hdr[dma::HDR_ORIGIN] & 0xffff;
         let y = hdr[dma::HDR_ORIGIN] >> 16;
@@ -1761,6 +1784,8 @@ impl Board {
         // image through the FIFO, Board::image_put()).
         let gpu = self.gpu_unit();
         let to = if gpu { super::pipe::backend::DestMem::of(mem.untracked(), &self.dest_views()).colour[0] } else { self.dest_mem().colour[0] };
+        #[cfg(feature = "vprodiag")]
+        self.note_selected_upload("mip-level build", 0);
         for y in 0..hd {
             for x in 0..wd {
                 let v = from.load_word(2 * x as i32, 2 * y as i32).unwrap_or(0);

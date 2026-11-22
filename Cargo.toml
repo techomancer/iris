@@ -55,6 +55,12 @@ perfetto = []
 # live either way. jit_go_count is load-bearing in tests: several JIT tests
 # assert on it to prove they compared compiled code, not the interpreter.
 rexdiag = []
+# VPro texture packing check: records how each upload into board memory
+# packed its texels and checks every texture level descriptor against the
+# upload that wrote its memory; `vpro status` reports disagreements. A
+# diagnostic with a small cost per upload and per texture bind, so off by
+# default and independent of `developer`: `lightning,vprodiag` builds.
+vprodiag = []
 # Stale-code detector: verify, at execution time, that the instruction word an
 # engine is about to run still matches what memory holds at that VA.
 #

@@ -37,6 +37,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `r5ksc_triton` | Disabled O2/Triton integrated L2 model; deliberately refuses to compile. | `r5ksc` |
 | `idle-pause` | Park the CPU in recognized guest idle loops; opt-in. | — |
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
+| `vprodiag` | VPro texture packing check: each texture level is checked against the upload that wrote its memory, reported by `vpro status`. Off by default; small cost per upload. | — |
 | `cache-ecc` | Cache parity/ECC injection and Cache Error exceptions for SGI IDE diagnostics; adds miss/exception checks. Off by default. | — |
 | `decode-cache` | Compatibility flag; decoded-instruction caching for the shadow model is unconditional. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
@@ -1016,6 +1017,7 @@ both the interpreter and jitv2.
 | `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
 | `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
+| `vprodiag` | VPro texture packing check (`vpro status`, "texture packing"): every texture level the guest names is checked against the upload that wrote that memory. Off by default; works with `lightning` |
 | `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2, IMPACT, O2 and VPro annotated traces (`gr2 trace`, `mgras trace`, `re trace`, `vpro trace`); O2 engine recording (`re rec`). On with `developer`; opt in for plain and `lightning` builds |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
 | `perfetto` | Record Perfetto traces for ui.perfetto.dev: per-thread event rings, a writer thread, host or guest timeline. See [docs/perfetto.md](docs/perfetto.md) |

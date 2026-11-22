@@ -82,6 +82,8 @@ impl Board {
             let at = (tag - reg::TEX_LEVEL) as usize * 3;
             let op = self.cmd.operand;
             self.tex_mut().levels[at..at + 3].copy_from_slice(&op[..3]);
+            #[cfg(feature = "vprodiag")]
+            self.check_level_packing(op[0], op[1]);
             return;
         }
         if tag == gl_cmd::TEXCOORD_3F || tag == gl_cmd::TEXCOORD_4F {
