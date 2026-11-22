@@ -164,7 +164,7 @@ fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
 // Seed the picker at `cur`'s folder, else the managed disks dir — never the OS
 // default. See `crate::filedialog`, which is where the "else" used to be a
 // silent no-op and the panel opened at whatever the user last browsed.
-fn dialog_at(title: &str, cur: &str) -> rfd::FileDialog {
+fn dialog_at(title: &str, cur: &str) -> crate::filedialog::Dialog {
     crate::filedialog::dialog(title, cur, crate::filedialog::Anchor::Disks,
                               crate::filedialog::Purpose::Open)
 }
