@@ -186,6 +186,16 @@ LIBCHDMAN_FORCE_SOURCE=1 cargo build --release --offline --locked \
 
 CHD support stays on; there is no build without it.
 
+A prebuilt archive downloaded earlier is cached in `~/Library/Caches/libchdman-rs`
+(macOS), `~/.cache/libchdman-rs` (Linux) or `$XDG_CACHE_HOME/libchdman-rs`, and
+an offline build without `LIBCHDMAN_FORCE_SOURCE` uses it. Such a build passing
+on a developer machine therefore says nothing about a clean build host.
+[tools/offline-build-test.sh](tools/offline-build-test.sh) runs the steps above
+with the network denied and with a fresh `CARGO_HOME`, cache and target
+directory. Then the `chd-extract` it built unpacks a CHD made by MAME's
+`chdman`. With `--expect-download-failure` it first shows that the same build
+without `LIBCHDMAN_FORCE_SOURCE` fails.
+
 | Variable | Effect |
 |---|---|
 | `LIBCHDMAN_FORCE_SOURCE` | Any value: compile the bundled MAME CHD sources instead of downloading a prebuilt archive. Needs a C++20 compiler. |

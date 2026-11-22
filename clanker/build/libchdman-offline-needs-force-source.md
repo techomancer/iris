@@ -1,6 +1,6 @@
 # libchdman-rs builds offline only with LIBCHDMAN_FORCE_SOURCE
 
-Status: current (2026-11-19, libchdman-rs 0.289.6). Issue techomancer/iris#213.
+Status: current (2026-11-22, libchdman-rs 0.289.6). E2E: `tools/offline-build-test.sh`. Issue techomancer/iris#213.
 
 Symptom: a `cargo vendor` + `--offline` build (distro packaging) fails in
 libchdman-rs's build script, which tries to download a prebuilt static
@@ -20,6 +20,15 @@ Rule:
 - On x86_64 the source build passes `-mavx2 -mfma` to the FLAC sub-build, so
   the binary can SIGILL on pre-Haswell CPUs. Generic-baseline packages need
   `LIBCHDMAN_CPU=portable`.
+- The build script caches downloaded prebuilts in
+  `~/Library/Caches/libchdman-rs` (macOS), `~/.cache/libchdman-rs` or
+  `$XDG_CACHE_HOME/libchdman-rs`, and an offline build without
+  `LIBCHDMAN_FORCE_SOURCE` silently uses that cache. To reproduce the
+  packager failure, point `XDG_CACHE_HOME` at an empty directory, as
+  `tools/offline-build-test.sh` does.
+- A `sandbox-exec` profile with `(deny network-outbound (remote ip))` also
+  blocks 127.0.0.1, so loopback unit tests (vnc::auth, net::testnet,
+  net::wake) hang or fail inside it. Deny the network for builds only.
 - No other dependency downloads at build time. Checked by building
   `--release --bin iris` and checking `iris-gui --features iris/lightning,bundled`
   under `sandbox-exec` with outbound IP denied and a fresh `CARGO_HOME`
