@@ -797,7 +797,8 @@ prebuf_ms = 20              # sound held before playing: the margin against a la
 
 # What one machine has beyond these keys also goes in [machine] and is described in
 # its guide in docs/: for example nodes = 2 (C-bricks or node boards), flash, console,
-# usb_input = true (the Fuel's USB keyboard and mouse) and audio_card = true (the Tezro).
+# usb_input = true (the Fuel's USB keyboard and mouse) and audio_card = true (the ICE1724
+# audio card of the Tezro, Fuel, Origin 3200 and Onyx 3000).
 # The older tables named for a machine ([o2], [octane], [origin200], [origin2000],
 # [onyx2], [fuel], [tezro], [origin3200], [onyx3000]) are still read.
 # [graphics] node and widget say where the graphics board plugs in on the Onyx 3000

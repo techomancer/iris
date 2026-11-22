@@ -45,6 +45,14 @@ disks, and its slot runs 64-bit data phases (inferred from the PROM's behaviour:
 the control block and rings it builds are right only if the bridge reverses
 each doubleword of the adapter's DMA). A `[scsi.N]` table is refused.
 
+`[machine] audio_card = true` fits an audio card at device 2 of head F: the IC
+Ensemble ICE1724 with the DMediaPro DM8's converters, the same model as the
+[Tezro's](tezro-ip53.md). The device number is the model's choice; which
+devices the I-brick's option slots are is not established. On an Onyx 3000,
+IRIX 6.5.30 lists it as `Iris Audio Processor: version MAD revision 1` and
+plays through it; it has not been run in an Origin 3200 guest. It plays to the
+host as `[audio]` sets, or silently with `no_audio`.
+
 ## Nodes and the link
 
 Address bits 39:33 name a node. Each node's local block holds the number the PROM

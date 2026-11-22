@@ -20,6 +20,9 @@ profile = "origin3200_ip35"
 nodes = 2
 console = "l1"
 l1_port = 18882
+# Fit the ICE1724 audio card in an I-brick PCI slot (default false). It plays as [audio]
+# sets; unset no_audio for sound.
+# audio_card = true
 
 [graphics]
 board = "none"

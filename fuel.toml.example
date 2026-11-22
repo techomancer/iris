@@ -27,6 +27,9 @@ cpu = "r14000"
 flash = "ignore/fuel/flash.bin"
 console = "l1"
 l1_port = 18882
+# Fit the ICE1724 audio card in a PCI slot (default false). It plays as [audio]
+# sets; unset no_audio for sound.
+# audio_card = true
 # Send the host's keyboard and mouse (from the window or VNC) to a USB keyboard
 # and mouse on the OHCI controller instead of the PS/2 pair (docs/fuel-ip34.md).
 # usb_input = true

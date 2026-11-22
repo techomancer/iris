@@ -1590,7 +1590,7 @@ pub struct MachineSection {
     pub serial_port_c: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_port_d: Option<u16>,
-    /// Tezro: fit the audio card (`[tezro] audio`).
+    /// Tezro, Fuel, Origin 3200, Onyx 3000: fit the ICE1724 audio card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_card: Option<bool>,
     /// Fuel: which keyboard and mouse the host's reach.
@@ -2357,6 +2357,9 @@ pub struct FuelSection {
     /// the marked synthetic `EMUN00`.
     #[serde(default)]
     pub brick_serial: Option<String>,
+    /// Fit the audio card (IC Ensemble ICE1724) in a PCI slot. Off by default.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 fn default_fuel_input() -> bool { true }
@@ -2372,6 +2375,7 @@ impl Default for FuelSection {
             usb_input: false,
             l1_revision: None,
             brick_serial: None,
+            audio: false,
         }
     }
 }
@@ -2387,6 +2391,7 @@ impl FuelSection {
             && !self.usb_input
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
+            && !self.audio
     }
 }
 
@@ -2439,6 +2444,10 @@ pub struct Ip35Section {
     /// bytes. Unset: the marked synthetic `EMUN00`.
     #[serde(default)]
     pub brick_serial: Option<String>,
+    /// Fit the audio card (IC Ensemble ICE1724) in an I-brick PCI slot. Off
+    /// by default.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 impl Default for Ip35Section {
@@ -2451,6 +2460,7 @@ impl Default for Ip35Section {
             l1_log: None,
             l1_revision: None,
             brick_serial: None,
+            audio: false,
         }
     }
 }
@@ -2465,6 +2475,7 @@ impl Ip35Section {
             && self.l1_log.is_none()
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
+            && !self.audio
     }
 }
 
@@ -3473,8 +3484,14 @@ impl MachineConfig {
             self.tezro.serial_port_d = Some(port);
         }
         if let Some(card) = self.machine.audio_card.take() {
-            if !tezro { return Err(not_here("audio_card")); }
-            self.tezro.audio = card;
+            let slot = match p {
+                P::TezroIp53 => &mut self.tezro.audio,
+                P::FuelIp34 => &mut self.fuel.audio,
+                P::Origin3200Ip35 => &mut self.origin3200.audio,
+                P::Onyx3000Ip35 => &mut self.onyx3000.audio,
+                _ => return Err(not_here("audio_card")),
+            };
+            *slot = card;
         }
         let fuel = p == P::FuelIp34;
         if let Some(on) = self.machine.ps2_input.take() {
@@ -3557,6 +3574,7 @@ impl MachineConfig {
                 m.usb_input = fuel.usb_input.then_some(true);
                 m.l1_revision = fuel.l1_revision;
                 m.brick_serial = fuel.brick_serial;
+                m.audio_card = fuel.audio.then_some(true);
             }
             P::TezroIp53 => {
                 let tezro = std::mem::take(&mut out.tezro);
@@ -3577,6 +3595,7 @@ impl MachineConfig {
                 m.l1_log = section.l1_log;
                 m.l1_revision = section.l1_revision;
                 m.brick_serial = section.brick_serial;
+                m.audio_card = section.audio.then_some(true);
             }
             _ => {}
         }
@@ -3795,6 +3814,17 @@ impl MachineConfig {
     }
 
     /// The section that configures an IP35 brick machine: `[origin3200]` or `[onyx3000]`.
+    /// Whether the ICE1724 audio card is fitted (`[machine] audio_card`), on
+    /// the machines that take one.
+    pub fn audio_card(&self) -> bool {
+        match self.machine.profile {
+            MachineProfile::TezroIp53 => self.tezro.audio,
+            MachineProfile::FuelIp34 => self.fuel.audio,
+            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => self.ip35_section().audio,
+            _ => false,
+        }
+    }
+
     pub fn ip35_section(&self) -> &Ip35Section {
         if self.machine.profile == MachineProfile::Onyx3000Ip35 { &self.onyx3000 } else { &self.origin3200 }
     }
@@ -5654,6 +5684,15 @@ mod export_tests {
         assert_eq!((tezro.tezro.console, tezro.tezro.serial_port_c, tezro.tezro.audio), (TezroConsole::Ioc4C, Some(9003), true));
         let text = toml::to_string_pretty(&tezro.for_writing()).unwrap();
         assert!(text.contains("audio_card = true") && !text.contains("[tezro]"), "{text}");
+        // The Fuel, Origin 3200 and Onyx 3000 take the same card; no other machine does.
+        for (profile, cpu) in [("fuel_ip34", "r14000"), ("origin3200_ip35", "r12000"), ("onyx3000_ip35", "r12000")] {
+            let cfg = load(&format!("[machine]\nprofile = \"{profile}\"\ncpu = \"{cpu}\"\naudio_card = true\n")).unwrap();
+            assert!(cfg.audio_card(), "{profile}");
+            let text = toml::to_string_pretty(&cfg.for_writing()).unwrap();
+            assert!(text.contains("audio_card = true"), "{profile}: {text}");
+            assert!(MachineConfig::parse_toml(&text).unwrap().audio_card(), "{profile}");
+        }
+        assert!(load("[machine]\nprofile = \"octane_ip30\"\naudio_card = true\n").unwrap_err().contains("machine.audio_card is not a key"));
 
         let onyx2 = load("[machine]\nprofile = \"onyx2_ip27\"\nnodes = 2\nio_prom = \"io6prom.img\"\n").unwrap();
         assert_eq!((onyx2.node_boards(), onyx2.onyx2.io_prom.as_deref()), (2, Some("io6prom.img")));

@@ -17,7 +17,7 @@
 //! - The PCI devices at 1 to 4 and the IOC4 (0x53), ISP12160 (6) and BCM5701 (0x15) revisions
 //!   are as consoles print them (established). INTA and INTC reaching PIC input d - 1 is IRIX's
 //!   pin rule; the board wiring, INTB and INTD are unknown.
-//! - The audio controller (`[tezro] audio`) is the ICE1724 with the DM8's converters, at device 2
+//! - The audio controller (`[machine] audio_card`) is the ICE1724 with the DM8's converters, at device 2
 //!   of the TI bridge's bus (`AUDIO_DEVICE`, inferred by exclusion); its converters, subsystem
 //!   IDs and EEPROM are a model choice, not Tezro evidence. Its INTA reaches PIC input 1 via the
 //!   bridge's rotation (wiring unknown).
@@ -45,7 +45,6 @@ use crate::dev::bedrock::{Bedrock, Population, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::ds1744::{Ds1744, YearBase};
 use crate::dev::heart::Clock;
-use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};
@@ -377,14 +376,8 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     );
     io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
     let audio = cfg.tezro.audio.then(|| {
-        let card = Arc::new(Ice1724::new(Variant::Dm8));
-        if cfg.no_audio {
-            eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
-        } else {
-            card.enable_output(cfg.audio.clone());
-        }
+        let card = crate::ip35::audio_card(cfg, timers);
         ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
-        card.set_timer_manager(timers.clone());
         card
     });
     io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
@@ -527,10 +520,6 @@ fn attach_virtio(cfg: &MachineConfig, io9: &Arc<Pic>) -> Vec<Arc<crate::dev::vir
     attached
 }
 
-/// Said at startup and by `--validate` when the audio card is added with
-/// `no_audio` set: the guest sees the card and nothing is played.
-pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
-    "[tezro] audio is set but no_audio is too: the audio card is added and plays to nowhere";
 
 /// Where the V12 sits: widget 12 behind the PIC that owns widget 0 (QEMU's graphics slot). On the
 /// one-processor board the guide names no widget or route for it; this is inferred.
