@@ -435,7 +435,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
                 Resettable::power_on(&**v);
             }
         }),
-        poll: None,
         at_batch: (running.count() > 1).then(|| Arc::new(move || held.at_batch()) as Arc<dyn Fn() + Send + Sync>),
         monitor,
         ps2: ioc4.ps2(),

@@ -736,9 +736,7 @@ pub struct BoardIo {
     pub display: Option<Arc<dyn GfxDisplay>>,
     /// What the graphics board's status bar shows.
     pub status: Option<Arc<crate::status::MachineStatus>>,
-    /// IP35 only: brings the board's clocked devices up to date, every batch.
-    pub poll: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// IP35 only: per-processor batch hook on a node of several, beside the poll.
+    /// IP35 only: per-processor batch hook on a node of several.
     pub at_batch: Option<Arc<dyn Fn() + Send + Sync>>,
     /// IP35 only: the counter the status bar blinks on the first processor's Compare matches.
     pub fasttick: Option<Arc<AtomicU64>>,
