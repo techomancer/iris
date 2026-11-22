@@ -4072,6 +4072,15 @@ impl MachineConfig {
             }
         }
         self.validate_serial_sockets()?;
+        // The test device decodes GIO expansion slot 0, as do the Ultra64 board and the second Newport head.
+        if self.test_device && matches!(self.machine.profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28) {
+            if self.ultra64.enabled {
+                return Err("test_device and [ultra64] both claim GIO expansion slot 0; enable one".into());
+            }
+            if self.graphics.heads == 2 && !self.headless {
+                return Err("test_device and the second graphics head (graphics.heads = 2) both claim GIO expansion slot 0".into());
+            }
+        }
         if self.test_device_run_config.is_some() {
             if !self.test_device {
                 return Err("test_device_run_config needs test_device".into());
@@ -5373,6 +5382,17 @@ mod export_tests {
         assert!(bad.contains("test_device_run_config"), "{bad}");
         let alone = cli(&["--test-device-run-config", "time_pct=10"]).validate().unwrap_err();
         assert!(alone.contains("needs test_device"), "{alone}");
+    }
+
+    #[test]
+    fn the_test_device_refuses_another_card_in_gio_slot_0() {
+        let cli = |a: &[&str]| Cli::parse_from(["iris"].iter().chain(a)).apply(MachineConfig::default());
+        let mut cfg = cli(&["--test-device"]);
+        cfg.ultra64.enabled = true;
+        assert!(cfg.validate().unwrap_err().contains("[ultra64]"));
+        let mut cfg = cli(&["--test-device"]);
+        cfg.graphics.heads = 2;
+        assert!(cfg.validate().unwrap_err().contains("second graphics head"));
     }
 
     #[test]
