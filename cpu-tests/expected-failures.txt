@@ -7,7 +7,7 @@
 # is an IRIS bug, not a test bug. The R10000 family has no oracle; its
 # expectations are the manuals' (docs/r10000.md).
 #
-#   fpu/vec_*, fpu/cvt_*   FCSR Inexact/Invalid are not computed for ordinary
+#   fpu/vec_*              FCSR Inexact/Invalid are not computed for ordinary
 #                          arithmetic (clanker/jitv2/fpu-flags-are-computed-not-read.md)
 #   fpu/trap_*, inexact    a trapped exception still writes its result and Flag
 #                          bit (docs/findings.md, findings 3, 4 and 6)
@@ -28,13 +28,11 @@
 
 [r4400-interp]
 excep/cop2_unusable
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
 fpu/vec_arith_double
 fpu/vec_arith_single
-fpu/vec_cvt_from_l
 fpu/vec_sqrt
 mem/lwr_all_offsets
 mips4/fp_cond_move_d
@@ -45,13 +43,11 @@ mips4/recip_rsqrt_d
 [r4400-interp-shadow, r4400-jitv2, r4400-jitv2-full]
 cache/hit_inv_discards
 excep/cop2_unusable
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
 fpu/vec_arith_double
 fpu/vec_arith_single
-fpu/vec_cvt_from_l
 fpu/vec_sqrt
 mem/lwr_all_offsets
 mips4/fp_cond_move_d
@@ -61,30 +57,25 @@ mips4/recip_rsqrt_d
 
 [r5000-interp]
 excep/cop2_unusable
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
 fpu/vec_arith_double
 fpu/vec_arith_single
-fpu/vec_cvt_from_l
 fpu/vec_sqrt
 
 [r5000-interp-shadow, r5000-jitv2, r5000-jitv2-full]
 cache/hit_inv_discards
 excep/cop2_unusable
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
 fpu/vec_arith_double
 fpu/vec_arith_single
-fpu/vec_cvt_from_l
 fpu/vec_sqrt
 
 [r10000-interp]
 cache/hit_inv_discards
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
@@ -95,7 +86,6 @@ r10k/ch_bit
 
 [r10000-jitv2]
 cache/hit_inv_discards
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
@@ -106,7 +96,6 @@ r10k/ch_bit
 
 [r12000-interp]
 cache/hit_inv_discards
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
@@ -117,7 +106,6 @@ r10k/ch_bit
 
 [r12000-jitv2]
 cache/hit_inv_discards
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
@@ -128,7 +116,6 @@ r10k/ch_bit
 
 [r14000-interp]
 cache/hit_inv_discards
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact
@@ -139,7 +126,6 @@ r10k/ch_bit
 
 [r14000-jitv2]
 cache/hit_inv_discards
-fpu/cvt_s_d_rounds
 fpu/inexact_flag
 fpu/trap_disabled_control
 fpu/trap_inexact

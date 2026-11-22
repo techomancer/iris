@@ -165,7 +165,9 @@ fn fb_draw_rect(outer: egui::Rect, px: egui::Vec2, ppp: f32, max_scale: f32) -> 
 static CLOSE_ON_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> eframe::Result<()> {
-    env_logger::init();
+    // env_logger, plus the tap that tells a file dialog that never appeared
+    // from one the user cancelled (see `filedialog`).
+    filedialog::init_logging();
     // Prevent the iris lib from calling process::exit on guest soft-power-off
     // or CI `quit`. iris-gui never wants the embedder to die from a guest event.
     // Set this once, before any worker thread can read it.
@@ -254,6 +256,8 @@ struct App {
     bench: bench_ui::BenchState,
     emu: EmulatorHandle,
     toast: Option<(String, std::time::Instant)>,
+    /// rfd's reasons, when a Browse button found no file dialog to open.
+    picker_unavailable: Option<Vec<String>>,
     fullscreen: bool,
     stop_modal: Option<StopModal>,
     missing_modal: Option<MissingDiskModal>,
@@ -538,6 +542,7 @@ impl App {
             bench: bench_ui::BenchState::default(),
             emu: EmulatorHandle::spawn(),
             toast: startup_toast,
+            picker_unavailable: None,
             stop_modal: None,
             missing_modal: None,
             chd_grant_modal: None,
@@ -3496,6 +3501,32 @@ impl eframe::App for App {
             // message appears.
             self.emu.send(Cmd::HaltIrix);
             self.toast(t!("toast-halt-sent"));
+        }
+
+        // A Browse button found no file dialog to open (Linux without a
+        // desktop portal or zenity): say so instead of doing nothing.
+        if let Some(reasons) = filedialog::take_unavailable() {
+            self.picker_unavailable = Some(reasons);
+        }
+        if let Some(reasons) = &self.picker_unavailable {
+            let mut close = false;
+            egui::Window::new(t!("modal-no-picker-title"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(RichText::new(t!("modal-no-picker-body")).strong());
+                    ui.add_space(4.0);
+                    ui.label(t!("modal-no-picker-fix"));
+                    ui.add_space(4.0);
+                    for r in reasons {
+                        ui.label(RichText::new(r).weak().small());
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(t!("common-close")).clicked() { close = true; }
+                });
+            if close { self.picker_unavailable = None; }
         }
 
         // Confirm switching from a custom PROM back to the built-in image.

@@ -880,7 +880,7 @@ impl<
     };
     const CACHE_KIND: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = Self::R10K;
-    const CVT_L_51_BITS: bool = MODEL == model::R10000;
+    const CVT_L_RANGE_BITS: u32 = if MODEL == model::R10000 { 51 } else if Self::R10K_FAMILY { 63 } else { 53 };
 }
 
 impl<

@@ -118,6 +118,9 @@ that remain, all `fpu/`, all on every cell:
 - `cp0/wired_reserved_bits` and `fpu/fcsr_reserved` (findings 3-4).
 - `mips4/multi_fp_cc` on R5000 (finding 1) — now reports a skip rather than a
   failure.
+- `fpu/cvt_s_d_rounds` on every cell (CVT.S.D overflow now raises Inexact with
+  Overflow) and `fpu/vec_cvt_from_l` on the R4400 and R5000 (CVT.S/D.L of a
+  long past 2^52 now takes Unimplemented Operation), issue #71.
 
 ### The `fpu/vec_*` and `fpu/cvt_*` failures: a deliberate design trade
 

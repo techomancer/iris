@@ -56,8 +56,20 @@
 //! - **An absolute path we hold no bookmark for** — typed in, or carried over
 //!   in a machine TOML. We cannot stat it, and that is the
 //!   case `nearest_existing` has to get right; see there.
+//!
+//! # When there is no picker at all (Linux)
+//!
+//! rfd's Linux backend asks the XDG desktop portal over D-Bus, loading
+//! `libdbus-1.so.3` with `dlopen`, and falls back to running `zenity`. When
+//! both fail — no portal (or no libdbus the process can load) and no zenity on
+//! `PATH` — it logs the reason and returns `None`, the same value a cancelled
+//! dialog returns. Left alone, the Browse button then simply does nothing.
+//! [`Dialog`] tells the two apart from rfd's log (see [`LogTap`]) and leaves a
+//! notice for the window to show ([`take_unavailable`]), so the user learns
+//! what to install and that the path can be typed instead.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::settings::GuiSettings;
 
@@ -185,21 +197,120 @@ fn last_resort() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// An `rfd::FileDialog` seeded at [`start_dir`].
+/// A native file dialog: `rfd::FileDialog`, with each pick watched for the
+/// case where no picker could be shown at all (see the module docs).
+#[must_use]
+pub struct Dialog(rfd::FileDialog);
+
+impl Dialog {
+    pub fn add_filter(self, name: impl Into<String>, extensions: &[impl ToString]) -> Self {
+        Dialog(self.0.add_filter(name, extensions))
+    }
+
+    pub fn pick_file(self) -> Option<PathBuf> {
+        watched(|| self.0.pick_file())
+    }
+
+    pub fn save_file(self) -> Option<PathBuf> {
+        watched(|| self.0.save_file())
+    }
+
+    pub fn pick_folder(self) -> Option<PathBuf> {
+        watched(|| self.0.pick_folder())
+    }
+}
+
+/// rfd errors logged during the pick in progress; `None` when no pick is.
+static PICK_ERRORS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+/// Why the last picker failed to appear, until the window collects it.
+static UNAVAILABLE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// Run one pick, noting whether `None` meant "cancelled" or "no picker".
+fn watched(pick: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+    *PICK_ERRORS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    let picked = pick();
+    let errors = PICK_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    if picked.is_none() && no_picker_shown(&errors) {
+        // Not an rfd target, so the tap does not collect it. The AppImage
+        // test (scripts/appimage-file-chooser-test.sh) waits for this line.
+        log::error!("no file chooser could be opened; showing the notice");
+        *UNAVAILABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(errors);
+    }
+    picked
+}
+
+/// Whether rfd's log for one pick says no dialog appeared.
+///
+/// rfd 0.17 (`backend/xdg_desktop_portal.rs`) logs "Failed to <pick file|save
+/// file|pick folder|…> with zenity: <error>" only when the portal has already
+/// failed and running zenity failed too. A dialog the user cancels logs
+/// nothing; a portal failure that zenity then covers logs only the portal
+/// error. So the zenity line is the one that means "nothing was shown".
+fn no_picker_shown(errors: &[String]) -> bool {
+    errors.iter().any(|e| e.starts_with("Failed to ") && e.contains(" with zenity"))
+}
+
+/// Why the last file dialog could not be shown — rfd's own error lines — if
+/// one failed since the last call. The window polls this each frame.
+pub fn take_unavailable() -> Option<Vec<String>> {
+    UNAVAILABLE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// A logger that hands rfd's errors to [`Dialog`] before passing every record
+/// on to `inner`. Install it in place of `env_logger::init()`; see [`init_logging`].
+pub struct LogTap<L>(pub L);
+
+impl<L: log::Log> log::Log for LogTap<L> {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        is_rfd_error(metadata) || self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if is_rfd_error(record.metadata()) {
+            if let Some(errors) = PICK_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                errors.push(record.args().to_string());
+            }
+        }
+        // env_logger applies RUST_LOG itself, so pass everything on.
+        self.0.log(record);
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+fn is_rfd_error(metadata: &log::Metadata) -> bool {
+    metadata.level() == log::Level::Error
+        && (metadata.target() == "rfd" || metadata.target().starts_with("rfd::"))
+}
+
+/// `env_logger::init()`, with [`LogTap`] in front. Errors stay enabled even
+/// under `RUST_LOG=off`, so the tap still sees rfd's; env_logger drops them
+/// from the output as it would have.
+pub fn init_logging() {
+    let inner = env_logger::Builder::from_default_env().build();
+    let max = inner.filter().max(log::LevelFilter::Error);
+    if log::set_boxed_logger(Box::new(LogTap(inner))).is_ok() {
+        log::set_max_level(max);
+    }
+}
+
+/// A [`Dialog`] seeded at [`start_dir`].
 ///
 /// The starting directory is always set. The name field is filled only for a
 /// save panel, and only where that does not cost us the directory — see the
 /// module docs.
-pub fn dialog(title: &str, current: &str, anchor: Anchor, purpose: Purpose) -> rfd::FileDialog {
+pub fn dialog(title: &str, current: &str, anchor: Anchor, purpose: Purpose) -> Dialog {
     dialog_seeded(title, current, purpose, start_dir(current, anchor))
 }
 
-fn dialog_seeded(title: &str, current: &str, purpose: Purpose, dir: PathBuf) -> rfd::FileDialog {
+fn dialog_seeded(title: &str, current: &str, purpose: Purpose, dir: PathBuf) -> Dialog {
     let mut d = rfd::FileDialog::new().set_title(title).set_directory(dir);
     if let Some(name) = name_to_prefill(current, purpose, NAME_FIELD_BREAKS_DIRECTORY) {
         d = d.set_file_name(name);
     }
-    d
+    Dialog(d)
 }
 
 /// New-machine pickers use a prospective folder without creating it or reserving
@@ -211,7 +322,7 @@ pub fn dialog_with_base(
     anchor: Anchor,
     purpose: Purpose,
     filters: &[(&str, &[&str])],
-) -> rfd::FileDialog {
+) -> Dialog {
     let fallback = match anchor {
         Anchor::Disks => nearest_existing(&base.join("disks")),
         Anchor::Data => nearest_existing(base),
@@ -228,10 +339,10 @@ pub fn dialog_with_base(
 /// sandbox access to the folder a disk image sits in, say — so confirming it is
 /// one click. `dialog` deliberately does the opposite for files, where the
 /// parent is the useful view.
-pub fn dialog_at_dir(title: &str, dir: &str, anchor: Anchor) -> rfd::FileDialog {
+pub fn dialog_at_dir(title: &str, dir: &str, anchor: Anchor) -> Dialog {
     let start = nearest_existing(Path::new(dir.trim()))
         .unwrap_or_else(|| start_dir("", anchor));
-    rfd::FileDialog::new().set_title(title).set_directory(start)
+    Dialog(rfd::FileDialog::new().set_title(title).set_directory(start))
 }
 
 /// `dialog` with a set of `(label, extensions)` filters applied.
@@ -241,7 +352,7 @@ pub fn dialog_with(
     anchor: Anchor,
     purpose: Purpose,
     filters: &[(&str, &[&str])],
-) -> rfd::FileDialog {
+) -> Dialog {
     let mut d = dialog(title, current, anchor, purpose);
     for (label, exts) in filters {
         d = d.add_filter(*label, exts);
@@ -480,6 +591,73 @@ mod tests {
         if !denied {
             eprintln!("skipped: could not produce a PermissionDenied (running as root?)");
         }
+    }
+
+    /// The lines rfd 0.17 logged in the report this was written for: no
+    /// libdbus the AppImage could load, and no zenity on PATH.
+    #[test]
+    fn no_portal_and_no_zenity_counts_as_no_picker() {
+        let errors = vec![
+            "Can't connect to a portal: libdbus-1.so not found".to_string(),
+            "Failed to pick file with zenity: No such file or directory (os error 2)".to_string(),
+        ];
+        assert!(no_picker_shown(&errors));
+        for op in ["save file", "pick folder", "pick files", "pick folders"] {
+            assert!(no_picker_shown(&[format!("Failed to {op} with zenity: x")]), "{op}");
+        }
+    }
+
+    /// A portal failure zenity covered for, and a cancelled dialog, both still
+    /// returned `None` from rfd. Neither may raise the notice.
+    #[test]
+    fn a_cancel_or_a_covered_portal_failure_is_not_no_picker() {
+        assert!(!no_picker_shown(&[]));
+        assert!(!no_picker_shown(&["Can't connect to a portal: libdbus-1.so not found".to_string()]));
+        assert!(!no_picker_shown(&["OpenFile failed: org.freedesktop.DBus.Error.ServiceUnknown".to_string()]));
+    }
+
+    struct Silent;
+    impl log::Log for Silent {
+        fn enabled(&self, _: &log::Metadata) -> bool { false }
+        fn log(&self, _: &log::Record) {}
+        fn flush(&self) {}
+    }
+
+    fn emit(tap: &LogTap<Silent>, level: log::Level, target: &str, msg: &str) {
+        use log::Log;
+        tap.log(&log::Record::builder().level(level).target(target)
+            .args(format_args!("{msg}")).build());
+    }
+
+    /// The whole path, with records shaped as rfd emits them: only rfd's
+    /// errors are collected, only while a pick runs, and only the zenity
+    /// failure leaves a notice — once.
+    #[test]
+    fn the_log_tap_turns_rfds_errors_into_one_notice() {
+        let tap = LogTap(Silent);
+        emit(&tap, log::Level::Error, "rfd::backend::xdg_desktop_portal",
+             "Failed to pick file with zenity: outside a pick");
+        assert_eq!(take_unavailable(), None, "nothing is collected outside a pick");
+
+        let picked = watched(|| {
+            emit(&tap, log::Level::Error, "rfd::backend::xdg_desktop_portal::portal::libdbus",
+                 "Can't connect to a portal: libdbus-1.so not found");
+            emit(&tap, log::Level::Warn, "rfd::backend::xdg_desktop_portal", "Using zenity fallback");
+            emit(&tap, log::Level::Error, "iris::something", "Failed to x with zenity: not rfd");
+            emit(&tap, log::Level::Error, "rfd::backend::xdg_desktop_portal",
+                 "Failed to pick file with zenity: No such file or directory (os error 2)");
+            None
+        });
+        assert_eq!(picked, None);
+        assert_eq!(take_unavailable(), Some(vec![
+            "Can't connect to a portal: libdbus-1.so not found".to_string(),
+            "Failed to pick file with zenity: No such file or directory (os error 2)".to_string(),
+        ]));
+        assert_eq!(take_unavailable(), None, "the notice is collected once");
+
+        // A cancelled dialog: rfd logs nothing and returns None.
+        assert_eq!(watched(|| None), None);
+        assert_eq!(take_unavailable(), None);
     }
 
     /// The invariant the whole module exists for. Whatever it is handed —

@@ -488,6 +488,10 @@ path = "src/bin/jitv2_pcp_dump.rs"
 required-features = ["jitv2", "j2wp"]
 
 [[example]]
+name = "ultra64-peer"
+path = "examples/ultra64_peer.rs"
+
+[[example]]
 name = "rex3-gpu-probe"
 path = "examples/rex3_gpu_probe.rs"
 required-features = ["rex-gpu"]

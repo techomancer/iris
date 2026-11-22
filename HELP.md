@@ -18,6 +18,10 @@ walks through installing IRIX 5.3 or 6.5.22 from the original CDs. Prefer
 windows and menus? `cargo run -p iris-gui --release` (see
 [iris-gui-README.md](iris-gui-README.md)).
 
+Building without network access, for example for a Linux distribution
+package: vendor the dependencies and set `LIBCHDMAN_FORCE_SOURCE=1`, as
+[FEATURES.md](FEATURES.md#offline-and-distribution-builds) describes.
+
 Connect the monitor console (a second terminal):
 You have monitor console in the terminal or you can open extra ones telnetting to 127.0.0.1:8888
 

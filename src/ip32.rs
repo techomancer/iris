@@ -152,6 +152,13 @@ pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 /// 0x8000_0000 ([`PCI_HI_MEM_BASE`]), so the CPU folds this one onto
 /// `RAM_BASE` before the bus sees it (`MipsExecutor::phys_alias`).
 pub const NO_ECC_BASE: u64 = 0x8000_0000;
+/// MACE's 64-bit window onto PCI memory space, CPU physical 0x2_0000_0000 for
+/// the whole 4 GB (`docs/dev/aic7880.md` §3.2). OpenBSD reaches its PCI
+/// devices here, from 0x2_8000_0000: the same low 32 bits as
+/// [`NO_ECC_BASE`], so the CPU keeps the alias away from this window
+/// (`MipsExecutor::phys_alias_bypass`).
+pub const PCI_MEM_64_BASE: u64 = 0x2_0000_0000;
+pub const PCI_MEM_64_SIZE: u64 = 0x1_0000_0000;
 /// How much of memory also answers from address 0: the first 256 MB.
 pub const LOW_ALIAS_SIZE: u32 = 0x1000_0000;
 
