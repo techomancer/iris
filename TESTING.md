@@ -814,6 +814,23 @@ the same files and reads every sector back. Another test fails on any
 cargo nextest run --release --lib exit_persistence_tests
 ```
 
+## O2 snapshots, CD changes and scratch over iris-ci
+
+`tools/tests/o2-ci-rollback.sh` boots a headless O2 on its built-in PROM (no
+IRIX needed) and drives it over the CI socket into the command monitor. It
+sets a PROM variable, then checks that `restore` and `rollback` each bring back
+the value saved before. It also makes two CD images with `mkvh`, each holding
+one file in its volume header, and checks that the PROM's `ls` of the CD names
+the file on the new disc after `cdrom-eject` and after `cdrom-load`, and that
+the PROM's `hinv` lists a scratch volume whose bytes round-trip through
+`iris-ci scratch write` and `scratch read`. It prints
+one PASS or FAIL line per check and exits 1 if any fail.
+
+```sh
+cargo build --release --bin iris --bin iris-ci --bin mkvh
+tools/tests/o2-ci-rollback.sh            # --bin DIR, --port BASE (default 23050), --keep
+```
+
 ## Offline distribution build
 
 `tools/offline-build-test.sh` builds iris the way a distribution's build host
