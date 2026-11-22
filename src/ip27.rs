@@ -380,6 +380,7 @@ pub(crate) fn pci_devices(
 
     let mut monitor: Vec<Arc<dyn Device>> = scsi.iter().map(|s| s.clone() as Arc<dyn Device>).collect();
     monitor.push(ioc3.ps2());
+    monitor.push(crate::pci::pci_host_commands("Bridge", &[bridge.bus()], None));
     let devices: Vec<Arc<dyn Device>> = vec![ioc3.clone(), scsi[0].clone(), scsi[1].clone()];
     let ps2 = ioc3.ps2();
     let reset_scsi = scsi.clone();

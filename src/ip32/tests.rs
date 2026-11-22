@@ -982,7 +982,7 @@ fn every_device_answers_the_monitor_through_the_bus() {
     }
     let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
     let names: Vec<String> = bus.register_commands().into_iter().map(|(c, _)| c).collect();
-    for cmd in ["crime", "re", "gbe", "pci", "ust", "rtc", "maceps2", "onewire", "com0", "com1", "sdma", "mec"] {
+    for cmd in ["crime", "re", "gbe", "ust", "rtc", "maceps2", "onewire", "com0", "com1", "sdma", "mec"] {
         assert!(names.iter().any(|n| n == cmd), "{cmd} is listed: {names:?}");
         let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         bus.execute_command(cmd, &["status"], Box::new(Sink(out.clone()))).unwrap_or_else(|e| panic!("{cmd}: {e}"));

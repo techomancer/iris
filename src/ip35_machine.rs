@@ -56,7 +56,7 @@ use crate::dev::isp2200::card::Card;
 use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::l1::{AttachedBrick, BoardIdentity, ComputeNode, L1Config, L1};
 use crate::dev::timekeeper::Timekeeper;
-use crate::dev::xbridge::{XBridge, HEAD_F, HOST_WIDGET};
+use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
 use crate::hptimer::TimerManager;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::presence::PresenceHold;
@@ -236,7 +236,7 @@ fn build_baseio(
     let console = cfg.ci.then(|| serial[console_index].ci.clone());
     let (reset_xbridge, reset_ioc3, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), usb.clone(), timekeeper.clone());
     // `scsi2` and `cow2`: the Fibre Channel loop's disks.
-    let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone()];
+    let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone(), crate::pci::pci_host_commands("XBridge", &[xbridge.bus(HEAD_E), pci], None)];
     let scsi_fibre = fibre.clone();
     let mut io = BoardIo {
         devices: vec![ioc3.clone(), usb, fibre],
@@ -311,7 +311,7 @@ pub(crate) fn check_placement(cfg: &MachineConfig) -> Result<(), String> {
     if node == 0 && widget != PIPE_WIDGET {
         return Err(format!("graphics.widget {widget}: on the first C-brick the board is at the I-brick's port B, widget {PIPE_WIDGET}"));
     }
-    if !(8..crate::dev::xbridge::HEAD_E).contains(&widget) || widget == HOST_WIDGET {
+    if !(8..HEAD_E).contains(&widget) || widget == HOST_WIDGET {
         return Err(format!("graphics.widget {widget} is not a port of the graphics brick's XBridge (valid: 8, 9, 11, 12, 13)"));
     }
     Ok(())

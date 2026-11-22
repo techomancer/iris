@@ -2003,25 +2003,6 @@ impl PciHost for Bridge {
     }
 }
 
-impl crate::traits::Device for Bridge {
-    fn step(&self, _cycles: u64) {}
-    fn stop(&self) {}
-    fn start(&self) {}
-    fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
-
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("pci".to_string(), "Bridge PCI bus: pci status | pci config <slot>".to_string())]
-    }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
-        if cmd != "pci" {
-            return Err("Command not found".to_string());
-        }
-        self.bus.command(args, &mut w)
-    }
-}
-
 impl crate::traits::Resettable for Bridge {
     /// Power-on: the chip's own state, as a reset. The functions behind it
     /// are not reset here; see [`Bridge::reset_pci`].
