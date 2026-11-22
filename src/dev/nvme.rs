@@ -49,7 +49,7 @@ pub(crate) mod tests;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::devlog::{LogModule, NVME_LOG_ADMIN, NVME_LOG_IO, NVME_LOG_REGS, NVME_LOG_STATE};
 use crate::pci::{Bar, DevFn, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PciToPciBridge, PCI_INTA};
@@ -306,6 +306,17 @@ pub struct Nvme {
     me: Weak<Self>,
     /// The zero of the trace's timestamps.
     born: Instant,
+}
+
+/// A device dropped while its worker runs would leave it parked on the condvar.
+impl Drop for Nvme {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Ok(mut pending) = self.wake.0.lock() {
+            *pending = true;
+        }
+        self.wake.1.notify_one();
+    }
 }
 
 impl Nvme {
@@ -692,11 +703,7 @@ impl Nvme {
                 let (m, cv) = &*wake;
                 let mut pending = m.lock().unwrap();
                 while !*pending {
-                    let (g, t) = cv.wait_timeout(pending, Duration::from_millis(50)).unwrap();
-                    pending = g;
-                    if t.timed_out() {
-                        break;
-                    }
+                    pending = cv.wait(pending).unwrap();
                 }
                 *pending = false;
             }
