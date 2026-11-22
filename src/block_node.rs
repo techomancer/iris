@@ -2938,15 +2938,8 @@ mod tests {
     }
 
     /// Wait for `cond`, up to 5 s.
-    fn wait_for(cond: impl Fn() -> bool) -> bool {
-        let end = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < end {
-            if cond() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        cond()
+    fn wait_for(cond: impl FnMut() -> bool) -> bool {
+        crate::test_board::until(Duration::from_secs(5), cond)
     }
 
     /// The thread syncs once for a write and then not at all while nothing

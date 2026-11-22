@@ -2786,20 +2786,11 @@ const WAIT: Duration = Duration::from_secs(60);
 
 /// Wait for `cond`, and fail the test, not hang it, if it never holds.
 fn spin_until(what: &str, cond: impl Fn() -> bool) {
-    let end = std::time::Instant::now() + WAIT;
-    while !cond() {
-        assert!(std::time::Instant::now() < end, "timed out waiting for {what}");
-        std::thread::yield_now();
-    }
+    assert!(crate::test_board::until(WAIT, cond), "timed out waiting for {what}");
 }
 
 fn wait_resp<P: IspPart>(r: &Rig<P>, n: u16, max: Duration) -> bool {
-    let t = std::time::Instant::now();
-    while t.elapsed() < max {
-        if r.r(reg::RESPONSE_QUEUE) >= n { return true; }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    false
+    crate::test_board::until(max, || r.r(reg::RESPONSE_QUEUE) >= n)
 }
 
 #[test]

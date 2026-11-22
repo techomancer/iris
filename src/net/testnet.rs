@@ -105,17 +105,17 @@ impl TestNet {
 
     /// Pump until a frame matching `pred` arrives; return it (others stay queued).
     pub fn wait_for<F: FnMut(&[u8]) -> bool>(&mut self, what: &str, mut pred: F) -> Vec<u8> {
-        let deadline = Instant::now() + PATIENCE;
-        loop {
+        let mut found = None;
+        let ok = crate::test_board::until(PATIENCE, || {
             if let Some(i) = self.inbox.iter().position(|f| pred(f)) {
-                return self.inbox.remove(i).unwrap();
+                found = self.inbox.remove(i);
+                return true;
             }
-            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
             self.pump();
-            if self.inbox.is_empty() {
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
+            false
+        });
+        assert!(ok, "timed out waiting for {}", what);
+        found.unwrap()
     }
 
     /// Pump for `d`, collecting whatever the engine sends.

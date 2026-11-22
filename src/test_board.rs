@@ -40,3 +40,15 @@ impl<T: Device> Drop for TestBoard<T> {
         self.0.stop();
     }
 }
+
+/// Wait up to `limit` for another thread to make `cond` true.
+pub(crate) fn until(limit: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while !cond() {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    true
+}
