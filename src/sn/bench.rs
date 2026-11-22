@@ -29,6 +29,7 @@ fn bench_node_register_paths() {
     // IP27: one Hub node with a 128 MiB bank, and two joined as the IP27 machine joins them, the
     // second numbered 1.
     let clock: Clock = Arc::new(|| 0);
+    let tm = Arc::new(crate::hptimer::TimerManager::new());
     let prom = super::tests::prom();
     let hub_spec = |index: usize, nodes| crate::ip27::NodeSpec {
         hub: HubConfig { cpus: 1, first_cpu: 2 * index, banks_mb: [128, 0, 0, 0], nodes, ..Default::default() },
@@ -37,7 +38,7 @@ fn bench_node_register_paths() {
         flash: None,
         node_record: None,
     };
-    let hub_node = |index, nodes| NodeBoard::<Hub, NodeFlash>::build("origin2000", &hub_spec(index, nodes), index, &prom, &clock).unwrap();
+    let hub_node = |index, nodes| NodeBoard::<Hub, NodeFlash>::build("origin2000", &hub_spec(index, nodes), index, &prom, &tm).unwrap();
     let hub = hub_node(0, 1);
     let hub_bus: &dyn BusDevice = &*hub.bus;
     let hub_memory: &dyn BusDevice = &**hub.chip.decode.physical();
@@ -65,7 +66,7 @@ fn bench_node_register_paths() {
             "fuel",
             &spec,
             &[],
-            &clock,
+            &tm,
             first_cpu,
             nodes,
             &events,

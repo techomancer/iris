@@ -39,7 +39,7 @@ pub const WINDOW_SIZE: u64 = 8 << 20;
 /// Pending interrupts are two banks of 64 bits.
 pub const PENDING_BANKS: usize = 2;
 
-use crate::dev::heart::Clock;
+use crate::hptimer::TimerManager;
 use crate::dev::widths::{self, access_widths};
 use self::io::Io;
 use self::md::Md;
@@ -217,15 +217,15 @@ impl std::ops::Deref for Hub {
 impl Hub {
     /// A Hub with the memory `cfg` installs and the node's boot `flash`, which the Hub
     /// maps at the reset address wherever no bank covers it.
-    pub fn new(cfg: HubConfig, clock: Clock, flash: Option<Arc<dyn BusDevice>>) -> Result<Arc<Self>, String> {
+    pub fn new(cfg: HubConfig, tm: &Arc<TimerManager>, flash: Option<Arc<dyn BusDevice>>) -> Result<Arc<Self>, String> {
         let memory = md::memory(cfg.banks_mb, cfg.nodes)?;
         let boot = flash.map(|f| (crate::sn::RESET_WINDOW, crate::dev::node_flash::SIZE as u64, f));
         let runs = md::installed_mappings(cfg.banks_mb);
         let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
             let node = Node::new(weak.clone(), memory, runs, boot, false);
             let regs = Arc::new(Regs {
-                pi: Pi::new(cfg.cpus, cfg.first_cpu, clock.clone()),
-                md: Md::new(clock, cfg.slot, cfg.banks_mb),
+                pi: Pi::new(tm, cfg.cpus, cfg.first_cpu),
+                md: Md::new(tm.clock().reader(), cfg.slot, cfg.banks_mb),
                 io: Io::new(cfg.widget_revision, cfg.manufacturer),
                 ni: Arc::new(Ni::new(cfg.ni_revision)),
                 i2c: OnceLock::new(),
@@ -670,9 +670,7 @@ impl Resettable for Hub {
 }
 
 impl Device for Hub {
-    fn step(&self, _cycles: u64) {
-        self.pi.poll();
-    }
+    fn step(&self, _cycles: u64) {}
     fn stop(&self) {
         self.pi.stop();
     }

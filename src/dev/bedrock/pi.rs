@@ -17,12 +17,12 @@
 
 use super::regs::IIO_PROTECT_OVRRD_KEY;
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
-use super::{arm_host_timer, Bedrock};
+use super::Bedrock;
 use crate::dev::heart::Clock;
-use crate::hptimer::{TimerId, TimerManager};
+use crate::hptimer::{Timer, TimerManager};
 use parking_lot::Mutex;
-use std::sync::Weak;
-use std::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst}};
+use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst}};
 
 pub(super) const RT_MASK: u64 = reg::RT_COUNTER::RC_COUNT::MASK;
 pub(super) const ERROR_MASK: u64 = reg::ERR_INT_MASK_A::EIMA_MASK::MASK;
@@ -135,71 +135,11 @@ impl Levels {
     }
 }
 
-/// The real-time counter's origin, read without a lock: `base + (time - epoch) / TICK`. A writer
-/// holds the timer lock and makes `seq` odd while changing the words; a reader retries while it is
-/// odd or moved.
-struct Counter {
-    seq: AtomicU64,
-    base: AtomicU64,
-    epoch: AtomicU64,
-    /// The pause instant, or `RUNNING`.
-    paused: AtomicU64,
-}
-const RUNNING: u64 = u64::MAX;
-#[derive(Clone, Copy)]
-struct Origin {
-    base: u64,
-    epoch: u64,
-    paused: u64,
-}
-impl Origin {
-    fn time(&self, now: u64) -> u64 {
-        if self.paused == RUNNING { now } else { self.paused }
-    }
-    fn count(&self, now: u64) -> u64 {
-        self.base.wrapping_add(self.time(now).saturating_sub(self.epoch) / TICK) & RT_MASK
-    }
-    /// The start of the tick `time` falls in.
-    fn tick_start(&self, time: u64) -> u64 {
-        time - time.saturating_sub(self.epoch) % TICK
-    }
-}
-impl Counter {
-    fn new(now: u64) -> Self {
-        Self { seq: AtomicU64::new(0), base: AtomicU64::new(0), epoch: AtomicU64::new(now), paused: AtomicU64::new(now) }
-    }
-    fn read(&self) -> Origin {
-        loop {
-            let seq = self.seq.load(Acquire);
-            let origin = Origin { base: self.base.load(Relaxed), epoch: self.epoch.load(Relaxed), paused: self.paused.load(Relaxed) };
-            fence(Acquire);
-            if seq & 1 == 0 && self.seq.load(Relaxed) == seq {
-                return origin;
-            }
-            std::hint::spin_loop();
-        }
-    }
-    /// Publish `origin`. The caller holds the timer lock, so writers are one at a time.
-    fn write(&self, origin: Origin) {
-        let seq = self.seq.load(Relaxed);
-        self.seq.store(seq + 1, Relaxed);
-        fence(Release);
-        self.base.store(origin.base, Relaxed);
-        self.epoch.store(origin.epoch, Relaxed);
-        self.paused.store(origin.paused, Relaxed);
-        self.seq.store(seq + 2, Release);
-    }
-}
-
-/// The comparators and their deadlines, in host nanoseconds, which change
-/// together and with the counter's origin.
+/// The comparators and the machine times they next match.
 struct Comparators {
     rt_compare: [u64; 2],
     profile_compare: u64,
-    rt_due: [u128; 2],
-    profile_due: u128,
-    /// The host timer that fires at the earliest deadline.
-    id: Option<TimerId>,
+    due: [u64; 3],
 }
 
 /// The doublewords of the stored-word registers, from offset 0.
@@ -228,10 +168,16 @@ pub(super) struct Pi {
     /// Each slot's IP2..IP6 as last written, held across an input change and its publish so levels
     /// arrive in order.
     out: Mutex<[u64; 2]>,
-    counter: Counter,
-    /// The earliest deadline in host nanoseconds; `u64::MAX` while stopped.
-    next_due: AtomicU64,
+    /// The machine tick (time / `TICK`) at which the counter read zero, modulo 2^64: the counter
+    /// is 55 bits, too wide for a nanosecond origin.
+    origin: AtomicU64,
+    /// The latest clock reading `count` has used: processors on different sockets read the host
+    /// clock a few hundred ns apart, but the counter never goes back.
+    seen: AtomicU64,
     timer: Mutex<Comparators>,
+    /// The two real-time comparators, then the profile one.
+    timers: [Timer; 3],
+    running: AtomicBool,
     /// The registers that only hold what was stored, by offset / 8. Plain
     /// atomics, as hardware has no lock there: a store is one doubleword,
     /// and a read-modify-write register uses an atomic update.
@@ -242,7 +188,7 @@ pub(super) struct Pi {
 }
 
 impl Pi {
-    pub(super) fn new(interface: u8, processors: Population, now: u64) -> Self {
+    pub(super) fn new(interface: u8, processors: Population, now: u64, tm: &Arc<TimerManager>, chip: &Weak<Bedrock>) -> Self {
         let pi = Self {
             interface,
             processors,
@@ -259,9 +205,13 @@ impl Pi {
             error_cause: Default::default(),
             words: Default::default(),
             out: Mutex::new([0; 2]),
-            counter: Counter::new(now),
-            next_due: AtomicU64::new(RUNNING),
-            timer: Mutex::new(Comparators { rt_compare: [0; 2], profile_compare: 0, rt_due: [0; 2], profile_due: 0, id: None }),
+            origin: AtomicU64::new(now / TICK),
+            seen: AtomicU64::new(0),
+            timer: Mutex::new(Comparators { rt_compare: [0; 2], profile_compare: 0, due: [0; 3] }),
+            timers: [0, 1, 2].map(|kind| {
+                Timer::new(tm, chip, move |c: &Bedrock, due| c.pi[usize::from(interface)].expire(kind, due, (c.clock)(), &c.levels))
+            }),
+            running: AtomicBool::new(false),
             stored: std::array::from_fn(|i| {
                 AtomicU64::new(match i as u64 * 8 {
                     reg::CPU_PROTECT::OFFSET => reg::CPU_PROTECT::RESET,
@@ -404,160 +354,79 @@ impl Pi {
         true
     }
 
-    /// The real-time counter at host time `now`. Lock-free.
-    pub(super) fn count(&self, now: u64) -> u64 {
-        self.counter.read().count(now)
+    fn since(&self, now: u64) -> u64 {
+        (now / TICK).wrapping_sub(self.origin.load(Relaxed))
     }
 
-    fn arm_rt(&self, t: &mut Comparators, o: &Origin, slot: usize, now: u64) {
-        let time = o.time(now);
-        let ticks = (t.rt_compare[slot].wrapping_sub(o.count(now)).wrapping_sub(1) & RT_MASK) + 1;
-        t.rt_due[slot] = u128::from(o.tick_start(time)) + u128::from(ticks) * u128::from(TICK);
+    /// The origin is read before the clock, so a store that moves it is never read against a stale clock.
+    pub(super) fn count(&self, clock: &Clock) -> u64 {
+        let origin = self.origin.load(Acquire);
+        let now = clock();
+        let now = self.seen.fetch_max(now, Relaxed).max(now);
+        (now / TICK).wrapping_sub(origin) & RT_MASK
     }
-    fn arm_profile(&self, t: &mut Comparators, o: &Origin, now: u64) {
-        let time = o.time(now);
-        let ticks = (t.profile_compare as u32).wrapping_sub(o.count(now) as u32);
+
+    fn arm_rt(&self, t: &mut Comparators, slot: usize, now: u64) {
+        let ticks = (t.rt_compare[slot].wrapping_sub(self.since(now)).wrapping_sub(1) & RT_MASK) + 1;
+        t.due[slot] = (now / TICK).saturating_add(ticks).saturating_mul(TICK);
+    }
+    fn arm_profile(&self, t: &mut Comparators, now: u64) {
+        let ticks = (t.profile_compare as u32).wrapping_sub(self.since(now) as u32);
         let ticks = if ticks == 0 { 1u64 << 32 } else { u64::from(ticks) };
-        t.profile_due = u128::from(o.tick_start(time)) + u128::from(ticks) * u128::from(TICK);
+        t.due[2] = (now / TICK).saturating_add(ticks).saturating_mul(TICK);
     }
     fn arm_all(&self, t: &mut Comparators, now: u64) {
-        let o = self.counter.read();
-        self.arm_rt(t, &o, 0, now);
-        self.arm_rt(t, &o, 1, now);
-        self.arm_profile(t, &o, now);
-        self.set_next_due(t, &o);
+        self.arm_rt(t, 0, now);
+        self.arm_rt(t, 1, now);
+        self.arm_profile(t, now);
     }
-    fn set_next_due(&self, t: &Comparators, o: &Origin) {
-        let due = if o.paused != RUNNING {
-            RUNNING
+
+    /// Give each timer its comparator's match. Under the lock `t` is read under.
+    fn schedule(&self, t: &Comparators) {
+        for (timer, due) in self.timers.iter().zip(t.due) {
+            timer.set_due((due != u64::MAX).then_some(due));
+        }
+    }
+
+    /// Comparator `kind` matched: latch it and arm its next match.
+    fn matched(&self, t: &mut Comparators, kind: usize, now: u64) {
+        if kind < 2 {
+            self.rt_status[kind].store(1, SeqCst);
+            let _cpu = (usize::from(self.interface) * 2 + kind) & 3;
+            crate::pf_level!(crate::perfetto::events::PI_RT_TICK_LEVEL[_cpu], crate::perfetto::events::PI_RT_TICK[_cpu], true);
+            self.arm_rt(t, kind, now);
         } else {
-            t.rt_due.iter().copied().chain([t.profile_due]).min().unwrap().min(u128::from(RUNNING - 1)) as u64
-        };
-        self.next_due.store(due, SeqCst);
-    }
-
-    /// Latch the comparators that are due at `now`, under the timer lock.
-    /// Whether one latched.
-    fn latch(&self, t: &mut Comparators, now: u64) -> bool {
-        let o = self.counter.read();
-        let time = o.time(now);
-        let mut latched = false;
-        for slot in 0..2 {
-            if u128::from(time) >= t.rt_due[slot] {
-                self.rt_status[slot].store(1, SeqCst);
-                let _cpu = (usize::from(self.interface) * 2 + slot) & 3;
-                crate::pf_level!(crate::perfetto::events::PI_RT_TICK_LEVEL[_cpu], crate::perfetto::events::PI_RT_TICK[_cpu], true);
-                self.arm_rt(t, &o, slot, now);
-                latched = true;
-            }
-        }
-        if u128::from(time) >= t.profile_due {
-            self.profile_status[0].store(1, SeqCst);
-            self.profile_status[1].store(1, SeqCst);
-            self.arm_profile(t, &o, now);
-            latched = true;
-        }
-        self.set_next_due(t, &o);
-        latched
-    }
-
-    /// Latch and publish what is due at `now`: one load, and no lock, when
-    /// nothing is.
-    fn sync(&self, now: u64, levels: &Levels) {
-        if now < self.next_due.load(SeqCst) {
-            return;
-        }
-        let mut out = self.out.lock();
-        if self.latch(&mut self.timer.lock(), now) {
-            self.drive(&mut out, levels);
+            self.profile_status.iter().for_each(|s| s.store(1, SeqCst));
+            self.arm_profile(t, now);
         }
     }
 
-    /// Latch what is due at `now`, with `out` held.
-    fn catch_up(&self, now: u64) {
-        if now >= self.next_due.load(SeqCst) {
-            self.latch(&mut self.timer.lock(), now);
-        }
-    }
-
-    /// The host timer fired: latch and publish what is due and arm the next
-    /// deadline.
-    pub(super) fn expire(&self, tm: &TimerManager, chip: &Weak<Bedrock>, now: u64, levels: &Levels) {
+    /// A comparator's timer fired for `due`; a fire after the deadline moved does nothing.
+    pub(super) fn expire(&self, kind: usize, due: u64, now: u64, levels: &Levels) {
         let mut out = self.out.lock();
         let mut t = self.timer.lock();
-        let latched = self.latch(&mut t, now);
-        self.arm_host(&mut t, tm, chip, now);
+        if t.due[kind] != due {
+            return;
+        }
+        self.matched(&mut t, kind, now);
+        self.schedule(&t);
         drop(t);
-        if latched {
-            self.drive(&mut out, levels);
-        }
+        self.drive(&mut out, levels);
     }
 
-    /// (Re)arm the host timer for the earliest deadline, under the timer
-    /// lock. A deadline more than a second out is armed for a second.
-    fn arm_host(&self, t: &mut Comparators, tm: &TimerManager, chip: &Weak<Bedrock>, now: u64) {
-        if let Some(id) = t.id.take() {
-            tm.remove(id);
-        }
-        let due = self.next_due.load(SeqCst);
-        if due == RUNNING {
-            return;
-        }
-        let delay = due.saturating_sub(now).clamp(1, 1_000_000_000);
-        t.id = Some(arm_host_timer(tm, chip, self.interface, delay));
+    pub(super) fn start(&self) {
+        self.running.store(true, SeqCst);
+        self.timers.iter().for_each(Timer::start);
     }
 
-    /// Re-arm after the comparators or the counter moved.
-    pub(super) fn reschedule(&self, tm: Option<&TimerManager>, chip: &Weak<Bedrock>, now: u64) {
-        if let Some(tm) = tm {
-            self.arm_host(&mut self.timer.lock(), tm, chip, now);
-        }
-    }
-
-    /// The machine started at `now`: the counter resumes from where it paused.
-    pub(super) fn start(&self, tm: Option<&TimerManager>, chip: &Weak<Bedrock>, now: u64) {
-        let mut t = self.timer.lock();
-        let mut o = self.counter.read();
-        if o.paused == RUNNING {
-            return;
-        }
-        let delta = now.saturating_sub(o.paused);
-        o.epoch = o.epoch.saturating_add(delta);
-        o.paused = RUNNING;
-        self.counter.write(o);
-        for due in &mut t.rt_due {
-            *due += u128::from(delta);
-        }
-        t.profile_due += u128::from(delta);
-        self.set_next_due(&t, &o);
-        if let Some(tm) = tm {
-            self.arm_host(&mut t, tm, chip, now);
-        }
-    }
-
-    /// The machine stopped at `now`: latch and publish what is due, then
-    /// freeze the counter.
-    pub(super) fn stop(&self, tm: Option<&TimerManager>, now: u64, levels: &Levels) {
-        let mut out = self.out.lock();
-        let mut t = self.timer.lock();
-        let latched = self.latch(&mut t, now);
-        let mut o = self.counter.read();
-        if o.paused == RUNNING {
-            o.paused = now;
-            self.counter.write(o);
-        }
-        self.next_due.store(RUNNING, SeqCst);
-        if let (Some(tm), Some(id)) = (tm, t.id.take()) {
-            tm.remove(id);
-        }
-        drop(t);
-        if latched {
-            self.drive(&mut out, levels);
-        }
+    /// The machine stopped; its clock holds the counter, and `start` arms the deadlines again.
+    pub(super) fn stop(&self) {
+        self.running.store(false, SeqCst);
+        self.timers.iter().for_each(Timer::stop);
     }
 
     pub(super) fn is_running(&self) -> bool {
-        self.counter.read().paused == RUNNING
+        self.running.load(SeqCst)
     }
 
     /// The CPU-number register: the reader's slot in bit 0 and this interface in bit 1; slot A for
@@ -570,8 +439,7 @@ impl Pi {
         slot | u64::from(self.interface) << reg::CPU_NUM::CN_PI_ID::SHIFT
     }
 
-    /// A doubleword read at `off`, publishing a comparator that latched on
-    /// the way. `None` for a register the model does not have.
+    /// A doubleword read at `off`, or `None` for a register the model does not have.
     pub(super) fn read(&self, off: u64, clock: &Clock, levels: &Levels) -> Option<u64> {
         let value = match off {
             reg::CPU_NUM::OFFSET => self.cpu_number(),
@@ -589,19 +457,15 @@ impl Pi {
             reg::CC_MASK::OFFSET => self.request_enable.load(SeqCst),
             reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET => self.timer.lock().rt_compare[((off - reg::RT_COMPARE_A::OFFSET) / 8) as usize],
             reg::PROFILE_COMPARE::OFFSET => self.timer.lock().profile_compare,
-            reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => {
-                self.sync(clock(), levels);
-                self.rt_status[((off - reg::RT_INT_PEND_A::OFFSET) / 8) as usize].load(SeqCst)
-            }
+            reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => self.rt_status[((off - reg::RT_INT_PEND_A::OFFSET) / 8) as usize].load(SeqCst),
             reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => {
-                self.sync(clock(), levels);
                 self.profile_status[((off - reg::PROF_INT_PEND_A::OFFSET) / 8) as usize].load(SeqCst)
             }
             reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET => self.rt_enable[((off - reg::RT_INT_EN_A::OFFSET) / 8) as usize].load(SeqCst),
             reg::PROF_INT_EN_A::OFFSET | reg::PROF_INT_EN_B::OFFSET => self.profile_enable[((off - reg::PROF_INT_EN_A::OFFSET) / 8) as usize].load(SeqCst),
             reg::ERR_INT_PEND::OFFSET | reg::ERR_INT_PEND_WR::OFFSET => self.error_summary.load(SeqCst),
             reg::ERR_INT_MASK_A::OFFSET | reg::ERR_INT_MASK_B::OFFSET => self.error_cause[((off - reg::ERR_INT_MASK_A::OFFSET) / 8) as usize].load(SeqCst),
-            reg::RT_COUNTER::OFFSET => self.count(clock()),
+            reg::RT_COUNTER::OFFSET => self.count(clock),
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
                 let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
@@ -620,36 +484,28 @@ impl Pi {
         Some(value)
     }
 
-    /// A doubleword store at `off`; true when the comparators or counter moved, so the caller
-    /// re-arms the host timer.
-    pub(super) fn write(&self, off: u64, value: u64, clock: &Clock, levels: &Levels) -> bool {
+    pub(super) fn write(&self, off: u64, value: u64, clock: &Clock, levels: &Levels) {
         match off {
             reg::GFX_PAGE_A::OFFSET..GRAPHICS_END if off % 8 == 0 => {
                 let n = ((off - reg::GFX_PAGE_A::OFFSET) / 8) as u32;
                 debug_assert!(n < PI_GFX_REGS);
                 self.state.lock().write(n, value);
-                false
             }
             reg::GFX_CREDIT_MODE::OFFSET => {
                 self.credit_mode.store(value & reg::GFX_CREDIT_MODE::GCM_TRANS_MODE::MASK, Release);
-                false
             }
             // Nothing that `outputs` reads changes: no `out`, no publish.
-            _ if stored_write(off) => {
-                self.write_stored(off, value);
-                false
-            }
+            _ if stored_write(off) => self.write_stored(off, value),
             _ => {
                 let mut out = self.out.lock();
-                let moved = self.store(off, value, clock);
+                self.store(off, value, clock);
                 self.drive(&mut out, levels);
-                moved
             }
         }
     }
 
     /// Any other store, with `out` held.
-    fn store(&self, off: u64, value: u64, clock: &Clock) -> bool {
+    fn store(&self, off: u64, value: u64, clock: &Clock) {
         let index = |base: u64| ((off - base) / 8) as usize;
         match off {
             reg::IO_PROTECT::OFFSET => self.region.store(value, SeqCst),
@@ -669,17 +525,12 @@ impl Pi {
             }
             reg::CC_MASK::OFFSET => self.request_enable.store(value, SeqCst),
             reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => {
-                // Latch a deadline that has passed first, so the clear takes it.
-                self.catch_up(clock());
                 let slot = index(reg::RT_INT_PEND_A::OFFSET);
                 self.rt_status[slot].store(0, SeqCst);
                 let _cpu = (usize::from(self.interface) * 2 + slot) & 3;
                 crate::pf_level!(crate::perfetto::events::PI_RT_TICK_LEVEL[_cpu], crate::perfetto::events::PI_RT_TICK[_cpu], false);
             }
-            reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => {
-                self.catch_up(clock());
-                self.profile_status[index(reg::PROF_INT_PEND_A::OFFSET)].store(0, SeqCst);
-            }
+            reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => self.profile_status[index(reg::PROF_INT_PEND_A::OFFSET)].store(0, SeqCst),
             reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET | reg::PROF_INT_EN_A::OFFSET | reg::PROF_INT_EN_B::OFFSET => {
                 let rt = matches!(off, reg::RT_INT_EN_A::OFFSET | reg::RT_INT_EN_B::OFFSET);
                 let slot = index(if rt { reg::RT_INT_EN_A::OFFSET } else { reg::PROF_INT_EN_A::OFFSET });
@@ -710,33 +561,37 @@ impl Pi {
             reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET | reg::PROFILE_COMPARE::OFFSET | reg::RT_COUNTER::OFFSET => {
                 let now = clock();
                 let mut t = self.timer.lock();
-                self.latch(&mut t, now);
-                let mut o = self.counter.read();
+                // A match whose timer has not fired yet still happened before this store.
+                for kind in 0..3 {
+                    if t.due[kind] <= now {
+                        self.matched(&mut t, kind, now);
+                    }
+                }
                 match off {
                     reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET => {
                         let slot = index(reg::RT_COMPARE_A::OFFSET);
                         t.rt_compare[slot] = value & RT_MASK;
-                        self.arm_rt(&mut t, &o, slot, now);
+                        self.arm_rt(&mut t, slot, now);
+                        // The match is on equality, so a store of the counter's own value matches now.
+                        if t.rt_compare[slot] == self.since(now) & RT_MASK {
+                            self.matched(&mut t, slot, now);
+                        }
                     }
                     reg::PROFILE_COMPARE::OFFSET => {
                         t.profile_compare = value & reg::PROFILE_COMPARE::PC_PROFILE_COMPARE::MASK;
-                        self.arm_profile(&mut t, &o, now);
+                        self.arm_profile(&mut t, now);
                     }
                     _ => {
-                        o.base = value & RT_MASK;
-                        o.epoch = o.time(now);
-                        self.counter.write(o);
-                        self.arm_rt(&mut t, &o, 0, now);
-                        self.arm_rt(&mut t, &o, 1, now);
-                        self.arm_profile(&mut t, &o, now);
+                        let count = value & RT_MASK;
+                        self.origin.store((now / TICK).wrapping_sub(count), Release);
+                        self.seen.store(0, Relaxed);
+                        self.arm_all(&mut t, now);
                     }
                 }
-                self.set_next_due(&t, &o);
-                return true;
+                self.schedule(&t);
             }
             _ => self.write_stored(off, value),
         }
-        false
     }
 
     /// The stores that only change a stored word.
@@ -850,11 +705,10 @@ impl Pi {
         let mut t = self.timer.lock();
         t.rt_compare = [0; 2];
         t.profile_compare = 0;
-        let o = self.counter.read();
-        let time = o.time(now);
-        self.counter.write(Origin { base: 0, epoch: time, paused: o.paused });
+        self.origin.store(now / TICK, Release);
+        self.seen.store(0, Relaxed);
         self.arm_all(&mut t, now);
-        drop(t);
+        self.schedule(&t);
         self.drive(&mut out, levels);
     }
 }

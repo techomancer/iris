@@ -269,7 +269,7 @@ pub(crate) fn machine(
     let (mut nodes, mut l1s, mut first_cpu) = (Vec::new(), Vec::new(), 0);
     for spec in &specs {
         let l1 = Arc::new(L1::new(spec.l1.clone())?);
-        nodes.push(NodeBoard::<Bedrock, Flash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, &prom, &clock, first_cpu, specs.len(), &events, &l1)?);
+        nodes.push(NodeBoard::<Bedrock, Flash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, &prom, &timers, first_cpu, specs.len(), &events, &l1)?);
         l1s.push(l1);
         first_cpu += spec.processors.count();
     }
@@ -331,7 +331,6 @@ pub(crate) fn machine(
     world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
     for (node, cpus) in nodes.iter().zip(&node_cpus) {
         connect_cpus(&node.chip, cpus)?;
-        node.chip.set_timer_manager(&timers);
     }
     // One JIT for the machine: every processor of every node compiles through
     // one queue into one page pool, each node an address space of it.

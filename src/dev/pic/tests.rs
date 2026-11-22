@@ -215,12 +215,11 @@ impl Pi {
 }
 
 /// A Bedrock's PI0, which the PIC raises its levels on, and the chip's clock.
-fn pi_with_clock() -> (Pi, Arc<AtomicU64>) {
-    let now = Arc::new(AtomicU64::new(0));
-    let clock = now.clone();
+fn pi_with_clock() -> (Pi, crate::clock::Clock) {
+    let now = crate::clock::Clock::stepped();
     let chip = Bedrock::new(BedrockConfig {
         name: "test",
-        clock: Arc::new(move || clock.load(Ordering::SeqCst)),
+        timers: &Arc::new(crate::hptimer::TimerManager::with_clock(now.clone())),
         processors: Default::default(),
         banks_mib: &[64],
         nodes: 1,
@@ -1129,7 +1128,7 @@ fn a_level_cleared_while_its_input_stays_high_waits_for_the_force_write() {
         }
         assert_eq!(pic.request_counts(0, 0), (1, 0), "{what}: one packet");
         assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0, "{what}: the processor took it");
-        now.store(1_000_000_000, Ordering::SeqCst);
+        now.step(1_000_000_000);
         assert_eq!(pi.read64(pi_reg::INT_PEND0::OFFSET).data, 0, "{what}: nothing comes back by itself");
         assert_eq!(pic.request_counts(0, 0), (1, 0), "{what}: no packet of the chip's own");
         bus.write64(0x1c0, 0);

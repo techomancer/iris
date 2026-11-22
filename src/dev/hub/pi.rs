@@ -5,8 +5,9 @@
 //!
 //! Pending banks, masks, the counter origin, the comparators' pending and
 //! enable bits and the single-word registers are atomics, so registers a waiting processor polls take no
-//! lock. The rest sits behind one mutex never held across an interrupt-line
-//! call; a store the machine must hear of returns an [`Effect`].
+//! lock. A comparator's pending bit is set by a timer armed for its deadline,
+//! never by a read. The rest sits behind one mutex never held across an
+//! interrupt-line call; a store the machine must hear of returns an [`Effect`].
 //!
 //! # Interrupt lines
 //!
@@ -46,16 +47,15 @@
 
 use crate::cpu::mips_exec::SOFT_RESET_BIT;
 use crate::cpu::smp::on_cpu_thread;
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use super::{Effect, PENDING_BANKS};
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::hptimer::{Timer, TimerManager};
 use crate::traits::Resettable;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Weak};
 
 use super::regs as reg;
 /// The end of the graphics credit registers.
@@ -127,7 +127,6 @@ struct State {
     err_stack_size: u64,
     err_status0: [u64; 2],
     gfx: PiGfx,
-    running: bool,
 }
 impl State {
     /// Reset values, with the enable of each of the `cpus` populated slices set as the module's strap does.
@@ -143,7 +142,6 @@ impl State {
             err_stack_size: reg::PI_ERR_STACK_SIZE::RESET,
             err_status0: [0; 2],
             gfx: PiGfx::default(),
-            running: false,
         }
     }
 }
@@ -158,6 +156,9 @@ pub struct Pi {
     mask: [AtomicU64; 4],
     /// The clock reading at which the counter read zero, modulo 2^64.
     rt_origin: AtomicU64,
+    /// The latest clock reading the counter register has used: processors on different sockets
+    /// read the host clock a few hundred ns apart, but the counter never goes back.
+    rt_seen: AtomicU64,
     /// A match pends whether or not enabled; enable only gates the line.
     rt_pending: [AtomicBool; 2],
     rt_enable: [AtomicBool; 2],
@@ -186,19 +187,18 @@ pub struct Pi {
     /// a test that stalls the writer there.
     #[cfg(test)]
     stall: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Held weakly: the manager's callbacks reach the processor, whose bus
-    /// reaches this Hub, so a strong handle here would keep all three alive.
-    timers: OnceLock<Weak<TimerManager>>,
-    timer: Mutex<Option<TimerId>>,
-    weak: Weak<Self>,
+    /// The two processors' comparators, then the profiling one.
+    timers: [Timer; 3],
+    running: AtomicBool,
 }
 
 impl Pi {
     /// `cpus` is the sockets populated (1 or 2); `first_cpu` the global index of
     /// slice A, which PI_CPU_NUM subtracts from the reader's.
-    pub fn new(cpus: u8, first_cpu: usize, clock: Clock) -> Arc<Self> {
+    pub fn new(tm: &Arc<TimerManager>, cpus: u8, first_cpu: usize) -> Arc<Self> {
         assert!((1..=2).contains(&cpus));
-        let now = clock();
+        let clock = tm.clock().clone();
+        let now = clock.now();
         Arc::new_cyclic(|weak| Self {
             cpus,
             first_cpu,
@@ -206,6 +206,7 @@ impl Pi {
             pend: Default::default(),
             mask: Default::default(),
             rt_origin: AtomicU64::new(now.wrapping_sub(reg::PI_RT_COUNT::RESET * TICK_NS)),
+            rt_seen: AtomicU64::new(0),
             rt_pending: Default::default(),
             rt_enable: Default::default(),
             prof_pending: Default::default(),
@@ -223,17 +224,9 @@ impl Pi {
             falls: Default::default(),
             #[cfg(test)]
             stall: Mutex::new(None),
-            timers: OnceLock::new(),
-            timer: Mutex::new(None),
-            weak: weak.clone(),
+            timers: [0, 1, 2].map(|kind| Timer::new(tm, weak, move |pi: &Self, due| pi.expire(kind, due))),
+            running: AtomicBool::new(false),
         })
-    }
-
-    /// The machine owns the manager; the interface only keeps a weak handle to
-    /// arm the comparator timer.
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timers.set(Arc::downgrade(&tm));
-        self.schedule();
     }
 
     /// Where processor `slice`'s lines (bank 0, bank 1, its comparator, the profiling
@@ -271,7 +264,10 @@ impl Pi {
     /// Where the counter has got to, from the clock rather than stored state:
     /// firmware measures elapsed time by polling this register.
     pub fn rt_count(&self) -> u64 {
-        self.count_at((self.clock)())
+        let origin = self.rt_origin.load(Ordering::Relaxed);
+        let now = self.clock.now();
+        let now = self.rt_seen.fetch_max(now, Ordering::Relaxed).max(now);
+        (now.wrapping_sub(origin) / TICK_NS) & RT_MASK
     }
 
     /// The clock reading at which the counter next equals `compare`: a value
@@ -297,30 +293,22 @@ impl Pi {
         s.prof_due = Some(self.deadline(s.prof_compare, now, written));
     }
 
-    /// Pend every comparator whose deadline has passed.
-    fn sync(&self, now: u64) {
-        let mut s = self.state.lock();
-        for slot in 0..2 {
-            if s.due[slot].is_some_and(|due| now >= due) {
-                s.due[slot] = None;
-                self.change(|| self.rt_pending[slot].store(true, Ordering::Release));
-            }
-        }
-        if s.prof_due.is_some_and(|due| now >= due) {
+    fn latch(&self, s: &mut State, kind: usize) {
+        if kind < 2 {
+            s.due[kind] = None;
+            self.change(|| self.rt_pending[kind].store(true, Ordering::Release));
+        } else {
             s.prof_due = None;
-            self.change(|| {
-                for pending in &self.prof_pending {
-                    pending.store(true, Ordering::Release);
-                }
-            });
+            self.change(|| self.prof_pending.iter().for_each(|p| p.store(true, Ordering::Release)));
         }
     }
 
-    /// Bring the comparators up to the clock and publish the lines. Tests and
-    /// the machine's poll call it; the timer does the same on expiry.
-    pub fn poll(&self) {
-        self.sync((self.clock)());
-        self.drive();
+    /// A comparator's timer fired for `due`; a fire after the deadline moved does nothing.
+    fn expire(&self, kind: usize, due: u64) {
+        let mut s = self.state.lock();
+        if [s.due[0], s.due[1], s.prof_due][kind] == Some(due) {
+            self.latch(&mut s, kind);
+        }
     }
 
     /// What slice `slot`'s four lines say: banks 0 and 1 through their masks,
@@ -400,32 +388,11 @@ impl Pi {
         }
     }
 
-    /// Bring the lines to the registers with no input changed.
-    fn drive(&self) {
-        let _lines = self.lines.lock();
-        self.write_all();
-    }
-
-    fn schedule(&self) {
-        let Some(tm) = self.timers.get().and_then(Weak::upgrade) else { return };
-        let mut timer = self.timer.lock();
-        if let Some(id) = timer.take() {
-            tm.remove(id);
+    /// Give each timer its comparator's deadline. Under the lock `s` is read under.
+    fn schedule(&self, s: &State) {
+        for (timer, due) in self.timers.iter().zip([s.due[0], s.due[1], s.prof_due]) {
+            timer.set_due(due);
         }
-        let s = self.state.lock();
-        if !s.running {
-            return;
-        }
-        let Some(next) = s.due.iter().chain([&s.prof_due]).flatten().min().copied() else { return };
-        drop(s);
-        let delay = next.saturating_sub((self.clock)()).clamp(1, 1_000_000_000);
-        *timer = Some(tm.add_one_shot(Duration::from_nanos(delay), self.weak.clone(), |weak| {
-            if let Some(pi) = weak.upgrade() {
-                pi.poll();
-                pi.schedule();
-            }
-            TimerReturn::Delete
-        }));
     }
 
     /// Set or clear one pending interrupt, as a write to PI_INT_PEND_MOD
@@ -527,10 +494,6 @@ impl Pi {
             // The registers a waiting processor polls take no lock.
             reg::PI_INT_PEND0::OFFSET => self.pend[0].load(Ordering::Acquire),
             reg::PI_INT_PEND1::OFFSET => self.pend[1].load(Ordering::Acquire),
-            reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET | reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
-                self.sync((self.clock)());
-                self.peek(off).unwrap_or(0)
-            }
             reg::PI_ERR_STATUS1_A::OFFSET | reg::PI_ERR_STATUS1_A_RCLR::OFFSET | reg::PI_ERR_STATUS1_B::OFFSET | reg::PI_ERR_STATUS1_B_RCLR::OFFSET
             | reg::PI_CRB_TIMEOUT_A::OFFSET | reg::PI_CRB_TIMEOUT_B::OFFSET => 0,
             reg::PI_ERR_STATUS0_A_RCLR::OFFSET | reg::PI_ERR_STATUS0_B_RCLR::OFFSET => {
@@ -555,7 +518,7 @@ impl Pi {
     /// `size` is the access width: only a full-width zero store ends an error record through a
     /// clearing alias. The Hub acts on the returned effect after the unit's lock is released.
     pub fn write_sized(&self, off: u64, value: u64, size: u32) -> Effect {
-        let now = || (self.clock)();
+        let now = || self.clock.now();
         match off {
             reg::PI_REGION_PRESENT::OFFSET => self.region_present.store(value, Ordering::Release),
             reg::PI_CPU_NUM::OFFSET => {
@@ -598,9 +561,12 @@ impl Pi {
                 let slot = idx(off, reg::PI_RT_COMPARE_A::OFFSET);
                 let mut s = self.state.lock();
                 s.rt_compare[slot] = value & RT_MASK;
-                self.arm(&mut s, slot, now(), true);
-                drop(s);
-                self.schedule();
+                let now = now();
+                self.arm(&mut s, slot, now, true);
+                if s.due[slot] == Some(now) {
+                    self.latch(&mut s, slot);
+                }
+                self.schedule(&s);
             }
             reg::PI_RT_PEND_A::OFFSET | reg::PI_RT_PEND_B::OFFSET => {
                 // The handler acknowledges by writing zero, which drops the line.
@@ -612,9 +578,12 @@ impl Pi {
             reg::PI_PROFILE_COMPARE::OFFSET => {
                 let mut s = self.state.lock();
                 s.prof_compare = value & RT_MASK;
-                self.arm_prof(&mut s, now(), true);
-                drop(s);
-                self.schedule();
+                let now = now();
+                self.arm_prof(&mut s, now, true);
+                if s.prof_due == Some(now) {
+                    self.latch(&mut s, 2);
+                }
+                self.schedule(&s);
             }
             reg::PI_PROF_PEND_A::OFFSET | reg::PI_PROF_PEND_B::OFFSET => {
                 // Acknowledged by writing zero, as for the processors' comparators.
@@ -657,14 +626,14 @@ impl Pi {
             reg::PI_RT_COUNT::OFFSET => {
                 let (value, now) = (value & RT_MASK, now());
                 self.rt_origin.store(now.wrapping_sub(value * TICK_NS), Ordering::Release);
+                self.rt_seen.store(0, Ordering::Relaxed);
                 // Moving the counter moves every deadline standing against it.
                 let mut s = self.state.lock();
                 for slot in 0..2 {
                     self.arm(&mut s, slot, now, false);
                 }
                 self.arm_prof(&mut s, now, false);
-                drop(s);
-                self.schedule();
+                self.schedule(&s);
             }
             _ => unimp("register", off, Some(value)),
         }
@@ -677,22 +646,18 @@ impl Pi {
     }
 
     pub fn start(&self) {
-        self.state.lock().running = true;
-        self.schedule();
+        self.running.store(true, Ordering::SeqCst);
+        self.timers.iter().for_each(Timer::start);
     }
 
+    /// The deadlines stay; the machine clock stops, and `start` arms them again.
     pub fn stop(&self) {
-        self.poll();
-        self.state.lock().running = false;
-        if let Some(tm) = self.timers.get().and_then(Weak::upgrade) {
-            if let Some(id) = self.timer.lock().take() {
-                tm.remove(id);
-            }
-        }
+        self.running.store(false, Ordering::SeqCst);
+        self.timers.iter().for_each(Timer::stop);
     }
 
     pub fn is_running(&self) -> bool {
-        self.state.lock().running
+        self.running.load(Ordering::SeqCst)
     }
 }
 
@@ -700,12 +665,11 @@ impl Resettable for Pi {
     /// Everything returns to its reset value except the error stack addresses
     /// (firmware's warm-start marker); each populated slice is enabled again.
     fn power_on(&self) {
-        let now = (self.clock)();
+        let now = self.clock.now();
         let mut s = self.state.lock();
-        let (addr, running) = (s.err_stack_addr, s.running);
+        let addr = s.err_stack_addr;
         *s = State::new(self.cpus);
         s.err_stack_addr = addr;
-        s.running = running;
         drop(s);
         self.region_present.store(reg::PI_REGION_PRESENT::RESET, Ordering::Release);
         self.calias.store(CALIAS_RESET, Ordering::Release);
@@ -714,6 +678,7 @@ impl Resettable for Pi {
         }
         self.rt_local_ctrl.store(RT_LOCAL_CTRL_RESET, Ordering::Release);
         self.rt_origin.store(now.wrapping_sub(reg::PI_RT_COUNT::RESET * TICK_NS), Ordering::Release);
+        self.rt_seen.store(0, Ordering::Relaxed);
         self.change(|| {
             for bank in &self.pend {
                 bank.store(0, Ordering::Release);
@@ -728,7 +693,7 @@ impl Resettable for Pi {
                 self.prof_enable[slot].store(false, Ordering::Release);
             }
         });
-        self.schedule();
+        self.schedule(&self.state.lock());
     }
 }
 

@@ -12,7 +12,8 @@ use super::*;
 
 struct Fixture {
     pi: Arc<Pi>,
-    now: Arc<AtomicU64>,
+    clock: crate::clock::Clock,
+    _tm: Arc<TimerManager>,
     lines: Arc<Lines>,
     /// What the writes so far asked the Hub to do, as text.
     effects: Mutex<Vec<String>>,
@@ -27,14 +28,15 @@ impl Lines {
 }
 impl Fixture {
     fn new(cpus: u8) -> Self {
-        let now = Arc::new(AtomicU64::new(1_000_000));
-        let clock = now.clone();
-        let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
+        let clock = crate::clock::Clock::stepped();
+        clock.step(1_000_000);
+        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+        let pi = Pi::new(&tm, cpus, 0);
         let lines = Arc::new(Lines::default());
         for (slice, word) in lines.0.iter().enumerate() {
             pi.set_cpu_interrupts(slice, word);
         }
-        Self { pi, now, lines, effects: Mutex::default() }
+        Self { pi, clock, _tm: tm, lines, effects: Mutex::default() }
     }
     fn r(&self, off: u64) -> u64 {
         self.pi.read(off, true)
@@ -47,10 +49,23 @@ impl Fixture {
         };
         self.effects.lock().extend(text);
     }
-    /// Let `ticks` counter ticks pass and bring the comparators up to date.
+    /// Let `ticks` counter ticks pass and run the timers that fell due.
     fn advance(&self, ticks: u64) {
-        self.now.fetch_add(ticks * TICK_NS, Ordering::SeqCst);
-        self.pi.poll();
+        self.clock.step(ticks * TICK_NS);
+        self.settle();
+    }
+    /// Fire the comparator timers whose deadline has come, as the timer thread would.
+    fn settle(&self) {
+        let now = self.clock.now();
+        for kind in 0..3 {
+            let due = {
+                let s = self.pi.state.lock();
+                [s.due[0], s.due[1], s.prof_due][kind]
+            };
+            if let Some(due) = due.filter(|&d| d <= now) {
+                self.pi.expire(kind, due);
+            }
+        }
     }
     /// Whether slice `slice`'s word carries the soft-reset request.
     fn reset_requested(&self, slice: usize) -> bool {
@@ -59,6 +74,30 @@ impl Fixture {
     fn take_effects(&self) -> Vec<String> {
         std::mem::take(&mut *self.effects.lock())
     }
+}
+
+/// A reading taken on another socket can sit behind the last one; the counter does not go back.
+#[test]
+fn the_rt_counter_never_reads_below_the_last_reading() {
+    let f = Fixture::new(1);
+    f.clock.step(8_000);
+    let first = f.r(reg::PI_RT_COUNT::OFFSET);
+    let now = f.clock.now();
+    f.clock.restore(now - 1_600);
+    assert_eq!(f.r(reg::PI_RT_COUNT::OFFSET), first);
+    f.clock.restore(now + 1_600);
+    assert!(f.r(reg::PI_RT_COUNT::OFFSET) > first);
+}
+
+/// The clamp starts over when the guest writes the counter.
+#[test]
+fn a_counter_write_clears_the_rt_clamp() {
+    let f = Fixture::new(1);
+    f.clock.step(8_000_000);
+    f.r(reg::PI_RT_COUNT::OFFSET);
+    f.clock.restore(1_000_000);
+    f.w(reg::PI_RT_COUNT::OFFSET, 1000);
+    assert_eq!(f.r(reg::PI_RT_COUNT::OFFSET), 1000);
 }
 
 /// An unprogrammed Hub claims every region exists.
@@ -101,7 +140,7 @@ fn the_processor_number_names_the_reading_processor() {
     t.w(reg::PI_CPU_NUM::OFFSET, 1);
     assert_eq!(t.r(reg::PI_CPU_NUM::OFFSET), 0);
     // A node whose slice A is global CPU 2.
-    let node = Pi::new(2, 2, Arc::new(|| 0));
+    let node = Pi::new(&Arc::new(TimerManager::new()), 2, 2);
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(3);
         assert_eq!(node.read(reg::PI_CPU_NUM::OFFSET, true), 1);
@@ -230,9 +269,9 @@ fn the_counter_runs_at_1_25_mhz_in_52_bits_and_can_be_written() {
     t.w(reg::PI_RT_COUNT::OFFSET, 0);
     assert_eq!(t.r(reg::PI_RT_COUNT::OFFSET), 0);
     // 800 ns is one tick, and the counter moves between two reads.
-    t.now.fetch_add(799, Ordering::SeqCst);
+    t.clock.step(799);
     assert_eq!(t.r(reg::PI_RT_COUNT::OFFSET), 0);
-    t.now.fetch_add(1, Ordering::SeqCst);
+    t.clock.step(1);
     assert_eq!(t.r(reg::PI_RT_COUNT::OFFSET), 1);
     // A whole second is 1,250,000 ticks.
     t.advance(1_250_000 - 1);
@@ -304,6 +343,20 @@ fn a_comparator_behind_the_counter_waits_a_whole_revolution() {
     assert_eq!(t.r(reg::PI_RT_PEND_A::OFFSET), 1);
 }
 
+/// The running timer, not a read, pends the comparator once the clock reaches it.
+#[test]
+fn a_started_comparator_timer_pends_the_bit_at_the_deadline() {
+    let t = Fixture::new(1);
+    t.pi.start();
+    t.w(reg::PI_RT_COMPARE_A::OFFSET, t.r(reg::PI_RT_COUNT::OFFSET) + 10);
+    t.clock.step(9 * TICK_NS);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(t.pi.rt_pending[0].load(Ordering::SeqCst), false);
+    t.clock.step(TICK_NS);
+    assert!(crate::test_board::until(std::time::Duration::from_secs(10), || t.pi.rt_pending[0].load(Ordering::SeqCst)));
+    t.pi.stop();
+}
+
 /// Equal is not behind.
 #[test]
 fn a_comparator_written_equal_to_the_counter_matches_at_once() {
@@ -311,7 +364,6 @@ fn a_comparator_written_equal_to_the_counter_matches_at_once() {
     t.w(reg::PI_RT_EN_A::OFFSET, 1);
     t.w(reg::PI_RT_COUNT::OFFSET, 1_250_000);
     t.w(reg::PI_RT_COMPARE_A::OFFSET, t.r(reg::PI_RT_COUNT::OFFSET));
-    t.pi.poll();
     assert_eq!((t.r(reg::PI_RT_PEND_A::OFFSET), t.lines.get(2)), (1, true));
     // Once: acknowledged, it stays quiet.
     t.w(reg::PI_RT_PEND_A::OFFSET, 0);
@@ -394,7 +446,6 @@ fn a_profiling_comparator_written_equal_to_the_counter_matches_at_once() {
     let t = Fixture::new(2);
     t.w(reg::PI_RT_COUNT::OFFSET, 1_250_000);
     t.w(reg::PI_PROFILE_COMPARE::OFFSET, t.r(reg::PI_RT_COUNT::OFFSET));
-    t.pi.poll();
     assert_eq!((t.r(reg::PI_PROF_PEND_A::OFFSET), t.r(reg::PI_PROF_PEND_B::OFFSET)), (1, 1));
 }
 
@@ -406,7 +457,6 @@ fn a_reset_clears_the_profiling_comparator() {
     t.w(reg::PI_PROF_EN_A::OFFSET, 1);
     t.w(reg::PI_PROF_EN_B::OFFSET, 1);
     t.w(reg::PI_PROFILE_COMPARE::OFFSET, t.r(reg::PI_RT_COUNT::OFFSET));
-    t.pi.poll();
     assert_eq!(t.r(reg::PI_PROF_PEND_A::OFFSET), 1);
     assert!(t.lines.get(3) && t.lines.get(7));
     // Armed again a millisecond out, so a surviving deadline would show.
@@ -603,8 +653,7 @@ fn a_write_that_changes_no_line_makes_no_edge() {
     t.pi.int_modify(MODIFY_SET | 5);
     t.pi.int_modify(MODIFY_SET | 6);
     t.w(reg::PI_INT_MASK0_A::OFFSET, !0);
-    t.pi.drive();
-    t.pi.poll();
+    t.pi.change(|| {});
     assert_eq!(edges(&t), (1, 0));
     // One bit clears and the other holds the line.
     t.pi.int_modify(5);
@@ -628,7 +677,7 @@ fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
             let (t, stop) = (t.clone(), stop.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    t.pi.drive();
+                    t.pi.change(|| {});
                     // The same values the registers hold.
                     t.pi.write_sized(reg::PI_INT_MASK0_A::OFFSET, !0, 8);
                     t.pi.write_sized(reg::PI_RT_EN_A::OFFSET, 1, 8);

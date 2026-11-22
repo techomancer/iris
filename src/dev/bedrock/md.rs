@@ -16,6 +16,7 @@
 
 use super::mem::{bank_bytes, bank_of, layout_differs, Memory, RamExtent, BANK_SPAN};
 use super::{Bedrock, Effect};
+use crate::dev::heart::Clock;
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -65,8 +66,6 @@ struct State {
     /// with the data the doubleword held when it was written.
     ecc: HashMap<u64, (u8, u64)>,
     admitted: [u16; 2],
-    clock_ns: u64,
-    clock_anchor: Option<u64>,
     selftest_deadline: Option<u64>,
     selftest_result: bool,
     selftest_status: u64,
@@ -87,8 +86,6 @@ impl Default for State {
             compat: HashMap::new(),
             ecc: HashMap::new(),
             admitted: [0; 2],
-            clock_ns: 0,
-            clock_anchor: None,
             selftest_deadline: None,
             selftest_result: false,
             selftest_status: 0,
@@ -99,7 +96,7 @@ impl Default for State {
 
 pub(crate) struct Md {
     memory: Arc<Memory>,
-    clock: crate::dev::heart::Clock,
+    clock: Clock,
     // RAM uses the banks directly. The registers and the diagnostic views
     // take the state lock.
     state: Mutex<State>,
@@ -123,8 +120,7 @@ pub(super) struct MdBus {
 }
 
 impl Md {
-    /// A controller over `memory`, with `clock` timing its self-test.
-    pub(super) fn new(memory: Memory, clock: crate::dev::heart::Clock) -> Self {
+    pub(super) fn new(memory: Memory, clock: Clock) -> Self {
         Self {
             memory: Arc::new(memory),
             clock,
@@ -153,30 +149,15 @@ impl Md {
     pub(super) fn view(&self, chip: Weak<Bedrock>, view: View) -> Arc<dyn BusDevice> {
         Arc::new(MdBus { chip, view })
     }
-    fn advance(s: &mut State, elapsed: u64) {
-        s.clock_ns = s.clock_ns.saturating_add(elapsed);
-        if s.selftest_deadline.is_some_and(|end| s.clock_ns >= end) {
+    /// Report a self-test whose time has passed; it raises no interrupt, so the status and error reads are the
+    /// only observers.
+    fn selftest_settle(&self, s: &mut State) {
+        if s.selftest_deadline.is_some_and(|due| (self.clock)() >= due) {
             s.selftest_deadline = None;
             let done = reg::SELF_TEST_STATUS::DONE::MASK;
             s.selftest_status = if s.selftest_result { done | reg::SELF_TEST_STATUS::PASSED::MASK } else { done };
             s.selftest_error = if s.selftest_result { 0 } else { reg::SELF_TEST_ERROR_ADDR::MEMORY_ERROR::MASK };
         }
-    }
-    fn catch_up(s: &mut State, now: u64) {
-        if let Some(anchor) = s.clock_anchor {
-            s.clock_anchor = Some(anchor.max(now));
-            Self::advance(s, now.saturating_sub(anchor));
-        }
-    }
-    pub(super) fn start_clock(&self) {
-        let now = (self.clock)();
-        self.state.lock().clock_anchor.get_or_insert(now);
-    }
-    pub(super) fn stop_clock(&self) {
-        let now = (self.clock)();
-        let mut s = self.state.lock();
-        Self::catch_up(&mut s, now);
-        s.clock_anchor = None;
     }
     /// Cell register bit 0, which gates the register window and the board's
     /// Hub-special windows. One atomic load.
@@ -198,14 +179,8 @@ impl Md {
         if ![1, 2, 4, 8].contains(&bytes) || addr % bytes != 0 {
             return (self.refuse("access", addr), Effect::None);
         }
-        // Sample outside state: even an injected clock must not call out under
-        // the lock. Only register observations need the self-test timer.
-        let now = matches!(view, View::Registers).then(|| (self.clock)());
         let mut effect = Effect::None;
         let mut s = self.state.lock();
-        if let Some(now) = now {
-            Self::catch_up(&mut s, now);
-        }
         let result = match view {
             View::Registers => self.register(&mut s, addr, bytes, write, &mut effect),
             View::Directory => self.directory(&mut s, addr, bytes, write),
@@ -219,6 +194,9 @@ impl Md {
     fn register(&self, s: &mut State, at: u64, bytes: u64, write: Option<u64>, effect: &mut Effect) -> Option<u64> {
         if bytes != 8 {
             return self.refuse("register", at);
+        }
+        if matches!(at, reg::SELF_TEST_STATUS::OFFSET | reg::SELF_TEST_ERROR_ADDR::OFFSET) {
+            self.selftest_settle(s);
         }
         let old = match at {
             reg::CURRENT_CELL::OFFSET => s.cell,
@@ -348,7 +326,7 @@ impl Md {
         s.selftest_result = covered;
         s.selftest_status = 0;
         s.selftest_error = 0;
-        s.selftest_deadline = Some(s.clock_ns.saturating_add(1000));
+        s.selftest_deadline = Some((self.clock)().saturating_add(1000));
         if covered && s.storage.get(&reg::SELF_TEST_DATA::OFFSET).copied().unwrap_or(0) == reg::SELF_TEST_DATA::WRITE_CONTROL::MASK {
             *effect = Effect::Zero(selected as usize, size);
             // The zero fill writes every doubleword's data and check bits.
@@ -492,7 +470,7 @@ mod tests {
 
     /// The controller inside a chip of its own, with the views the node hands
     /// out.
-    struct TestMd(Arc<Bedrock>);
+    struct TestMd(Arc<Bedrock>, crate::clock::Clock);
     impl std::ops::Deref for TestMd {
         type Target = Md;
         fn deref(&self) -> &Md {
@@ -500,17 +478,19 @@ mod tests {
         }
     }
     impl TestMd {
-        fn new(banks: &[u32]) -> Result<Arc<Self>, String> {
-            Self::with_clock(banks, Arc::new(|| 0))
+        fn finish_selftest(&self) {
+            self.1.step(1000);
         }
-        fn with_clock(banks: &[u32], clock: crate::dev::heart::Clock) -> Result<Arc<Self>, String> {
-            Self::with_world(banks, clock, Arc::new(crate::cpu::smp::World::new()))
+        fn new(banks: &[u32]) -> Result<Arc<Self>, String> {
+            Self::with_world(banks, Arc::new(crate::cpu::smp::World::new()))
         }
         /// A chip whose remap parks the processors of `world`.
-        fn with_world(banks: &[u32], clock: crate::dev::heart::Clock, world: Arc<crate::cpu::smp::World>) -> Result<Arc<Self>, String> {
-            let chip = Bedrock::new(BedrockConfig { banks_mib: banks, ..super::super::test_config(clock) })?;
+        fn with_world(banks: &[u32], world: Arc<crate::cpu::smp::World>) -> Result<Arc<Self>, String> {
+            let clock = crate::clock::Clock::stepped();
+            let timers = Arc::new(crate::hptimer::TimerManager::with_clock(clock.clone()));
+            let chip = Bedrock::new(BedrockConfig { banks_mib: banks, ..super::super::test_config(&timers) })?;
             chip.decode.set_world(world);
-            Ok(Arc::new(Self(chip)))
+            Ok(Arc::new(Self(chip, clock)))
         }
         /// MD's registers, through the chip's register window, which acts on
         /// what a store changes.
@@ -553,10 +533,6 @@ mod tests {
         /// Hold the lock, for tests of the paths that must not take it.
         pub(in crate::dev::bedrock) fn hold(&self) -> impl Sized + '_ {
             self.state.lock()
-        }
-        /// Explicit elapsed time, for tests that drive the self-test by hand.
-        fn advance_ns(&self, elapsed: u64) {
-            Self::advance(&mut self.state.lock(), elapsed);
         }
         fn unsupported(&self) -> u64 {
             self.unsupported.load(Ordering::Relaxed)
@@ -616,7 +592,7 @@ mod tests {
         let processor = Arc::new(ParkSlot::new(0, &word));
         let world = Arc::new(World::new());
         world.set_slots(vec![processor.clone()]);
-        let md = TestMd::with_world(&FUEL_BANKS, Arc::new(|| 0), world).unwrap();
+        let md = TestMd::with_world(&FUEL_BANKS, world).unwrap();
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33);
         assert!(processor.release(REQUEST_JIT_REMAP), "mapping the banks asks for a flush");
         md.md_bus().write64(reg::MEMORY_CONFIG::OFFSET, 0x33 | (1 << 32));
@@ -850,11 +826,11 @@ mod tests {
         bus.write64(4 * BANK_SPAN + 0x40, 0x5555);
         regs.write64(reg::SELF_TEST_DATA::OFFSET, 0x80);
         regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (4 << 4) | 1);
-        md.advance_ns(1000);
+        md.finish_selftest();
         assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 3, "bank 4 is installed");
         assert_eq!(bus.read64(4 * BANK_SPAN + 0x40).data, 0, "and zeroed");
         regs.write64(reg::SELF_TEST_CONTROL::OFFSET, (6 << 4) | 1);
-        md.advance_ns(1000);
+        md.finish_selftest();
         assert_eq!(regs.read64(reg::SELF_TEST_STATUS::OFFSET).data, 2, "bank 6 is not installed");
     }
 
@@ -950,7 +926,7 @@ mod tests {
             let before = md.unsupported();
             assert_eq!(r.write64(0x20030, 3), BUS_OK);
             assert_eq!(md.unsupported(), before + 1);
-            md.advance_ns(1000);
+            md.finish_selftest();
             assert_eq!(r.read64(0x20048).data, 3);
             assert_eq!(r.write64(0x70000, 1), BUS_ERR);
             assert_eq!(r.read64(0x70000).status, BUS_ERR);
@@ -973,62 +949,41 @@ mod tests {
             assert_eq!(regs.read64(8).data, 0);
         }
     }
-    /// Self-test completion is visible only after its configured clock interval.
+    /// Self-test completion is reported once its time has passed, and a stop or reset cancels it.
     #[test]
-    fn selftest_waits_for_configured_clock_cycles_and_zero_fills_ram() {
+    fn selftest_waits_for_its_time_and_zero_fills_ram() {
         {
-            let now = Arc::new(AtomicU64::new(100));
-            let time = now.clone();
-            let md = TestMd::with_clock(&FUEL_BANKS, Arc::new(move || time.load(Ordering::Relaxed))).unwrap();
+            let md = configured();
             let regs = md.md_bus();
-            regs.write64(8, 0x33);
-            md.start_clock();
             regs.write64(0x20030, 1);
-            now.store(1099, Ordering::Relaxed);
             assert_eq!(regs.read64(0x20048).data, 0);
-            now.store(1100, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 3);
-            now.store(5000, Ordering::Relaxed);
-            regs.write64(0x20030, 1);
-            now.store(5500, Ordering::Relaxed);
-            md.stop_clock();
-            now.store(15000, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 0);
-            md.start_clock();
-            now.store(15499, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 0);
-            now.store(15500, Ordering::Relaxed);
+            md.finish_selftest();
             assert_eq!(regs.read64(0x20048).data, 3);
             regs.write64(0x20030, 1);
-            now.store(15400, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 0);
-            now.store(16499, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 0);
-            now.store(16500, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 3);
-            regs.write64(0x20030, 1);
+            assert_eq!(regs.read64(0x20048).data, 0, "a restart clears the status");
             regs.write64(0x20030, 2);
-            now.store(20000, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 0);
+            md.finish_selftest();
+            assert_eq!(regs.read64(0x20048).data, 0, "a stop cancels it");
+            regs.write64(0x20030, 1);
             md.0.power_on();
             regs.write64(8, 0x33);
-            md.start_clock();
+            md.finish_selftest();
+            assert_eq!(regs.read64(0x20048).data, 0, "a reset cancels it");
             regs.write64(0x20030, 1);
-            now.store(20999, Ordering::Relaxed);
-            assert_eq!(regs.read64(0x20048).data, 0);
-            now.store(21000, Ordering::Relaxed);
+            assert_eq!(regs.read64(0x20048).data, 0, "not before its microsecond");
+            md.finish_selftest();
             assert_eq!(regs.read64(0x20048).data, 3);
         }
         {
             let md = configured();
             let r = md.md_bus();
             r.write64(0x20030, 0x21);
-            md.advance_ns(1000);
+            md.finish_selftest();
             assert_eq!(r.read64(0x20048).data, 2);
             assert_eq!(r.read64(0x20040).data, 1 << 48);
             r.write64(0x20030, 1);
             r.write64(0x20030, 2);
-            md.advance_ns(1000);
+            md.finish_selftest();
             assert_eq!(r.read64(0x20048).data, 0);
             assert_eq!(r.write64(0x20030, 3), BUS_OK);
         }
@@ -1043,7 +998,7 @@ mod tests {
             md.0.ecc_bus().write8(15, 1);
             r.write64(0x20038, 0x80);
             r.write64(0x20030, 1);
-            md.advance_ns(1000);
+            md.finish_selftest();
             assert_eq!(r.read64(0x20048).data, 3);
             assert_eq!(md.physical().read64(0).data, 0);
             assert_eq!(md.0.ecc_bus().read8(7).data, 0);

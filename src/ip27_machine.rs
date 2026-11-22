@@ -59,12 +59,11 @@ use crate::sn::BoardIo;
 use crate::traits::MachineEvent;
 use std::sync::mpsc::Sender;
 use crate::irq::InterruptController;
-use crate::traits::{BusDevice, Resettable, BUS_ERR};
+use crate::traits::{BusDevice, Device, Resettable, BUS_ERR};
 use crate::xtalk::Upstream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 /// The Crossbow revision: 1.1, the earliest the kernel accepts.
 /// The Origin 2000 and Onyx2 node board.
@@ -198,11 +197,11 @@ impl ModuleController for ModuleManagement {
     fn take_events(&self) -> Vec<ModuleOutput> {
         self.module.take_events()
     }
-    fn next_due(&self) -> Option<Duration> {
-        self.module.next_due()
-    }
     fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
         self.module.set_wake(wake);
+    }
+    fn device(&self) -> Arc<dyn Device> {
+        self.module.clone()
     }
 }
 
@@ -237,11 +236,11 @@ fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Brid
 
 /// The module controller: one for the module, in front of every node's
 /// I2C controller.
-fn controller(nodes: &[NodeBoard<Hub, NodeFlash>], clock: &Clock, cfg: &MachineConfig) -> Result<Arc<ModuleManagement>, String> {
+fn controller(nodes: &[NodeBoard<Hub, NodeFlash>], timers: &Arc<TimerManager>, cfg: &MachineConfig) -> Result<Arc<ModuleManagement>, String> {
     let store = ElscNvram::origin2000(MODULE_NUMBER, cfg.ip27_section().expect("an IP27 profile").controller_store.as_deref().map(Path::new))
         .map(Arc::new)
         .map_err(|e| format!("{}.controller_store: {e}", cfg.machine.profile.table_name().unwrap_or_default()))?;
-    let module = Origin2000Module::new(ModuleConfig { module_number: MODULE_NUMBER, ..Default::default() }, store, clock.clone());
+    let module = Origin2000Module::new(ModuleConfig { module_number: MODULE_NUMBER, ..Default::default() }, store, timers);
     for (i, node) in nodes.iter().enumerate() {
         node.chip.attach_i2c(module.adapter(i));
     }
@@ -321,7 +320,7 @@ pub(crate) fn build_io(
     timers: &Arc<TimerManager>,
     events: &Sender<MachineEvent>,
 ) -> Result<BoardIo, String> {
-    let controller = controller(nodes, clock, cfg)?;
+    let controller = controller(nodes, timers, cfg)?;
     // The status bar's activity bits, shared with the Bridge's devices.
     let heartbeat = Arc::new(AtomicU64::new(0));
     let mut io = if cfg.machine.profile == MachineProfile::Onyx2Ip27 {
@@ -336,7 +335,7 @@ pub(crate) fn build_io(
         status.set_scsi_wide(true);
         io.status = Some(status);
     }
-    attach_controller(&mut io, controller, events, timers);
+    attach_controller(&mut io, controller, events);
     Ok(io)
 }
 

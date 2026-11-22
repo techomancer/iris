@@ -46,7 +46,7 @@ pub use pi::Population;
 
 use crate::dev::heart::Clock;
 use crate::dev::widths::access_widths;
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::hptimer::TimerManager;
 use crate::irq::{InterruptController, IrqLine};
 use crate::traits::{BusDevice, BusRead64, Device, MachineEvent, Resettable, BUS_ERR, BUS_OK};
 use crate::sn::{
@@ -68,9 +68,9 @@ pub const NODE_SHIFT: u32 = regs::extra::NODE_SHIFT as u32;
 pub struct BedrockConfig<'a> {
     /// The board's name in log lines.
     pub name: &'static str,
-    /// Host nanoseconds: the PIs' counter and timers run on it, and the
-    /// other units' clocked work.
-    pub clock: Clock,
+    /// The machine's timers: its clock drives the PIs' counter and the
+    /// other units' clocked work, and the PIs' comparators fire on it.
+    pub timers: &'a Arc<TimerManager>,
     /// The processor slots the board populates. CPU n sits in
     /// `processors.slot_of(n)`; a populated slot starts with its enable bit set.
     pub processors: Population,
@@ -145,17 +145,6 @@ impl Who {
     }
 }
 
-/// A one-shot `delay` nanoseconds out that latches PI `interface`'s due
-/// comparators and arms the next.
-fn arm_host_timer(tm: &TimerManager, chip: &Weak<Bedrock>, interface: u8, delay: u64) -> TimerId {
-    tm.add_one_shot(Duration::from_nanos(delay), (chip.clone(), interface), |(chip, interface)| {
-        if let Some(chip) = chip.upgrade() {
-            chip.expire(usize::from(*interface));
-        }
-        TimerReturn::Delete
-    })
-}
-
 pub struct Bedrock {
     name: &'static str,
     clock: Clock,
@@ -170,7 +159,6 @@ pub struct Bedrock {
     /// This node and the chip at the far end of its NI's port, by the numbers they
     /// publish, and the node's memory, which the chip remaps.
     pub(crate) decode: Arc<NodeDecode<Bedrock>>,
-    timers: OnceLock<Weak<TimerManager>>,
     events: Option<Sender<MachineEvent>>,
     weak: Weak<Self>,
 }
@@ -179,8 +167,9 @@ pub struct Bedrock {
 const XIO_NODE_SHIFT: u32 = 39;
 impl Bedrock {
     pub fn new(config: BedrockConfig<'_>) -> Result<Arc<Self>, String> {
-        let BedrockConfig { name, clock, processors, banks_mib, nodes, events, prom } = config;
+        let BedrockConfig { name, timers, processors, banks_mib, nodes, events, prom } = config;
         let memory = mem::Memory::new(banks_mib, nodes)?;
+        let clock = timers.clock().reader();
         let now = clock();
         let chip = Arc::new_cyclic(|weak: &Weak<Self>| {
             let md = Md::new(memory, clock.clone());
@@ -189,7 +178,7 @@ impl Bedrock {
             let decode = NodeDecode::new(NODE_SHIFT, 0x2000_0000, node, crate::devlog::LogModule::Bedrock);
             Self {
                 name,
-                pi: [Pi::new(0, processors, now), Pi::new(1, processors, now)],
+                pi: [Pi::new(0, processors, now, timers, weak), Pi::new(1, processors, now, timers, weak)],
                 md,
                 io: Io::new(),
                 lb: lb::Lb::new(),
@@ -197,7 +186,6 @@ impl Bedrock {
                 xb: xb::Xb::new(),
                 levels: Levels::default(),
                 decode,
-                timers: OnceLock::new(),
                 events,
                 clock,
                 processors,
@@ -382,25 +370,9 @@ impl Bedrock {
             }
         }
     }
-    /// The PIs' comparators and profile timers fire on `tm`. Held weakly.
-    pub fn set_timer_manager(&self, tm: &Arc<TimerManager>) {
-        let _ = self.timers.set(Arc::downgrade(tm));
-        let now = (self.clock)();
-        for pi in &self.pi {
-            pi.reschedule(Some(tm), &self.weak, now);
-        }
-    }
     /// The L1 UART's line: bank 0 bit 4 of both PIs.
     pub fn uart_irq(self: &Arc<Self>) -> IrqLine {
         IrqLine::new(Arc::new(Uart(self.weak.clone())), 0)
-    }
-    fn timer_manager(&self) -> Option<Arc<TimerManager>> {
-        self.timers.get().and_then(Weak::upgrade)
-    }
-    /// PI `interface`'s host timer fired.
-    fn expire(&self, interface: usize) {
-        let Some(tm) = self.timer_manager() else { return };
-        self.pi[interface].expire(&tm, &self.weak, (self.clock)(), &self.levels);
     }
     fn publish_all(&self) {
         for pi in &self.pi {
@@ -513,10 +485,7 @@ impl Bedrock {
                         self.lb.note_rt_compare(cpu);
                     }
                 }
-                if pi.write(a, v, &self.clock, &self.levels) {
-                    let tm = self.timer_manager();
-                    pi.reschedule(tm.as_deref(), &self.weak, (self.clock)());
-                }
+                pi.write(a, v, &self.clock, &self.levels);
                 if a == regs::pi::CALIAS_SIZE::OFFSET {
                     self.apply(Effect::CachedAlias(index, calias_bytes(pi.cached_alias())));
                 }
@@ -524,7 +493,7 @@ impl Bedrock {
             }
             // The counter's two halves, high word first.
             (4, None) if a & !4 == regs::pi::RT_COUNTER::OFFSET => {
-                BusRead64::ok(pi.count((self.clock)()) >> (32 - (a & 4) * 8) & 0xffff_ffff)
+                BusRead64::ok(pi.count(&self.clock) >> (32 - (a & 4) * 8) & 0xffff_ffff)
             }
             _ => {
                 pi.note(a, value.is_some());
@@ -565,28 +534,22 @@ impl Device for Bedrock {
     fn step(&self, _cycles: u64) {}
     /// The counters run and the PIs' timers arm.
     fn start(&self) {
-        let now = (self.clock)();
-        self.md.start_clock();
-        let tm = self.timer_manager();
         for pi in &self.pi {
-            pi.start(tm.as_deref(), &self.weak, now);
+            pi.start();
         }
         self.publish_all();
     }
-    /// The counters pause where they are and the PIs' timers stop.
+    /// The PIs' timers stop; the machine clock holds the counters.
     fn stop(&self) {
-        let now = (self.clock)();
-        let tm = self.timer_manager();
         for pi in &self.pi {
-            pi.stop(tm.as_deref(), now, &self.levels);
+            pi.stop();
         }
-        self.md.stop_clock();
     }
     fn is_running(&self) -> bool {
         self.pi[0].is_running()
     }
     fn get_clock(&self) -> u64 {
-        self.pi[0].count((self.clock)())
+        self.pi[0].count(&self.clock)
     }
 }
 
@@ -594,10 +557,8 @@ impl Resettable for Bedrock {
     /// Every unit's reset. Memory keeps its contents.
     fn power_on(&self) {
         let now = (self.clock)();
-        let tm = self.timer_manager();
         for pi in &self.pi {
             pi.power_on(now, &self.levels);
-            pi.reschedule(tm.as_deref(), &self.weak, now);
         }
         self.md.power_on();
         self.lb.power_on();

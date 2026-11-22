@@ -56,18 +56,16 @@ use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::devlog::LogModule;
 use crate::gdb_stub::CpuDebug;
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::hptimer::TimerManager;
 use crate::cpu::smp::World;
 use crate::window_map::SparseWindowMap;
 pub use crate::dev::hub::{bank_mappings, BANKS, BANK_STRIDE, SLOT_STRIDE};
 use crate::traits::*;
 use crate::workstation::{DiscChanger, Workstation};
-use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 /// The ranges the CPU model reports as memory for a node with `banks_mb`: the
 /// installed runs, and the boot flash's reset address unless a 512 MiB bank 0 holds it.
@@ -125,106 +123,23 @@ pub trait ModuleController: Send + Sync {
     /// The controller's outputs since the last call, with its time brought
     /// up to date.
     fn take_events(&self) -> Vec<ModuleOutput>;
-    /// How long until the controller has an output or action due with no bus access to bring it
-    /// up to date: zero if due now, `None` if nothing is pending.
-    fn next_due(&self) -> Option<Duration>;
-    /// `wake` runs, with no controller lock held, after any access that may
-    /// have moved [`Self::next_due`]. Once, when the machine is built.
+    /// `wake` runs, with no controller lock held, on a timer thread once the controller has
+    /// outputs for the machine. Once, when the machine is built.
     fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>);
+    /// The device that starts and stops the controller's timers with the machine.
+    fn device(&self) -> Arc<dyn Device>;
 }
 
-/// Brings the module controller up to date when next due. It keeps its own time and a bus access
-/// updates it; this serves a guest that leaves the bus idle across a countdown or pulse. One
-/// one-shot timer is re-armed after each visit and access, so an idle machine wakes nothing.
-pub(crate) struct ControllerWatch {
-    controller: Arc<dyn ModuleController>,
-    events: Sender<MachineEvent>,
-    timers: Weak<TimerManager>,
-    /// The armed timer, if any. Held across the arming so two arms cannot
-    /// leave two timers.
-    timer: Mutex<Option<TimerId>>,
-    /// Whether the machine is running its peripherals.
-    running: AtomicBool,
-    me: Weak<ControllerWatch>,
-}
-
-impl ControllerWatch {
-    fn new(controller: Arc<dyn ModuleController>, events: Sender<MachineEvent>, timers: &Arc<TimerManager>) -> Arc<Self> {
-        let watch = Arc::new_cyclic(|me| Self {
-            controller,
-            events,
-            timers: Arc::downgrade(timers),
-            timer: Mutex::new(None),
-            running: AtomicBool::new(false),
-            me: me.clone(),
-        });
-        let me = Arc::downgrade(&watch);
-        watch.controller.set_wake(Box::new(move || {
-            if let Some(watch) = me.upgrade() {
-                watch.arm();
-            }
-        }));
-        watch
-    }
-
-    /// Arm the timer for the controller's next due time, replacing the last.
-    fn arm(&self) {
-        let Some(timers) = self.timers.upgrade() else { return };
-        let mut timer = self.timer.lock();
-        if let Some(id) = timer.take() {
-            timers.remove(id);
+/// Run the module controller as the board's last device, handing its outputs to the machine as
+/// its timers produce them.
+pub(crate) fn attach_controller(io: &mut BoardIo, controller: Arc<dyn ModuleController>, events: &Sender<MachineEvent>) {
+    let (me, events) = (Arc::downgrade(&controller), events.clone());
+    controller.set_wake(Box::new(move || {
+        for event in me.upgrade().map(|c| c.take_events()).unwrap_or_default() {
+            controller_output(event, &events);
         }
-        if !self.running.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(due) = self.controller.next_due() else { return };
-        // Never zero: a controller that is due now and stays due after a
-        // visit must not spin the timer thread.
-        let due = due.max(Duration::from_nanos(1));
-        let me = self.me.clone();
-        *timer = Some(timers.add_one_shot(due, me, |me| {
-            if let Some(watch) = me.upgrade() {
-                watch.visit();
-            }
-            TimerReturn::Delete
-        }));
-    }
-
-    /// Carry out what the controller has due, and arm for what is next.
-    fn visit(&self) {
-        for event in self.controller.take_events() {
-            controller_output(event, &self.events);
-        }
-        self.arm();
-    }
-
-    #[cfg(test)]
-    fn armed(&self) -> Option<TimerId> {
-        *self.timer.lock()
-    }
-}
-
-impl Device for ControllerWatch {
-    fn step(&self, _: u64) {}
-    fn start(&self) {
-        self.running.store(true, Ordering::Release);
-        self.arm();
-    }
-    fn stop(&self) {
-        self.running.store(false, Ordering::Release);
-        self.arm();
-    }
-    fn is_running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
-    }
-    fn get_clock(&self) -> u64 {
-        0
-    }
-}
-
-/// Run the module controller's watch as the board's last device.
-pub(crate) fn attach_controller(io: &mut BoardIo, controller: Arc<dyn ModuleController>, events: &Sender<MachineEvent>, timers: &Arc<TimerManager>) {
-    io.devices.push(ControllerWatch::new(controller, events.clone(), timers));
+    }));
+    io.devices.push(controller.device());
 }
 
 /// What the controller's outputs ask of the machine: power falling is power loss, rising or a
@@ -243,13 +158,13 @@ fn controller_output(event: ModuleOutput, machine: &Sender<MachineEvent>) {
 impl NodeBoard<Hub, NodeFlash> {
     /// Node `index`: its flash from `prom` and `spec`, the Hub and the
     /// node board's one-wire record, and the uncached bus its processor uses.
-    pub fn build(table: &str, spec: &NodeSpec, index: usize, prom: &[u8], clock: &Clock) -> Result<Self, String> {
+    pub fn build(table: &str, spec: &NodeSpec, index: usize, prom: &[u8], tm: &Arc<TimerManager>) -> Result<Self, String> {
         let image = node_flash::initial_image(prom, &spec.firmware)?;
         let flash = match &spec.flash {
             Some(path) => NodeFlash::with_file(image, path).map_err(|e| format!("machine.flash {}: {e}", path.display()))?,
             None => NodeFlash::new(image)?,
         };
-        let hub = Hub::new(spec.hub, clock.clone(), Some(flash.chip()))?;
+        let hub = Hub::new(spec.hub, tm, Some(flash.chip()))?;
         // The Hub's one-wire master reads the node board's record, whose serial is the node's
         // identity: the other node's PROM reads it as the remote NIC.
         let mut onewire = w1::Bus::new();
@@ -294,8 +209,7 @@ pub fn machine(
     let clock = timers.clock().reader();
     let mut nodes = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
-        let node = NodeBoard::<Hub, NodeFlash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, i, &prom, &clock)?;
-        node.chip.pi.set_timer_manager(timers.clone());
+        let node = NodeBoard::<Hub, NodeFlash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, i, &prom, &timers)?;
         nodes.push(node);
     }
     let (tx, rx) = channel();

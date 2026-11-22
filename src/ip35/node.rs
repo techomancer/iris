@@ -13,7 +13,7 @@ use crate::cpu::mips_exec::CpuDevice;
 use crate::dev::bedrock::{Bedrock, BedrockConfig, Population, BANK_SPAN, SLOTS};
 use crate::cpu::parts::CpuModule;
 use crate::dev::bedrock_flash::{disabled_positions_environment, FirmwareRecord, Flash, PART_SIZE};
-use crate::dev::heart::Clock;
+use crate::hptimer::TimerManager;
 use crate::dev::l1::{L1Config, L1Event, L1};
 use crate::dev::widths::{self, access_widths};
 use crate::devlog::LogModule;
@@ -56,7 +56,7 @@ impl NodeBoard<Bedrock, Flash> {
         table: &str,
         spec: &NodeSpec,
         payload: &[u8],
-        clock: &Clock,
+        timers: &Arc<TimerManager>,
         first_cpu: usize,
         nodes: usize,
         events: &Sender<MachineEvent>,
@@ -68,13 +68,13 @@ impl NodeBoard<Bedrock, Flash> {
             Some(path) => Flash::with_file_seeded(payload, path, firmware, &records).map_err(|e| format!("machine.flash {}: {e}", path.display())),
             None => Flash::seeded(payload, firmware, &records).map_err(|e| e.to_string()),
         }?);
-        flash.use_clock(clock.clone());
+        flash.use_clock(timers.clock().reader());
         let prom = Arc::new(flash.array_view(0, PART_SIZE).map_err(|e| e.to_string())?);
         // A bank 0 over the reset window keeps its RAM there for cached references;
         // otherwise the chip maps the PROM there.
         let chip = Bedrock::new(BedrockConfig {
             name,
-            clock: clock.clone(),
+            timers,
             processors: processors.with_first_cpu(first_cpu),
             banks_mib: &spec.banks_mib,
             nodes,

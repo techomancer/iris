@@ -28,8 +28,8 @@
 //! * that `nic` reads 1 (no device on the one-wire line) and `sla` reports
 //!   from a slave are stored or logged only.
 //!
-//! Timers run lazily on each bus, serial or [`Elsc::poll`] touch, so a test sets
-//! the clock by hand. A request is attributed to the CPU thread that made it
+//! Timers run on the machine's timer manager, one kind each, and expire at their own
+//! deadlines. A request is attributed to the CPU thread that made it
 //! ([`crate::cpu::smp::current_cpu`]); other threads count as CPU 0. Migration
 //! state is not saved yet.
 //!
@@ -41,17 +41,17 @@
 //! Ported from hw/misc/sgi-elsc.c in jamesbraid/qemu-sgi-origami.
 
 use crate::dev::elsc_nvram::{self, ElscNvram};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::i2c::{BusBusy, I2cTarget, Service};
 use crate::dev::serial_host::{null_serial_backend, SerialBackend};
 use crate::devlog::LogModule;
 use crate::dlog;
-use crate::traits::Resettable;
+use crate::hptimer::{Timer, TimerManager};
+use crate::traits::{Device, Resettable};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 /// Seven-bit I2C address the controller answers at.
 pub const I2C_ADDR: u8 = 0x08;
@@ -258,7 +258,11 @@ const T_NMI_PULSE: usize = 5;
 const T_HBT: usize = 6;
 const T_POWER_UP: usize = 7;
 const T_START: usize = 8;
-const TIMERS: usize = 9;
+/// Hand the machine what the controller has for it: queued outputs or a committed action.
+const T_VISIT: usize = 9;
+/// A visit waits a millisecond, so a wake that leaves its outputs queued cannot spin the timer thread.
+const VISIT_NS: u64 = NS_PER_MS;
+const TIMERS: usize = 10;
 
 // Commands whose missing effect is logged once.
 const UNIMP_FSC: u8 = 1 << 0;
@@ -419,8 +423,10 @@ struct State {
     nvram: Arc<ElscNvram>,
     bus_busy: BusBusy,
 
-    /// Virtual time of the event being handled, nanoseconds.
-    now: u64,
+    clock: Clock,
+    /// The deadline of the timer being handled; arming counts from it, so a long gap replays what
+    /// a steady clock gives.
+    at: Option<u64>,
     deadlines: [Option<u64>; TIMERS],
 
     /// The request, one byte per I2C send; one over the legal maximum so an
@@ -436,6 +442,10 @@ struct State {
     // Grant ring.
     arb_code: u32,
     arb_signal: u8,
+    /// When the next grant tick falls, or none before the rotation has started. The tick is armed
+    /// only while an adapter polls for grants, and the ticks it missed are replayed on the next poll.
+    arb_next: Option<u64>,
+    arb_polled: bool,
     pending_grant: Option<u8>,
 
     // Power.
@@ -504,18 +514,16 @@ struct State {
     out: Vec<u8>,
     events: Vec<ModuleOutput>,
     release_bus: bool,
-    /// What [`Self::due`] said when the machine was last told it might have
-    /// moved; `None` before the first report.
-    reported_due: Option<Option<u64>>,
 }
 
 impl State {
-    fn new(cfg: ElscConfig, nvram: Arc<ElscNvram>, bus_busy: BusBusy) -> Self {
+    fn new(cfg: ElscConfig, nvram: Arc<ElscNvram>, bus_busy: BusBusy, clock: Clock) -> Self {
         Self {
             cfg,
             nvram,
             bus_busy,
-            now: 0,
+            clock,
+            at: None,
             deadlines: [None; TIMERS],
             rx: Vec::new(),
             tx: Vec::new(),
@@ -523,6 +531,8 @@ impl State {
             resp_owner: -1,
             arb_code: 0,
             arb_signal: 0,
+            arb_next: None,
+            arb_polled: false,
             pending_grant: None,
             module_off: false,
             power_sequence: false,
@@ -571,14 +581,17 @@ impl State {
             out: Vec::new(),
             events: Vec::new(),
             release_bus: false,
-            reported_due: None,
         }
     }
 
     // ---- time -----------------------------------------------------------
 
+    fn now(&self) -> u64 {
+        self.at.unwrap_or_else(|| self.clock.now())
+    }
+
     fn arm_ms(&mut self, timer: usize, ms: u64) {
-        self.deadlines[timer] = Some(self.now + ms * NS_PER_MS);
+        self.deadlines[timer] = Some(self.now() + ms * NS_PER_MS);
     }
 
     fn arm_secs(&mut self, timer: usize, secs: u64) {
@@ -589,44 +602,13 @@ impl State {
         self.deadlines[timer].is_some()
     }
 
-    /// When the controller next has something for its machine, in clock ns: a committed action, an
-    /// unclaimed queued output or a timer ending in one. Grant ticks and message expiry are
-    /// replayed by the bus access that sees them.
-    fn due(&self) -> Option<u64> {
-        if self.deferred_scheduled || !self.events.is_empty() {
-            return Some(self.now);
-        }
-        const OUTPUT_TIMERS: [usize; 7] = [T_PWR_DOWN, T_RST, T_NMI, T_NMI_PULSE, T_HBT, T_POWER_UP, T_START];
-        OUTPUT_TIMERS.iter().filter_map(|&t| self.deadlines[t]).min()
-    }
-
     fn cancel(&mut self, timer: usize) {
         self.deadlines[timer] = None;
     }
 
-    /// Run every timer due by `clock_now`, oldest first, each at its own
-    /// deadline so a long gap replays the same sequence a steady clock gives.
-    fn advance(&mut self, clock_now: u64) {
-        if clock_now < self.now {
-            return;
-        }
-        while let Some((deadline, timer)) = self
-            .deadlines
-            .iter()
-            .enumerate()
-            .filter_map(|(i, d)| d.filter(|d| *d <= clock_now).map(|d| (d, i)))
-            .min()
-        {
-            self.deadlines[timer] = None;
-            self.now = deadline.max(self.now);
-            self.fire(timer, deadline, clock_now);
-        }
-        self.now = clock_now;
-    }
-
-    fn fire(&mut self, timer: usize, deadline: u64, clock_now: u64) {
+    fn fire(&mut self, timer: usize, deadline: u64) {
         match timer {
-            T_ARB => self.arb_tick(deadline, clock_now),
+            T_ARB => self.arb_tick(deadline),
             T_PWR_DOWN => self.pwr_down_expired(),
             T_MESSAGE => {
                 self.message = Message::None;
@@ -1062,25 +1044,35 @@ impl State {
     }
 
     /// One periodic tick. A tick that finds the bus busy publishes nothing and does
-    /// not advance. Long gaps skip whole revolutions to the next other timer.
-    fn arb_tick(&mut self, deadline: u64, clock_now: u64) {
-        let blocked = self.arb_blocked();
-        let horizon = self
-            .deadlines
-            .iter()
-            .flatten()
-            .copied()
-            .filter(|d| *d <= clock_now)
-            .min()
-            .map_or(clock_now, |d| d.min(clock_now));
-        let whole = horizon.saturating_sub(deadline) / ARB_TICK_NS;
-        let skip = if blocked { whole } else { whole / ARB_POSITIONS as u64 * ARB_POSITIONS as u64 };
-        let at = deadline + skip * ARB_TICK_NS;
-        self.now = self.now.max(at);
-        if !blocked {
+    /// not advance. The ring lapses unless an adapter polled during the tick.
+    fn arb_tick(&mut self, deadline: u64) {
+        if !self.arb_blocked() {
             self.arb_publish();
         }
-        self.deadlines[T_ARB] = Some(at + ARB_TICK_NS);
+        let next = deadline + ARB_TICK_NS;
+        self.arb_next = Some(next);
+        self.deadlines[T_ARB] = std::mem::take(&mut self.arb_polled).then_some(next);
+    }
+
+    /// An adapter is waiting for a grant: bring the ring up to the clock, as ticks would have, and
+    /// keep it ticking while the polls go on.
+    fn arb_poll(&mut self) {
+        let Some(mut next) = self.arb_next.filter(|_| self.rings()) else { return };
+        self.arb_polled = true;
+        if self.pending(T_ARB) {
+            return;
+        }
+        let now = self.now();
+        if now >= next {
+            let missed = (now - next) / ARB_TICK_NS + 1;
+            if !self.arb_blocked() {
+                self.arb_code = (self.arb_code + ((missed - 1) % u64::from(ARB_POSITIONS)) as u32) % ARB_POSITIONS;
+                self.arb_publish();
+            }
+            next += missed * ARB_TICK_NS;
+            self.arb_next = Some(next);
+        }
+        self.deadlines[T_ARB] = Some(next);
     }
 
     // ---- deferred destructive commands ---------------------------------
@@ -2007,7 +1999,7 @@ impl State {
 
     /// The controller's own start, which the machine's reset stands for (an
     /// AC cycle).
-    fn start(&mut self, clock_now: u64) {
+    fn start(&mut self) {
         self.reset_queues();
         self.cancel(T_PWR_DOWN);
         self.serial_command = false;
@@ -2066,11 +2058,11 @@ impl State {
         self.serial_puts("\r\n");
         // The rotation starts with code 0, and a later start leaves a running
         // rotation on its schedule.
-        if self.rings() && !self.pending(T_ARB) {
+        if self.rings() && self.arb_next.is_none() {
             if !self.arb_blocked() {
                 self.arb_publish();
             }
-            self.deadlines[T_ARB] = Some(clock_now + ARB_TICK_NS);
+            self.arb_next = Some(self.now() + ARB_TICK_NS);
         }
     }
 
@@ -2193,36 +2185,38 @@ impl State {
 
 pub struct Elsc {
     state: Mutex<State>,
-    clock: Clock,
     backend: Mutex<Arc<dyn SerialBackend>>,
-    /// Told, with no controller lock held, that [`Self::next_due`] may have
-    /// moved.
+    /// Called, with no controller lock held, when the controller has outputs or a committed
+    /// action for the machine.
     wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    timers: [Timer; TIMERS],
+    running: AtomicBool,
 }
 
 impl Elsc {
     /// A controller on the bus whose busy flag is `busy`, keeping its
     /// configuration in `nvram`. Call [`Resettable::power_on`] to start it.
-    pub fn new(cfg: ElscConfig, nvram: Arc<ElscNvram>, clock: Clock, busy: BusBusy) -> Self {
-        Self {
-            state: Mutex::new(State::new(cfg, nvram, busy)),
-            clock,
+    pub fn new(cfg: ElscConfig, nvram: Arc<ElscNvram>, tm: &Arc<TimerManager>, busy: BusBusy) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            state: Mutex::new(State::new(cfg, nvram, busy, tm.clock().clone())),
             backend: Mutex::new(null_serial_backend()),
             wake: OnceLock::new(),
-        }
+            timers: std::array::from_fn(|kind| Timer::new(tm, me, move |e: &Self, due| e.expire(kind, due))),
+            running: AtomicBool::new(false),
+        })
     }
 
-    /// Call `wake` after any access that may have moved [`Self::next_due`] or handed
-    /// the module an action. Once, before the machine runs.
+    /// Call `wake` on a timer thread once the controller has outputs or a committed action to hand
+    /// the machine. Once, before the machine runs.
     pub fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
         let _ = self.wake.set(wake);
     }
 
-    /// How long until the controller next has an output or committed action: zero if due now,
-    /// `None` if nothing is pending. A machine with no bus access to piggy-back on visits then.
-    pub fn next_due(&self) -> Option<Duration> {
-        let due = self.state.lock().due()?;
-        Some(Duration::from_nanos(due.saturating_sub((self.clock)())))
+    /// Hand the machine what is waiting, as [`Self::set_wake`] asked.
+    pub fn wake(&self) {
+        if let Some(wake) = self.wake.get() {
+            wake();
+        }
     }
 
     /// Attach the module that owns this controller's power, reset and bus
@@ -2248,17 +2242,14 @@ impl Elsc {
         *self.backend.lock() = backend;
     }
 
-    /// Run `f` with the timers brought up to the present, then send what it
-    /// wrote to the AUX port with the lock released.
+    /// Run `f`, arm the timers it moved, then send what it wrote to the AUX port and hand the
+    /// module its actions with the lock released.
     fn run<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let (value, out, actions, module, moved) = {
+        let (value, out, actions, module) = {
             let mut st = self.state.lock();
-            st.advance((self.clock)());
             let value = f(&mut st);
-            let due = st.due();
-            let moved = st.reported_due != Some(due);
-            st.reported_due = Some(due);
-            (value, std::mem::take(&mut st.out), std::mem::take(&mut st.outbox), st.module.clone(), moved)
+            self.arm(&mut st);
+            (value, std::mem::take(&mut st.out), std::mem::take(&mut st.outbox), st.module.clone())
         };
         let acted = !actions.is_empty();
         // What the module does reaches back into the controller, so it runs
@@ -2274,12 +2265,50 @@ impl Elsc {
                 backend.send_byte(byte);
             }
         }
-        if moved || acted {
-            if let Some(wake) = self.wake.get() {
-                wake();
-            }
+        if acted {
+            self.visit_soon();
         }
         value
+    }
+
+    /// Make each timer match its deadline, and ask for a visit if the machine is owed one.
+    fn arm(&self, st: &mut State) {
+        if self.wake.get().is_some() && (st.deferred_scheduled || !st.events.is_empty()) && !st.pending(T_VISIT) {
+            st.deadlines[T_VISIT] = Some(st.now() + VISIT_NS);
+        }
+        for (timer, due) in self.timers.iter().zip(st.deadlines) {
+            timer.set_due(due);
+        }
+    }
+
+    /// What the module just did may have left it outputs for the machine.
+    fn visit_soon(&self) {
+        let mut st = self.state.lock();
+        if self.wake.get().is_some() && !st.pending(T_VISIT) {
+            st.deadlines[T_VISIT] = Some(st.now() + VISIT_NS);
+        }
+        self.arm(&mut st);
+    }
+
+    /// The timer of `kind` armed for `due` has fired. A visit carries out a committed action and
+    /// hands the machine the outputs.
+    fn expire(&self, kind: usize, due: u64) {
+        let live = self.run(|st| {
+            if st.deadlines[kind] != Some(due) {
+                return false;
+            }
+            st.deadlines[kind] = None;
+            st.at = Some(due);
+            if kind != T_VISIT {
+                st.fire(kind, due);
+            }
+            st.at = None;
+            true
+        });
+        if live && kind == T_VISIT {
+            self.poll();
+            self.wake();
+        }
     }
 
     /// Let time pass and carry out what is due. The bus does this around every
@@ -2339,8 +2368,26 @@ impl Resettable for Elsc {
     /// The controller's own start, which the machine's reset stands for (an
     /// AC cycle): every timer and flag starts over.
     fn power_on(&self) {
-        let now = (self.clock)();
-        self.run(|st| st.start(now));
+        self.run(|st| st.start());
+    }
+}
+
+impl Device for Elsc {
+    fn step(&self, _: u64) {}
+    /// The machine's clock holds while it is stopped, so the timers go and come back with it.
+    fn start(&self) {
+        self.running.store(true, Ordering::Release);
+        self.timers.iter().for_each(Timer::start);
+    }
+    fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+        self.timers.iter().for_each(Timer::stop);
+    }
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+    fn get_clock(&self) -> u64 {
+        0
     }
 }
 
@@ -2423,6 +2470,7 @@ impl I2cTarget for Elsc {
                 st.run_committed_action();
             }
             st.serial_poll();
+            st.arb_poll();
             Service {
                 grant: st.pending_grant.take(),
                 release_bus: std::mem::take(&mut st.release_bus),
