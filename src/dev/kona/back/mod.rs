@@ -414,7 +414,7 @@ impl KonaBackend {
     }
 
     /// Wire the machine's status-bar inputs into the display.
-    pub fn set_status(&self, status: Arc<crate::disp::StatusSource>) {
+    pub fn set_status(&self, status: Arc<crate::status::MachineStatus>) {
         // The same window, whether the machine took `display()` before or after.
         self.display.set_status(status);
     }

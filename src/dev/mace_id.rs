@@ -76,7 +76,7 @@ struct State {
 
 pub struct MaceId {
     st: Mutex<State>,
-    /// The LEDs as the status bar shows them: `Rex3::HB_LED_RED` and
+    /// The LEDs as the status bar shows them: `crate::status::hb::LED_RED` and
     /// `HB_LED_GREEN`.
     pub heartbeat: Arc<AtomicU64>,
 }
@@ -179,7 +179,7 @@ impl MaceId {
     /// An LED lights when its bit is clear: writing zero enables both
     /// outputs, and the register resets with only the green one disabled.
     fn show_leds(&self, bits: u8) {
-        for (bit, led) in [(RED_LED, Rex3::HB_LED_RED), (GREEN_LED, Rex3::HB_LED_GREEN)] {
+        for (bit, led) in [(RED_LED, crate::status::hb::LED_RED), (GREEN_LED, crate::status::hb::LED_GREEN)] {
             if bits & bit == 0 {
                 self.heartbeat.fetch_or(led, Ordering::Relaxed);
             } else {

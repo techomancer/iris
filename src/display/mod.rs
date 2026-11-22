@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
 use crate::debug_overlay::DebugOverlay;
-use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, StatusSource, FB_STRIDE};
+use crate::disp::{Rex3Screen, FB_STRIDE};
+use crate::status::{MachineStatus, StatusBar};
 use crate::gfx_display::DisplayStop;
 
 mod marks;
@@ -269,7 +270,10 @@ pub struct HeadHandle {
     screen: Mutex<Rex3Screen>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
     stop: DisplayStop,
-    status: Mutex<Arc<StatusSource>>,
+    status: Mutex<Arc<MachineStatus>>,
+    /// The status bar under this head's picture, drawn here for every
+    /// renderer (see [`with_status_bar`](Self::with_status_bar)).
+    bar: Mutex<StatusBar>,
     /// The timing the board asked for, and a count of the requests.
     timing: Mutex<(VideoTiming, u64)>,
     /// Lines the board wants [`Head::line`] called at.
@@ -303,8 +307,30 @@ impl HeadHandle {
 
     /// Show another machine's status in the bar. The handle stays with the
     /// refresh thread it was made on.
-    pub fn set_status(&self, status: Arc<StatusSource>) {
+    pub fn set_status(&self, status: Arc<MachineStatus>) {
         *self.status.lock() = status;
+    }
+
+    /// The machine status this head's bar shows.
+    pub fn status(&self) -> Arc<MachineStatus> {
+        self.status.lock().clone()
+    }
+
+    /// Draw the status bar for a frame `width` pixels wide and hand it to
+    /// `f`. Once per presented frame: it clears the activity lights. The
+    /// refresh thread calls it for every board; a board that presents
+    /// from its own thread (Newport on the GPU) calls it there.
+    pub fn with_status_bar<R>(&self, gfifo_pending: usize, width: usize, f: impl FnOnce(&[u32]) -> R) -> R {
+        f(self.status_bar(gfifo_pending, width).pixels())
+    }
+
+    /// As [`with_status_bar`](Self::with_status_bar), returning the drawn
+    /// bar held (its [`StatusBar::pixels`]).
+    pub fn status_bar(&self, gfifo_pending: usize, width: usize) -> parking_lot::MutexGuard<'_, StatusBar> {
+        let status = self.status();
+        let mut bar = self.bar.lock();
+        bar.render(&status, gfifo_pending, width);
+        bar
     }
 
     /// The last frame. Screenshots and VNC read `rgba`.
@@ -487,9 +513,7 @@ struct Slot {
     in_blank: bool,
     /// When the blank in progress ends.
     blank_end_ns: u64,
-    status_bar: StatusBar,
     overlay: DebugOverlay,
-    sbtex: StatusBarTexture,
     size: (usize, usize),
     shown: bool,
     last_present_ns: u64,
@@ -556,7 +580,7 @@ impl Refresh {
     /// A handle for a new head. Nothing runs until the board is
     /// [attached](HeadHandle::attach) and [started](HeadHandle::start). The
     /// head leaves the schedule when the handle or the board is dropped.
-    pub fn head(&self, status: Arc<StatusSource>) -> Arc<HeadHandle> {
+    pub fn head(&self, status: Arc<MachineStatus>) -> Arc<HeadHandle> {
         let timing = VideoTiming::HZ60;
         let handle = Arc::new(HeadHandle {
             refresh: Arc::downgrade(&self.shared),
@@ -565,6 +589,7 @@ impl Refresh {
             renderer: Mutex::new(None),
             stop: DisplayStop::default(),
             status: Mutex::new(status),
+            bar: Mutex::new(StatusBar::new()),
             timing: Mutex::new((timing, 0)),
             lines: Mutex::new(Vec::new()),
             chain: Mutex::new(Chain::default()),
@@ -587,9 +612,7 @@ impl Refresh {
             field: 0,
             in_blank: false,
             blank_end_ns: 0,
-            status_bar: StatusBar::new(),
             overlay: DebugOverlay::new(),
-            sbtex: StatusBarTexture::new(),
             size: (0, 0),
             shown: false,
             last_present_ns: 0,
@@ -604,7 +627,7 @@ impl Refresh {
     }
 
     /// [`head`](Self::head) for a board that already exists.
-    pub fn add_head(&self, head: Weak<dyn Head>, status: Arc<StatusSource>) -> Arc<HeadHandle> {
+    pub fn add_head(&self, head: Weak<dyn Head>, status: Arc<MachineStatus>) -> Arc<HeadHandle> {
         let handle = self.head(status);
         handle.attach(head);
         handle
@@ -985,7 +1008,7 @@ impl Slot {
             return;
         }
         // Taken once per presented frame: it clears the activity lights.
-        let stats = h.status.lock().clone().snapshot(Instant::now(), head.gfifo_pending());
+        let bar = h.status_bar(head.gfifo_pending(), size.0);
         if fill && screen.prebuilt {
             for y in 0..size.1 {
                 let row = y * FB_STRIDE;
@@ -1024,12 +1047,12 @@ impl Slot {
             match composed {
                 #[cfg(feature = "wgpu")]
                 Composed::Gpu { frame, width, height } => r.present_gpu_frame(
-                    &frame, width, height, screen, &mut self.overlay, &mut self.status_bar, &mut self.sbtex, &stats,
+                    &frame, width, height, screen, &mut self.overlay, bar.pixels(),
                 ),
                 _ => {
                     let live = head.live_planes();
                     r.present(
-                        screen, &mut self.overlay, &mut self.status_bar, &mut self.sbtex, &stats,
+                        screen, &mut self.overlay, bar.pixels(),
                         renderer_reads_back, live.map(|l| l.0), live.map(|l| l.1),
                     );
                 }

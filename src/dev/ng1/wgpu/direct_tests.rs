@@ -1031,7 +1031,7 @@ fn direct_ng1_scanout_gpu_uses_the_board_binding_seam() {
         .spawn(|| {
             let gpu = required_gpu();
             let (mut rgb, mut aux) = seed_planes();
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.fb_rgb.get_mut().copy_from_slice(&rgb);
             rex.fb_aux.get_mut().copy_from_slice(&aux);
             rex.activate_resident_gpu(Arc::clone(&gpu)).expect("activate board");
@@ -1157,9 +1157,7 @@ impl crate::dev::ng1::rex3::Renderer for CompatibilityPresenter {
         &mut self,
         screen: &mut Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status: &mut crate::disp::StatusBar,
-        _sbtex: &mut crate::disp::StatusBarTexture,
-        _stats: &crate::disp::BarStats,
+        _bar: &[u32],
         need_readback: bool,
         live_rgb: Option<&[u32]>,
         live_aux: Option<&[u32]>,
@@ -1189,9 +1187,7 @@ impl crate::dev::ng1::rex3::Renderer for QueuePresenter {
         &mut self,
         _screen: &mut Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status: &mut crate::disp::StatusBar,
-        _sbtex: &mut crate::disp::StatusBarTexture,
-        _stats: &crate::disp::BarStats,
+        _bar: &[u32],
         _need_readback: bool,
         _rgb: Option<&[u32]>,
         _aux: Option<&[u32]>,
@@ -1212,9 +1208,7 @@ impl crate::dev::ng1::rex3::Renderer for QueuePresenter {
         height: u32,
         _screen: &mut Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status: &mut crate::disp::StatusBar,
-        _sbtex: &mut crate::disp::StatusBarTexture,
-        _stats: &crate::disp::BarStats,
+        _bar: &[u32],
     ) -> Result<(), String> {
         let gpu = self.gpu.as_ref().unwrap();
         let bytes = u64::from(width) * u64::from(height) * 4;
@@ -1277,7 +1271,7 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             let (seed_rgb, seed_aux) = seed_planes();
             let mut first_rgb = seed_rgb.clone();
             let mut first_aux = seed_aux.clone();
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
             rex.fb_aux.get_mut().copy_from_slice(&seed_aux);
             rex.fb_rgb.get_mut().isolate().unwrap();
@@ -1555,7 +1549,7 @@ fn run_common_presenter_window_test() {
     let (rgb, aux) = seed_planes();
     let mut expected_rgb = rgb.clone();
     let mut expected_aux = aux.clone();
-    let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+    let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
     rex.fb_rgb.get_mut().copy_from_slice(&rgb);
     rex.fb_aux.get_mut().copy_from_slice(&aux);
     rex.fb_rgb.get_mut().isolate().unwrap();
@@ -1687,7 +1681,7 @@ fn resident_frame_gpu_readback_compatibility_is_labeled() {
             let (rgb, aux) = seed_planes();
             let mut expected_rgb = rgb.clone();
             let mut expected_aux = aux.clone();
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.fb_rgb.get_mut().copy_from_slice(&rgb);
             rex.fb_aux.get_mut().copy_from_slice(&aux);
             rex.fb_rgb.get_mut().isolate().unwrap();
@@ -1730,14 +1724,13 @@ fn resident_frame_gpu_readback_compatibility_is_labeled() {
                 frames: Arc::clone(&cpu_frames),
                 resizes: Arc::new(Mutex::new(Vec::new())),
             };
-            let stats = board.0.status.snapshot(Instant::now(), 0);
+            let mut bar = crate::status::StatusBar::new();
+            let bar_width = cpu.screen.width;
             crate::dev::ng1::rex3::Renderer::present(
                 &mut cpu_presenter,
                 &mut cpu.screen,
                 &mut crate::debug_overlay::DebugOverlay::new(),
-                &mut crate::disp::StatusBar::new(),
-                &mut crate::disp::StatusBarTexture::new(),
-                &stats,
+                bar.render(&board.0.status, 0, bar_width),
                 false,
                 None,
                 None,
@@ -1888,7 +1881,7 @@ fn resident_frame_gpu_compatibility_capture_failures_and_coalescing() {
 
             let gpu = required_gpu();
             let (rgb, aux) = seed_planes();
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.fb_rgb.get_mut().copy_from_slice(&rgb);
             rex.fb_aux.get_mut().copy_from_slice(&aux);
             rex.fb_rgb.get_mut().isolate().unwrap();
@@ -2063,7 +2056,7 @@ fn resident_frame_gpu_headless_screenshot_png_matches_cpu() {
             let gpu = required_gpu();
             let (rgb, aux) = seed_planes();
             for mode in [ResidentDisplayMode::DirectWgpu, ResidentDisplayMode::ReadbackCompatibility] {
-                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 rex.fb_rgb.get_mut().copy_from_slice(&rgb);
                 rex.fb_aux.get_mut().copy_from_slice(&aux);
                 rex.fb_rgb.get_mut().isolate().unwrap();
@@ -2159,7 +2152,7 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
                 ResidentDisplayMode::DirectWgpu,
                 ResidentDisplayMode::ReadbackCompatibility,
             ] {
-                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 rex.fb_rgb.get_mut().copy_from_slice(&rgb);
                 rex.fb_aux.get_mut().copy_from_slice(&aux);
                 rex.fb_rgb.get_mut().isolate().unwrap();
@@ -2400,7 +2393,7 @@ fn resident_frame_gpu_restore_invalidates_capture_and_rebinds_display() {
             for mode in [ResidentDisplayMode::DirectWgpu, ResidentDisplayMode::ReadbackCompatibility] {
                 let mut expected_rgb = rgb.clone();
                 let mut expected_aux = aux.clone();
-                let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 rex.fb_rgb.get_mut().copy_from_slice(&rgb);
                 rex.fb_aux.get_mut().copy_from_slice(&aux);
                 rex.fb_rgb.get_mut().isolate().unwrap();

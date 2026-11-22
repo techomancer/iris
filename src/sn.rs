@@ -735,7 +735,7 @@ pub struct BoardIo {
     /// The graphics board's window, when the product has one.
     pub display: Option<Arc<dyn GfxDisplay>>,
     /// What the graphics board's status bar shows.
-    pub status: Option<Arc<crate::disp::StatusSource>>,
+    pub status: Option<Arc<crate::status::MachineStatus>>,
     /// IP35 only: brings the board's clocked devices up to date, every batch.
     pub poll: Option<Arc<dyn Fn() + Send + Sync>>,
     /// IP35 only: per-processor batch hook on a node of several, beside the poll.
@@ -798,6 +798,9 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
+        if let Some(status) = &io.status {
+            monitor.register_device(status.clone());
+        }
         monitor.register_device(PerfMonitor::with_cpus(first.running_flag(), cpus.iter().map(|c| c.cycles_ptr()).collect(), first.fasttick_count()));
         for node_memory in memory {
             monitor.register_device(node_memory);

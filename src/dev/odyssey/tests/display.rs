@@ -773,7 +773,7 @@ fn the_host_reads_the_cursor_glyph_and_position_from_the_registers() {
     use crate::gfx_display::GfxDisplay;
 
     let (mut s, _) = board("v12");
-    let display = Display::new(crate::disp::StatusSource::detached());
+    let display = Display::new(crate::status::MachineStatus::detached());
     display.attach_registers(s.display.clone());
     assert_eq!(display.hw_cursor(), None, "out of reset the cursor is off");
 

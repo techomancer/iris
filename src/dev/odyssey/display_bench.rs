@@ -237,7 +237,7 @@ fn compose_and_present_timings() {
         println!("compose {name:10}: {ms:.3} ms per whole frame (snapshot included, best run), pixel by pixel {old:.3} ms");
     }
     let locks = BoardLocks::new(scene_board(Scene::Mixed));
-    let display = Display::new(crate::disp::StatusSource::detached());
+    let display = Display::new(crate::status::MachineStatus::detached());
     let ms = bench(|| { Odyssey::frame(&locks, &display); });
     println!("frame: composed and presented in {ms:.3} ms");
 }

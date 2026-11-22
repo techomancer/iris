@@ -19,7 +19,7 @@ fn board() -> Arc<Odyssey> {
         "v12",
         heart,
         ram.dma_view(),
-        crate::disp::StatusSource::detached(),
+        crate::status::MachineStatus::detached(),
         (2, 32),
         (crate::config::RasterUnit::Cpu, "auto"),
     )

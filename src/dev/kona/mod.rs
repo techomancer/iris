@@ -302,7 +302,7 @@ impl Kona {
     /// flash is held in that file, which must be exactly `FLASH_SIZE` bytes:
     /// every byte the pipe programs is written through, so the contents outlast
     /// the process as they outlast power-off on a pipe.
-    pub fn new(cfg: KonaConfig, irq: Arc<dyn InterruptController>, mem: Arc<dyn BusDevice>, status: Arc<crate::disp::StatusSource>, flash: Option<File>) -> Result<Arc<Kona>, String> {
+    pub fn new(cfg: KonaConfig, irq: Arc<dyn InterruptController>, mem: Arc<dyn BusDevice>, status: Arc<crate::status::MachineStatus>, flash: Option<File>) -> Result<Arc<Kona>, String> {
         let flash = match flash {
             Some(f) => flash::Flash::backed(f)?,
             None => flash::Flash::fresh(),

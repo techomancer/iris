@@ -283,7 +283,7 @@ mod tests {
             product,
             heart,
             ram.dma_view(),
-            crate::disp::StatusSource::detached(),
+            crate::status::MachineStatus::detached(),
             (2, 32),
             (crate::config::RasterUnit::Cpu, "auto"),
         )
@@ -517,7 +517,7 @@ mod tests {
             "v6",
             heart,
             ram.dma_view(),
-            crate::disp::StatusSource::detached(),
+            crate::status::MachineStatus::detached(),
             (2, 32),
             (crate::config::RasterUnit::Wgpu, "auto"),
         ) {

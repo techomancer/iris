@@ -314,7 +314,7 @@ pub(super) mod tests {
 
     /// As `live_board_raster`, set up as the Octane's board where `octane`.
     pub fn live_board_with(kind: GraphicsBoard, raster: crate::config::RasterUnit, octane: bool) -> Arc<Mgras> {
-        let m = Mgras::with_raster(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached(), raster, "auto")
+        let m = Mgras::with_raster(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::status::MachineStatus::detached(), raster, "auto")
             .unwrap_or_else(|e| panic!("{e}"));
         if octane {
             crate::dev::mgras::hq4::octane_board(&m, kind);

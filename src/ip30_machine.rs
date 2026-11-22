@@ -459,7 +459,7 @@ impl OctaneMachine {
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
-        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+        let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
         let gfx = board
             .map(|b| ImpactXio::with_raster(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone(), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str())))
             .transpose()?;
@@ -635,6 +635,7 @@ impl OctaneMachine {
 
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
+        monitor.register_device(status.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         monitor.register_device(heart.clone());
         // `pci`: the Bridge's bus, as the O2's MACE shows its own.

@@ -234,7 +234,7 @@ pub struct Gr2 {
     /// by the machine's refresh thread (`crate::display`).
     head: Arc<crate::display::HeadHandle>,
     retrace_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
-    status: Arc<crate::disp::StatusSource>,
+    status: Arc<crate::status::MachineStatus>,
     /// Annotated FIFO capture (`gr2 trace`); `trace_mask` gates the hot path.
     trace: Mutex<debug::Gr2Trace>,
     trace_mask: AtomicU32,
@@ -324,7 +324,7 @@ impl Gr2 {
     /// Build a GR2 in place on the heap. The multi-megabyte register/VRAM
     /// state is zero-initialised without ever touching the stack; only the
     /// runtime fields that are not all-zero-valid are written explicitly.
-    pub fn new(variant: Gr2Variant, status: Arc<crate::disp::StatusSource>) -> Arc<Self> {
+    pub fn new(variant: Gr2Variant, status: Arc<crate::status::MachineStatus>) -> Arc<Self> {
         let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
         let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
         // SAFETY: `p` points at zeroed, exclusively owned memory. Every field

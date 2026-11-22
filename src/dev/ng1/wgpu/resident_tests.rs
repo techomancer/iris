@@ -821,7 +821,7 @@ fn resident_gpu_failed_observation_is_counted_and_latched() {
 
         drop(raster);
         drop(resident);
-        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut board = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         board.0.fb_rgb.get_mut().copy_from_slice(&rgb);
         board.0.fb_aux.get_mut().copy_from_slice(&aux);
         board.0.fb_rgb.get_mut().isolate().unwrap();
@@ -2318,9 +2318,9 @@ fn resident_gpu_continuation_and_noop_match_complete_cpu_planes() {
         let outer_rgb = seeded_plane(0x14b8_6c2f);
         let outer_aux = seeded_plane(0xeb47_93d0);
         let mut resident_board =
-            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+            TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         let mut cpu_board =
-            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+            TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         for board in [&mut resident_board, &mut cpu_board] {
             board.0.fb_rgb.get_mut().copy_from_slice(&outer_rgb);
             board.0.fb_aux.get_mut().copy_from_slice(&outer_aux);
@@ -3393,8 +3393,8 @@ fn resident_gpu_host_fills_match_complete_cpu_planes() {
         let board_rgb = seeded_plane(0x3e91_7ac4);
         let board_aux = seeded_plane(0xc16e_853b);
         let mut resident_board =
-            TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
-        let mut cpu_board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+            TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
+        let mut cpu_board = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         for board in [&mut resident_board, &mut cpu_board] {
             board.0.fb_rgb.get_mut().copy_from_slice(&board_rgb);
             board.0.fb_aux.get_mut().copy_from_slice(&board_aux);
@@ -3828,7 +3828,7 @@ impl ResidentBackend for ProducerTelemetryBackend {
 #[test]
 fn resident_board_gfifo_full_and_bus_busy_are_counted_at_producer() {
     on_large_stack(|| {
-        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut board = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         board.0.attach_resident_raster(ProducerTelemetryBackend { entered: entered_tx, resume: resume_rx }).unwrap();
@@ -3993,7 +3993,7 @@ fn resident_gpu_continuous_gfifo_flushes_on_age_without_idle_or_fence() {
         let gpu = required_gpu();
         let rgb = seeded_plane(0x3718_529a);
         let aux = seeded_plane(0x6482_7c10);
-        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut board = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         board.0.fb_rgb.get_mut().copy_from_slice(&rgb);
         board.0.fb_aux.get_mut().copy_from_slice(&aux);
         let backend = Arc::new(Mutex::new(ResidentGpu::activate(Arc::clone(&gpu), &rgb, &aux).unwrap()));
@@ -4044,8 +4044,8 @@ fn resident_gpu_independent_mixed_workload_gate() {
         let gpu = required_gpu();
         let rgb = seeded_plane(0x5638_4129);
         let aux = seeded_plane(0x8921_76bc);
-        let mut resident = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
-        let mut cpu = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut resident = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
+        let mut cpu = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         for board in [&mut resident, &mut cpu] {
             board.0.fb_rgb.get_mut().copy_from_slice(&rgb);
             board.0.fb_aux.get_mut().copy_from_slice(&aux);
@@ -4277,7 +4277,7 @@ fn resident_replay_aggregate_file() {
             records.truncate(limit);
         }
         let gpu = required_gpu();
-        let mut board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut board = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         if let Some(state) = rec::tests::start_state(&records) {
             board.0.rec_state_decode(state).unwrap_or_else(|_| panic!("cannot decode local recording state"));
         }
@@ -4324,7 +4324,7 @@ fn resident_gpu_snapshot_restore_reset_round_trip_without_cpu_shadows() {
         let seed_aux = seeded_plane(0xabcd_9876);
         let mut expected_rgb = seed_rgb.clone();
         let mut expected_aux = seed_aux.clone();
-        let mut rex = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut rex = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         rex.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
         rex.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
         rex.0.fb_rgb.get_mut().isolate().unwrap();
@@ -4422,8 +4422,8 @@ fn resident_gpu_hostw_continues_across_snapshot_restore() {
         let gpu = required_gpu();
         let seed_rgb = seeded_plane(0x1357_2468);
         let seed_aux = seeded_plane(0x8642_7531);
-        let mut resident = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
-        let mut cpu = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut resident = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
+        let mut cpu = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         for board in [&mut resident, &mut cpu] {
             board.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
             board.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
@@ -4507,7 +4507,7 @@ fn resident_gpu_gfifo_draws_match_complete_cpu_planes() {
         let gpu = required_gpu();
         let seed_rgb = seeded_plane(0x3487_5612);
         let seed_aux = seeded_plane(0xabcd_9876);
-        let mut rex = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut rex = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         rex.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
         rex.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
         let resident = Arc::new(Mutex::new(ResidentGpu::activate_with_limits(
@@ -4594,8 +4594,8 @@ fn resident_gpu_gfifo_full_context_matches_cpu_across_boundaries_and_retries() {
         let gpu = required_gpu();
         let seed_rgb = seeded_plane(0x1357_9bdf);
         let seed_aux = seeded_plane(0x2468_ace0);
-        let mut resident_board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
-        let mut cpu_board = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut resident_board = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
+        let mut cpu_board = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         for board in [&mut resident_board, &mut cpu_board] {
             board.0.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
             board.0.fb_aux.get_mut().copy_from_slice(&seed_aux);
@@ -4691,7 +4691,7 @@ fn resident_gpu_gfifo_full_context_matches_cpu_across_boundaries_and_retries() {
 fn resident_gpu_gfifo_activation_reset_and_fault() {
     on_large_stack(|| {
         let gpu = required_gpu();
-        let mut rex = TestRex(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+        let mut rex = TestRex(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
         let before_rgb = unsafe { (*rex.0.fb_rgb.get())[20 * STRIDE as usize + 10] };
         let before_aux = unsafe { (*rex.0.fb_aux.get())[20 * STRIDE as usize + 10] };
         rex.0.activate_resident_gpu(Arc::clone(&gpu)).expect("activate through board gate");

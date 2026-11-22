@@ -725,7 +725,7 @@ fn display_rig() -> (BoardLocks, LibState, Arc<Display>) {
     s.set_scanout_size(ODSY_WIDTH, ODSY_HEIGHT);
     let h = BoardLocks::new(s);
     h.raster.start();
-    let display = Arc::new(Display::new(crate::disp::StatusSource::detached()));
+    let display = Arc::new(Display::new(crate::status::MachineStatus::detached()));
     (h, st, display)
 }
 
@@ -983,7 +983,7 @@ fn a_frame_waits_for_no_slice_and_takes_no_lock() {
         return;
     }
     let (h, st) = slow_raster(0);
-    let display = Arc::new(Display::new(crate::disp::StatusSource::detached()));
+    let display = Arc::new(Display::new(crate::status::MachineStatus::detached()));
     let hold = Arc::new(AtomicBool::new(true));
     let held = hold.clone();
     h.raster.submit(move |_| {

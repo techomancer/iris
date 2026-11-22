@@ -70,8 +70,8 @@ impl Recorder {
 }
 
 /// The machine's status-bar inputs, idle.
-pub(super) fn test_status() -> Arc<crate::disp::StatusSource> {
-    crate::disp::StatusSource::new(Arc::default(), Arc::default())
+pub(super) fn test_status() -> Arc<crate::status::MachineStatus> {
+    crate::status::MachineStatus::new(Arc::default(), Arc::default())
 }
 
 pub(super) struct Fixture {

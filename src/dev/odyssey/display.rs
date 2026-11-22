@@ -26,7 +26,7 @@ pub(super) struct Display {
     /// update in progress. Held for each frame.
     pub reader: Mutex<ScanoutReader>,
     /// The machine's status-bar inputs.
-    status: Arc<crate::disp::StatusSource>,
+    status: Arc<crate::status::MachineStatus>,
     /// The registers the display reads, for the host's cursor query; set
     /// when the board hands the display out.
     shared: OnceLock<Arc<DisplayShared>>,
@@ -34,7 +34,7 @@ pub(super) struct Display {
 }
 
 impl Display {
-    pub(super) fn new(status: Arc<crate::disp::StatusSource>) -> Self {
+    pub(super) fn new(status: Arc<crate::status::MachineStatus>) -> Self {
         Self {
             head: status.refresh().head(status.clone()),
             reader: Mutex::new(ScanoutReader::default()),

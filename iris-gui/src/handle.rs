@@ -181,7 +181,7 @@ impl RateMeter {
 /// rate: every CPU takes its own clock interrupt at the kernel's rate, so
 /// adding them would show twice the Hz on two CPUs.
 fn window_rates(prev: &[(u64, u64)], cur: &[(u64, u64)], dt: f64) -> (f32, f32) {
-    let retired: u64 = prev.iter().zip(cur).map(|(p, c)| iris::disp::cycles_moved(p.0, c.0)).sum();
+    let retired: u64 = prev.iter().zip(cur).map(|(p, c)| iris::status::cycles_moved(p.0, c.0)).sum();
     let mips = (retired as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
     let hz = match (prev.first(), cur.first()) {
         (Some(p), Some(c)) => (c.1.wrapping_sub(p.1) as f64 / dt).round() as f32,

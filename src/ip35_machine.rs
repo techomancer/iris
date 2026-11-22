@@ -373,7 +373,7 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
     let bedrock = &nodes[node].chip;
     let bridge = if on_ibrick { xbridge.clone() } else { xbridge_on(bedrock) };
     let brick = if on_ibrick { "the I-brick".to_string() } else { format!("the graphics brick of C-brick {node}") };
-    let status = crate::disp::StatusSource::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let status = crate::status::MachineStatus::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     // What a link reset of the board's port does, what a machine reset does, and the board's
     // entries in the machine's lists.
     type Hook = Arc<dyn Fn() + Send + Sync>;
@@ -452,7 +452,7 @@ fn attach_ir3(
     xbridge: &Arc<XBridge>,
     cfg: &MachineConfig,
     kona: KonaConfig,
-    status: &Arc<crate::disp::StatusSource>,
+    status: &Arc<crate::status::MachineStatus>,
     widget: u8,
 ) -> Result<Arc<Kona>, String> {
     let kona = kona.with_host_widget(HOST_WIDGET)?.with_widget(widget)?.with_pool(cfg.graphics.threads, cfg.graphics.tile);

@@ -798,6 +798,7 @@ pub fn start_gdb_server(port: u16, cpu: Arc<dyn CpuDebug>) {
                 "GDB stub: listening on {} (GDB: target remote {})",
                 addr, addr
             );
+            let _port = crate::ports::register("tcp", &addr, "GDB stub");
 
             for stream in listener.incoming() {
                 match stream {

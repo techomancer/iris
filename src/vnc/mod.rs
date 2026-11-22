@@ -68,6 +68,8 @@ pub(crate) struct Shared {
 pub struct VncServer {
     shared: Arc<Shared>,
     addr: SocketAddr,
+    /// The listener's entry in `ports`.
+    _port: crate::ports::PortGuard,
 }
 
 impl VncServer {
@@ -139,7 +141,7 @@ impl VncServer {
             }).unwrap();
         }
         eprintln!("iris: VNC server on {addr}");
-        Ok(VncServer { shared, addr })
+        Ok(VncServer { shared, addr, _port: crate::ports::register("tcp", addr, "VNC") })
     }
 
     pub fn addr(&self) -> SocketAddr {

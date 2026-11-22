@@ -113,7 +113,7 @@ fn fixture() -> (
     plane::PlaneProtection,
     plane::PlaneProtection,
 ) {
-    let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+    let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
     rex.fb_rgb.get_mut().isolate().unwrap();
     rex.fb_aux.get_mut().isolate().unwrap();
     let state = probe_state();

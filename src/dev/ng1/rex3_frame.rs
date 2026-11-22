@@ -18,7 +18,7 @@ use crate::dev::ng1::wgpu::resident::{
 };
 use crate::dev::ng1::wgpu::telemetry::{duration_ns, FlushReason};
 use crate::dev::ng1::wgpu::Ng1Scanout;
-use crate::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture, FB_STRIDE};
+use crate::disp::{Rex3Screen, FB_STRIDE};
 use crate::debug_overlay::DebugOverlay;
 use crate::wgpu::Gpu;
 
@@ -448,8 +448,6 @@ fn observed_words(observation: &Observation, rgb: bool) -> Result<Vec<u32>, Resi
 /// planes, then hand the CPU snapshots to the ordinary renderer.
 struct ResidentCompatibilityDisplay {
     overlay: DebugOverlay,
-    status: StatusBar,
-    sbtex: StatusBarTexture,
     compositor: Option<SwCompositor>,
     capture: CaptureCount,
     #[cfg(test)]
@@ -465,8 +463,6 @@ impl ResidentCompatibilityDisplay {
         }
         Ok(Self {
             overlay: DebugOverlay::new(),
-            status: StatusBar::new(),
-            sbtex: StatusBarTexture::new(),
             compositor: None,
             capture: CaptureCount::default(),
             #[cfg(test)]
@@ -517,12 +513,12 @@ impl ResidentCompatibilityDisplay {
         self.overlay.show_cmap = rex.show_cmap.load(Ordering::Relaxed);
         self.overlay.show_disp_debug = rex.show_disp_debug.load(Ordering::Relaxed);
         self.overlay.show_draw_debug = rex.draw_debug_active();
-        let stats: BarStats = rex.status.snapshot(Instant::now(), rex.gfifo.len());
-
         let mut renderer = rex.head.renderer_slot().lock();
         if let Some(renderer) = renderer.as_deref() {
             validate_compatibility_presenter(renderer)?;
         }
+        // Screen, renderer, bar: the refresh thread's lock order.
+        let bar = rex.head.status_bar(rex.gfifo.len(), screen.width);
         let mut mode = rex.raster.lock();
         let RasterMode::Resident(raster) = &mut *mode else {
             return Err(ResidentError::InvalidState("resident raster is not active"));
@@ -575,9 +571,7 @@ impl ResidentCompatibilityDisplay {
             renderer.present(
                 &mut screen,
                 &mut self.overlay,
-                &mut self.status,
-                &mut self.sbtex,
-                &stats,
+                bar.pixels(),
                 false,
                 None,
                 None,
@@ -619,8 +613,6 @@ impl ResidentCompatibilityDisplay {
 struct ResidentDirectDisplay {
     scanout: Ng1ResidentScanout,
     overlay: DebugOverlay,
-    status: StatusBar,
-    sbtex: StatusBarTexture,
     capture: Vec<u32>,
     save_screenshots: bool,
     resize_pending: bool,
@@ -635,8 +627,6 @@ impl ResidentDirectDisplay {
         Ok(Self {
             scanout,
             overlay: DebugOverlay::new(),
-            status: StatusBar::new(),
-            sbtex: StatusBarTexture::new(),
             capture: Vec::new(),
             save_screenshots: true,
             resize_pending: true,
@@ -698,7 +688,7 @@ impl ResidentDirectDisplay {
             self.resize_pending = true;
         }
 
-        let stats: BarStats = rex.status.snapshot(Instant::now(), rex.gfifo.len());
+        let bar = rex.head.status_bar(rex.gfifo.len(), screen.width);
 
         // The cut keeps the consumer from accepting later draws; the raster
         // lock also excludes every other submitter until both consumers have
@@ -722,8 +712,7 @@ impl ResidentDirectDisplay {
         if let Some(renderer) = renderer.as_deref_mut() {
             validate_presenter(renderer, &gpu)?;
             renderer.present_resident_gpu_frame(
-                &buffer, stamp.width, stamp.height, &mut screen, &mut self.overlay,
-                &mut self.status, &mut self.sbtex, &stats,
+                &buffer, stamp.width, stamp.height, &mut screen, &mut self.overlay, bar.pixels(),
             ).map_err(ResidentError::Failed)?;
         }
         if capture {
@@ -940,7 +929,7 @@ mod tests {
     #[test]
     fn resident_frame_timeouts_never_publish_fences_or_stale_pixels() {
         std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.attach_resident_raster(Probe).unwrap();
             rex.running.store(true, Ordering::Release);
             rex.xmap_fence.store(9, Ordering::Release);
@@ -1011,7 +1000,7 @@ mod tests {
         const CHILD: &str = "IRIS_RESIDENT_FULL_FIFO_LOSS_CHILD";
         if std::env::var_os(CHILD).is_some() {
             std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
-                let mut board = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let mut board = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
                 board.fb_rgb.get_mut().isolate().unwrap();
                 board.fb_aux.get_mut().isolate().unwrap();
                 board.fb_rgb.get_mut().reset_access_counts();

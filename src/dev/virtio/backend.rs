@@ -158,7 +158,9 @@ pub fn tcp_port(port: u16) -> io::Result<(Arc<dyn PortBackend>, u16)> {
     let l = TcpListener::bind(("127.0.0.1", port))?;
     l.set_nonblocking(true)?;
     let bound = l.local_addr()?.port();
+    let port = crate::ports::register("tcp", format!("127.0.0.1:{bound}"), "virtio console");
     let accept: Accept = Box::new(move || {
+        let _port = &port;
         let (s, _) = l.accept()?;
         s.set_nonblocking(true)?;
         let _ = s.set_nodelay(true);
@@ -184,7 +186,9 @@ pub fn unix_port(path: &str) -> io::Result<Arc<dyn PortBackend>> {
     }
     let l = UnixListener::bind(path)?;
     l.set_nonblocking(true)?;
+    let port = crate::ports::register("unix", path, "virtio console");
     let accept: Accept = Box::new(move || {
+        let _port = &port;
         let (s, _) = l.accept()?;
         s.set_nonblocking(true)?;
         Ok(Box::new(s) as Box<dyn Conn>)

@@ -740,7 +740,7 @@ impl ImpactXio {
         widget: u8,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        status: Arc<crate::disp::StatusSource>,
+        status: Arc<crate::status::MachineStatus>,
     ) -> Arc<Self> {
         Self::with_board(widget, GraphicsBoard::SolidImpact, irq, mem, status)
     }
@@ -755,7 +755,7 @@ impl ImpactXio {
         kind: GraphicsBoard,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        status: Arc<crate::disp::StatusSource>,
+        status: Arc<crate::status::MachineStatus>,
     ) -> Arc<Self> {
         Self::with_raster(widget, kind, irq, mem, status, (crate::config::RasterUnit::Cpu, "auto")).expect("the CPU raster engines")
     }
@@ -767,7 +767,7 @@ impl ImpactXio {
         kind: GraphicsBoard,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        status: Arc<crate::disp::StatusSource>,
+        status: Arc<crate::status::MachineStatus>,
         raster: (crate::config::RasterUnit, &str),
     ) -> Result<Arc<Self>, String> {
         let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
@@ -1582,7 +1582,7 @@ mod tests {
     fn rig() -> Rig {
         let heart = Arc::new(Heart::default());
         let ram = Arc::new(Ram(Mutex::new(vec![0; 1 << 20])));
-        let b = ImpactXio::new(11, heart.clone(), ram.clone(), crate::disp::StatusSource::detached());
+        let b = ImpactXio::new(11, heart.clone(), ram.clone(), crate::status::MachineStatus::detached());
         b.mgras().start_engines();
         Rig { b, heart, ram }
     }
@@ -2172,7 +2172,7 @@ mod tests {
         // No engine thread, so nothing drains the command FIFO.
         let heart = Arc::new(Heart::default());
         let ram = Arc::new(Ram(Mutex::new(vec![0; 1 << 20])));
-        let r = Rig { b: ImpactXio::new(11, heart.clone(), ram.clone(), crate::disp::StatusSource::detached()), heart, ram };
+        let r = Rig { b: ImpactXio::new(11, heart.clone(), ram.clone(), crate::status::MachineStatus::detached()), heart, ram };
         let mut accepted = 0u32;
         let st = loop {
             let st = r.b.write(SH + hq4::RE_STATUS as u64, 32, 0);

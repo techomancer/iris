@@ -29,9 +29,7 @@ impl Renderer for MainBoundRenderer {
         &mut self,
         _screen: &mut crate::disp::Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status: &mut crate::disp::StatusBar,
-        _sbtex: &mut crate::disp::StatusBarTexture,
-        _stats: &crate::disp::BarStats,
+        _bar: &[u32],
         _need_readback: bool,
         _live_fb_rgb: Option<&[u32]>,
         _live_fb_aux: Option<&[u32]>,
@@ -50,7 +48,7 @@ impl Renderer for MainBoundRenderer {
 fn board() -> Arc<Odyssey> {
     let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), host_clock()));
     let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
-    Odyssey::new(11, "v12", heart, ram.dma_view(), crate::disp::StatusSource::detached(), (2, 32), (crate::config::RasterUnit::Cpu, "auto")).expect("board")
+    Odyssey::new(11, "v12", heart, ram.dma_view(), crate::status::MachineStatus::detached(), (2, 32), (crate::config::RasterUnit::Cpu, "auto")).expect("board")
 }
 
 /// Queue the self-test preamble twice behind the board's thread.

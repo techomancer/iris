@@ -520,7 +520,7 @@ impl Mec {
         if frames.is_empty() {
             return;
         }
-        self.blink(crate::dev::ng1::rex3::Rex3::HB_ENET_TX);
+        self.blink(crate::status::hb::ENET_TX);
         if let Some(link) = self.link.lock().unwrap().as_mut() {
             for f in frames {
                 Self::trace("tx", &f);
@@ -629,7 +629,7 @@ impl Mec {
             self.ram_write(u64::from(buf), &stat.to_be_bytes());
             s.int_status |= bits::INT_RX_THRESHOLD;
             s.rx_frames += 1;
-            self.blink(crate::dev::ng1::rex3::Rex3::HB_ENET_RX);
+            self.blink(crate::status::hb::ENET_RX);
         }
     }
 }

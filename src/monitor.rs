@@ -55,7 +55,7 @@ impl Monitor {
     pub fn command_names(&self) -> Vec<String> {
         let devs = self.devices.lock();
         let own = devs.iter().flat_map(|d| d.register_commands()).map(|(name, _)| name);
-        own.chain(["help", "quit", "exit"].map(String::from)).collect()
+        own.chain(["help", "quit", "exit", "watch", "ports"].map(String::from)).collect()
     }
 
     pub fn register_device(&self, device: Arc<dyn Device>) {
@@ -101,7 +101,9 @@ impl Monitor {
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
+        let port = bound.map(|a| crate::ports::register("tcp", a, "monitor"));
         thread::spawn(move || {
+            let _port = port;
             // The address as bound: with port 0 the OS chose the port, and
             // this line is how a caller finds it.
             println!("Monitor listening on {}", bound.map_or(addr, |a| a.to_string()));
@@ -199,10 +201,26 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         if cmd == "quit" || cmd == "exit" {
             break;
         }
+
+        if cmd == "watch" {
+            match watch(&mut reader, &stream, &mut writer, &devices, args) {
+                Ok(()) => {}
+                Err(WatchEnd::HungUp) => break,
+                Err(WatchEnd::Usage(e)) => { let _ = write!(writer, "Error: {e}\n"); }
+            }
+            let _ = write!(writer, "> ");
+            let _ = writer.flush();
+            continue;
+        }
         
         let mut target_device: Option<Arc<dyn Device>> = None;
         let mut is_help = false;
         let audio = cmd == "audio" && (args.is_empty() || args == ["status"]);
+        if cmd == "ports" {
+            let _ = write!(writer, "{}> ", crate::ports::report());
+            let _ = writer.flush();
+            continue;
+        }
         
         if cmd == "help" {
             is_help = true;
@@ -212,6 +230,8 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             let devs = devices.lock();
             if is_help {
                 let cmds: Vec<_> = devs.iter().flat_map(|d| d.register_commands()).collect();
+                let _ = writeln!(writer, "{:12} - {}", "watch", WATCH_HELP);
+                let _ = writeln!(writer, "{:12} - {}", "ports", "ports: the host sockets iris listens on (monitor, telnet and other port forwards, VNC, GDB, CI, serial and virtio sockets)");
                 if !cmds.iter().any(|(c, _)| c == "audio") {
                     let _ = writeln!(writer, "{:12} - {}", "audio", "audio status: each sound card's frames moved and skipped, and its host stream");
                 }
@@ -257,6 +277,85 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     // writer a command was given, whose handle keeps the connection open,
     // and the console client waits for it to close before it exits.
     let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+const WATCH_HELP: &str = "watch [-n SECONDS] <command> [args]: run a command again every second (or SECONDS), its answer redrawn on one line, until Enter";
+
+enum WatchEnd {
+    /// The client went away.
+    HungUp,
+    Usage(String),
+}
+
+/// A writer into a shared buffer: a command's answer, for `watch`.
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+/// `watch`: run a command over and over, redrawing its answer on one line,
+/// until the client sends a line (Enter).
+fn watch<R: BufRead>(
+    reader: &mut R,
+    stream: &TcpStream,
+    writer: &mut impl Write,
+    devices: &Mutex<Vec<Arc<dyn Device>>>,
+    args: &[&str],
+) -> Result<(), WatchEnd> {
+    let (every, args) = match args {
+        ["-n", secs, rest @ ..] => {
+            let s: f64 = secs.parse().map_err(|_| WatchEnd::Usage(format!("watch: bad interval {secs}")))?;
+            (std::time::Duration::from_secs_f64(s.clamp(0.1, 3600.0)), rest)
+        }
+        _ => (std::time::Duration::from_secs(1), args),
+    };
+    let Some((&cmd, rest)) = args.split_first() else {
+        return Err(WatchEnd::Usage(WATCH_HELP.into()));
+    };
+    if cmd == "watch" || cmd == "quit" || cmd == "exit" {
+        return Err(WatchEnd::Usage(format!("watch: cannot watch {cmd}")));
+    }
+    let dev = devices.lock().iter()
+        .find(|d| d.register_commands().iter().any(|(c, _)| c == cmd))
+        .cloned()
+        .ok_or_else(|| WatchEnd::Usage(format!("watch: unknown command {cmd}")))?;
+    let _ = write!(writer, "(Enter stops)\n");
+    let result = loop {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let text = match dev.execute_command(cmd, rest, Box::new(Capture(out.clone()))) {
+            Ok(()) => {
+                let raw = String::from_utf8_lossy(&out.lock()).into_owned();
+                raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("  ")
+            }
+            Err(e) => format!("Error: {e}"),
+        };
+        // Back to the start of the line, then erase what the last answer
+        // left beyond this one.
+        let _ = write!(writer, "\r{text}\x1b[K");
+        if writer.flush().is_err() {
+            break Err(WatchEnd::HungUp);
+        }
+        let _ = stream.set_read_timeout(Some(every));
+        match reader.fill_buf() {
+            Ok([]) => break Err(WatchEnd::HungUp),
+            Ok(buf) => {
+                // Eat the line that stopped us.
+                let n = buf.iter().position(|&b| b == b'\n').map_or(buf.len(), |i| i + 1);
+                reader.consume(n);
+                break Ok(());
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => break Err(WatchEnd::HungUp),
+        }
+    };
+    let _ = stream.set_read_timeout(None);
+    let _ = write!(writer, "\n");
+    result
 }
 
 #[cfg(test)]
@@ -432,5 +531,53 @@ mod tests {
         monitor.clone().start_server("127.0.0.1:0".to_string());
         let addr = wait_for("bind", || monitor.bound_addr());
         wait_for("port release", || TcpListener::bind(addr).ok());
+    }
+
+    /// Counts its runs: what `watch` repeats.
+    struct Counter(std::sync::atomic::AtomicU32);
+
+    impl Device for Counter {
+        fn step(&self, _cycles: u64) {}
+        fn stop(&self) {}
+        fn start(&self) {}
+        fn is_running(&self) -> bool { false }
+        fn get_clock(&self) -> u64 { 0 }
+        fn register_commands(&self) -> Vec<(String, String)> {
+            vec![("count".to_string(), "count".to_string())]
+        }
+        fn execute_command(&self, _: &str, _: &[&str], mut w: Box<dyn Write + Send>) -> Result<(), String> {
+            let n = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+            writeln!(w, "run {n}").map_err(|e| e.to_string())
+        }
+    }
+
+    /// `watch` redraws the answer on one line until a line arrives, then
+    /// the session carries on.
+    #[test]
+    fn watch_repeats_until_enter() {
+        let c = Arc::new(Counter(std::sync::atomic::AtomicU32::new(0)));
+        let monitor = Arc::new(Monitor::new());
+        monitor.register_device(c.clone());
+        monitor.clone().start_server("127.0.0.1:0".to_string());
+        let addr = wait_for("bind", || monitor.bound_addr());
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"watch -n 0.1 count\n").unwrap();
+        wait_for("three runs", || (c.0.load(Ordering::Relaxed) >= 3).then_some(()));
+        s.write_all(b"\ncount\nquit\n").unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        monitor.shutdown();
+        let out = String::from_utf8_lossy(&out);
+        assert!(out.contains("\rrun 2\x1b[K"), "{out}");
+        let runs = c.0.load(Ordering::Relaxed);
+        assert!(out.contains(&format!("run {runs}")), "the plain command still answers: {out}");
+    }
+
+    #[test]
+    fn watch_needs_a_known_command() {
+        let out = converse(b"watch nosuch\nwatch\n");
+        assert!(out.contains("watch: unknown command nosuch"), "{out}");
+        assert!(out.contains("run a command again"), "{out}");
     }
 }

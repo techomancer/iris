@@ -370,7 +370,7 @@ impl DaynaPort {
         }
         if n > 0 {
             self.stats.rx_frames += n as u64;
-            self.heartbeat.fetch_or(crate::dev::ng1::rex3::Rex3::HB_ENET_RX, Ordering::Relaxed);
+            self.heartbeat.fetch_or(crate::status::hb::ENET_RX, Ordering::Relaxed);
         } else {
             // Nothing queued (or the interface is disabled): a zero pktlen is
             // how the driver is told to stop parsing. Even that never exceeds
@@ -413,7 +413,7 @@ impl DaynaPort {
         } else {
             self.stats.tx_frames += 1;
             if let Some(w) = &self.tx_wake { w.notify(); }
-            self.heartbeat.fetch_or(crate::dev::ng1::rex3::Rex3::HB_ENET_TX, Ordering::Relaxed);
+            self.heartbeat.fetch_or(crate::status::hb::ENET_TX, Ordering::Relaxed);
         }
         good()
     }

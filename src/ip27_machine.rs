@@ -381,7 +381,7 @@ fn onyx2(
     let bridge = build_baseio(cfg, upstream(), &[(BASEIO_G_RECORD, BASEIO_G_SERIAL), (MIO_RECORD, MIO_SERIAL)])?;
     xbow.serve_bridge(BASEIO_WIDGET, &bridge);
 
-    let status = crate::disp::StatusSource::new(heartbeat.clone(), Arc::new(AtomicU64::new(0)));
+    let status = crate::status::MachineStatus::new(heartbeat.clone(), Arc::new(AtomicU64::new(0)));
     let pipe = match cfg.graphics_board().kona() {
         Some((product, rm_count)) => {
             let pipe_hosts = Arc::new(PipeHosts { widget: OnceLock::new(), up: upstream() });
