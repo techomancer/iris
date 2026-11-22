@@ -206,6 +206,7 @@ fn build_baseio(
     fibre.set_heartbeat(heartbeat.clone());
     let section = cfg.ip35_section();
     let (ioc3, serial) = attach_ioc3(
+        timers,
         cfg,
         pci,
         &IO7,

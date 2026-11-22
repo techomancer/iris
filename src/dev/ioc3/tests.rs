@@ -95,7 +95,11 @@ impl PciDma for TestMem {
 
 /// The Octane's IOC3, as the machine builds it but for the records.
 fn octane() -> Ioc3 {
-    Ioc3::new(&IP30, MAC, ByteBus::Ds1685(Ds1685::new(None)))
+    octane_on(&Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped())))
+}
+
+fn octane_on(tm: &Arc<TimerManager>) -> Ioc3 {
+    Ioc3::new(tm, &IP30, MAC, ByteBus::Ds1685(Ds1685::new(None)))
 }
 
 struct Rig {
@@ -103,14 +107,22 @@ struct Rig {
     mem: Arc<TestMem>,
     wire: [Arc<Wire>; 2],
     superio: Arc<LevelProbe>,
+    clock: crate::clock::Clock,
+    _tm: Arc<TimerManager>,
 }
 
 impl Rig {
     fn new() -> Rig {
-        Rig::with(octane())
+        Rig::with(octane_on)
     }
 
-    fn with(c: Ioc3) -> Rig {
+    fn with(make: impl FnOnce(&Arc<TimerManager>) -> Ioc3) -> Rig {
+        Rig::on(Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped())), make)
+    }
+
+    fn on(tm: Arc<TimerManager>, make: impl FnOnce(&Arc<TimerManager>) -> Ioc3) -> Rig {
+        let clock = tm.clock().clone();
+        let c = make(&tm);
         let mem = TestMem::new();
         c.state().connect_dma(mem.clone());
         c.attached();
@@ -119,7 +131,7 @@ impl Rig {
         c.set_serial_backend(1, wire[1].clone());
         let (superio, line) = LevelProbe::line();
         c.connect_superio_interrupt(line);
-        Rig { c, mem, wire, superio }
+        Rig { c, mem, wire, superio, clock, _tm: tm }
     }
 
     fn r32(&self, a: u32) -> u32 {
@@ -176,7 +188,7 @@ fn each_board_reads_back_as_its_row_says() {
                 ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at_on(crate::clock::Clock::stepped(), 2026, 1, 1, 0, 0, 0).unwrap()))
             }
         };
-        let r = Rig::with(Ioc3::new(board, MAC, bus));
+        let r = Rig::with(|tm| Ioc3::new(tm, board, MAC, bus));
         let name = board.name;
         assert_eq!(r.c.state().config().read(11), (board.subsystem_id as u32) << 16 | VENDOR_ID as u32, "{name}");
         // A child that is present keeps what is written to it; one that is
@@ -431,17 +443,30 @@ fn diagnostic_output_commands_keep_the_running_output() {
 fn a_periodic_output_catches_up_to_the_clock() {
     let r = Rig::new();
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 100);
-    std::thread::sleep(Duration::from_millis(3));
-    // Many periods (782 us each) have passed; the read applies them all and
-    // the pulse source is posted.
-    let _ = r.r32(reg::INT_OUTPUT);
+    r.clock.step(3_000_000);
+    // Many periods (782 us each) have passed; the timer's pass applies them
+    // all and the pulse source is posted.
+    r.c.service();
     assert_ne!(r.r32(reg::INT_STATUS) & int::RT_OUTPUT_PULSE, 0);
     r.w32(reg::INT_STATUS, int::RT_OUTPUT_PULSE);
     // A fixed command cancels the periodic one for good.
     r.w32(reg::INT_OUTPUT, IO_LOW);
-    std::thread::sleep(Duration::from_millis(2));
-    let _ = r.r32(reg::INT_OUTPUT);
+    r.clock.step(2_000_000);
+    r.c.service();
     assert_eq!(r.r32(reg::INT_STATUS) & int::RT_OUTPUT_PULSE, 0);
+}
+
+/// With the pulse interrupt masked no timer runs; a read of the state bit still follows the clock.
+#[test]
+fn the_output_state_bit_follows_the_clock_while_the_interrupt_is_masked() {
+    let r = Rig::new();
+    r.w32(reg::INT_OUTPUT, IO_SQUARE | 100);
+    let mut seen = [false; 2];
+    for _ in 0..40 {
+        r.clock.step(100_000);
+        seen[(r.r32(reg::INT_OUTPUT) & IO_STATE != 0) as usize] = true;
+    }
+    assert_eq!(seen, [true, true]);
 }
 
 #[test]
@@ -449,7 +474,7 @@ fn reset_cancels_the_interrupt_output() {
     let r = Rig::new();
     r.w32(reg::INT_OUTPUT, IO_SQUARE | 2);
     r.c.reset();
-    std::thread::sleep(Duration::from_millis(1));
+    r.clock.step(1_000_000);
     assert_eq!(r.r32(reg::INT_OUTPUT), 0);
     assert_eq!(r.r32(reg::INT_STATUS), 0);
 }
@@ -494,7 +519,7 @@ fn a_pin_register_reaches_the_shared_data_word() {
 #[test]
 fn the_board_inputs_are_read_only() {
     {
-        let r = Rig::with(octane());
+        let r = Rig::with(octane_on);
         for pin in [2u32, 3] {
             let reg = reg::PIN_REG_FIRST + 4 * pin;
             assert_eq!(r.r32(reg), 1);
@@ -581,7 +606,7 @@ fn each_row_wires_its_pins_as_listed() {
                 ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at_on(crate::clock::Clock::stepped(), 2026, 1, 1, 0, 0, 0).unwrap()))
             }
         };
-        let r = Rig::with(Ioc3::new(board, MAC, bus));
+        let r = Rig::with(|tm| Ioc3::new(tm, board, MAC, bus));
         let hb = Arc::new(AtomicU64::new(0));
         r.c.set_heartbeat(hb.clone());
         let name = board.name;
@@ -1005,24 +1030,23 @@ fn host_input_arrives_in_the_receive_ring_after_the_timer() {
     r.w32(A + sdma_off::RX_CONSUME, ARM_RX_TIMER);
     r.w32(A, sdma_ctl::ENABLE | 4);
     r.wire[0].inp.lock().unwrap().extend(b"hi");
-    let before = Instant::now();
+    let at = r.clock.now();
     r.c.service();
-    let after = Instant::now();
     // Every register access first expires a deadline already past, so a
     // test thread descheduled past it would see the entry posted before it
     // looked. Hold the timer off while looking, then let it run out.
-    let wait = Duration::from_nanos(0x200 * TIMER_TICK_NS);
+    let wait = 0x200 * TIMER_TICK_NS;
     let due = {
         let serial = r.c.sh.serial[0].as_ref().unwrap();
         let due = serial.rx_deadline().expect("the first character started the timer");
-        assert!(due >= before + wait && due <= after + wait, "the reload's 32 ms from the character");
-        serial.set_rx_deadline(Some(Instant::now() + Duration::from_secs(3600)));
+        assert_eq!(due, at + wait, "the reload's 32 ms from the character");
+        serial.set_rx_deadline(Some(at + 3_600_000_000_000));
         due
     };
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) >> HELD_SHIFT & 7, 2, "two held in the packer");
     assert_eq!(r.r32(A + sdma_off::RX_CONSUME) & ARM_RX_TIMER, ARM_RX_TIMER);
     r.c.sh.serial[0].as_ref().unwrap().set_rx_deadline(Some(due));
-    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    r.clock.step(wait);
     r.c.service();
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE), 8, "posted when the timer ran out");
     assert_eq!(&get(&r, 0x3000, 2), b"hi");
@@ -1179,9 +1203,9 @@ fn nvram_writes_reach_the_file_after_a_pause() {
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5];
     assert_eq!(in_file(), 0, "not yet written");
-    r.c.rtc().flush_after(Duration::from_secs(3600));
+    r.c.rtc().hand_over(0);
     assert_eq!(in_file(), 0, "the writes have not paused for long enough");
-    r.c.rtc().flush_after(Duration::ZERO);
+    r.c.rtc().flush();
     assert_eq!(in_file(), 0x66);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0x200);
 }
@@ -1766,10 +1790,8 @@ fn rtc_offset_starts_a_clock_with_no_reference() {
 /// A running chip with a timer manager, for the tests where nothing touches
 /// a register while the chip works.
 fn running_rig() -> (Rig, Arc<TimerManager>) {
-    let r = Rig::new();
-    let tm = Arc::new(TimerManager::new());
-    r.c.set_timer_manager(tm.clone());
-    (r, tm)
+    let tm = Arc::new(TimerManager::with_clock(crate::clock::Clock::new()));
+    (Rig::on(tm.clone(), octane_on), tm)
 }
 
 /// Whether a timer is pending for deadline `kind`, read while no timer
@@ -1778,7 +1800,7 @@ fn running_rig() -> (Rig, Arc<TimerManager>) {
 /// deadline briefly shows none; the callback holds `gate` throughout.
 fn timer_pending(r: &Rig, kind: usize) -> bool {
     let _idle = r.c.sh.gate.lock();
-    r.c.sh.armed.lock()[kind].is_some()
+    r.c.sh.timers[kind].is_armed()
 }
 
 /// Typed input reaches the ring and the receive timer posts it and raises its
@@ -1890,13 +1912,12 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert!(r.c.rtc().is_running(), "and the clock's NVRAM writer");
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
-    assert!(timer_pending(&r, K_INT_OUT));
+    assert!(eventually(|| timer_pending(&r, K_INT_OUT)));
     r.c.stop();
     r.c.stop();
     assert!(!r.c.is_running());
     assert!(r.c.threads.lock().is_empty());
     assert!(!r.c.rtc().is_running());
-    assert!(r.c.sh.armed.lock().iter().all(|a| a.is_none()));
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
     // The threads are joined, so nothing can take the character: it is
@@ -1905,7 +1926,8 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert!(r.c.rx_pending(0) == 0);
     r.c.start();
     assert!(eventually(|| r.c.rx_pending(0) != 0));
-    assert!(timer_pending(&r, K_INT_OUT), "start arms the deadlines the chip holds");
+    // A periodic output shows no timer between its host timer firing and the callback taking `gate`.
+    assert!(eventually(|| timer_pending(&r, K_INT_OUT)), "start arms the deadlines the chip holds");
     r.c.stop();
 }
 
@@ -1918,7 +1940,8 @@ fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
     for _ in 0..20_000 {
-        assert!(timer_pending(&r, K_INT_OUT));
+        // The timer shows none between its host timer firing and the callback taking `gate`.
+        assert!(eventually(|| timer_pending(&r, K_INT_OUT)));
     }
     r.c.stop();
 }
@@ -1946,7 +1969,7 @@ fn a_pass_that_read_the_chip_first_arms_first() {
         });
         for i in 0..5_000u32 {
             r.w32(reg::INT_OUTPUT, if i % 2 == 0 { IO_PERIODIC | (0x1000 + i) } else { 0 });
-            let held = sh.armed.lock()[K_INT_OUT].map(|(_, d)| d);
+            let held = decode(sh.armed_due[K_INT_OUT].load(Ordering::SeqCst));
             let want = decode(sh.io_due.load(Ordering::SeqCst));
             if held != want {
                 stop.store(true, Ordering::SeqCst);
@@ -1976,7 +1999,7 @@ fn dropping_a_running_chip_ends_its_threads() {
 #[test]
 fn the_clocks_power_off_is_sent_to_the_machine_once() {
     let (tx, rx) = std::sync::mpsc::sync_channel(4);
-    let r = Rig::with(Ioc3::new(&IP30, MAC, ByteBus::Ds1685(Ds1685::new(Some(tx)))));
+    let r = Rig::with(|tm| Ioc3::new(tm, &IP30, MAC, ByteBus::Ds1685(Ds1685::new(Some(tx)))));
     rtc_w(&r, 0x0a, 0x10); // bank 1
     assert!(rx.try_recv().is_err());
     rtc_w(&r, 0x4a, 0x08);
@@ -2033,8 +2056,8 @@ fn without_clock(v: &toml::Value) -> toml::Value {
 
 #[test]
 fn save_load_round_trip() {
-    for build in [octane] {
-        let src = Rig::with(build());
+    for build in [octane_on] {
+        let src = Rig::with(build);
         src.w8(reg::SERIAL_A + 3, 0x80);
         src.w8(reg::SERIAL_A + 7, 6);
         src.w8(reg::SERIAL_A + 3, 0x03);
@@ -2042,7 +2065,7 @@ fn save_load_round_trip() {
         src.w32(reg::INT_ENABLE_SET, 0x40);
         let v1 = src.c.save_state();
 
-        let dst = Rig::with(build());
+        let dst = Rig::with(build);
         dst.c.load_state(&v1).expect("load_state");
         // Seconds may pass between the load and the save, as on a loaded host.
         dst.c.sh.rtc.as_ref().unwrap().advance_clock(2);
@@ -2078,22 +2101,24 @@ fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
     assert_eq!(without_clock(&used.c.save_state()), without_clock(&v));
 }
 
-/// A periodic interrupt output keeps the time its next pulse had left,
-/// counted from the load rather than from the save.
+/// A periodic interrupt output keeps the machine time of its next pulse.
 #[test]
-fn a_pending_output_keeps_its_time_left() {
+fn a_pending_output_keeps_its_deadline() {
     let src = octane();
     src.bar_write(0, reg::INT_OUTPUT, IO_PERIODIC | 100, 4);
-    let at_save = Instant::now();
-    let left = Duration::from_micros(20);
     let v = {
-        src.sh.int_out.lock().next = Some(at_save + left);
-        src.sh.save_state(at_save)
+        src.sh.int_out.lock().next = Some(1_020_000);
+        src.sh.save_state()
     };
     let dst = octane();
-    let at_load = at_save + Duration::from_millis(5);
-    dst.sh.load_state(&v, at_load).unwrap();
-    assert_eq!(dst.sh.int_out.lock().next, Some(at_load + left));
+    dst.sh.load_state(&v, 0).unwrap();
+    assert_eq!(dst.sh.int_out.lock().next, Some(1_020_000));
+    // A build that saved the time left under `next` is refused.
+    let mut old = v.clone();
+    let o = old["int_out"].as_table_mut().unwrap();
+    o.remove("next_at");
+    o.insert("next".into(), toml::Value::Integer(20_001));
+    assert!(dst.sh.load_state(&old, 0).unwrap_err().contains("next_at"));
 }
 
 #[test]
@@ -2124,7 +2149,7 @@ fn an_octane_chip_reset_keeps_the_pci_header() {
 #[test]
 fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     let clock = Arc::new(crate::dev::timekeeper::Timekeeper::at_on(crate::clock::Clock::stepped(), 2026, 1, 1, 0, 0, 0).unwrap());
-    let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock.clone())));
+    let r = Rig::with(|tm| Ioc3::new(tm, &IP34, MAC, ByteBus::M48t35(clock.clone())));
     let cfg = r.c.state().config();
     cfg.write(1, 0xffff_0146);
     cfg.write(3, 0xffff_ffff);
@@ -2160,7 +2185,7 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
 #[test]
 fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
     let clock = Arc::new(crate::dev::timekeeper::Timekeeper::at_on(crate::clock::Clock::stepped(), 2026, 1, 1, 0, 0, 0).unwrap());
-    let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock)));
+    let r = Rig::with(|tm| Ioc3::new(tm, &IP34, MAC, ByteBus::M48t35(clock)));
     for _ in 0..2 {
         r.c.reset();
         r.c.ps2().power_on();

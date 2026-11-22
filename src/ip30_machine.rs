@@ -417,13 +417,12 @@ impl OctaneMachine {
         if let Err(e) = rtc.set_nvram_file(&cfg.nvram) {
             eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
         }
-        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
+        let ioc3 = Arc::new(Ioc3::new(&timer_manager, &ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
         ioc3.set_microlan(identity.ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
         let eth = ioc3.eth().expect("the Octane's IOC3 has Ethernet").clone();
         pci.attach(slot(2), ioc3.clone());
         ioc3.connect_superio(pci);
-        ioc3.set_timer_manager(timer_manager.clone());
         // ... and resetting itself through HEART.
         heart.on_soft_reset(Box::new(move || {
             let _ = event_tx.try_send(MachineEvent::HardReset);

@@ -160,7 +160,7 @@ measured property of the silicon.
 Order: the serial engine before the `SuperIo` it reaches through. A pass
 takes the `SuperIo` only when it first reaches a UART and holds both across
 its DMA, which is safe because no host's DMA path calls back into a function. The deadlines the
-timers need are published as atomic words (`dev/deadline.rs`), so arming a
+timers need are published as atomic words (`clock::encode`), so arming a
 timer takes no child lock.
 
 ## The boards
@@ -294,3 +294,7 @@ holds the state: `ioc3.chip` carries `int_status`, `int_enable`, `chip_control`,
 the PS/2 devices; and the Octane saves the MAC under its own `eth` key. A
 child a board lacks writes no key. `power_off_pending` is written clear: the
 DS1685 now sends its event as the guest writes it.
+
+Deadlines (`rx_at`, `tx_delay_at`, `loop_at`, `int_out.next_at`) are machine
+nanoseconds. A snapshot an older build saved with the time left (`rx_due`,
+`tx_delay_due`, `loop_due`, `int_out.next`) is refused.

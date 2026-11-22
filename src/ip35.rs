@@ -87,6 +87,7 @@ pub(crate) fn xbridge_on(bedrock: &Bedrock) -> Arc<XBridge> {
 /// then the IOC3's two ports.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attach_ioc3(
+    timers: &Arc<TimerManager>,
     cfg: &MachineConfig,
     pci: &PciBus,
     board: &'static Ioc3Board,
@@ -96,7 +97,7 @@ pub(crate) fn attach_ioc3(
     l1_setting: &'static str,
     l1_log: Option<String>,
 ) -> (Arc<Ioc3>, Vec<SerialPort>) {
-    let ioc3 = Arc::new(Ioc3::new(board, l1.station_mac(), ByteBus::M48t35(timekeeper.clone())));
+    let ioc3 = Arc::new(Ioc3::new(timers, board, l1.station_mac(), ByteBus::M48t35(timekeeper.clone())));
     pci.attach(DevFn { device: 4, function: 0 }, ioc3.clone());
     ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
     let serial: [Arc<CiSerialBackend>; 3] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));

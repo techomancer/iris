@@ -1366,7 +1366,7 @@ fn ioc4_behind_a_bit19_clear_slot_sends_a_memory_order_ring_in_order() {
     use crate::pci::PciFunction;
 
     let r = rig();
-    let ioc4 = Arc::new(Ioc4::new(Ioc4Config::bare(Ioc4Clock::Mhz33)));
+    let ioc4 = Arc::new(Ioc4::new(&Arc::new(crate::hptimer::TimerManager::new()), Ioc4Config::bare(Ioc4Clock::Mhz33)));
     let line = Arc::new(Line::default());
     ioc4.set_serial_backend(0, line.clone());
     r.pic.attach(0, 1, ioc4.clone(), Function::default());

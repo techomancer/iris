@@ -79,6 +79,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, MutexGuard};
 
+use crate::clock::Clock;
 use crate::dev::ds1744::Ds1744;
 use crate::dev::ioc3::Ioc3Dma;
 use crate::dev::ioc3_kbc::{self, Ioc3Kbc, KbcLine, KbcOwner};
@@ -86,8 +87,7 @@ use crate::dev::ps2::Ps2Controller;
 use crate::dev::ioc_serial_dma::{self, off as sdma_off, SerialDmaUart, SerialDmaHost, SerialDmaParams, SerialDma, SerialDmaSource};
 use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
-use crate::dev::deadline_timers::DeadlineTimers;
-use crate::hptimer::{TimerManager, TimerReturn};
+use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::traits::{BusDevice, Device, Resettable};
@@ -279,10 +279,13 @@ struct St {
     kbc: Ioc3Kbc,
     ps2: Arc<Ps2Controller>,
     dma: Option<Arc<dyn PciDma>>,
+    clock: Clock,
+    /// The deadlines last set on the timers.
+    armed: Deadlines,
 }
 
 impl St {
-    fn new(cfg: Ioc4Config, ps2: Arc<Ps2Controller>) -> St {
+    fn new(cfg: Ioc4Config, ps2: Arc<Ps2Controller>, clock: Clock) -> St {
         St {
             cfg,
             serial_pending: 0,
@@ -299,6 +302,8 @@ impl St {
             kbc: Ioc3Kbc::new(true),
             ps2,
             dma: None,
+            clock,
+            armed: [None; KINDS],
         }
     }
 
@@ -362,7 +367,7 @@ impl St {
         (self.serial_pending | self.level) & self.serial_enable != 0 || self.other_pending & self.other_enable != 0
     }
 
-    /// The host-time deadlines the engines hold, for the timers.
+    /// The deadlines the engines hold, for the timers.
     fn deadlines(&self) -> Deadlines {
         let mut d = [None; KINDS];
         for p in 0..PORTS {
@@ -382,6 +387,7 @@ impl St {
             error_low: &mut self.error_low,
             error_high: &mut self.error_high,
             dma: self.dma.as_deref(),
+            clock: &self.clock,
         };
         (&mut self.sdma, host)
     }
@@ -391,7 +397,8 @@ impl St {
         sdma.run(p, &mut host);
     }
 
-    fn sdma_catch_up(&mut self, now: Instant) {
+    fn sdma_catch_up(&mut self) {
+        let now = self.clock.now();
         let (sdma, mut host) = self.sdma_engine_split();
         sdma.catch_up(now, &mut host);
     }
@@ -488,7 +495,6 @@ impl St {
     // ----- control registers -----
 
     fn read32(&mut self, a: u32) -> u32 {
-        self.sdma_catch_up(Instant::now());
         if let Some(r) = sdma_decode(a) {
             let (sdma, mut host) = self.sdma_engine_split();
             return match r {
@@ -514,7 +520,6 @@ impl St {
     }
 
     fn write32(&mut self, a: u32, v: u32) {
-        self.sdma_catch_up(Instant::now());
         if let Some(r) = sdma_decode(a) {
             match r {
                 SdmaReg::Base { pair, high } => {
@@ -566,6 +571,7 @@ struct Ioc4SerialDmaHost<'a> {
     error_low: &'a mut u32,
     error_high: &'a mut u32,
     dma: Option<&'a dyn PciDma>,
+    clock: &'a Clock,
 }
 
 impl SerialDmaHost for Ioc4SerialDmaHost<'_> {
@@ -589,6 +595,10 @@ impl SerialDmaHost for Ioc4SerialDmaHost<'_> {
     fn uart_line_changed(&mut self, port: usize) {
         let level = self.uart[port].irq();
         set_level_bit(self.level, int::pass(port), level);
+    }
+
+    fn now(&self) -> u64 {
+        self.clock.now()
     }
 
     fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool {
@@ -628,16 +638,16 @@ impl SerialDmaHost for Ioc4SerialDmaHost<'_> {
 /// `SerialBackend` has no blocking read to wait on.
 const RX_IDLE: Duration = Duration::from_millis(2);
 
-/// The deadlines the chip keeps on host time, one timer slot each.
+/// The deadlines the chip keeps on the machine clock, one timer slot each.
 const K_RX: usize = 0;
 const K_TX_DELAY: usize = PORTS;
 const K_LOOP: usize = 2 * PORTS;
 const KINDS: usize = 3 * PORTS;
-type Deadlines = [Option<Instant>; KINDS];
+type Deadlines = [Option<u64>; KINDS];
 
-/// Lock order: `gate`, then `line_order`, then `st`; `armed` and `line` are
-/// leaves. The engines move their rings with `st` held: the DMA goes down
-/// through the bridge, which never calls back into the chip.
+/// Lock order: `gate`, then `line_order`, then `st`; `line` is a
+/// leaf. A timer is set under `st`. The engines move their rings with `st` held:
+/// the DMA goes down through the bridge, which never calls back into the chip.
 struct Shared {
     pci: PciFunctionState,
     st: Mutex<St>,
@@ -648,7 +658,7 @@ struct Shared {
     /// Serialises driving the line; see [`Shared::sync_line`].
     line_order: Mutex<()>,
     me: Weak<Shared>,
-    timers: DeadlineTimers<KINDS>,
+    timers: [Timer; KINDS],
     /// A PS/2 character arrived while an access held the chip.
     kbc_dirty: AtomicBool,
     /// Between `start` and `stop`.
@@ -712,22 +722,21 @@ impl Shared {
         r
     }
 
-    /// Arm a timer for each deadline the chip holds, then let the chip go.
-    fn arm(&self, st: MutexGuard<'_, St>) {
-        self.timers.arm(&st.deadlines(), st, &self.running, &self.me, |_| Duration::ZERO, Shared::fire);
+    /// Set each timer to the deadline the chip holds, under the chip's lock
+    /// so passes set them in the order they saw the chip.
+    fn arm(&self, mut st: MutexGuard<'_, St>) {
+        let want = st.deadlines();
+        if want != st.armed {
+            self.timers.iter().zip(want).for_each(|(t, d)| t.set_due(d));
+            st.armed = want;
+        }
     }
 
     /// A deadline passed with no guest access to notice it. Runs on the timer
     /// thread: short, no waiting beyond the chip's own locks.
-    fn fire(me: &Weak<Shared>, kind: usize, due: Instant) -> TimerReturn {
-        let Some(sh) = me.upgrade() else { return TimerReturn::Delete };
-        let _gate = sh.gate.lock();
-        if !sh.running.load(Ordering::SeqCst) {
-            return TimerReturn::Delete;
-        }
-        sh.timers.fired(kind, due);
-        sh.with_st(|st| st.sdma_catch_up(Instant::now()));
-        TimerReturn::Delete
+    fn fire(&self) {
+        let _gate = self.gate.lock();
+        self.with_st(|st| st.sdma_catch_up());
     }
 
     /// Feed host input from serial backend `port` into its FIFO until the
@@ -757,7 +766,7 @@ impl Shared {
                 st.uart_pump(p);
                 st.uart_changed(p);
             }
-            st.sdma_catch_up(Instant::now());
+            st.sdma_catch_up();
             for p in 0..PORTS {
                 st.sdma_run(p);
             }
@@ -775,7 +784,7 @@ pub struct Ioc4 {
 }
 
 impl Ioc4 {
-    pub fn new(cfg: Ioc4Config) -> Ioc4 {
+    pub fn new(tm: &Arc<TimerManager>, cfg: Ioc4Config) -> Ioc4 {
         let sh = Arc::new_cyclic(|weak: &Weak<Shared>| {
             let line = IrqLine::new(Arc::new(KbcLine(weak.clone())), 0);
             let ps2 = Arc::new(Ps2Controller::new(Some(line)));
@@ -791,13 +800,13 @@ impl Ioc4 {
             };
             Shared {
                 pci: PciFunctionState::new(PciConfig::new_with_policy(VENDOR_ID, DEVICE_ID, PCI_CLASS, REVISION, bars, PCI_INTA, policy)),
-                st: Mutex::new(St::new(cfg, ps2)),
+                st: Mutex::new(St::new(cfg, ps2, tm.clock().clone())),
                 line: Mutex::new(None),
                 line_level: AtomicBool::new(false),
                 line_order: Mutex::new(()),
                 kbc_dirty: AtomicBool::new(false),
                 me: weak.clone(),
-                timers: DeadlineTimers::new(),
+                timers: std::array::from_fn(|_| Timer::new(tm, weak, |sh: &Shared, _| sh.fire())),
                 running: AtomicBool::new(false),
                 gate: Mutex::new(()),
             }
@@ -810,11 +819,6 @@ impl Ioc4 {
     /// chip's reset does not touch it: it is memory with a battery.
     pub fn attach_clock(&self, clock: Arc<Ds1744>) {
         assert!(self.clock.set(clock).is_ok(), "IOC4 clock attached more than once");
-    }
-
-    /// The timer manager for device deadlines. Set it before start.
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        self.sh.timers.set_manager(tm);
     }
 
     /// Wire the host end of serial port `port` (0 is the console): a TCP
@@ -883,6 +887,7 @@ impl Device for Ioc4 {
         }
         drop(threads);
         self.sh.arm(self.sh.st.lock());
+        self.sh.timers.iter().for_each(Timer::start);
     }
 
     /// Remove the timers, wait out a callback in flight and join the threads.
@@ -891,7 +896,7 @@ impl Device for Ioc4 {
         if !self.sh.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        self.sh.timers.cancel_all();
+        self.sh.timers.iter().for_each(Timer::stop);
         drop(self.sh.gate.lock());
         let mut threads = self.threads.lock();
         for t in threads.iter() {

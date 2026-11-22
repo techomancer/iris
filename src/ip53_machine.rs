@@ -357,9 +357,8 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
             .map_err(|_| "Tezro: PIC peer connected twice".to_string())?;
     }
 
-    let ioc4 = Arc::new(Ioc4::new(Ioc4Config::tezro()));
+    let ioc4 = Arc::new(Ioc4::new(timers, Ioc4Config::tezro()));
     ioc4.attach_clock(timekeeper.clone());
-    ioc4.set_timer_manager(timers.clone());
     for (port, backend) in serial[1..].iter().enumerate() {
         ioc4.set_serial_backend(port, backend.clone());
     }
