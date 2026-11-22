@@ -201,7 +201,9 @@ outside `access`, or the hot path carries its stack frame.
 Devices connect to each other through device-specific `connect()` /
 `set_phys()` calls made by `Machine`, not through a generic graph. Smaller
 interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
-channel), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
+channel; `wait_active` lets a device thread block until the guest arms the
+channel, which HPC3 signals from the arming register write instead of being
+polled), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
 (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 

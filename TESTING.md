@@ -861,6 +861,23 @@ the same files and reads every sector back. Another test fails on any
 cargo nextest run --release --lib exit_persistence_tests
 ```
 
+## SCSI data phases on Indy and Indigo2
+
+NetBSD's wdsc driver writes the WD33C93A's TRANSFER_INFO command before it
+arms the HPC3 DMA channel, so the chip reaches a data phase with the channel
+still off and has to wait for it (IRIX arms the channel first and never
+waits). `tools/scsi-armwait-e2e.py` boots the NetBSD/sgimips install CD on an
+Indy, leaves sysinst for its shell, reads the CD with `dd`, and reads
+`scsi armwait` from the monitor. It passes when most waits ended within one
+100 µs poll interval, that is when the arming itself starts the data phase.
+
+```sh
+tools/scsi-armwait-e2e.py target/release/iris NetBSD-11.1-sgimips.iso
+```
+
+The CD image comes from the NetBSD project and is opened read-only; the
+machine has no disk. `--keep DIR` keeps the config, console log and iris
+output, `--monitor-port` moves the monitor (default 23460).
 ## O2 snapshots, CD changes and scratch over iris-ci
 
 `tools/tests/o2-ci-rollback.sh` boots a headless O2 on its built-in PROM (no
