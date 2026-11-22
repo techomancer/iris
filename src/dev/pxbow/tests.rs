@@ -4,7 +4,8 @@
 // tests/qtest/sgi-graphics-pipes-test.c (ip53-v12). The qtest's machine
 // properties and migration have no counterpart here.
 use super::*;
-use crate::dev::pic::{PicPeer, Refused, Pic};
+use crate::dev::pic::Pic;
+use crate::xtalk::{Upstream, XtalkHost};
 use crate::traits::{BusRead32, BUS_OK};
 use parking_lot::Mutex;
 
@@ -32,20 +33,25 @@ impl BusDevice for Stub {
     }
 }
 
+/// The host's interrupt packets, as (source, address, payload).
 #[derive(Default)]
 struct Peer(Mutex<Vec<(u8, u64, u64)>>);
-impl PicPeer for Peer {
-    fn interrupt(&self, source: u8, address: u64, payload: u64) -> Result<(), Refused> {
-        self.0.lock().push((source, address, payload));
-        Ok(())
-    }
-    fn dma_read(&self, _: u8, _: u8, _: u64, _: &mut [u8]) -> Result<(), Refused> {
-        Err(Refused)
-    }
-    fn dma_write(&self, _: u8, _: u8, _: u64, _: &[u8]) -> Result<(), Refused> {
-        Err(Refused)
+impl crate::irq::InterruptController for Peer {
+    fn set_line(&self, _: u32, _: bool) {}
+    fn packet(&self, source: u8, address: u64, line: u32, level: bool) -> bool {
+        self.0.lock().push((source, address, u64::from(line) | if level { 0x100 } else { 0 }));
+        true
     }
 }
+
+/// A PIC at `widget` whose only host is widget 10, taking packets into `peer` and no memory.
+fn pic_at(widget: u8, peer: Arc<Peer>) -> Arc<Pic> {
+    let host = XtalkHost { widget: 10, int_packet: 0, int_packet_mask: 0, vectors: 256 };
+    Pic::new(widget, 10, Upstream::single(host, Arc::new(NoMemory), peer))
+}
+
+struct NoMemory;
+impl BusDevice for NoMemory {}
 
 /// Widget zero names itself PXBOW and shows the host's and the PIC's links up.
 #[test]
@@ -133,9 +139,8 @@ fn fences_and_the_lock_are_stored_and_read_back() {
 /// address.
 #[test]
 fn a_widget_zero_error_sends_an_interrupt_packet_to_the_host() {
-    let pic = Pic::new(15);
     let peer = Arc::new(Peer::default());
-    pic.connect_peer(peer.clone()).unwrap();
+    let pic = pic_at(15, peer.clone());
     let p = pic.enable_pxbow(10).unwrap();
     let w = p.widget_zero();
     let address = 0x1_0180_0090u64;
@@ -191,8 +196,8 @@ fn attachment_refuses_the_host_a_taken_widget_and_a_non_link() {
 /// through the switch.
 #[test]
 fn only_the_pic_that_enables_it_has_a_pxbow_and_it_forwards_to_the_pic() {
-    let with = Pic::new(15);
-    let without = Pic::new(11);
+    let with = pic_at(15, Arc::default());
+    let without = pic_at(11, Arc::default());
     assert!(with.pxbow().is_none());
     let p = with.enable_pxbow(10).unwrap();
     assert!(without.pxbow().is_none());
@@ -203,14 +208,14 @@ fn only_the_pic_that_enables_it_has_a_pxbow_and_it_forwards_to_the_pic() {
     let id = via_switch.read64(0).data;
     assert_eq!((id >> 28) & 0xf, 3, "the PIC's head 0 answers through widget 15");
     assert_eq!(via_switch.read64(crate::dev::pic::HEAD_OFFSET).data >> 12 & 0xffff, 0xd112);
-    assert!(Pic::new(15).enable_pxbow(15).is_err(), "host and PIC differ");
+    assert!(pic_at(15, Arc::default()).enable_pxbow(15).is_err(), "host and PIC differ");
 }
 
 /// A link reset on the host's link or the PIC's is over when the write returns: the PIC is
 /// reachable and kept its registers.
 #[test]
 fn a_link_reset_leaves_the_pic_reachable_with_its_registers() {
-    let pic = Pic::new(15);
+    let pic = pic_at(15, Arc::default());
     let p = pic.enable_pxbow(10).unwrap();
     let via = p.route(15);
     let wz = p.widget_zero();

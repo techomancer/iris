@@ -48,21 +48,22 @@ use crate::clock::Clock;
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};
-use crate::dev::pic::{Function, Pic, PicPeer, Refused};
+use crate::dev::pic::{Function, Pic};
 use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::devlog::LogModule;
 use crate::hptimer::TimerManager;
 use crate::ip35::presence::PresenceHold;
-use crate::ip35::{attach_vpro};
+use crate::ip35::{attach_vpro, BEDROCK_PORT};
+use crate::xtalk::Upstream;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::serial::{connect_serial_ports, SerialPort};
 use crate::sn::BoardIo;
 use crate::pci::{DevFn, PciToPciBridge};
 use crate::sn::{NodeBoard};
-use crate::traits::{Device, Resettable, BUS_OK};
+use crate::traits::{Device, Resettable};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 /// The Bedrock board word the QEMU Tezro profiles select.
 const BOARD_ID: u64 = 0x2001;
@@ -71,6 +72,8 @@ const BOARD_ID: u64 = 0x2001;
 const IO9_WIDGET: u8 = 15;
 const SECOND_PIC_WIDGET: u8 = 11;
 const HOST_WIDGET: u8 = 10;
+/// The device the V12's packets name at Bedrock IO's inbound permission check.
+const INBOUND_DEVICE: u8 = 0;
 /// IO9's PCI functions: configuration device on head 0.
 const IOC4_DEVICE: u8 = 1;
 const SCSI_DEVICE: u8 = 3;
@@ -319,7 +322,11 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let serial: [Arc<CiSerialBackend>; SERIAL_PORTS] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
     l1.set_serial_backend(serial[0].clone());
 
-    let io9 = Pic::new(IO9_WIDGET);
+    let to_bedrock = |widget| {
+        let port = bedrock.inbound(widget);
+        Upstream::single(BEDROCK_PORT, port.clone(), port)
+    };
+    let io9 = Pic::new(IO9_WIDGET, HOST_WIDGET, to_bedrock(IO9_WIDGET));
     let pxbow = io9.enable_pxbow(HOST_WIDGET).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
     bedrock.io.connect_widget(0, pxbow.widget_zero());
     bedrock.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
@@ -345,18 +352,13 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     } else {
         // The PROM finds widget 11 only as a live link of widget 0's
         // crossbar, so the second PIC is a port of the same switch.
-        let second = Pic::new(SECOND_PIC_WIDGET);
+        let second = Pic::new(SECOND_PIC_WIDGET, HOST_WIDGET, to_bedrock(SECOND_PIC_WIDGET));
         pxbow
             .attach_widget(SECOND_PIC_WIDGET, second.widget())
             .map_err(|e| format!("Tezro: second PIC on the PXBOW: {e:?}"))?;
         bedrock.io.connect_widget(SECOND_PIC_WIDGET, pxbow.route(SECOND_PIC_WIDGET));
         vec![second, io9.clone()]
     };
-    for pic in &pics {
-        pic.connect_peer(Arc::new(BedrockPeer(Arc::downgrade(bedrock))))
-            .map_err(|_| "Tezro: PIC peer connected twice".to_string())?;
-    }
-
     let ioc4 = Arc::new(Ioc4::new(timers, Ioc4Config::tezro()));
     ioc4.attach_clock(timekeeper.clone());
     for (port, backend) in serial[1..].iter().enumerate() {
@@ -534,118 +536,6 @@ pub(crate) fn check_vpro_widget(widget: u8) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("graphics.widget {widget} is not a free port of the Tezro's crossbar (valid: 8, 9, 12, 13, 14)"))
-    }
-}
-
-/// The far end of a PIC's link: Bedrock IO, where interrupt packets and DMA arrive as inbound
-/// packets from the PIC's widget. DMA aimed at another widget is refused (no peer-to-peer XIO).
-struct BedrockPeer(Weak<Bedrock>);
-
-const INBOUND_DEVICE: u8 = 0;
-
-impl BedrockPeer {
-    fn io(&self) -> Result<Arc<Bedrock>, Refused> {
-        self.0.upgrade().ok_or(Refused)
-    }
-
-    fn host(widget: u8) -> Result<(), Refused> {
-        if widget == HOST_WIDGET {
-            Ok(())
-        } else {
-            dlog!(LogModule::Bedrock, "Tezro: PIC DMA to widget {widget} refused; only Bedrock IO is reachable");
-            Err(Refused)
-        }
-    }
-
-    /// The legs of a transfer as (offset, bytes): whole doublewords from an 8-aligned address are
-    /// one leg; the ragged bytes around them are each the largest naturally aligned size of four or
-    /// fewer.
-    fn legs(address: u64, len: usize) -> impl Iterator<Item = (usize, usize)> {
-        let mut offset = 0;
-        std::iter::from_fn(move || {
-            if offset == len {
-                return None;
-            }
-            let at = address + offset as u64;
-            let left = len - offset;
-            let size = if at.is_multiple_of(8) && left >= 8 {
-                left & !7
-            } else {
-                [4usize, 2, 1]
-                    .into_iter()
-                    .find(|&n| at.is_multiple_of(n as u64) && n <= left)
-                    .unwrap_or(1)
-            };
-            let leg = (offset, size);
-            offset += size;
-            Some(leg)
-        })
-    }
-}
-
-/// Doublewords moved per call to memory. The stack buffer is zeroed per transfer, so it is small:
-/// a whole page cost a `rep stos` that outweighed the saving.
-const BLOCK_WORDS: usize = 64;
-
-impl PicPeer for BedrockPeer {
-    fn interrupt(&self, source_widget: u8, address: u64, payload: u64) -> Result<(), Refused> {
-        let io = self.io()?;
-        (io.inbound_write(source_widget, Some(INBOUND_DEVICE), address, 8, payload) == BUS_OK)
-            .then_some(())
-            .ok_or(Refused)
-    }
-
-    fn dma_read(&self, source_widget: u8, widget: u8, address: u64, data: &mut [u8]) -> Result<(), Refused> {
-        Self::host(widget)?;
-        let io = self.io()?;
-        for (offset, size) in Self::legs(address, data.len()) {
-            let at = address + offset as u64;
-            if size < 8 {
-                let value = io.inbound_read(source_widget, Some(INBOUND_DEVICE), at, size as u8);
-                if value.status != BUS_OK {
-                    return Err(Refused);
-                }
-                data[offset..offset + size].copy_from_slice(&value.data.to_be_bytes()[8 - size..]);
-                continue;
-            }
-            let mut words = [0u64; BLOCK_WORDS];
-            for (n, part) in data[offset..offset + size].chunks_mut(8 * BLOCK_WORDS).enumerate() {
-                let words = &mut words[..part.len() / 8];
-                if io.inbound_read_block(source_widget, Some(INBOUND_DEVICE), at + (n * 8 * BLOCK_WORDS) as u64, words) != BUS_OK {
-                    return Err(Refused);
-                }
-                for (bytes, word) in part.chunks_exact_mut(8).zip(words.iter()) {
-                    bytes.copy_from_slice(&word.to_be_bytes());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn dma_write(&self, source_widget: u8, widget: u8, address: u64, data: &[u8]) -> Result<(), Refused> {
-        Self::host(widget)?;
-        let io = self.io()?;
-        for (offset, size) in Self::legs(address, data.len()) {
-            let at = address + offset as u64;
-            if size < 8 {
-                let value = data[offset..offset + size].iter().fold(0u64, |v, b| (v << 8) | u64::from(*b));
-                if io.inbound_write(source_widget, Some(INBOUND_DEVICE), at, size as u8, value) != BUS_OK {
-                    return Err(Refused);
-                }
-                continue;
-            }
-            let mut words = [0u64; BLOCK_WORDS];
-            for (n, part) in data[offset..offset + size].chunks(8 * BLOCK_WORDS).enumerate() {
-                let words = &mut words[..part.len() / 8];
-                for (word, bytes) in words.iter_mut().zip(part.chunks_exact(8)) {
-                    *word = u64::from_be_bytes(bytes.try_into().unwrap());
-                }
-                if io.inbound_write_block(source_widget, Some(INBOUND_DEVICE), at + (n * 8 * BLOCK_WORDS) as u64, words) != BUS_OK {
-                    return Err(Refused);
-                }
-            }
-        }
-        Ok(())
     }
 }
 

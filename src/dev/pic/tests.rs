@@ -18,8 +18,9 @@
 // write or a force write, and has no timer that sends one again.
 use super::*;
 use crate::dev::bedrock::{regs::{pi as pi_reg, PI1_BASE}, Bedrock, BedrockConfig};
-use crate::irq::LevelProbe;
-use crate::traits::Device;
+use crate::irq::{InterruptController, LevelProbe};
+use crate::traits::{Device, BUS_ERR};
+use crate::xtalk::XtalkHost;
 use crate::pci::{Bar, PciConfig, PciFunctionState, PCI_INTA};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,7 +69,6 @@ impl PciFunction for Card {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Dma {
-    source: u8,
     widget: u8,
     address: u64,
     len: usize,
@@ -100,35 +100,101 @@ impl Peer {
     }
 }
 
-impl PicPeer for Peer {
-    fn interrupt(&self, source_widget: u8, address: u64, payload: u64) -> Result<(), Refused> {
-        if self.refuse.load(Ordering::SeqCst) {
-            return Err(Refused);
-        }
-        self.interrupts.lock().push((source_widget, address, payload));
-        Ok(())
-    }
+/// The link's far end as one widget's host port: what the PIC reaches is a
+/// bus device and an interrupt controller, one per widget.
+struct Port {
+    peer: Arc<Peer>,
+    widget: u8,
+}
 
-    fn dma_read(&self, source: u8, widget: u8, address: u64, data: &mut [u8]) -> Result<(), Refused> {
-        self.dma.lock().push(Dma { source, widget, address, len: data.len(), write: false });
-        if self.refuse.load(Ordering::SeqCst) {
-            return Err(Refused);
-        }
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = self.byte(widget, address + i as u64);
-        }
-        Ok(())
-    }
+const HOST: u8 = 10;
+/// The interrupt packet's set bit.
+const SET: u64 = 0x100;
 
-    fn dma_write(&self, source: u8, widget: u8, address: u64, data: &[u8]) -> Result<(), Refused> {
-        self.dma.lock().push(Dma { source, widget, address, len: data.len(), write: true });
-        if self.refuse.load(Ordering::SeqCst) {
-            return Err(Refused);
-        }
-        self.put(widget, address, data);
-        Ok(())
+impl Peer {
+    /// A host at every widget the tests aim DMA at; interrupts go to `HOST`.
+    fn up(self: &Arc<Self>) -> Upstream {
+        (0..15).fold(Upstream::new(), |up, widget| {
+            let port = Arc::new(Port { peer: self.clone(), widget });
+            up.with(HostPort::new(XtalkHost { widget, int_packet: 0, int_packet_mask: 0, vectors: 256 }, port.clone(), port))
+        })
     }
 }
+
+impl Port {
+    fn read(&self, address: u64, len: usize) -> BusRead64 {
+        self.peer.dma.lock().push(Dma { widget: self.widget, address, len, write: false });
+        if self.peer.refuse.load(Ordering::SeqCst) {
+            return BusRead64::err();
+        }
+        let data = self.peer.bytes(self.widget, address, len).iter().fold(0u64, |v, b| (v << 8) | u64::from(*b));
+        BusRead64 { status: BUS_OK, data }
+    }
+
+    fn write(&self, address: u64, bytes: &[u8]) -> u32 {
+        self.peer.dma.lock().push(Dma { widget: self.widget, address, len: bytes.len(), write: true });
+        if self.peer.refuse.load(Ordering::SeqCst) {
+            return BUS_ERR;
+        }
+        self.peer.put(self.widget, address, bytes);
+        BUS_OK
+    }
+}
+
+impl BusDevice for Port {
+    fn read8(&self, a: u64) -> BusRead8 {
+        let r = self.read(a, 1);
+        BusRead8 { status: r.status, data: r.data as u8 }
+    }
+    fn read16(&self, a: u64) -> BusRead16 {
+        let r = self.read(a, 2);
+        BusRead16 { status: r.status, data: r.data as u16 }
+    }
+    fn read32(&self, a: u64) -> BusRead32 {
+        let r = self.read(a, 4);
+        BusRead32 { status: r.status, data: r.data as u32 }
+    }
+    fn write8(&self, a: u64, v: u8) -> u32 {
+        self.write(a, &v.to_be_bytes())
+    }
+    fn write16(&self, a: u64, v: u16) -> u32 {
+        self.write(a, &v.to_be_bytes())
+    }
+    fn write32(&self, a: u64, v: u32) -> u32 {
+        self.write(a, &v.to_be_bytes())
+    }
+    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
+        let r = self.read(a, 8 * buf.len());
+        if r.status == BUS_OK {
+            let bytes = self.peer.bytes(self.widget, a, 8 * buf.len());
+            for (word, b) in buf.iter_mut().zip(bytes.chunks_exact(8)) {
+                *word = u64::from_be_bytes(b.try_into().unwrap());
+            }
+        }
+        r.status
+    }
+    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
+        self.write(a, &buf.iter().flat_map(|w| w.to_be_bytes()).collect::<Vec<_>>())
+    }
+}
+
+impl InterruptController for Port {
+    fn set_line(&self, _: u32, _: bool) {}
+    fn packet(&self, source: u8, address: u64, line: u32, level: bool) -> bool {
+        if self.peer.refuse.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.peer.interrupts.lock().push((source, address, u64::from(line) | if level { SET } else { 0 }));
+        true
+    }
+}
+
+/// A host that takes interrupt packets only, and has no memory.
+fn packets_only(irq: impl InterruptController + 'static) -> Upstream {
+    Upstream::single(XtalkHost { widget: HOST, int_packet: 0, int_packet_mask: 0, vectors: 256 }, Arc::new(NoMemory), Arc::new(irq))
+}
+struct NoMemory;
+impl BusDevice for NoMemory {}
 
 struct Rig {
     pic: Arc<Pic>,
@@ -137,9 +203,8 @@ struct Rig {
 }
 
 fn rig() -> Rig {
-    let pic = Pic::new(15);
     let peer = Arc::new(Peer::default());
-    pic.connect_peer(peer.clone()).unwrap();
+    let pic = Pic::new(15, HOST, peer.up());
     Rig { bus: pic.widget(), pic, peer }
 }
 
@@ -504,7 +569,7 @@ fn direct_map_dma_goes_where_each_heads_direct_map_says() {
     assert_eq!(r.peer.bytes(11, (1 << 31) | 0x2000, 8), other);
     assert_eq!(r.peer.bytes(10, 0x2000, 8), vec![0; 8], "the other head's target is untouched");
     let log = r.peer.dma.lock().clone();
-    assert_eq!(log[0], Dma { source: 15, widget: 10, address: 0x1000, len: 8, write: true });
+    assert_eq!(log[0], Dma { widget: 10, address: 0x1000, len: 8, write: true });
     // Reads come back through the same path.
     let mut back = [0u8; 8];
     assert!(a.dma().dma_read(0x8000_1000, &mut back).is_ok());
@@ -563,6 +628,42 @@ fn dma_outside_the_direct_window_is_refused_and_a_read_comes_back_zero() {
     r.peer.refuse.store(false, Ordering::SeqCst);
     assert_eq!(r.pic.heads[0].dma(0, 0x8000_0000, &mut [0; 4], false), PciDmaStatus::MasterAbort);
     assert_eq!(r.pic.heads[0].dma(5, 0x8000_0000, &mut [0; 4], false), PciDmaStatus::MasterAbort);
+}
+
+/// DMA that names a widget the PIC has no host at is a master abort and moves
+/// nothing, and a host whose link is down is no better.
+#[test]
+fn dma_to_a_widget_that_is_not_a_host_is_a_bus_error() {
+    let peer = Arc::new(Peer::default());
+    let pic = Pic::new(15, HOST, Upstream::new().with(HostPort::new(
+        XtalkHost { widget: HOST, int_packet: 0, int_packet_mask: 0, vectors: 256 },
+        Arc::new(Port { peer: peer.clone(), widget: HOST }),
+        Arc::new(Port { peer: peer.clone(), widget: HOST }),
+    )));
+    let bus = pic.widget();
+    let card = Card::new(0x7005);
+    pic.attach(0, 1, card.clone(), Function::default());
+    bus.write64(0x80, u64::from(HOST) << 20);
+    bus.write64(0x200, 0x1800_1000 | (1 << 19));
+    assert!(card.dma().dma_write(0x8000_1000, &[7; 8]).is_ok());
+    assert_eq!(peer.bytes(HOST, 0x1000, 8), [7; 8]);
+    bus.write64(0x80, 12 << 20);
+    assert_eq!(card.dma().dma_write(0x8000_1000, &[9; 8]), PciDmaStatus::MasterAbort);
+    let mut back = [0xffu8; 8];
+    assert_eq!(card.dma().dma_read(0x8000_1000, &mut back), PciDmaStatus::MasterAbort);
+    assert_eq!(back, [0; 8]);
+    assert_eq!(peer.dma.lock().len(), 1, "only the first transfer reached a host");
+}
+
+#[test]
+fn transfer_legs_keep_aligned_widths() {
+    assert_eq!(legs(0x1003, 19).collect::<Vec<_>>(), [(0, 1), (1, 4), (5, 8), (13, 4), (17, 2)]);
+    // Whole doublewords from an aligned address are one run; ragged bytes
+    // around it stay as the fields they were.
+    assert_eq!(legs(0x2000, 16).collect::<Vec<_>>(), [(0, 16)]);
+    assert_eq!(legs(0x2004, 4100).collect::<Vec<_>>(), [(0, 4), (4, 4096)]);
+    assert_eq!(legs(0x2000, 4103).collect::<Vec<_>>(), [(0, 4096), (4096, 4), (4100, 2), (4102, 1)]);
+    assert_eq!(legs(0x2000, 0).count(), 0);
 }
 
 /// This bridge refuses a function's DMA aimed at a bus address a function
@@ -656,11 +757,11 @@ fn a_swap_clear_direct64_transfer_keeps_its_words_whole() {
     assert_eq!(r.peer.bytes(0xa, 0x6000, 4), [0xa2, 0xa1, 0, 0], "the word's other bytes are left alone");
     assert_eq!(r.peer.bytes(0xa, 0x6004, 4), [4, 3, 2, 1]);
     assert_eq!(r.peer.byte(0xa, 0x600b), 0xb1);
-    // Three bytes from a doubleword's second: one packet, read back too.
+    // Three bytes from a doubleword's second: the host takes them as a halfword and a byte, read back too.
     r.peer.dma.lock().clear();
     assert!(wide.dma().dma_write(direct64(0xa, 0, 0x7001), &[1, 2, 3]).is_ok());
     let packets: Vec<(u64, usize)> = r.peer.dma.lock().iter().map(|p| (p.address, p.len)).collect();
-    assert_eq!(packets, [(0x7004, 3)]);
+    assert_eq!(packets, [(0x7004, 2), (0x7006, 1)]);
     assert_eq!(r.peer.bytes(0xa, 0x7004, 3), [3, 2, 1]);
     let mut back = [0u8; 3];
     assert!(wide.dma().dma_read(direct64(0xa, 0, 0x7001), &mut back).is_ok());
@@ -765,22 +866,18 @@ fn an_unswapped_transfer_goes_as_one_run_of_doublewords() {
     {
         r.peer.dma.lock().clear();
         // The head takes the page whole (the card's own DMA path feeds it
-        // in 512-byte pieces).
+        // in 512-byte pieces); the host sees it as runs of whole doublewords.
         let head = &r.pic.heads[0];
         assert_eq!(head.dma(1, address, &mut data[..4096].to_vec(), true), PciDmaStatus::Ok);
         let packets: Vec<(u64, usize)> = r.peer.dma.lock().iter().map(|p| (p.address, p.len)).collect();
-        assert_eq!(packets, [(at, 4096)], "{name}: an aligned page is one packet");
+        let runs: Vec<_> = (0..8).map(|i| (at + 512 * i, 512)).collect();
+        assert_eq!(packets, runs, "{name}: an aligned page is runs of whole doublewords");
         assert_eq!(r.peer.bytes(widget, at, 4096), data[..4096]);
         r.peer.dma.lock().clear();
         // Three bytes before the first doubleword, five after the last.
         assert_eq!(head.dma(1, address + 5, &mut data[..3 + 64 + 5].to_vec(), true), PciDmaStatus::Ok);
         let packets: Vec<(u64, usize)> = r.peer.dma.lock().iter().map(|p| (p.address, p.len)).collect();
-        let want: Vec<(u64, usize)> = if name == "direct32" {
-            vec![(at + 5, 1), (at + 6, 2), (at + 8, 64), (at + 72, 4), (at + 76, 1)]
-        } else {
-            vec![(at + 5, 3), (at + 8, 64), (at + 72, 5)]
-        };
-        assert_eq!(packets, want, "{name}");
+        assert_eq!(packets, [(at + 5, 1), (at + 6, 2), (at + 8, 64), (at + 72, 4), (at + 76, 1)], "{name}");
         assert_eq!(r.peer.bytes(widget, at + 5, 72), data[..72], "{name}");
         let mut back = vec![0u8; 4096 + 7];
         assert!(card.dma().dma_write(address, &data).is_ok());
@@ -1051,16 +1148,11 @@ fn a_refused_packet_is_dropped_and_a_force_write_sends_it_again() {
 
 /// Both PIs, told apart the way the node does: by address bit 21.
 struct ToPi([Pi; 2]);
-impl PicPeer for ToPi {
-    fn interrupt(&self, _: u8, address: u64, payload: u64) -> Result<(), Refused> {
-        self.0[(address >> 21) as usize & 1].write64(pi_reg::INT_PEND_MOD::OFFSET, payload);
-        Ok(())
-    }
-    fn dma_read(&self, _: u8, _: u8, _: u64, _: &mut [u8]) -> Result<(), Refused> {
-        Err(Refused)
-    }
-    fn dma_write(&self, _: u8, _: u8, _: u64, _: &[u8]) -> Result<(), Refused> {
-        Err(Refused)
+impl InterruptController for ToPi {
+    fn set_line(&self, _: u32, _: bool) {}
+    fn packet(&self, _: u8, address: u64, line: u32, level: bool) -> bool {
+        self.0[(address >> 21) as usize & 1].write64(pi_reg::INT_PEND_MOD::OFFSET, u64::from(line) | if level { SET } else { 0 });
+        true
     }
 }
 
@@ -1070,8 +1162,7 @@ impl PicPeer for ToPi {
 #[test]
 fn a_force_write_after_dispatch_brings_back_an_active_input() {
     let (pi, _now) = pi_with_clock();
-    let pic = Pic::new(15);
-    pic.connect_peer(Arc::new(ToPi([pi.clone(), pi.other()]))).unwrap();
+    let pic = Pic::new(15, HOST, packets_only(ToPi([pi.clone(), pi.other()])));
     let bus = pic.widget();
     bus.write64(0x130 + 3 * 8, destination(12));
     bus.write64(0x108, 1 << 3);
@@ -1091,17 +1182,13 @@ fn a_force_write_after_dispatch_brings_back_an_active_input() {
 /// A processor on another thread that takes and clears the level the moment
 /// the set packet lands, before the sending thread has gone on.
 struct TakenAtOnce(Pi);
-impl PicPeer for TakenAtOnce {
-    fn interrupt(&self, _: u8, _: u64, payload: u64) -> Result<(), Refused> {
+impl InterruptController for TakenAtOnce {
+    fn set_line(&self, _: u32, _: bool) {}
+    fn packet(&self, _: u8, _: u64, line: u32, level: bool) -> bool {
+        let payload = u64::from(line) | if level { SET } else { 0 };
         self.0.write64(pi_reg::INT_PEND_MOD::OFFSET, payload);
         self.0.write64(pi_reg::INT_PEND_MOD::OFFSET, payload & !SET);
-        Ok(())
-    }
-    fn dma_read(&self, _: u8, _: u8, _: u64, _: &mut [u8]) -> Result<(), Refused> {
-        Err(Refused)
-    }
-    fn dma_write(&self, _: u8, _: u8, _: u64, _: &[u8]) -> Result<(), Refused> {
-        Err(Refused)
+        true
     }
 }
 
@@ -1115,8 +1202,7 @@ fn a_level_cleared_while_its_input_stays_high_waits_for_the_force_write() {
     for enable_last in [false, true] {
         let what = if enable_last { "enable" } else { "rising input" };
         let (pi, now) = pi_with_clock();
-        let pic = Pic::new(15);
-        pic.connect_peer(Arc::new(TakenAtOnce(pi.clone()))).unwrap();
+        let pic = Pic::new(15, HOST, packets_only(TakenAtOnce(pi.clone())));
         let bus = pic.widget();
         bus.write64(0x130, destination(12));
         if enable_last {
@@ -1197,13 +1283,10 @@ fn an_invalid_address_write_latches_status_and_sends_one_packet() {
 
 #[test]
 fn two_pics_are_independent_devices() {
-    let a = Pic::new(11);
-    let b = Pic::new(15);
     let peer_a = Arc::new(Peer::default());
     let peer_b = Arc::new(Peer::default());
-    a.connect_peer(peer_a.clone()).unwrap();
-    b.connect_peer(peer_b.clone()).unwrap();
-    assert_eq!(a.connect_peer(peer_b.clone()), Err(AlreadyConnected));
+    let a = Pic::new(11, HOST, peer_a.up());
+    let b = Pic::new(15, HOST, peer_b.up());
     assert_eq!((a.widget_number(), b.widget_number()), (11, 15));
     let (bus_a, bus_b) = (a.widget(), b.widget());
     bus_a.write64(0x20, 0x0f00_3205);
