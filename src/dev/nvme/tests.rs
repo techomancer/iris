@@ -8,6 +8,7 @@ use super::*;
 use crate::irq::LevelProbe;
 use crate::pci::{CpuWindow, DevFn, IntxRouting, PciBus, PciDmaStatus, PciHost, PciToPciBridge, Space, PCI_COMMAND_MEMORY};
 use crate::test_temp::TempPath;
+use std::time::Duration;
 
 /// Host memory as a bus master sees it: a byte array from address 0.
 use crate::pci::testing::FlatMem as Mem;
