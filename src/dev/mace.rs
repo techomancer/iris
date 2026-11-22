@@ -317,7 +317,6 @@ impl BusDevice for Mace {
             return self.rtc.read8(addr);
         }
         if MaceAudio::contains(a) {
-            self.audio.catch_up(&self.audio_io());
             return BusDevice::read8(&self.audio, addr);
         }
         if Self::in_sdma(a) {
@@ -351,7 +350,6 @@ impl BusDevice for Mace {
             return self.rtc.read16(addr);
         }
         if MaceAudio::contains(a) {
-            self.audio.catch_up(&self.audio_io());
             return BusDevice::read16(&self.audio, addr);
         }
         if Self::in_sdma(a) {
@@ -395,7 +393,6 @@ impl BusDevice for Mace {
             return self.rtc.read32(addr);
         }
         if MaceAudio::contains(a) {
-            self.audio.catch_up(&self.audio_io());
             return BusDevice::read32(&self.audio, addr);
         }
         if Self::in_sdma(a) {
@@ -440,7 +437,6 @@ impl BusDevice for Mace {
             return self.rtc.read64(addr);
         }
         if MaceAudio::contains(a) {
-            self.audio.catch_up(&self.audio_io());
             return BusDevice::read64(&self.audio, addr);
         }
         if Self::in_sdma(a) {

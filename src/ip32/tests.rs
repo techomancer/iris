@@ -410,11 +410,10 @@ fn sdma_bus() -> std::sync::Arc<Ip32Bus> {
 }
 
 /// IRIX paces its audio by MACE's read pointer: it reads it about once a
-/// millisecond and writes about 2 ms of sound past it. The pointer it reads
-/// is where the engine is, not where the last service pass (up to 2 ms ago
-/// on a quiet machine) left it; otherwise the next pass ran the ring dry.
+/// millisecond and writes about 2 ms of sound past it. While a channel plays the
+/// service thread passes again at once, not after its 2 ms idle sleep.
 #[test]
-fn an_audio_register_read_sees_the_ring_as_it_stands() {
+fn audio_keeps_the_service_thread_polling_and_a_pass_moves_the_ring() {
     use crate::dev::mace_audio::MACE_AUDIO;
     let bus = sdma_bus();
     let a = MACE_AUDIO as u64;
@@ -426,10 +425,10 @@ fn an_audio_register_read_sees_the_ring_as_it_stands() {
     codec(27, 1 << 8); // DAC1 on
     bus.write64(a + 0x40, 0x200); // output 1 running
     bus.write64(a + 0x50, 0xfe0); // a full ring
-    bus.service();
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    let rptr = bus.read64(a + 0x48).data;
-    assert!(rptr >= 0x280, "10 ms at 8 kHz is 20 blocks with no service pass between, read {rptr:#x}");
+    assert!(bus.service(), "a channel playing from a ring asks for the tight poll");
+    // 10 ms at 8 kHz is 20 blocks.
+    let passes = |bus: &Ip32Bus| { bus.service(); bus.read64(a + 0x48).data >= 0x280 };
+    assert!(crate::test_board::until(std::time::Duration::from_secs(60), || passes(&bus)), "the ring did not move");
 }
 
 fn sdma_reg(p: u32, reg: u32) -> u64 {

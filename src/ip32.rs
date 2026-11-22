@@ -669,11 +669,12 @@ impl Ip32Bus {
     /// and the beam's timing interrupts. As on the Indy, there is no
     /// refresh of interrupt lines: each device drives its own when its state
     /// changes, from the register access, the event or this tick that
-    /// changed it. Returns whether CRIME is interrupting the CPU (IP2).
+    /// changed it. Returns whether CRIME is interrupting the CPU (IP2) or audio is
+    /// playing from a ring: the caller then passes again at once.
     pub fn service(&self) -> bool {
         self.mace.service();
         self.gbe.service();
-        self.crime.regs.interrupting()
+        self.crime.regs.interrupting() || self.mace.audio.active()
     }
 
     /// The file the flash is kept in, if one was named.
