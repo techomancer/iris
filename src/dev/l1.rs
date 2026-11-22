@@ -11,6 +11,7 @@
 use crate::dev::ns16550::{com_reg, Ns16550};
 use crate::dev::serial_host::{null_serial_backend, SerialBackend};
 use crate::devlog::LogModule;
+use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
 use crate::traits::{BusDevice, BusRead64, Device, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
@@ -83,6 +84,19 @@ impl SerialBackend for ProtocolBackend {
 /// Register offsets are relative to the 0x40-byte UART window; only aligned
 /// 64-bit accesses decode, values in the low eight bits.
 pub struct L1 {
+    shared: Arc<Shared>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl std::ops::Deref for L1 {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+/// What the serial worker and the receive-timeout timer share with the device.
+pub struct Shared {
     // UART RX takes UART -> protocol queue. Model replies take state -> protocol
     // queue. No path holds the protocol queue while acquiring either lock.
     state: Arc<Mutex<State>>,
@@ -94,11 +108,12 @@ pub struct L1 {
     irq: Arc<Mutex<IrqLine>>,
     handler: Arc<Mutex<Option<EventHandler>>>,
     running: Arc<AtomicBool>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     wake: Arc<(Mutex<()>, parking_lot::Condvar)>,
+    /// The UART's receive timeout, on the machine clock.
+    rx_timer: Timer,
 }
 impl L1 {
-    pub fn new(config: L1Config) -> Result<Self, String> {
+    pub fn new(tm: &Arc<TimerManager>, config: L1Config) -> Result<Self, String> {
         if config.rack > 0x3ff || config.bay > 0x3f || config.node_position > 3 {
             return Err("L1 rack, bay or node position out of range".into());
         }
@@ -135,8 +150,9 @@ impl L1 {
         });
         let mut uart = Ns16550::new(UART_BAUDBASE);
         uart.set_backend(protocol_backend);
+        uart.set_clock(tm.clock().clone());
 
-        Ok(Self {
+        let shared = Arc::new_cyclic(|me| Shared {
             state,
             dispatch: Arc::new(Mutex::new(Dispatch::default())),
             uart: Arc::new(Mutex::new(uart)),
@@ -145,9 +161,13 @@ impl L1 {
             irq: Arc::new(Mutex::new(IrqLine::unconnected())),
             handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
-            worker: Mutex::new(None),
             wake: Arc::new((Mutex::new(()), parking_lot::Condvar::new())),
-        })
+            rx_timer: Timer::new(tm, me, |s: &Shared, _| {
+                s.service_protocol_uart();
+                s.flush();
+            }),
+        });
+        Ok(Self { shared, worker: Mutex::new(None) })
     }
 
     /// Install the separate host-side L1 console connection.
@@ -174,11 +194,6 @@ impl L1 {
 
     pub fn station_mac(&self) -> [u8; 6] {
         self.state.lock().config.mac
-    }
-
-    /// The machine clock the UART's receive timeout runs on.
-    pub fn set_clock(&self, clock: crate::clock::Clock) {
-        self.uart.lock().set_clock(clock);
     }
 
     #[cfg(test)]
@@ -237,13 +252,6 @@ impl L1 {
         }
     }
 
-    /// Let the native UART pull reply bytes from the model's shared bounded queue.
-    fn service_protocol_uart(&self) {
-        let mut uart = self.uart.lock();
-        uart.pump();
-        uart.check_timeout();
-    }
-
     /// Parse guest transmit only after the UART lock is released. The UART
     /// callback only appends to this independent queue.
     fn process_guest_transmit(&self) {
@@ -258,6 +266,14 @@ impl L1 {
             }
         }
         self.service_protocol_uart();
+    }
+}
+impl Shared {
+    /// Let the native UART pull reply bytes from the model's shared bounded queue.
+    fn service_protocol_uart(&self) {
+        let mut uart = self.uart.lock();
+        uart.pump();
+        uart.check_timeout();
     }
 
     fn flush(&self) {
@@ -277,7 +293,12 @@ impl L1 {
                 )
             };
             drop(dispatch);
-            let level = self.uart.lock().irq();
+            // Under the lock, so an older deadline cannot land after a newer one.
+            let level = {
+                let uart = self.uart.lock();
+                self.rx_timer.set_due(uart.timeout_due());
+                uart.irq()
+            };
 
             // Reentrant reads request another drain, but must not repeat an
             // unchanged IRQ and recursively trigger the same machine callback.
@@ -352,18 +373,8 @@ impl Device for L1 {
             return;
         }
         self.running.store(true, Ordering::Release);
-        let device = Self {
-            state: self.state.clone(),
-            dispatch: self.dispatch.clone(),
-            uart: self.uart.clone(),
-            guest_tx: self.guest_tx.clone(),
-            backend: self.backend.clone(),
-            irq: self.irq.clone(),
-            handler: self.handler.clone(),
-            running: self.running.clone(),
-            worker: Mutex::new(None),
-            wake: self.wake.clone(),
-        };
+        self.rx_timer.start();
+        let device = Self { shared: self.shared.clone(), worker: Mutex::new(None) };
         *worker = Some(
             std::thread::Builder::new()
                 .name("l1-serial".into())
@@ -391,6 +402,7 @@ impl Device for L1 {
             self.wake.1.notify_all();
         }
         let worker = slot.take();
+        self.rx_timer.stop();
         if let Some(worker) = worker {
             if worker.thread().id() != std::thread::current().id() {
                 let _ = worker.join();
