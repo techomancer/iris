@@ -19,7 +19,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -201,6 +201,16 @@ fn save_nvram((path, image, clock): &NvramJob) -> std::io::Result<()> {
 /// A rewrite of the NVRAM file waiting for the writer thread.
 type NvramJob = (std::path::PathBuf, Vec<u8>, Option<Vec<u8>>);
 
+/// What the writer thread shares with the part. It holds only this, so
+/// dropping the part's last reference runs its `Drop`, which joins the writer.
+#[derive(Default)]
+struct WriterSlot {
+    /// The NVRAM image the writer thread has yet to put in the file.
+    job: Mutex<Option<NvramJob>>,
+    ready: Condvar,
+    running: AtomicBool,
+}
+
 /// The clock part: its registers and RAM, the file they persist in, and the
 /// thread that writes it.
 pub struct Ds1685 {
@@ -210,25 +220,18 @@ pub struct Ds1685 {
     /// Where the guest's power-off goes: one `PowerOff` event when it writes
     /// the bit.
     events: Option<SyncSender<MachineEvent>>,
-    /// The NVRAM image the writer thread has yet to put in the file.
-    job: Mutex<Option<NvramJob>>,
-    ready: Condvar,
-    running: AtomicBool,
+    slot: Arc<WriterSlot>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    me: Weak<Ds1685>,
 }
 
 impl Ds1685 {
     pub fn new(events: Option<SyncSender<MachineEvent>>) -> Arc<Ds1685> {
-        Arc::new_cyclic(|me| Ds1685 {
+        Arc::new(Ds1685 {
             st: Mutex::new(Rtc::new()),
             dirty: AtomicU64::new(0),
             events,
-            job: Mutex::new(None),
-            ready: Condvar::new(),
-            running: AtomicBool::new(false),
+            slot: Arc::default(),
             thread: Mutex::new(None),
-            me: me.clone(),
         })
     }
 
@@ -312,8 +315,8 @@ impl Ds1685 {
     /// The debounce ran out: hand the image to the writer thread.
     pub fn hand_over(&self) {
         if let Some(job) = self.take_dirty(NVRAM_QUIET) {
-            *self.job.lock() = Some(job);
-            self.ready.notify_all();
+            *self.slot.job.lock() = Some(job);
+            self.slot.ready.notify_all();
         }
     }
 
@@ -340,13 +343,12 @@ impl Ds1685 {
     }
 
     /// Write the NVRAM file when the timer hands over an image.
-    fn writer(me: Weak<Ds1685>) {
+    fn writer(s: Arc<WriterSlot>) {
         loop {
             let job = {
-                let Some(d) = me.upgrade() else { return };
-                let mut slot = d.job.lock();
-                while slot.is_none() && d.running.load(Ordering::SeqCst) {
-                    d.ready.wait(&mut slot);
+                let mut slot = s.job.lock();
+                while slot.is_none() && s.running.load(Ordering::SeqCst) {
+                    s.ready.wait(&mut slot);
                 }
                 match slot.take() {
                     Some(j) => j,
@@ -405,39 +407,35 @@ impl Device for Ds1685 {
 
     /// Start the writer thread.
     fn start(&self) {
-        if self.running.swap(true, Ordering::SeqCst) {
+        if self.slot.running.swap(true, Ordering::SeqCst) {
             return;
         }
-        let me = self.me.clone();
+        let slot = self.slot.clone();
         *self.thread.lock() = Some(
             std::thread::Builder::new()
                 .name("IOC3-NVRAM".into())
-                .spawn(move || Ds1685::writer(me))
+                .spawn(move || Ds1685::writer(slot))
                 .expect("spawn ds1685 nvram thread"),
         );
     }
 
     /// Join the writer and flush the file.
     fn stop(&self) {
-        if !self.running.swap(false, Ordering::SeqCst) {
+        if !self.slot.running.swap(false, Ordering::SeqCst) {
             return;
         }
         // The writer waits on the job slot's lock: take it so the wake-up
         // cannot fall between its check of `running` and its wait.
-        drop(self.job.lock());
-        self.ready.notify_all();
-        // The writer can hold the last reference for a moment, and then this
-        // runs on it; it cannot join itself.
+        drop(self.slot.job.lock());
+        self.slot.ready.notify_all();
         if let Some(t) = self.thread.lock().take() {
-            if t.thread().id() != std::thread::current().id() {
-                let _ = t.join();
-            }
+            let _ = t.join();
         }
         self.flush();
     }
 
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.slot.running.load(Ordering::SeqCst)
     }
 
     fn get_clock(&self) -> u64 {
@@ -449,5 +447,24 @@ impl Drop for Ds1685 {
     fn drop(&mut self) {
         Device::stop(&*self);
         self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_started_part_without_stop_ends_its_writer() {
+        let d = Ds1685::new(None);
+        d.start();
+        // Wait for the writer to park holding its reference.
+        let t = Instant::now();
+        while Arc::strong_count(&d) < 2 && t.elapsed() < Duration::from_millis(500) {
+            std::thread::yield_now();
+        }
+        let part = Arc::downgrade(&d);
+        drop(d);
+        assert!(part.upgrade().is_none(), "the writer kept the part alive");
     }
 }
