@@ -115,6 +115,9 @@ pub(super) struct Reports {
     pub dma_code_reported: bool,
     /// One bit per dma::REPORT_* reason.
     pub dma_read_reported: u32,
+    /// The texture packing check (Board::check_level_packing).
+    #[cfg(feature = "vprodiag")]
+    pub packing: super::packing::PackingCheck,
 }
 
 /// The vertex side's texture registers: the current texture coordinate
@@ -599,6 +602,8 @@ impl Default for Board {
                 dma_readback_reported: false,
                 dma_code_reported: false,
                 dma_read_reported: 0,
+                #[cfg(feature = "vprodiag")]
+                packing: Default::default(),
             },
             draw_mask: 0,
             draw_word: 0,
@@ -970,6 +975,8 @@ impl Board {
         self.tex.coord_r = 0;
         self.tex.coord_q = ODSY_F32_ONE;
         self.diag.tex_rect_reported = false;
+        #[cfg(feature = "vprodiag")]
+        self.diag.packing.uploads.clear();
         self.stream.vertex_x.fill(0);
         self.stream.vertex_y.fill(0);
         self.stream.vertex_count = 0;

@@ -410,6 +410,20 @@ impl Odyssey {
                     g.diag.reported_addr_count.load(std::sync::atomic::Ordering::Relaxed),
                     g.diag.reported_cmd_count
                 );
+                #[cfg(feature = "vprodiag")]
+                {
+                    let p = &g.diag.packing;
+                    let _ = writeln!(
+                        out,
+                        "  texture packing: {} levels checked against the upload that wrote them, {} disagree",
+                        p.checked, p.mismatch_count
+                    );
+                    for m in &p.mismatches {
+                        let _ = writeln!(out, "    {m}");
+                    }
+                }
+                #[cfg(not(feature = "vprodiag"))]
+                let _ = writeln!(out, "  texture packing: not checked (build with --features vprodiag)");
             }
             None => {
                 let _ = writeln!(out, "  board busy: state not read (FIFO {} words, raster {} jobs)", fifo.queued_words(), raster.pending());

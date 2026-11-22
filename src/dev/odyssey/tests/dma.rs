@@ -597,3 +597,81 @@ fn a_luminance_alpha_texture_upload_keeps_its_alpha() {
     assert_eq!(word(1), 0x8080_80ff);
     assert_eq!(word(2), 0x3c3c_3c5a);
 }
+
+/// Level descriptor `i`'s three words, as the library sends them.
+fn tex_level(s: &mut Board, i: u32, word0: u32, word1: u32) {
+    for w in [select(reg::TEX_LEVEL + i), word0, word1, 0] {
+        s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
+    }
+}
+
+/// The board model checks each texture level the library names against
+/// the upload that wrote its memory: buttonfly's luminance-alpha font
+/// (format index 0xb over a 2-byte upload of code 0x48) agrees; the same
+/// memory named as format index 0xc (four 4-bit components) does not, and
+/// the disagreement is counted and kept for `vpro status`.
+#[cfg(feature = "vprodiag")]
+#[test]
+fn a_level_is_checked_against_the_upload_that_wrote_it() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0xff, 0x00, 0x80, 0xff]);
+    put_table(&ram, TABLE, [0x16d000, 0, 0x10, 1 << 16 | 2, 0x8000_1000, 0, 4, 0x3200_0048], &[pte(PAGE_B, 4)]);
+    descriptor(&mut s, TABLE);
+
+    tex_level(&mut s, 0, 0x16d000, 0x00b0_0010);
+    s.gpu_sync();
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+
+    // Each upload is checked once: a second draw's descriptor is not.
+    tex_level(&mut s, 0, 0x16d000, 0x00c0_0010);
+    s.gpu_sync();
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+
+    descriptor(&mut s, TABLE);
+    tex_level(&mut s, 0, 0x16d000, 0x00c0_0010);
+    s.gpu_sync();
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (2, 1));
+    assert!(s.diag.packing.mismatches[0].contains("word 4 0x80001000"), "{}", s.diag.packing.mismatches[0]);
+}
+
+/// glprim's 256x256 LUMINANCE (and INTENSITY) texture: a one-byte source,
+/// code 0x42, uploaded by address with no level selected under the same
+/// word 4 as buttonfly's font, into the level its descriptor names as
+/// format index 4, one byte a texel's value. The board model's packing
+/// check found it stored as four 4-bit components.
+#[test]
+fn a_luminance_texture_upload_keeps_its_byte() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0x00, 0x80, 0xff, 0x5a]);
+    put_table(&ram, TABLE, [0x16d000, 0, 0x10, 1 << 16 | 4, 0x8000_1000, 0, 4, 0x3205_0042], &[pte(PAGE_B, 4)]);
+
+    descriptor(&mut s, TABLE);
+    tex_level(&mut s, 0, 0x16d000, 0x0040_0010);
+    s.gpu_sync();
+
+    let one = Codec::Texel { bytes: 2, field: crate::dev::odyssey::field::FIELD_ONE };
+    let word = |x| mem_word(&s, 0x16d000, 0x10, 1, one, x, 0);
+    assert_eq!([word(0), word(1), word(2), word(3)], [0, 0x8080_8080, 0xffff_ffff, 0x5a5a_5a5a]);
+    #[cfg(feature = "vprodiag")]
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+}
+
+/// An 8-byte level names format index 33 (four components) over an
+/// upload stored as four 12-bit lanes: the same storage, not a
+/// disagreement.
+#[cfg(feature = "vprodiag")]
+#[test]
+fn an_eight_byte_level_over_lanes_is_the_same_packing() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0x11, 0x22, 0x33, 0x44]);
+    put_table(&ram, TABLE, [0x16b000, 0, 0x10, 1 << 16 | 1, 0x8002_5000, 0, 4, 0x3201_004b], &[pte(PAGE_B, 4)]);
+
+    descriptor(&mut s, TABLE);
+    tex_level(&mut s, 0, 0x16b000, 0x8210_0010);
+    s.gpu_sync();
+
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+}
