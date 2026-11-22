@@ -141,6 +141,19 @@ impl MachineStatus {
     /// A status reporting through `heartbeat`, whose first CPU's clock
     /// ticks are counted in `ticks`.
     pub fn new(heartbeat: Arc<AtomicU64>, ticks: Arc<AtomicU64>) -> Arc<Self> {
+        let s = Self::build(heartbeat);
+        let _ = s.cpus[0].ticks.set(ticks);
+        s
+    }
+
+    /// A status whose first CPU's tick counter is wired later, with
+    /// [`set_cpu_ticks`](Self::set_cpu_ticks): for boards built before
+    /// their CPUs.
+    pub fn without_ticks(heartbeat: Arc<AtomicU64>) -> Arc<Self> {
+        Self::build(heartbeat)
+    }
+
+    fn build(heartbeat: Arc<AtomicU64>) -> Arc<Self> {
         let s = Self {
             heartbeat,
             scsi_wide: AtomicBool::new(false),
@@ -155,7 +168,6 @@ impl MachineStatus {
             sampler: Mutex::new(Sampler::default()),
             refresh: crate::display::Refresh::new(),
         };
-        let _ = s.cpus[0].ticks.set(ticks);
         Arc::new(s)
     }
 
@@ -190,6 +202,12 @@ impl MachineStatus {
     /// Wire the first CPU's cycle counter.
     pub fn set_cpu_cycles(&self, ptr: CyclesPtr) {
         self.cpus[0].set_cycles(ptr);
+    }
+
+    /// Wire the first CPU's clock-tick counter, unless the status was made
+    /// with one.
+    pub fn set_cpu_ticks(&self, ticks: Arc<AtomicU64>) {
+        let _ = self.cpus[0].ticks.set(ticks);
     }
 
     /// The first CPU's cycle counter.
@@ -834,6 +852,20 @@ mod tests {
     fn a_reset_in_the_window_counts_from_zero() {
         assert_eq!(cycles_moved(900, 40), 40);
         assert_eq!(cycles_moved(40, 900), 860);
+    }
+
+    /// A board built before its CPUs takes CPU 0's tick counter later; a
+    /// status made with one keeps it.
+    #[test]
+    fn first_cpu_ticks_wired_later() {
+        let late = MachineStatus::without_ticks(Arc::default());
+        assert_eq!(late.cpu(0).ticks(), 0);
+        let t = Arc::new(AtomicU64::new(42));
+        late.set_cpu_ticks(t.clone());
+        assert_eq!(late.cpu(0).ticks(), 42);
+        let made = MachineStatus::new(Arc::default(), Arc::new(AtomicU64::new(7)));
+        made.set_cpu_ticks(t);
+        assert_eq!(made.cpu(0).ticks(), 7);
     }
 
     /// Activity bits clear once shown; the LEDs stay lit.

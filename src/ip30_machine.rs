@@ -584,8 +584,12 @@ impl OctaneMachine {
         }
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
+        // Each processor's clock is its CP0 Compare (HEART's counter is
+        // IRIX's time base, not its tick): publish the rate it programs.
+        cpu.publish_tick_rate(status.cpu(0).tick_rate());
         for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
-            status.add_cpu_stats(c.cycles_ptr(), tick.clone());
+            let n = status.add_cpu_stats(c.cycles_ptr(), tick.clone());
+            c.publish_tick_rate(status.cpu(n).tick_rate());
         }
         if let Some(g) = &gfx {
             // Host GL frames composite straight into the IMPACT framebuffer.

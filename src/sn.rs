@@ -789,10 +789,15 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
         let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
         let first = &cpus[0];
         if let Some(status) = &io.status {
+            // Every processor's clock is its CP0 Compare: count its matches
+            // and publish the rate its deadlines program.
             status.set_cpu_cycles(first.cycles_ptr());
+            status.set_cpu_ticks(first.fasttick_count());
             status.set_count_hz(first.count_hz_atomic());
+            first.publish_tick_rate(status.cpu(0).tick_rate());
             for c in &cpus[1..] {
-                status.add_cpu_stats(c.cycles_ptr(), c.fasttick_count());
+                let n = status.add_cpu_stats(c.cycles_ptr(), c.fasttick_count());
+                c.publish_tick_rate(status.cpu(n).tick_rate());
             }
         }
         let monitor = Monitor::new();

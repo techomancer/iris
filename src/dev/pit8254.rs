@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use spin::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
@@ -66,6 +66,9 @@ pub struct Pit8254 {
     debug: Arc<AtomicBool>,
     base_frequency: u32,
     clock: Clock,
+    /// Where the interrupt rate the guest programmed is published (see
+    /// `publish_rate`): the channels counted, as a mask, and the sink.
+    rate_sink: Arc<std::sync::OnceLock<(u8, Arc<AtomicU64>)>>,
 }
 
 impl Pit8254 {
@@ -81,6 +84,7 @@ impl Pit8254 {
             debug: Arc::new(AtomicBool::new(false)),
             base_frequency,
             clock: Clock::default(),
+            rate_sink: Arc::new(std::sync::OnceLock::new()),
         };
         // Channel 2 is driven by the base frequency (1 MHz)
         pit.channels[2].lock().input_freq = base_frequency;
@@ -89,6 +93,41 @@ impl Pit8254 {
 
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
         let _ = self.timer_manager.set(tm);
+    }
+
+    /// Publish into `sink`, in millihertz, the interrupt rate the guest has
+    /// programmed on the channels in `channels` (bit n for channel n),
+    /// summed, every time it reprograms them. For the status bar's tick
+    /// light (`status::CpuStatus::tick_rate`).
+    pub fn publish_rate(&self, channels: u8, sink: Arc<AtomicU64>) {
+        let _ = self.rate_sink.set((channels, sink));
+        self.update_rate();
+    }
+
+    /// The rate channel `idx` interrupts at as programmed, in hertz: 0 when
+    /// it is not a periodic mode (2, rate generator, or 3, square wave) or
+    /// has a zero count, which this model does not run. Channels 0 and 1 are
+    /// clocked by channel 2's output, channel 2 by the base clock.
+    pub fn programmed_hz(&self, idx: usize) -> f64 {
+        let periodic = |c: &Channel| (c.mode == 2 || c.mode == 3) && c.reload > 0;
+        let input = {
+            let c = self.channels[2].lock();
+            if !periodic(&c) {
+                return 0.0;
+            }
+            self.base_frequency as f64 / c.reload as f64
+        };
+        if idx == 2 {
+            return input;
+        }
+        let c = self.channels[idx].lock();
+        if periodic(&c) { input / c.reload as f64 } else { 0.0 }
+    }
+
+    fn update_rate(&self) {
+        let Some((mask, sink)) = self.rate_sink.get() else { return };
+        let hz: f64 = (0..3).filter(|i| mask & (1 << i) != 0).map(|i| self.programmed_hz(i)).sum();
+        sink.store(crate::status::hz_to_mhz(hz), Ordering::Relaxed);
     }
 
     /// ci_clock: the CPU's cycle counter, the channels' time base (see
@@ -295,6 +334,9 @@ impl Pit8254 {
         if update_chain {
             self.update_chaining();
         }
+        if do_arm {
+            self.update_rate();
+        }
     }
 
     fn write_control(&self, val: u8) {
@@ -334,6 +376,9 @@ impl Pit8254 {
 
         if update_chain {
             self.update_chaining();
+        }
+        if rw != 0 {
+            self.update_rate();
         }
     }
 
@@ -485,6 +530,7 @@ impl Resettable for Pit8254 {
             // Channel 2 is driven by base frequency; channels 0,1 start with 0 until chaining fires.
             chan.input_freq = if i == 2 { self.base_frequency } else { 0 };
         }
+        self.update_rate();
     }
 }
 
@@ -791,6 +837,38 @@ mod tests {
 
         assert_eq!(v1, v2, "Pit8254 save_state mismatch after load_state round-trip");
     }
+
+    /// The rate the guest programs is published as IRIX sets the timers up:
+    /// timer 2 divides 1 MHz to 5 kHz, timer 0 to the 100 Hz system clock,
+    /// timer 1 to the 1 kHz fast clock; a zero count stops timer 1, and a
+    /// one-shot mode is no clock.
+    #[test]
+    fn programmed_rate_is_published() {
+        let pit = Pit8254::new(1_000_000, None, None, None);
+        let sink = Arc::new(AtomicU64::new(7));
+        pit.publish_rate(0b011, sink.clone());
+        let mhz = || sink.load(AOrdering::Relaxed);
+        assert_eq!(mhz(), 0, "nothing programmed");
+        program_mode2(&pit, 0, 50);
+        assert_eq!(mhz(), 0, "timer 0 has no input clock yet");
+        program_mode2(&pit, 2, 200);
+        assert_eq!(mhz(), 100_000, "system clock");
+        program_mode2(&pit, 1, 5);
+        assert_eq!(mhz(), 1_100_000, "system and fast clocks");
+        program_mode2(&pit, 1, 0);
+        assert_eq!(mhz(), 100_000, "fast clock stopped");
+        pit.write(3, (3 << 4) | (1 << 1)); // timer 0, one-shot
+        pit.write(0, 50);
+        pit.write(0, 0);
+        assert_eq!(mhz(), 0, "clocks stopped");
+        program_mode2(&pit, 0, 50);
+        let saved = pit.save_state();
+        pit.power_on();
+        assert_eq!(mhz(), 0, "power-on clears the timers");
+        pit.load_state(&saved).unwrap();
+        assert_eq!(mhz(), 100_000, "a restored state publishes its rate");
+        assert_eq!(pit.programmed_hz(2), 5_000.0);
+    }
 }
 
 impl Saveable for Pit8254 {
@@ -810,6 +888,7 @@ impl Saveable for Pit8254 {
                 chan_from_toml(ct, &mut chan);
             }
         }
+        self.update_rate();
         Ok(())
     }
 }
