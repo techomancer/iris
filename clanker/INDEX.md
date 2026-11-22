@@ -54,7 +54,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [tlb-c-field-uses-the-models-table.md](cpu/tlb-c-field-uses-the-models-table.md) | rule | The TLB decodes EntryLo C with the CPU model's table; C=4 read as uncached sent every Octane user access to the bus |
 | [tlbcheck-vmap-dangling-slot-bug.md](cpu/tlbcheck-vmap-dangling-slot-bug.md) | rule | tlbcheck: vmap fast-path can strand a still-valid TLB entry as a phantom Miss |
 | [tlbcheck-vmap-scan-performance.md](cpu/tlbcheck-vmap-scan-performance.md) | measure | tlbcheck: naive vmap re-derivation cost ~800us/call, dominated boot time |
-| [wait-is-not-a-nop.md](cpu/wait-is-not-a-nop.md) | rule | `WAIT` is not a NOP — and `InstrKind::Nop` never meant "nop" |
+| [wait-is-not-a-nop.md](cpu/wait-is-not-a-nop.md) | rule | `WAIT` is not a NOP — and `InstrKind::Nop` never meant "nop"; with IE clear it completes once an IM-passed interrupt is requested (OpenBSD R5000 idle) |
 | [xtlb-vector-follows-mode-not-address.md](cpu/xtlb-vector-follows-mode-not-address.md) | rule | The XTLB refill vector follows the MODE, not the address shape |
 
 ## jitv2/
@@ -162,7 +162,8 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [aic7880-emulation-vs-spec.md](devices/aic7880-emulation-vs-spec.md) | open | AIC-7880: where the O2 SCSI model departs from `docs/dev/aic7880.md` (HLE above the sequencer, reset values, wide strap, residuals, interrupt gating, config space) |
 | [aic7880-seqdis.py](devices/aic7880-seqdis.py) | howto | Disassembler for an AIC-7xxx sequencer image in a C byte array (the HIM's image the O2 downloads) |
 | [aic7880-patchsim.py](devices/aic7880-patchsim.py) | howto | Reproduces the Linux aic7xxx firmware patch selection and critical sections for a 7880 |
-| [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones) |
+| [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones); the 64-bit PCI memory window at 0x2_0000_0000 bypasses it (OpenBSD `ahc` not responding) |
+| [o2-openbsd-warm-reboot-loop.md](devices/o2-openbsd-warm-reboot-loop.md) | open | O2: issue 308 (OpenBSD 6.9 damaged after a warm reboot) not reproduced in 89 warm reboots on R5000/R10000, HEAD and 5e871a2b^; the reboot-and-checksum loop, what is ruled out and not covered |
 | [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | history | O2 cache as it was until 2026-10-30: the full model through POST, the shadow model after, switched by PC range and a tag-store trigger |
 | [o2-prom-stack-is-a-cached-page-at-phys-0.md](devices/o2-prom-stack-is-a-cached-page-at-phys-0.md) | design | O2 PROM stack: one tag-installed page at physical 0 that the memory test overwrites through KSEG1. Retired: the CPU's cached view holds it now |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |

@@ -1304,6 +1304,14 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
     /// there. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
+    /// A window of full physical addresses, `(base, size)`, that the board
+    /// decodes as its own and [`Self::phys_alias`] never applies to: cut to
+    /// [`Self::phys_mask`] and nothing more. The O2's 64-bit PCI memory
+    /// window at 0x2_0000_0000 has the same low 32 bits as the no-ECC alias
+    /// from 0x2_8000_0000, where OpenBSD puts every PCI device; matched on
+    /// the cut address alone, its register accesses reached RAM. None on the
+    /// other machines.
+    pub phys_alias_bypass: Option<(u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
     /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
     /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
@@ -3079,6 +3087,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
             batch_hook: None,
             phys_alias: None,
+            phys_alias_bypass: None,
             phys_mask: u64::MAX,
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
@@ -5319,9 +5328,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     /// A CPU physical address as the board decodes it: cut to
-    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
+    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in
+    /// it, unless the full address is in [`Self::phys_alias_bypass`].
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
+        if let Some((base, size)) = self.phys_alias_bypass {
+            if pa.wrapping_sub(base) < size {
+                return pa & self.phys_mask;
+            }
+        }
         // Cut first: the PTE software bits above the PFN are not part of the
         // address the alias window sees. Window and target lie within the mask.
         let pa = pa & self.phys_mask;
@@ -8062,26 +8077,37 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// - under `ci_clock`, `hot.cycles` reaches the Compare deadline with IP7
     ///   unmasked (the stall raises IP7 itself, as `step_cycles!` would).
     ///
-    /// A WAIT that can never be released (`Status.IE` clear, or `EXL`/`ERL`
-    /// set) is handled *before* the PC update instead: see the top of the
-    /// body. It returns `EXEC_RETRY` with PC still on the WAIT, so the guest
-    /// correctly never progresses while the CPU thread keeps returning to its
-    /// run loop.
+    /// A WAIT whose interrupts cannot be taken (`Status.IE` clear, or
+    /// `EXL`/`ERL` set) is handled *before* the PC update instead: see the top
+    /// of the body. It completes once an interrupt the IM bits pass is
+    /// requested, and until then returns `EXEC_RETRY` with PC still on the
+    /// WAIT, so the CPU thread keeps returning to its run loop.
     fn exec_wait(&mut self) -> ExecStatus {
-        // Unreleasable WAIT (IE clear, or EXL/ERL set): no interrupt can ever
-        // end this stall. Checked BEFORE the PC update and answered with
+        // WAIT with its interrupts not takeable (IE clear, or EXL/ERL set).
+        // Checked BEFORE the PC update; until it may complete it answers
         // EXEC_RETRY, so PC stays on the WAIT and the run loop simply
-        // re-dispatches it. That reproduces the hardware behaviour (a WAIT
-        // with interrupts disabled never completes) while keeping the CPU
-        // thread returning to its loop every iteration, so the monitor, the
-        // debugger and the soft-reset check all stay responsive — none of
-        // which would be true if we spun inside this one instruction.
+        // re-dispatches it, keeping the CPU thread returning to its loop every
+        // iteration, so the monitor, the debugger and the soft-reset check all
+        // stay responsive — none of which would be true if we spun inside
+        // this one instruction.
         //
         // IRIX never gets here: `wait_for_interrupt_fix_loc` requires the
         // `mtc0 a1,C0_SR` that re-enables interrupts to be *adjacent* to the
         // WAIT, which is what its "must be adjacent to avoid a race with an
         // interrupt" comment is about.
+        //
+        // A requested interrupt that IE (or EXL/ERL) keeps from being taken
+        // still ends the stall: the WAIT graduates and the interrupt is taken
+        // once software enables it. OpenBSD's R5000/RM52xx/RM7000 idle
+        // (`cpu_idle_cycle_rm7k`) clears IE, executes WAIT and restores Status
+        // after it, as Linux's `r4k_wait_irqoff` does; answering RETRY there
+        // held an idle OpenBSD O2 on the WAIT for good with its clock
+        // interrupt pending. So the masked case polls once per dispatch and
+        // completes when an interrupt the IM bits pass is pending.
         if !self.core.interrupts_enabled() {
+            if self.wait_wake_pending() {
+                return self.handle_exec_complete();
+            }
             return EXEC_RETRY;
         }
 
@@ -8145,6 +8171,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
 
         status
+    }
+
+    /// Whether an interrupt the IM bits pass is requested (`Cause.IP` or a
+    /// device's line in `hot.interrupts`), whatever IE, EXL and ERL say.
+    fn wait_wake_pending(&self) -> bool {
+        let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
+        let ip = (self.core.cp0_cause | (pending as u32)) & crate::cpu::mips_core::CAUSE_IP_MASK;
+        ip & self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK != 0
     }
 
     fn exec_eret(&mut self) -> ExecStatus {

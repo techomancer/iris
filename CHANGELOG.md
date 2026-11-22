@@ -261,6 +261,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### O2
 
+- OpenBSD finds its SCSI disks and CD-ROM again: since 2026-10-31 its
+  accesses to the AIC-7880s went to memory, so every command timed out
+  ("board is not responding").
+- An R5000 O2 running OpenBSD no longer stops for good the first time it
+  idles (after `boot device: sd0`).
 - `iris-ci rollback` works on the O2, returning memory, devices and
   copy-on-write disks to the last `restore`.
 - `prom` also takes the IRIX installer's `ip32prom.image`; a raw O2 PROM file
@@ -609,6 +614,8 @@ image) where the guest test suites showed they differed:
 - Nightlies and releases publish only after `build.yml` boots IRIX on an Indy
   and an O2 on Linux, macOS and Windows and matches golden login screens.
 - `iris-ci screen-wait GOLDEN` waits for the screen to match a golden image.
+- `iris-ci boot-test` boots OpenBSD 6.9 on the O2 to its login with
+  `--steps tests/openbsd/boot-openbsd69-o2.toml` (a local disk; see TESTING.md).
 - A failed first phase keeps the PROM's output and the CPU's registers
   (`phase-a.log`, `phase-a-cpu.log`).
 - `iris-ci rtc-save` works on an O2, writing its PROM flash.

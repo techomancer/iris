@@ -2125,12 +2125,12 @@ mod tests {
             "WAIT graduates — PC must advance so the following `j ra` is reachable");
     }
 
-    /// A WAIT that can never be released — `Status.IE` clear, or `EXL`/`ERL`
-    /// set — must NOT graduate. It returns `EXEC_RETRY` with PC still on the
-    /// instruction, so the guest correctly never progresses (matching hardware,
-    /// which hangs) while the CPU thread keeps returning to its run loop, so
-    /// the monitor, debugger and soft-reset check stay responsive. Spinning
-    /// inside the instruction instead would freeze all three.
+    /// A WAIT whose interrupts cannot be taken — `Status.IE` clear, or
+    /// `EXL`/`ERL` set — with nothing requested must NOT graduate. It returns
+    /// `EXEC_RETRY` with PC still on the instruction, so the guest waits while
+    /// the CPU thread keeps returning to its run loop, so the monitor, debugger
+    /// and soft-reset check stay responsive. Spinning inside the instruction
+    /// instead would freeze all three.
     #[test]
     fn test_wait_with_interrupts_disabled_retries_without_advancing() {
         let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
@@ -2149,6 +2149,34 @@ mod tests {
         exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::STATUS_EXL;
         assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
         assert_eq!(exec.core.pc, pc, "EXL is just as unreleasable as IE=0");
+    }
+
+    /// A requested interrupt the IM bits pass ends a WAIT executed with IE
+    /// clear: the WAIT graduates, no exception is taken, and the interrupt
+    /// waits for software to enable it. OpenBSD's R5000/RM52xx idle
+    /// (`cpu_idle_cycle_rm7k`) clears IE around its WAIT; answering RETRY
+    /// held an idle OpenBSD O2 on the WAIT for good with its clock interrupt
+    /// pending. Fix: WAIT with IE clear.
+    #[test]
+    fn test_wait_with_ie_clear_completes_on_a_requested_interrupt() {
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let (mut exec, _) = create_executor();
+        exec.core.pc = pc;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_IM_MASK;
+        exec.core.cp0_status |= crate::cpu::mips_core::CAUSE_IP7; // IM7
+        exec.core.cp0_cause = 0;
+        let epc = exec.core.cp0_epc;
+        // An interrupt IM masks does not end it.
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
+        assert_eq!(exec.core.pc, pc);
+        // The clock's IP7, which IM passes, does.
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP7 as u64, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, pc + 4, "the WAIT graduates");
+        assert_eq!(exec.core.cp0_epc, epc, "and takes no exception");
     }
 
     /// The stall ends as soon as an enabled, unmasked interrupt is pending —
@@ -8541,6 +8569,29 @@ mod tests {
             let lo0 = (0x18_0000 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
             tlb_op(&mut exec, &[(0, 0), (5, 0), (10, 0x4000_0000), (2, lo0), (3, 0)], FUNCT_TLBWI);
             assert_eq!(exec.debug_translate(0x4000_0000).phys, 0);
+        });
+    }
+
+    /// The O2's 64-bit PCI memory window (PA 0x2_0000_0000, OpenBSD's devices
+    /// from 0x2_8000_0000) shares its low 32 bits with the no-ECC alias. A page
+    /// there reaches the PCI window the bus decodes at 0x8000_0000, not RAM;
+    /// the alias and its masked match still hold everywhere else. Fix:
+    /// OpenBSD's AIC-7880 registers on the O2.
+    #[test]
+    fn phys_alias_bypass_keeps_the_o2_pci_memory_window_off_memory() {
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(Arc::new(MockMemory::new()));
+            exec.phys_mask = u32::MAX as u64;
+            exec.phys_alias = Some((0x8000_0000, 0x4000_0000, 0x4000_0000));
+            exec.phys_alias_bypass = Some((0x2_0000_0000, 0x1_0000_0000));
+            let page = |pfn: u64| (pfn << 6) | (2 << 3) | (1 << 2) | (1 << 1);
+            // VPN2 0x4000_0000: even page PCI at 0x2_8000_1000, odd page the alias.
+            tlb_op(&mut exec, &[(0, 0), (5, 0), (10, 0x4000_0000), (2, page(0x28_0001)), (3, page(0x8_0001))], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_0000).phys, 0x8000_1000, "PCI memory window");
+            assert_eq!(exec.debug_translate(0x4000_1000).phys, 0x4000_1000, "no-ECC alias");
+            // A software bit above the PFN still folds onto memory.
+            tlb_op(&mut exec, &[(0, 1), (5, 0), (10, 0x4000_2000), (2, page(0x18_0000)), (3, 0)], FUNCT_TLBWI);
+            assert_eq!(exec.debug_translate(0x4000_2000).phys, 0x4000_0000);
         });
     }
 
