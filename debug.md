@@ -674,7 +674,7 @@ controller's accesses and values nothing establishes.
 |---|---|
 | `perf snapshot` | Performance counters (Indy, Indigo2 and the Bedrock machines) |
 | `locks` | Every registered lock, whether it is held, and by which thread and call site (for `SpinLock`s); Indy and Indigo2 |
-| `perfetto start FILE [cats=LIST] [clock=host\|guest]` | Start a Perfetto trace (`--features perfetto`; Indy, Indigo2, O2 and Octane) |
+| `perfetto start FILE [cats=LIST] [clock=host\|guest]` | Start a Perfetto trace (`--features perfetto`; Indy, Indigo2, O2, Octane, Origin 200/2000, Fuel, Tezro and Origin 3000) |
 | `perfetto cats LIST` / `perfetto status` / `perfetto stop` | Change categories / show / stop |
 | `idleprof ...` | See [history and tracing](#history-undo-and-tracing) |
 

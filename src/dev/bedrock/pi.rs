@@ -445,6 +445,8 @@ impl Pi {
         for slot in 0..2 {
             if u128::from(time) >= t.rt_due[slot] {
                 self.rt_status[slot].store(1, SeqCst);
+                let _cpu = (usize::from(self.interface) * 2 + slot) & 3;
+                crate::pf_level!(crate::perfetto::events::PI_RT_TICK_LEVEL[_cpu], crate::perfetto::events::PI_RT_TICK[_cpu], true);
                 self.arm_rt(t, &o, slot, now);
                 latched = true;
             }
@@ -669,7 +671,10 @@ impl Pi {
             reg::RT_INT_PEND_A::OFFSET | reg::RT_INT_PEND_B::OFFSET => {
                 // Latch a deadline that has passed first, so the clear takes it.
                 self.catch_up(clock());
-                self.rt_status[index(reg::RT_INT_PEND_A::OFFSET)].store(0, SeqCst);
+                let slot = index(reg::RT_INT_PEND_A::OFFSET);
+                self.rt_status[slot].store(0, SeqCst);
+                let _cpu = (usize::from(self.interface) * 2 + slot) & 3;
+                crate::pf_level!(crate::perfetto::events::PI_RT_TICK_LEVEL[_cpu], crate::perfetto::events::PI_RT_TICK[_cpu], false);
             }
             reg::PROF_INT_PEND_A::OFFSET | reg::PROF_INT_PEND_B::OFFSET => {
                 self.catch_up(clock());
