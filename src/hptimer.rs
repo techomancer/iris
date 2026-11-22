@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -269,6 +269,167 @@ impl Default for TimerManager {
 impl Drop for TimerManager {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// One deadline in machine nanoseconds, owned by one device.
+pub struct Timer(Arc<TimerInner>);
+
+struct TimerInner {
+    tm: Weak<TimerManager>,
+    clock: Clock,
+    callback: Box<dyn Fn(u64) + Send + Sync>,
+    state: parking_lot::Mutex<TimerState>,
+    /// `state.due` as a word (see `word`), so a repeated deadline skips the lock.
+    due_word: AtomicU64,
+    /// Held while the callback runs, so `stop` can wait one out.
+    gate: parking_lot::Mutex<()>,
+}
+
+struct TimerState {
+    due: Option<u64>,
+    /// The host timer pending for `due`.
+    id: Option<TimerId>,
+    running: bool,
+    /// The callback is running: a re-arm from it reuses the host timer.
+    firing: bool,
+}
+
+impl Timer {
+    /// `callback(device, due)` runs on the timer thread once the machine clock reaches `due`;
+    /// it resyncs under the device's lock.
+    pub fn new<S, F>(tm: &Arc<TimerManager>, me: &Weak<S>, callback: F) -> Self
+    where
+        S: Send + Sync + 'static,
+        F: Fn(&S, u64) + Send + Sync + 'static,
+    {
+        let me = me.clone();
+        Self(Arc::new(TimerInner {
+            tm: Arc::downgrade(tm),
+            clock: tm.clock().clone(),
+            callback: Box::new(move |due| {
+                if let Some(s) = me.upgrade() {
+                    callback(&s, due);
+                }
+            }),
+            state: parking_lot::Mutex::new(TimerState { due: None, id: None, running: false, firing: false }),
+            due_word: AtomicU64::new(crate::clock::encode(None)),
+            gate: parking_lot::Mutex::new(()),
+        }))
+    }
+
+    /// Arm, or re-arm, for absolute machine time `when`.
+    pub fn arm_at(&self, when: u64) {
+        self.set_due(Some(when));
+    }
+
+    /// Forget the deadline. A callback already running is not waited for.
+    pub fn cancel(&self) {
+        self.set_due(None);
+    }
+
+    /// `arm_at` for `Some`, `cancel` for `None`.
+    pub fn set_due(&self, due: Option<u64>) {
+        if self.0.due_word.load(Ordering::Relaxed) == crate::clock::encode(due) {
+            return;
+        }
+        let mut st = self.0.state.lock();
+        self.0.due_word.store(crate::clock::encode(due), Ordering::Relaxed);
+        let old = std::mem::replace(&mut st.due, due);
+        // A later deadline keeps the pending host timer, which `expire` re-arms for the rest;
+        // re-timing costs the storing CPU microseconds, and the guest sees them pass.
+        let later = st.id.is_some() && matches!((old, due), (Some(o), Some(n)) if n > o);
+        if old != due && st.running && !st.firing && !later {
+            self.0.retime(&mut st);
+        }
+    }
+
+    /// The deadline armed, started or not.
+    #[cfg(test)]
+    pub fn due(&self) -> Option<u64> {
+        self.0.state.lock().due
+    }
+
+    #[cfg(test)]
+    pub fn is_armed(&self) -> bool {
+        self.due().is_some()
+    }
+
+    /// The machine clock, in nanoseconds.
+    pub fn now(&self) -> u64 {
+        self.0.clock.now()
+    }
+
+    /// From `Device::start`: arm the deadline `stop` kept or `arm_at` set.
+    pub fn start(&self) {
+        let mut st = self.0.state.lock();
+        st.running = true;
+        self.0.retime(&mut st);
+    }
+
+    /// Remove the host timer, keep the deadline, wait out a running callback.
+    /// Never from a callback or under a lock it takes.
+    pub fn stop(&self) {
+        {
+            let mut st = self.0.state.lock();
+            st.running = false;
+            self.0.unarm(&mut st);
+        }
+        drop(self.0.gate.lock());
+    }
+}
+
+impl TimerInner {
+    /// Make the host timer serve `st.due`.
+    fn retime(self: &Arc<Self>, st: &mut TimerState) {
+        self.unarm(st);
+        let (Some(due), Some(tm)) = (st.due, self.tm.upgrade()) else { return };
+        let delay = Duration::from_nanos(due.saturating_sub(self.clock.now()));
+        st.id = Some(tm.add_one_shot(delay, Arc::downgrade(self), move |w: &mut Weak<Self>| {
+            w.upgrade().map_or(TimerReturn::Delete, |t| t.expire())
+        }));
+    }
+
+    fn unarm(&self, st: &mut TimerState) {
+        if let (Some(id), Some(tm)) = (st.id.take(), self.tm.upgrade()) {
+            tm.remove(id);
+        }
+    }
+
+    /// A host timer is up. A cancelled deadline or a stopped timer does
+    /// nothing; one that ran ahead of the machine clock waits out the rest.
+    fn expire(self: &Arc<Self>) -> TimerReturn {
+        let _gate = self.gate.lock();
+        let due = {
+            let mut st = self.state.lock();
+            let Some(due) = st.due.filter(|_| st.running) else { return TimerReturn::Delete };
+            let now = self.clock.now();
+            if now < due {
+                return TimerReturn::RescheduleOneShot(Duration::from_nanos(due - now));
+            }
+            st.due = None;
+            self.due_word.store(crate::clock::encode(None), Ordering::Relaxed);
+            st.firing = true;
+            due
+        };
+        (self.callback)(due);
+        let mut st = self.state.lock();
+        st.firing = false;
+        match st.due {
+            Some(next) if st.running => {
+                TimerReturn::RescheduleOneShot(Duration::from_nanos(next.saturating_sub(self.clock.now())))
+            }
+            _ => {
+                st.id = None;
+                TimerReturn::Delete
+            }
+        }
+    }
+}
+
+impl Drop for TimerInner {
+    fn drop(&mut self) {
+        self.unarm(&mut self.state.lock());
     }
 }
 
@@ -678,3 +839,156 @@ mod windows_waiter {
 
 #[cfg(windows)]
 pub(crate) use windows_waiter::{Waiter, Waker};
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Dev {
+        timer: Timer,
+        fired: Mutex<Vec<u64>>,
+        rearm: AtomicUsize,
+    }
+
+    fn dev() -> (Arc<Dev>, Clock, Arc<TimerManager>) {
+        let clock = Clock::stepped();
+        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+        let d = Arc::new_cyclic(|me| Dev {
+            timer: Timer::new(&tm, me, |d: &Dev, due| {
+                d.fired.lock().push(due);
+                if d.rearm.load(Ordering::SeqCst) > 0 {
+                    d.rearm.fetch_sub(1, Ordering::SeqCst);
+                    d.timer.arm_at(due + 10);
+                }
+            }),
+            fired: Mutex::new(Vec::new()),
+            rearm: AtomicUsize::new(0),
+        });
+        (d, clock, tm)
+    }
+
+    fn until(f: impl FnMut() -> bool) -> bool {
+        crate::test_board::until(Duration::from_secs(10), f)
+    }
+
+    fn fired(d: &Dev) -> Vec<u64> {
+        d.fired.lock().clone()
+    }
+
+    #[test]
+    fn a_timer_fires_once_when_the_machine_clock_reaches_it() {
+        let (d, clock, _tm) = dev();
+        d.timer.start();
+        d.timer.arm_at(1_000);
+        thread::sleep(Duration::from_millis(20));
+        assert!(fired(&d).is_empty(), "the host timer ran ahead of the stepped clock");
+        clock.step(1_000);
+        assert!(until(|| fired(&d) == [1_000]));
+        assert!(!d.timer.is_armed());
+    }
+
+    #[test]
+    fn a_replaced_or_cancelled_deadline_does_not_fire() {
+        let (d, clock, _tm) = dev();
+        d.timer.start();
+        d.timer.arm_at(1_000_000);
+        d.timer.arm_at(50);
+        clock.step(50);
+        assert!(until(|| fired(&d) == [50]));
+        d.timer.arm_at(60);
+        d.timer.cancel();
+        clock.step(1_000);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(fired(&d), [50]);
+    }
+
+    #[test]
+    fn stop_keeps_the_deadline_and_start_arms_it() {
+        let (d, clock, _tm) = dev();
+        d.timer.arm_at(10);
+        clock.step(10);
+        thread::sleep(Duration::from_millis(20));
+        assert!(fired(&d).is_empty(), "a timer never started stays quiet");
+        d.timer.start();
+        assert!(until(|| fired(&d) == [10]));
+        d.timer.arm_at(30);
+        d.timer.stop();
+        clock.step(100);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(d.timer.due(), Some(30));
+        assert_eq!(fired(&d), [10]);
+        d.timer.start();
+        assert!(until(|| fired(&d) == [10, 30]));
+    }
+
+    #[test]
+    fn a_callback_can_arm_the_next_deadline() {
+        let (d, clock, _tm) = dev();
+        d.rearm.store(2, Ordering::SeqCst);
+        d.timer.start();
+        d.timer.arm_at(5);
+        clock.step(100);
+        assert!(until(|| fired(&d) == [5, 15, 25]));
+        assert!(!d.timer.is_armed());
+    }
+
+    #[test]
+    fn a_deadline_that_did_not_move_or_moved_later_keeps_its_host_timer() {
+        let (d, _clock, _tm) = dev();
+        d.timer.start();
+        d.timer.arm_at(1_000);
+        let id = d.timer.0.state.lock().id;
+        assert!(id.is_some());
+        d.timer.arm_at(1_000);
+        assert_eq!(d.timer.0.state.lock().id, id);
+        d.timer.arm_at(2_000);
+        assert_eq!(d.timer.0.state.lock().id, id);
+        d.timer.arm_at(500);
+        assert_ne!(d.timer.0.state.lock().id, id);
+    }
+
+    #[test]
+    fn a_deadline_moved_later_fires_at_the_later_time_only() {
+        let (d, clock, _tm) = dev();
+        d.timer.start();
+        d.timer.arm_at(1_000);
+        d.timer.arm_at(5_000);
+        clock.step(1_000);
+        thread::sleep(Duration::from_millis(20));
+        assert!(fired(&d).is_empty(), "fired at the deadline it moved away from");
+        clock.step(4_000);
+        assert!(until(|| fired(&d) == [5_000]));
+    }
+
+    #[test]
+    fn a_repeated_deadline_does_not_take_the_lock() {
+        let (d, _clock, _tm) = dev();
+        d.timer.arm_at(1_000);
+        let held = d.timer.0.state.lock();
+        let done = Arc::new(AtomicBool::new(false));
+        let t = {
+            let (d, done) = (d.clone(), done.clone());
+            thread::spawn(move || {
+                d.timer.arm_at(1_000);
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        assert!(until(|| done.load(Ordering::SeqCst)), "blocked on the timer lock");
+        drop(held);
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn set_due_arms_or_cancels() {
+        let (d, clock, _tm) = dev();
+        d.timer.start();
+        d.timer.set_due(Some(7));
+        assert_eq!(d.timer.due(), Some(7));
+        d.timer.set_due(None);
+        clock.step(10);
+        thread::sleep(Duration::from_millis(20));
+        assert!(fired(&d).is_empty());
+        assert_eq!(d.timer.now(), 10);
+    }
+}

@@ -193,7 +193,7 @@ impl Counter {
 
 /// The comparators and their deadlines, in host nanoseconds, which change
 /// together and with the counter's origin.
-struct Timer {
+struct Comparators {
     rt_compare: [u64; 2],
     profile_compare: u64,
     rt_due: [u128; 2],
@@ -231,7 +231,7 @@ pub(super) struct Pi {
     counter: Counter,
     /// The earliest deadline in host nanoseconds; `u64::MAX` while stopped.
     next_due: AtomicU64,
-    timer: Mutex<Timer>,
+    timer: Mutex<Comparators>,
     /// The registers that only hold what was stored, by offset / 8. Plain
     /// atomics, as hardware has no lock there: a store is one doubleword,
     /// and a read-modify-write register uses an atomic update.
@@ -261,7 +261,7 @@ impl Pi {
             out: Mutex::new([0; 2]),
             counter: Counter::new(now),
             next_due: AtomicU64::new(RUNNING),
-            timer: Mutex::new(Timer { rt_compare: [0; 2], profile_compare: 0, rt_due: [0; 2], profile_due: 0, id: None }),
+            timer: Mutex::new(Comparators { rt_compare: [0; 2], profile_compare: 0, rt_due: [0; 2], profile_due: 0, id: None }),
             stored: std::array::from_fn(|i| {
                 AtomicU64::new(match i as u64 * 8 {
                     reg::CPU_PROTECT::OFFSET => reg::CPU_PROTECT::RESET,
@@ -409,25 +409,25 @@ impl Pi {
         self.counter.read().count(now)
     }
 
-    fn arm_rt(&self, t: &mut Timer, o: &Origin, slot: usize, now: u64) {
+    fn arm_rt(&self, t: &mut Comparators, o: &Origin, slot: usize, now: u64) {
         let time = o.time(now);
         let ticks = (t.rt_compare[slot].wrapping_sub(o.count(now)).wrapping_sub(1) & RT_MASK) + 1;
         t.rt_due[slot] = u128::from(o.tick_start(time)) + u128::from(ticks) * u128::from(TICK);
     }
-    fn arm_profile(&self, t: &mut Timer, o: &Origin, now: u64) {
+    fn arm_profile(&self, t: &mut Comparators, o: &Origin, now: u64) {
         let time = o.time(now);
         let ticks = (t.profile_compare as u32).wrapping_sub(o.count(now) as u32);
         let ticks = if ticks == 0 { 1u64 << 32 } else { u64::from(ticks) };
         t.profile_due = u128::from(o.tick_start(time)) + u128::from(ticks) * u128::from(TICK);
     }
-    fn arm_all(&self, t: &mut Timer, now: u64) {
+    fn arm_all(&self, t: &mut Comparators, now: u64) {
         let o = self.counter.read();
         self.arm_rt(t, &o, 0, now);
         self.arm_rt(t, &o, 1, now);
         self.arm_profile(t, &o, now);
         self.set_next_due(t, &o);
     }
-    fn set_next_due(&self, t: &Timer, o: &Origin) {
+    fn set_next_due(&self, t: &Comparators, o: &Origin) {
         let due = if o.paused != RUNNING {
             RUNNING
         } else {
@@ -438,7 +438,7 @@ impl Pi {
 
     /// Latch the comparators that are due at `now`, under the timer lock.
     /// Whether one latched.
-    fn latch(&self, t: &mut Timer, now: u64) -> bool {
+    fn latch(&self, t: &mut Comparators, now: u64) -> bool {
         let o = self.counter.read();
         let time = o.time(now);
         let mut latched = false;
@@ -495,7 +495,7 @@ impl Pi {
 
     /// (Re)arm the host timer for the earliest deadline, under the timer
     /// lock. A deadline more than a second out is armed for a second.
-    fn arm_host(&self, t: &mut Timer, tm: &TimerManager, chip: &Weak<Bedrock>, now: u64) {
+    fn arm_host(&self, t: &mut Comparators, tm: &TimerManager, chip: &Weak<Bedrock>, now: u64) {
         if let Some(id) = t.id.take() {
             tm.remove(id);
         }

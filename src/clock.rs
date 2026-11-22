@@ -72,9 +72,29 @@ impl Clock {
     }
 }
 
+/// An optional machine time as one atomic word, so a timer can read it
+/// without the device's lock: the time plus one, zero for none. `u64::MAX` is not
+/// representable (it saturates to `MAX - 1`).
+pub(crate) fn encode(t: Option<u64>) -> u64 {
+    t.map_or(0, |t| t.saturating_add(1))
+}
+
+pub(crate) fn decode(n: u64) -> Option<u64> {
+    n.checked_sub(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_optional_time_round_trips_through_its_word() {
+        assert_eq!(encode(None), 0);
+        for t in [0, 1, u64::MAX - 1] {
+            assert_eq!(decode(encode(Some(t))), Some(t));
+        }
+        assert_eq!(decode(0), None);
+    }
+
     #[test]
     fn a_stopped_clock_holds_and_a_restore_moves_it() {
         let c = Clock::stepped();

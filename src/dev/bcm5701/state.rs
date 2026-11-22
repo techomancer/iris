@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::eeprom::{self, Eeprom};
 use super::phy::{self, Phy};
-use super::dma::{Doorbells, HeldCompletion, Ring, Timer};
+use super::dma::{Doorbells, HeldCompletion, Ring, EngineDeadline};
 use crate::cpu::smp::MAX_CPUS;
 use crate::cpu::mips_core::CyclesPtr;
 use crate::pci::PciDma;
@@ -347,27 +347,27 @@ impl State {
         while let Some((deadline, timer)) = self.timers().into_iter().filter(|(d, _)| *d <= target).min() {
             self.now = deadline;
             match timer {
-                Timer::PhySettle => self.phy.sync(deadline),
-                Timer::BufferManager => {
+                EngineDeadline::PhySettle => self.phy.sync(deadline),
+                EngineDeadline::BufferManager => {
                     self.bufmgr_start = None;
                     let mode = self.rf(reg::BUFMGR_MODE);
                     self.set_rf(reg::BUFMGR_MODE, mode | BUFMGR_MODE_ENABLE);
                 }
-                Timer::RxCoalescing => self.rx_coal_timer_fired(),
-                Timer::TxCoalescing => self.tx_coal_timer_fired(),
-                Timer::RxArrival => self.rx_arrival_due(target),
+                EngineDeadline::RxCoalescing => self.rx_coal_timer_fired(),
+                EngineDeadline::TxCoalescing => self.tx_coal_timer_fired(),
+                EngineDeadline::RxArrival => self.rx_arrival_due(target),
             }
         }
         self.now = target;
     }
 
-    fn timers(&self) -> Vec<(Instant, Timer)> {
+    fn timers(&self) -> Vec<(Instant, EngineDeadline)> {
         [
-            self.phy.deadline().map(|d| (d, Timer::PhySettle)),
-            self.bufmgr_start.map(|d| (d, Timer::BufferManager)),
-            self.rx_coal_timer.map(|d| (d, Timer::RxCoalescing)),
-            self.tx_coal_timer.map(|d| (d, Timer::TxCoalescing)),
-            self.rx_latency.front().map(|held| (held.due, Timer::RxArrival)),
+            self.phy.deadline().map(|d| (d, EngineDeadline::PhySettle)),
+            self.bufmgr_start.map(|d| (d, EngineDeadline::BufferManager)),
+            self.rx_coal_timer.map(|d| (d, EngineDeadline::RxCoalescing)),
+            self.tx_coal_timer.map(|d| (d, EngineDeadline::TxCoalescing)),
+            self.rx_latency.front().map(|held| (held.due, EngineDeadline::RxArrival)),
         ]
         .into_iter()
         .flatten()

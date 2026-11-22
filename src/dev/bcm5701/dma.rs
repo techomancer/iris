@@ -148,7 +148,7 @@ pub enum DmaWhat {
 
 /// The timers the engines keep, ordered by when they fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Timer {
+pub enum EngineDeadline {
     PhySettle,
     BufferManager,
     RxCoalescing,
