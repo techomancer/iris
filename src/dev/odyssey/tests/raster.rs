@@ -102,12 +102,8 @@ fn hold_raster(h: &BoardLocks) -> Arc<AtomicBool> {
 }
 
 /// Wait for `what`, up to 20 s.
-fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !done() {
-        assert!(Instant::now() < deadline, "{what}");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+fn eventually(what: &str, done: impl FnMut() -> bool) {
+    assert!(crate::test_board::until(Duration::from_secs(20), done), "{what}");
 }
 
 /// A GL draw returns to the front end before it is drawn; a register read

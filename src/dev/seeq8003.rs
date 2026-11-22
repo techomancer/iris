@@ -1212,11 +1212,7 @@ mod tests {
     /// Wait for a condition another thread brings about. Fails the test
     /// rather than hanging if it never does.
     fn wait_for<F: Fn() -> bool>(what: &str, done: F) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
-            thread::yield_now();
-        }
+        assert!(crate::test_board::until(Duration::from_secs(10), done), "timed out waiting for {what}");
     }
 
     /// A SEEQ on a loopback link with `ring` as its receive channel, running,

@@ -10,7 +10,7 @@ use crate::scsi::{ScsiResponse, ScsiTarget};
 use parking_lot::Condvar;
 use std::io;
 use std::sync::atomic::AtomicU32;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const COMPLETION_COMPLETE: u16 = IOCB_COMPLETE;
 const COMPLETION_UNDERRUN: u16 = IOCB_DATA_UNDERRUN;
@@ -520,11 +520,10 @@ impl Gate {
     }
 
     fn wait_for(&self, counter: &AtomicU32, n: u32) {
-        let end = Instant::now() + Duration::from_secs(10);
-        while counter.load(Ordering::Acquire) < n {
-            assert!(Instant::now() < end, "the device did not get there");
-            std::thread::yield_now();
-        }
+        assert!(
+            crate::test_board::until(Duration::from_secs(10), || counter.load(Ordering::Acquire) >= n),
+            "the device did not get there"
+        );
     }
 }
 

@@ -197,15 +197,8 @@ mod tests {
     }
 
     /// Wait for `cond`, up to a deadline, not a count of tries.
-    fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
-        let end = std::time::Instant::now() + Duration::from_secs(30);
-        while std::time::Instant::now() < end {
-            if cond() {
-                return true;
-            }
-            std::thread::yield_now();
-        }
-        cond()
+    fn wait_for(cond: impl FnMut() -> bool) -> bool {
+        crate::test_board::until(Duration::from_secs(30), cond)
     }
 
     fn read(kona: &crate::dev::kona::Kona, off: u64) -> u32 {

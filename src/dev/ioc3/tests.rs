@@ -1842,15 +1842,8 @@ fn a_transmit_delay_ends_with_no_guest_access() {
 /// NVRAM writer run on other threads and the suite runs many tests at once, so
 /// a bound counted in milliseconds gives up on a busy host before either has
 /// had a core; the deadline only has to catch a write that never comes.
-fn eventually(mut done: impl FnMut() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(60);
-    while !done() {
-        if Instant::now() >= end {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    true
+fn eventually(done: impl FnMut() -> bool) -> bool {
+    crate::test_board::until(Duration::from_secs(60), done)
 }
 
 /// A guest write to the clock's RAM leaves the file alone: it only marks the

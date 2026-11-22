@@ -129,15 +129,8 @@ fn dropped_words_are_counted() {
 }
 
 /// Wait for `cond`, up to a deadline, not a count of tries.
-fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < end {
-        if cond() {
-            return true;
-        }
-        std::thread::yield_now();
-    }
-    cond()
+fn wait_for(cond: impl FnMut() -> bool) -> bool {
+    crate::test_board::until(std::time::Duration::from_secs(30), cond)
 }
 
 fn backend() -> KonaBackend {

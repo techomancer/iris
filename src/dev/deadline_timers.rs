@@ -141,14 +141,8 @@ mod tests {
         d
     }
 
-    fn wait_for(f: impl Fn() -> bool) -> bool {
-        for _ in 0..500 {
-            if f() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        false
+    fn wait_for(f: impl FnMut() -> bool) -> bool {
+        crate::test_board::until(Duration::from_secs(10), f)
     }
 
     #[test]

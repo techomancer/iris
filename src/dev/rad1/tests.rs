@@ -664,15 +664,8 @@ fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
 /// on another thread and the suite runs many cards at once, so a wait counted
 /// in sleeps or milliseconds gives up on a busy host before the callback has
 /// had a core; the deadline only has to catch a callback that never comes.
-fn eventually(mut done: impl FnMut() -> bool) -> bool {
-    let end = std::time::Instant::now() + Duration::from_secs(60);
-    while !done() {
-        if std::time::Instant::now() >= end {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    true
+fn eventually(done: impl FnMut() -> bool) -> bool {
+    crate::test_board::until(Duration::from_secs(60), done)
 }
 
 /// Poll the schedule's own counter, which no guest register read touches.
