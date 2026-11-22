@@ -78,11 +78,54 @@ pub struct Ps2Controller {
     /// Host keyboard shape (`KeyboardLayout as u8`). Host config, not guest
     /// state, so it is not in snapshots.
     layout: AtomicU8,
+    /// Whether an 8042 sits between the keyboard and the guest, so that
+    /// command-byte bit 6 translates the keyboard's codes to set 1. Hosts
+    /// that reach each device on its own port ([`Self::write_to`]) have no
+    /// command byte and never translate.
+    has_8042: bool,
+}
+
+/// Command-byte bit 6: the 8042 translates keyboard bytes to set 1.
+const CTR_XLATE: u8 = 0x40;
+
+/// The 8042's translation of the keyboard's bytes (scan code set 2) to set 1,
+/// for the bytes below 0x80. Of the bytes above, the 8042 changes only 0x83
+/// (F7) and 0x84 (SysRq); see [`xlate`].
+#[rustfmt::skip]
+static XLATE_TABLE: [u8; 128] = [
+    0xff, 0x43, 0x41, 0x3f, 0x3d, 0x3b, 0x3c, 0x58, 0x64, 0x44, 0x42, 0x40, 0x3e, 0x0f, 0x29, 0x59,
+    0x65, 0x38, 0x2a, 0x70, 0x1d, 0x10, 0x02, 0x5a, 0x66, 0x71, 0x2c, 0x1f, 0x1e, 0x11, 0x03, 0x5b,
+    0x67, 0x2e, 0x2d, 0x20, 0x12, 0x05, 0x04, 0x5c, 0x68, 0x39, 0x2f, 0x21, 0x14, 0x13, 0x06, 0x5d,
+    0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5e, 0x6a, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5f,
+    0x6b, 0x33, 0x25, 0x17, 0x18, 0x0b, 0x0a, 0x60, 0x6c, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0c, 0x61,
+    0x6d, 0x73, 0x28, 0x74, 0x1a, 0x0d, 0x62, 0x6e, 0x3a, 0x36, 0x1c, 0x1b, 0x75, 0x2b, 0x63, 0x76,
+    0x55, 0x56, 0x77, 0x78, 0x79, 0x7a, 0x0e, 0x7b, 0x7c, 0x4f, 0x7d, 0x4b, 0x47, 0x7e, 0x7f, 0x6f,
+    0x52, 0x53, 0x50, 0x4c, 0x4d, 0x48, 0x01, 0x45, 0x57, 0x4e, 0x51, 0x4a, 0x37, 0x49, 0x46, 0x54,
+];
+
+/// One keyboard byte as the translating 8042 passes it on.
+fn xlate(b: u8) -> u8 {
+    match b {
+        0x00..=0x7f => XLATE_TABLE[b as usize],
+        0x83 => 0x41,
+        0x84 => 0x54,
+        _ => b,
+    }
 }
 
 impl Ps2Controller {
-    /// Create a new PS/2 Controller
+    /// A keyboard and a mouse, each on its own port, with no 8042 in front.
     pub fn new(irq: Option<IrqLine>) -> Self {
+        Self::build(irq, false)
+    }
+
+    /// A keyboard and a mouse behind an 8042 (the Indy's and Indigo2's IOC),
+    /// which translates the keyboard's codes while the guest asks it to.
+    pub fn new_8042(irq: Option<IrqLine>) -> Self {
+        Self::build(irq, true)
+    }
+
+    fn build(irq: Option<IrqLine>, has_8042: bool) -> Self {
         Self {
             sink: OnceLock::new(),
             state: Mutex::new(Ps2State {
@@ -107,6 +150,31 @@ impl Ps2Controller {
             irq,
             running: AtomicBool::new(false),
             layout: AtomicU8::new(KeyboardLayout::Ansi as u8),
+            has_8042,
+        }
+    }
+
+    /// Queue bytes from the keyboard, as one sequence, through the 8042's
+    /// translation when it is on. Translating, the 8042 swallows a break
+    /// prefix (0xF0) and sets bit 7 of the byte after it instead.
+    fn queue_kbd(&self, state: &mut Ps2State, bytes: &[u8]) {
+        let translate = self.has_8042 && state.config & CTR_XLATE != 0;
+        let mut brk = 0;
+        for &b in bytes {
+            let out = if !translate {
+                b
+            } else if b == 0xF0 {
+                brk = 0x80;
+                continue;
+            } else {
+                let t = xlate(b) | brk;
+                brk = 0;
+                t
+            };
+            if crate::devlog::devlog_is_active(LogModule::Ps2) {
+                dlog!(LogModule::Ps2, "PS2: Pushed KB byte {:02x}", out);
+            }
+            state.rx_queue.push_back((out, Ps2Source::Keyboard));
         }
     }
 
@@ -321,9 +389,8 @@ impl Ps2Controller {
                     }
                     0xF2 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Read ID <- {:02x}", val); }
-                        state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
-                        state.rx_queue.push_back((0xAB, Ps2Source::Keyboard));
-                        state.rx_queue.push_back((0x83, Ps2Source::Keyboard));
+                        // Through a translating 8042 the ID reads AB 41.
+                        self.queue_kbd(&mut state, &[0xFA, 0xAB, 0x83]);
                     }
                     0xF6 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Reset to Defaults <- {:02x}", val); }
@@ -359,9 +426,9 @@ impl Ps2Controller {
                 CommandState::SetScancodeSet => {
                     if val == 0 {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Get Scancode Set <- {:02x}", val); }
-                        state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
+                        // Translated, sets 1, 2 and 3 read 43, 41 and 3F.
                         let current_set = state.scancode_set;
-                        state.rx_queue.push_back((current_set, Ps2Source::Keyboard));
+                        self.queue_kbd(&mut state, &[0xFA, current_set]);
                     } else {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Set Scancode Set <- {:02x}", val); }
                         state.scancode_set = val;
@@ -570,45 +637,27 @@ impl Ps2Controller {
             return;
         }
 
+        let mut seq: Vec<u8> = Vec::with_capacity(3);
         match state.scancode_set {
             1 => {
                 if let Some(scancode) = self.map_keycode_set1(key) {
                     let val = scancode as u16;
                     if (val & 0xFF00) == 0xE000 {
-                        state.rx_queue.push_back((0xE0, Ps2Source::Keyboard));
-                        if crate::devlog::devlog_is_active(LogModule::Ps2) {
-                            dlog!(LogModule::Ps2, "PS2: Pushed KB byte E0");
-                        }
+                        seq.push(0xE0);
                     }
-                    let mut code = (val & 0xFF) as u8;
-                    if !pressed {
-                        code |= 0x80;
-                    }
-                    if crate::devlog::devlog_is_active(LogModule::Ps2) {
-                        dlog!(LogModule::Ps2, "PS2: Pushed KB byte {:02x}", code);
-                    }
-                    state.rx_queue.push_back((code, Ps2Source::Keyboard));
+                    seq.push((val & 0xFF) as u8 | if pressed { 0 } else { 0x80 });
                 }
             }
             2 => {
                 if let Some(scancode) = self.map_keycode_set2(key) {
                     let val = scancode as u16;
                     if (val & 0xFF00) == 0xE000 {
-                        state.rx_queue.push_back((0xE0, Ps2Source::Keyboard));
-                        if crate::devlog::devlog_is_active(LogModule::Ps2) {
-                            dlog!(LogModule::Ps2, "PS2: Pushed KB byte E0");
-                        }
+                        seq.push(0xE0);
                     }
                     if !pressed {
-                        state.rx_queue.push_back((0xF0, Ps2Source::Keyboard));
-                        if crate::devlog::devlog_is_active(LogModule::Ps2) {
-                            dlog!(LogModule::Ps2, "PS2: Pushed KB byte F0");
-                        }
+                        seq.push(0xF0);
                     }
-                    if crate::devlog::devlog_is_active(LogModule::Ps2) {
-                        dlog!(LogModule::Ps2, "PS2: Pushed KB byte {:02x}", (val & 0xFF) as u8);
-                    }
-                    state.rx_queue.push_back(((val & 0xFF) as u8, Ps2Source::Keyboard));
+                    seq.push((val & 0xFF) as u8);
                 }
             }
             3 => {
@@ -624,19 +673,14 @@ impl Ps2Controller {
                         return;
                     }
                     if !pressed {
-                        state.rx_queue.push_back((0xF0, Ps2Source::Keyboard));
-                        if crate::devlog::devlog_is_active(LogModule::Ps2) {
-                            dlog!(LogModule::Ps2, "PS2: Pushed KB byte F0");
-                        }
+                        seq.push(0xF0);
                     }
-                    if crate::devlog::devlog_is_active(LogModule::Ps2) {
-                        dlog!(LogModule::Ps2, "PS2: Pushed KB byte {:02x}", val);
-                    }
-                    state.rx_queue.push_back((val, Ps2Source::Keyboard));
+                    seq.push(val);
                 }
             }
             _ => {}
         }
+        self.queue_kbd(&mut state, &seq);
         drop(state);
         self.update_interrupt();
     }
@@ -1475,6 +1519,101 @@ mod tests {
         assert!(probe.level(), "the ACK is waiting");
         assert_eq!(ps2.read_data(), 0xFA);
         assert!(!probe.level(), "and once read, the line drops");
+    }
+
+    /// An 8042 set up as NetBSD's pckbc and pckbd leave it: ports on, then
+    /// translation on (read back), the keyboard in set 2, scanning on.
+    fn netbsd_8042() -> Ps2Controller {
+        let ps2 = Ps2Controller::new_8042(None);
+        ps2.start();
+        ps2.write_command(0x60);
+        ps2.write_data(0x04); // KC8_CPU
+        ps2.write_command(0x60);
+        ps2.write_data(0x44); // KC8_CPU | KC8_TRANS
+        ps2.write_command(0x20);
+        assert_eq!(ps2.read_data(), 0x44, "the command byte reads back");
+        for b in [0xF0, 2, 0xF4] {
+            ps2.write_data(b);
+            assert_eq!(ps2.read_data(), 0xFA);
+        }
+        ps2
+    }
+
+    fn drain(ps2: &Ps2Controller) -> Vec<u8> {
+        std::iter::from_fn(|| ps2.pop_from(false)).collect()
+    }
+
+    fn tap(ps2: &Ps2Controller, k: KeyCode) -> Vec<u8> {
+        ps2.push_kb(k, true);
+        ps2.push_kb(k, false);
+        drain(ps2)
+    }
+
+    #[test]
+    fn translating_8042_sends_set_1_make_and_break() {
+        let ps2 = netbsd_8042();
+        assert_eq!(tap(&ps2, KeyCode::KeyA), [0x1E, 0x9E], "a: no F0, break has bit 7");
+        assert_eq!(tap(&ps2, KeyCode::Enter), [0x1C, 0x9C]);
+        assert_eq!(tap(&ps2, KeyCode::ArrowUp), [0xE0, 0x48, 0xE0, 0xC8]);
+        assert_eq!(tap(&ps2, KeyCode::ArrowDown), [0xE0, 0x50, 0xE0, 0xD0]);
+        assert_eq!(tap(&ps2, KeyCode::ArrowLeft), [0xE0, 0x4B, 0xE0, 0xCB]);
+        assert_eq!(tap(&ps2, KeyCode::ArrowRight), [0xE0, 0x4D, 0xE0, 0xCD]);
+        assert_eq!(tap(&ps2, KeyCode::ControlRight), [0xE0, 0x1D, 0xE0, 0x9D]);
+    }
+
+    #[test]
+    fn without_translation_the_8042_passes_set_2() {
+        let ps2 = netbsd_8042();
+        ps2.write_command(0x60);
+        ps2.write_data(0x04);
+        assert_eq!(tap(&ps2, KeyCode::KeyA), [0x1C, 0xF0, 0x1C]);
+        assert_eq!(tap(&ps2, KeyCode::ArrowUp), [0xE0, 0x75, 0xE0, 0xF0, 0x75]);
+    }
+
+    #[test]
+    fn a_port_without_an_8042_never_translates() {
+        // The O2's MACE and the IOC3/IOC4 ports have no command byte; the
+        // power-on value (bit 6 set) must not translate there.
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        assert_ne!(ps2.state.lock().config & CTR_XLATE, 0);
+        ps2.write_to(0xF4, false);
+        assert_eq!(ps2.pop_from(false), Some(0xFA));
+        assert_eq!(tap(&ps2, KeyCode::KeyA), [0x1C, 0xF0, 0x1C]);
+    }
+
+    #[test]
+    fn translating_8042_turns_set_2_into_set_1_for_every_key() {
+        let ps2 = netbsd_8042();
+        let mut compared = 0;
+        for xt in (0x01..0x80).chain(0x81..0x100) {
+            let Some(k) = crate::keysym::from_xt(xt) else { continue };
+            let (Some(s1), Some(_)) = (ps2.map_keycode_set1(k), ps2.map_keycode_set2(k)) else { continue };
+            let s1 = s1 as u16;
+            let mut want = Vec::new();
+            for brk in [0, 0x80] {
+                if s1 & 0xFF00 == 0xE000 { want.push(0xE0); }
+                want.push((s1 & 0xFF) as u8 | brk);
+            }
+            assert_eq!(tap(&ps2, k), want, "{k:?}");
+            compared += 1;
+        }
+        assert!(compared > 90, "only {compared} keys compared");
+    }
+
+    #[test]
+    fn translating_8042_translates_the_keyboard_s_replies() {
+        let ps2 = netbsd_8042();
+        ps2.write_data(0xF2);
+        assert_eq!(drain(&ps2), [0xFA, 0xAB, 0x41], "Read ID");
+        ps2.write_data(0xF0);
+        ps2.write_data(0x00);
+        assert_eq!(drain(&ps2), [0xFA, 0xFA, 0x41], "Get Scancode Set: 2");
+        ps2.write_data(0xEE);
+        assert_eq!(drain(&ps2), [0xEE], "Echo");
+        // The controller's own bytes are not the keyboard's.
+        ps2.write_command(0x20);
+        assert_eq!(drain(&ps2), [0x44], "Read Command Byte");
     }
 
     #[test]

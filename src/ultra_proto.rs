@@ -98,7 +98,13 @@ pub const SHM_MAGIC:   u32   = 0x4E36_344D;
 pub const SHM_VERSION: u32   = 1;
 
 /// Fixed area at the start of shm reserved for the two raw_sync Events.
-pub const EVENT_AREA_SIZE:   usize = 256;
+/// The second event starts where the first one's reported size ends, and
+/// raw_sync 0.1.5 reports its mutex twice in that size: 184 bytes for the
+/// first event on macOS (64-byte mutex, 48-byte condition variable), so the
+/// second one ends at 304. 256 bytes put its condition variable under the
+/// header; 512 leaves room on every host. `Ultra64::new` refuses a layout
+/// that does not fit.
+pub const EVENT_AREA_SIZE:   usize = 512;
 pub const SHM_HEADER_OFFSET: usize = EVENT_AREA_SIZE;
 pub const SHM_RAMROM_OFFSET: usize = SHM_HEADER_OFFSET + std::mem::size_of::<ShmHeader>();
 pub const RAMROM_TOTAL:      usize = 0x100_0000; // 16 MB

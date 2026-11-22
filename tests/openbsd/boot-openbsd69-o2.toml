@@ -1,0 +1,35 @@
+# Read by `iris-ci boot-test --steps --machine o2_ip32` for an O2 disk with
+# OpenBSD 6.9 installed from the stock install69.iso (no disk is published,
+# so this runs locally, not in the nightly job). The PROM loads OpenBSD's
+# `boot` from the volume header, which loads `bsd` from partition 0. One boot,
+# on serial; nothing is checked in the guest, which has no `nvram` command.
+#
+# What it catches: the AIC-7880 not answering ("ahc0: board is not
+# responding", no sd0) and an R5000 that never wakes from OpenBSD's first
+# idle `wait` (the console stops after "boot device: sd0").
+
+[[nvram]]
+name = "SystemPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(8)"
+
+[[nvram]]
+name = "OSLoadPartition"
+value = "scsi(0)disk(1)rdisk(0)partition(0)"
+
+[[nvram]]
+name = "OSLoader"
+value = "boot"
+
+[[nvram]]
+name = "OSLoadFilename"
+value = "bsd"
+
+[[nvram]]
+name = "AutoLoad"
+value = "Yes"
+
+[[boot]]
+name = "serial console: openbsd login prompt"
+console = "d"
+quit = "iris quits when asked, serial boot"
+serial = "login:"

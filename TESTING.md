@@ -115,6 +115,28 @@ recordings of a failing case (`vpro rec`) replay on both raster units offline:
 unit and the GPU unit with live-style slice ends, and compares what the board
 wrote to guest memory and its final memory.
 
+**Other guest systems** — `tools/tests/netbsd-indy-keyboard.py` boots the
+NetBSD/sgimips install CD on an R4400 Indy with the Newport console, presses
+keys at sysinst's first menu, and follows the console's text cursor in
+screenshots. Down, Down and Up must move the menu's highlight by one row each,
+and the letter `a` must change the screen once and then leave it still, with no
+key repeating. It takes about five minutes, needs the CD image (which is not in
+the repository), and attaches it through a copy-on-write overlay.
+
+```sh
+cargo build --release --bin iris --bin iris-ci
+tools/tests/netbsd-indy-keyboard.py --iso NetBSD-11.1-sgimips.iso   # exit 0 pass, 1 fail, 2 setup error
+**NetBSD install CD** — `tools/netbsd-cd-boot.py` boots a NetBSD/sgimips
+install CD on a headless Indy with a blank NVRAM, runs the CD's install kernel
+from the PROM Command Monitor and passes when the sysinst menu appears. It
+fails when the kernel panics, and prints the panic line. It starts and quits
+its own iris and writes nothing but an NVRAM file in its work directory. The CD
+is not in the repository; use any `NetBSD-*-sgimips.iso`.
+
+```sh
+tools/netbsd-cd-boot.py NetBSD-11.1-sgimips.iso --cpu r5000   # and --cpu r4400
+```
+
 ## Real PROM images
 
 `real_prom_files_load_to_their_payload` (in `src/dev/prom_image.rs`) loads the
@@ -127,6 +149,41 @@ PROM no longer look for a file. `cargo run -p iris-prom -- show FILE` prints wha
 file holds (its kind, version and segments, each checked) and `extract` writes its
 payload or one segment, such as the BaseIO PROM inside the IP35 file; `download` and
 `pack` rebuild `data/proms` from the catalog.
+
+## Ultra64 dev board without gopher64
+
+`tools/tests/ultra64-irq-or.py` runs a headless Indy at its built-in PROM with
+`[ultra64] enabled` and no disks, and plays the N64 side itself with the
+`ultra64-peer` example, which queues messages on the board's shared-memory
+bridge as gopher64 does. The monitor makes the driver's bus accesses and
+`ioc status` shows the GIO slot 0 interrupt. It checks that acknowledging
+one of the board's interrupt sources leaves the line up while another is
+pending.
+
+```sh
+cargo build --bin iris --example ultra64-peer
+tools/tests/ultra64-irq-or.py target/debug/iris target/debug/examples/ultra64-peer --port 8888
+```
+
+The bridge's shared memory has a fixed name, so run one at a time per host.
+## Shared IOC interrupt bits
+
+`tools/ioc-shared-bit-e2e.py` checks on a running emulator that an IOC
+status bit two sources share stays set while either of them holds it. It
+starts iris as an Indigo2 (IP22) with the built-in PROM, Newport, a blank
+overlay disk and virtio-serial in GIO expansion slot 1, so Newport's retrace
+and the virtio device share L0 GRAPHICS. Once the PROM has the display up it
+stops the CPU, then works both sources from the monitor: the virtio device
+holds its interrupt while Newport's retrace is released (a REX3 STATUS read),
+and the reverse. It reports how many iterations saw the bit clear while a
+source still held it and exits 1 if any did.
+
+```sh
+tools/ioc-shared-bit-e2e.py --iris target/release/iris --iris-ci target/release/iris-ci
+```
+
+It needs no IRIX image. `--base-port` (default 22620) moves the monitor, CI
+socket and serial ports off the defaults.
 
 ## Host audio
 
@@ -802,6 +859,26 @@ registers where it stopped (on the O2, also the words at physical 0x1000 and
 0x4000). [clanker/testing/ci-unattended-irix-boot.md](clanker/testing/ci-unattended-irix-boot.md)
 has the details.
 
+### OpenBSD on the O2 (local)
+
+`tests/openbsd/boot-openbsd69-o2.toml` boots an O2 disk with OpenBSD 6.9 on
+it to its serial login. No such disk is published, so the nightly job does not
+run it: install one from the stock `install69.iso` (sd1, a 4 GB raw image)
+and run
+
+```sh
+cp -c openbsd69-o2.raw /tmp/obsd-boot.raw
+target/release/iris-ci boot-test /tmp/obsd-boot.raw --machine o2_ip32 \
+    --steps tests/openbsd/boot-openbsd69-o2.toml --timeout 600 --out boot-openbsd
+```
+
+The disk gets a copy-on-write overlay beside it, so boot a fresh copy each
+time (`cp -c` clones it on APFS). The boot fails when OpenBSD cannot use the
+AIC-7880 (`ahc0: board is not responding`, then `root device:`) or when an
+R5000 never wakes from its first idle `wait` (the console stops after `boot
+device: sd0`). The guest is not checked from inside: the steps file marks no
+variable `guest`, so the readback that needs IRIX's `nvram` is skipped.
+
 ## Disk persistence on exit
 
 `src/exit_persistence_tests.rs` builds the Indy, Indigo2, Indigo2 IMPACT, O2,
@@ -817,6 +894,60 @@ the same files and reads every sector back. Another test fails on any
 ```sh
 cargo nextest run --release --lib exit_persistence_tests
 ```
+
+## SCSI data phases on Indy and Indigo2
+
+NetBSD's wdsc driver writes the WD33C93A's TRANSFER_INFO command before it
+arms the HPC3 DMA channel, so the chip reaches a data phase with the channel
+still off and has to wait for it (IRIX arms the channel first and never
+waits). `tools/scsi-armwait-e2e.py` boots the NetBSD/sgimips install CD on an
+Indy, leaves sysinst for its shell, reads the CD with `dd`, and reads
+`scsi armwait` from the monitor. It passes when most waits ended within one
+100 µs poll interval, that is when the arming itself starts the data phase.
+
+```sh
+tools/scsi-armwait-e2e.py target/release/iris NetBSD-11.1-sgimips.iso
+```
+
+The CD image comes from the NetBSD project and is opened read-only; the
+machine has no disk. `--keep DIR` keeps the config, console log and iris
+output, `--monitor-port` moves the monitor (default 23460).
+## O2 snapshots, CD changes and scratch over iris-ci
+
+`tools/tests/o2-ci-rollback.sh` boots a headless O2 on its built-in PROM (no
+IRIX needed) and drives it over the CI socket into the command monitor. It
+sets a PROM variable, then checks that `restore` and `rollback` each bring back
+the value saved before. It also makes two CD images with `mkvh`, each holding
+one file in its volume header, and checks that the PROM's `ls` of the CD names
+the file on the new disc after `cdrom-eject` and after `cdrom-load`, and that
+the PROM's `hinv` lists a scratch volume whose bytes round-trip through
+`iris-ci scratch write` and `scratch read`. It prints
+one PASS or FAIL line per check and exits 1 if any fail.
+
+```sh
+cargo build --release --bin iris --bin iris-ci --bin mkvh
+tools/tests/o2-ci-rollback.sh            # --bin DIR, --port BASE (default 23050), --keep
+```
+
+## Offline distribution build
+
+`tools/offline-build-test.sh` builds iris the way a distribution's build host
+does: dependencies vendored, network denied (`sandbox-exec` on macOS, an
+unshared network namespace on Linux), and a fresh `CARGO_HOME`, download cache
+and target directory. It follows the steps in
+[FEATURES.md](FEATURES.md#offline-and-distribution-builds), then checks the
+result: the `chd-extract` it built must unpack a CHD made by MAME's `chdman`
+byte for byte (skipped without `chdman`).
+
+```sh
+tools/offline-build-test.sh --expect-download-failure --gui
+```
+
+`--expect-download-failure` first builds without `LIBCHDMAN_FORCE_SOURCE` and
+requires that build to fail at the prebuilt download. `--gui` also checks
+iris-gui as the release builds it. `--keep` keeps the vendor tree and logs.
+`JOBS` and `BUILD_WRAPPER` (a prefix such as `nice -n 10`) control the cargo
+runs. Two cold release builds take several minutes.
 
 ## Interpreter hot paths
 
