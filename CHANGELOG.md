@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Newport colour-index shading
+
+- With the REX3 JIT (always on in iris-gui), smooth-shaded colour-index
+  drawing no longer turns into black and white stripes on Indy and Indigo2
+  Newport. SideFX PRISMS's "smooth" and "facet" views now draw correctly
+  (issue #798).
+
 ### jitv2 interrupts
 
 - Under jitv2, software interrupts are taken as soon as they are enabled, not

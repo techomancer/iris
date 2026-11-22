@@ -1324,6 +1324,9 @@ fn emit_shader(
             // DRAW path (possibly HOSTW): resolve source color from DDA / host pixel.
             let raw_src = if is_hostw && dm0.colorhost() {
                 host_pixel_v
+            } else if dm0.shade() && !dm1.rgbmode() {
+                // CI: the red DDA is the index (get_colori), not a clamped byte.
+                b.ins().ushr_imm_s(colorred_v, 11)
             } else if dm0.shade() {
                 let r  = clamp_color_component(&mut b, colorred_v);
                 let g  = clamp_color_component(&mut b, colorgrn_v);
@@ -2082,7 +2085,10 @@ fn emit_draw_iline(
     let _ = depth_mask; // used indirectly via emit_pixel_write
 
     let src_color: Value = {
-        let raw_src = if dm0.shade() {
+        let raw_src = if dm0.shade() && !dm1.rgbmode() {
+            // CI: the red DDA is the index (get_colori), not a clamped byte.
+            b.ins().ushr_imm_s(colorred_v, 11)
+        } else if dm0.shade() {
             let r  = clamp_color_component(&mut b, colorred_v);
             let g  = clamp_color_component(&mut b, colorgrn_v);
             let bl = clamp_color_component(&mut b, colorblue_v);
