@@ -36,5 +36,14 @@ this, use `log ps2 file <path>` then `log ps2 on`: `IRIS_DEBUG_LOG=ps2` logs
 every status poll the PROM makes to stderr and to the monitor, and the monitor
 stops answering.
 
-The IRIX kernel's command-byte writes were not traced; it drives set 3 like the
-PROM and has not been booted against this change.
+**IRIX.** IRIX 6.5 on an Indigo2 IP28 (same IOC controller) leaves the command
+byte at 0x03 with the keyboard in set 3, so it never translates either. With
+the fix, clogin took typed letters, Left and Return (`gust`, Left, Left, `e`
+logged in as `guest`). No Indy IRIX disk was at hand.
+
+**E2E check.** `tools/tests/netbsd-indy-keyboard.py` boots the install CD to
+sysinst and judges which screen rows each key changes, because NetBSD 11.1's
+glyphs do not reach the Newport screen under `--ci` (only its text cursor
+does) while 11.99.11's do. It fails on the pre-fix build (cursor
+never moves, screen keeps changing after `a`) and passes with the fix, on 11.1
+and on the 11.99.11 daily.

@@ -542,3 +542,136 @@ fn a_ci16_image_put_lands_its_indices_in_the_index_field() {
     assert_eq!(index_at(&s, 146, 313), 0);
     assert_eq!(index_at(&s, 147, 314), 0);
 }
+
+/// The X server's 30-bit TrueColor save of screen pixels, as the Motif text
+/// cursor's save-under sends it in nedit's file dialog: the frame buffer
+/// named by address with the window's pixel mode selected, word 7 write
+/// code 0x10c (ABGR, 2_10_10_10_REV), four bytes a pixel. Refusing the
+/// code left the guest's buffer as it was, and the cursor's restore then
+/// painted that back: the glyph columns under the cursor vanished.
+#[test]
+fn a_30_bit_save_under_returns_abgr_2_10_10_10_rev() {
+    use crate::dev::odyssey::field::Layout;
+    use crate::dev::odyssey::vram::Format;
+    const MODE: u32 = 0x2000_6960;
+    let (mut s, _, ram) = fenced_board();
+    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, MODE, 0] {
+        s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
+    }
+    s.gpu_sync();
+    let f = Format::decode(MODE);
+    let rows = Rows::new(s.vram_ptr(), View::colour(&Surface::new(0x2000, 0x50, f.fb_log2), Layout::of(f).field(false), MAX_DIM));
+    rows.store_word(200, 300, 0xffff_ffff);
+    rows.store_word(201, 300, 0x4747_4700);
+    ram.put(PAGE_A, &[0xa5; 40]);
+    let mut expect = [0xa5u8; 40];
+
+    put_table(&ram, TABLE, [0x2000, 300 << 16 | 200, 0x50, 0x10002, 0x8223_3062, 0, 8, 0xb301_010c], &[pte(PAGE_A + 16, 8)]);
+    descriptor(&mut s, TABLE);
+
+    // Ten bits a channel: 0x47 widens to 0x11d, as the plane holds it.
+    expect[16..20].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
+    expect[20..24].copy_from_slice(&0x11d4_751du32.to_be_bytes());
+    assert_eq!(ram.get(PAGE_A, 40), expect);
+}
+
+/// buttonfly's texture font: a luminance-alpha texture uploaded by address
+/// with no level selected, word 4 0x80001000 (2-byte fields, format byte
+/// 0) and source code 0x48, into the level its descriptor later names as
+/// format 0xb, a luminance byte then an alpha byte. Each texel keeps its
+/// two bytes. Stored as four 4-bit components, a clear texel (L 0xff, A 0)
+/// read back with alpha 0xf0 and every glyph drew as an opaque box.
+#[test]
+fn a_luminance_alpha_texture_upload_keeps_its_alpha() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0xff, 0x00, 0x80, 0xff, 0x3c, 0x5a]);
+    let header = [0x16d000, 0, 0x10, 1 << 16 | 3, 0x8000_1000, 0, 6, 0x3200_0048];
+    put_table(&ram, TABLE, header, &[pte(PAGE_B, 6)]);
+
+    descriptor(&mut s, TABLE);
+
+    let lum_alpha = Codec::Texel { bytes: 2, field: crate::dev::odyssey::field::FIELD_TWO };
+    let word = |x| mem_word(&s, 0x16d000, 0x10, 1, lum_alpha, x, 0);
+    assert_eq!(word(0), 0xffff_ff00);
+    assert_eq!(word(1), 0x8080_80ff);
+    assert_eq!(word(2), 0x3c3c_3c5a);
+}
+
+/// Level descriptor `i`'s three words, as the library sends them.
+fn tex_level(s: &mut Board, i: u32, word0: u32, word1: u32) {
+    for w in [select(reg::TEX_LEVEL + i), word0, word1, 0] {
+        s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
+    }
+}
+
+/// The board model checks each texture level the library names against
+/// the upload that wrote its memory: buttonfly's luminance-alpha font
+/// (format index 0xb over a 2-byte upload of code 0x48) agrees; the same
+/// memory named as format index 0xc (four 4-bit components) does not, and
+/// the disagreement is counted and kept for `vpro status`.
+#[cfg(feature = "vprodiag")]
+#[test]
+fn a_level_is_checked_against_the_upload_that_wrote_it() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0xff, 0x00, 0x80, 0xff]);
+    put_table(&ram, TABLE, [0x16d000, 0, 0x10, 1 << 16 | 2, 0x8000_1000, 0, 4, 0x3200_0048], &[pte(PAGE_B, 4)]);
+    descriptor(&mut s, TABLE);
+
+    tex_level(&mut s, 0, 0x16d000, 0x00b0_0010);
+    s.gpu_sync();
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+
+    // Each upload is checked once: a second draw's descriptor is not.
+    tex_level(&mut s, 0, 0x16d000, 0x00c0_0010);
+    s.gpu_sync();
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+
+    descriptor(&mut s, TABLE);
+    tex_level(&mut s, 0, 0x16d000, 0x00c0_0010);
+    s.gpu_sync();
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (2, 1));
+    assert!(s.diag.packing.mismatches[0].contains("word 4 0x80001000"), "{}", s.diag.packing.mismatches[0]);
+}
+
+/// glprim's 256x256 LUMINANCE (and INTENSITY) texture: a one-byte source,
+/// code 0x42, uploaded by address with no level selected under the same
+/// word 4 as buttonfly's font, into the level its descriptor names as
+/// format index 4, one byte a texel's value. The board model's packing
+/// check found it stored as four 4-bit components.
+#[test]
+fn a_luminance_texture_upload_keeps_its_byte() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0x00, 0x80, 0xff, 0x5a]);
+    put_table(&ram, TABLE, [0x16d000, 0, 0x10, 1 << 16 | 4, 0x8000_1000, 0, 4, 0x3205_0042], &[pte(PAGE_B, 4)]);
+
+    descriptor(&mut s, TABLE);
+    tex_level(&mut s, 0, 0x16d000, 0x0040_0010);
+    s.gpu_sync();
+
+    let one = Codec::Texel { bytes: 2, field: crate::dev::odyssey::field::FIELD_ONE };
+    let word = |x| mem_word(&s, 0x16d000, 0x10, 1, one, x, 0);
+    assert_eq!([word(0), word(1), word(2), word(3)], [0, 0x8080_8080, 0xffff_ffff, 0x5a5a_5a5a]);
+    #[cfg(feature = "vprodiag")]
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+}
+
+/// An 8-byte level names format index 33 (four components) over an
+/// upload stored as four 12-bit lanes: the same storage, not a
+/// disagreement.
+#[cfg(feature = "vprodiag")]
+#[test]
+fn an_eight_byte_level_over_lanes_is_the_same_packing() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0x11, 0x22, 0x33, 0x44]);
+    put_table(&ram, TABLE, [0x16b000, 0, 0x10, 1 << 16 | 1, 0x8002_5000, 0, 4, 0x3201_004b], &[pte(PAGE_B, 4)]);
+
+    descriptor(&mut s, TABLE);
+    tex_level(&mut s, 0, 0x16b000, 0x8210_0010);
+    s.gpu_sync();
+
+    assert_eq!((s.diag.packing.checked, s.diag.packing.mismatch_count), (1, 0));
+}

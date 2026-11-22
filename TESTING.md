@@ -88,6 +88,17 @@ in each. Both write to `/shared/results/TAG`; the host-side
 `test/gltest/glsuite-compare.sh A B` lists every difference between two runs.
 Running both on the CPU and the GPU raster unit and comparing is how the GPU
 unit is checked against the reference end to end.
+
+`test/gltest/texpack.sh` makes the library upload a texture every way glprim
+can: each sized internal format and each unsized source format, small (FIFO
+image) and 256x256 (DMA), with and without mipmap levels, plus ABGR, 16-bit
+sources, a sub-image and `gluBuild2DMipmaps`. On VPro, in a build with
+`--features vprodiag`, the board model checks
+every texture level the library names against the upload that wrote that
+memory, and `vpro status` shows the count and the first disagreements
+("texture packing"). A texture packed one way and sampled another can round
+trip through `glGetTexImage` unnoticed, so the texture sweep alone does not
+catch it; run `texpack.sh` and read `vpro status` after it.
 The same suite on a real board, from the same binaries, against a guest
 emulating that board is how the model is checked against hardware; the
 board's quirks then show up as differences instead of as failures. Cases
@@ -117,11 +128,13 @@ wrote to guest memory and its final memory.
 
 **Other guest systems** — `tools/tests/netbsd-indy-keyboard.py` boots the
 NetBSD/sgimips install CD on an R4400 Indy with the Newport console, presses
-keys at sysinst's first menu, and follows the console's text cursor in
-screenshots. Down, Down and Up must move the menu's highlight by one row each,
-and the letter `a` must change the screen once and then leave it still, with no
-key repeating. It takes about five minutes, needs the CD image (which is not in
-the repository), and attaches it through a copy-on-write overlay.
+keys at sysinst's first menu, and compares screenshots. Down, Down and Up must
+each change exactly two adjacent text rows (the highlight moving by one row
+each), and the letter `a` must change the screen once and then leave it still,
+with no key repeating. It judges only which rows change, so it works whether or
+not the console's glyphs reach the screen. It takes about five minutes, needs
+the CD image (which is not in the repository), and attaches it through a
+copy-on-write overlay.
 
 ```sh
 cargo build --release --bin iris --bin iris-ci

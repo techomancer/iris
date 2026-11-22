@@ -83,6 +83,8 @@ mod interface;
 mod clip;
 mod logic;
 mod mmio;
+#[cfg(feature = "vprodiag")]
+mod packing;
 mod pixel_dma;
 mod pipe;
 mod pixel_write;

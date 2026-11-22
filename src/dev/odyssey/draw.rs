@@ -853,6 +853,10 @@ impl Board {
         let z = f32::from_bits(self.image.box_words[6]) as f64;
 
         self.image.fragment = None;
+        #[cfg(feature = "vprodiag")]
+        if self.dest_views().scratch {
+            self.note_selected_upload("FIFO image", 0);
+        }
         if z == 0.0 || !z.is_finite() || self.dest_views().scratch {
             return;
         }

@@ -218,8 +218,30 @@ impl Board {
             ((hdr[dma::HDR_ORIGIN] & 0xffff) as i32).wrapping_add(self.win.read_origin[0]),
             ((hdr[dma::HDR_ORIGIN] >> 16) as i32).wrapping_add(self.win.read_origin[1]),
         );
+        // A luminance or luminance-alpha texture uploaded by address with
+        // no level selected names 2-byte fields with format byte 0, which
+        // would read as four 4-bit components; the source's bytes are the
+        // field's (traced: buttonfly's texture font, word 4 0x80001000 and
+        // code 0x48 into a format-0xb level; glprim's 256x256 LUMINANCE
+        // and INTENSITY textures, code 0x42 into a format-4 level). Packed
+        // as 4/4/4/4, a clear texel's alpha came back 0xf0 and every glyph
+        // drew as a box. The board model's packing check (feature
+        // vprodiag, Board::check_level_packing) found the luminance case.
+        let one_or_two = if read || drawable || bytes != 2 {
+            None
+        } else {
+            match hdr[dma::HDR_CONTROL] & image::CODE_MASK {
+                image::CODE_LUM => Some(super::field::FIELD_ONE),
+                image::CODE_LUM_ALPHA => Some(super::field::FIELD_TWO),
+                _ => None,
+            }
+        };
         let codec = |at: u8| {
-            let named = super::copy::source_codec(bytes, fmt & 0xff);
+            let named = if let Some(field) = one_or_two {
+                super::field::Codec::Texel { bytes: 2, field }
+            } else {
+                super::copy::source_codec(bytes, fmt & 0xff)
+            };
             if drawable && read {
                 return self.drawable_codec(origin.0, origin.1, at).filter(|c| super::copy::codec_bytes(*c) == bytes).unwrap_or(named);
             }
@@ -305,6 +327,29 @@ impl Board {
             }
         }
         let obj = memory.then_some(());
+        // The texture packing check: a backing-store page (dma_raw) is
+        // no texture and is not checked.
+        #[cfg(feature = "vprodiag")]
+        let fmt = hdr[dma::HDR_FORMAT];
+        #[cfg(feature = "vprodiag")]
+        let page = hdr[dma::HDR_CONTROL] & image::CODE_MASK == 0 && matches!(fmt, dma::FMT_RAW16 | dma::FMT_RAW32 | dma::FMT_RAW64);
+        #[cfg(feature = "vprodiag")]
+        if memory && !page {
+            use super::packing::{kind_codec, UploadPacking};
+            if let Some(codec) = kind_codec(to.v.kind) {
+                // The surface dma_fields() wrote through.
+                self.note_upload(UploadPacking {
+                    base: if drawable { self.draw_word } else { hdr[dma::HDR_DEST] } & ADDR_MASK,
+                    pitch: hdr[dma::HDR_WIDTH] & PITCH_MASK,
+                    log2: ((fmt >> 16) & 0xf) as u8 + 1,
+                    codec,
+                    word4: fmt,
+                    code: hdr[dma::HDR_CONTROL] & write::CODE_MASK,
+                    how: "DMA",
+                    checked: false,
+                });
+            }
+        }
         let mut e = [DmaEntry::default(); dma::MAX_PAGES];
         let x = hdr[dma::HDR_ORIGIN] & 0xffff;
         let y = hdr[dma::HDR_ORIGIN] >> 16;
@@ -791,6 +836,17 @@ pub(super) static DMA_X_LAYOUTS: [DmaLayout; 4] = [
     lay(image::CODE_CI, 1, [BI, 0, 0, 0, 0, 0, 0, 0]),
 ];
 
+/// X reads whose word 7 names a packed type (bits 8:5 nonzero beyond the
+/// byte types), by the whole write code (write::CODE_MASK): the write
+/// table's packing (pixel_write.rs) run backwards. The X server's 30-bit
+/// TrueColor visual saves screen pixels as 0x10c, ABGR 2_10_10_10_REV
+/// (traced: the Motif text cursor's save-under in nedit), and puts them
+/// back under the same code.
+pub(super) static DMA_X_PACKED: [(u32, DmaLayout); 2] = [
+    (0x10c, pack(0x0c, 4, [fld(3, 2, 30), fld(2, 10, 20), fld(1, 10, 10), fld(0, 10, 0)])), // ABGR, 2_10_10_10_REV
+    (0x10b, pack(0x0b, 4, [fld(0, 10, 22), fld(1, 10, 12), fld(2, 10, 2), fld(3, 2, 0)])),  // RGBA, 10_10_10_2
+];
+
 /// Whether a read header's class and code are sent both for a colour read
 /// and for a depth or stencil read.
 fn shared_depth_code(cls: u32, code: u32) -> bool {
@@ -811,7 +867,11 @@ impl Board {
         let drawable = hdr[dma::HDR_DEST] & dma::SENTINEL != 0;
         let mut l: Option<&'static DmaLayout> = None;
 
-        if xcode != 0 {
+        let wide = hdr[dma::HDR_CONTROL] & write::CODE_MASK;
+
+        if wide > image::CODE_MASK {
+            l = DMA_X_PACKED.iter().find(|(c, _)| *c == wide).map(|(_, t)| t);
+        } else if xcode != 0 {
             for t in DMA_X_LAYOUTS.iter() {
                 if t.code as u32 == xcode {
                     l = Some(t);
@@ -1724,6 +1784,8 @@ impl Board {
         // image through the FIFO, Board::image_put()).
         let gpu = self.gpu_unit();
         let to = if gpu { super::pipe::backend::DestMem::of(mem.untracked(), &self.dest_views()).colour[0] } else { self.dest_mem().colour[0] };
+        #[cfg(feature = "vprodiag")]
+        self.note_selected_upload("mip-level build", 0);
         for y in 0..hd {
             for x in 0..wd {
                 let v = from.load_word(2 * x as i32, 2 * y as i32).unwrap_or(0);
