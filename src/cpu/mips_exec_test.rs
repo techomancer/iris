@@ -7489,6 +7489,30 @@ mod tests {
         }
     }
 
+    /// Config's line-size bits IB (5) and DB (4) are fixed by the part, not
+    /// by software: an MTC0 that clears them must leave them as reset set
+    /// them. The R5000 Indy PROM writes Config with IB and DB clear, and
+    /// NetBSD then sized the R5000's I-cache line as 16 bytes and panicked
+    /// ("r5k picache line size 16", techomancer/iris#773).
+    #[test]
+    fn config_line_size_bits_ignore_mtc0() {
+        use crate::cpu::mips_cache_v2::R5000Cache;
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(ib_db: u32) {
+            let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            let reset = exec.core.cp0_config;
+            assert_eq!(reset & 0x30, ib_db, "{} reset IB/DB", C::NAME);
+            let mtc0_config = (OP_COP0 << 26) | (0x04 << 21) | (9 << 16) | (16 << 11);
+            // Flip IB and DB, set K0 to 2: only K0 may change.
+            exec.core.write_gpr(9, ((reset ^ 0x30) & !7 | 2) as u64);
+            assert_eq!(exec.exec(mtc0_config), EXEC_COMPLETE);
+            assert_eq!(exec.core.cp0_config, reset & !7 | 2, "{}: IB/DB must stay", C::NAME);
+        }
+        check::<R4400Cache>(0);
+        check::<R5000Cache>(0x30);
+    }
+
     // ============ C1: misaligned instruction address raises AdEL ===========
     //
     // Before the fix nothing checked PC alignment, so a misaligned target
