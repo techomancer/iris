@@ -28,6 +28,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [cache-lines-live-in-the-cpus-view.md](cpu/cache-lines-live-in-the-cpus-view.md) | design | A valid R10000-family cache line, or R5000 primary data line, makes its page private in that CPU's own copy of ppmem's window; the uncached path and other masters keep memory. How CACHE operands translate, the limits, and how to see what is held |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
 | [cache-tag-index-and-check-bits.md](cpu/cache-tag-index-and-check-bits.md) | rule | Cache tags: index ops index by address; check bits are generated, not stored |
+| [config-line-size-bits-are-read-only.md](cpu/config-line-size-bits-are-read-only.md) | rule | Config IB/DB (line sizes) ignore MTC0; the Indy PROM clears them and NetBSD on an R5000 then panicked "r5k picache line size 16" |
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
 | [cp0-index-masks-never-wraps.md](cpu/cp0-index-masks-never-wraps.md) | rule | CP0 `Index` selects a TLB slot by masking, never modulo |
 | [cp0-status-writes-must-resync-privilege-state.md](cpu/cp0-status-writes-must-resync-privilege-state.md) | rule | Every `cp0_status` write must call `resync_privilege_state()` |
@@ -36,6 +37,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [decode-cache-index-must-survive-page-colouring.md](cpu/decode-cache-index-must-survive-page-colouring.md) | rule | Decode cache indexed by `pfn % 64` thrashed on the O2's coloured text pages; hash the page number. Also: O2 shadow model ran with an empty RAM bitmap in interpreter builds |
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [cvt-to-int-inexact-is-judged-against-the-source.md](cpu/cvt-to-int-inexact-is-judged-against-the-source.md) | rule | A float-to-integer conversion's Inexact is judged against the source, in both engines |
+| [fpu-conversions-hand-the-hard-cases-to-software.md](cpu/fpu-conversions-hand-the-hard-cases-to-software.md) | rule | Conversions take Unimplemented Operation for denormal/quiet-NaN sources, unrepresentable results and longs past the part's range; Invalid default is 2^31-1 whatever the sign; CVT.S.D overflow raises I too |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
 | [fused-load-store-passes-retry-through.md](cpu/fused-load-store-passes-retry-through.md) | rule | A fused ADDU/ADDIU+load/store must pass EXEC_RETRY through; raising it gave IP22+IMPACT a spurious ExcCode 0 PROM panic under `lightning` (#270) |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
@@ -140,6 +142,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
 | [o2-icon-backdrop-crosshatch.md](devices/o2-icon-backdrop-crosshatch.md) | open | O2 icon boxes crosshatch: GL dithers the panel's own colour, truncated just under the 5-bit grid; the guest's drawing, unconfirmed against hardware; `re dither off` compares |
 | [o2-timing-interrupts-are-line-compares.md](devices/o2-timing-interrupts-are-line-compares.md) | rule | GBE has four line-compare interrupts and no vblank one; IRIX uses lines 1028 and ~976; the refresh thread raises them as line events; the old "dispatcher never returns" hang did not reproduce |
+| [ioc-shared-status-bits-are-wired-or.md](devices/ioc-shared-status-bits-are-wired-or.md) | rule | An IOC status bit several sources drive (Indigo2 GIO slots, direct graphics pins) is the OR of their levels; acks drop a source's level, not the bit; snapshots keep levels. Open: the Indy second head's pins |
 | [second-newport-needs-slot0-and-board-rev-4.md](devices/second-newport-needs-slot0-and-board-rev-4.md) | rule | IRIX probes a second Newport only at 0x1F4F0000; an Indy needs board revision 4; its retrace and FIFO share the slot's GIO_EXP0 pin |
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
@@ -352,6 +355,7 @@ The InfiniteReality (KONA) graphics pipe's host interface.
 |---|---|---|
 | [front-end.md](kona/front-end.md) | design | The Host Interface Processor: attach interface, the command queue on `GFifo`, which accesses wait, the job seam to a back end, approximations |
 | [token-census.md](kona/token-census.md) | measurement | The token families two recorded streams (the PROM to its graphics menu, IRIX to the 4Dwm desktop) send, how far a replay into `NullBackend` stays exact, and the selectors QEMU's decoder leaves unresolved |
+| [tile-scheduled-flag-needs-seqcst.md](kona/tile-scheduled-flag-needs-seqcst.md) | rule | The tile scheduler's `tail`/`scheduled` hand-off is a store-buffering pair: SeqCst on all four accesses, or a job is never run and `submit`/`drain` spin forever |
 
 ## hostgl/
 
@@ -527,6 +531,7 @@ Toolchain, dependency upgrades, platform build issues.
 | Note | Kind | Title |
 |---|---|---|
 | [chd-disks-need-features-chd-at-build-time.md](build/chd-disks-need-features-chd-at-build-time.md) | history | CHD disk images require `--features chd` at build time |
+| [libchdman-offline-needs-force-source.md](build/libchdman-offline-needs-force-source.md) | rule | libchdman-rs builds offline only with LIBCHDMAN_FORCE_SOURCE |
 | [dependency-upgrade-gotchas.md](build/dependency-upgrade-gotchas.md) | howto | Dependency upgrade gotchas (2026-08 sweep) |
 | [mmap-rs-fixed-address-aliasing.md](build/mmap-rs-fixed-address-aliasing.md) | design | Host memory aliasing: what mmap-rs actually supports (and where it doesn't) |
 
@@ -541,6 +546,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
 | [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
+| [kona-tile-handoff-race.md](plans/kona-tile-handoff-race.md) | open | KONA tile scheduler strands a job when a tile changes hands (tail store `Release` / load `Acquire` in a store-then-load hand-over): `a_tiled_run_is_bit_exact_with_the_inline_one` hangs on Apple silicon and is ignored; stuck-state dump, cause, candidate two-line `SeqCst` fix with measurements |
 | [iris-daynaport-target.md](plans/iris-daynaport-target.md) | plan | Task: add a DaynaPort SCSI/Link target to the IRIS emulator |
 | [origin-octane-o2-landing-review.md](plans/origin-octane-o2-landing-review.md) | plan | Review of James Braid's SGI series (547 commits to 2026-11-11, two passes): Origin/Onyx2 two-node, Octane, O2, Fuel/Tezro (IP35), InfiniteReality (KONA); cache-as-RAM, DMA and interrupt paths per machine; ranked findings with status (KONA texture-bind race, Origin node-1 code never JIT-compiled, cross-node IRQs land on node 0, byte-wise DMA on Origin/IP35, BCM5701 lost coalescing wake) |
 | [irix7-fork-review.md](plans/irix7-fork-review.md) | plan | The `irix7/iris` fork — change inventory and triage |

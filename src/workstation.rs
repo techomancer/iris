@@ -316,6 +316,19 @@ pub trait Workstation: Send {
     fn pending_chd_sync_count(&self) -> usize {
         0
     }
+    /// Read and write counters of every disk and CD-ROM, for a front-end's
+    /// activity lights: one entry per disk bus, in the order the machine
+    /// numbers its SCSI controllers (then NVMe and Fibre Channel where it has
+    /// them), each a list by SCSI id. The counters only go up; compare two
+    /// samples. Takes no bus lock.
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        Vec::new()
+    }
+    /// Frames the machine's sound cards have moved, for a front-end's audio
+    /// light; `None` with no sound card. Compare two samples.
+    fn audio_frames(&self) -> Option<u64> {
+        self.monitor().audio_frames()
+    }
     /// Make every disk's accepted writes survive the process, including a
     /// copy-on-write overlay's record of the sectors it holds. Run it before
     /// the process exits without dropping the machine.

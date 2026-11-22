@@ -664,20 +664,38 @@ pub trait CpuModel: MipsCache {
     const SINGLE_CLEARS_UPPER: bool = Self::R10K_FAMILY;
     /// A conversion to an integer format that cannot hold the result (NaN,
     /// infinity, out of range) takes Unimplemented Operation instead of
-    /// raising Invalid with a saturated result. "R10000 took an unimplemented
-    /// exception whenever a conversion from an FP value would result in a
-    /// value that cannot be represented in the target format", and the
-    /// R12000 kept it except for a denormal source with FCSR.FS set, which
-    /// it flushes to zero (NEC VR10000 Series User's Manual U10278EJ4V0UM,
-    /// Appendix B.4, p. 350). The R14000 is inferred to match.
-    const CVT_UNREPRESENTABLE_UNIMPLEMENTED: bool = Self::R10K_FAMILY;
+    /// raising Invalid with the 2^31-1 / 2^63-1 default result. Every part
+    /// IRIS models does: an Indy R4400 rev 6.0 traps CVT.W.S of 2^31 and of
+    /// +infinity with Cause.E (`cpu-tests/oracle/r4400-rev6.0-run5-clean.log`),
+    /// the VR5000 manual lists an out-of-range word conversion as a cause of
+    /// the exception (9.4.6), "R10000 took an unimplemented exception
+    /// whenever a conversion from an FP value would result in a value that
+    /// cannot be represented in the target format", and the R12000 kept it
+    /// except for a denormal source with FCSR.FS set, which it flushes to
+    /// zero (NEC VR10000 Series User's Manual U10278EJ4V0UM, Appendix B.4,
+    /// p. 350). The R14000 is inferred to match. The kernel's FP emulator
+    /// delivers the architectural Invalid result.
+    const CVT_UNREPRESENTABLE_UNIMPLEMENTED: bool = true;
     /// CVT.L and the other long conversions take Unimplemented Operation for
-    /// a result outside [-2^51, 2^51) instead of the format's own range. "In
-    /// the R10000, the conversion allows only up to 51 bits; otherwise an
-    /// Unimplemented Operation exception is taken" (R10000 UM v2.0, p. 312).
-    /// Read as 51 bits of magnitude beside the sign, the shape of the 64-bit
-    /// range. The R12000's manual has no such sentence, so only the R10000.
-    const CVT_L_51_BITS: bool = false;
+    /// a result outside [-2^N, 2^N) instead of the format's own range, for
+    /// this N; 63 means the format's own range. The VR5000 takes it outside
+    /// [-2^53, 2^53) (manual 9.4.6: "greater than 2^53-1 ... or less than
+    /// -2^53"); the R4400 is inferred to match, as it does for the long
+    /// sources below. "In the R10000, the conversion allows only up to 51
+    /// bits; otherwise an Unimplemented Operation exception is taken"
+    /// (R10000 UM v2.0, p. 312), read as 51 bits of magnitude beside the
+    /// sign. The R12000's manual has neither sentence, so the R12000 and
+    /// later use the full range. The cache models override this for the
+    /// R10000 itself, which `R10K_FAMILY` cannot tell from its successors.
+    const CVT_L_RANGE_BITS: u32 = if Self::R10K_FAMILY { 63 } else { 53 };
+    /// CVT.S.L and CVT.D.L take Unimplemented Operation for a source outside
+    /// [-2^N, 2^N), for this N; 63 means every long converts. The VR5000
+    /// takes it outside [-2^52, 2^52) (manual 9.4.6: "greater than 2^52-1
+    /// ... or less than -2^52"). An Indy R4400 rev 6.0 and an R5000 rev 1.0
+    /// both convert 2^40+1 and trap 2^53+1 and 2^62
+    /// (`cpu-tests/tests/fpu/fpu_vectors.c`, `fpu/vec_cvt_from_l`), which
+    /// fits the manual's bound. The R10000 family converts every long.
+    const CVT_FROM_L_RANGE_BITS: u32 = if Self::R10K_FAMILY { 63 } else { 52 };
     /// An uncached store the system refuses completes instead of raising a
     /// Data Bus Error. The R10000 sends it as a write request, which gets no
     /// response, and Bus Error comes only from an error response to a read or
@@ -3742,7 +3760,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
-    const CVT_L_51_BITS: bool = MODEL == model::R10000;
+    const CVT_L_RANGE_BITS: u32 = if MODEL == model::R10000 { 51 } else if Self::R10K_FAMILY { 63 } else { 53 };
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.
     const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };

@@ -13,6 +13,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### NetBSD on the R5000 Indy
+
+- NetBSD/sgimips boots on an Indy with `--cpu r5000`; its kernel
+  stopped with `panic: r5k picache line size 16` before reaching the installer.
+### InfiniteReality graphics
+
+- The InfiniteReality pipe's tile renderer no longer hangs when one of its
+  jobs is handed to a worker at the same moment that worker goes idle, which
+  happened in about 1 in 15 test runs on Apple Silicon (Onyx2, Origin 3200).
+
 ### Volume headers
 
 - `mkvh build` splits an ELF executable's segments larger than 512 KB, so the
@@ -67,6 +77,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   the Indy and Indigo2: the second board moved to GIO expansion slot 0 with
   its interrupts on that slot, and `iris` opens a window for each head. The
   Ultra64 board shares that slot and is turned off with two heads.
+- Indy and Indigo2: two devices on one shared graphics interrupt (Indigo2 GIO
+  slots, both heads) no longer lose an interrupt when one of them lets go.
 - The `iris` window shows frames at once and no longer waits for the host
   monitor's vertical sync, so the guest's retrace is not held to the host's
   rate. `vsync = true` restores the wait (useful on an X11 desktop with no
@@ -523,6 +535,10 @@ image) where the guest test suites showed they differed:
   every CPU, interpreter and jitv2; the Octane PROM's `ide fpu` tests pass.
 - `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` set the Inexact
   cause and flag, and raise an enabled Inexact trap, when they drop a fraction.
+- FPU conversions follow the R4400, R5000 and R10000 rules (#71): an
+  unrepresentable result, a denormal or quiet-NaN source, and a long past the
+  part's range go to the kernel's FP emulator. `CVT.S.D` raises Inexact with
+  Overflow and flushes or traps an underflow by FCSR.FS. Interpreter and jitv2.
 
 ### Interpreter
 
@@ -603,6 +619,8 @@ image) where the guest test suites showed they differed:
 
 - The `developer` profile uses thin LTO, so a rebuild after an edit takes one
   to three minutes instead of about nine; measure performance with `--release`.
+- Distribution packagers can build iris and iris-gui without network access,
+  CHD support included: `cargo vendor`, then `LIBCHDMAN_FORCE_SOURCE=1` (issue 213).
 
 ### iris-gui
 

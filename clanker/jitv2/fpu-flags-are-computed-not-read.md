@@ -40,11 +40,12 @@ particular:
   and each ADD/SUB/MUL/DIV carries one call, not a copy of the rules. 0/0 is Invalid, not divide-by-zero; FZ needs a
   finite nonzero dividend. The Octane PROM's IDE `fpu` test checks both
   (its "invalid result" and "overflow result" cases). SQRT, RECIP,
-  RSQRT, the MADD, MSUB, NMADD and NMSUB families and CVT.S.D follow the
+  RSQRT and the MADD, MSUB, NMADD and NMSUB families follow the
   Invalid rule only (next bullet) and still compute no Overflow or Inexact:
   an overflowing result from any of them is delivered as the host rounds
-  it, with FCSR untouched. CVT.S.D has its own overflow check but no
-  Inexact-with-Overflow.
+  it, with FCSR untouched. The conversions compute all their flags,
+  CVT.S.D's Overflow with Inexact included
+  (`clanker/cpu/fpu-conversions-hand-the-hard-cases-to-software.md`).
 - **Invalid results of the operations above deliver the MIPS default NaN.**
   The host's NaN for an invalid result (x86: 0xFFC00000) has the quiet bit
   set, which is a *signalling* NaN under the MIPS encoding, so an
@@ -70,8 +71,8 @@ particular:
   raises V where hardware probably takes E. SQRT traps a quiet-NaN operand
   with E before this point. What an R10000 does with a quiet-NaN operand to
   these operations is not stated in the manuals we have, so it is left.
-  A quiet-NaN source to CVT.S.D has a related quirk: it is never equal to
-  its widened result, so it leaves the exact path and sets Cause and Flag I.
+  A quiet-NaN source to a conversion takes Unimplemented Operation, so the
+  conversions do not have this quirk.
 
 Stated in `fpu_update_fcsr`'s doc comment as: *"not worth the IR to compute for
 ordinary arithmetic, and nothing in IRIX depends on them."* That trade is sound
@@ -89,7 +90,7 @@ the computed *result* is correct in every case.
 | `fpu/vec_arith_single` | `o.flags` got `0x0`, want `0x1`/`0x5` — missing FI |
 | `fpu/vec_arith_double` | same |
 | `fpu/vec_sqrt` | `o.flags [sqrt.s]` got `0x0`, want `0x1` — missing FI |
-| `fpu/cvt_s_d_rounds` | got `0x4`, want `0x5` — has FO, missing FI (CVT.S.D, not covered by the ADD/SUB/MUL/DIV overflow rule) |
+| `fpu/cvt_s_d_rounds` | got `0x4`, want `0x5` — has FO, missing FI. Fixed 2026-11-19 (#71). |
 | `fpu/cvt_out_of_range` | `cvt.w.s` of 2^31 does not set FV (though `+inf` does) |
 
 `fpu/cvt_out_of_range` is the odd one out: it is about Invalid on an
