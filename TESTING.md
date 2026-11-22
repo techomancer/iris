@@ -117,11 +117,13 @@ wrote to guest memory and its final memory.
 
 **Other guest systems** — `tools/tests/netbsd-indy-keyboard.py` boots the
 NetBSD/sgimips install CD on an R4400 Indy with the Newport console, presses
-keys at sysinst's first menu, and follows the console's text cursor in
-screenshots. Down, Down and Up must move the menu's highlight by one row each,
-and the letter `a` must change the screen once and then leave it still, with no
-key repeating. It takes about five minutes, needs the CD image (which is not in
-the repository), and attaches it through a copy-on-write overlay.
+keys at sysinst's first menu, and compares screenshots. Down, Down and Up must
+each change exactly two adjacent text rows (the highlight moving by one row
+each), and the letter `a` must change the screen once and then leave it still,
+with no key repeating. It judges only which rows change, so it works whether or
+not the console's glyphs reach the screen. It takes about five minutes, needs
+the CD image (which is not in the repository), and attaches it through a
+copy-on-write overlay.
 
 ```sh
 cargo build --release --bin iris --bin iris-ci

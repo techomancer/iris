@@ -3,11 +3,11 @@
 
 Boots the NetBSD/sgimips install CD on an R4400 Indy with the Newport console,
 waits for sysinst's first menu, then presses keys on the emulated PS/2
-keyboard through the monitor and watches the console's text cursor in
-screenshots:
+keyboard through the monitor and compares screenshots:
 
-  1. Down, Down, Up must move the cursor down one row, down another, and back
-     up one: sysinst moved its highlight.
+  1. Down, Down, Up must each change exactly two adjacent text rows: the row
+     the highlight left and the one it moved to, one row further down for the
+     second Down and the same two rows again for Up.
   2. A letter (`a`, the first item) must change the screen once, and the
      screen must then stay still: the key was released and did not repeat.
 
@@ -15,8 +15,9 @@ NetBSD's keyboard driver asks the 8042 to translate the keyboard's scan
 codes to set 1; without that translation the arrows mean nothing to it and
 `a` reads as an Enter that is never released (issue #765).
 
-Only the cursor's position is used, so the check works whether or not the
-console's glyphs reach the screen.
+Only which rows change is used, so the check works whether the console draws
+its glyphs (NetBSD 11.99.11) or only its text cursor (NetBSD 11.1 under
+`--ci`).
 
     tools/tests/netbsd-indy-keyboard.py --iso NetBSD-11.1-sgimips.iso \\
         [--iris target/release/iris] [--iris-ci target/release/iris-ci] \\
@@ -163,12 +164,12 @@ class Guest:
         return box, len(xs), rows
 
 
-def cursor_only(box, count):
-    """The screen holds one text cursor block and nothing else."""
-    if not box:
-        return False
-    w, h = box[2] - box[0] + 1, box[3] - box[1] + 1
-    return 4 <= w <= 16 and 8 <= h <= 32 and count == w * h
+def changed_rows(a, b):
+    """First and last pixel row that differ between two screenshots."""
+    if a is None or b is None:
+        return None
+    ys = [y for y, (ra, rb) in enumerate(zip(a, b)) if ra != rb]
+    return (ys[0], ys[-1]) if ys else None
 
 
 def wait_for(cond, timeout, step=3):
@@ -199,32 +200,41 @@ def boot_to_sysinst(g: Guest):
     g.mon.cmd(f"key type {BOOT}")
     g.key("Return")
 
-    # sysinst's first menu: the screen holds only the text cursor and keeps
-    # it in one place for three samples in a row.
+    # sysinst's first menu waits for a key: once the kernel has started, the
+    # screen stops changing. Four identical samples (about half a minute).
+    time.sleep(30)
     seen = []
 
     def settled():
-        box, count, _ = g.lit(g.shot("boot"))
-        seen.append(box if cursor_only(box, count) else None)
-        return len(seen) >= 3 and seen[-1] and seen[-1] == seen[-2] == seen[-3] and seen[-1]
-    box = wait_for(settled, 600, 5)
-    if not box:
+        box, _, rows = g.lit(g.shot("boot"))
+        seen.append(rows if box else None)
+        last = seen[-4:]
+        return len(last) == 4 and last[0] is not None and all(r == last[0] for r in last)
+    if not wait_for(settled, 900, 5):
         raise RuntimeError("sysinst's menu did not appear")
-    return box
+    return seen[-1]
 
 
-def check_arrows(g: Guest, start) -> list[str]:
-    fails, row_h = [], start[3] - start[1] + 1
-    want = [("Down", start[1] + row_h), ("Down", start[1] + 2 * row_h), ("Up", start[1] + row_h)]
-    for k, y in want:
+def check_arrows(g: Guest, screen) -> list[str]:
+    bands = []
+    for k in ("Down", "Down", "Up"):
         g.key(k)
         time.sleep(3)
-        box, count, _ = g.lit(g.shot(f"key-{k}"))
-        got = box[1] if cursor_only(box, count) else None
-        ok = got == y
-        print(f"  {k:5s} cursor row y={got} want {y}: {'ok' if ok else 'FAIL'}")
-        if not ok:
-            fails.append(f"{k}: cursor at y={got}, want {y}")
+        _, _, after = g.lit(g.shot(f"key-{k}"))
+        bands.append(changed_rows(screen, after))
+        print(f"  {k:5s} changed rows: {bands[-1]}")
+        screen = after
+    d1, d2, d3 = bands
+    if not d1:
+        return ["Down changed nothing on the screen: the arrows do not reach sysinst"]
+    row_h = (d1[1] - d1[0] + 1) // 2
+    fails = []
+    if not 8 <= row_h <= 32 or d1[1] - d1[0] + 1 != 2 * row_h:
+        fails.append(f"Down changed rows {d1}, not two text rows")
+    elif d2 != (d1[0] + row_h, d1[1] + row_h):
+        fails.append(f"the second Down changed rows {d2}, want {(d1[0] + row_h, d1[1] + row_h)}")
+    elif d3 != d2:
+        fails.append(f"Up changed rows {d3}, want {d2}")
     return fails
 
 
@@ -267,9 +277,9 @@ def main() -> int:
     g = Guest(args)
     try:
         g.start()
-        start = boot_to_sysinst(g)
-        print(f"sysinst menu up; cursor at {start}")
-        fails = check_arrows(g, start) + check_letter(g)
+        screen = boot_to_sysinst(g)
+        print("sysinst menu up")
+        fails = check_arrows(g, screen) + check_letter(g)
         print("ps2:", g.mon.cmd("ps2 status"))
     except Exception as e:  # setup failure, not a keyboard verdict
         print(f"ERROR: {e}", file=sys.stderr)
