@@ -71,6 +71,7 @@ struct Rig {
     mem: Arc<TestMem>,
     wire: [Arc<Wire>; PORTS],
     pin: Arc<LevelProbe>,
+    _tm: Arc<TimerManager>,
 }
 
 impl Rig {
@@ -79,7 +80,11 @@ impl Rig {
     }
 
     fn with(cfg: Ioc4Config) -> Rig {
-        let c = Ioc4::new(cfg);
+        Rig::on(Arc::new(TimerManager::new()), cfg)
+    }
+
+    fn on(tm: Arc<TimerManager>, cfg: Ioc4Config) -> Rig {
+        let c = Ioc4::new(&tm, cfg);
         let mem = Arc::new(TestMem(std::sync::Mutex::new(vec![0; MEM_SIZE])));
         c.state().connect_dma(mem.clone());
         let wire: [Arc<Wire>; PORTS] = std::array::from_fn(|_| Arc::new(Wire::default()));
@@ -89,7 +94,7 @@ impl Rig {
         let (pin, line) = LevelProbe::line();
         c.state().connect_irq(line);
         c.attached();
-        Rig { c, mem, wire, pin }
+        Rig { c, mem, wire, pin, _tm: tm }
     }
 
     /// A 32-bit register as the processor sees it through the self-ordered
@@ -1343,17 +1348,19 @@ fn a_delay_entry_sets_the_busy_bit() {
     assert_eq!(r.sr(0, sdma_off::CONTROL) & (1 << 16), 0);
 }
 
-/// Ports test_dma_rx_timer_due_before_access: an expiry already due
-/// happens before a register access, with no timer thread to run it.
+/// A due expiry happens when the timers run, not on a register access.
 #[test]
-fn a_due_receive_timer_expires_before_an_access() {
-    let r = Rig::new();
+fn a_due_receive_timer_expires_when_the_timers_run() {
+    let clock = crate::clock::Clock::stepped();
+    let r = Rig::on(Arc::new(TimerManager::with_clock(clock.clone())), Ioc4Config::bare(Ioc4Clock::Mhz33));
     r.pair_base(0, RINGS, 0x1000);
     r.sw(0, sdma_off::CONTROL, ENABLE);
     r.sw(0, sdma_off::RX_TIMER, 2);
     r.sw(0, sdma_off::RX_CONSUME, ARM);
     r.type_in(0, &[0x64]);
-    std::thread::sleep(Duration::from_millis(5));
+    clock.step(5_000_000);
+    assert_eq!(r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED, 0, "a read does not run it");
+    r.c.service();
     assert_eq!(r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED, TIMER_EXPIRED);
 }
 

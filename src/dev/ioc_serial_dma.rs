@@ -27,7 +27,7 @@
 //!
 //! # What is approximated here
 //!
-//! * The receive timer and a transmit delay run on host time. A pause freezes
+//! * The receive timer and a transmit delay run on the machine clock. A pause freezes
 //!   both where they stand and a resume lets each finish the time it had
 //!   left. No source says what the part does.
 //! * Receive-ring-full is a level that follows a held entry; what the part
@@ -51,10 +51,10 @@
 //! Ported from hw/char/sgi-ioc-serial-dma.c in jamesbraid/qemu-sgi-origami,
 //! in the form the IOC3 had before the engine was shared.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::dev::deadline::{due, span, unspan, until};
-use crate::snapshot::{field, usize_field, get_field, field_bool, field_u32, field_u32s, field_u64, field_u8s, StateTable};
+use crate::clock::{decode, encode};
+use crate::snapshot::{field, usize_field, field_bool, field_u32, field_u32s, field_u64, field_u8s, StateTable};
 
 use crate::dev::ns16550::Ns16550;
 
@@ -176,6 +176,7 @@ pub trait SerialDmaHost {
     /// The 16550's interrupt line may have moved: reflect it in the chip's
     /// pass-through source.
     fn uart_line_changed(&mut self, port: usize);
+    fn now(&self) -> u64;
     fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool;
     fn dma_write(&self, addr: u64, data: &[u8]) -> bool;
     /// A transfer failed at `addr`: a receive post or a transmit fetch.
@@ -199,17 +200,17 @@ pub struct SerialDmaPort {
     /// The last post was turned away for lack of ring room.
     post_refused: bool,
     paused: bool,
-    pub rx_deadline: Option<Instant>,
+    pub rx_deadline: Option<u64>,
     rx_idle_count: u32,
-    /// Time a frozen timer had left when a pause began.
-    rx_frozen: Option<Duration>,
-    tx_delay_deadline: Option<Instant>,
-    tx_delay_frozen: Option<Duration>,
+    /// Nanoseconds a frozen timer had left when a pause began.
+    rx_frozen: Option<u64>,
+    tx_delay_deadline: Option<u64>,
+    tx_delay_frozen: Option<u64>,
     tx_delay_irq: bool,
     /// A looped-back character still on the line: when it reaches the
     /// receiver. The 16550 core loops it back the moment it is written, and
     /// the engine does not look at the receiver until this time.
-    loop_due: Option<Instant>,
+    loop_due: Option<u64>,
 }
 
 pub struct SerialDma {
@@ -263,12 +264,12 @@ impl SerialDma {
     }
 
     /// When the port's receive timer runs out, if it is running.
-    pub fn rx_deadline(&self, p: usize) -> Option<Instant> {
+    pub fn rx_deadline(&self, p: usize) -> Option<u64> {
         self.port[p].rx_deadline
     }
 
     /// When the port's transmit delay ends. A paused port keeps it frozen.
-    pub fn tx_delay_deadline(&self, p: usize) -> Option<Instant> {
+    pub fn tx_delay_deadline(&self, p: usize) -> Option<u64> {
         let port = &self.port[p];
         if port.paused { None } else { port.tx_delay_deadline }
     }
@@ -296,7 +297,7 @@ impl SerialDma {
 
     /// When a looped-back character reaches the receiver, if one is on the
     /// line.
-    pub fn loop_deadline(&self, p: usize) -> Option<Instant> {
+    pub fn loop_deadline(&self, p: usize) -> Option<u64> {
         self.port[p].loop_due
     }
 
@@ -424,11 +425,11 @@ impl SerialDma {
         true
     }
 
-    fn rx_timer_start(&mut self, p: usize, since: Instant) {
+    fn rx_timer_start(&mut self, p: usize, since: u64) {
         let port = &mut self.port[p];
         let reload = port.reg[5] & TIMER_RELOAD;
         port.rx_idle_count = 0;
-        let dur = Duration::from_nanos(u64::from(reload) * TIMER_TICK_NS);
+        let dur = u64::from(reload) * TIMER_TICK_NS;
         if port.paused {
             // Started while paused, it waits frozen at its full count.
             port.rx_frozen = Some(dur);
@@ -452,7 +453,7 @@ impl SerialDma {
     }
 
     /// Expiries already due happen before an access.
-    pub fn catch_up(&mut self, now: Instant, host: &mut dyn SerialDmaHost) {
+    pub fn catch_up(&mut self, now: u64, host: &mut dyn SerialDmaHost) {
         for p in 0..self.port.len() {
             if let Some(d) = self.port[p].tx_delay_deadline {
                 if !self.port[p].paused && d <= now {
@@ -473,12 +474,12 @@ impl SerialDma {
 
     /// A looped-back character reaches the receiver; the walk goes on from
     /// then.
-    fn loop_arrived(&mut self, p: usize, when: Instant, host: &mut dyn SerialDmaHost) {
+    fn loop_arrived(&mut self, p: usize, when: u64, host: &mut dyn SerialDmaHost) {
         self.port[p].loop_due = None;
         self.run_from(p, when, host);
     }
 
-    fn tx_delay_ended(&mut self, p: usize, when: Instant, host: &mut dyn SerialDmaHost) {
+    fn tx_delay_ended(&mut self, p: usize, when: u64, host: &mut dyn SerialDmaHost) {
         let irq = {
             let port = &mut self.port[p];
             port.tx_delay_deadline = None;
@@ -490,7 +491,7 @@ impl SerialDma {
         self.run_from(p, when, host);
     }
 
-    fn receive(&mut self, p: usize, since: Instant, host: &mut dyn SerialDmaHost) {
+    fn receive(&mut self, p: usize, since: u64, host: &mut dyn SerialDmaHost) {
         // The 16550 core loops a character back the moment it is written; on
         // the part it takes a character time on the line to arrive.
         if self.port[p].loop_due.is_some() {
@@ -566,7 +567,7 @@ impl SerialDma {
 
     /// Each control byte types its data byte; the empty type ends the entry,
     /// wherever it sits.
-    fn transmit(&mut self, p: usize, since: Instant, host: &mut dyn SerialDmaHost) {
+    fn transmit(&mut self, p: usize, since: u64, host: &mut dyn SerialDmaHost) {
         let mask = self.mask(p);
         let ring = self.ring(p, 0);
         if self.port[p].tx_delay_deadline.is_some() {
@@ -616,7 +617,7 @@ impl SerialDma {
                         }
                         host.uart(p).write(UART_THR, entry[slot]);
                         if looped && !self.params.loopback_at_once {
-                            self.port[p].loop_due = Some(since + host.uart(p).char_time());
+                            self.port[p].loop_due = Some(since + host.uart(p).char_time().as_nanos() as u64);
                         }
                         // Drain per character or loopback overruns the FIFO.
                         self.receive(p, since, host);
@@ -627,7 +628,7 @@ impl SerialDma {
                         if entry[slot] != 0 {
                             let port = &mut self.port[p];
                             port.tx_slot = slot + 1;
-                            port.tx_delay_deadline = Some(since + Duration::from_millis(u64::from(entry[slot])));
+                            port.tx_delay_deadline = Some(since + u64::from(entry[slot]) * 1_000_000);
                             port.tx_delay_irq = control & TX_INTERRUPT != 0;
                             return;
                         }
@@ -662,7 +663,7 @@ impl SerialDma {
 
     /// Walk the port's rings from `since`: where a transmit delay ended, or
     /// now.
-    pub fn run_from(&mut self, p: usize, since: Instant, host: &mut dyn SerialDmaHost) {
+    pub fn run_from(&mut self, p: usize, since: u64, host: &mut dyn SerialDmaHost) {
         if !host.reachable(p) || self.port[p].busy {
             return;
         }
@@ -676,7 +677,7 @@ impl SerialDma {
     }
 
     pub fn run(&mut self, p: usize, host: &mut dyn SerialDmaHost) {
-        self.run_from(p, Instant::now(), host);
+        self.run_from(p, host.now(), host);
     }
 
     /// A passive mirror of the 16550's lines; no read side effects.
@@ -701,7 +702,7 @@ impl SerialDma {
     }
 
     pub fn port_read(&mut self, p: usize, offset: u32, host: &mut dyn SerialDmaHost) -> u32 {
-        let now = Instant::now();
+        let now = host.now();
         self.catch_up(now, host);
         if offset == off::SHADOW {
             return self.shadow(p, host);
@@ -729,12 +730,12 @@ impl SerialDma {
             off::RX_TIMER => {
                 // Ticks left while running or frozen; idle, whatever a reload
                 // write last loaded.
-                let ticks_in = |d: Duration| (d.as_nanos() as u64 / TIMER_TICK_NS).min(u64::from(TIMER_RELOAD)) as u32;
+                let ticks_in = |ns: u64| (ns / TIMER_TICK_NS).min(u64::from(TIMER_RELOAD)) as u32;
                 let mut ticks = port.rx_idle_count;
                 if let (true, Some(left)) = (port.paused, port.rx_frozen) {
                     ticks = ticks_in(left);
                 } else if let Some(d) = port.rx_deadline {
-                    ticks = ticks_in(d.saturating_duration_since(now));
+                    ticks = ticks_in(d.saturating_sub(now));
                 }
                 v |= ticks << TIMER_COUNT_SHIFT;
             }
@@ -764,7 +765,7 @@ impl SerialDma {
     }
 
     pub fn port_write(&mut self, p: usize, offset: u32, val: u32, host: &mut dyn SerialDmaHost) {
-        let now = Instant::now();
+        let now = host.now();
         self.catch_up(now, host);
         let mask = self.mask(p);
         match offset {
@@ -782,8 +783,8 @@ impl SerialDma {
                 // choice; no source says what the part does.
                 if val & ctl::PAUSE != 0 && !port.paused {
                     port.paused = true;
-                    port.rx_frozen = port.rx_deadline.take().map(|d| d.saturating_duration_since(now));
-                    port.tx_delay_frozen = port.tx_delay_deadline.take().map(|d| d.saturating_duration_since(now));
+                    port.rx_frozen = port.rx_deadline.take().map(|d| d.saturating_sub(now));
+                    port.tx_delay_frozen = port.tx_delay_deadline.take().map(|d| d.saturating_sub(now));
                 } else if val & ctl::PAUSE == 0 && port.paused {
                     port.paused = false;
                     port.rx_deadline = port.rx_frozen.take().map(|l| now + l);
@@ -910,6 +911,7 @@ mod tests {
         errors: Vec<(usize, bool, u64)>,
         /// Whether the chip reports errors itself, as IOC4 does.
         reports_errors: bool,
+        now: u64,
     }
 
     impl Chip {
@@ -921,6 +923,7 @@ mod tests {
                 raised: Vec::new(),
                 errors: Vec::new(),
                 reports_errors: true,
+                now: 0,
             }
         }
     }
@@ -937,6 +940,9 @@ mod tests {
             true
         }
         fn uart_line_changed(&mut self, _port: usize) {}
+        fn now(&self) -> u64 {
+            self.now
+        }
         fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool {
             if addr < self.refuse_below {
                 return false;
@@ -1025,18 +1031,15 @@ mod tests {
         assert_eq!(chip.uart[0].sent, b"a", "the walk retries once the transfer works");
     }
 
-    /// The IOC3 wrote its port tables before the engine was shared, without
-    /// the halt and loop keys. They load, with both off.
+    /// A port table missing the halt or loop key is refused.
     #[test]
-    fn a_port_table_written_before_the_engine_was_shared_loads() {
-        let now = Instant::now();
-        let mut table = SerialDma::new(2, TWO).save_port(0, now);
-        let keys = table.as_table_mut().expect("a table");
-        assert!(keys.remove("halted").is_some() && keys.remove("loop_due").is_some());
-        let mut dst = SerialDma::new(2, TWO);
-        dst.load_port(0, &table, now).expect("loads without the newer keys");
-        assert!(!dst.halted(0));
-        assert_eq!(dst.loop_deadline(0), None);
+    fn a_port_table_missing_the_halt_or_loop_key_is_refused() {
+        for key in ["halted", "loop_at"] {
+            let mut table = SerialDma::new(2, TWO).save_port(0);
+            assert!(table.as_table_mut().expect("a table").remove(key).is_some());
+            let mut dst = SerialDma::new(2, TWO);
+            assert!(dst.load_port(0, &table).unwrap_err().contains(key), "{key}");
+        }
     }
 
     #[test]
@@ -1070,10 +1073,10 @@ mod tests {
 }
 
 // The engine's state for a snapshot of the chip that carries it. Each timer
-// is saved as the time it had left (see the IOC3's snapshot helpers).
+// is saved as an absolute machine time.
 
 impl SerialDmaPort {
-    fn save_state(&self, now: Instant) -> toml::Value {
+    fn save_state(&self) -> toml::Value {
         StateTable::new()
             .u32s("reg", &self.reg)
             .u8s("packer", &self.packer)
@@ -1085,18 +1088,18 @@ impl SerialDmaPort {
             .bool("drain_pending", self.drain_pending)
             .bool("busy", self.busy)
             .bool("paused", self.paused)
-            .u64("rx_due", until(self.rx_deadline, now))
+            .u64("rx_at", encode(self.rx_deadline))
             .u32("rx_idle_count", self.rx_idle_count)
-            .u64("rx_frozen", span(self.rx_frozen))
-            .u64("tx_delay_due", until(self.tx_delay_deadline, now))
-            .u64("tx_delay_frozen", span(self.tx_delay_frozen))
+            .u64("rx_frozen", encode(self.rx_frozen))
+            .u64("tx_delay_at", encode(self.tx_delay_deadline))
+            .u64("tx_delay_frozen", encode(self.tx_delay_frozen))
             .bool("tx_delay_irq", self.tx_delay_irq)
             .bool("post_refused", self.post_refused)
             .bool("halted", self.halted)
-            .u64("loop_due", until(self.loop_due, now))
+            .u64("loop_at", encode(self.loop_due))
             .build()
     }
-    fn load_state(v: &toml::Value, now: Instant) -> Result<Self, String> {
+    fn load_state(v: &toml::Value) -> Result<Self, String> {
         Ok(Self {
             reg: field_u32s(v, "reg")?,
             packer: field_u8s(v, "packer")?,
@@ -1108,31 +1111,29 @@ impl SerialDmaPort {
             drain_pending: field_bool(v, "drain_pending")?,
             busy: field_bool(v, "busy")?,
             paused: field_bool(v, "paused")?,
-            rx_deadline: due(field_u64(v, "rx_due")?, now),
+            rx_deadline: decode(field_u64(v, "rx_at")?),
             rx_idle_count: field_u32(v, "rx_idle_count")?,
-            rx_frozen: unspan(field_u64(v, "rx_frozen")?),
-            tx_delay_deadline: due(field_u64(v, "tx_delay_due")?, now),
-            tx_delay_frozen: unspan(field_u64(v, "tx_delay_frozen")?),
+            rx_frozen: decode(field_u64(v, "rx_frozen")?),
+            tx_delay_deadline: decode(field_u64(v, "tx_delay_at")?),
+            tx_delay_frozen: decode(field_u64(v, "tx_delay_frozen")?),
             tx_delay_irq: field_bool(v, "tx_delay_irq")?,
             post_refused: field_bool(v, "post_refused")?,
-            // A table saved before the keys existed has neither.
-            halted: get_field(v, "halted").map(|_| field_bool(v, "halted")).transpose()?.unwrap_or(false),
-            loop_due: get_field(v, "loop_due").map(|_| field_u64(v, "loop_due")).transpose()?.and_then(|n| due(n, now)),
+            halted: field_bool(v, "halted")?,
+            loop_due: decode(field_u64(v, "loop_at")?),
         })
     }
 }
 
 impl SerialDma {
-    /// One port's state, timers as the time left after `now`: for a chip
-    /// that keeps each port's table beside its own.
-    pub fn save_port(&self, p: usize, now: Instant) -> toml::Value {
-        self.port[p].save_state(now)
+    /// One port's state: for a chip that keeps each port's table beside its
+    /// own.
+    pub fn save_port(&self, p: usize) -> toml::Value {
+        self.port[p].save_state()
     }
 
-    /// Replace one port's state with what `save_port` described, timers set
-    /// that far after `now`.
-    pub fn load_port(&mut self, p: usize, v: &toml::Value, now: Instant) -> Result<(), String> {
-        self.port[p] = SerialDmaPort::load_state(v, now)?;
+    /// Replace one port's state with what `save_port` described.
+    pub fn load_port(&mut self, p: usize, v: &toml::Value) -> Result<(), String> {
+        self.port[p] = SerialDmaPort::load_state(v)?;
         Ok(())
     }
 
@@ -1141,22 +1142,21 @@ impl SerialDma {
         self.port[p] = SerialDmaPort::default();
     }
 
-    /// The ring bases and each port's state, timers as the time left after
-    /// `now`.
-    pub fn save_state(&self, now: Instant) -> toml::Value {
+    /// The ring bases and each port's state.
+    pub fn save_state(&self) -> toml::Value {
         let mut t = StateTable::new();
         t.u32s("base_hi", &self.base_hi).u32s("base_lo", &self.base_lo);
         for (i, port) in self.port.iter().enumerate() {
-            t.value(&format!("port{i}"), port.save_state(now));
+            t.value(&format!("port{i}"), port.save_state());
         }
         t.build()
     }
 
     /// The engine `save_state` described, with this engine's parameters
-    /// and port count, timers set that far after `now`.
-    pub fn loaded(&self, v: &toml::Value, now: Instant) -> Result<SerialDma, String> {
+    /// and port count.
+    pub fn loaded(&self, v: &toml::Value) -> Result<SerialDma, String> {
         let port = (0..self.port.len())
-            .map(|i| SerialDmaPort::load_state(field(v, &format!("port{i}"))?, now))
+            .map(|i| SerialDmaPort::load_state(field(v, &format!("port{i}"))?))
             .collect::<Result<Vec<_>, String>>()?;
         // Transfers are under way only inside a call, never at a save.
         Ok(SerialDma { params: self.params, base_hi: field_u32s(v, "base_hi")?, base_lo: field_u32s(v, "base_lo")?, in_flight: 0, port })

@@ -23,13 +23,13 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use parking_lot::{Mutex, MutexGuard};
 
 use super::superio::{Sio, SuperIo};
 use crate::dev::ns16550::com_reg::{self, MSR_CTS};
 use super::{decode, encode, int, reg, Core};
+use crate::clock::Clock;
 use crate::dev::ioc_serial_dma::{ctl, SerialDma, SerialDmaHost, SerialDmaParams, SerialDmaSource, SerialDmaUart};
 use crate::snapshot::StateTable;
 
@@ -62,8 +62,9 @@ struct Engine {
     st: Mutex<SerialDma>,
     /// The deadlines in `st`, kept where a timer can read them without the
     /// lock: per port the receive timer then the transmit delay, as
-    /// nanoseconds after the process epoch plus one, zero for none.
+    /// machine nanoseconds plus one, zero for none.
     due: [AtomicU64; 4],
+    clock: Clock,
 }
 
 /// The chip as the engine sees it for the length of one pass. The Super I/O
@@ -113,6 +114,10 @@ impl SerialDmaHost for Host<'_> {
         self.e.core.level(int::serial(port, int::PASSTHROUGH), level);
     }
 
+    fn now(&self) -> u64 {
+        self.e.clock.now()
+    }
+
     fn dma_read(&self, addr: u64, buf: &mut [u8]) -> bool {
         self.e.core.dma().is_some_and(|d| d.dma_read(addr, buf).is_ok())
     }
@@ -159,30 +164,31 @@ pub(super) struct Serial {
 
 impl Serial {
     /// Both ports of a chip, over one engine.
-    pub(super) fn pair(core: Arc<Core>, sio: Arc<SuperIo>) -> [Serial; 2] {
+    pub(super) fn pair(core: Arc<Core>, sio: Arc<SuperIo>, clock: Clock) -> [Serial; 2] {
         let e = Arc::new(Engine {
             core,
             sio,
             st: Mutex::new(SerialDma::new(2, PARAMS)),
             due: std::array::from_fn(|_| AtomicU64::new(0)),
+            clock,
         });
         [0, 1].map(|p| Serial { p, e: e.clone() })
     }
 
     /// The receive-timer and transmit-delay deadlines as of the last access,
     /// without taking the engine's lock.
-    pub(super) fn due(&self) -> (Option<Instant>, Option<Instant>) {
+    pub(super) fn due(&self) -> (Option<u64>, Option<u64>) {
         let at = self.p * 2;
         (decode(self.e.due[at].load(Ordering::SeqCst)), decode(self.e.due[at + 1].load(Ordering::SeqCst)))
     }
 
     #[cfg(test)]
-    pub(super) fn rx_deadline(&self) -> Option<Instant> {
+    pub(super) fn rx_deadline(&self) -> Option<u64> {
         self.e.st.lock().rx_deadline(self.p)
     }
 
     #[cfg(test)]
-    pub(super) fn set_rx_deadline(&self, due: Option<Instant>) {
+    pub(super) fn set_rx_deadline(&self, due: Option<u64>) {
         self.e.with(|st, _| st.port[self.p].rx_deadline = due);
     }
 
@@ -196,7 +202,7 @@ impl Serial {
     }
 
     /// Expiries already due happen before an access.
-    pub(super) fn catch_up(&self, now: Instant) {
+    pub(super) fn catch_up(&self, now: u64) {
         self.e.with(|st, h| st.catch_up(now, h));
     }
 
@@ -263,7 +269,7 @@ impl Serial {
     /// A pass of what the receive thread and the timers do between guest
     /// accesses.
     #[cfg(test)]
-    pub(super) fn service(&self, now: Instant) {
+    pub(super) fn service(&self, now: u64) {
         let p = self.p;
         self.e.with(|st, h| {
             if h.sio().uart[p].pump() {
@@ -287,23 +293,23 @@ impl Serial {
         self.set_ring_base(false, 0);
     }
 
-    pub(super) fn save_state(&self, now: Instant) -> toml::Value {
-        self.e.st.lock().save_port(self.p, now)
+    pub(super) fn save_state(&self) -> toml::Value {
+        self.e.st.lock().save_port(self.p)
     }
 
-    pub(super) fn load_state(&self, v: &toml::Value, now: Instant) -> Result<(), String> {
-        self.e.with(|st, _| st.load_port(self.p, v, now))
+    pub(super) fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        self.e.with(|st, _| st.load_port(self.p, v))
     }
 }
 
 /// The ring base registers and each port's table for a snapshot, under the
 /// keys the chip has always written.
-pub(super) fn save_rings(ports: &[Option<Serial>; 2], now: Instant) -> Option<toml::Value> {
+pub(super) fn save_rings(ports: &[Option<Serial>; 2]) -> Option<toml::Value> {
     let first = ports.iter().flatten().next()?;
     let mut sdma = StateTable::new();
     sdma.u32("base_hi", first.ring_base(true)).u32("base_lo", first.ring_base(false));
     for s in ports.iter().flatten() {
-        sdma.value(["port0", "port1"][s.p], s.save_state(now));
+        sdma.value(["port0", "port1"][s.p], s.save_state());
     }
     Some(sdma.build())
 }

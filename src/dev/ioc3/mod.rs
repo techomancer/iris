@@ -76,7 +76,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IO7, IP29, IP30, IP34, IP34_NO_PS2, MIO};
 pub use self::dma::Ioc3Dma;
@@ -89,14 +89,14 @@ use self::serial::Serial;
 use self::superio::SuperIo;
 use self::w1::W1;
 use crate::dev::ds1685::Ds1685;
-use crate::dev::deadline::{decode, due, encode, until};
+use crate::clock::{decode, encode};
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1 as onewire;
 use crate::dev::w1::sgi;
 use crate::dev::serial_host::SerialBackend;
 use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::pci::{Bar, BoardIrq, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::hptimer::{Timer, TimerManager};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, StateTable};
 
@@ -201,7 +201,7 @@ const IO_PERIODIC: u32 = 0x0006_0000;
 const IO_SQUARE: u32 = 0x0007_0000;
 const IO_DIAG: u32 = 0x4000_0000;
 const IO_STATE: u32 = 0x8000_0000;
-const IO_TICK: Duration = Duration::from_nanos(7800);
+const IO_TICK: u64 = 7800;
 const IO_PULSE_TICKS: u32 = 3;
 
 #[derive(Default)]
@@ -211,7 +211,7 @@ struct IntOut {
     state: bool,
     pulse_end: bool,
     square_started: bool,
-    next: Option<Instant>,
+    next: Option<u64>,
 }
 
 fn int_out_valid(v: u32) -> bool {
@@ -296,7 +296,7 @@ impl Shared {
 
     /// One transition due at `at`; the next is scheduled from `at`, so a
     /// late one keeps the output's phase.
-    fn io_step(&self, o: &mut IntOut, at: Instant) {
+    fn io_step(&self, o: &mut IntOut, at: u64) {
         let active = o.active;
         let count = active & IO_COUNT;
         match active & IO_MODE {
@@ -312,7 +312,7 @@ impl Shared {
                 if !o.pulse_end {
                     self.io_drive(o, true);
                     o.pulse_end = true;
-                    o.next = Some(at + IO_TICK * IO_PULSE_TICKS);
+                    o.next = Some(at + IO_TICK * u64::from(IO_PULSE_TICKS));
                 } else {
                     self.io_drive(o, false);
                     o.pulse_end = false;
@@ -326,11 +326,11 @@ impl Shared {
                 } else if !o.pulse_end {
                     self.io_drive(o, true);
                     o.pulse_end = true;
-                    o.next = Some(at + IO_TICK * IO_PULSE_TICKS);
+                    o.next = Some(at + IO_TICK * u64::from(IO_PULSE_TICKS));
                 } else {
                     self.io_drive(o, false);
                     o.pulse_end = false;
-                    o.next = Some(at + IO_TICK * (count + 1 - IO_PULSE_TICKS));
+                    o.next = Some(at + IO_TICK * u64::from(count + 1 - IO_PULSE_TICKS));
                 }
             }
             _ => {
@@ -341,14 +341,14 @@ impl Shared {
                 } else {
                     o.square_started = true;
                 }
-                o.next = Some(at + IO_TICK * (count + 1));
+                o.next = Some(at + IO_TICK * u64::from(count + 1));
             }
         }
     }
 
     /// Transitions already due happen before a read, not whenever the
     /// receive thread or a timer next runs.
-    fn io_catch_up_locked(&self, o: &mut IntOut, now: Instant) {
+    fn io_catch_up_locked(&self, o: &mut IntOut, now: u64) {
         for _ in 0..100_000 {
             match o.next {
                 Some(due) if due <= now => {
@@ -484,20 +484,20 @@ const RX_IDLE: Duration = Duration::from_millis(2);
 /// The interrupt output can ask for a transition every few microseconds; a
 /// timer never re-arms sooner than this, and the catch-up that follows applies
 /// every transition due in the meantime.
-const IO_REARM_MIN: Duration = Duration::from_micros(100);
+const IO_REARM_MIN: u64 = 100_000;
 
-/// The deadlines the chip keeps on host time, one timer slot each.
+/// The deadlines the chip keeps on the machine clock, one timer slot each.
 const K_RX: usize = 0;
 const K_TX_DELAY: usize = 2;
 const K_INT_OUT: usize = 4;
 const K_NVRAM: usize = 5;
 const KINDS: usize = 6;
-type Deadlines = [Option<Instant>; KINDS];
+type Deadlines = [Option<u64>; KINDS];
 
 /// Lock order: `gate`, then a child's lock (the serial engine's before the
 /// Super I/O's it reaches through), then the interrupt words' lock in `Core`,
-/// under which the SuperIO line is driven, then the Bridge's. `armed` and the
-/// NVRAM hand-off are leaves; the lines are set once and read without a lock.
+/// under which the SuperIO line is driven, then the Bridge's. `order` (taken
+/// after `gate`, before a timer's lock) and the NVRAM hand-off are leaves; the lines are set once and read without a lock.
 /// The Bridge never calls back into the chip while it holds a lock of its
 /// own, so a child's lock may be held while the line is driven.
 ///
@@ -528,18 +528,22 @@ struct Shared {
     ssram: Mutex<Vec<u32>>,
     eth: Option<Arc<Ioc3Eth>>,
     me: Weak<Shared>,
-    timers: OnceLock<Arc<TimerManager>>,
+    timers: [Timer; KINDS],
     /// Between `start` and `stop`.
     running: AtomicBool,
     /// Held by a timer callback while it runs, so `stop` can wait one out.
     gate: Mutex<()>,
-    /// The timer pending for each deadline kind, and the deadline it serves.
-    armed: Mutex<[Option<(TimerId, Instant)>; KINDS]>,
-    /// The deadlines in `armed`, readable without its lock.
+    /// Orders the passes that read the deadlines and set the timers.
+    order: Mutex<()>,
+    /// The deadlines last set on `timers`, readable without a lock.
     armed_due: [AtomicU64; KINDS],
 }
 
 impl Shared {
+    fn now(&self) -> u64 {
+        self.timers[0].now()
+    }
+
     /// What follows every access: arm the timers for the deadlines it left,
     /// and pick up a PS/2 character that arrived meanwhile.
     fn after(&self) {
@@ -549,9 +553,8 @@ impl Shared {
         }
     }
 
-    /// The host-time deadlines the chip holds, for the timers: the serial
-    /// receive timers, transmit delays, the interrupt output while its status
-    /// bit can reach the line, and the NVRAM file's debounce.
+    /// The deadlines the chip holds, for the timers: serial receive and transmit,
+    /// the interrupt output while it can reach the line, the NVRAM debounce.
     fn deadlines(&self) -> Deadlines {
         let mut d = [None; KINDS];
         for (p, s) in self.serial.iter().enumerate() {
@@ -568,94 +571,65 @@ impl Shared {
         d
     }
 
-    /// Make the pending timers match the deadlines the chip holds: one
-    /// one-shot per deadline. A timer whose deadline moved is replaced; with
-    /// none set or the chip not running, deadlines are only evaluated lazily,
-    /// by the next access.
-    ///
-    /// The deadlines are read again once `armed` is held, never before. Each
-    /// child publishes its deadline under its own lock before its access
-    /// returns to arm, so a pass that takes `armed` afterwards reads at least
-    /// what that access left. A pass that read first and was held up (a
-    /// receive thread's poll just before a register write) would otherwise
-    /// arm from the older deadlines and remove the timer the write set.
+    /// Set each timer to the deadline the chip holds. Read them under `order`, or a
+    /// held-up pass would set older ones over a later write's.
     fn arm(&self) {
-        let Some(tm) = self.timers.get() else { return };
-        // Unlocked, only to skip the table when nothing moved; a read that
+        // Unlocked, only to skip the timers when nothing moved; a read that
         // is stale here costs a pass the writer that made it stale also runs.
         if self.deadlines().iter().zip(&self.armed_due).all(|(w, a)| encode(*w) == a.load(Ordering::SeqCst)) {
             return;
         }
-        let mut armed = self.armed.lock();
-        // Checked under the lock `stop` clears the slots with: a pass that
-        // sees `running` set has its timers removed by that stop.
-        if !self.running.load(Ordering::SeqCst) {
-            return;
-        }
-        let want = self.deadlines();
-        for (k, w) in want.iter().enumerate() {
-            if armed[k].map(|(_, d)| d) == *w {
+        let _order = self.order.lock();
+        for (k, w) in self.deadlines().into_iter().enumerate() {
+            if encode(w) == self.armed_due[k].load(Ordering::SeqCst) {
                 continue;
             }
-            if let Some((id, _)) = armed[k].take() {
-                tm.remove(id);
-            }
-            self.armed_due[k].store(0, Ordering::SeqCst);
-            let Some(due) = *w else { continue };
-            let mut delay = due.saturating_duration_since(Instant::now());
-            if k == K_INT_OUT {
-                delay = delay.max(IO_REARM_MIN);
-            }
-            let id = tm.add_one_shot(delay, self.me.clone(), move |me| Shared::fire(me, k, due));
-            armed[k] = Some((id, due));
-            self.armed_due[k].store(encode(Some(due)), Ordering::SeqCst);
+            // The output can ask for a transition every few microseconds.
+            let floor = self.now() + IO_REARM_MIN;
+            self.timers[k].set_due(if k == K_INT_OUT { w.map(|d| d.max(floor)) } else { w });
+            self.armed_due[k].store(encode(w), Ordering::SeqCst);
         }
     }
 
     /// A deadline passed with no guest access to notice it. Runs on the timer
     /// thread, shared with the CPU's compare: short, no waiting beyond the
     /// chip's own locks.
-    fn fire(me: &Weak<Shared>, kind: usize, due: Instant) -> TimerReturn {
-        let Some(sh) = me.upgrade() else { return TimerReturn::Delete };
-        let _gate = sh.gate.lock();
-        if !sh.running.load(Ordering::SeqCst) {
-            return TimerReturn::Delete;
-        }
+    fn fire(&self, kind: usize, due: u64) {
+        let _gate = self.gate.lock();
         {
-            let mut armed = sh.armed.lock();
-            if armed[kind].map(|(_, d)| d) == Some(due) {
-                armed[kind] = None;
-                sh.armed_due[kind].store(0, Ordering::SeqCst);
+            // The deadline this timer served is spent, unless a later one replaced it.
+            let _order = self.order.lock();
+            if decode(self.armed_due[kind].load(Ordering::SeqCst)).is_some_and(|d| d <= due) {
+                self.armed_due[kind].store(0, Ordering::SeqCst);
             }
         }
         if kind == K_NVRAM {
             // The file is written by the clock's own thread, not here.
-            if let Some(rtc) = &sh.rtc {
-                rtc.hand_over();
+            if let Some(rtc) = &self.rtc {
+                rtc.hand_over(self.now());
             }
-            sh.rearm();
+            self.rearm();
         } else {
-            sh.catch_up(Instant::now());
-            sh.after();
+            self.catch_up(self.now());
+            self.after();
         }
-        TimerReturn::Delete
     }
 
     /// The expiries already due, everywhere the chip keeps one.
-    fn catch_up(&self, now: Instant) {
+    fn catch_up(&self, now: u64) {
         self.serial_catch_up(now);
         self.io_catch_up(now);
     }
 
     /// The serial engine's expiries. Both ports run on one engine and one
     /// catch-up walks both, so asking each port would do the work twice.
-    fn serial_catch_up(&self, now: Instant) {
+    fn serial_catch_up(&self, now: u64) {
         if let Some(s) = self.serial.iter().flatten().next() {
             s.catch_up(now);
         }
     }
 
-    fn io_catch_up(&self, now: Instant) {
+    fn io_catch_up(&self, now: u64) {
         let mut o = self.int_out.lock();
         self.io_catch_up_locked(&mut o, now);
         self.io_due.store(encode(o.next), Ordering::SeqCst);
@@ -695,7 +669,7 @@ impl Shared {
     /// delays, the interrupt output, and any PS/2 character that arrived.
     #[cfg(test)]
     fn service(&self) {
-        let now = Instant::now();
+        let now = self.now();
         for s in self.serial.iter().flatten() {
             s.service(now);
         }
@@ -721,16 +695,13 @@ impl Shared {
             return self.gpio.read(a);
         }
         match a {
-            reg::INT_STATUS => {
-                self.serial_catch_up(Instant::now());
-                self.core.status()
-            }
+            reg::INT_STATUS => self.core.status(),
             // The set alias reads back the live mask; the clear one does not.
             reg::INT_ENABLE_SET => self.core.enabled(),
             reg::CHIP_CONTROL => self.core.chip_control.load(Ordering::SeqCst) | CHIP_CTRL_ARB_IDLE,
             reg::INT_OUTPUT => {
                 let mut o = self.int_out.lock();
-                self.io_catch_up_locked(&mut o, Instant::now());
+                self.io_catch_up_locked(&mut o, self.now());
                 self.io_due.store(encode(o.next), Ordering::SeqCst);
                 o.reg | if o.state { IO_STATE } else { 0 }
             }
@@ -757,8 +728,6 @@ impl Shared {
         }
         match a {
             reg::INT_STATUS => {
-                // An acknowledgement must not be undone by a late expiry.
-                self.serial_catch_up(Instant::now());
                 // Write-one-to-clear; level-following bits ignore the write.
                 self.core.clear_bits(val & !int::LEVELS);
             }
@@ -811,7 +780,7 @@ impl Shared {
         if !int_out_valid(v) {
             return;
         }
-        let now = Instant::now();
+        let now = self.now();
         o.next = None;
         o.active = v & (IO_MODE | IO_COUNT);
         o.pulse_end = false;
@@ -823,7 +792,7 @@ impl Shared {
             // A fixed level is there for the next read.
             self.io_step(o, now);
         } else {
-            o.next = Some(now + Duration::from_nanos(1));
+            o.next = Some(now + 1);
         }
     }
 
@@ -886,7 +855,7 @@ impl Shared {
         }
         if let Some(rtc) = &self.rtc {
             if (reg::BYTEBUS_DEV2..reg::BYTEBUS_DEV2 + 4).contains(&a) {
-                rtc.write_data(v);
+                rtc.write_data(v, self.now());
             } else if (reg::BYTEBUS_DEV1..reg::BYTEBUS_DEV1 + 4).contains(&a) {
                 rtc.write_index(v);
             }
@@ -1018,14 +987,14 @@ pub struct Ioc3 {
 impl Ioc3 {
     /// The IOC3 of `board`, with the station address `mac` on its one-wire
     /// part and the clock the machine built for the byte bus.
-    pub fn new(board: &'static Ioc3Board, mac: [u8; 6], byte_bus: ByteBus) -> Ioc3 {
+    pub fn new(tm: &Arc<TimerManager>, board: &'static Ioc3Board, mac: [u8; 6], byte_bus: ByteBus) -> Ioc3 {
         let cells = &board.cells;
         assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus has {:?}", board.name, cells.byte_bus);
         let core = Arc::new(Core::new());
         let sio = (cells.serial || cells.parallel)
             .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel)));
         let serial = if cells.serial {
-            Serial::pair(core.clone(), sio.clone().expect("a serial port has a Super I/O")).map(Some)
+            Serial::pair(core.clone(), sio.clone().expect("a serial port has a Super I/O"), tm.clock().clone()).map(Some)
         } else {
             [None, None]
         };
@@ -1069,20 +1038,15 @@ impl Ioc3 {
                 ssram: Mutex::new(vec![0; (reg::SSRAM_SIZE / 4) as usize]),
                 eth,
                 me: weak.clone(),
-                timers: OnceLock::new(),
+                timers: std::array::from_fn(|k| Timer::new(tm, weak, move |sh: &Shared, due| sh.fire(k, due))),
                 running: AtomicBool::new(false),
                 gate: Mutex::new(()),
-                armed: Mutex::new([None; KINDS]),
+                order: Mutex::new(()),
                 armed_due: std::array::from_fn(|_| AtomicU64::new(0)),
                 board,
             }
         });
         Ioc3 { sh, timekeeper, threads: Mutex::new(Vec::new()) }
-    }
-
-    /// The timer manager for device deadlines. Set it before start.
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.sh.timers.set(tm);
     }
 
     /// Replace the MicroLAN wire the chip builds for itself (the station
@@ -1219,6 +1183,7 @@ impl Device for Ioc3 {
             Device::start(&**r);
         }
         self.sh.rearm();
+        self.sh.timers.iter().for_each(Timer::start);
     }
 
     /// Remove the timers, wait out a callback in flight, join the threads and
@@ -1228,15 +1193,7 @@ impl Device for Ioc3 {
         if !self.sh.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        {
-            let mut armed = self.sh.armed.lock();
-            for (k, slot) in armed.iter_mut().enumerate() {
-                if let (Some((id, _)), Some(tm)) = (slot.take(), self.sh.timers.get()) {
-                    tm.remove(id);
-                }
-                self.sh.armed_due[k].store(0, Ordering::SeqCst);
-            }
-        }
+        self.sh.timers.iter().for_each(Timer::stop);
         drop(self.sh.gate.lock());
         let mut threads = self.threads.lock();
         for t in threads.iter() {
@@ -1395,14 +1352,11 @@ impl PciFunction for Ioc3 {
 // are the ones the single-lock chip wrote, whichever child now holds the
 // state.
 //
-// The serial DMA and the interrupt output time themselves on the host's
-// monotonic clock. Each deadline is saved as the time it had left and set
-// that far after the load, so a restored guest sees the same interval it
-// was waiting out. Deadlines are encoded as nanoseconds left plus one,
-// zero for none.
+// The serial DMA and the interrupt output save each deadline as a machine
+// time (`clock::encode`); the clock is restored before this loads.
 
 impl Shared {
-    fn save_state(&self, now: Instant) -> toml::Value {
+    fn save_state(&self) -> toml::Value {
         let c = &self.core;
         let mut t = StateTable::new();
         t.u32("int_status", c.status())
@@ -1417,7 +1371,7 @@ impl Shared {
                 .bool("state", o.state)
                 .bool("pulse_end", o.pulse_end)
                 .bool("square_started", o.square_started)
-                .u64("next", until(o.next, now));
+                .u64("next_at", encode(o.next));
             t.value("int_out", int_out.build());
         }
         let (pin_control, pin_data) = self.gpio.words();
@@ -1431,7 +1385,7 @@ impl Shared {
                 }
             }
         }
-        if let Some(sdma) = serial::save_rings(&self.serial, now) {
+        if let Some(sdma) = serial::save_rings(&self.serial) {
             t.value("sdma", sdma);
         }
         if let Some(k) = &self.kbd {
@@ -1451,7 +1405,7 @@ impl Shared {
         t.build()
     }
 
-    fn load_state(&self, v: &toml::Value, now: Instant) -> Result<(), String> {
+    fn load_state(&self, v: &toml::Value, now: u64) -> Result<(), String> {
         let ssram = field(v, "ssram")?.as_array().ok_or("ssram: not a list")?;
         if ssram.len() != (reg::SSRAM_SIZE / 4) as usize {
             return Err(format!("ssram: {} words, expected {}", ssram.len(), reg::SSRAM_SIZE / 4));
@@ -1465,7 +1419,7 @@ impl Shared {
             state: field_bool(o, "state")?,
             pulse_end: field_bool(o, "pulse_end")?,
             square_started: field_bool(o, "square_started")?,
-            next: due(field_u64(o, "next")?, now),
+            next: crate::clock::decode(field_u64(o, "next_at")?),
         };
         self.w1.load_state(field_u32(v, "microlan")?, field(v, "wire")?)?;
         if let Some(sio) = &self.sio {
@@ -1483,7 +1437,7 @@ impl Shared {
             }
             for p in 0..2 {
                 if let Some(s) = &self.serial[p] {
-                    s.load_state(field(sdma, ["port0", "port1"][p])?, now)?;
+                    s.load_state(field(sdma, ["port0", "port1"][p])?)?;
                 }
             }
         }
@@ -1511,8 +1465,7 @@ impl Shared {
 
 impl Saveable for Ioc3 {
     fn save_state(&self) -> toml::Value {
-        let now = Instant::now();
-        let st = self.sh.save_state(now);
+        let st = self.sh.save_state();
         StateTable::new()
             .value("chip", st)
             .value("ps2", self.ps2().save_state())
@@ -1522,7 +1475,7 @@ impl Saveable for Ioc3 {
     /// Called with the chip stopped; its timers are armed again by `start`.
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         self.ps2().load_state(field(v, "ps2")?)?;
-        let now = Instant::now();
+        let now = self.sh.now();
         self.sh.load_state(field(v, "chip")?, now)?;
         self.sh.rearm();
         self.sh.core.republish();

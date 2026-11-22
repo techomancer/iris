@@ -20,11 +20,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::dev::deadline::{decode, encode};
+use crate::clock::{decode, encode};
 use crate::dev::battery_clock;
 use crate::dev::ds1687::{image, MaceRtc};
 use crate::snapshot::{field, field_bool, field_u8, field_u8s, StateTable};
@@ -63,8 +63,8 @@ struct Rtc {
     /// Bank-1 registers at 0x40..0x7f (0x48 and 0x4a live in `dev`).
     ext: [u8; 64],
     xram: [u8; RTC_XRAM_SIZE],
-    /// When the RAM last changed, if the file has not caught up yet.
-    dirty_since: Option<Instant>,
+    /// When the RAM last changed (machine nanoseconds), if the file has not caught up yet.
+    dirty_since: Option<u64>,
     /// Where the clock starts with no reference saved (`[rtc_offset]`).
     rtc_offset: crate::config::RtcOffset,
 }
@@ -106,7 +106,7 @@ impl Rtc {
         }
     }
 
-    fn write(&mut self, v: u8) {
+    fn write(&mut self, v: u8, now: u64) {
         let i = self.index as usize;
         if self.delegated() {
             self.dev.write8(((i as u64) << 8) | 7, v);
@@ -118,12 +118,12 @@ impl Rtc {
         } else {
             self.ext[i - 0x40] = v;
         }
-        // The file catches up once the writes stop: see `Ds1685::flush_after`.
+        // The file catches up once the writes stop: see `Ds1685::hand_over`.
         // A write to the clock registers can set the clock, which is saved
         // beside it. Register A's cannot, and the PROM flips its bank bit
         // around every extended-RAM access.
         if i != 0x0a && self.file.is_some() {
-            self.dirty_since = Some(Instant::now());
+            self.dirty_since = Some(now);
         }
     }
 
@@ -159,9 +159,9 @@ impl Rtc {
     /// The file, the image to put in it and the clock reference to put
     /// beside it, if the RAM changed at least `quiet` ago; the RAM then
     /// counts as saved.
-    fn take_dirty(&mut self, quiet: Duration) -> Option<NvramJob> {
+    fn take_dirty(&mut self, quiet: Duration, now: u64) -> Option<NvramJob> {
         let since = self.dirty_since?;
-        if since.elapsed() < quiet {
+        if now.saturating_sub(since) < quiet.as_nanos() as u64 {
             return None;
         }
         self.dirty_since = None;
@@ -238,7 +238,7 @@ impl Ds1685 {
     /// Back the RAM (user RAM, bank-1 registers and the 128-byte extended
     /// RAM) with a file. A 512-byte file is loaded. The file is written as
     /// 512 bytes now and replaced whole once the guest's writes to the RAM
-    /// pause (see [`Ds1685::flush_after`]). The clock runs from the reference
+    /// pause (see [`Ds1685::hand_over`]). The clock runs from the reference
     /// beside the file (`<file>.clock`, the layout QEMU's model keeps) if
     /// there is one, else from where [`Ds1685::set_rtc_offset`] put it, host
     /// time by default.
@@ -287,11 +287,11 @@ impl Ds1685 {
         self.st.lock().read()
     }
 
-    pub fn write_data(&self, v: u8) {
+    pub fn write_data(&self, v: u8, now: u64) {
         let powered_off = {
             let mut rtc = self.st.lock();
             let was = rtc.dev.powered_off();
-            rtc.write(v);
+            rtc.write(v, now);
             self.dirty.store(encode(rtc.dirty_since), Ordering::SeqCst);
             !was && rtc.dev.powered_off()
         };
@@ -308,38 +308,30 @@ impl Ds1685 {
     }
 
     /// When the file next needs writing, if the RAM changed since it was.
-    pub fn due(&self) -> Option<Instant> {
-        decode(self.dirty.load(Ordering::SeqCst)).map(|t| t + NVRAM_QUIET)
+    pub fn due(&self) -> Option<u64> {
+        decode(self.dirty.load(Ordering::SeqCst)).map(|t| t + NVRAM_QUIET.as_nanos() as u64)
     }
 
     /// The debounce ran out: hand the image to the writer thread.
-    pub fn hand_over(&self) {
-        if let Some(job) = self.take_dirty(NVRAM_QUIET) {
+    pub fn hand_over(&self, now: u64) {
+        if let Some(job) = self.take_dirty(NVRAM_QUIET, now) {
             *self.slot.job.lock() = Some(job);
             self.slot.ready.notify_all();
         }
     }
 
-    fn take_dirty(&self, quiet: Duration) -> Option<NvramJob> {
+    fn take_dirty(&self, quiet: Duration, now: u64) -> Option<NvramJob> {
         let mut rtc = self.st.lock();
-        let job = rtc.take_dirty(quiet);
+        let job = rtc.take_dirty(quiet, now);
         self.dirty.store(encode(rtc.dirty_since), Ordering::SeqCst);
         job
     }
 
-    /// Write the NVRAM file if the RAM changed at least `quiet` ago. The
-    /// PROM writes its environment a byte at a time, so a timer waits for a
-    /// pause rather than rewriting the file per byte; stopping the machine
-    /// and dropping the part flush with no wait. The file is written outside
-    /// the part's lock.
-    pub fn flush_after(&self, quiet: Duration) {
-        let Some(job) = self.take_dirty(quiet) else { return };
-        report_nvram_save(&job.0, save_nvram(&job));
-    }
-
-    /// [`Ds1685::flush_after`] with no wait.
+    /// Write the NVRAM file if the RAM changed, with no wait, outside the part's lock.
+    /// The timer ([`Ds1685::hand_over`]) waits for a pause in the PROM's byte writes.
     pub fn flush(&self) {
-        self.flush_after(Duration::ZERO);
+        let Some(job) = self.take_dirty(Duration::ZERO, 0) else { return };
+        report_nvram_save(&job.0, save_nvram(&job));
     }
 
     /// Write the NVRAM file when the timer hands over an image.
@@ -379,7 +371,7 @@ impl Ds1685 {
             .build()
     }
 
-    pub fn load_state(&self, r: &toml::Value, now: Instant) -> Result<(), String> {
+    pub fn load_state(&self, r: &toml::Value, now: u64) -> Result<(), String> {
         let mut rtc = self.st.lock();
         rtc.dev.load_state(field(r, "clock")?)?;
         rtc.index = field_u8(r, "index")?;
@@ -397,7 +389,7 @@ impl Ds1685 {
     }
 
     #[cfg(test)]
-    pub(crate) fn dirty_since(&self) -> Option<Instant> {
+    pub(crate) fn dirty_since(&self) -> Option<u64> {
         self.st.lock().dirty_since
     }
 }
@@ -453,6 +445,7 @@ impl Drop for Ds1685 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn dropping_a_started_part_without_stop_ends_its_writer() {

@@ -210,10 +210,9 @@ impl ModuleController for ModuleManagement {
 /// registers none).
 fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Bridge, io: &mut BoardIo) {
     let pci = bridge.bus();
-    let mio = Arc::new(Ioc3::new(&crate::dev::ioc3::MIO, [0; 6], ByteBus::None));
+    let mio = Arc::new(Ioc3::new(timers, &crate::dev::ioc3::MIO, [0; 6], ByteBus::None));
     pci.attach(DevFn { device: MEDIAIO_IOC3_DEVICE, function: 0 }, mio.clone());
     mio.connect_superio(pci);
-    mio.set_timer_manager(timers.clone());
     mio.register_locks();
     io.devices.push(mio.clone());
     io.monitor.push(mio.ps2());
