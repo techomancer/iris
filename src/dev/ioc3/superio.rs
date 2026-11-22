@@ -84,7 +84,7 @@ impl Uart {
     /// byte the host end refused and let the receive timeout run out.
     /// Returns whether anything changed.
     pub(super) fn pump(&mut self) -> bool {
-        let now = Instant::now();
+        let now = crate::dev::deadline::register_now();
         let moved = self.core.pump();
         let sent = self.core.poll_tx(now);
         self.core.check_timeout(now) || moved || sent

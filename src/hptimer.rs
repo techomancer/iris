@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -116,6 +116,15 @@ pub struct TimerManager {
     inner: Arc<Mutex<TimerManagerInner>>,
     thread_handle: Option<thread::JoinHandle<()>>,
     new_timer_added: Arc<AtomicBool>,
+    counters: Arc<TimerCounters>,
+}
+
+/// What the worker has done, for the monitor's `timers` command: the wakes
+/// sent to it and the passes it made over the table.
+#[derive(Default)]
+struct TimerCounters {
+    wakes: AtomicU64,
+    scans: AtomicU64,
 }
 
 impl TimerManager {
@@ -130,9 +139,11 @@ impl TimerManager {
         }));
 
         let new_timer_added = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(TimerCounters::default());
 
         let thread_inner = inner.clone();
         let thread_added = new_timer_added.clone();
+        let thread_counters = counters.clone();
 
         let thread_handle = thread::Builder::new().name("hptimer".into()).spawn(move || {
             let waiter = Waiter::new();
@@ -140,13 +151,14 @@ impl TimerManager {
                 let mut guard = thread_inner.lock();
                 guard.waker = Some(waiter.waker());
             }
-            timer_thread_loop(thread_inner, thread_added, &waiter);
+            timer_thread_loop(thread_inner, thread_added, &thread_counters, &waiter);
         }).expect("spawn hptimer thread");
 
         Self {
             inner,
             thread_handle: Some(thread_handle),
             new_timer_added,
+            counters,
         }
     }
 
@@ -238,7 +250,14 @@ impl TimerManager {
         false
     }
 
+    /// Wakes sent to the worker and passes it has made over the table, since
+    /// the manager was made.
+    pub fn counters(&self) -> (u64, u64) {
+        (self.counters.wakes.load(Ordering::Relaxed), self.counters.scans.load(Ordering::Relaxed))
+    }
+
     fn wake_up(&self) {
+        self.counters.wakes.fetch_add(1, Ordering::Relaxed);
         self.new_timer_added.store(true, Ordering::Release);
         let inner = self.inner.lock();
         if let Some(w) = &inner.waker {
@@ -260,8 +279,9 @@ impl Drop for TimerManager {
 }
 
 /// The core loop tracking timeouts precisely.
-fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<AtomicBool>, waiter: &Waiter) {
+fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<AtomicBool>, counters: &TimerCounters, waiter: &Waiter) {
     loop {
+        counters.scans.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let mut next_wakeup = None;
         let mut to_call = None;

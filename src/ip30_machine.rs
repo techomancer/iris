@@ -632,6 +632,7 @@ impl OctaneMachine {
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
+        monitor.register_device(crate::timer_monitor::TimersMonitor::new(timer_manager.clone()));
         monitor.register_device(heart.clone());
         // `pci`: the Bridge's bus, as the O2's MACE shows its own.
         monitor.register_device(bridge.clone());

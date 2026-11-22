@@ -722,7 +722,7 @@ impl Shared {
         }
         match a {
             reg::INT_STATUS => {
-                self.serial_catch_up(Instant::now());
+                self.serial_catch_up(crate::dev::deadline::register_now());
                 self.core.status()
             }
             // The set alias reads back the live mask; the clear one does not.
@@ -758,7 +758,7 @@ impl Shared {
         match a {
             reg::INT_STATUS => {
                 // An acknowledgement must not be undone by a late expiry.
-                self.serial_catch_up(Instant::now());
+                self.serial_catch_up(crate::dev::deadline::register_now());
                 // Write-one-to-clear; level-following bits ignore the write.
                 self.core.clear_bits(val & !int::LEVELS);
             }

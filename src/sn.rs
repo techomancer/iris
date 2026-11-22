@@ -798,6 +798,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
         let monitor = Monitor::new();
         monitor.register_device(init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
+        monitor.register_device(crate::timer_monitor::TimersMonitor::new(timers.clone()));
         monitor.register_device(PerfMonitor::with_cpus(first.running_flag(), cpus.iter().map(|c| c.cycles_ptr()).collect(), first.fasttick_count()));
         for node_memory in memory {
             monitor.register_device(node_memory);

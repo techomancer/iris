@@ -672,6 +672,7 @@ controller's accesses and values nothing establishes.
 | Command | Description |
 |---|---|
 | `perf snapshot` | Performance counters (Indy, Indigo2 and the Bedrock machines) |
+| `timers` | Counters since start, every machine: `host_ns` (nanoseconds since the process began), `wakes` sent to the `hptimer` worker, `scans` (its passes over the timer table) and `register_clock_reads` (host clock reads on device register paths: the 16550 cores, the IOC3 and IOC4, the O2's MACE UART, the L1). Two samples give rates; `tools/timer-cost.py` takes them |
 | `locks` | Every registered lock, whether it is held, and by which thread and call site (for `SpinLock`s); Indy and Indigo2 |
 | `perfetto start FILE [cats=LIST] [clock=host\|guest]` | Start a Perfetto trace (`--features perfetto`; Indy, Indigo2, O2 and Octane) |
 | `perfetto cats LIST` / `perfetto status` / `perfetto stop` | Change categories / show / stop |

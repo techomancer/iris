@@ -56,7 +56,7 @@ impl MaceUart {
     /// driver polling for data sees it at once.
     pub fn pump(&self) {
         let changed = {
-            let now = std::time::Instant::now();
+            let now = crate::dev::deadline::register_now();
             let mut c = self.core();
             let a = c.pump();
             let sent = c.poll_tx(now);

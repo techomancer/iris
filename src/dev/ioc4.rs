@@ -410,7 +410,7 @@ impl St {
     /// Move host input into the port, retry a byte the host end refused and
     /// let the receive timeout run out. Returns whether anything changed.
     fn uart_pump(&mut self, p: usize) -> bool {
-        let now = Instant::now();
+        let now = crate::dev::deadline::register_now();
         let u = &mut self.uart[p];
         let moved = u.pump();
         let sent = u.poll_tx(now);
@@ -488,7 +488,7 @@ impl St {
     // ----- control registers -----
 
     fn read32(&mut self, a: u32) -> u32 {
-        self.sdma_catch_up(Instant::now());
+        self.sdma_catch_up(crate::dev::deadline::register_now());
         if let Some(r) = sdma_decode(a) {
             let (sdma, mut host) = self.sdma_engine_split();
             return match r {
@@ -514,7 +514,7 @@ impl St {
     }
 
     fn write32(&mut self, a: u32, v: u32) {
-        self.sdma_catch_up(Instant::now());
+        self.sdma_catch_up(crate::dev::deadline::register_now());
         if let Some(r) = sdma_decode(a) {
             match r {
                 SdmaReg::Base { pair, high } => {

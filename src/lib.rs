@@ -243,6 +243,7 @@ pub mod validate;
 pub mod registry;
 pub mod thread_affinity;
 pub mod perf_monitor;
+pub mod timer_monitor;
 pub mod ci;
 pub mod hptimer;
 pub mod hptimer_tests;

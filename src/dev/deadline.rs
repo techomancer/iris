@@ -37,3 +37,25 @@ pub(crate) fn span(d: Option<Duration>) -> u64 {
 pub(crate) fn unspan(n: u64) -> Option<Duration> {
     (n != 0).then(|| Duration::from_nanos(n - 1))
 }
+
+// The host clock as device register paths read it, counted for the
+// monitor's `timers` command: a guest that polls a status register reads it
+// once per access unless the device skips the read with nothing pending.
+
+static REGISTER_CLOCK_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `Instant::now()` for a device register path, counted.
+pub(crate) fn register_now() -> Instant {
+    REGISTER_CLOCK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Instant::now()
+}
+
+/// Host clock reads made through [`register_now`] since the process started.
+pub fn register_clock_reads() -> u64 {
+    REGISTER_CLOCK_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Nanoseconds since the process epoch, for rates between two samples.
+pub fn host_ns() -> u64 {
+    epoch().elapsed().as_nanos() as u64
+}

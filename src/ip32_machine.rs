@@ -325,6 +325,7 @@ impl O2Machine {
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
+        monitor.register_device(crate::timer_monitor::TimersMonitor::new(timer_manager.clone()));
         monitor.register_device(bus.clone());
         // `phys`: the physical bus's decode table, memory and traces.
         monitor.register_device(bus.phys.clone());

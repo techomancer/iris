@@ -402,7 +402,7 @@ impl Ns16550 {
                 }
             }
             IIR_FCR => {
-                self.check_timeout(Instant::now());
+                self.check_timeout(crate::dev::deadline::register_now());
                 let ret = self.iir;
                 if ret & IIR_ID == IIR_TX_EMPTY {
                     self.thr_ipending = false;
@@ -414,7 +414,7 @@ impl Ns16550 {
             MCR => self.mcr,
             LSR => {
                 self.pump();
-                self.check_timeout(Instant::now());
+                self.check_timeout(crate::dev::deadline::register_now());
                 let ret = self.lsr;
                 // Reading clears the break and overrun latches.
                 if self.lsr & (LSR_BI | LSR_OE) != 0 {
@@ -558,7 +558,7 @@ impl Ns16550 {
             } else {
                 self.held.push_back(val);
             }
-            self.drain_tx(Instant::now());
+            self.drain_tx(crate::dev::deadline::register_now());
         }
         self.sync_tx_flags();
     }
