@@ -489,15 +489,10 @@ impl MaceAudio {
         }
     }
 
-    /// Move each channel's ring up to now, keeping what the outputs played
-    /// for the next [`Self::poll`]. A read of the registers comes here
-    /// first, so software sees the pointers as they stand, not as of the
-    /// last service pass up to 2 ms ago: IRIX reads the read pointer about
-    /// once a millisecond and keeps its write pointer only about 2 ms
-    /// ahead of it, so a pass that found the ring that stale played it dry
-    /// and filled the tone with zeros.
-    pub fn catch_up(&self, io: &AudioIo) {
-        self.catch_up_at(io, Instant::now());
+    /// An output channel is playing from a ring with data: the service thread passes at once,
+    /// since IRIX keeps its write pointer only 2 ms ahead of the read pointer it reads.
+    pub fn active(&self) -> bool {
+        self.st.lock().ch[1..].iter().any(|c| c.running() && c.depth() != 0)
     }
 
     fn catch_up_at(&self, io: &AudioIo, now: Instant) {
@@ -1009,12 +1004,12 @@ mod tests {
     /// thread passes about every 2.1 ms when the machine is quiet. Reading
     /// a pointer last moved by such a pass, IRIX fell behind: a pass wanted
     /// 16 or 17 frames, sometimes found fewer and played zeros in the middle
-    /// of the tone, so 8 and 11 kHz played sharp and long. A register read
-    /// brings the ring up to date first, and it never runs dry.
+    /// of the tone, so 8 and 11 kHz played sharp and long. Passes every
+    /// 100 µs while a channel runs keep the ring from running dry.
     #[test]
-    fn a_register_read_catches_the_ring_up_so_irix_keeps_ahead() {
+    fn frequent_passes_keep_the_ring_ahead_of_irix() {
         let us = std::time::Duration::from_micros;
-        let run = |catch_up: bool| {
+        let run = |often: bool| {
             let ram = O2Memory::single(8 << 20);
             let a = MaceAudio::new();
             a.write(MACE_AUDIO, 0);
@@ -1033,20 +1028,17 @@ mod tests {
             for step in 0..4000u64 {
                 let t = t0 + us(step * 50);
                 if step % 20 == 0 {
-                    if catch_up {
-                        a.catch_up_at(&io, t);
-                    }
                     let rptr = a.read(MACE_AUDIO + 0x48);
                     a.write(MACE_AUDIO + 0x50, rptr + 17 * 8);
                 }
-                if step % 42 == 0 {
+                if step % if often { 2 } else { 42 } == 0 {
                     a.poll_at(&io, t);
                 }
             }
             (a.gaps[0].load(Ordering::Relaxed), a.msc_ust(1) >> 32)
         };
         let (gaps, _) = run(false);
-        assert!(gaps > 0, "a pointer only as fresh as the last pass let the ring run dry");
+        assert!(gaps > 0, "a pointer only as fresh as a 2 ms pass let the ring run dry");
         let (gaps, frames) = run(true);
         assert_eq!(gaps, 0, "the ring never ran dry");
         assert!((1590..=1600).contains(&frames), "200 ms at 8 kHz played, got {frames}");
