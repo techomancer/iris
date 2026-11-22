@@ -791,6 +791,17 @@ pub(super) static DMA_X_LAYOUTS: [DmaLayout; 4] = [
     lay(image::CODE_CI, 1, [BI, 0, 0, 0, 0, 0, 0, 0]),
 ];
 
+/// X reads whose word 7 names a packed type (bits 8:5 nonzero beyond the
+/// byte types), by the whole write code (write::CODE_MASK): the write
+/// table's packing (pixel_write.rs) run backwards. The X server's 30-bit
+/// TrueColor visual saves screen pixels as 0x10c, ABGR 2_10_10_10_REV
+/// (traced: the Motif text cursor's save-under in nedit), and puts them
+/// back under the same code.
+pub(super) static DMA_X_PACKED: [(u32, DmaLayout); 2] = [
+    (0x10c, pack(0x0c, 4, [fld(3, 2, 30), fld(2, 10, 20), fld(1, 10, 10), fld(0, 10, 0)])), // ABGR, 2_10_10_10_REV
+    (0x10b, pack(0x0b, 4, [fld(0, 10, 22), fld(1, 10, 12), fld(2, 10, 2), fld(3, 2, 0)])),  // RGBA, 10_10_10_2
+];
+
 /// Whether a read header's class and code are sent both for a colour read
 /// and for a depth or stencil read.
 fn shared_depth_code(cls: u32, code: u32) -> bool {
@@ -811,7 +822,11 @@ impl Board {
         let drawable = hdr[dma::HDR_DEST] & dma::SENTINEL != 0;
         let mut l: Option<&'static DmaLayout> = None;
 
-        if xcode != 0 {
+        let wide = hdr[dma::HDR_CONTROL] & write::CODE_MASK;
+
+        if wide > image::CODE_MASK {
+            l = DMA_X_PACKED.iter().find(|(c, _)| *c == wide).map(|(_, t)| t);
+        } else if xcode != 0 {
             for t in DMA_X_LAYOUTS.iter() {
                 if t.code as u32 == xcode {
                     l = Some(t);

@@ -86,6 +86,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   out pale and scrambled) and its tabs are grey again, not red and green.
 - VPro: the check mark of a checked menu toggle (IRIS GL pop-up menus, such
   as powerflip's) draws as a check mark, not a black bar twice the box's width.
+- VPro: text in X edit fields on a TrueColor desktop (nedit's file dialog,
+  any Motif text field) no longer loses the columns the text cursor has passed over.
 - Maximum IMPACT: every other screen row stayed black (PROM menus and
   monitor, issue 777) in builds since 2026-11-17; both raster engines draw again.
 - IMPACT (Indigo2 and Octane): texture colour tables

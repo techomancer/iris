@@ -542,3 +542,35 @@ fn a_ci16_image_put_lands_its_indices_in_the_index_field() {
     assert_eq!(index_at(&s, 146, 313), 0);
     assert_eq!(index_at(&s, 147, 314), 0);
 }
+
+/// The X server's 30-bit TrueColor save of screen pixels, as the Motif text
+/// cursor's save-under sends it in nedit's file dialog: the frame buffer
+/// named by address with the window's pixel mode selected, word 7 write
+/// code 0x10c (ABGR, 2_10_10_10_REV), four bytes a pixel. Refusing the
+/// code left the guest's buffer as it was, and the cursor's restore then
+/// painted that back: the glyph columns under the cursor vanished.
+#[test]
+fn a_30_bit_save_under_returns_abgr_2_10_10_10_rev() {
+    use crate::dev::odyssey::field::Layout;
+    use crate::dev::odyssey::vram::Format;
+    const MODE: u32 = 0x2000_6960;
+    let (mut s, _, ram) = fenced_board();
+    for w in [select(reg::DEST_SELECT), 0x2000, 0x50, MODE, 0] {
+        s.mmio_write(ODSY_USER_CMD_FIFO, w as u64, 4);
+    }
+    s.gpu_sync();
+    let f = Format::decode(MODE);
+    let rows = Rows::new(s.vram_ptr(), View::colour(&Surface::new(0x2000, 0x50, f.fb_log2), Layout::of(f).field(false), MAX_DIM));
+    rows.store_word(200, 300, 0xffff_ffff);
+    rows.store_word(201, 300, 0x4747_4700);
+    ram.put(PAGE_A, &[0xa5; 40]);
+    let mut expect = [0xa5u8; 40];
+
+    put_table(&ram, TABLE, [0x2000, 300 << 16 | 200, 0x50, 0x10002, 0x8223_3062, 0, 8, 0xb301_010c], &[pte(PAGE_A + 16, 8)]);
+    descriptor(&mut s, TABLE);
+
+    // Ten bits a channel: 0x47 widens to 0x11d, as the plane holds it.
+    expect[16..20].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
+    expect[20..24].copy_from_slice(&0x11d4_751du32.to_be_bytes());
+    assert_eq!(ram.get(PAGE_A, 40), expect);
+}
