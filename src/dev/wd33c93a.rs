@@ -928,10 +928,7 @@ impl Device for Wd33c93a {
                     dlog!(state_guard.log_module(), "WD33C93A({}): Processing Command {:02x}", state_guard.id, cmd_reg);
                     state_guard.process_wd_command(cmd_reg, dma.as_deref());
 
-                    let tid = state_guard.target_id;
-                    if tid < 7 {
-                        heartbeat.fetch_or(1u64 << (crate::dev::ng1::rex3::Rex3::HB_SCSI_BASE as u64 + tid as u64), Ordering::Relaxed);
-                    }
+                    crate::status::scsi_blink(&heartbeat, state_guard.target_id as u32);
                 }
 
                 // Deliver queued interrupt — update_irq sequences ASR transitions

@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn ordinary_presentation_scans_the_complete_host_framebuffer() {
         // Not started: a started board's refresh thread also presents its first frame.
-        let g = crate::test_board::TestBoard::new(Gr2::new(Gr2Variant::Xz, crate::disp::StatusSource::detached()));
+        let g = crate::test_board::TestBoard::new(Gr2::new(Gr2Variant::Xz, crate::status::MachineStatus::detached()));
         let mut screen = Rex3Screen::new();
         let want = Want { readback: false, gpu: true };
 

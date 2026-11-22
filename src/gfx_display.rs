@@ -2,7 +2,7 @@
 //! drives the screen (Newport/REX3 or GR2).
 //!
 //! Each board owns its display thread and composition (the status bar's
-//! inputs come from the machine's shared `StatusSource`); this trait only
+//! inputs come from the machine's shared `MachineStatus`); this trait only
 //! exposes the hand-off points: the renderer slot the front-end installs into, the
 //! last-presented screen (screenshots, VNC), the hardware cursor, and the CPU
 //! cycle counter.

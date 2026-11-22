@@ -176,9 +176,11 @@ pub fn start_server(
 fn start_unix_server(server: Arc<CiServer>, path: &str, listener: UnixListener) -> Result<(), String> {
     eprintln!("iris: --ci control socket listening at {}", path);
     let server_clone = server.clone();
+    let port = crate::ports::register("unix", path, "CI socket");
     thread::Builder::new()
         .name("iris-ci-accept".into())
         .spawn(move || {
+            let _port = port;
             for conn in listener.incoming() {
                 match conn {
                     Ok(stream) => {
@@ -220,9 +222,11 @@ fn start_tcp_server_impl(server: Arc<CiServer>, path: &str) -> Result<(), String
         .map_err(|e| format!("failed to bind TCP CI socket {}: {}", addr, e))?;
     eprintln!("iris: --ci control socket listening at tcp:{}", addr);
     let server_clone = server.clone();
+    let port = crate::ports::register("tcp", &addr, "CI socket");
     thread::Builder::new()
         .name("iris-ci-accept".into())
         .spawn(move || {
+            let _port = port;
             for conn in listener.incoming() {
                 match conn {
                     Ok(stream) => {

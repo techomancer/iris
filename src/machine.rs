@@ -481,11 +481,11 @@ impl Machine {
         // (CPU cycle counter is no longer among these: it lives inline on
         // MipsCore.hot.cycles now, wired into devices via set_cpu_cycles
         // after the executor/CPU exist — see Hot::cycles's doc comment.)
-        let heartbeat     = Arc::new(AtomicU64::new(0)); // activity bits: see Rex3::HB_*
+        let heartbeat     = Arc::new(AtomicU64::new(0)); // activity bits: see crate::status::hb
         let fasttick_count = Arc::new(AtomicU64::new(0)); // CP0 Compare match counter
         // What every graphics board's status bar reads; the CPU feeds its
         // fetch counters and the cycle counter is wired in below.
-        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick_count.clone());
+        let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick_count.clone());
         let [decoded_count, l1i_hit_count, l1i_fetch_count, uncached_fetch_count] = status.fetch_counters();
         let (fatal_tx, fatal_rx) = mpsc::channel::<MachineFatal>();
 
@@ -1054,6 +1054,7 @@ impl Machine {
             crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
             monitor.register_device(Arc::new(crate::perfetto::PerfettoMonitor));
         }
+        monitor.register_device(status.clone());
         monitor.register_device(crate::perf_monitor::PerfMonitor::new(
             cpu.running_flag(),
             cpu.cycles_ptr(),

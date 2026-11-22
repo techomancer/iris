@@ -431,7 +431,7 @@ pub struct Mgras {
     gpu_scanout: UnsafeCell<Option<Box<wgpu::scanout::MgrasScanout>>>,
     #[cfg(feature = "wgpu")]
     gpu_device: Option<Arc<crate::wgpu::Gpu>>,
-    status: Arc<crate::disp::StatusSource>,
+    status: Arc<crate::status::MachineStatus>,
     /// Annotated trace (`mgras trace`); `trace_mask` gates the hot paths.
     trace: SpinLock<debug::MgrasTrace>,
     trace_mask: AtomicU32,
@@ -570,7 +570,7 @@ impl Mgras {
     /// are not valid zeroed are written.
     /// `irqs` are the FIFO, general and retrace interrupts, as the slot
     /// wires them.
-    pub fn new(board: GraphicsBoard, irqs: [crate::irq::IrqLine; 3], status: Arc<crate::disp::StatusSource>) -> Arc<Self> {
+    pub fn new(board: GraphicsBoard, irqs: [crate::irq::IrqLine; 3], status: Arc<crate::status::MachineStatus>) -> Arc<Self> {
         Self::with_raster(board, irqs, status, crate::config::RasterUnit::Cpu, "auto").expect("the CPU raster engines")
     }
 
@@ -580,7 +580,7 @@ impl Mgras {
     pub fn with_raster(
         board: GraphicsBoard,
         irqs: [crate::irq::IrqLine; 3],
-        status: Arc<crate::disp::StatusSource>,
+        status: Arc<crate::status::MachineStatus>,
         raster: crate::config::RasterUnit,
         backend: &str,
     ) -> Result<Arc<Self>, String> {

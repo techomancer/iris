@@ -837,9 +837,8 @@ impl Aic7880 {
     /// the controller's own sense, if it holds one.
     fn request(&self, target: u8, cdb: &[u8], data_in: Option<&[u8]>) -> (Vec<u8>, u8) {
         const CHECK_CONDITION: u8 = 0x02;
-        // The bar has lights for SCSI ids 0-5.
-        if let (Some(hb), 0..=5) = (self.heartbeat.get(), target) {
-            hb.fetch_or(1u64 << (crate::dev::ng1::rex3::Rex3::HB_SCSI_BASE as u64 + target as u64), Ordering::Relaxed);
+        if let Some(hb) = self.heartbeat.get() {
+            crate::status::scsi_blink(hb, target as u32);
         }
         if cdb[0] == scsi_cmd::REQUEST_SENSE {
             if let Some((key, asc, ascq)) = self.sense.lock().unwrap().take() {

@@ -543,17 +543,17 @@ fn the_octane_lightbar_follows_pins_0_and_1() {
     let r = Rig::new();
     let hb = Arc::new(AtomicU64::new(0));
     r.c.set_heartbeat(hb.clone());
-    let lit = || hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    let lit = || hb.load(Ordering::Relaxed) & (crate::status::hb::LED_GREEN | crate::status::hb::LED_RED);
     r.w32(reg::PIN_REG_FIRST, 1);
-    assert_eq!(lit(), Rex3::HB_LED_GREEN);
+    assert_eq!(lit(), crate::status::hb::LED_GREEN);
     r.w32(reg::PIN_REG_FIRST + 4, 1);
-    assert_eq!(lit(), Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    assert_eq!(lit(), crate::status::hb::LED_GREEN | crate::status::hb::LED_RED);
     r.w32(reg::PIN_REG_FIRST, 0);
-    assert_eq!(lit(), Rex3::HB_LED_RED);
+    assert_eq!(lit(), crate::status::hb::LED_RED);
     r.w32(reg::PIN_REG_FIRST + 4 * 6, 1);
-    assert_eq!(lit(), Rex3::HB_LED_RED, "an unwired pin lights nothing");
+    assert_eq!(lit(), crate::status::hb::LED_RED, "an unwired pin lights nothing");
     r.w32(reg::PIN_DATA, 0b11);
-    assert_eq!(lit(), Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    assert_eq!(lit(), crate::status::hb::LED_GREEN | crate::status::hb::LED_RED);
     r.w32(reg::PIN_DATA, 0);
     assert_eq!(lit(), 0);
 }
@@ -566,7 +566,7 @@ fn the_octane_lightbar_follows_pins_0_and_1() {
 fn each_row_wires_its_pins_as_listed() {
     // (board, pins held high, [(pin, status-bar bit)])
     let rows: [(&Ioc3Board, u32, &[(u32, u64)]); 6] = [
-        (&IP30, 0b1100, &[(0, Rex3::HB_LED_GREEN), (1, Rex3::HB_LED_RED)]),
+        (&IP30, 0b1100, &[(0, crate::status::hb::LED_GREEN), (1, crate::status::hb::LED_RED)]),
         (&IP29, 0, &[]),
         (&BASEIO, 0, &[]),
         (&BASEIO6G, 0, &[]),
@@ -591,13 +591,13 @@ fn each_row_wires_its_pins_as_listed() {
             let bit = bits.iter().find(|b| b.0 == pin).map_or(0, |b| b.1);
             r.w32(reg, 1);
             let high = r.r32(reg) == 1;
-            let leds = hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+            let leds = hb.load(Ordering::Relaxed) & (crate::status::hb::LED_GREEN | crate::status::hb::LED_RED);
             let listed = board.gpio.iter().any(|w| w.pin as u32 == pin && matches!(w.to, PinUse::Strap(_)));
             assert_eq!(high, strapped || !listed, "{name} pin {pin}: a written 1 reads back unless a strap holds it low");
             assert_eq!(leds, bit, "{name} pin {pin}: status-bar bit after a 1");
             r.w32(reg, 0);
             assert_eq!(r.r32(reg) == 1, strapped, "{name} pin {pin}: a written 0");
-            assert_eq!(hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED), 0, "{name} pin {pin}: cleared");
+            assert_eq!(hb.load(Ordering::Relaxed) & (crate::status::hb::LED_GREEN | crate::status::hb::LED_RED), 0, "{name} pin {pin}: cleared");
         }
         assert_eq!(r.r32(reg::PIN_DATA), straps, "{name}: nothing but the straps left");
     }

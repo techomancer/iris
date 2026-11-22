@@ -326,7 +326,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let presence = PresenceHold::new(running, clock.clone(), bedrock);
     let heartbeat = Arc::new(AtomicU64::new(0));
     let fasttick = Arc::new(AtomicU64::new(0));
-    let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+    let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
     // The V12's interrupt packets and DMA reach Bedrock IO as the PIC's do. Nothing counts the
     // processors' stores into its graphics page or returns credits for them.
     let vpro = (cfg.graphics_board() == GraphicsBoard::V12)

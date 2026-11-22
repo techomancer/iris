@@ -1699,7 +1699,7 @@ mod rex3_e2e_tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
-                let rex = Box::leak(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+                let rex = Box::leak(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);

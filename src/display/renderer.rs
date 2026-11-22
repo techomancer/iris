@@ -7,17 +7,18 @@ use std::sync::Arc;
 pub trait Renderer: Send {
     /// Composite and present one display frame.
     ///
-    /// The renderer owns its compositor, debug overlay, and status bar texture.
-    /// It drives the full pipeline: compose → overlay → status bar → swap.
+    /// The renderer owns its compositor and drives the full pipeline:
+    /// compose → overlay → status bar → swap. `bar` is the status bar,
+    /// already drawn by the display layer (`crate::status::StatusBar`):
+    /// `STATUS_BAR_HEIGHT` rows of `STRIP_STRIDE` 0xAABBGGRR pixels, the
+    /// display's width of them drawn. The renderer only shows it.
     /// When `need_readback` is true the renderer must populate `screen.rgba`
     /// with the composited pixels (for screenshots) before returning.
     fn present(
         &mut self,
         screen:        &mut crate::disp::Rex3Screen,
         overlay:       &mut crate::debug_overlay::DebugOverlay,
-        status:        &mut crate::disp::StatusBar,
-        sbtex:         &mut crate::disp::StatusBarTexture,
-        stats:         &crate::disp::BarStats,
+        bar:           &[u32],
         need_readback: bool,
         live_fb_rgb:   Option<&[u32]>,
         live_fb_aux:   Option<&[u32]>,
@@ -50,9 +51,7 @@ pub trait Renderer: Send {
         _height:  u32,
         _screen:  &mut crate::disp::Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status:  &mut crate::disp::StatusBar,
-        _sbtex:   &mut crate::disp::StatusBarTexture,
-        _stats:   &crate::disp::BarStats,
+        _bar:     &[u32],
     ) {}
 
     /// The resident path must verify the presenter's actual device,
@@ -69,9 +68,7 @@ pub trait Renderer: Send {
         _height: u32,
         _screen: &mut Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _status: &mut crate::disp::StatusBar,
-        _sbtex: &mut crate::disp::StatusBarTexture,
-        _stats: &crate::disp::BarStats,
+        _bar: &[u32],
     ) -> Result<(), String> {
         Err("renderer does not support resident GPU frames".into())
     }

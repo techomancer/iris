@@ -1,7 +1,6 @@
 //! The refresh schedule on a clock the test moves.
 
 use super::*;
-use crate::disp::BarStats;
 use std::sync::atomic::AtomicUsize;
 
 type Log = Arc<Mutex<Vec<String>>>;
@@ -70,8 +69,8 @@ struct TestRenderer {
 
 impl Renderer for TestRenderer {
     fn present(
-        &mut self, screen: &mut Rex3Screen, _: &mut DebugOverlay, _: &mut StatusBar, _: &mut StatusBarTexture,
-        _: &BarStats, _: bool, _: Option<&[u32]>, _: Option<&[u32]>,
+        &mut self, screen: &mut Rex3Screen, _: &mut DebugOverlay, _: &[u32],
+        _: bool, _: Option<&[u32]>, _: Option<&[u32]>,
     ) {
         let what = if screen.status_bar_only { "bar" } else { "present" };
         self.log.lock().push(format!("{} {}", self.name, what));
@@ -100,7 +99,7 @@ impl Rig {
     fn head(&self, name: &'static str) -> (Arc<TestHead>, Arc<HeadHandle>) {
         let head = TestHead::new(name, &self.log);
         let weak: Weak<dyn Head> = Arc::downgrade(&(head.clone() as Arc<dyn Head>));
-        let handle = self.refresh.add_head(weak, StatusSource::detached());
+        let handle = self.refresh.add_head(weak, MachineStatus::detached());
         *handle.renderer_slot().lock() = Some(Box::new(TestRenderer { name, log: self.log.clone() }));
         (head, handle)
     }
@@ -187,7 +186,7 @@ fn with_timers_a_line_does_not_wait_for_the_thread() {
     refresh.set_timers(Arc::new(crate::hptimer::TimerManager::new()));
     let head = TestHead::new("a", &log);
     let as_head: Arc<dyn Head> = head.clone();
-    let handle = refresh.add_head(Arc::downgrade(&as_head), StatusSource::detached());
+    let handle = refresh.add_head(Arc::downgrade(&as_head), MachineStatus::detached());
     // Lines 100 and 300 of 1066: 1.6 ms and 4.7 ms after the retrace.
     handle.set_line_events(&[100, 300]);
     handle.start();
@@ -343,7 +342,7 @@ fn a_slow_compose_sets_the_rate() {
     let rig = Rig::new();
     let head = Arc::new(Slow { clock: rig.clock.clone(), frames: AtomicUsize::new(0), starts: Mutex::new(Vec::new()) });
     let weak: Weak<dyn Head> = Arc::downgrade(&(head.clone() as Arc<dyn Head>));
-    let handle = rig.refresh.add_head(weak, StatusSource::detached());
+    let handle = rig.refresh.add_head(weak, MachineStatus::detached());
     handle.start();
     rig.run(1_000 * MS);
     let frames = head.frames.load(Ordering::SeqCst) as u64;
@@ -552,7 +551,7 @@ fn the_thread_runs_and_stops() {
     let log = Log::default();
     let head = TestHead::new("a", &log);
     let weak: Weak<dyn Head> = Arc::downgrade(&(head.clone() as Arc<dyn Head>));
-    let handle = refresh.add_head(weak, StatusSource::detached());
+    let handle = refresh.add_head(weak, MachineStatus::detached());
     *handle.renderer_slot().lock() = Some(Box::new(TestRenderer { name: "a", log: log.clone() }));
     handle.start();
     let deadline = Instant::now() + Duration::from_secs(5);

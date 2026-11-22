@@ -216,7 +216,7 @@ mod tests {
     }
 
     fn gr2(variant: Gr2Variant) -> Arc<Gr2> {
-        Gr2::new(variant, crate::disp::StatusSource::detached())
+        Gr2::new(variant, crate::status::MachineStatus::detached())
     }
 
     /// What PROM Gr2Probe / Gr2InitInfo read (GR2.h probe section).
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn mgras_answers_the_gio_id_probe() {
-        let m = Mgras::new(GraphicsBoard::SolidImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached());
+        let m = Mgras::new(GraphicsBoard::SolidImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::status::MachineStatus::detached());
         assert_eq!(m.read32(MGRAS_SLOT_GFX_BASE as u64).data, GIO_ID);
     }
 

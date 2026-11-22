@@ -292,6 +292,12 @@ impl CyclesPtr {
     pub fn raw(self) -> *const u64 {
         self.0
     }
+
+    /// The parked-cycles word's address (null when there is none), the
+    /// other half of what [`with_parked`](Self::with_parked) took.
+    pub fn raw_parked(self) -> *const u64 {
+        self.1
+    }
 }
 
 /// MIPS CPU Core with full register state.

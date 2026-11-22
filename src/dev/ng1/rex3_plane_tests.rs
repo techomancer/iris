@@ -303,7 +303,7 @@ fn resident_gpu_no_touch_gfifo_fence_and_direct_scanout() {
                 .map(|i| (i.wrapping_mul(0x85eb_ca6b) ^ 0x8765_4321) & !0xff).collect();
             let mut expected_rgb = seed_rgb.clone();
             let mut expected_aux = seed_aux.clone();
-            let mut rex = Box::new(Rex3::new(crate::disp::StatusSource::detached()));
+            let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.fb_rgb.get_mut().copy_from_slice(&seed_rgb);
             rex.fb_aux.get_mut().copy_from_slice(&seed_aux);
             rex.fb_rgb.get_mut().isolate().unwrap();

@@ -204,7 +204,7 @@ pub(crate) fn attach_vpro(
     bedrock: &Bedrock,
     widget: u8,
     packets: PacketSender,
-    status: &Arc<crate::disp::StatusSource>,
+    status: &Arc<crate::status::MachineStatus>,
     attach: impl FnOnce(Arc<Odyssey>) -> Result<Arc<dyn BusDevice>, String>,
 ) -> Result<Arc<Odyssey>, String> {
     let vpro = Odyssey::new_widget_relative(

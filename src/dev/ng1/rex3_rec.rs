@@ -546,7 +546,7 @@ pub(crate) mod tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                let rex: &'static Rex3 = Box::leak(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
+                let rex: &'static Rex3 = Box::leak(Box::new(Rex3::new(crate::status::MachineStatus::detached())));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);
@@ -671,7 +671,7 @@ pub(crate) mod tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                let rex = Arc::new(Rex3::new(crate::disp::StatusSource::detached()));
+                let rex = Arc::new(Rex3::new(crate::status::MachineStatus::detached()));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);

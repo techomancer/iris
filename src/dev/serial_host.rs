@@ -96,6 +96,8 @@ impl SerialBackend for TeeBackend {
 /// port, and the socket's directory permissions say who may.
 #[cfg(unix)]
 pub(crate) struct UnixSocketBackend {
+    /// The socket's entry in `ports`.
+    _port: crate::ports::PortGuard,
     path: std::path::PathBuf,
     listener: UnixListener,
     stream: Mutex<Option<UnixStream>>,
@@ -129,7 +131,8 @@ impl UnixSocketBackend {
         let listener = bind_unix_socket(&path)?;
         listener.set_nonblocking(true)?;
         crate::workstation::remove_at_exit(&path);
-        Ok(Self { path, listener, stream: Mutex::new(None) })
+        let _port = crate::ports::register("unix", path.display(), "serial port");
+        Ok(Self { _port, path, listener, stream: Mutex::new(None) })
     }
 }
 
@@ -307,6 +310,8 @@ impl TcpConn {
 }
 
 pub(crate) struct TcpSocketBackend {
+    /// The socket's entry in `ports`.
+    _port: Option<crate::ports::PortGuard>,
     pub(crate) listener: TcpListener,
     /// Every connected client: each sees all the output and may type, so a
     /// person at the console and a script can share it.
@@ -331,7 +336,9 @@ impl TcpSocketBackend {
             log::warn!("serial TCP backend disabled: failed to set nonblocking: {e}");
             return None;
         }
+        let _port = listener.local_addr().map(|a| crate::ports::register("tcp", a, "serial port")).ok();
         Some(Self {
+            _port,
             listener,
             conns: Mutex::new(Vec::new()),
         })

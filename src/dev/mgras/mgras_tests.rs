@@ -327,7 +327,7 @@ fn dma_read_to_host_memory() {
 /// A board in the Octane's order (see `Mgras::start_reads_at_kick`), set
 /// before the engines start.
 fn octane_board() -> Arc<Mgras> {
-    let m = Mgras::new(crate::config::GraphicsBoard::HighImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached());
+    let m = Mgras::new(crate::config::GraphicsBoard::HighImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::status::MachineStatus::detached());
     m.start_reads_at_kick();
     m.start_engines();
     m

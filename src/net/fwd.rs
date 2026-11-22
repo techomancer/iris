@@ -20,11 +20,15 @@ const MAX_FTP_DATA_FWD: usize = 16;
 pub(super) struct TcpFwdListener {
     pub(super) listener: Watched<TcpListener>,
     pub(super) guest_port: u16,
+    /// The listener's entry in `ports`.
+    _port: Option<crate::ports::PortGuard>,
 }
 
 pub(super) struct UdpFwdListener {
     pub(super) sock: Watched<UdpSocket>,
     guest_port: u16,
+    /// The socket's entry in `ports`.
+    _port: crate::ports::PortGuard,
     host_port: u16,
     /// Most recent sender; the guest's replies go back here.
     last_sender: Option<SocketAddr>,
@@ -46,7 +50,8 @@ pub(super) fn bind_forwards(rules: &[PortForwardConfig], wake: &Arc<Wake>) -> (V
                 Ok(listener) => {
                     let _ = listener.set_nonblocking(true);
                     eprintln!("iris: TCP port forward {}:{} → guest:{}", bind_addr, rule.host_port, rule.guest_port);
-                    tcp.push(TcpFwdListener { listener, guest_port: rule.guest_port });
+                    let _port = Some(crate::ports::register("tcp", addr, format!("port forward to guest port {}", rule.guest_port)));
+                    tcp.push(TcpFwdListener { listener, guest_port: rule.guest_port, _port });
                 }
                 Err(e) => eprintln!("iris: TCP port forward {}:{} failed to bind: {}", bind_addr, rule.host_port, e),
             },
@@ -55,7 +60,8 @@ pub(super) fn bind_forwards(rules: &[PortForwardConfig], wake: &Arc<Wake>) -> (V
                     let _ = sock.set_nonblocking(true);
                     super::nat_udp::allow_large_datagrams(&sock);
                     eprintln!("iris: UDP port forward {}:{} → guest:{}", bind_addr, rule.host_port, rule.guest_port);
-                    udp.push(UdpFwdListener { sock, guest_port: rule.guest_port, host_port: rule.host_port,
+                    let _port = crate::ports::register("udp", addr, format!("port forward to guest port {}", rule.guest_port));
+                    udp.push(UdpFwdListener { sock, _port, guest_port: rule.guest_port, host_port: rule.host_port,
                                               last_sender: None });
                 }
                 Err(e) => eprintln!("iris: UDP port forward {}:{} failed to bind: {}", bind_addr, rule.host_port, e),
@@ -90,7 +96,9 @@ impl NatEngine {
         {
             self.tcp_fwd_listeners.remove(self.fwd_static_count); // drop the oldest
         }
-        self.tcp_fwd_listeners.push(TcpFwdListener { listener, guest_port });
+        let _port = listener.local_addr().ok()
+            .map(|a| crate::ports::register("tcp", a, format!("FTP data forward to guest port {guest_port}")));
+        self.tcp_fwd_listeners.push(TcpFwdListener { listener, guest_port, _port });
     }
 
     /// Pick a source port for a synthesized inbound connection that isn't live

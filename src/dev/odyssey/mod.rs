@@ -163,7 +163,7 @@ impl Odyssey {
         product: &str,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        status: Arc<crate::disp::StatusSource>,
+        status: Arc<crate::status::MachineStatus>,
         pool: (usize, u32),
         raster: (crate::config::RasterUnit, &str),
     ) -> Result<Arc<Self>, String> {
@@ -180,7 +180,7 @@ impl Odyssey {
         product: &str,
         packets: PacketSender,
         mem: Arc<dyn BusDevice>,
-        status: Arc<crate::disp::StatusSource>,
+        status: Arc<crate::status::MachineStatus>,
         pool: (usize, u32),
         raster: (crate::config::RasterUnit, &str),
     ) -> Result<Arc<Self>, String> {
@@ -194,7 +194,7 @@ impl Odyssey {
         packets: PacketSender,
         aperture: Aperture,
         mem: Arc<dyn BusDevice>,
-        status: Arc<crate::disp::StatusSource>,
+        status: Arc<crate::status::MachineStatus>,
         pool: (usize, u32),
         raster: (crate::config::RasterUnit, &str),
     ) -> Result<Arc<Self>, String> {

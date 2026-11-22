@@ -913,9 +913,9 @@ fn the_front_leds_follow_the_register() {
     use std::sync::atomic::Ordering::Relaxed;
     let id = MaceId::new(TEST_MAC);
     let hb = || id.heartbeat.load(Relaxed);
-    assert_eq!(hb(), Rex3::HB_LED_RED);
+    assert_eq!(hb(), crate::status::hb::LED_RED);
     id.write(0, 0);
-    assert_eq!(hb(), Rex3::HB_LED_RED | Rex3::HB_LED_GREEN);
+    assert_eq!(hb(), crate::status::hb::LED_RED | crate::status::hb::LED_GREEN);
     id.write(1, 0x30);
     assert_eq!(hb(), 0);
     assert_eq!(id.read(2) & 0x30, 0x30);

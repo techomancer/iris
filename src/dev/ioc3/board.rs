@@ -86,8 +86,8 @@ pub static IP30: Ioc3Board = Ioc3Board {
     phy: Phy::Ics1890,
     superio_pin: 4,
     gpio: &[
-        PinWire::status_bit(0, Rex3::HB_LED_GREEN),
-        PinWire::status_bit(1, Rex3::HB_LED_RED),
+        PinWire::status_bit(0, crate::status::hb::LED_GREEN),
+        PinWire::status_bit(1, crate::status::hb::LED_RED),
         PinWire::strap(2, true),
         PinWire::strap(3, true),
     ],

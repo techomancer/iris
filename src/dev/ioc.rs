@@ -599,7 +599,7 @@ pub struct Ioc {
     guinness: bool,
     /// Sender for async machine events (power-off).
     event_tx: Arc<std::sync::OnceLock<mpsc::SyncSender<MachineEvent>>>,
-    /// Shared heartbeat — IOC sets/clears HB_LED_RED/GREEN bits directly.
+    /// Shared heartbeat — IOC sets/clears `crate::status::hb::LED_RED`/`LED_GREEN` directly.
     heartbeat: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
     /// Counter bumped on every 8254 timer 0/1 interrupt (see `set_clock_ticks`).
     clock_ticks: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
@@ -1075,14 +1075,14 @@ impl BusDevice for Ioc {
                 // bit SET = LED off, bit CLEAR = LED on — update heartbeat unconditionally
                 if let Some(hb) = self.heartbeat.get() {
                     if (val & 0x10) == 0 {
-                        hb.fetch_or(Rex3::HB_LED_RED, Ordering::Relaxed);
+                        hb.fetch_or(crate::status::hb::LED_RED, Ordering::Relaxed);
                     } else {
-                        hb.fetch_and(!Rex3::HB_LED_RED, Ordering::Relaxed);
+                        hb.fetch_and(!crate::status::hb::LED_RED, Ordering::Relaxed);
                     }
                     if (val & 0x20) == 0 {
-                        hb.fetch_or(Rex3::HB_LED_GREEN, Ordering::Relaxed);
+                        hb.fetch_or(crate::status::hb::LED_GREEN, Ordering::Relaxed);
                     } else {
-                        hb.fetch_and(!Rex3::HB_LED_GREEN, Ordering::Relaxed);
+                        hb.fetch_and(!crate::status::hb::LED_GREEN, Ordering::Relaxed);
                     }
                 }
             },

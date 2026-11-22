@@ -465,7 +465,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
         WIDGET_GFX,
         heart.clone(),
         ram.dma_view(),
-        crate::disp::StatusSource::detached(),
+        crate::status::MachineStatus::detached(),
     );
     let _release = Release(ram.phys().clone());
     let id = widget_small_base(WIDGET_GFX) + 4;

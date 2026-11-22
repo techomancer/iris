@@ -1957,9 +1957,7 @@ fn a_stop_from_the_main_thread_leaves_the_renderer_alone() {
             &mut self,
             _: &mut crate::disp::Rex3Screen,
             _: &mut crate::debug_overlay::DebugOverlay,
-            _: &mut crate::disp::StatusBar,
-            _: &mut crate::disp::StatusBarTexture,
-            _: &crate::disp::BarStats,
+            _: &[u32],
             _: bool,
             _: Option<&[u32]>,
             _: Option<&[u32]>,
@@ -1999,7 +1997,7 @@ fn the_window_is_the_same_before_and_after_the_status_is_wired() {
     let cfg = test_cfg();
     let backend = KonaBackend::new(cfg);
     let before = backend.display();
-    backend.set_status(crate::disp::StatusSource::new(Arc::default(), Arc::default()));
+    backend.set_status(crate::status::MachineStatus::new(Arc::default(), Arc::default()));
     assert!(Arc::ptr_eq(&before, &backend.display()));
 }
 

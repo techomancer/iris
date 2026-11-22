@@ -66,7 +66,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     // The status bar's activity bits, shared with the base I/O's devices.
     let heartbeat = Arc::new(AtomicU64::new(0));
     let fasttick = Arc::new(AtomicU64::new(0));
-    let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+    let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
     let graphics = cfg.graphics_board();
     let vpro = (graphics != GraphicsBoard::None)
         .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, bedrock.interrupt_sender(WIDGET_VPRO, None), &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))

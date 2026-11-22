@@ -43,7 +43,7 @@ impl Probe {
 impl Renderer for Probe {
     fn present(
         &mut self, _: &mut crate::disp::Rex3Screen, _: &mut crate::debug_overlay::DebugOverlay,
-        _: &mut crate::disp::StatusBar, _: &mut crate::disp::StatusBarTexture, _: &crate::disp::BarStats,
+        _: &[u32],
         _: bool, _: Option<&[u32]>, _: Option<&[u32]>,
     ) {
         self.presents.fetch_add(1, SeqCst);
