@@ -128,6 +128,23 @@ file holds (its kind, version and segments, each checked) and `extract` writes i
 payload or one segment, such as the BaseIO PROM inside the IP35 file; `download` and
 `pack` rebuild `data/proms` from the catalog.
 
+## Ultra64 dev board without gopher64
+
+`tools/tests/ultra64-irq-or.py` runs a headless Indy at its built-in PROM with
+`[ultra64] enabled` and no disks, and plays the N64 side itself with the
+`ultra64-peer` example, which queues messages on the board's shared-memory
+bridge as gopher64 does. The monitor makes the driver's bus accesses and
+`ioc status` shows the GIO slot 0 interrupt. It checks that acknowledging
+one of the board's interrupt sources leaves the line up while another is
+pending.
+
+```sh
+cargo build --bin iris --example ultra64-peer
+tools/tests/ultra64-irq-or.py target/debug/iris target/debug/examples/ultra64-peer --port 8888
+```
+
+The bridge's shared memory has a fixed name, so run one at a time per host.
+
 ## Host audio
 
 A sound card can break anywhere between guest memory and the host's
