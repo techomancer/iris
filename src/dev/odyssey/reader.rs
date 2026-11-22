@@ -606,7 +606,7 @@ impl ScanoutReader {
     }
 
     /// Take a new mode and retrace restart the front end published.
-    fn sync(&mut self, shared: &DisplayShared) {
+    pub fn sync(&mut self, shared: &DisplayShared) {
         let cell = &shared.mode;
         let (gen, restart) = (cell.gen.load(Acquire), cell.restart.load(Acquire));
         let mode = ScanoutMode {

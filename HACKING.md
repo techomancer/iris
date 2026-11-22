@@ -1307,6 +1307,13 @@ separate CPU cache before using the ordinary renderer.
 `wait_fresh_frame` says whether the board composed a new frame in time, so a
 caller can tell a fresh screenshot from a repeat of the last one.
 
+The shared frame and readback buffers start at 1024 rows and grow to the
+highest active mode, up to `FB_MAX_H`. Newport's auxiliary and DID planes are
+allocated only by a Newport display-state refresh. Software compositors and
+debug overlays likewise allocate for their active frame height instead of
+reserving 2048 rows up front. A producer that writes `fb_rgb`, or a renderer
+that fills `rgba`, must first ensure the corresponding row count.
+
 Nothing downstream looks inside the drawing code. The VNC server
 (`src/vnc/`) finds damage by comparing frames in 64x64 tiles, so every board
 is served the same way and drawing paths carry no bookkeeping.

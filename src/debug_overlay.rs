@@ -34,7 +34,8 @@ pub struct SeenMode {
 /// Debug overlay: renders CMAP swatches, DID/XMAP mode info, and draw-record
 /// annotations into a GL texture that is alpha-blended over the compositor output.
 pub struct DebugOverlay {
-    /// CPU pixel buffer for the overlay (transparent=0 where inactive), stride 2048.
+    /// CPU pixel buffer for the overlay (transparent=0 where inactive), stride
+    /// 2048. Empty until an overlay is drawn, then grown to the tallest frame.
     buf:         Vec<u32>,
     /// GL texture backing the overlay.
     tex:         Option<glow::Texture>,
@@ -58,7 +59,7 @@ pub struct DebugOverlay {
 impl DebugOverlay {
     pub fn new() -> Self {
         Self {
-            buf:              vec![0u32; crate::disp::FB_STRIDE * crate::disp::FB_MAX_H],
+            buf:              Vec::new(),
             tex:              None,
             font:             crate::vga_font::SCREEN_8X16.to_vec(),
             show_cmap:        false,
@@ -118,6 +119,10 @@ impl DebugOverlay {
     pub fn render_pixels(&mut self, src: &OverlaySource<'_>) -> &[u32] {
         let width  = src.width;
         let height = src.height;
+        let needed = crate::disp::FB_STRIDE * height.min(crate::disp::FB_MAX_H);
+        if self.buf.len() < needed {
+            self.buf.resize(needed, 0);
+        }
 
         let display_ctrl = src.vc2_regs[VC2_REG_DISPLAY_CONTROL as usize];
         let cursor_en    = (display_ctrl & VC2_CTRL_CURSOR_EN) != 0;

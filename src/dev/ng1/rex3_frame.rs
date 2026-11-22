@@ -602,6 +602,7 @@ impl ResidentCompatibilityDisplay {
             if matches!(fault, Some(CaptureFault::AfterStaging)) {
                 return Err(ResidentError::Failed("injected composed capture failure after staging".into()));
             }
+            screen.ensure_rgba_rows(height);
             for y in 0..height {
                 let row = y * FB_STRIDE;
                 screen.rgba[row..row + width]
@@ -734,6 +735,7 @@ impl ResidentDirectDisplay {
             let after = self.scanout.traffic().composed_readbacks;
             rex.resident_frame.capture_delta(ResidentDisplayMode::DirectWgpu, before, after)?;
             result?;
+            screen.ensure_rgba_rows(height);
             for y in 0..height {
                 let row = y * FB_STRIDE;
                 for (dst, &src) in screen.rgba[row..row + width]

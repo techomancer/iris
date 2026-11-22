@@ -646,7 +646,7 @@ impl Gbe {
     ///
     /// Returns the size and whether any of `out` was written, or None when
     /// the display is off or does not fit.
-    pub fn render_direct(&self, ram: &mut crate::dev::crime_mem::RamWindow, out: &mut [u32], stride: usize, memo: &mut ScanMemo) -> Option<(u32, u32, bool)> {
+    pub fn render_direct(&self, ram: &mut crate::dev::crime_mem::RamWindow, out: &mut Vec<u32>, stride: usize, memo: &mut ScanMemo) -> Option<(u32, u32, bool)> {
         // The registers the scan reads, copied under the lock: the guest
         // polls the beam through the same lock while the frame is made.
         let (ctl, wids, crs) = {
@@ -664,8 +664,12 @@ impl Gbe {
         };
         let [hcmap, vcmap, ctrlstat, dotclock, vt_xy, vt_flags, tile, frm_pixel, frm, ovr, ovr_tile, did, crs_ctl, crs_pos] = ctl;
         let (w, h) = (((hcmap >> 12) & 0xfff) as usize, ((vcmap >> 12) & 0xfff) as usize);
-        if (ctrlstat >> 28) & 3 != 3 || dotclock & DOTCLOCK_RUN == 0 || vt_xy & VT_FREEZE != 0 || w == 0 || h == 0 || vt_flags & 0xa == 0xa || w > stride || h * stride > out.len() {
+        if (ctrlstat >> 28) & 3 != 3 || dotclock & DOTCLOCK_RUN == 0 || vt_xy & VT_FREEZE != 0 || w == 0 || h == 0 || vt_flags & 0xa == 0xa || w > stride || h > crate::disp::FB_MAX_H {
             return None;
+        }
+        let needed = h * stride;
+        if out.len() < needed {
+            out.resize(needed, 0);
         }
         ram.begin();
         let ram = &*ram;

@@ -99,7 +99,7 @@ pub trait Compositor: Send {
 /// Pure-CPU compositor.  Runs the per-pixel loop into a `Vec<u32>`, uploads to
 /// a GL texture via `glTexSubImage2D`, and returns that texture.
 pub struct SwCompositor {
-    /// CPU pixel buffer: stride 2048, `FB_MAX_H` rows.
+    /// CPU pixel buffer: stride 2048, grown to the tallest frame composed.
     buf:    Vec<u32>,
     /// GL texture that holds the last uploaded frame.
     tex:    Option<glow::Texture>,
@@ -115,7 +115,7 @@ pub struct SwCompositor {
 impl SwCompositor {
     pub fn new() -> Self {
         Self {
-            buf: vec![0u32; crate::disp::FB_STRIDE * crate::disp::FB_MAX_H],
+            buf: Vec::new(),
             tex: None,
             picture_current: false,
             current_size: (0, 0),
@@ -157,6 +157,10 @@ impl SwCompositor {
 
         let width  = src.width;
         let height = src.height;
+        let needed = crate::disp::FB_STRIDE * height.min(crate::disp::FB_MAX_H);
+        if self.buf.len() < needed {
+            self.buf.resize(needed, 0);
+        }
 
         if let Some(frame) = src.prebuilt {
             for y in 0..height {
@@ -392,5 +396,25 @@ mod tests {
         assert!(!holds_current_picture(&new, true, (1280, 1024)));
         // Another size: the texture holds a picture of another size.
         assert!(!holds_current_picture(&src, true, (1280, 768)));
+    }
+
+    #[test]
+    fn the_pixel_buffer_tracks_the_tallest_active_frame() {
+        let tall = vec![0xff12_3456; crate::disp::FB_STRIDE * 1200];
+        let mut comp = SwCompositor::new();
+        comp.compose_pixels(&CompositorSource {
+            prebuilt: Some(&tall),
+            ..source(1600, 1200, false)
+        });
+        assert_eq!(comp.pixels().len(), crate::disp::FB_STRIDE * 1200);
+        assert_eq!(comp.pixels()[1199 * crate::disp::FB_STRIDE], 0xff12_3456);
+
+        let small = vec![0xff65_4321; crate::disp::FB_STRIDE * 768];
+        comp.compose_pixels(&CompositorSource {
+            prebuilt: Some(&small),
+            ..source(1280, 768, false)
+        });
+        assert_eq!(comp.pixels().len(), crate::disp::FB_STRIDE * 1200);
+        assert_eq!(comp.pixels()[0], 0xff65_4321);
     }
 }

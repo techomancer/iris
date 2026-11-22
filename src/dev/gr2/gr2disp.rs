@@ -49,6 +49,7 @@ impl Head for Gr2 {
     /// There is nothing smaller to take than the composed frame.
     fn capture(&self, screen: &mut Rex3Screen, _want: Want) -> bool {
         let r = self.regs();
+        screen.ensure_fb_rows(FB_H);
         gr2comp::compose(self.vram(), &r.vc1, &r.xmap, &r.dac, &mut screen.fb_rgb);
         self.presentation_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.presentation_host_read_pixels
