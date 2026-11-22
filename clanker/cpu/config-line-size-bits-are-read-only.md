@@ -49,3 +49,6 @@ From the PROM command monitor (serial channel B):
 `ip2x`; with no argument ip2xboot looks for `/netbsd` and fails). A failed
 `boot -f` leaves the PROM short of memory ("doesn't fit in a FreeMemory
 area"); `init` and enter the monitor again before retrying.
+
+`tools/netbsd-cd-boot.py ISO --cpu r5000` does all of this unattended and
+exits 1 with the panic line before the fix, 0 at the sysinst menu after.

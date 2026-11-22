@@ -115,6 +115,17 @@ recordings of a failing case (`vpro rec`) replay on both raster units offline:
 unit and the GPU unit with live-style slice ends, and compares what the board
 wrote to guest memory and its final memory.
 
+**NetBSD install CD** — `tools/netbsd-cd-boot.py` boots a NetBSD/sgimips
+install CD on a headless Indy with a blank NVRAM, runs the CD's install kernel
+from the PROM Command Monitor and passes when the sysinst menu appears. It
+fails when the kernel panics, and prints the panic line. It starts and quits
+its own iris and writes nothing but an NVRAM file in its work directory. The CD
+is not in the repository; use any `NetBSD-*-sgimips.iso`.
+
+```sh
+tools/netbsd-cd-boot.py NetBSD-11.1-sgimips.iso --cpu r5000   # and --cpu r4400
+```
+
 ## Real PROM images
 
 `real_prom_files_load_to_their_payload` (in `src/dev/prom_image.rs`) loads the
