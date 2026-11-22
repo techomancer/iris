@@ -218,8 +218,30 @@ impl Board {
             ((hdr[dma::HDR_ORIGIN] & 0xffff) as i32).wrapping_add(self.win.read_origin[0]),
             ((hdr[dma::HDR_ORIGIN] >> 16) as i32).wrapping_add(self.win.read_origin[1]),
         );
+        // A luminance or luminance-alpha texture uploaded by address with
+        // no level selected names 2-byte fields with format byte 0, which
+        // would read as four 4-bit components; the source's bytes are the
+        // field's (traced: buttonfly's texture font, word 4 0x80001000 and
+        // code 0x48 into a format-0xb level; glprim's 256x256 LUMINANCE
+        // and INTENSITY textures, code 0x42 into a format-4 level). Packed
+        // as 4/4/4/4, a clear texel's alpha came back 0xf0 and every glyph
+        // drew as a box. The board model's packing check
+        // (Board::check_level_packing) found the luminance case.
+        let one_or_two = if read || drawable || bytes != 2 {
+            None
+        } else {
+            match hdr[dma::HDR_CONTROL] & image::CODE_MASK {
+                image::CODE_LUM => Some(super::field::FIELD_ONE),
+                image::CODE_LUM_ALPHA => Some(super::field::FIELD_TWO),
+                _ => None,
+            }
+        };
         let codec = |at: u8| {
-            let named = super::copy::source_codec(bytes, fmt & 0xff);
+            let named = if let Some(field) = one_or_two {
+                super::field::Codec::Texel { bytes: 2, field }
+            } else {
+                super::copy::source_codec(bytes, fmt & 0xff)
+            };
             if drawable && read {
                 return self.drawable_codec(origin.0, origin.1, at).filter(|c| super::copy::codec_bytes(*c) == bytes).unwrap_or(named);
             }

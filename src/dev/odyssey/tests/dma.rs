@@ -574,3 +574,26 @@ fn a_30_bit_save_under_returns_abgr_2_10_10_10_rev() {
     expect[20..24].copy_from_slice(&0x11d4_751du32.to_be_bytes());
     assert_eq!(ram.get(PAGE_A, 40), expect);
 }
+
+/// buttonfly's texture font: a luminance-alpha texture uploaded by address
+/// with no level selected, word 4 0x80001000 (2-byte fields, format byte
+/// 0) and source code 0x48, into the level its descriptor later names as
+/// format 0xb, a luminance byte then an alpha byte. Each texel keeps its
+/// two bytes. Stored as four 4-bit components, a clear texel (L 0xff, A 0)
+/// read back with alpha 0xf0 and every glyph drew as an opaque box.
+#[test]
+fn a_luminance_alpha_texture_upload_keeps_its_alpha() {
+    let (mut s, _, ram) = board_with_ram();
+    colour_destination(&mut s);
+    ram.put(PAGE_B, &[0xff, 0x00, 0x80, 0xff, 0x3c, 0x5a]);
+    let header = [0x16d000, 0, 0x10, 1 << 16 | 3, 0x8000_1000, 0, 6, 0x3200_0048];
+    put_table(&ram, TABLE, header, &[pte(PAGE_B, 6)]);
+
+    descriptor(&mut s, TABLE);
+
+    let lum_alpha = Codec::Texel { bytes: 2, field: crate::dev::odyssey::field::FIELD_TWO };
+    let word = |x| mem_word(&s, 0x16d000, 0x10, 1, lum_alpha, x, 0);
+    assert_eq!(word(0), 0xffff_ff00);
+    assert_eq!(word(1), 0x8080_80ff);
+    assert_eq!(word(2), 0x3c3c_3c5a);
+}
