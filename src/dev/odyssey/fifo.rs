@@ -377,6 +377,7 @@ impl CommandFifo {
             // the enable mask says.
             let mut f = front.lock();
             f.intr_flags |= intr::FIFO_HIGH_WATER;
+            crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_HIGH_WATER, after);
             f.update_irq();
         }
         self.wake();

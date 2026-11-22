@@ -31,7 +31,7 @@ event that belongs to several categories is recorded when any of them is on.
 |---|---|
 | `cpu` | Interrupts taken by the CPU (also `irq`). |
 | `irq` | IOC/INT2 interrupt lines, the CPU's IP2-IP7 pins, interrupts taken. |
-| `timer` | The 8254 slow and fast ticks and Count/Compare (IP7); these are also `irq`. |
+| `timer` | The 8254 slow and fast ticks, Count/Compare (IP7) and the IP35 PI real-time clock; these are also `irq`. |
 | `dma` | HPC3 PDMA channels, VDMA (also `gfx`), IMPACT host DMA (also `gfx`). |
 | `scsi` | WD33C93A commands, CDBs and chip interrupts. |
 | `net` | Ethernet frames sent, received, refused and filtered. |
@@ -72,6 +72,7 @@ host thread's name.
 |---|---|---|
 | Interrupts | `L0 *`, `L1 *`, `map *` | One slice per assertion of each IOC/INT2 status bit (raw, before masking), from raise to clear. `slow tick (8254 timer 0)` and `fast tick (8254 timer 1)` are latches, so their slices measure tick-to-acknowledge latency. |
 | CPU interrupt pins | `IP2`…`IP6`, `IP7 (count/compare)` | The CPU's interrupt inputs. IP7 runs from the Count/Compare match to the guest's Compare write. `IP7 masked (Status)` is a slice while the guest has the clock masked (Status IE or IM7 clear); `IP7 pending, held` while IP7 is pending and the CPU cannot take it (arg at the start: Status << 32 \| PC). |
+| IP35 clock | `RT clock cpu 0`…`3` | The Fuel, Tezro and Origin 3000 schedule from each processor's PI real-time comparator, not Count/Compare. A `rt tick` slice runs from the comparator latching to the guest clearing its pending bit: its length is the tick-to-acknowledge latency, and a gap is a missed tick. Both nodes of a two-node machine share the tracks. |
 | `MIPS-CPU` | thread | `interrupt taken` (arg: pending & enabled IP bits); jitv2 `compile request` and `hot request` (arg: PC); `pool flush (CPU thread)` and `track page (CPU thread)`, the jitv2 work that runs on the CPU thread with no guest code running. |
 | DMA | `PDMA pbus0-7`, `PDMA scsi0/1`, `PDMA enet rx/tx` | HPC3 channel `active` slices (arg: first descriptor), `desc` per data descriptor (arg: byte count/flags), `int` on completion interrupts. PBUS channels carry HAL2 audio. |
 | DMA | `VDMA` | MC graphics DMA: `mem -> gio`, `gio -> mem`, `fill` (arg: bytes). |
@@ -87,8 +88,9 @@ host thread's name.
 | Graphics | `IMPACT status`, `IMPACT flags`, `IMPACT vc3` | Every STATUS read with its value (bit 2 is vertical blank); flags raised (arg: raster entries queued << 32 \| bits) and cleared by the host; VC3 register and SRAM writes (the window-ID tables) and current-line reads. |
 | Graphics | `IMPACT irq` | The board's three interrupt lines (arg: line << 1 \| level: 0 FIFO, 1 general, 2 retrace). On the Octane, the interrupt packets sent to HEART (arg: vector << 1 \| set) and the kernel's acknowledgements (arg: offset << 32 \| bits). |
 | Graphics | `VPro cfifo level` | The command-FIFO level STATUS0 is built from (words queued, not yet run), sampled at slice start and end and at STATUS0 reads. |
-| Graphics | `VPro irq` | `cfifo low water` (the level fell below the mark as a store retired), `dma done`, and an `interrupt packet` per packet sent to HEART (arg: routed-source shift << 9 \| vector << 1 \| set). |
+| Graphics | `VPro irq` | `cfifo high water` (the level reached the driver's mark as a store was queued, arg: level), `enable/flags write` (the driver's writes to the interrupt enables and flags, arg: enables << 32 \| flags), `cfifo low water` (the level fell below the mark as a store retired), `dma done`, and an `interrupt packet` per packet sent to HEART (arg: routed-source shift << 9 \| vector << 1 \| set). |
 | Graphics | `Display vblank`, `Display frame` | The display refresh thread, for every board: a `vblank` slice from vblank start to vblank end (arg: field), then on the frame track `capture` (the board taking the frame from its live state), `compose` and `present`, or `capture refused` when the board is not ready (Newport's fence). |
+| Graphics | `VPro irq line`, `VPro flow control` | `flag interrupt` while an enabled flag is set (arg: flags & enables); `low-water enabled` while the driver has the low-water interrupt enabled, that is, while its flow control waits for the command FIFO to drain. |
 | Graphics | `VPro display`, `VPro capture`, `VPro present` | `swap arm` (the driver's flip request, arg: mask), `retrace` (flips latched, arg: displayed-buffer bits); the refresh thread resolving the frame and handing it to the window. Inside a capture, `frame planes` on `Display-Refresh` is the part that composes the whole frame from board memory, with no lock and no wait for the raster unit. |
 | Graphics | `VPro access busy` | One processor access answered busy, from its first refusal until it completes (arg: aperture offset). The processor takes its enabled interrupts in between. |
 | `odyssey-work` | thread | `slice` per run of queued stores on the front-end thread (arg: stores waiting), `dma descriptor` per page-table transfer (arg: table address). A processor access that drains the queue shows `drain` on its own thread. |

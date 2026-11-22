@@ -805,6 +805,12 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
         for device in &io.monitor {
             monitor.register_device(device.clone());
         }
+        // The guest timeline follows the first CPU's retired instructions.
+        #[cfg(feature = "perfetto")]
+        {
+            crate::perfetto::set_guest_cycles(Some(first.cycles_ptr()));
+            monitor.register_device(Arc::new(crate::perfetto::PerfettoMonitor));
+        }
         let mut nat = None;
         let net = GatewayConfig::from_network(&cfg.network());
         if let Some(link) = Link::with_gateway(net.clone())? {
@@ -860,6 +866,9 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Worksta
         for c in self.cpus() {
             c.clone().as_device().stop();
         }
+        // The guest clock points into this machine's first CPU.
+        #[cfg(feature = "perfetto")]
+        crate::perfetto::set_guest_cycles(None);
         for d in self.io.devices.iter().rev() {
             d.stop();
         }

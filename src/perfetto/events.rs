@@ -73,6 +73,18 @@ pub static IP7_MASKED_LEVEL: crate::PfLevel = crate::PfLevel::new();
 pub static IP7_HELD: EventDef = EventDef::new("IP7 pending, held", cat::CPU | cat::IRQ).on_track("IP7 pending, held").in_group(PIN_GROUP).with_arg("status<<32|pc");
 pub static IP7_HELD_LEVEL: crate::PfLevel = crate::PfLevel::new();
 
+const fn rt_tick(track: &'static str) -> EventDef {
+    EventDef::new("rt tick", cat::IRQ | cat::TIMER).on_track(track).in_group(PIN_GROUP)
+}
+/// IP35 (Fuel, Tezro, Origin 3000): a processor's PI real-time comparator,
+/// the IRIX scheduler clock on these machines, indexed by interface * 2 +
+/// slot. A slice runs from the comparator latching to the guest clearing
+/// RT_INT_PEND, so its length is tick-to-acknowledge latency and a missing
+/// slice is a missed tick. Both nodes of a two-node machine share the tracks.
+pub static PI_RT_TICK: [EventDef; 4] =
+    [rt_tick("RT clock cpu 0"), rt_tick("RT clock cpu 1"), rt_tick("RT clock cpu 2"), rt_tick("RT clock cpu 3")];
+pub static PI_RT_TICK_LEVEL: [crate::PfLevel; 4] = [const { crate::PfLevel::new() }; 4];
+
 // ── HPC3 peripheral DMA ──────────────────────────────────────────────────────
 
 macro_rules! pdma {
@@ -297,6 +309,17 @@ pub static MGRAS_HQ4_ACK: EventDef = EventDef::new("hq4 ack", cat::GFX).on_track
 /// by the hundred thousand.
 pub static ODSY_CFIFO_LEVEL: EventDef = EventDef::new("VPro cfifo level", cat::GFX).in_group(GFX_GROUP);
 /// The FIFO fell below the low-water mark as a store retired (arg: level).
+/// The level reached the driver's high-water mark (the 0x6b2 value) as a store was queued.
+pub static ODSY_CFIFO_HIGH_WATER: EventDef = EventDef::new("cfifo high water", cat::GFX).on_track("VPro irq").in_group(GFX_GROUP).with_arg("level");
+/// A write to the interrupt enables or flags (arg: enables << 32 | flags after it).
+pub static ODSY_INTR_WRITE: EventDef = EventDef::new("enable/flags write", cat::GFX | cat::IRQ).on_track("VPro irq").in_group(GFX_GROUP).with_arg("enable<<32|flags");
+/// The flag interrupt line: raised while an enabled flag is set (arg: flags & enables).
+pub static ODSY_IRQ_LINE: EventDef = EventDef::new("flag interrupt", cat::GFX | cat::IRQ).on_track("VPro irq line").in_group(GFX_GROUP).with_arg("flags&enable");
+pub static ODSY_IRQ_LINE_LEVEL: crate::PfLevel = crate::PfLevel::new();
+/// The driver has the low-water interrupt enabled: its flow control is
+/// waiting for the command FIFO to drain.
+pub static ODSY_LOW_WATER_WAIT: EventDef = EventDef::new("low-water enabled", cat::GFX | cat::IRQ).on_track("VPro flow control").in_group(GFX_GROUP);
+pub static ODSY_LOW_WATER_WAIT_LEVEL: crate::PfLevel = crate::PfLevel::new();
 pub static ODSY_CFIFO_LOW_WATER: EventDef = EventDef::new("cfifo low water", cat::GFX).on_track("VPro irq").in_group(GFX_GROUP).with_arg("level");
 /// One slice of the board's front-end thread running queued stores (arg:
 /// stores waiting when it began), and an access draining the queue on its own

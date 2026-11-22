@@ -348,6 +348,12 @@ impl HostInterface {
 
     pub fn update_irq(&mut self) {
         let level = (self.intr_flags & self.intr_enable) != 0;
+        crate::pf_level!(crate::perfetto::events::ODSY_IRQ_LINE_LEVEL, crate::perfetto::events::ODSY_IRQ_LINE, level, self.intr_flags & self.intr_enable);
+        crate::pf_level!(
+            crate::perfetto::events::ODSY_LOW_WATER_WAIT_LEVEL,
+            crate::perfetto::events::ODSY_LOW_WATER_WAIT,
+            self.intr_enable & intr::FIFO_LOW_WATER != 0
+        );
 
         if level != self.interrupt_asserted {
             self.interrupt_asserted = level;
@@ -464,14 +470,17 @@ impl HostInterface {
             Some(ODSY_ERROR_COMMAND) => self.error_command = 0,
             Some(intr::CLEAR) => {
                 self.intr_flags &= !(value as u32);
+                crate::pf_instant!(crate::perfetto::events::ODSY_INTR_WRITE, (self.intr_enable as u64) << 32 | self.intr_flags as u64);
                 self.update_irq();
             }
             Some(intr::ENABLE_SET) => {
                 self.intr_enable |= value as u32;
+                crate::pf_instant!(crate::perfetto::events::ODSY_INTR_WRITE, (self.intr_enable as u64) << 32 | self.intr_flags as u64);
                 self.update_irq();
             }
             Some(intr::ENABLE_CLEAR) => {
                 self.intr_enable &= !(value as u32);
+                crate::pf_instant!(crate::perfetto::events::ODSY_INTR_WRITE, (self.intr_enable as u64) << 32 | self.intr_flags as u64);
                 self.update_irq();
             }
             Some(intr::FLAGS) => {
@@ -483,6 +492,7 @@ impl HostInterface {
                 // registers (set enables, clear enables, clear flags) make a
                 // set-only write the competing reading.
                 self.intr_flags = value as u32;
+                crate::pf_instant!(crate::perfetto::events::ODSY_INTR_WRITE, (self.intr_enable as u64) << 32 | self.intr_flags as u64);
                 self.update_irq();
             }
             Some(ODSY_SW_TOKEN) => self.sw_token = value as u32,
