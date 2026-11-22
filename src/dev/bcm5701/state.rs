@@ -346,7 +346,7 @@ impl State {
     /// whenever this entry happened.
     fn run_timers(&mut self) {
         let target = self.now;
-        while let Some((deadline, timer)) = self.timers().into_iter().filter(|(d, _)| *d <= target).min() {
+        while let Some((deadline, timer)) = self.timers().into_iter().flatten().filter(|(d, _)| *d <= target).min() {
             self.now = deadline;
             match timer {
                 EngineDeadline::PhySettle => self.phy.sync(),
@@ -363,7 +363,7 @@ impl State {
         self.now = target;
     }
 
-    fn timers(&self) -> Vec<(u64, EngineDeadline)> {
+    fn timers(&self) -> [Option<(u64, EngineDeadline)>; 5] {
         [
             self.phy.deadline().map(|d| (d, EngineDeadline::PhySettle)),
             self.bufmgr_start.map(|d| (d, EngineDeadline::BufferManager)),
@@ -371,14 +371,11 @@ impl State {
             self.tx_coal_timer.map(|d| (d, EngineDeadline::TxCoalescing)),
             self.rx_latency.front().map(|held| (held.due, EngineDeadline::RxArrival)),
         ]
-        .into_iter()
-        .flatten()
-        .collect()
     }
 
     /// The earliest moment something here needs attention.
     pub fn deadline(&self) -> Option<u64> {
-        self.timers().into_iter().map(|(d, _)| d).min()
+        self.timers().into_iter().flatten().map(|(d, _)| d).min()
     }
 
     pub fn refused(&self) -> Vec<(Refused, u64)> {
