@@ -70,7 +70,7 @@ fn bench_node_register_paths() {
             first_cpu,
             nodes,
             &events,
-            &Arc::new(L1::new(L1Config::default()).unwrap()),
+            &Arc::new(L1::new(&Arc::new(crate::hptimer::TimerManager::new()), L1Config::default()).unwrap()),
         )
         .unwrap()
     };

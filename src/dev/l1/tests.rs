@@ -3,6 +3,11 @@
 // router brick-reply cases (test_port_speed, test_irouter_*).
 
 use super::*;
+use crate::clock::Clock;
+
+fn new_l1(config: L1Config) -> Result<L1, String> {
+    L1::new(&Arc::new(TimerManager::with_clock(Clock::stepped())), config)
+}
 
 fn send(l1: &L1, bytes: &[u8]) {
     for &b in bytes {
@@ -40,7 +45,7 @@ fn integer_reply(values: &[u32]) -> Vec<u8> {
 /// The PROM accesses the L1 UART through byte-sized register operations.
 #[test]
 fn the_l1_uart_frames_bytes_and_prioritizes_interrupts() {
-    let l1 = L1::new(Default::default()).unwrap();
+    let l1 = new_l1(Default::default()).unwrap();
     assert_eq!(l1.read64(1).status, BUS_ERR);
     assert_eq!(l1.read8(0).status, BUS_ERR);
     assert_eq!(l1.read32(0).status, BUS_ERR);
@@ -69,7 +74,7 @@ fn the_l1_uart_frames_bytes_and_prioritizes_interrupts() {
 /// The guest reads controller identity and checks the EEPROM record checksum.
 #[test]
 fn the_l1_returns_identity_and_validated_eeprom_records() {
-    let l1 = L1::new(Default::default()).unwrap();
+    let l1 = new_l1(Default::default()).unwrap();
     assert_eq!(request(&l1, 3, &[], 0), integer_reply(&[65, 65]));
     let board = l1.record(1, 2).unwrap();
     assert_eq!(board.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
@@ -92,9 +97,9 @@ fn the_l1_returns_identity_and_validated_eeprom_records() {
 /// `l1_build_board_area` layout); the I/O area and default record carry none.
 #[test]
 fn the_node_board_record_carries_a_configured_cpu_configuration() {
-    let plain = L1::new(Default::default()).unwrap().record(0, 2).unwrap();
+    let plain = new_l1(Default::default()).unwrap().record(0, 2).unwrap();
     let cpu = CpuContext { mode_word: 0x589b_ad85, cpu_mhz: 700, hub_mhz: 200 };
-    let l1 = L1::new(L1Config { cpu_context: Some(cpu), ..Default::default() }).unwrap();
+    let l1 = new_l1(L1Config { cpu_context: Some(cpu), ..Default::default() }).unwrap();
     let area = l1.record(0, 2).unwrap();
     assert_eq!(area.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
     assert_eq!((area.len() % 8, usize::from(area[1]) * 8), (0, area.len()));
@@ -108,7 +113,7 @@ fn the_node_board_record_carries_a_configured_cpu_configuration() {
     }
     fields.push(0xc1);
     assert_eq!(&area[identity..identity + fields.len()], fields);
-    assert_eq!(l1.record(1, 2), L1::new(Default::default()).unwrap().record(1, 2), "the I/O board's area");
+    assert_eq!(l1.record(1, 2), new_l1(Default::default()).unwrap().record(1, 2), "the I/O board's area");
 }
 
 /// A board naming its node board gets that identity in component 0 and no I/O record; otherwise the
@@ -116,7 +121,7 @@ fn the_node_board_record_carries_a_configured_cpu_configuration() {
 #[test]
 fn a_named_node_board_answers_in_component_0_alone() {
     let ip53 = BoardIdentity { name: "IP53_4CPU", part: "030-1868-001", revision: "-C" };
-    let l1 = L1::new(L1Config { node_board: Some(ip53), ..Default::default() }).unwrap();
+    let l1 = new_l1(L1Config { node_board: Some(ip53), ..Default::default() }).unwrap();
     let area = l1.record(0, 2).unwrap();
     assert_eq!(area.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
     for text in [b"IP53_4CPU".as_slice(), b"030-1868-001", b"-C"] {
@@ -126,12 +131,12 @@ fn a_named_node_board_answers_in_component_0_alone() {
     assert_eq!(l1.record(1, 2), None, "no I/O board record");
     assert_eq!(l1.record(1, 1), None);
     let empty = BoardIdentity { name: "", part: "", revision: "" };
-    let area = L1::new(L1Config { node_board: Some(empty), ..Default::default() }).unwrap().record(0, 2).unwrap();
+    let area = new_l1(L1Config { node_board: Some(empty), ..Default::default() }).unwrap().record(0, 2).unwrap();
     // SYNTHETIC, empty name, serial, empty part, FRU file byte, empty revision.
     let at = area.windows(10).position(|x| x == b"\xc9SYNTHETIC").unwrap() + 10;
     assert_eq!(&area[at..at + 11], b"\xc0\xc6EMUN00\xc0\x00\xc0");
-    let fuel = L1::new(Default::default()).unwrap();
-    assert_eq!(fuel.record(0, 2), L1::new(L1Config { node_board: None, ..Default::default() }).unwrap().record(0, 2));
+    let fuel = new_l1(Default::default()).unwrap();
+    assert_eq!(fuel.record(0, 2), new_l1(L1Config { node_board: None, ..Default::default() }).unwrap().record(0, 2));
     assert!(fuel.record(1, 2).is_some());
 }
 
@@ -139,10 +144,10 @@ fn a_named_node_board_answers_in_component_0_alone() {
 #[test]
 fn a_named_graphics_board_answers_in_component_2() {
     let args = model::ints(&[2, 2, 0, 64]);
-    let none = L1::new(Default::default()).unwrap();
+    let none = new_l1(Default::default()).unwrap();
     assert_eq!(request(&none, 6, &args, 4), encode(&[0x30, 255, 255, 255, 152, 0]));
     let v12 = BoardIdentity { name: "ODY128VERSIONB", part: "030-1611-001", revision: "C" };
-    let l1 = L1::new(L1Config { graphics_board: Some(v12), ..Default::default() }).unwrap();
+    let l1 = new_l1(L1Config { graphics_board: Some(v12), ..Default::default() }).unwrap();
     let area = l1.record(2, 2).unwrap();
     assert_eq!(area.iter().fold(0u8, |s, x| s.wrapping_add(*x)), 0);
     // The guest reads 64 bytes at a time; the reply gives what is left.
@@ -172,13 +177,13 @@ fn text_reply(text: &str) -> Vec<u8> {
 fn the_l1_revision_and_brick_serial_default_and_can_be_overridden() {
     let set = L1Config { revision: Some(parse_revision("2.13.40").unwrap()), brick_serial: Some("EMUN07".into()), ..Default::default() };
     for (config, rev, serial) in [(Default::default(), [1, 48, 1], "EMUN00"), (set, [2, 13, 40], "EMUN07")] {
-        let l1 = L1::new(config).unwrap();
+        let l1 = new_l1(config).unwrap();
         l1.power_on();
         assert_eq!(request(&l1, 5, &[], 0), integer_reply(&rev));
         assert_eq!(request(&l1, 4, &[], 0), text_reply(serial));
     }
     assert_eq!(
-        L1::new(L1Config { brick_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
+        new_l1(L1Config { brick_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
         Some("L1 brick serial is longer than its 37-byte field")
     );
 }
@@ -195,20 +200,20 @@ fn the_l1_revision_text_is_three_decimal_parts() {
 /// Request 0x0008 is the station address in hex; a configured serial replaces only that text.
 #[test]
 fn a_system_serial_changes_only_the_system_serial_reply() {
-    let plain = L1::new(Default::default()).unwrap();
-    let set = L1::new(L1Config { system_serial: Some("LEMU200420".into()), ..Default::default() }).unwrap();
+    let plain = new_l1(Default::default()).unwrap();
+    let set = new_l1(L1Config { system_serial: Some("LEMU200420".into()), ..Default::default() }).unwrap();
     for l1 in [&plain, &set] {
         l1.power_on();
     }
     assert_eq!(request(&set, 8, &[], 0), text_reply("LEMU200420"));
     assert_eq!(request(&plain, 8, &[], 0), text_reply("080069123456"));
-    let mac = L1::new(L1Config { mac: [0x00, 0xA0, 0xc9, 0x1f, 0x02, 0xbe], ..Default::default() }).unwrap();
+    let mac = new_l1(L1Config { mac: [0x00, 0xA0, 0xc9, 0x1f, 0x02, 0xbe], ..Default::default() }).unwrap();
     mac.power_on();
     assert_eq!(request(&mac, 8, &[], 0), text_reply("00A0C91F02BE"));
     assert_eq!(request(&set, 4, &[], 0), request(&plain, 4, &[], 0));
     assert_eq!(set.state.lock().records, plain.state.lock().records);
     assert_eq!(
-        L1::new(L1Config { system_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
+        new_l1(L1Config { system_serial: Some("x".repeat(38)), ..Default::default() }).err().as_deref(),
         Some("L1 system serial is longer than its 37-byte field")
     );
 }
@@ -216,7 +221,7 @@ fn a_system_serial_changes_only_the_system_serial_reply() {
 /// The L1 parser recovers after malformed frames.
 #[test]
 fn the_l1_resynchronizes_after_bad_frames() {
-    let l1 = L1::new(Default::default()).unwrap();
+    let l1 = new_l1(Default::default()).unwrap();
     send(&l1, &[0x7e, 1, 2, 3, 0x7e]);
     send(&l1, &vec![0x41; 259]);
     send(&l1, &[0x7e]);
@@ -233,7 +238,7 @@ fn the_l1_resynchronizes_after_bad_frames() {
 #[test]
 fn l1_reset_clears_uart_state_but_keeps_the_os_event_channel() {
     for channel in [3, 23] {
-        let l1 = L1::new(Default::default()).unwrap();
+        let l1 = new_l1(Default::default()).unwrap();
         let (irq, line) = crate::irq::LevelProbe::line();
         l1.set_irq(line);
         request(&l1, 0x1007, &model::ints(&[channel]), 1);
@@ -269,7 +274,7 @@ fn l1_reset_clears_uart_state_but_keeps_the_os_event_channel() {
 /// Requests no guest sends are refused as unknown (minus 101).
 #[test]
 fn requests_no_guest_sends_are_refused() {
-    let l1 = L1::new(Default::default()).unwrap();
+    let l1 = new_l1(Default::default()).unwrap();
     for cmd in [2, 7, 0xf, 0x1001, 0x1004, 0x4002] {
         assert_eq!(request(&l1, cmd, &[], 0), encode(&[0x30, 255, 255, 255, 155, 0]), "{cmd:#x}");
     }
@@ -278,7 +283,7 @@ fn requests_no_guest_sends_are_refused() {
 /// A local console power-down request requires a second confirmation command.
 #[test]
 fn interactive_power_down_waits_for_a_second_command() {
-    let l1 = Arc::new(L1::new(Default::default()).unwrap());
+    let l1 = Arc::new(new_l1(Default::default()).unwrap());
     let actions = Arc::new(Mutex::new(Vec::new()));
     let observed = actions.clone();
     let weak = Arc::downgrade(&l1);
@@ -317,7 +322,7 @@ fn protocol_and_task_three_power_down_commands_are_immediate() {
         ("protocol command", protocol),
         ("task three console", task_three),
     ] {
-        let l1 = L1::new(Default::default()).unwrap();
+        let l1 = new_l1(Default::default()).unwrap();
         let actions = Arc::new(Mutex::new(Vec::new()));
         let observed = actions.clone();
         l1.set_event_handler(Arc::new(move |event| observed.lock().push(event)));
@@ -354,7 +359,7 @@ fn l1_worker_irq_delivery_stays_ordered_across_reentrant_cpu_reads() {
             self.levels.lock().push(level);
         }
     }
-    let l1 = Arc::new(L1::new(Default::default()).unwrap());
+    let l1 = Arc::new(new_l1(Default::default()).unwrap());
     let backend = Arc::new(crate::dev::serial_host::CiSerialBackend::new());
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
@@ -401,7 +406,7 @@ fn concurrent_l1_outputs_and_actions_are_delivered_in_order() {
             Err(std::io::ErrorKind::WouldBlock.into())
         }
     }
-    let l1 = Arc::new(L1::new(Default::default()).unwrap());
+    let l1 = Arc::new(new_l1(Default::default()).unwrap());
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::sync_channel(1);
     let backend = Arc::new(BlockingBackend {
@@ -444,14 +449,14 @@ fn concurrent_l1_outputs_and_actions_are_delivered_in_order() {
 /// Ported from test_port_speed in tests/qtest/sn1-l1-test.c.
 #[test]
 fn the_port_speed_reply_carries_the_configured_first_integer() {
-    let l1 = L1::new(Default::default()).unwrap();
+    let l1 = new_l1(Default::default()).unwrap();
     assert_eq!(request(&l1, 0xa, &[], 0), integer_reply(&[0, 0]));
-    let l1 = L1::new(L1Config { port_speed_first: 1, ..Default::default() }).unwrap();
+    let l1 = new_l1(L1Config { port_speed_first: 1, ..Default::default() }).unwrap();
     assert_eq!(request(&l1, 0xa, &[], 0), integer_reply(&[1, 0]));
     l1.power_on();
     drain(&l1);
     assert_eq!(request(&l1, 0xa, &[], 0), integer_reply(&[1, 0]));
-    assert!(L1::new(L1Config { port_speed_first: 2, ..Default::default() }).is_err());
+    assert!(new_l1(L1Config { port_speed_first: 2, ..Default::default() }).is_err());
 }
 
 const BRICK: [u8; 53] = [
@@ -461,7 +466,7 @@ const BRICK: [u8; 53] = [
 ];
 
 fn router_l1(type_code: u32, rack: u32, bay: u32, serial: Option<&str>) -> L1 {
-    L1::new(L1Config {
+    new_l1(L1Config {
         router: true,
         type_code,
         rack,
@@ -575,7 +580,7 @@ fn a_reset_drops_a_pending_router_message_and_unsupported_types_stay_silent() {
     send_packet(&l1, &BRICK);
     expect_brick(&l1, 0x30, 0x0004_4215, 0x0004_4003, DEFAULT_TEXT);
 
-    let off = L1::new(Default::default()).unwrap();
+    let off = new_l1(Default::default()).unwrap();
     send_packet(&off, &BRICK);
     assert_eq!(drain(&off), encode(&[0x30, 255, 255, 255, 255, 0, 0, 0, 8]));
 
@@ -660,7 +665,7 @@ const C_BRICK_NODE: BoardIdentity = BoardIdentity { name: "NODE-ROW", part: "030
 const C_BRICK_PIMM: BoardIdentity = BoardIdentity { name: "PIMM-ROW", part: "030-PIMM-ROW", revision: "-P" };
 
 fn cbrick(index: u8, pimm_mask: u8) -> L1 {
-    L1::new(L1Config {
+    new_l1(L1Config {
         bay: 4,
         type_code: 0x43,
         brick_serial: Some("EMUN00".into()),
@@ -677,7 +682,7 @@ fn cbrick(index: u8, pimm_mask: u8) -> L1 {
 #[test]
 fn an_i_brick_lists_its_c_brick_and_its_g_brick() {
     let l1 = |graphics_bay| {
-        L1::new(L1Config {
+        new_l1(L1Config {
             bay: 4,
             type_code: 0x43,
             node_board: Some(C_BRICK_NODE),
@@ -709,7 +714,7 @@ fn a_c_brick_reports_itself_and_relays_to_its_i_brick() {
     };
     assert_eq!(attached(&l1, 3), integer_reply(&[(1 << 6) | 14, 0x49]));
     // A brick with nothing on the cable refuses the attached form.
-    let lone = L1::new(Default::default()).unwrap();
+    let lone = new_l1(Default::default()).unwrap();
     assert_eq!(attached(&lone, 3), encode(&[0x30, 255, 255, 255, 255, 0, 0, 0, 8]));
     assert_eq!(request(&lone, 0xa, &[], 0), integer_reply(&[0, 0]));
 }
@@ -739,13 +744,39 @@ fn a_c_brick_holds_a_node_board_and_the_populated_pimms() {
 #[test]
 fn a_config_without_the_c_brick_fields_is_unchanged() {
     let plain = L1Config { node_board: Some(C_BRICK_NODE), ..Default::default() };
-    let l1 = L1::new(plain).unwrap();
+    let l1 = new_l1(plain).unwrap();
     assert!(has_text(&l1.record(0, 2).unwrap(), b"EMUN00"));
     assert!(l1.record(1, 2).is_none() && l1.record(2, 2).is_none());
-    let refused = L1::new(L1Config { compute_node: Some(ComputeNode { index: 0, pimm_mask: 1, pimm: C_BRICK_PIMM }), ..Default::default() });
+    let refused = new_l1(L1Config { compute_node: Some(ComputeNode { index: 0, pimm_mask: 1, pimm: C_BRICK_PIMM }), ..Default::default() });
     assert!(refused.is_err());
 }
 
 fn has_text(area: &[u8], text: &[u8]) -> bool {
     area.windows(text.len()).any(|x| x == text)
+}
+
+/// The UART's receive timeout reaches the line from the L1's timer once the
+/// machine clock is four character times past the character; a stop keeps
+/// the deadline and a start arms it again.
+#[test]
+fn the_receive_timeout_runs_on_a_timer_on_the_machine_clock() {
+    let clock = Clock::stepped();
+    let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+    let l1 = L1::new(&tm, Default::default()).unwrap();
+    let (irq, line) = crate::irq::LevelProbe::line();
+    l1.set_irq(line);
+    l1.write64(0x10, 0x81);
+    l1.write64(8, 1);
+    l1.start();
+    l1.receive_console(b"x");
+    let due = l1.uart.lock().timeout_due().expect("the character started the timeout");
+    assert_eq!(l1.rx_timer.due(), Some(due));
+    clock.step(due - 1);
+    assert!(!irq.level(), "not before the deadline");
+    l1.stop();
+    clock.step(1);
+    assert!(!irq.level() && l1.rx_timer.due() == Some(due), "a stopped timer keeps its deadline and does not fire");
+    l1.start();
+    assert!(crate::test_board::until(std::time::Duration::from_secs(60), || irq.level()), "start arms it again");
+    l1.stop();
 }

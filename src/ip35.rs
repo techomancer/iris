@@ -267,8 +267,7 @@ pub(crate) fn machine(
     // The machine numbers its processors once, across its nodes in order.
     let (mut nodes, mut l1s, mut first_cpu) = (Vec::new(), Vec::new(), 0);
     for spec in &specs {
-        let l1 = Arc::new(L1::new(spec.l1.clone())?);
-        l1.set_clock(timers.clock().clone());
+        let l1 = Arc::new(L1::new(&timers, spec.l1.clone())?);
         nodes.push(NodeBoard::<Bedrock, Flash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, &prom, &timers, first_cpu, specs.len(), &events, &l1)?);
         l1s.push(l1);
         first_cpu += spec.processors.count();
