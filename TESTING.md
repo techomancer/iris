@@ -139,6 +139,25 @@ file holds (its kind, version and segments, each checked) and `extract` writes i
 payload or one segment, such as the BaseIO PROM inside the IP35 file; `download` and
 `pack` rebuild `data/proms` from the catalog.
 
+## Shared IOC interrupt bits
+
+`tools/ioc-shared-bit-e2e.py` checks on a running emulator that an IOC
+status bit two sources share stays set while either of them holds it. It
+starts iris as an Indigo2 (IP22) with the built-in PROM, Newport, a blank
+overlay disk and virtio-serial in GIO expansion slot 1, so Newport's retrace
+and the virtio device share L0 GRAPHICS. Once the PROM has the display up it
+stops the CPU, then works both sources from the monitor: the virtio device
+holds its interrupt while Newport's retrace is released (a REX3 STATUS read),
+and the reverse. It reports how many iterations saw the bit clear while a
+source still held it and exits 1 if any did.
+
+```sh
+tools/ioc-shared-bit-e2e.py --iris target/release/iris --iris-ci target/release/iris-ci
+```
+
+It needs no IRIX image. `--base-port` (default 22620) moves the monitor, CI
+socket and serial ports off the defaults.
+
 ## Host audio
 
 A sound card can break anywhere between guest memory and the host's
