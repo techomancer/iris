@@ -68,6 +68,12 @@ impl Monitor {
         audio_status(&self.devices.lock())
     }
 
+    /// Frames every sound card has moved (see [`Device::audio_frames`]), or
+    /// `None` on a machine with no sound card.
+    pub fn audio_frames(&self) -> Option<u64> {
+        self.devices.lock().iter().filter_map(|d| d.audio_frames()).reduce(|a, b| a + b)
+    }
+
     /// Bind `addr` and serve it on a new thread. The bind happens before
     /// this returns, so `bound_addr` answers at once whether this monitor
     /// has its port.
@@ -323,6 +329,7 @@ mod tests {
         fn is_running(&self) -> bool { true }
         fn get_clock(&self) -> u64 { 0 }
         fn audio_report(&self) -> Option<String> { Some(format!("audio: {}\n", self.0)) }
+        fn audio_frames(&self) -> Option<u64> { Some(self.0.len() as u64) }
         fn register_commands(&self) -> Vec<(String, String)> {
             if self.1 { vec![("audio".into(), "own".into())] } else { vec![] }
         }
@@ -352,6 +359,9 @@ mod tests {
         monitor.register_device(Arc::new(Card("one", false)));
         monitor.register_device(Arc::new(Card("two", false)));
         assert_eq!(monitor.audio_status(), "audio: one\naudio: two\n");
+        // The activity count sums the cards, and is absent with none.
+        assert_eq!(monitor.audio_frames(), Some(6));
+        assert_eq!(Monitor::new().audio_frames(), None);
     }
 
     /// `quit` ends the connection even though the machine's log sink keeps a

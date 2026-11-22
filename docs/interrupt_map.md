@@ -134,8 +134,10 @@ fan-out mechanism and, notably, why fullhouse's Newport driver doesn't use GIO_I
 the GFIFO handler at `VECTOR_GIO0` → L0 bit 0.
 
 On IP22 fullhouse all three GIO interrupt lines are shared between GFX slot and expansion
-slots; the EXTIO register disambiguates which slot fired. On IP24 Indy, GFX slot gets the
-three dedicated pins and expansion slots route through MAP instead.
+slots, as a wired OR; the EXTIO register disambiguates which slot fired. On IP24 Indy, GFX
+slot gets the three dedicated pins and expansion slots route through MAP instead. A second
+Newport on an Indy puts its retrace and FIFO interrupts, ORed, on its slot's single pin
+(`GIO_EXP0`); whether real hardware routes them that way is not yet confirmed.
 
 ---
 
@@ -280,8 +282,8 @@ PIO6 has `MAP_POL` at the same relative offset instead (a genuinely different re
 
 Real IRIX (this kernel tree) never references `PCON_CLR_*`/`PCON_*_RESET_N` from any driver
 — these are defined but unused by the version of IRIX in this tree, so their effect (IRIS
-clears the shared `L1_STAT` `VERTICAL_RETRACE` bit when a clear strobe is asserted) is
-speculative, not confirmed by a live call site.
+clears that slot's EXT_IO retrace bit, and `L1_STAT` `VERTICAL_RETRACE` once no slot's retrace
+is pending) is speculative, not confirmed by a live call site.
 
 ### EXT_IO / `HPC3_EXT_IO_ADDR` (fullhouse only, `0x1FBD9900`)
 
@@ -337,8 +339,11 @@ whether that slot's bit for this vector is clear; if so it calls
 `andi v0, s1, 0x1000` / `→EXP0 dispatch`) — matches this table's bit layout exactly.
 
 IRIS implements this fan-out for real: `IocInterrupt::Gio{Sg,S0,S1}{Fifo,Graphics,Retrace}`
-(`ioc.rs`) each set the one shared L0/L1 bit *and* clear/set their own EXT_IO bit; `GIO_SLOT_MAP`
-picks which variant a given `GioSlot` uses per profile.
+(`ioc.rs`) each drive their own EXT_IO bit (slot 1 has none) and the one shared L0/L1 bit;
+`GIO_SLOT_MAP` picks which variant a given `GioSlot` uses per profile. The IOC keeps every
+source's level, and a shared bit is the OR of the sources on it: the three slots' variants
+and the direct `FifoFull`/`Graphics`/`VerticalRetrace` sources. One slot letting go leaves
+the bit set while another still asserts; its EXT_IO bit tells IRIX which one.
 
 ### Why Newport retrace is delivered through GIO_INTERRUPT_1, not GIO_INTERRUPT_2
 

@@ -506,6 +506,14 @@ pub trait Device: Send + Sync {
     fn audio_report(&self) -> Option<String> {
         None
     }
+
+    /// Frames a sound card has moved between the guest and the host, inputs
+    /// and outputs together, since it was built; other devices have none.
+    /// It only goes up while sound plays or records, so a front-end compares
+    /// two samples for an activity light.
+    fn audio_frames(&self) -> Option<u64> {
+        None
+    }
 }
 
 // Compile-time asserts: BUS_* constants must equal the corresponding ExecStatus values.

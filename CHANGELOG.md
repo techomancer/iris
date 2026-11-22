@@ -13,6 +13,22 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Indy and Indigo2 keyboard
+
+- The Indy and Indigo2 keyboard controller now translates key codes when the
+  guest asks it to. NetBSD's installer and console get working cursor keys,
+  and a key no longer repeats forever after it is pressed
+  ([#765](https://github.com/techomancer/iris/issues/765)).
+### NetBSD on the R5000 Indy
+
+- NetBSD/sgimips boots on an Indy with `--cpu r5000`; its kernel
+  stopped with `panic: r5k picache line size 16` before reaching the installer.
+### InfiniteReality graphics
+
+- The InfiniteReality pipe's tile renderer no longer hangs when one of its
+  jobs is handed to a worker at the same moment that worker goes idle, which
+  happened in about 1 in 15 test runs on Apple Silicon (Onyx2, Origin 3200).
+
 ### Volume headers
 
 - `mkvh build` splits an ELF executable's segments larger than 512 KB, so the
@@ -67,6 +83,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   the Indy and Indigo2: the second board moved to GIO expansion slot 0 with
   its interrupts on that slot, and `iris` opens a window for each head. The
   Ultra64 board shares that slot and is turned off with two heads.
+- Indy and Indigo2: two devices on one shared graphics interrupt (Indigo2 GIO
+  slots, both heads) no longer lose an interrupt when one of them lets go.
 - The `iris` window shows frames at once and no longer waits for the host
   monitor's vertical sync, so the guest's retrace is not held to the host's
   rate. `vsync = true` restores the wait (useful on an X11 desktop with no
@@ -249,6 +267,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### O2
 
+- OpenBSD finds its SCSI disks and CD-ROM again: since 2026-10-31 its
+  accesses to the AIC-7880s went to memory, so every command timed out
+  ("board is not responding").
+- An R5000 O2 running OpenBSD no longer stops for good the first time it
+  idles (after `boot device: sd0`).
+- `iris-ci rollback` works on the O2, returning memory, devices and
+  copy-on-write disks to the last `restore`.
 - `prom` also takes the IRIX installer's `ip32prom.image`; a raw O2 PROM file
   that is not the whole 512 KiB flash is refused at start with the reason.
 - On a busy host the O2 no longer stops at the PROM's serial loader prompt
@@ -266,6 +291,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   supply, system board and processor module records, not the Octane's.
 - Onyx2: the BaseIO-G has the MediaIO daughtercard (a second IOC3: serial,
   keyboard, mouse, parallel port, RAD1 audio), and `hinv` lists it all.
+
+### Ultra64 dev board
+
+- macOS: the Indy now receives the N64 emulator's interrupts and RDB packets;
+  the bridge's shared memory grew, so rebuild gopher64 against this IRIS.
+- Indy: acknowledging one of the board's interrupts (GIO, RDB read, RDB
+  write) no longer drops another that is still pending (issue 263).
 
 ### Indy and Indigo2 chime on the first boot
 
@@ -524,6 +556,10 @@ image) where the guest test suites showed they differed:
   every CPU, interpreter and jitv2; the Octane PROM's `ide fpu` tests pass.
 - `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` set the Inexact
   cause and flag, and raise an enabled Inexact trap, when they drop a fraction.
+- FPU conversions follow the R4400, R5000 and R10000 rules (#71): an
+  unrepresentable result, a denormal or quiet-NaN source, and a long past the
+  part's range go to the kernel's FP emulator. `CVT.S.D` raises Inexact with
+  Overflow and flushes or traps an underflow by FCSR.FS. Interpreter and jitv2.
 
 ### Interpreter
 
@@ -594,6 +630,8 @@ image) where the guest test suites showed they differed:
 - Nightlies and releases publish only after `build.yml` boots IRIX on an Indy
   and an O2 on Linux, macOS and Windows and matches golden login screens.
 - `iris-ci screen-wait GOLDEN` waits for the screen to match a golden image.
+- `iris-ci boot-test` boots OpenBSD 6.9 on the O2 to its login with
+  `--steps tests/openbsd/boot-openbsd69-o2.toml` (a local disk; see TESTING.md).
 - A failed first phase keeps the PROM's output and the CPU's registers
   (`phase-a.log`, `phase-a-cpu.log`).
 - `iris-ci rtc-save` works on an O2, writing its PROM flash.
@@ -604,6 +642,8 @@ image) where the guest test suites showed they differed:
 
 - The `developer` profile uses thin LTO, so a rebuild after an edit takes one
   to three minutes instead of about nine; measure performance with `--release`.
+- Distribution packagers can build iris and iris-gui without network access,
+  CHD support included: `cargo vendor`, then `LIBCHDMAN_FORCE_SOURCE=1` (issue 213).
 
 ### iris-gui
 
