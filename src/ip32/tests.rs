@@ -1,4 +1,5 @@
 use super::*;
+use crate::hptimer::TimerManager;
 
 /// Send `b` the PROM's way: clock off, TX, then TxEN|CLKEN.
 fn ps2_send(k: &MacePs2, port: u32, b: u8) {
@@ -348,7 +349,7 @@ fn the_flash_is_readable_and_writable() {
 /// silently inert — every register reads zero and nothing is ever sent.
 #[test]
 fn the_uart_decodes_maces_register_spacing() {
-    let c = MaceUart::new();
+    let c = MaceUart::new(&Arc::new(TimerManager::new()));
     // Transmit register is offset 0, so byte lane +7 of the first slot.
     c.write8((MACE_COM0 + 7) as u64, b'A');
     assert_eq!(c.output(), "A");
@@ -365,7 +366,7 @@ fn the_uart_decodes_maces_register_spacing() {
 /// With DLAB set, writes to register 0 are the baud divisor, not characters.
 #[test]
 fn the_baud_divisor_is_not_mistaken_for_output() {
-    let c = MaceUart::new();
+    let c = MaceUart::new(&Arc::new(TimerManager::new()));
     c.write8((MACE_COM0 + 0x307) as u64, com_reg::LCR_DLAB);
     c.write8((MACE_COM0 + 7) as u64, 0x0c);
     assert_eq!(c.output(), "", "divisor writes are not characters");
@@ -379,7 +380,7 @@ fn the_baud_divisor_is_not_mistaken_for_output() {
 /// prompt — which looks exactly like a hang.
 #[test]
 fn a_typed_character_becomes_readable() {
-    let c = MaceUart::new();
+    let c = MaceUart::new(&Arc::new(TimerManager::new()));
     let lsr = (MACE_COM0 + 0x507) as u64;
     assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "nothing typed yet");
 
@@ -1049,6 +1050,7 @@ fn the_rtc_survives_a_relaunch_in_its_file() {
             rtc_offset: crate::config::RtcOffset { years, ..Default::default() },
             ..Default::default()
         },
+        &Arc::new(TimerManager::new()),
     );
     let reg = |n: u64| MACE_RTC as u64 + (n << 8) + 7;
     let year = |b: &Ip32Bus| { let y = b.mace.rtc.read8(reg(9)).data; i32::from((y >> 4) * 10 + (y & 0x0f)) };

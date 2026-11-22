@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::dev::ns16550::{com_reg, Ns16550};
 use crate::dev::serial_host::SerialBackend;
+use crate::hptimer::{Timer, TimerManager};
 use crate::ip32::*;
 use crate::irq::IrqLine;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, Saveable, BUS_OK};
@@ -24,20 +25,22 @@ pub struct MaceUart {
     name: &'static str,
     /// Its interrupt, while it is driven by PIO (MACE ISA, port 0's group).
     irq: OnceLock<IrqLine>,
-}
-
-impl Default for MaceUart {
-    fn default() -> Self { Self::new() }
+    /// The receive timeout, on the machine clock.
+    timer: Timer,
 }
 
 impl MaceUart {
-    pub fn new() -> Self {
-        Self::named("com")
+    pub fn new(tm: &Arc<TimerManager>) -> Arc<Self> {
+        Self::named("com", tm)
     }
 
     /// A UART answering monitor commands as `name`.
-    pub fn named(name: &'static str) -> Self {
-        Self { core: Mutex::new(Ns16550::new(BAUDBASE)), name, irq: OnceLock::new() }
+    pub fn named(name: &'static str, tm: &Arc<TimerManager>) -> Arc<Self> {
+        Arc::new_cyclic(|me| {
+            let mut core = Ns16550::new(BAUDBASE);
+            core.set_clock(tm.clock().clone());
+            Self { core: Mutex::new(core), name, irq: OnceLock::new(), timer: Timer::new(tm, me, |u: &Self, _| u.pump()) }
+        })
     }
 
     /// The 16550 itself, for the serial DMA engine in front of it.
@@ -115,10 +118,16 @@ impl MaceUart {
         let _ = self.irq.set(line);
     }
 
-    /// Drive the interrupt from the UART's state.
+    /// Drive the interrupt and the timeout timer from the UART's state.
     pub fn update_irq(&self) {
+        // Under the lock, so an older deadline cannot land after a newer one.
+        let level = {
+            let c = self.core();
+            self.timer.set_due(c.timeout_due());
+            c.irq()
+        };
         if let Some(l) = self.irq.get() {
-            l.set(self.interrupting());
+            l.set(level);
         }
     }
 
@@ -160,8 +169,8 @@ impl MaceUart {
 
 impl Device for MaceUart {
     fn step(&self, _cycles: u64) {}
-    fn stop(&self) {}
-    fn start(&self) {}
+    fn stop(&self) { self.timer.stop(); }
+    fn start(&self) { self.timer.start(); }
     fn is_running(&self) -> bool { true }
     fn get_clock(&self) -> u64 { 0 }
 
@@ -248,12 +257,13 @@ pub(crate) mod tests {
     use super::*;
     use crate::dev::ns16550::com_reg;
     use crate::irq::LevelProbe;
+    use std::time::Duration;
 
     /// Register `n` is at `+ (n << 8) + 7`, the byte answers on any lane, and
     /// the port's interrupt reaches the line it was given.
     #[test]
     fn the_isa_register_spacing_maps_onto_the_core_and_drives_the_line() {
-        let c = MaceUart::new();
+        let c = MaceUart::new(&Arc::new(TimerManager::new()));
         let (probe, line) = LevelProbe::line();
         c.connect_irq(line);
         let reg = |n: u32| MACE_COM0 as u64 + ((n as u64) << 8);
@@ -269,18 +279,62 @@ pub(crate) mod tests {
 
     #[test]
     fn a_saved_uart_loads_and_saves_the_same() {
-        let src = MaceUart::new();
+        let src = MaceUart::new(&Arc::new(TimerManager::new()));
         src.write8(MACE_COM0 as u64 + ((com_reg::IIR_FCR as u64) << 8) + 7, 0x81);
         src.write8(MACE_COM0 as u64 + ((com_reg::IER as u64) << 8) + 7, com_reg::IER_RX);
         src.feed(b"typed");
         let saved = src.save_state();
-        let dst = MaceUart::new();
+        let dst = MaceUart::new(&Arc::new(TimerManager::new()));
         dst.load_state(&saved).expect("load");
         assert_eq!(saved, dst.save_state());
         assert_eq!(dst.read8(MACE_COM0 as u64 + 7).data, b't', "unread input survives");
     }
 
-    struct Mace(MaceUart);
+    /// The 16550's receive timeout reaches the line from the UART's own timer
+    /// once the machine clock is four character times past the character; a
+    /// stop keeps the deadline and a restore sets it again.
+    #[test]
+    fn the_receive_timeout_runs_on_a_timer_on_the_machine_clock() {
+        use crate::clock::Clock;
+        let clock = Clock::stepped();
+        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+        let reg = |n: u32| MACE_COM0 as u64 + ((n as u64) << 8) + 7;
+        let armed = |u: &MaceUart| {
+            u.write8(reg(com_reg::IIR_FCR), 0x81);
+            u.write8(reg(com_reg::IER), com_reg::IER_RX);
+            u.feed(b"x");
+        };
+        let u = MaceUart::new(&tm);
+        let (probe, line) = LevelProbe::line();
+        u.connect_irq(line);
+        armed(&u);
+        u.start();
+        let due = u.core().timeout_due().expect("the character started the timeout");
+        assert_eq!(u.timer.due(), Some(due));
+        clock.step(due - 1);
+        assert!(!probe.level(), "not before the deadline");
+        clock.step(1);
+        assert!(crate::test_board::until(Duration::from_secs(60), || probe.level()), "the timer raised the cause");
+
+        let held = MaceUart::new(&tm);
+        let (probe, line) = LevelProbe::line();
+        held.connect_irq(line);
+        armed(&held);
+        held.start();
+        held.stop();
+        clock.step(held.timer.due().unwrap() - held.timer.now());
+        assert!(!probe.level() && held.timer.due().is_some(), "a stopped timer keeps its deadline and does not fire");
+        held.start();
+        assert!(crate::test_board::until(Duration::from_secs(60), || probe.level()), "start arms it again");
+
+        let (src, dst) = (MaceUart::new(&tm), MaceUart::new(&tm));
+        armed(&src);
+        dst.load_state(&src.save_state()).unwrap();
+        assert_eq!(dst.timer.due(), dst.core().timeout_due());
+        assert!(dst.timer.due().is_some(), "a restore sets the deadline again");
+    }
+
+    struct Mace(Arc<MaceUart>);
 
     impl crate::dev::serial_host::tests::Port for Mace {
         fn write(&mut self, b: u8) {
@@ -296,7 +350,7 @@ pub(crate) mod tests {
 
     /// The O2's console UART on `backend`, for the shared serial contract.
     pub(crate) fn contract_port(backend: Arc<dyn SerialBackend>) -> Box<dyn crate::dev::serial_host::tests::Port> {
-        let u = MaceUart::new();
+        let u = MaceUart::new(&Arc::new(TimerManager::new()));
         u.set_backend(backend);
         Box::new(Mace(u))
     }
