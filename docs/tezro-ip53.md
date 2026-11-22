@@ -119,7 +119,11 @@ matches a captured Tezro. One processor needs at least 512 MiB, two or four at l
 the L1 port and log. The console options are `l1` (the default) and `ioc4_a`
 to `ioc4_d`, the IOC4's ports 0 to 3. IOC4 ports 0 and 1 listen on
 `serial_port_a` and `serial_port_b`, ports 2 and 3 on `tezro.serial_port_c`
-and `tezro.serial_port_d`. `nvram` names the 32 KiB DS1744 store; its clock
+and `tezro.serial_port_d`. The setting only picks the host connection: the
+PROM writes to the L1 until `console ioc4` is run in its Command Monitor and
+the machine is reset, after which the menu appears on UART A (`ioc4_a`) only.
+The PROM keeps that choice in the flash, so set `flash` or it is lost on the
+next start. `nvram` names the 32 KiB DS1744 store; its clock
 reference is kept beside it with a `.clock` suffix.
 
 ## Firmware inputs

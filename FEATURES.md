@@ -324,7 +324,7 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `flash` | unset | Persistent 16 MiB boot-flash file. Unset, the flash is volatile. |
-| `console` | `l1` | `l1`, `ioc4_a`, `ioc4_b`, `ioc4_c` or `ioc4_d`. Selects the guest console connection. |
+| `console` | `l1` | `l1`, `ioc4_a`, `ioc4_b`, `ioc4_c` or `ioc4_d`. Selects the host connection only. The PROM uses the L1 until `console ioc4` is run in its Command Monitor and the machine is reset; it then uses UART A (`ioc4_a`) only, and keeps the choice in the `flash` file. |
 | `l1_port` | `8882` | Host TCP port for the L1 console. |
 | `l1_log` | unset | Optional serial log path for L1 output when an IOC4 port is selected as console. |
 | `serial_port_c`, `serial_port_d` | `8883`, `8884` | Host TCP ports of IOC4 ports 2 and 3; ports 0 and 1 use `serial_port_a` and `serial_port_b`. |
