@@ -811,7 +811,7 @@ impl crate::traits::Device for Heart {
 // MicroLAN. The counter runs on the host clock: it is saved as its value
 // and how far into its tick it was, and resumes from there at the load, as
 // the CPU's Count does, so the guest sees no jump. A MicroLAN slot in
-// progress keeps the time it had left. After a load HEART drives every
+// progress keeps its deadline in machine time, which a restore puts back first. After a load HEART drives every
 // processor's pins from the loaded registers, holds or releases the
 // processors its mode disables, and has memory placed from the loaded
 // descriptors.
@@ -819,7 +819,6 @@ impl Saveable for Heart {
     fn save_state(&self) -> toml::Value {
         let now = (self.clock)();
         let r = self.regs.lock();
-        let at = now;
         let elapsed = now.saturating_sub(r.epoch_ns);
         StateTable::new()
             .u64s("words", &[
@@ -833,7 +832,7 @@ impl Saveable for Heart {
             .u64("count", r.counter(now))
             .u64("phase", elapsed % COUNT_NS)
             .u32s("widget", &[r.widget_control, r.widget_request_timeout, r.widget_error_mask])
-            .u64("onewire_left", if r.onewire_busy { r.onewire_deadline_ns.saturating_sub(at) } else { 0 })
+            .u64("onewire_at", r.onewire_deadline_ns)
             .bool("onewire_level", r.onewire_level)
             .bool("onewire_busy", r.onewire_busy)
             .value("microlan", self.mlan.lock().save_state())
@@ -849,7 +848,6 @@ impl Saveable for Heart {
         self.mlan.lock().load_state(field(v, "microlan")?).map_err(|e| format!("MicroLAN: {e}"))?;
         let now = (self.clock)();
         let mut r = self.regs.lock();
-        let at = now;
         let old_mode = r.mode;
         let out = r.out;
         *r = Regs {
@@ -864,7 +862,7 @@ impl Saveable for Heart {
             // A clock still inside its first tick cannot carry the phase.
             epoch_ns: now.checked_sub(phase).unwrap_or(now),
             widget_control, widget_request_timeout, widget_error_mask,
-            onewire_deadline_ns: at.saturating_add(field_u64(v, "onewire_left")?),
+            onewire_deadline_ns: field_u64(v, "onewire_at")?,
             onewire_level: field_bool(v, "onewire_level")?,
             onewire_busy: field_bool(v, "onewire_busy")?,
             out,
@@ -1261,6 +1259,23 @@ mod tests {
         assert!(h.piu_write(0xbc, 4, reset));
         f.step_us(565);
         assert_eq!(h.piu_read(0xbc, 4).unwrap() & 3, 2, "presence pulls the wire low");
+    }
+
+    /// A slot in flight is saved as an absolute deadline: on a restored clock it completes when it would have.
+    #[test]
+    fn a_saved_microlan_slot_completes_at_its_deadline() {
+        let src = heart();
+        let read = (6 << 10) | (13 << 2);
+        assert!(src.heart.piu_write(0xbc, 4, read));
+        src.step_us(10);
+        let v = src.heart.save_state();
+        let dst = heart();
+        dst.clock.restore(src.clock.now());
+        dst.heart.load_state(&v).expect("load_state");
+        dst.step_us(8);
+        assert_eq!(dst.heart.piu_read(0xbc, 4).unwrap() & 3, 0, "still inside the slot");
+        dst.step_us(1);
+        assert_eq!(dst.heart.piu_read(0xbc, 4), Some(read | 3));
     }
 
     /// A reading taken on another socket can sit a few hundred ns behind the last one.

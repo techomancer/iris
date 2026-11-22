@@ -44,7 +44,7 @@ pub use mem::{check_banks, RamExtent, BANK_SPAN, SLOTS};
 
 pub use pi::Population;
 
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::widths::access_widths;
 use crate::hptimer::TimerManager;
 use crate::irq::{InterruptController, IrqLine};
@@ -169,8 +169,8 @@ impl Bedrock {
     pub fn new(config: BedrockConfig<'_>) -> Result<Arc<Self>, String> {
         let BedrockConfig { name, timers, processors, banks_mib, nodes, events, prom } = config;
         let memory = mem::Memory::new(banks_mib, nodes)?;
-        let clock = timers.clock().reader();
-        let now = clock();
+        let clock = timers.clock().clone();
+        let now = clock.now();
         let chip = Arc::new_cyclic(|weak: &Weak<Self>| {
             let md = Md::new(memory, clock.clone());
             // The Hub-special space's reader-relative forms end at 512 MiB.
@@ -518,8 +518,8 @@ impl Bedrock {
         let (data, effect) = match (base, value) {
             (regs::io::BASE, None) => (self.io.read(a), Effect::None),
             (regs::io::BASE, Some(v)) => (0, self.io.write(a, v)),
-            (regs::lb::BASE, None) => (self.lb.read(a, (self.clock)(), who.cpu(self.processors)), Effect::None),
-            (regs::lb::BASE, Some(v)) => (0, self.lb.write(a, v, (self.clock)(), who.cpu(self.processors), &self.levels)),
+            (regs::lb::BASE, None) => (self.lb.read(a, &self.clock, who.cpu(self.processors)), Effect::None),
+            (regs::lb::BASE, Some(v)) => (0, self.lb.write(a, v, &self.clock, who.cpu(self.processors), &self.levels)),
             (regs::ni::BASE, None) => self.ni.read(a, &self.levels, self.decode.connected()),
             (regs::ni::BASE, Some(v)) => (0, self.ni.write(a, v, &self.levels)),
             (_, None) => (self.xb.read(a), Effect::None),
@@ -556,7 +556,7 @@ impl Device for Bedrock {
 impl Resettable for Bedrock {
     /// Every unit's reset. Memory keeps its contents.
     fn power_on(&self) {
-        let now = (self.clock)();
+        let now = self.clock.now();
         for pi in &self.pi {
             pi.power_on(now, &self.levels);
         }

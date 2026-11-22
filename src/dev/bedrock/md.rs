@@ -16,7 +16,7 @@
 
 use super::mem::{bank_bytes, bank_of, layout_differs, Memory, RamExtent, BANK_SPAN};
 use super::{Bedrock, Effect};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::traits::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -152,7 +152,7 @@ impl Md {
     /// Report a self-test whose time has passed; it raises no interrupt, so the status and error reads are the
     /// only observers.
     fn selftest_settle(&self, s: &mut State) {
-        if s.selftest_deadline.is_some_and(|due| (self.clock)() >= due) {
+        if s.selftest_deadline.is_some_and(|due| self.clock.now() >= due) {
             s.selftest_deadline = None;
             let done = reg::SELF_TEST_STATUS::DONE::MASK;
             s.selftest_status = if s.selftest_result { done | reg::SELF_TEST_STATUS::PASSED::MASK } else { done };
@@ -326,7 +326,7 @@ impl Md {
         s.selftest_result = covered;
         s.selftest_status = 0;
         s.selftest_error = 0;
-        s.selftest_deadline = Some((self.clock)().saturating_add(1000));
+        s.selftest_deadline = Some(self.clock.now().saturating_add(1000));
         if covered && s.storage.get(&reg::SELF_TEST_DATA::OFFSET).copied().unwrap_or(0) == reg::SELF_TEST_DATA::WRITE_CONTROL::MASK {
             *effect = Effect::Zero(selected as usize, size);
             // The zero fill writes every doubleword's data and check bits.

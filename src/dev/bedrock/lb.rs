@@ -16,6 +16,7 @@
 use super::pi::Levels;
 use super::regs::IIO_PROTECT_OVRRD_KEY;
 use super::{Effect, NodeReset};
+use crate::clock::Clock;
 use crate::dev::w1;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -240,9 +241,8 @@ impl Lb {
         self.reset(&mut self.regs.lock());
     }
     /// A doubleword read at `a` by processor `requester`, or by none.
-    pub(super) fn read(&self, a: u64, now: u64, requester: Option<usize>) -> u64 {
+    pub(super) fn read(&self, a: u64, clock: &Clock, requester: Option<usize>) -> u64 {
         let mut r = self.regs.lock();
-        Self::complete(&mut r, now);
         match a {
             reg::REV_ID::OFFSET => {
                 ID | ((r.node as u64) << reg::REV_ID::NODE_ID::SHIFT) | ((r.region as u64) << reg::REV_ID::REGION_SIZE::SHIFT)
@@ -257,7 +257,11 @@ impl Lb {
                 v
             }
             reg::VECTOR_STATUS_CLEAR::OFFSET => r.words.remove(&reg::VECTOR_STATUS::OFFSET).unwrap_or(0),
-            reg::VECTOR_STATUS::OFFSET | reg::MICROLAN_CTL::OFFSET => r.words.get(&a).copied().unwrap_or(0),
+            reg::MICROLAN_CTL::OFFSET => {
+                Self::complete(&mut r, clock.now());
+                r.words.get(&a).copied().unwrap_or(0)
+            }
+            reg::VECTOR_STATUS::OFFSET => r.words.get(&a).copied().unwrap_or(0),
             _ if Self::mask(a).is_some() => r.words.get(&a).copied().unwrap_or(0),
             _ => {
                 crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock LB unsupported read {a:#x}");
@@ -267,9 +271,8 @@ impl Lb {
     }
     /// A doubleword store by processor `requester`, or none. A region store returns the new node
     /// number; a soft reset asks for the node's.
-    pub(super) fn write(&self, a: u64, v: u64, now: u64, requester: Option<usize>, levels: &Levels) -> Effect {
+    pub(super) fn write(&self, a: u64, v: u64, clock: &Clock, requester: Option<usize>, levels: &Levels) -> Effect {
         let mut r = self.regs.lock();
-        Self::complete(&mut r, now);
         let mut launch = None;
         let mut renumbered = false;
         match a {
@@ -318,6 +321,8 @@ impl Lb {
                 }
             }
             reg::MICROLAN_CTL::OFFSET => {
+                let now = clock.now();
+                Self::complete(&mut r, now);
                 if r.deadline.is_some() {
                     crate::dlog!(crate::devlog::LogModule::Bedrock, "Bedrock LB MicroLAN write while slot pending discarded");
                 } else {

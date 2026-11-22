@@ -293,16 +293,11 @@ pub(crate) fn machine(
         let several = spec.processors.count() > 1;
         let cpus: Vec<_> = (0..spec.processors.count())
             .map(|n| {
-                // A node's first processor brings its boot flash, and the first node's the
-                // board's devices, up to date; every processor of a node of several joins the
-                // PROM's holds.
-                let flash = (n == 0).then(|| (node.flash.clone(), clock.clone()));
+                // The first node's first processor brings the board's devices up to date; every
+                // processor of a node of several joins the PROM's holds.
                 let board = (index == 0 && n == 0).then(|| io.poll.clone()).flatten();
                 let held = io.at_batch.clone().filter(|_| several);
                 let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    if let Some((flash, clock)) = &flash {
-                        flash.advance_to(clock());
-                    }
                     if let Some(board) = &board {
                         board();
                     }

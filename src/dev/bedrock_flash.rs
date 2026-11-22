@@ -15,7 +15,7 @@
 use super::sflash::amd::{AmdCore, Effect, SECTOR_SIZE};
 use super::sflash::storage::FlashBacking;
 use crate::cpu::parts;
-use crate::dev::heart::Clock;
+use crate::hptimer::{Timer, TimerManager};
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK,
 };
@@ -24,7 +24,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
+    Arc,
 };
 
 pub const PART_SIZE: usize = 8 << 20;
@@ -259,36 +259,30 @@ impl State {
 
 pub struct Flash {
     /// A reader lock: every processor fetches PROM code at once. Status and query reads toggle part
-    /// state and take the writer lock, as do commands, resets and the erase clock.
+    /// state and take the writer lock, as do commands, resets and erase completion.
     st: RwLock<State>,
     gen: AtomicU64,
     /// JIT v2: the flash's identity in a page key.
     #[cfg(feature = "jitv2")]
     code_bank: crate::traits::CodeBank,
-    /// The host time the model clock last stood at: [`Self::advance_to`]
-    /// advances it from there.
-    clock: AtomicU64,
-    /// The machine's clock, which stop and start read: a clock of their own would start at zero.
-    machine_clock: OnceLock<Clock>,
+    /// One per part: the erase completing, so it reaches the backing file with the CPU idle.
+    timers: [Timer; 2],
 }
 
 impl Flash {
-    /// Read the machine's clock on stop and start.
-    pub fn use_clock(&self, clock: Clock) {
-        let _ = self.machine_clock.set(clock);
-    }
-    fn now(&self) -> u64 {
-        self.machine_clock.get().map_or_else(|| crate::clock::Clock::new().now(), |c| c())
-    }
     /// Format a fresh two-position store from a decoded payload, with the
     /// board's firmware record.
-    pub fn new(payload: &[u8], record: FirmwareRecord) -> io::Result<Self> {
-        Self::seeded(payload, record, &[])
+    pub fn new(payload: &[u8], record: FirmwareRecord, tm: &Arc<TimerManager>) -> io::Result<Arc<Self>> {
+        Self::seeded(payload, record, &[], tm)
     }
 
     /// [`Self::new`], with environment `records` written into the volume
     /// after its label, each at its own offset into the store.
-    pub fn seeded(payload: &[u8], record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
+    pub fn seeded(payload: &[u8], record: FirmwareRecord, records: &[(usize, Vec<u8>)], tm: &Arc<TimerManager>) -> io::Result<Arc<Self>> {
+        Ok(Self::with_state(State::new(Self::image(payload, record, records)?), tm))
+    }
+
+    fn image(payload: &[u8], record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Vec<u8>> {
         if payload.len() > PART_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -305,29 +299,32 @@ impl Flash {
         for (offset, bytes) in records {
             data[*offset..offset + bytes.len()].copy_from_slice(bytes);
         }
-        Ok(Self {
-            st: RwLock::new(State::new(data)),
+        Ok(data)
+    }
+
+    fn with_state(st: State, tm: &Arc<TimerManager>) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            st: RwLock::new(st),
             gen: AtomicU64::new(0),
             #[cfg(feature = "jitv2")]
             code_bank: crate::traits::CodeBank::new(),
-            clock: AtomicU64::new(0),
-            machine_clock: OnceLock::new(),
+            timers: std::array::from_fn(|_| Timer::new(tm, me, Self::erase_timer)),
         })
     }
 
     /// Load an exact 16 MiB store, or seed a missing or empty one; wrong sizes are refused without
     /// writes. Reopening reapplies a refreshed record and keeps an authored one. Completed
     /// programming and erasure write through.
-    pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
-        Self::with_file_seeded(payload, path, record, &[])
+    pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord, tm: &Arc<TimerManager>) -> io::Result<Arc<Self>> {
+        Self::with_file_seeded(payload, path, record, &[], tm)
     }
 
     /// [`Self::with_file`], seeding a missing or empty store with `records`
     /// as [`Self::seeded`] does. A store that exists keeps what it holds,
     /// except seeded records of positions `records` no longer names, which
     /// are ended ([`end_stale_seeded_records`]).
-    pub fn with_file_seeded(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
-        let mut data = Self::seeded(payload, record, records)?.st.into_inner().data;
+    pub fn with_file_seeded(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord, records: &[(usize, Vec<u8>)], tm: &Arc<TimerManager>) -> io::Result<Arc<Self>> {
+        let mut data = Self::image(payload, record, records)?;
         let mut backing = FlashBacking::open(path.as_ref(), &mut data).map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 io::Error::new(
@@ -348,7 +345,7 @@ impl Flash {
         backing.write_range(0, &data)?;
         let mut st = State::new(data);
         st.backing = Some(backing);
-        Ok(Self { st: RwLock::new(st), gen: AtomicU64::new(0), #[cfg(feature = "jitv2")] code_bank: crate::traits::CodeBank::new(), clock: AtomicU64::new(0), machine_clock: OnceLock::new() })
+        Ok(Self::with_state(st, tm))
     }
 
     pub fn contents(&self) -> Vec<u8> {
@@ -363,31 +360,13 @@ impl Flash {
             part.reset();
         }
         self.gen.fetch_add(1, Ordering::Release);
+        self.rearm(&st);
     }
-    /// The machine's clock reads `now` nanoseconds and the flash is to take
-    /// up from there: time while the machine is stopped does not count.
-    pub fn hold_clock(&self, now: u64) {
-        self.clock.store(now, Ordering::Release);
-    }
-    /// Advance the model clock to host time `now`, from where it last stood.
-    pub fn advance_to(&self, now: u64) {
-        let previous = self.clock.swap(now, Ordering::AcqRel);
-        self.advance_ns(now.saturating_sub(previous));
-    }
-    /// Advance the model clock independently of flash reads, from the boards' poll; with no erase
-    /// in flight it only looks, under the reader lock.
-    pub fn advance_ns(&self, ns: u64) {
-        if !self.st.read().parts.iter().any(AmdCore::busy) {
-            return;
-        }
-        let mut st = self.st.write();
+    /// Commit every erase whose time has come to the array and the backing file.
+    fn settle(&self, st: &mut State) {
+        let now = self.timers[0].now();
         for part in 0..2 {
-            let selecting = st.parts[part].selecting();
-            let complete = st.parts[part].advance_ns(ns);
-            if selecting && !st.parts[part].selecting() {
-                self.gen.fetch_add(1, Ordering::Release);
-            }
-            if !complete {
+            if st.parts[part].erase_due().is_none_or(|due| now < due) {
                 continue;
             }
             let sectors: Vec<_> = st.parts[part].selected_sectors().collect();
@@ -401,6 +380,17 @@ impl Flash {
             st.parts[part].finish_erase(success);
             self.gen.fetch_add(1, Ordering::Release);
         }
+    }
+    /// Arm each part's timer for its erase, under the `st` lock the deadlines were read with.
+    fn rearm(&self, st: &State) {
+        for (timer, core) in self.timers.iter().zip(&st.parts) {
+            timer.set_due(core.erase_due());
+        }
+    }
+    fn erase_timer(&self, _due: u64) {
+        let mut st = self.st.write();
+        self.settle(&mut st);
+        self.rearm(&st);
     }
     pub fn register_locks(self: &Arc<Self>) {
         let me = self.clone();
@@ -435,19 +425,18 @@ impl Resettable for Flash {
 
 impl Device for Flash {
     fn step(&self, _: u64) {}
-    /// The machine starts: time while it was stopped does not count.
+    /// The machine's clock holds while it is stopped, so the erase timers go and come back with it.
     fn start(&self) {
-        self.hold_clock(self.now());
+        self.timers.iter().for_each(Timer::start);
     }
-    /// The machine stops: the model clock catches up to host time.
     fn stop(&self) {
-        self.advance_to(self.now());
+        self.timers.iter().for_each(Timer::stop);
     }
     fn is_running(&self) -> bool {
         false
     }
     fn get_clock(&self) -> u64 {
-        self.clock.load(Ordering::Acquire)
+        self.timers[0].now()
     }
 }
 
@@ -487,11 +476,12 @@ impl FlashView {
                 // writer lock, and the mode is checked again under it.
                 drop(st);
                 let mut w = self.flash.st.write();
+                self.flash.settle(&mut w);
                 if !w.parts[part].array_reads() {
                     if width != 2 || off & 1 != 0 {
                         return None;
                     }
-                    if let Some(value) = w.parts[part].read16(off % PART_SIZE) {
+                    if let Some(value) = w.parts[part].read16_at(off % PART_SIZE, self.flash.timers[0].now()) {
                         return Some(value as u64);
                     }
                 }
@@ -556,10 +546,12 @@ impl BusDevice for FlashView {
         }
         let offset = (within / 4) as usize;
         let mut st = self.flash.st.write();
-        let effect = match st.parts[part].write16(offset, v as u16) {
+        self.flash.settle(&mut st);
+        let effect = match st.parts[part].write16_at(offset, v as u16, self.flash.timers[0].now()) {
             Ok(effect) => effect,
             Err(()) => {
                 self.flash.gen.fetch_add(1, Ordering::Release);
+                self.flash.rearm(&st);
                 return BUS_ERR;
             }
         };
@@ -576,6 +568,7 @@ impl BusDevice for FlashView {
             }
         }
         self.flash.gen.fetch_add(1, Ordering::Release);
+        self.flash.rearm(&st);
         BUS_OK
     }
     #[cfg(feature = "jitv2")]
@@ -605,6 +598,13 @@ mod tests {
             crate::traits::BUS_OK
         );
     }
+    fn tm() -> Arc<TimerManager> {
+        Arc::new(TimerManager::new())
+    }
+    /// Time the flash by a clock the test steps.
+    fn on(clock: &crate::clock::Clock) -> Arc<TimerManager> {
+        Arc::new(TimerManager::with_clock(clock.clone()))
+    }
     fn erase_select(v: &FlashView, part: u64, offset: u64) {
         unlock(v, part);
         assert_eq!(v.write64(part + 8 * 0x555, 0x80), BUS_OK);
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn a_board_names_its_empty_positions() {
         let records = disabled_positions_environment("BD");
-        let bytes = Flash::seeded(&[], FirmwareRecord::TEZRO, &records).unwrap().contents();
+        let bytes = Flash::seeded(&[], FirmwareRecord::TEZRO, &records, &tm()).unwrap().contents();
         let mut expected = vec![0x10];
         expected.extend_from_slice(b"DisableB\0\0\0\0\0\0\032: CPU failed early init.");
         expected.extend_from_slice(&[0; 22]);
@@ -628,7 +628,7 @@ mod tests {
 
         let records = disabled_positions_environment("BCD");
         assert_eq!(records.len(), 3);
-        let bytes = Flash::seeded(&[], FirmwareRecord::FUEL, &records).unwrap().contents();
+        let bytes = Flash::seeded(&[], FirmwareRecord::FUEL, &records, &tm()).unwrap().contents();
         for (slot, position) in ['B', 'C', 'D'].into_iter().enumerate() {
             let at = PART_SIZE + 0x1e0100 + slot * 0x40;
             assert_eq!(bytes[at], 0x10);
@@ -638,7 +638,7 @@ mod tests {
         assert!(bytes[PART_SIZE + 0x1e0100 + 3 * 0x40..PART_SIZE + 0x1e0100 + 4 * 0x40].iter().all(|b| *b == 0xff));
 
         for record in [FirmwareRecord::FUEL, FirmwareRecord::TEZRO] {
-            assert_eq!(Flash::new(&[], record).unwrap().contents()[0x9e0100], 0xff, "new seeds nothing");
+            assert_eq!(Flash::new(&[], record, &tm()).unwrap().contents()[0x9e0100], 0xff, "new seeds nothing");
         }
     }
 
@@ -648,13 +648,13 @@ mod tests {
         let dir = crate::test_temp::TempPath::dir("flash-seed");
         let path = dir.join("flash.bin");
         let records = disabled_positions_environment("BD");
-        let fresh = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &records).unwrap();
+        let fresh = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &records, &tm()).unwrap();
         assert_eq!(fresh.contents()[0x9e0100 + 8], b'B', "a missing store is seeded");
         drop(fresh);
         let mut held = std::fs::read(&path).unwrap();
         held[0x9e0100 + 8] = b'X';
         std::fs::write(&path, &held).unwrap();
-        let again = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &records).unwrap();
+        let again = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &records, &tm()).unwrap();
         assert_eq!(again.contents()[0x9e0100 + 8], b'X', "an existing store keeps what it holds");
         drop(again);
     }
@@ -666,19 +666,19 @@ mod tests {
         let dir = crate::test_temp::TempPath::dir("flash-repopulate");
         let path = dir.join("flash.bin");
         let at = |slot: usize| 0x9e0100 + slot * 0x40;
-        drop(Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BCD")).unwrap());
+        drop(Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BCD"), &tm()).unwrap());
         // Two processors: A and C run, B and D stay empty.
-        let two = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BD")).unwrap().contents();
+        let two = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BD"), &tm()).unwrap().contents();
         assert_eq!([two[at(0)], two[at(1)], two[at(2)]], [0x10, 0, 0x10]);
         assert_eq!(&two[at(1) + 1..at(1) + 9], b"DisableC", "an ended record keeps its text");
         // Four: every record is ended, and a record the PROM wrote in its own words is not.
         let mut held = std::fs::read(&path).unwrap();
         held[at(2) + 16] = b'9';
         std::fs::write(&path, &held).unwrap();
-        let four = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &[]).unwrap().contents();
+        let four = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &[], &tm()).unwrap().contents();
         assert_eq!([four[at(0)], four[at(1)], four[at(2)]], [0, 0, 0x10]);
         // Back to one: nothing is rewritten; the PROM finds the empty positions itself.
-        let one = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BCD")).unwrap().contents();
+        let one = Flash::with_file_seeded(&[], &path, FirmwareRecord::TEZRO, &disabled_positions_environment("BCD"), &tm()).unwrap().contents();
         assert_eq!(one, four);
     }
 
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn the_seed_exposes_fuel_configuration_and_volume_label() {
         let seed = vec![0x21; 0xb0];
-        let f = Flash::new(&seed, FirmwareRecord::FUEL).unwrap();
+        let f = Flash::new(&seed, FirmwareRecord::FUEL, &tm()).unwrap();
         let bytes = f.contents();
         assert_eq!(sum(&bytes[0x60..0xb0]), sum(&seed[0x60..0xb0]));
         assert_eq!(&bytes[0x64..0x68], &0x549aa985u32.to_be_bytes());
@@ -699,7 +699,7 @@ mod tests {
             &[0x50, 0x4c, 0x4f, 0x49, 0, 0, 0, 1, 0, 0, 0, 1]
         );
         assert!(bytes[label + 28..].iter().all(|b| *b == 0xff));
-        assert!(Flash::new(&vec![0; PART_SIZE + 1], FirmwareRecord::FUEL).is_err());
+        assert!(Flash::new(&vec![0; PART_SIZE + 1], FirmwareRecord::FUEL, &tm()).is_err());
     }
     /// The stock image's factory block: the 400 MHz mode word, machine type 0
     /// and a zero check adjustment, before any board configures it.
@@ -716,7 +716,7 @@ mod tests {
     fn a_refreshed_record_configures_the_block_and_keeps_its_byte_sum() {
         let record = FirmwareRecord::FUEL;
         let image = factory_block();
-        let bytes = Flash::new(&image, record).unwrap().contents();
+        let bytes = Flash::new(&image, record, &tm()).unwrap().contents();
         let block = &bytes[0x60..0xb0];
         assert_eq!(&block[4..8], &record.cpu_mode_word.to_be_bytes());
         assert_eq!(&block[0x14..0x18], &record.cpu_clock_hz.to_be_bytes());
@@ -767,7 +767,7 @@ mod tests {
     fn the_tezro_seed_writes_the_blocks_the_proms_editor_would() {
         let image = stock_image();
         for ((name, record), compensation) in TEZRO_RECORDS.iter().zip([0xdau8, 0xff, 0x1e, 0xfa]) {
-            let bytes = Flash::new(&image, *record).unwrap().contents();
+            let bytes = Flash::new(&image, *record, &tm()).unwrap().contents();
             let block = &bytes[0x60..0xb0];
             assert_eq!(&block[0..4], &21u32.to_be_bytes(), "{name}");
             assert_eq!(&block[4..8], &record.cpu_mode_word.to_be_bytes(), "{name}");
@@ -797,18 +797,18 @@ mod tests {
             zero[0x1ff] = 0u8.wrapping_sub(sum(&zero[..0x1ff]));
             assert_eq!(sum(zero), 0);
             for (name, record) in records.clone() {
-                assert_eq!(sum(&Flash::new(zero, record).unwrap().contents()[..0x200]), 0, "{name}: the seeded image sums to zero");
+                assert_eq!(sum(&Flash::new(zero, record, &tm()).unwrap().contents()[..0x200]), 0, "{name}: the seeded image sums to zero");
             }
         }
         for payload in [stock_image(), vec![0x5a; 0x200], factory_block()] {
             let before = sum(&payload[..0x200.min(payload.len())]);
             for (name, record) in records.clone() {
-                let bytes = Flash::new(&payload, record).unwrap().contents();
+                let bytes = Flash::new(&payload, record, &tm()).unwrap().contents();
                 let end = 0x200.min(payload.len());
                 assert_eq!(sum(&bytes[..end]), before, "{name}: the image's byte sum");
                 // A record that differs in one field is compensated to the same sum.
                 let other = FirmwareRecord { cpu_mode_word: record.cpu_mode_word ^ 0x0100_0000, ..record };
-                assert_eq!(sum(&Flash::new(&payload, other).unwrap().contents()[..end]), before, "{name}: another mode word");
+                assert_eq!(sum(&Flash::new(&payload, other, &tm()).unwrap().contents()[..end]), before, "{name}: another mode word");
                 for at in 0x60..0xb0 {
                     let mut broken = bytes[..end].to_vec();
                     broken[at] ^= 1;
@@ -859,25 +859,25 @@ mod tests {
     fn reopening_keeps_a_tezros_stored_block_and_refreshes_a_fuels() {
         let dir = crate::test_temp::TempPath::dir("flash-record");
         let fuel_path = dir.join("fuel.bin");
-        drop(Flash::with_file(&factory_block(), &fuel_path, FirmwareRecord::TEZRO).unwrap());
-        let fuel = Flash::with_file(&[], &fuel_path, FirmwareRecord::FUEL).unwrap().contents();
+        drop(Flash::with_file(&factory_block(), &fuel_path, FirmwareRecord::TEZRO, &tm()).unwrap());
+        let fuel = Flash::with_file(&[], &fuel_path, FirmwareRecord::FUEL, &tm()).unwrap().contents();
         assert_eq!(&fuel[0x64..0x68], &0x549aa985u32.to_be_bytes());
         assert_eq!(&fuel[0x90..0x94], &2u32.to_be_bytes(), "machine type: SN11");
         assert_eq!(std::fs::read(&fuel_path).unwrap(), fuel, "the store holds what the machine sees");
         let tezro_path = dir.join("tezro.bin");
-        let seeded = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
+        let seeded = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO, &tm()).unwrap().contents();
         assert_eq!(std::fs::read(&tezro_path).unwrap(), seeded, "the seed is what the store holds");
         let mut stored = seeded.clone();
         stored[0x64..0x68].copy_from_slice(&0x1234_5678u32.to_be_bytes());
         std::fs::write(&tezro_path, &stored).unwrap();
-        let reopened = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
+        let reopened = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO, &tm()).unwrap().contents();
         assert_eq!(reopened, stored);
     }
     /// The PROM programs through one view while executable aliases keep reading array bytes.
     #[test]
     fn programming_changes_shared_bytes_without_exposing_status_to_instruction_fetches() {
         {
-            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+            let f = Flash::new(&[], FirmwareRecord::FUEL, &tm()).unwrap();
             let local = f.boot_view();
             let remote = f.boot_view();
             let execute = f.array_view(0, PART_SIZE).unwrap();
@@ -904,7 +904,7 @@ mod tests {
             assert!(!local.read8(PART_SIZE as u64).is_ok());
         }
         {
-            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+            let f = Flash::new(&[], FirmwareRecord::FUEL, &tm()).unwrap();
             let v = f.boot_view();
             program(&v, 0, 0x200, 0x1234);
             program(&v, 0, 0x200, 0xf0ff);
@@ -931,7 +931,7 @@ mod tests {
             assert_eq!(execute.read16(0x202).data, 0x5555);
         }
         {
-            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+            let f = Flash::new(&[], FirmwareRecord::FUEL, &tm()).unwrap();
             let v = f.boot_view();
             assert_eq!(v.write64(0x550, 0x98), BUS_ERR);
             assert_eq!(v.read16(0x20).data, 0xffff);
@@ -954,7 +954,8 @@ mod tests {
     /// toggles once.
     #[test]
     fn status_reads_toggle_once_each_while_other_threads_read_the_array() {
-        let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+        let clock = crate::clock::Clock::stepped();
+        let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
         let v = f.boot_view();
         program(&v, 0, 0x200, 0x1234);
         program(&v, SECOND_POSITION, 0x200, 0x5678);
@@ -983,29 +984,32 @@ mod tests {
                 assert_eq!((last ^ now) & 0x44, 0x44, "each status read toggles once");
                 last = now;
             }
-            // The erase clock runs under the writer lock with readers about.
-            f.advance_ns(50_000 + 512_000_000);
+            // The erase commits under the writer lock with readers about.
+            clock.step(50_000 + 512_000_000);
             done.store(true, Ordering::Release);
         });
         assert_eq!(v.read16(0x200).data, 0xffff, "the erase completed");
         assert_eq!(execute.read16(0x200).data, 0xffff);
     }
-    /// With nothing in flight the board poll's clock advance does not take the writer lock.
+    /// The erase timer's callback commits an erase to the array and the backing file with nothing touching the flash.
     #[test]
-    fn an_idle_flash_advances_its_clock_under_the_reader_lock() {
-        let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
-        let reader = f.st.read();
-        f.advance_ns(1_000_000);
-        drop(reader);
+    fn an_erase_completes_with_the_cpu_idle() {
+        let clock = crate::clock::Clock::stepped();
+        let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
         let v = f.boot_view();
+        program(&v, 0, 0x200, 0);
         erase_select(&v, 0, 0x200);
-        f.advance_ns(50_000 + 512_000_000);
-        assert_eq!(v.read16(0x200).data & 0x80, 0x80, "an erase still completes");
+        f.erase_timer(0);
+        assert_eq!(f.contents()[0x200], 0, "not before its time");
+        clock.step(50_000 + 512_000_000);
+        f.erase_timer(0);
+        assert_eq!(f.contents()[0x200], 0xff);
     }
     /// The PROM polls erase completion and can reset the chip before selected sectors change.
     #[test]
     fn erase_completes_only_for_selected_sectors_and_reset_cancels_it() {
-        let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+        let clock = crate::clock::Clock::stepped();
+        let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
         let v = f.boot_view();
         program(&v, 0, 0x200, 0);
         program(&v, 0, 0x10000, 0);
@@ -1017,28 +1021,28 @@ mod tests {
         let a = v.read16(0x10000).data;
         let b = v.read16(0x10000).data;
         assert_eq!((a ^ b) & 0x44, 0x40);
-        f.advance_ns(40_000);
+        clock.step(40_000);
         assert_eq!(v.write64(4 * 0x10000, 0x30), BUS_OK);
-        f.advance_ns(40_000);
+        clock.step(40_000);
         assert_eq!(v.read16(0x10000).data & 8, 0);
         assert_eq!(v.write64(SECOND_POSITION + 8 * 0x55, 0x98), BUS_OK);
         assert_eq!(v.read16(SECOND_POSITION + 0x20).data, b'Q' as u16);
-        f.advance_ns(10_000);
+        clock.step(10_000);
         assert_eq!(v.read16(0x200).data & 8, 8);
         assert_eq!(v.write64(0, 0xf0), BUS_OK);
         assert_eq!(v.read16(0x200).data & 0x80, 0);
         f.reset();
-        f.advance_ns(u64::MAX);
+        clock.step(1 << 40);
         assert_eq!(v.read16(0x200).data, 0);
         assert_eq!(v.read16(0x10000).data, 0);
         assert_eq!(v.read16(SECOND_POSITION + 0x20).data, 0xffff);
         erase_select(&v, 0, 0x200);
         assert_eq!(v.write64(0, 0xf0), BUS_OK);
-        f.advance_ns(u64::MAX);
+        clock.step(1 << 40);
         assert_eq!(v.read16(0x200).data, 0);
         erase_select(&v, 0, 0x200);
         assert_eq!(v.write64(4 * 0x10000, 0x30), BUS_OK);
-        f.advance_ns(50_000 + 512_000_000);
+        clock.step(50_000 + 512_000_000);
         assert_eq!(v.read16(0x200).data, 0xffff);
         assert_eq!(v.read16(0x10000).data, 0xffff);
         unlock(&v, 0);
@@ -1049,7 +1053,7 @@ mod tests {
         program(&v, 0, 0x200, 0);
         program(&v, 0, 0x10000, 0x3456);
         erase_select(&v, 0, 0x200);
-        f.advance_ns(50_000 + 512_000_000);
+        clock.step(50_000 + 512_000_000);
         assert_eq!(v.read16(0x200).data, 0xffff);
         assert_eq!(v.read16(0x10000).data, 0x3456);
     }
@@ -1061,16 +1065,16 @@ mod tests {
             let mut bytes = vec![0x5a; FLASH_SIZE];
             bytes[PART_SIZE] = 0xc7;
             std::fs::write(&path, &bytes).unwrap();
-            let f = Flash::with_file(&[0x11], &path, FirmwareRecord::FUEL).unwrap();
+            let f = Flash::with_file(&[0x11], &path, FirmwareRecord::FUEL, &tm()).unwrap();
             assert_eq!(f.contents()[0], 0x5a);
             assert_eq!(f.contents()[PART_SIZE], 0xc7);
             assert_eq!(std::fs::read(&path).unwrap(), f.contents());
             drop(f);
             std::fs::write(&path, [1, 2, 3]).unwrap();
-            assert!(Flash::with_file(&[], &path, FirmwareRecord::FUEL).is_err());
+            assert!(Flash::with_file(&[], &path, FirmwareRecord::FUEL, &tm()).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3]);
             std::fs::write(&path, []).unwrap();
-            let g = Flash::with_file(&[0x34], &path, FirmwareRecord::FUEL).unwrap();
+            let g = Flash::with_file(&[0x34], &path, FirmwareRecord::FUEL, &tm()).unwrap();
             assert_eq!(g.contents()[0], 0x34);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), FLASH_SIZE as u64);
             drop(g);
@@ -1078,13 +1082,14 @@ mod tests {
         {
             let path = crate::test_temp::TempPath::new("amd-persist");
             std::fs::write(&path, []).unwrap();
-            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
+            let f = Flash::with_file(&[], &path, FirmwareRecord::FUEL, &tm()).unwrap();
             let v = f.boot_view();
             program(&v, 0, 0x200, 0x1234);
             program(&v, SECOND_POSITION, (PART_SIZE - 2) as u64, 0x5678);
             drop(v);
             drop(f);
-            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
+            let clock = crate::clock::Clock::stepped();
+            let f = Flash::with_file(&[], &path, FirmwareRecord::FUEL, &on(&clock)).unwrap();
             let v = f.boot_view();
             assert_eq!(v.read16(0x200).data, 0x1234);
             assert_eq!(
@@ -1098,10 +1103,11 @@ mod tests {
                 v.write64(SECOND_POSITION + 4 * (PART_SIZE as u64 - 2), 0x30),
                 BUS_OK
             );
-            f.advance_ns(50_000 + 512_000_000);
+            clock.step(50_000 + 512_000_000);
+            let _ = v.read16(SECOND_POSITION);
             drop(v);
             drop(f);
-            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
+            let f = Flash::with_file(&[], &path, FirmwareRecord::FUEL, &tm()).unwrap();
             let v = f.boot_view();
             assert_eq!(v.read16(0x200).data, 0x1234);
             assert_eq!(
@@ -1115,7 +1121,7 @@ mod tests {
     #[test]
     fn failed_backing_writes_leave_array_bytes_unchanged() {
         {
-            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+            let f = Flash::new(&[], FirmwareRecord::FUEL, &tm()).unwrap();
             // A read-only descriptor makes writes fail without a special backend.
             let path = crate::test_temp::TempPath::new("amd-read-only");
             std::fs::write(&path, []).unwrap();
@@ -1130,7 +1136,8 @@ mod tests {
             assert_eq!(v.read16(0x200).data, 0xffff);
         }
         {
-            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
+            let clock = crate::clock::Clock::stepped();
+            let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
             let v = f.boot_view();
             program(&v, 0, 0x200, 0);
             let path =
@@ -1141,7 +1148,7 @@ mod tests {
                 FLASH_SIZE,
             ));
             erase_select(&v, 0, 0x200);
-            f.advance_ns(50_000 + 512_000_000);
+            clock.step(50_000 + 512_000_000);
             assert_eq!(v.read16(0x200).data & 0x20, 0x20);
             assert_eq!(f.contents()[0x200], 0);
             assert_eq!(v.write64(0, 0xf0), BUS_OK);

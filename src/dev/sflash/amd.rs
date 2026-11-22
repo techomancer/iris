@@ -116,9 +116,9 @@ pub struct AmdCore {
     geometry: Geometry,
     mode: Mode,
     selected: [bool; SECTORS],
-    /// Remaining time includes the sector-selection interval.
-    remaining_ns: u64,
-    setup_ns: u64,
+    /// Machine nanoseconds at which the sector-selection window closes and at which the erase completes.
+    setup_end_at: u64,
+    erase_done_at: Option<u64>,
     toggle: bool,
     failed: bool,
 }
@@ -136,8 +136,8 @@ impl AmdCore {
             geometry,
             mode: Mode::Array,
             selected: [false; SECTORS],
-            remaining_ns: 0,
-            setup_ns: 0,
+            setup_end_at: 0,
+            erase_done_at: None,
             toggle: false,
             failed: false,
         }
@@ -147,16 +147,25 @@ impl AmdCore {
         *self = Self::new(self.geometry);
     }
     pub fn busy(&self) -> bool {
-        self.remaining_ns != 0 || self.failed
+        self.erase_done_at.is_some() || self.failed
     }
-    pub fn selecting(&self) -> bool {
-        self.setup_ns != 0
+    pub fn selecting(&self, now: u64) -> bool {
+        self.erase_done_at.is_some() && now < self.setup_end_at
+    }
+    /// When the running erase completes; the owner then commits it and calls `finish_erase`.
+    pub fn erase_due(&self) -> Option<u64> {
+        self.erase_done_at
     }
     pub fn array_reads(&self) -> bool {
         !self.busy() && self.mode != Mode::Query && self.mode != Mode::Identify
     }
-    /// None selects ordinary backing bytes. Polling never advances time.
+    /// [`Self::read16_at`] for a part whose erase is untimed, which never consults the time.
     pub fn read16(&mut self, offset: usize) -> Option<u16> {
+        debug_assert!(!self.geometry.timed_erase);
+        self.read16_at(offset, 0)
+    }
+    /// None selects ordinary backing bytes. `now` is machine nanoseconds.
+    pub fn read16_at(&mut self, offset: usize, now: u64) -> Option<u16> {
         if self.busy() {
             let selected = self.selected[offset / self.geometry.sector_size];
             self.toggle = !self.toggle;
@@ -165,7 +174,7 @@ impl AmdCore {
                     0x40 | if selected { 4 } else { 0 }
                 } else {
                     0
-                }) | if self.setup_ns == 0 { 8 } else { 0 }
+                }) | if self.selecting(now) { 0 } else { 8 }
                     | if self.failed { 0x20 } else { 0 },
             );
         }
@@ -179,6 +188,11 @@ impl AmdCore {
     /// One bus cycle: a word on a x16 part, a byte on a x8 part, at byte
     /// offset `offset`.
     pub fn write16(&mut self, offset: usize, value: u16) -> Result<Effect, ()> {
+        debug_assert!(!self.geometry.timed_erase);
+        self.write16_at(offset, value, 0)
+    }
+    /// As [`Self::write16`], at machine nanosecond `now`, which times a sector erase.
+    pub fn write16_at(&mut self, offset: usize, value: u16, now: u64) -> Result<Effect, ()> {
         let g = self.geometry;
         if (!g.x8 && offset & 1 != 0) || offset >= g.size() {
             return Err(());
@@ -186,13 +200,13 @@ impl AmdCore {
         let cmd = value as u8;
         let word = g.command_address(offset);
         if self.busy() {
-            if (self.failed || self.setup_ns != 0) && cmd == 0xf0 {
+            let selecting = self.selecting(now);
+            if (self.failed || selecting) && cmd == 0xf0 {
                 self.reset();
-            } else if self.setup_ns != 0 && cmd == 0x30 {
+            } else if selecting && cmd == 0x30 {
                 self.selected[offset / g.sector_size] = true;
-                self.setup_ns = ERASE_SETUP_NS;
-                self.remaining_ns = ERASE_SETUP_NS + ERASE_NS;
-            } else if self.setup_ns != 0 {
+                self.start_erase(now);
+            } else if selecting {
                 self.reset();
                 crate::dlog!(
                     g.log,
@@ -231,8 +245,7 @@ impl AmdCore {
             (Mode::Erase3, _, 0x30) => {
                 self.selected[offset / g.sector_size] = true;
                 if g.timed_erase {
-                    self.setup_ns = ERASE_SETUP_NS;
-                    self.remaining_ns = ERASE_SETUP_NS + ERASE_NS;
+                    self.start_erase(now);
                 }
                 Mode::Array
             }
@@ -249,14 +262,10 @@ impl AmdCore {
         self.mode = next;
         Ok(Effect::None)
     }
-    /// The owner persists and applies selected sectors before calling finish.
-    pub fn advance_ns(&mut self, ns: u64) -> bool {
-        if self.remaining_ns == 0 || self.failed {
-            return false;
-        }
-        self.setup_ns = self.setup_ns.saturating_sub(ns);
-        self.remaining_ns = self.remaining_ns.saturating_sub(ns);
-        self.remaining_ns == 0
+    /// The window restarts on each selection.
+    fn start_erase(&mut self, now: u64) {
+        self.setup_end_at = now.saturating_add(ERASE_SETUP_NS);
+        self.erase_done_at = Some(self.setup_end_at.saturating_add(ERASE_NS));
     }
     pub fn selected_sectors(&self) -> impl Iterator<Item = usize> + '_ {
         self.selected
@@ -268,6 +277,7 @@ impl AmdCore {
         if success {
             self.reset();
         } else {
+            self.erase_done_at = None;
             self.failed = true;
         }
     }
@@ -300,7 +310,7 @@ mod tests {
     const CFI: usize = 0x55 * 2;
 
     fn cmd(f: &mut AmdCore, offset: usize, value: u16) -> Effect {
-        f.write16(offset, value).unwrap()
+        f.write16_at(offset, value, 0).unwrap()
     }
 
     fn unlock(f: &mut AmdCore) {
@@ -322,24 +332,23 @@ mod tests {
         let mut f = AmdCore::default();
         let sector = 5 * SECTOR_SIZE;
         start_sector_erase(&mut f, sector);
-        assert!(f.busy() && f.selecting());
+        assert!(f.busy() && f.selecting(0));
         assert!(!f.array_reads());
         // DQ3 clear: still inside the window where more sectors may be added.
-        let first = f.read16(sector).unwrap();
+        let first = f.read16_at(sector, 0).unwrap();
         assert_eq!(first & 0x08, 0);
         assert_eq!(first & 0x80, 0);
-        f.advance_ns(ERASE_SETUP_NS);
-        assert!(!f.selecting());
-        let a = f.read16(sector).unwrap();
-        let b = f.read16(sector).unwrap();
+        assert!(!f.selecting(ERASE_SETUP_NS));
+        let a = f.read16_at(sector, ERASE_SETUP_NS).unwrap();
+        let b = f.read16_at(sector, ERASE_SETUP_NS).unwrap();
         assert_eq!(a & 0x08, 0x08);
         assert_eq!(a & 0x80, 0);
         assert_eq!(a & 0x40, !b & 0x40, "DQ6 toggles on successive reads");
-        assert!(f.advance_ns(ERASE_NS));
+        assert_eq!(f.erase_due(), Some(ERASE_SETUP_NS + ERASE_NS));
         assert_eq!(f.selected_sectors().collect::<Vec<_>>(), [5]);
         f.finish_erase(true);
         assert!(f.array_reads());
-        assert_eq!(f.read16(sector), None);
+        assert_eq!(f.read16_at(sector, 0), None);
     }
 
     /// Firmware erases several sectors with one command; each further 0x30
@@ -348,13 +357,13 @@ mod tests {
     fn extra_sectors_join_a_pending_erase_inside_the_selection_window() {
         let mut f = AmdCore::default();
         start_sector_erase(&mut f, 0);
-        cmd(&mut f, 3 * SECTOR_SIZE, 0x30);
+        f.write16_at(3 * SECTOR_SIZE, 0x30, 10).unwrap();
         assert_eq!(f.selected_sectors().collect::<Vec<_>>(), [0, 3]);
         // The window restarts on each selection.
-        f.advance_ns(ERASE_SETUP_NS - 1);
-        assert!(f.selecting());
+        assert!(f.selecting(ERASE_SETUP_NS + 9));
+        assert!(!f.selecting(ERASE_SETUP_NS + 10));
         // A non-erase command in the window cancels the whole operation.
-        assert!(f.write16(0, 0x55).is_err());
+        assert!(f.write16_at(0, 0x55, ERASE_SETUP_NS).is_err());
         assert!(!f.busy());
         assert_eq!(f.selected_sectors().count(), 0);
     }
@@ -367,13 +376,13 @@ mod tests {
         cmd(&mut f, UNLOCK0, 0xaa);
         cmd(&mut f, 0, 0xf0);
         // The unlock is forgotten: a program setup now is not a valid cycle.
-        assert!(f.write16(UNLOCK1, 0x55).is_err());
+        assert!(f.write16_at(UNLOCK1, 0x55, 0).is_err());
 
         cmd(&mut f, CFI, 0x98);
         assert!(!f.array_reads());
         cmd(&mut f, 0, 0xf0);
         assert!(f.array_reads());
-        assert_eq!(f.read16(0x10 * 2), None);
+        assert_eq!(f.read16_at(0x10 * 2, 0), None);
     }
 
     /// Firmware that probes the part reads the CFI "QRY" signature and the
@@ -382,7 +391,7 @@ mod tests {
     fn the_cfi_query_returns_the_qry_signature_and_the_size_exponent() {
         let mut f = AmdCore::default();
         cmd(&mut f, CFI, 0x98);
-        let q = |f: &mut AmdCore, word: usize| f.read16(word * 2).unwrap();
+        let q = |f: &mut AmdCore, word: usize| f.read16_at(word * 2, 0).unwrap();
         assert_eq!([q(&mut f, 0x10), q(&mut f, 0x11), q(&mut f, 0x12)], [b'Q' as u16, b'R' as u16, b'Y' as u16]);
         assert_eq!(1usize << q(&mut f, 0x27), PART_SIZE);
     }
@@ -398,7 +407,7 @@ mod tests {
         assert_eq!(cmd(&mut f, 0x1234 * 2, 0xa5f0), Effect::Program { offset: 0x1234 * 2, value: 0xa5f0 });
         assert!(f.array_reads());
         // Odd byte offsets are not word cycles.
-        assert!(f.write16(UNLOCK0 + 1, 0xaa).is_err());
+        assert!(f.write16_at(UNLOCK0 + 1, 0xaa, 0).is_err());
     }
 
     const NODE: Geometry = Geometry {
