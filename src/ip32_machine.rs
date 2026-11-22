@@ -210,7 +210,8 @@ impl O2Machine {
             rtc_file: Some(format!("{}.rtc", cfg.nvram).into()),
             rtc_offset: cfg.rtc_offset,
         };
-        let bus = Ip32Bus::with_options(mem, prom, opts);
+        let timer_manager = Arc::new(TimerManager::new());
+        let bus = Ip32Bus::with_options(mem, prom, opts, &timer_manager);
         // MACE audio plays through the host unless audio is off.
         if !cfg.no_audio {
             bus.mace.audio.enable_output(cfg.audio.clone());
@@ -256,7 +257,6 @@ impl O2Machine {
             bus.mace.mec.attach(link);
         }
 
-        let timer_manager = Arc::new(TimerManager::new());
         let sysad: Arc<dyn BusDevice> = bus.phys.clone();
         let arcs_fpu = o2.arcs_fpu;
         // The CPU clock the PROM measures and reports is twice Count.
@@ -302,9 +302,6 @@ impl O2Machine {
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();
-        for com in [&bus.mace.com0, &bus.mace.com1] {
-            com.core().set_clock(timer_manager.clock().clone());
-        }
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
         // CRIME's rendering engine draws on its own thread, fed through
@@ -477,6 +474,7 @@ impl O2Machine {
         let events = (self.events.clone(), self.controller_up.clone());
         let paused = self.paused.clone();
         self.start_scsi();
+        self.run_uarts(true);
         self.threads.push(
             std::thread::Builder::new()
                 .name("O2-Service".into())
@@ -588,6 +586,7 @@ impl O2Machine {
         if let Err(e) = self.bus.flush_disks() {
             eprintln!("iris: disk flush at stop failed: {e} (guest writes may be lost)");
         }
+        self.run_uarts(false);
         self.timer_manager.clock().stop();
         // A machine that was never started has nothing to halt.
         if self.lifecycle != crate::machine_state::GuestState::Idle {
@@ -600,6 +599,15 @@ impl O2Machine {
         self.timer_manager.clock().start();
         self.paused.store(false, Ordering::SeqCst);
         self.start_scsi();
+        self.run_uarts(true);
+    }
+
+    /// The console UARTs' receive-timeout timers follow the machine.
+    fn run_uarts(&self, on: bool) {
+        use crate::traits::Device;
+        for com in [&self.bus.mace.com0, &self.bus.mace.com1] {
+            if on { com.start() } else { com.stop() }
+        }
     }
 
     /// Give each SCSI controller its own thread, so disk transfers do not

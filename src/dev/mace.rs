@@ -41,8 +41,8 @@ pub struct Mace {
     pub rtc: MaceRtc,
     pub ps2: MacePs2,
     pub id: MaceId,
-    pub com0: MaceUart,
-    pub com1: MaceUart,
+    pub com0: Arc<MaceUart>,
+    pub com1: Arc<MaceUart>,
     /// The serial ports' DMA rings, which IRIX's console runs on.
     pub sdma: MaceSerialDma,
     /// The audio interface and its AD1843 (dev/mace_audio.rs).
@@ -55,7 +55,7 @@ impl Mace {
     /// MACE with its blocks reset, its interrupts wired into `crime`: the
     /// Ethernet straight in, the ISA peripherals (the PS/2 ports, audio, the
     /// console UART while driven by PIO, serial DMA) through the ISA block.
-    pub fn new(ram: Arc<O2Memory>, crime: Arc<Crime>, ust: Arc<MaceUst>, pci: &'static crate::pci::IntxRouting) -> Self {
+    pub fn new(ram: Arc<O2Memory>, crime: Arc<Crime>, ust: Arc<MaceUst>, pci: &'static crate::pci::IntxRouting, tm: &Arc<crate::hptimer::TimerManager>) -> Self {
         let isa = Arc::new(MaceIsa::new(crime.clone()));
         let mace = Self {
             isa,
@@ -66,8 +66,8 @@ impl Mace {
             ps2: MacePs2::new(),
             // A locally-administered address; nothing depends on the value yet.
             id: MaceId::new(DEFAULT_MAC),
-            com0: MaceUart::named("com0"),
-            com1: MaceUart::named("com1"),
+            com0: MaceUart::named("com0", tm),
+            com1: MaceUart::named("com1", tm),
             sdma: MaceSerialDma::new(),
             audio: MaceAudio::new(),
             mec: Arc::new(Mec::new(ram.clone())),
@@ -111,7 +111,7 @@ impl Mace {
     /// commands through on the Indigo2.
     pub fn devices(&self) -> Vec<&dyn crate::traits::Device> {
         vec![
-            &*self.pci, &*self.ust, &self.rtc, &self.ps2, &self.id, &self.com0, &self.com1, &self.sdma,
+            &*self.pci, &*self.ust, &self.rtc, &self.ps2, &self.id, &*self.com0, &*self.com1, &self.sdma,
             &self.audio, &*self.mec, &*self.isa,
         ]
     }
@@ -129,7 +129,7 @@ impl Mace {
     fn sdma_io(&self) -> SdmaIo<'_> {
         SdmaIo {
             ram: &self.ram,
-            com: [&self.com0, &self.com1],
+            com: [&*self.com0, &*self.com1],
             ring_base: (self.regs.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
         }
     }
@@ -280,8 +280,8 @@ impl Mace {
             ("rtc", &self.rtc),
             ("ps2", &self.ps2),
             ("id", &self.id),
-            ("com0", &self.com0),
-            ("com1", &self.com1),
+            ("com0", &*self.com0),
+            ("com1", &*self.com1),
             ("sdma", &self.sdma),
             ("audio", &self.audio),
             ("mec", &*self.mec),
