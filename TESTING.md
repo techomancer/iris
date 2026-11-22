@@ -150,6 +150,33 @@ file holds (its kind, version and segments, each checked) and `extract` writes i
 payload or one segment, such as the BaseIO PROM inside the IP35 file; `download` and
 `pack` rebuild `data/proms` from the catalog.
 
+## Repeated PROM boots
+
+A PROM that fails one start in a hundred needs hundreds of starts to show it.
+`tools/prom-boot-loop.py` starts iris with one config again and again, watches
+the serial log the config names, and counts each start as ok (the PROM menu,
+`Option?`), failed (`SL-9600`, the O2's serial loader, or `EXC`, a PROM
+exception; both can be changed with `--good` and `--bad`), timed out or
+exited. It stops iris with SIGTERM once a start is decided, so use it only on
+a config whose disks the guest cannot write: none, or `overlay = true` on each.
+The serial log and iris's output of every start that was not ok are kept. The
+script's help has an O2 config with no disks that reaches the menu in about
+five seconds. Races between the CPU thread and a device thread show up more
+often when the host is busy, so run it beside a few busy loops.
+
+The O2 PROM clears memory with its rendering engine and reuses it after one
+status read, so it reaches its menu only while that read waits for the
+engine's memory transfers. `IRIS_IP32_RE_LAG_US` holds each transfer on the
+engine's thread for that many microseconds, which opens the window on any host
+without loading it:
+
+```bash
+IRIS_IP32_RE_LAG_US=5000 tools/prom-boot-loop.py --iris target/release/iris --config o2.toml --count 10 --timeout 60
+```
+
+Every start must reach the menu, at 1500, 5000 or 20000 alike; a start that
+stops at `SL-9600-8E>` or hangs with no output means a status read no longer
+waits for the engine.
 ## Ultra64 dev board without gopher64
 
 `tools/tests/ultra64-irq-or.py` runs a headless Indy at its built-in PROM with
