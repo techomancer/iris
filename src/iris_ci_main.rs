@@ -172,11 +172,14 @@ enum Cmd {
         timeout: u64,
     },
 
-    /// Boot from PROM menu through to the IRIS console login prompt.
+    /// Boot through the PROM menu, if it appears, to the login prompt.
     Boot {
         /// Total timeout in seconds for boot to reach the login prompt.
         #[arg(long, default_value_t = 240)]
         timeout: u64,
+        /// Console text that means the login prompt is up.
+        #[arg(long, default_value = "login:")]
+        prompt: String,
     },
     /// Send root login + dismiss the vt100 prompt + wait for the shell.
     Login {
@@ -378,7 +381,7 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::SerialRead => cmd_serial_read(opts),
         Cmd::SerialWait { pattern, timeout } => cmd_serial_wait(opts, &pattern, timeout * 1000),
 
-        Cmd::Boot   { timeout } => cmd_boot(opts, timeout),
+        Cmd::Boot   { timeout, prompt } => cmd_boot(opts, timeout, &prompt),
         Cmd::Login  { user, password } => cmd_login(opts, &user, password.as_deref()),
         Cmd::Run    { command, shell, timeout } => cmd_run(opts, &command, &shell, timeout * 1000),
         Cmd::WaitPrompt { timeout } => cmd_wait_prompt(opts, timeout * 1000),
@@ -944,16 +947,26 @@ fn screen_wait(
 
 // ---- boot/login/run macros --------------------------------------------------
 
-fn cmd_boot(opts: &Opts, timeout_s: u64) -> Result<()> {
+fn cmd_boot(opts: &Opts, timeout_s: u64, prompt: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_s);
     if !opts.quiet { eprintln!("boot: starting CPU"); }
     send(opts, "start", json!({}))?;
-    if !opts.quiet { eprintln!("boot: waiting for PROM menu"); }
-    wait_with_deadline(opts, "Option?", deadline)?;
-    if !opts.quiet { eprintln!("boot: PROM reached, selecting 1) Start System"); }
-    send(opts, "serial-send", json!({"data": "1\r"}))?;
-    if !opts.quiet { eprintln!("boot: waiting for kernel boot to login prompt"); }
-    wait_with_deadline(opts, "IRIS console login", deadline)?;
+    // An autoloading PROM never shows the menu, so watch for both together.
+    let (mut seen, mut menu) = (String::new(), false);
+    loop {
+        let read = send(opts, "serial-read", json!({}))?;
+        seen.push_str(read.as_str().unwrap_or(""));
+        if seen.contains(prompt) { break; }
+        if !menu && seen.contains("Option?") {
+            menu = true;
+            if !opts.quiet { eprintln!("boot: PROM reached, selecting 1) Start System"); }
+            send(opts, "serial-send", json!({"data": "1\r"}))?;
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout(format!("boot: no {prompt:?} within {timeout_s}s")));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
     if !opts.quiet { eprintln!("boot: ready at login"); }
     Ok(())
 }
@@ -1642,4 +1655,61 @@ mod tests {
         assert_eq!(count_differing(&golden, &no_root, 32), Some(156));
         assert!(100 <= SCREEN_MAX_PIXELS && SCREEN_MAX_PIXELS < 156);
     }
+    /// Serves `start`, `serial-send` and `serial-read` for `cmd_boot`; the
+    /// console shows `before` until `1\r` arrives (or always, when `after`
+    /// is None) and `after` from then on. Returns the address and a handle
+    /// that yields the data sent.
+    fn fake_console(before: &'static str, after: Option<&'static str>)
+        -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
+    {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let s = s.unwrap();
+                let mut line = String::new();
+                BufReader::new(s.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let data = match req["cmd"].as_str().unwrap() {
+                    "serial-send" => {
+                        log.lock().unwrap().push(req["args"]["data"].as_str().unwrap().into());
+                        Value::Null
+                    }
+                    "serial-read" => {
+                        let sent = !log.lock().unwrap().is_empty();
+                        json!(if sent { after.unwrap_or(before) } else { before })
+                    }
+                    // The fixed waits the old script used never match a real console.
+                    "wait-serial" => {
+                        writeln!(&s, "{}", json!({"ok": false, "error": "timeout", "timeout": true})).unwrap();
+                        continue;
+                    }
+                    _ => Value::Null,
+                };
+                writeln!(&s, "{}", json!({"ok": true, "data": data})).unwrap();
+            }
+        });
+        (addr, sent)
+    }
+
+    fn boot_opts(addr: &str) -> Opts {
+        Opts { socket: addr.into(), json: false, quiet: true }
+    }
+
+    #[test]
+    fn boot_presses_the_menu_and_stops_at_any_hostnames_login() {
+        let (addr, sent) = fake_console("Option? ", Some("ip30-6530 console login: "));
+        cmd_boot(&boot_opts(&addr), 5, "login:").unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["1\r"]);
+    }
+
+    #[test]
+    fn boot_of_an_autoloading_prom_needs_no_menu() {
+        let (addr, sent) = fake_console("Starting up the system...\r\nindy-6522 console login: ", None);
+        cmd_boot(&boot_opts(&addr), 5, "login:").unwrap();
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
 }

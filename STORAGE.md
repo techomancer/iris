@@ -309,7 +309,7 @@ debugging the wrapper itself.
 
 # In another terminal: drive it
 ./target/release/iris-ci status --wait-ready 60   # guest state + monitor readiness
-./target/release/iris-ci boot          # PROM menu → IRIS console login (one cmd)
+./target/release/iris-ci boot          # PROM menu (if shown) → login prompt (one cmd)
 ./target/release/iris-ci login         # send root + dismiss vt100 prompt + wait #
 ./target/release/iris-ci run 'ls /'    # send shell command, get stdout + exit code
 ./target/release/iris-ci save base/multiuser
