@@ -13,6 +13,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### jitv2 interrupts
+
+- Under jitv2, software interrupts are taken as soon as they are enabled, not
+  at the next hardware interrupt, on every machine. On the Tezro, quake's
+  timedemo no longer freezes for up to a second at a time.
+
 ### jitv2 flushes
 
 - Under jitv2, a single-processor machine no longer hangs when the CPU runs out
