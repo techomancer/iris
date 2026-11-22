@@ -58,6 +58,7 @@ use crate::devlog::LogModule;
 use crate::gdb_stub::CpuDebug;
 use crate::hptimer::TimerManager;
 use crate::cpu::smp::World;
+use crate::ip35::presence::Cpu;
 use crate::window_map::SparseWindowMap;
 pub use crate::dev::hub::{bank_mappings, BANKS, BANK_STRIDE, SLOT_STRIDE};
 use crate::traits::*;
@@ -239,6 +240,13 @@ pub fn machine(
             node.chip.pi.set_cpu_interrupts(slice, cpu.interrupts_ptr());
             cpu.register_locks();
             cpus.push(cpu);
+        }
+        if let [a, b] = &cpus[..] {
+            let hold = |c: &Arc<dyn CpuDevice>| {
+                let cycles = c.cycles_ptr();
+                Cpu { slot: c.park_slot(), cycles: Box::new(move || cycles.retired()) }
+            };
+            node.chip.pi.set_pair([hold(a), hold(b)]);
         }
         node.chip.set_event_sender(tx.clone());
         node.chip.register_locks();
