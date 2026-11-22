@@ -115,6 +115,17 @@ recordings of a failing case (`vpro rec`) replay on both raster units offline:
 unit and the GPU unit with live-style slice ends, and compares what the board
 wrote to guest memory and its final memory.
 
+**NetBSD install CD** — `tools/netbsd-cd-boot.py` boots a NetBSD/sgimips
+install CD on a headless Indy with a blank NVRAM, runs the CD's install kernel
+from the PROM Command Monitor and passes when the sysinst menu appears. It
+fails when the kernel panics, and prints the panic line. It starts and quits
+its own iris and writes nothing but an NVRAM file in its work directory. The CD
+is not in the repository; use any `NetBSD-*-sgimips.iso`.
+
+```sh
+tools/netbsd-cd-boot.py NetBSD-11.1-sgimips.iso --cpu r5000   # and --cpu r4400
+```
+
 ## Real PROM images
 
 `real_prom_files_load_to_their_payload` (in `src/dev/prom_image.rs`) loads the
@@ -127,6 +138,25 @@ PROM no longer look for a file. `cargo run -p iris-prom -- show FILE` prints wha
 file holds (its kind, version and segments, each checked) and `extract` writes its
 payload or one segment, such as the BaseIO PROM inside the IP35 file; `download` and
 `pack` rebuild `data/proms` from the catalog.
+
+## Shared IOC interrupt bits
+
+`tools/ioc-shared-bit-e2e.py` checks on a running emulator that an IOC
+status bit two sources share stays set while either of them holds it. It
+starts iris as an Indigo2 (IP22) with the built-in PROM, Newport, a blank
+overlay disk and virtio-serial in GIO expansion slot 1, so Newport's retrace
+and the virtio device share L0 GRAPHICS. Once the PROM has the display up it
+stops the CPU, then works both sources from the monitor: the virtio device
+holds its interrupt while Newport's retrace is released (a REX3 STATUS read),
+and the reverse. It reports how many iterations saw the bit clear while a
+source still held it and exits 1 if any did.
+
+```sh
+tools/ioc-shared-bit-e2e.py --iris target/release/iris --iris-ci target/release/iris-ci
+```
+
+It needs no IRIX image. `--base-port` (default 22620) moves the monitor, CI
+socket and serial ports off the defaults.
 
 ## Host audio
 
@@ -803,6 +833,43 @@ the same files and reads every sector back. Another test fails on any
 ```sh
 cargo nextest run --release --lib exit_persistence_tests
 ```
+
+## O2 snapshots, CD changes and scratch over iris-ci
+
+`tools/tests/o2-ci-rollback.sh` boots a headless O2 on its built-in PROM (no
+IRIX needed) and drives it over the CI socket into the command monitor. It
+sets a PROM variable, then checks that `restore` and `rollback` each bring back
+the value saved before. It also makes two CD images with `mkvh`, each holding
+one file in its volume header, and checks that the PROM's `ls` of the CD names
+the file on the new disc after `cdrom-eject` and after `cdrom-load`, and that
+the PROM's `hinv` lists a scratch volume whose bytes round-trip through
+`iris-ci scratch write` and `scratch read`. It prints
+one PASS or FAIL line per check and exits 1 if any fail.
+
+```sh
+cargo build --release --bin iris --bin iris-ci --bin mkvh
+tools/tests/o2-ci-rollback.sh            # --bin DIR, --port BASE (default 23050), --keep
+```
+
+## Offline distribution build
+
+`tools/offline-build-test.sh` builds iris the way a distribution's build host
+does: dependencies vendored, network denied (`sandbox-exec` on macOS, an
+unshared network namespace on Linux), and a fresh `CARGO_HOME`, download cache
+and target directory. It follows the steps in
+[FEATURES.md](FEATURES.md#offline-and-distribution-builds), then checks the
+result: the `chd-extract` it built must unpack a CHD made by MAME's `chdman`
+byte for byte (skipped without `chdman`).
+
+```sh
+tools/offline-build-test.sh --expect-download-failure --gui
+```
+
+`--expect-download-failure` first builds without `LIBCHDMAN_FORCE_SOURCE` and
+requires that build to fail at the prebuilt download. `--gui` also checks
+iris-gui as the release builds it. `--keep` keeps the vendor tree and logs.
+`JOBS` and `BUILD_WRAPPER` (a prefix such as `nice -n 10`) control the cargo
+runs. Two cold release builds take several minutes.
 
 ## Interpreter hot paths
 

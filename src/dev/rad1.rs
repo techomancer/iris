@@ -1452,6 +1452,10 @@ impl Device for Rad1 {
     fn is_running(&self) -> bool { self.inner.armed.load(Ordering::SeqCst) }
     fn get_clock(&self) -> u64 { 0 }
 
+    fn audio_frames(&self) -> Option<u64> {
+        Some(self.inner.meter.total())
+    }
+
     fn audio_report(&self) -> Option<String> {
         let i = &self.inner;
         let rates = {

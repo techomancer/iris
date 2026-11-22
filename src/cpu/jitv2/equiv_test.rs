@@ -4596,7 +4596,8 @@ mod tests {
         let consts = jit.jitv2.lock().compile_queue.jit_consts.lock().clone();
         codegen.jit_consts.lwr_keeps_upper = consts.lwr_keeps_upper;
         codegen.jit_consts.single_clears_upper = consts.single_clears_upper;
-        codegen.jit_consts.cvt_l_51_bits = consts.cvt_l_51_bits;
+        codegen.jit_consts.cvt_l_range_bits = consts.cvt_l_range_bits;
+        codegen.jit_consts.cvt_from_l_range_bits = consts.cvt_from_l_range_bits;
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable region");
         unsafe { jit_fn(&mut jit.core as *mut MipsCore) };
         std::mem::forget(codegen);
@@ -7162,45 +7163,110 @@ mod tests {
         }
     }
 
+    /// A value a word cannot hold — overflow either way, NaN — is
+    /// Unimplemented Operation on the default (R4400) model, as on an Indy:
+    /// Cause.E alone, fd untouched. `cvt_to_int_case` only checks JIT ==
+    /// interpreter, which a shared bug in `cvt_to_int_and_commit` would pass
+    /// right through, so the outcome is pinned against the interpreter too.
+    /// The untrapped Invalid default result (2^31-1 whatever the sign) is
+    /// pinned on the shared helper in `mips_exec.rs`.
     #[test]
-    fn cvt_to_int_overflow_saturates_matches_interpreter() {
-        // MIPS's fixed poison pattern on float->int overflow: INT_MAX
-        // (0x7FFFFFFF/0x7FFFFFFFFFFFFFFF) for positive overflow, INT_MIN for
-        // negative — see `cvt_f32/64_to_int_by_value` in mips_exec.rs, the
-        // single function both engines call through `cvt_to_int_and_commit`.
-        // Also sets FCSR.V/Cause, which `cvt_to_int_case`'s snapshot compare
-        // covers alongside the destination register value.
-        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_S, 1.0e20);
-        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_S, -1.0e20);
-
-        // cvt_to_int_case only checks JIT == interpreter, which a shared bug
-        // in cvt_to_int_and_commit would pass right through — pin the actual
-        // MIPS poison values against the interpreter directly too.
-        let mut fpr = [0u64; 32];
-        fpr[1] = (1.0e20f32).to_bits() as u64;
-        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_W);
-        let pos = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
-        assert_eq!(pos.fpr[2] as u32, i32::MAX as u32, "positive overflow must poison to INT_MAX");
-        assert_ne!(pos.fpu_fcsr & 0x0001_0000, 0, "overflow must raise FCSR Cause.V (bit 16)");
-
-        fpr[1] = (-1.0e20f32).to_bits() as u64;
-        let neg = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
-        assert_eq!(neg.fpr[2] as u32, i32::MIN as u32, "negative overflow must poison to INT_MIN");
-        assert_ne!(neg.fpu_fcsr & 0x0001_0000, 0, "overflow must raise FCSR Cause.V (bit 16)");
+    fn cvt_to_int_unrepresentable_matches_interpreter() {
+        for v in [1.0e20f32, -1.0e20, f32::NAN, f32::NEG_INFINITY] {
+            cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_S, v as f64);
+            let mut fpr = [0u64; 32];
+            fpr[1] = v.to_bits() as u64;
+            fpr[2] = 0x5a5a_5a5a;
+            let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_W);
+            assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
+            let r = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
+            assert_eq!(r.fpr[2], 0x5a5a_5a5a, "{v}: fd untouched");
+            assert_eq!(r.fpu_fcsr & 0x0003_f000, 0x0002_0000, "{v}: Cause.E alone");
+        }
     }
 
+    /// Conversion sources the FPU hands to software — denormals and MIPS
+    /// quiet NaNs — and the operands around them, for every conversion with
+    /// a float source, in both FR modes and with a stale Cause. The inline
+    /// paths must send each special operand to the callout.
     #[test]
-    fn cvt_to_int_nan_matches_interpreter() {
-        // MIPS's poison pattern for NaN input is INT_MAX (same as positive
-        // overflow) — see `cvt_to_int_overflow_saturates_matches_interpreter`.
-        let mut fpr = [0u64; 32];
-        fpr[1] = f32::NAN.to_bits() as u64;
-        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_W);
-        assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
+    fn conversion_special_operands_match_interpreter() {
+        use crate::cpu::mips_isa::*;
+        let singles: &[u32] = &[
+            0x0000_0001, 0x8000_0001, 0x007F_FFFF, 0x0080_0000, 0x0000_0000, 0x8000_0000,
+            0x7F80_0000, 0xFF80_0000, 0x7FBF_FFFF, 0x7FC0_0000, 0x3FC0_0000, 0x7F7F_FFFF,
+        ];
+        let doubles: &[u64] = &[
+            0x0000_0000_0000_0001, 0x800F_FFFF_FFFF_FFFF, 0x0010_0000_0000_0000, 0, 0x8000_0000_0000_0000,
+            0x7FF0_0000_0000_0000, 0x7FF7_FFFF_FFFF_FFFF, 0x7FF8_0000_0000_0000, 0x3FF8_0000_0000_0000,
+            0x3800_0000_0000_0000, // 2^-127: a single denormal
+            0x3690_0000_0000_0000, // 2^-150: rounds to zero
+            0x47EF_FFFF_F000_0000, 0x4C70_0000_0000_0000, 0x4340_0000_0000_0000, 0xC340_0000_0000_0000,
+        ];
+        let to_int = [FUNCT_FCVT_W, FUNCT_FCVT_L, FUNCT_FROUND_W, FUNCT_FTRUNC_L, FUNCT_FCEIL_W, FUNCT_FFLOOR_L];
+        for fr1 in [false, true] {
+            for fcsr in [None, Some(0x0100_1000), Some(0x0000_0f80), Some(0x0000_0002)] {
+                for &bits in singles {
+                    let mut fpr = [0u64; 32];
+                    fpr[2] = bits as u64;
+                    fpr[4] = 0xDEAD_BEEF_DEAD_BEEF;
+                    for funct in to_int.iter().copied().chain([FUNCT_FCVT_D]) {
+                        let instr = make_r(OP_COP1, RS_S, 0, 2, 4, funct);
+                        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, fr1, fcsr);
+                    }
+                }
+                for &bits in doubles {
+                    let mut fpr = [0u64; 32];
+                    fpr[2] = bits;
+                    fpr[4] = 0xDEAD_BEEF_DEAD_BEEF;
+                    for funct in to_int.iter().copied().chain([FUNCT_FCVT_S]) {
+                        let instr = make_r(OP_COP1, RS_D, 0, 2, 4, funct);
+                        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, fr1, fcsr);
+                    }
+                }
+            }
+        }
+    }
 
-        let nan = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
-        assert_eq!(nan.fpr[2] as u32, i32::MAX as u32, "NaN must poison to INT_MAX");
-        assert_ne!(nan.fpu_fcsr & 0x0001_0000, 0, "NaN input must raise FCSR Cause.V (bit 16)");
+    /// CVT.S.L and CVT.D.L at the R4400's 52-bit source limit: the inline
+    /// path converts inside it and the callout traps outside it, on the
+    /// default (R4400) model, in every rounding mode.
+    #[test]
+    fn cvt_from_long_limit_matches_interpreter() {
+        use crate::cpu::mips_isa::*;
+        for v in [(1i64 << 52) - 1, 1 << 52, -(1i64 << 52), -(1i64 << 52) - 1, (1i64 << 53) + 1, i64::MAX, i64::MIN] {
+            for rm in 0..4u32 {
+                for funct in [FUNCT_FCVT_S, FUNCT_FCVT_D] {
+                    let mut fpr = [0u64; 32];
+                    fpr[2] = v as u64;
+                    fpr[4] = 0xDEAD_BEEF_DEAD_BEEF;
+                    let instr = make_r(OP_COP1, RS_L, 0, 2, 4, funct);
+                    let snap = assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, true, Some(rm));
+                    let traps = !(-(1i64 << 52)..(1i64 << 52)).contains(&v);
+                    assert_eq!(snap.fpr[4] == 0xDEAD_BEEF_DEAD_BEEF, traps, "{v} rm={rm}");
+                }
+            }
+        }
+    }
+
+    /// On the R10000, which converts every long, the inline path's Inexact
+    /// test must not call i64::MAX exact: it rounds to 2^63, which saturates
+    /// back to i64::MAX.
+    #[test]
+    fn jit_cvt_from_long_max_is_inexact_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        use crate::cpu::mips_isa::*;
+        for funct in [FUNCT_FCVT_S, FUNCT_FCVT_D] {
+            let instr = (OP_COP1 << 26) | (RS_L << 21) | (1 << 11) | (3 << 6) | funct;
+            let setup = move |_: &MockMemory, exec: &mut MipsExecutor<PassthroughTlb, R10000ShadowCache>| {
+                use crate::cpu::mips_core::{STATUS_CU1, STATUS_FR, STATUS_KX};
+                exec.set_cp0_status(STATUS_KX | STATUS_CU1 | STATUS_FR);
+                exec.core.fpr[1] = i64::MAX as u64;
+            };
+            let (interp, jit) = instr_both::<R10000ShadowCache>(instr, setup);
+            assert_eq!(jit, interp, "R10000 {funct:#x}");
+            assert_eq!(interp.fpu_fcsr & 0x0003_f000, 0x0000_1000, "R10000 {funct:#x} Cause.I");
+        }
     }
 
     fn cvt_from_int_case(funct: u32, fmt: u32, val: i64) {
@@ -7392,9 +7458,9 @@ mod tests {
         }
     }
 
-    /// Inexact with Enable.I set must trap with the destination already
-    /// written (unlike the to-int direction), and with it clear must set the
-    /// sticky Flag.I; a dirty Flag must be preserved either way.
+    /// Inexact with Enable.I set must trap with the destination unwritten,
+    /// and with it clear must set the sticky Flag.I; a dirty Flag must be
+    /// preserved either way.
     #[test]
     fn cvt_from_int_inexact_enable_bits_match_interpreter() {
         use crate::cpu::mips_isa::*;

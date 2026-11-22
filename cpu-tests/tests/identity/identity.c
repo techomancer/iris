@@ -171,6 +171,35 @@ static void t_config_k0_writable(void)
     CHECK_EQ(final, orig);
 }
 
+/* Config.IB and DB (bits 5:4), the primary line sizes, are fixed by the part:
+ * a write that flips them must read back unchanged. The R5000 Indy PROM
+ * writes Config with both clear, and NetBSD then sized the R5000 I-cache line
+ * as 16 bytes and panicked (techomancer/iris#773). K0 is written back as it
+ * was, so no cacheability changes and memory is safe to touch. The R10000
+ * keeps other fields in these bits and is left out. */
+static void t_config_line_size_ro(void)
+{
+    u32 orig, flipped, final;
+
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder\n\t"
+        "mfc0   %0, $16\n\t"
+        "nop; nop\n\t"
+        "xori   $8, %0, 0x30\n\t"
+        "mtc0   $8, $16\n\t"
+        "nop; nop; nop\n\t"
+        "mfc0   %1, $16\n\t"
+        "nop; nop\n\t"
+        "mtc0   %0, $16\n\t"
+        "nop; nop; nop\n\t"
+        "mfc0   %2, $16\n\t"
+        "nop; nop\n\t"
+        ".set pop"
+        : "=&r"(orig), "=&r"(flipped), "=&r"(final) :: "$8");
+
+    CHECK_EQ(flipped, orig);
+    CHECK_EQ(final, orig);
+}
+
 /* The R4400, R4600 and R5000 have 48 TLB entries, so Random must wrap within
  * 0..47. The R10000 has 64: "The upper bound is set by the total number of
  * TLB entries minus 1 (64 - 1 maximum)" (R10000 UM v2.0, p. 238). Just the
@@ -193,6 +222,8 @@ static const struct test tests[] = {
     TEST("identity/fir",              t_fir,                    CPU_ALL),
     TEST("identity/cache_geometry",   t_config_cache_geometry,  CPU_ALL),
     TEST("identity/config_k0",        t_config_k0_writable,     CPU_ALL),
+    TEST("identity/config_line_size_ro", t_config_line_size_ro,
+         CPU_R4400 | CPU_R5000 | CPU_R4600),
     TEST("identity/tlb_size",         t_tlb_size,               CPU_ALL),
 };
 

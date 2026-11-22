@@ -8,6 +8,8 @@
 //! controller owns one of and reaches its targets through.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
 
@@ -37,6 +39,10 @@ pub trait ScsiTarget: Send {
 
     /// Stop it, with no command part way through.
     fn stop(&mut self) {}
+
+    /// Take the bus's counters for this target's id, to count the reads and
+    /// writes it carries out. A target that moves no blocks ignores them.
+    fn set_activity(&mut self, _activity: Arc<DiskActivity>) {}
 
     /// Whether READ(6) and WRITE(6) move packets, not blocks, so a
     /// controller must not read their count as a number of sectors.
@@ -140,6 +146,50 @@ pub struct ScsiIdentities {
     pub cdrom: ScsiIdentity,
 }
 
+/// Reads and writes a target has completed since it was attached, for a
+/// front-end's activity light. The counters only go up; whoever shows them
+/// compares two samples. Reading takes no lock, so a sample never waits for
+/// a command that holds the bus.
+#[derive(Default)]
+pub struct DiskActivity {
+    reads: AtomicU64,
+    read_bytes: AtomicU64,
+    writes: AtomicU64,
+    write_bytes: AtomicU64,
+}
+
+/// One sample of a [`DiskActivity`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskCounts {
+    /// Completed read commands and the bytes they returned.
+    pub reads: u64,
+    pub read_bytes: u64,
+    /// Completed write commands and the bytes they stored.
+    pub writes: u64,
+    pub write_bytes: u64,
+}
+
+impl DiskActivity {
+    pub fn read(&self, bytes: u64) {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn write(&self, bytes: u64) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn counts(&self) -> DiskCounts {
+        DiskCounts {
+            reads: self.reads.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            write_bytes: self.write_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The targets on a bus by SCSI id, `None` where nothing answers.
 pub type Targets = Vec<Option<Box<dyn ScsiTarget>>>;
 
@@ -150,6 +200,9 @@ pub type Targets = Vec<Option<Box<dyn ScsiTarget>>>;
 pub struct ScsiBus {
     identities: ScsiIdentities,
     targets: Mutex<Targets>,
+    /// Per-id counters, outside the table's lock; a target keeps the ones
+    /// for its id from [`ScsiBus::attach`] on.
+    activity: Box<[Arc<DiskActivity>]>,
 }
 
 impl ScsiBus {
@@ -158,6 +211,7 @@ impl ScsiBus {
         Self {
             identities,
             targets: Mutex::new(std::iter::repeat_with(|| None).take(ids).collect()),
+            activity: std::iter::repeat_with(Arc::default).take(ids).collect(),
         }
     }
 
@@ -184,11 +238,12 @@ impl ScsiBus {
     }
 
     /// Put `target` at `id`, replacing what was there.
-    pub fn attach(&self, id: u8, target: Box<dyn ScsiTarget>) -> io::Result<()> {
+    pub fn attach(&self, id: u8, mut target: Box<dyn ScsiTarget>) -> io::Result<()> {
         let mut targets = self.targets.lock();
         let slot = targets.get_mut(id as usize).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("SCSI id {id} out of range"))
         })?;
+        target.set_activity(self.activity[id as usize].clone());
         *slot = Some(target);
         Ok(())
     }
@@ -271,6 +326,13 @@ impl ScsiBus {
     }
 
     /// Whether something answers at `id`.
+    /// Every id's read and write counters, by id. Takes no lock: safe from a
+    /// status poll while a command holds the bus. An id with nothing on it
+    /// stays at zero.
+    pub fn activity(&self) -> Vec<DiskCounts> {
+        self.activity.iter().map(|a| a.counts()).collect()
+    }
+
     pub fn has_target(&self, id: u8) -> bool {
         self.targets.lock().get(id as usize).is_some_and(|t| t.is_some())
     }
@@ -488,6 +550,30 @@ mod tests {
             data_len: crate::scsi::ScsiDataLength::Unlimited,
             data_in: None,
         }
+    }
+
+    /// A front-end's disk light: completed reads and writes count on the
+    /// id's own counters, a refused command and other ids do not, and a
+    /// sample needs no lock, so it works while a command holds the bus.
+    #[test]
+    fn activity_counts_completed_reads_and_writes_per_id() {
+        let dir = TempPath::dir("scsiact");
+        let b = bus(8);
+        attach(&b, 1, &image(&dir, 8), false).unwrap();
+        assert_eq!(b.activity(), vec![DiskCounts::default(); 8]);
+
+        b.request(1, &write_block(2, 0x55)).unwrap().unwrap();
+        b.request(1, &read_block(2)).unwrap().unwrap();
+        b.request(1, &read_block(3)).unwrap().unwrap();
+        // Past the end: CHECK CONDITION, nothing moved.
+        assert_ne!(b.request(1, &read_block(99)).unwrap().unwrap().status, 0);
+        b.request(1, &inquiry()).unwrap().unwrap();
+
+        let held = b.lock();
+        let counts = b.activity();
+        drop(held);
+        assert_eq!(counts[1], DiskCounts { reads: 2, read_bytes: 1024, writes: 1, write_bytes: 512 });
+        assert!(counts.iter().enumerate().all(|(id, c)| id == 1 || *c == DiskCounts::default()));
     }
 
     /// The machine can exit without dropping the bus (`process::exit` after
