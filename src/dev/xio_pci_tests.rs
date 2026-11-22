@@ -418,7 +418,7 @@ impl FibreHost<'_> {
         );
         // The loop comes up on the adapter's own clock; a LIP and loop up
         // are posted, each released by the host before the next.
-        self.fc.set_test_clock(crate::dev::isp2200::BRINGUP.as_nanos() as i64);
+        crate::dev::isp2200::tests::set_test_clock(&self.fc, crate::dev::isp2200::BRINGUP.as_nanos() as i64);
         self.fc.wait_idle();
         for _ in 0..2 {
             assert_eq!(self.rd(reg::ISR) & 0x8008, 0x8008);
@@ -464,7 +464,7 @@ fn a_fibre_channel_card_in_the_pci_module_masters_ram_and_raises_its_pin() {
     let img = crate::dev::nvme::tests::temp_image(&format!("fc-{}-{slot}", kind.name()));
     let mut cfg = crate::config::FibreChannelConfig::default();
     cfg.disks.insert(5, crate::config::ScsiDeviceConfig { path: img.to_string_lossy().into_owned(), ..Default::default() });
-    let card = Card::open(&cfg, false).unwrap();
+    let card = Card::open(&cfg, false, &Arc::new(crate::hptimer::TimerManager::new())).unwrap();
     rig.board.check_slot(slot).unwrap();
     card.attach(rig.board.bus(), slot);
     let cfg_write = |off: u32, size: u32, v: u32| {
@@ -486,7 +486,7 @@ fn a_fibre_channel_card_in_the_pci_module_masters_ram_and_raises_its_pin() {
     cfg_write(0x04, 2, command);
     let fc = &*card.fc;
     crate::traits::Device::start(fc);
-    fc.set_test_clock(0);
+    crate::dev::isp2200::tests::set_test_clock(&fc, 0);
     let host = FibreHost { rig: &rig, slot, fc };
     // Interrupt enable, then a driver's attach.
     host.wr(crate::dev::isp2200::reg::ICR, 0x8008);

@@ -7,6 +7,7 @@
 use super::*;
 use crate::irq::{InterruptController, IrqLine};
 use std::sync::Mutex;
+use std::time::Instant;
 
 const MEM_SIZE: usize = 0x80_0000;
 const RX_RING: u32 = 0x1_0000;
@@ -71,12 +72,21 @@ fn core_for(mem: Option<Arc<Mem>>) -> (Arc<Core>, Arc<Mutex<Vec<bool>>>) {
 
 /// A MAC behind the Octane's transceiver with a negotiation of `delay`.
 fn mac(core: &Arc<Core>, delay: Duration) -> Arc<Ioc3Eth> {
-    Ioc3Eth::with_phy(core.clone(), STATION, Box::new(Ics1890::new(PHY_ADDR, delay)))
+    mac_on(core, delay, &stepped())
+}
+
+fn mac_on(core: &Arc<Core>, delay: Duration, tm: &Arc<TimerManager>) -> Arc<Ioc3Eth> {
+    Ioc3Eth::with_phy(core.clone(), STATION, Box::new(Ics1890::new(PHY_ADDR, delay)), tm)
+}
+
+/// A timer manager whose clock stands at 0 until a test steps it.
+fn stepped() -> Arc<TimerManager> {
+    Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped()))
 }
 
 /// A MAC with nothing behind it, for tests of its management port.
 fn standalone(phy: Box<dyn MiiPhy>) -> Arc<Ioc3Eth> {
-    Ioc3Eth::with_phy(core_for(None).0, STATION, phy)
+    Ioc3Eth::with_phy(core_for(None).0, STATION, phy, &stepped())
 }
 
 fn rig() -> Rig {
@@ -800,18 +810,19 @@ fn a_stopped_mac_takes_no_frames_and_a_restart_drops_the_queued_one() {
 }
 
 /// A frame held back by the PHY still negotiating is taken when the
-/// negotiation ends, with no wake from anyone: the receive thread's wait ends
-/// at the PHY's deadline.
+/// negotiation ends, with no second wake: the PHY's deadline timer wakes the receive thread.
 #[test]
-fn a_frame_waits_for_the_negotiation_deadline_without_a_wake() {
+fn a_frame_waits_for_the_negotiation_deadline_with_one_wake() {
     let mem = Arc::new(Mem(Mutex::new(vec![0; MEM_SIZE])));
-    let eth = mac(&core_for(Some(mem.clone())).0, Duration::from_millis(60));
+    let eth = mac_on(&core_for(Some(mem.clone())).0, Duration::from_millis(60), &Arc::new(TimerManager::new()));
     let (link, _sent, mut inject) = crate::net::Link::loopback();
     eth.attach(link);
     let t = Rig { eth, mem, irq: Arc::new(Mutex::new(Vec::new())), sent: rtrb::RingBuffer::new(1).1, inject: rtrb::RingBuffer::new(1).0 };
     t.rx_setup(2);
     t.eth.start();
     inject.push(frame(STATION, 60)).unwrap();
+    // The one wake the NAT engine gives; the PHY's timer gives the next.
+    t.eth.wake_rx();
     assert!(waits_for(|| t.r(RX_CONSUME) == 8), "taken after the negotiation");
     t.eth.stop();
 }
@@ -1017,11 +1028,11 @@ fn save_load_round_trip() {
         st.tx_frames = 9;
         // Let the power-on negotiation finish, so the save holds no
         // deadline for the two saves to differ by.
-        st.phy.sync(Instant::now() + Duration::from_secs(10));
+        st.phy.sync(10_000_000_000);
     }
     let v1 = src.save_state();
     let (core, pin) = core_for(None);
-    let dst = Ioc3Eth::with_phy(core, STATION, Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)));
+    let dst = Ioc3Eth::with_phy(core, STATION, Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)), &stepped());
     dst.load_state(&v1).expect("load_state");
     assert_eq!(v1, dst.save_state());
     assert_eq!(pin.lock().unwrap().last(), Some(&true), "the loaded interrupt level is published");
@@ -1032,15 +1043,19 @@ fn save_load_round_trip() {
 /// auto-negotiation across a save and load.
 #[test]
 fn the_transceiver_round_trips_with_negotiation_in_progress() {
-    let now = Instant::now();
+    let now = 0;
     let mut src = Ics1890::new(1, Duration::from_millis(50));
     src.set_backend_link(true, now);
     src.write(0, 0x1200, now); // restart auto-negotiation
-    let v = src.save_state(now);
+    let v = src.save_state();
     let mut dst = Ics1890::new(1, Duration::from_millis(50));
-    dst.load_state(&v, now).unwrap();
-    assert_eq!(v, dst.save_state(now));
+    dst.load_state(&v).unwrap();
+    assert_eq!(v, dst.save_state());
     assert_eq!(src.deadline().is_some(), dst.deadline().is_some());
+    // A snapshot from before the deadline was absolute lacks the new key.
+    let mut old = v;
+    old.as_table_mut().unwrap().remove("deadline_at");
+    assert!(dst.load_state(&old).is_err());
 }
 
 /// A guest acknowledges a source and then unmasks it, as two writes, while

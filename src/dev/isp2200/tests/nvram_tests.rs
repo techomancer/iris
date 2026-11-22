@@ -89,7 +89,7 @@ fn nvram_default_image() {
 /// are pinned, with the image still summing to zero.
 #[test]
 fn nvram_serial() {
-    let r = Rig::on(Isp2200 { core: Arc::new(Core::new_at(0, Isp2200::new_bus(), 0x123456)) });
+    let r = Rig::on(Isp2200 { core: Arc::new_cyclic(|me| Core::new_at(0, Isp2200::new_bus(), 0x123456, &Arc::new(crate::hptimer::TimerManager::new()), me)) });
     let img = r.nvram_read_image();
     assert_eq!(img, r.nvram_read_image());
     assert_eq!(img[23..26], [0x12, 0x34, 0x56]);
@@ -175,8 +175,8 @@ fn nvram_default_serial() {
         let (w11, w12) = (r.nvram_read_word(11), r.nvram_read_word(12));
         (u32::from(w11 >> 8) << 16) | (u32::from(w12 & 0xff) << 8) | u32::from(w12 >> 8)
     }
-    let first = Rig::on(Isp2200::new_at(0, Isp2200::new_bus()));
-    let second = Rig::on(Isp2200::new_at(1, Isp2200::new_bus()));
+    let first = Rig::on(Isp2200::new_at(0, Isp2200::new_bus(), &Arc::new(crate::hptimer::TimerManager::new())));
+    let second = Rig::on(Isp2200::new_at(1, Isp2200::new_bus(), &Arc::new(crate::hptimer::TimerManager::new())));
     assert_eq!(serial(&first), fnv1a_serial("isp2200-0"));
     assert_eq!(serial(&second), fnv1a_serial("isp2200-1"));
     assert_ne!(serial(&first), serial(&second));

@@ -340,7 +340,7 @@ pub(crate) fn pci_devices(
         1 => Ok(&bus_b),
         _ => Err(format!("controller {c} ({name} has controllers 0 and 1)")),
     })?;
-    let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
+    let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a, timers)), Arc::new(Isp1040::new_at(1, bus_b, timers))];
     for s in &scsi {
         s.set_heartbeat(heartbeat.clone());
     }

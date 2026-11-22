@@ -62,9 +62,9 @@
 //!   wait at least that long; the model answers exactly at the value. A
 //!   programmed value of zero is no wait, and a queue initialisation leaves
 //!   a waiting selection alone: both are model choices, the datasheet being
-//!   silent. That clock is host wall time less the time
-//!   the machine was stopped; iris has no emulated-time source a device can
-//!   read, so the wait does not follow the guest's instruction rate.
+//!   silent. That clock is the machine clock, which stands still while the
+//!   machine is stopped; the wait does not follow the guest's instruction
+//!   rate.
 //!
 //! Register windows: BAR 0 is I/O space and BAR 1 memory space, both 256
 //! bytes onto the same sixteen-bit registers. Accesses of any other width
@@ -75,7 +75,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -83,6 +83,7 @@ use parking_lot::Mutex;
 use crate::dev::qlogic_ring::{self, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE, Notes, RingCtl, RingState, RingThread};
 
 use crate::devlog::LogModule;
+use crate::hptimer::{Timer, TimerManager};
 use crate::irq::{IrqGuard, IrqLevel, IrqMutex};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_INTA};
 use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
@@ -254,8 +255,8 @@ const DEFAULT_SELECTION_TIMEOUT: u16 = 250;
 /// lasts. Seconds is inferred from the vendor's NVRAM setting, which the
 /// drivers pass through; no firmware interface document is held. The
 /// datasheet puts the hold on the guest's virtual clock; iris has no such
-/// source for a device, so it runs on the adapter's clock, host wall time
-/// less the time the machine was stopped, like the selection timeout.
+/// source for a device, so it runs on the machine clock, like the selection
+/// timeout.
 const BUS_RESET_DELAY_UNIT: Duration = Duration::from_secs(1);
 /// The most SCSI buses any part drives (the ISP12160's two; the ISP1040 has
 /// one, `IspPart::channels`). The hold-off, the parked commands and the
@@ -667,6 +668,11 @@ pub struct Core<P: IspPart> {
     odd_accesses: AtomicU64,
     /// The status bar's activity bits, shared with the display thread.
     heartbeat: OnceLock<Arc<AtomicU64>>,
+    /// The selection and each bus's hold-off, which wake the ring thread.
+    timers: [Timer; 3],
+    #[cfg(test)]
+    /// The test constructors build their own manager; timers hold it weakly.
+    _tm: Arc<TimerManager>,
 }
 
 #[allow(private_bounds)]
@@ -688,12 +694,12 @@ impl Isp1040 {
     /// The controller on an empty bus, for the tests.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::new_at(0, Self::new_bus())
+        Self::new_at(0, Self::new_bus(), &Arc::new(TimerManager::new()))
     }
 
     /// The controller at `index` (0 internal, 1 external) on `bus`.
-    pub fn new_at(index: u8, bus: ScsiBus) -> Self {
-        Self::with_part(index, Isp1040Part, Box::new([bus]))
+    pub fn new_at(index: u8, bus: ScsiBus, tm: &Arc<TimerManager>) -> Self {
+        Self::with_part(index, Isp1040Part, Box::new([bus]), tm)
     }
 }
 
@@ -701,22 +707,23 @@ impl Isp1040 {
 #[cfg(test)]
 impl Isp<crate::dev::isp12160::Isp12160Part> {
     pub(crate) fn new_12160(bus0: ScsiBus, bus1: ScsiBus) -> Self {
-        Self::with_part(0, crate::dev::isp12160::Isp12160Part, Box::new([bus0, bus1]))
+        Self::with_part(0, crate::dev::isp12160::Isp12160Part, Box::new([bus0, bus1]), &Arc::new(TimerManager::new()))
     }
 }
 
 #[allow(private_bounds)]
 impl<P: IspPart> Isp<P> {
     /// The controller at `index` with one bus per channel of `part`.
-    pub(crate) fn with_part(index: u8, part: P, buses: Box<[ScsiBus]>) -> Self {
+    pub(crate) fn with_part(index: u8, part: P, buses: Box<[ScsiBus]>, tm: &Arc<TimerManager>) -> Self {
         assert_eq!(buses.len(), part.channels(), "one bus per channel");
-        Self { core: Arc::new(Core::new_at(index, part, buses)) }
+        Self { core: Arc::new_cyclic(|me| Core::new_at(index, part, buses, tm, me)) }
     }
 
     /// Start the ring thread (idempotent) and let it take whatever was
     /// published while the adapter was stopped.
     fn start_ring(&self) {
         self.ring.start_thread(self.pci.irq_cell(), &self.core, format!("{}-{}", self.core.model_name(), self.index), Core::run_ring);
+        self.timers.iter().for_each(Timer::start);
     }
 
     /// Park the ring between entries, then end and join the thread. A
@@ -724,6 +731,7 @@ impl<P: IspPart> Isp<P> {
     /// touches guest memory or the interrupt line.
     fn stop_ring(&self) {
         self.ring.stop_thread(self.pci.irq_cell());
+        self.timers.iter().for_each(Timer::stop);
     }
 }
 
@@ -759,14 +767,14 @@ impl<P: IspPart> Drop for Isp<P> {
 
 #[allow(private_bounds)]
 impl<P: IspPart> Core<P> {
-    fn new_at(index: u8, part: P, buses: Box<[ScsiBus]>) -> Self {
+    fn new_at(index: u8, part: P, buses: Box<[ScsiBus]>, tm: &Arc<TimerManager>, me: &Weak<Self>) -> Self {
         let st = State::new();
         let bars = [Bar::Io(reg::WINDOW_SIZE), Bar::Mem(reg::WINDOW_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
         let pci = part.pci_config(bars);
         Self {
             part,
             cancel: AtomicU64::new(0),
-            ring: RingThread::new(st),
+            ring: RingThread::new(st, tm.clock().clone()),
             buses,
             targets_reset: [AtomicBool::new(false), AtomicBool::new(false)],
             index,
@@ -777,6 +785,9 @@ impl<P: IspPart> Core<P> {
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
             odd_accesses: AtomicU64::new(0),
             heartbeat: OnceLock::new(),
+            timers: std::array::from_fn(|_| Timer::new(tm, me, Self::fire)),
+            #[cfg(test)]
+            _tm: tm.clone(),
         }
     }
 
@@ -828,27 +839,15 @@ impl<P: IspPart> Core<P> {
         let mut st = self.lock();
         while (st.ctl.work && st.ctl.hold == 0 && !st.ctl.paused)
             || (st.ctl.hold == 0 && !st.ctl.paused && !st.ctl.walking && self.release_due(&st))
-            || (st.ctl.walking && !st.ctl.selecting.as_ref().is_some_and(|sel| self.now_ns(&st) < sel.due))
+            || (st.ctl.walking && !st.ctl.selecting.as_ref().is_some_and(|sel| self.now_ns() < sel.due))
         {
             st.wait(&self.wake);
         }
     }
 
-    /// Take the clock off the host's and set it to `ns` (tests). The
-    /// thread reads the clock with `st` held and then waits on `wake`
-    /// with no timeout, so the move is made with `st` held too: made
-    /// outside it, the move and its wake-up can fall between that read and
-    /// that wait, and the thread sleeps through the time it waits for.
-    #[cfg(test)]
-    fn set_test_clock(&self, ns: i64) {
-        let _st = self.lock();
-        self.fake_ns.store(ns, Ordering::Relaxed);
-        self.wake.notify_all();
-    }
-
     /// The buses in their post-reset hold-off now, as a bit mask.
     fn held_mask(&self, st: &State) -> u8 {
-        let now = self.now_ns(st);
+        let now = self.now_ns();
         (0..BUSES).filter(|&b| st.quiet_until[b].is_some_and(|until| now < until)).fold(0, |m, b| m | 1 << b)
     }
 
@@ -869,16 +868,22 @@ impl<P: IspPart> Core<P> {
             && st.parked.iter().any(|p| !p.started && held & (1 << p.bus) == 0)
     }
 
-    /// How long until the first hold-off with a command parked behind it
-    /// ends, when none has ended yet.
-    fn next_release(&self, st: &State) -> Option<i64> {
-        let now = self.now_ns(st);
-        st.parked
-            .iter()
-            .filter_map(|p| st.quiet_until[usize::from(p.bus)])
-            .map(|until| until - now)
-            .filter(|&left| left > 0)
-            .min()
+    /// Arm a timer for the selection and each bus's hold-off that is still
+    /// to come, to wake the ring thread when it does. Read under the state lock.
+    fn arm(&self, st: &State) {
+        let now = self.now_ns();
+        let ahead = |due: Option<i64>| due.filter(|&d| d > now).map(|d| d as u64);
+        let sel = st.ctl.selecting.as_ref().map(|sel| sel.due);
+        let hold = st.quiet_until.map(ahead);
+        for (t, due) in self.timers.iter().zip([ahead(sel), hold[0], hold[1]]) {
+            t.set_due(due);
+        }
+    }
+
+    /// A deadline came due with the thread waiting: wake it to look.
+    fn fire(&self, _due: u64) {
+        drop(self.lock());
+        self.wake.notify_all();
     }
 
     /// Wait out the selection of an absent target on the ring entry at
@@ -899,6 +904,7 @@ impl<P: IspPart> Core<P> {
         }
         // Whoever waits for the ring to settle may now see it waiting on a
         // selection, a resumed one included.
+        self.arm(st);
         self.wake.notify_all();
         self.wait_selection(st, ring.gen)
     }
@@ -915,16 +921,10 @@ impl<P: IspPart> Core<P> {
             if st.ctl.shutdown || st.ctl.hold > 0 || st.ctl.paused || st.ctl.gen != gen {
                 return false;
             }
-            let left = due - self.now_ns(st);
-            if left <= 0 {
+            if due <= self.now_ns() {
                 return true;
             }
-            // A test clock only moves when the test moves it.
-            if self.fake_ns.load(Ordering::Relaxed) == i64::MIN {
-                st.wait_for(&self.wake, Duration::from_nanos(left as u64));
-            } else {
-                st.wait(&self.wake);
-            }
+            st.wait(&self.wake);
         }
     }
 
@@ -1261,7 +1261,7 @@ impl<P: IspPart> Core<P> {
             // nothing. The delay is not clamped, and nothing is posted when
             // the hold ends: model choices, none established.
             mbox::BUS_RESET => {
-                let now = self.now_ns(st);
+                let now = self.now_ns();
                 let bus = usize::from(st.mailbox[2]);
                 if bus >= self.part.channels() {
                     // A bus this part does not have: nothing to quiet or
@@ -1290,6 +1290,7 @@ impl<P: IspPart> Core<P> {
                     self.targets_reset[bus].store(true, Ordering::Release);
                     let delay = BUS_RESET_DELAY_UNIT * u32::from(st.mailbox[1]);
                     st.quiet_until[bus] = (!delay.is_zero()).then(|| now.saturating_add(delay.as_nanos() as i64));
+                    self.arm(st);
                     self.kick(st);
                 }
                 self.wake.notify_all();
@@ -1670,18 +1671,7 @@ impl<P: IspPart> Core<P> {
         let mut st = self.lock();
         loop {
             while !st.ctl.shutdown && !(st.ctl.hold == 0 && !st.ctl.paused && (st.ctl.work || self.release_due(&st))) {
-                // Commands parked behind a hold-off start when it ends,
-                // with nobody to wake the thread. A test clock only moves
-                // when the test moves it.
-                let ends = (st.ctl.hold == 0 && !st.ctl.paused && self.fake_ns.load(Ordering::Relaxed) == i64::MIN)
-                    .then(|| self.next_release(&st))
-                    .flatten();
-                match ends {
-                    Some(left) if left > 0 => {
-                        st.wait_for(&self.wake, Duration::from_nanos(left as u64));
-                    }
-                    _ => st.wait(&self.wake),
-                }
+                st.wait(&self.wake);
             }
             if st.ctl.shutdown {
                 return;
@@ -1787,7 +1777,7 @@ impl<P: IspPart> Core<P> {
             if let Some(i) = self.releasable(&st) {
                 st.parked[i].started = true;
                 let parked = st.parked[i].clone();
-                let now = self.now_ns(&st);
+                let now = self.now_ns();
                 // The chip would have begun selecting when the hold ended.
                 let start = st.quiet_until[usize::from(parked.bus)].map_or(now, |until| until.min(now));
                 let len = u32::from(st.rqst_len);
@@ -1850,7 +1840,7 @@ impl<P: IspPart> Core<P> {
                 }
                 continue;
             }
-            let now = self.now_ns(&st);
+            let now = self.now_ns();
             let (back, outcome) = self.run_prepared(st, &ring, prepared, now);
             st = back;
             let done = match outcome {
@@ -2144,23 +2134,21 @@ impl<P: IspPart> PciFunction for Isp<P> {
 impl<P: IspPart> crate::traits::Saveable for Isp<P> {
     fn save_state(&self) -> toml::Value {
         self.quiesced(|st| {
-            // Absolute deadlines mean nothing on another run's clock.
-            let now = self.now_ns(st);
-            let left = st.ctl.selecting.as_ref().map(|sel| sel.due - now);
-            // A hold-off already over but not acted on still crosses: the
-            // commands parked behind it start when the load re-arms it at 0.
-            let quiet_left = st.quiet_until.map(|until| until.map(|u| u - now));
-            self.save_locked(st, left, quiet_left)
+            // Deadlines cross as machine times. A hold-off over but not yet
+            // acted on still crosses, so the commands behind it start at the load.
+            self.save_locked(st)
         })
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         self.quiesced(|st| {
-            let now = self.now_ns(st);
-            self.load_locked(st, v, now);
+            let now = self.now_ns();
+            self.load_locked(st, v, now)?;
+            self.arm(st);
             self.cancel.store(0, Ordering::Release);
             self.publish_gen(st);
-        });
+            Ok::<(), String>(())
+        })?;
         // The controller took its own state from the snapshot.
         self.resync_irq();
         Ok(())
@@ -2169,7 +2157,7 @@ impl<P: IspPart> crate::traits::Saveable for Isp<P> {
 
 #[allow(private_bounds)]
 impl<P: IspPart> Isp<P> {
-    fn save_locked(&self, st: &State, selecting_left: Option<i64>, quiet_left: [Option<i64>; BUSES]) -> toml::Value {
+    fn save_locked(&self, st: &State) -> toml::Value {
         let mut t = toml::map::Map::new();
         for (k, v) in [
             ("bus_cfg1", st.bus_cfg1), ("bus_ctrl", st.bus_ctrl), ("bus_status", st.bus_status),
@@ -2205,13 +2193,13 @@ impl<P: IspPart> Isp<P> {
             toml::Value::Table(m)
         });
         t.insert("pending".into(), toml::Value::Array(pending.collect()));
-        // Each bus's hold-off after a bus reset, as the time left, and the
+        // Each bus's hold-off after a bus reset, as a machine time, and the
         // commands parked behind it by their ring positions: their entries
         // are in the guest's ring.
-        let holds = quiet_left.iter().enumerate().filter_map(|(bus, left)| {
+        let holds = st.quiet_until.iter().enumerate().filter_map(|(bus, at)| {
             let mut m = toml::map::Map::new();
             m.insert("bus".into(), toml::Value::Integer(bus as i64));
-            m.insert("left_ns".into(), toml::Value::Integer((*left)?.max(0)));
+            m.insert("at_ns".into(), toml::Value::Integer((*at)?));
             Some(toml::Value::Table(m))
         });
         t.insert("bus_hold".into(), toml::Value::Array(holds.collect()));
@@ -2225,11 +2213,11 @@ impl<P: IspPart> Isp<P> {
             toml::Value::Table(m)
         });
         t.insert("parked".into(), toml::Value::Array(parked.collect()));
-        // A selection still timing out: what is left of it, and the
-        // completion it ends in.
-        if let (Some(sel), Some(left)) = (&st.ctl.selecting, selecting_left) {
+        // A selection still timing out: when it ends, and the completion it
+        // ends in.
+        if let Some(sel) = &st.ctl.selecting {
             let mut m = toml::map::Map::new();
-            m.insert("left_ns".into(), toml::Value::Integer(left.max(0)));
+            m.insert("at_ns".into(), toml::Value::Integer(sel.due));
             m.insert("cons".into(), toml::Value::Integer(i64::from(sel.cons)));
             m.insert("orphan".into(), toml::Value::Boolean(sel.orphan));
             m.insert("bus".into(), toml::Value::Integer(i64::from(sel.bus)));
@@ -2248,7 +2236,7 @@ impl<P: IspPart> Isp<P> {
 
     /// Unprocessed request entries survive: the ring thread is kicked and
     /// runs them after the load.
-    fn load_locked(&self, st: &mut State, v: &toml::Value, now: i64) {
+    fn load_locked(&self, st: &mut State, v: &toml::Value, now: i64) -> Result<(), String> {
         {
             let ctl = std::mem::take(&mut st.ctl);
             *st = State::new();
@@ -2317,10 +2305,10 @@ impl<P: IspPart> Isp<P> {
             };
             if let Some(toml::Value::Array(a)) = get_field(v, "bus_hold") {
                 for h in a {
-                    if let (Some(bus), Some(left)) = (int(h, "bus"), int(h, "left_ns")) {
-                        if let Some(slot) = usize::try_from(bus).ok().and_then(|b| st.quiet_until.get_mut(b)) {
-                            *slot = Some(now.saturating_add(left.max(0)));
-                        }
+                    let at = int(h, "at_ns").ok_or("bus_hold: missing at_ns")?;
+                    if let Some(slot) = int(h, "bus").and_then(|b| usize::try_from(b).ok()).and_then(|b| st.quiet_until.get_mut(b)) {
+                        // One that ended while stopped counts from the load.
+                        *slot = Some(at.max(now));
                     }
                 }
             }
@@ -2340,12 +2328,11 @@ impl<P: IspPart> Isp<P> {
                     });
                 }
             }
-            // The wait goes on for what was left of it, from this clock.
             if let Some(sel) = get_field(v, "selecting") {
-                let left = match get_field(sel, "left_ns") {
-                    Some(toml::Value::Integer(n)) => (*n).max(0),
-                    _ => 0,
+                let Some(toml::Value::Integer(at)) = get_field(sel, "at_ns") else {
+                    return Err("selecting: missing at_ns".into());
                 };
+                let at = *at;
                 let cons = match get_field(sel, "cons") {
                     Some(toml::Value::Integer(n)) => *n as u32,
                     _ => 0,
@@ -2353,9 +2340,10 @@ impl<P: IspPart> Isp<P> {
                 let orphan = matches!(get_field(sel, "orphan"), Some(toml::Value::Boolean(true)));
                 let bus = int(sel, "bus").unwrap_or(0).clamp(0, BUSES as i64 - 1) as u8;
                 st.ctl.selecting =
-                    Some(Selection { cons, due: now.saturating_add(left), done: load_pending(sel), bus, orphan });
+                    Some(Selection { cons, due: at, done: load_pending(sel), bus, orphan });
             }
         }
+        Ok(())
     }
 }
 

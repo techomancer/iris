@@ -9,11 +9,13 @@
 
 use std::collections::VecDeque;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use crate::dev::isp1040::{
     mbox, Isp1040, reg, Bank, Core, Isp, IspPart, Locked, State, CFG1_BANK_SELECT, FW_VERSION, IOCB_ABORTED, IOCB_RESET, MAILBOX_COUNT,
     MAX_REQUESTS, MAX_TARGET, PCI_CLASS_SCSI, PCI_VENDOR_QLOGIC, SEMAPHORE_LOCK, STATE_ALL_PHASES,
 };
+use crate::hptimer::TimerManager;
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_INTA};
 use crate::scsi::ScsiBus;
@@ -175,10 +177,6 @@ impl IspPart for Isp12160Part {
 /// The two-channel controller. The shared ISP engine owns both buses.
 pub struct Isp12160(Isp<Isp12160Part>);
 
-impl Default for Isp12160 {
-    fn default() -> Self { Self::new(Self::new_bus(), Self::new_bus()) }
-}
-
 impl Isp12160 {
     /// Light the status bar's SCSI activity bits in `heartbeat`.
     pub fn set_heartbeat(&self, heartbeat: std::sync::Arc<std::sync::atomic::AtomicU64>) {
@@ -192,8 +190,8 @@ impl Isp12160 {
     }
 
     /// The controller with its two channel buses already populated.
-    pub fn new(bus0: ScsiBus, bus1: ScsiBus) -> Self {
-        Self(Isp::with_part(0, Isp12160Part, Box::new([bus0, bus1])))
+    pub fn new(bus0: ScsiBus, bus1: ScsiBus, tm: &Arc<TimerManager>) -> Self {
+        Self(Isp::with_part(0, Isp12160Part, Box::new([bus0, bus1]), tm))
     }
 
     /// Borrow one channel for the shared monitor commands.
@@ -339,7 +337,7 @@ mod tests {
         let bus0 = Isp12160::new_bus();
         let bus1 = Isp12160::new_bus();
         bus1.attach_device(1, "", true, Vec::new(), false, None, false).unwrap();
-        let isp = Isp12160::new(bus0, bus1);
+        let isp = Isp12160::new(bus0, bus1, &Arc::new(crate::hptimer::TimerManager::new()));
 
         let status = DiscChanger::disc_status(&isp);
         assert_eq!(status.iter().map(|drive| drive.0).collect::<Vec<_>>(), vec![17]);

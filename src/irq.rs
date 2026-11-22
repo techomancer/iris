@@ -177,12 +177,6 @@ impl<S: IrqLevel> IrqGuard<'_, S> {
         cv.wait(&mut self.guard);
     }
 
-    /// Like [`IrqGuard::wait`], giving up after `timeout`.
-    pub fn wait_for(&mut self, cv: &Condvar, timeout: Duration) {
-        self.drive();
-        cv.wait_for(&mut self.guard, timeout);
-    }
-
     /// Run `f` with the lock let go.
     pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R) -> R {
         self.drive();
@@ -398,6 +392,7 @@ mod irq_mutex_tests {
     fn waiting_drives_first() {
         let (probe, line, dev) = device();
         let cv = Condvar::new();
+        let done = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             let mut g = dev.lock(&line);
             *g = true;
@@ -407,9 +402,14 @@ mod irq_mutex_tests {
                     std::thread::yield_now();
                 }
                 assert!(probe.level(), "the line was not driven while the lock was waited out");
-                cv.notify_all();
+                // Until the wait returns: a notify before it began would be lost.
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    cv.notify_all();
+                    std::thread::yield_now();
+                }
             });
-            g.wait_for(&cv, Duration::from_secs(5));
+            g.wait(&cv);
+            done.store(true, std::sync::atomic::Ordering::Release);
         });
         assert_eq!(probe.writes(), [true]);
     }

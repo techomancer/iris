@@ -14,6 +14,21 @@ use crate::pci::PciDmaStatus;
 use crate::traits::{Device, Saveable};
 use std::sync::Mutex;
 
+/// Put the ring's clock at `ns`, stopped so that it moves only here.
+pub(crate) fn step_ring_to<S: RingState + IrqLevel>(ring: &RingThread<S>, ns: i64) {
+    let clock = ring.clock();
+    clock.stop();
+    clock.restore(ns as u64);
+}
+
+/// Set the clock to `ns`. Made with `st` held, as the ring thread reads the clock
+/// under it and then waits with no timeout.
+pub(crate) fn set_test_clock<P: IspPart>(isp: &Isp<P>, ns: i64) {
+    let _st = isp.lock();
+    step_ring_to(&isp.ring, ns);
+    isp.wake.notify_all();
+}
+
 pub(crate) const MEM: usize = 1 << 20;
 
 const RQST: u32 = 0x1000;
@@ -65,6 +80,14 @@ impl Rig {
         r
     }
 
+    /// Like `with_disk`, on a clock the test steps.
+    fn stepped(name: &str, id: u8, blocks: usize) -> Rig {
+        let tm = Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped()));
+        let r = Rig::on(Isp1040::new_at(0, Isp1040::new_bus(), &tm));
+        r.disk(name, id, blocks);
+        r
+    }
+
     fn disk(&self, name: &str, id: u8, blocks: usize) {
         self.isp.bus().attach_image(id, &image(name, blocks), false).expect("attach");
     }
@@ -74,7 +97,7 @@ impl<P: IspPart> Rig<P> {
     /// Take the adapter's clock off the host's and set it to `ns`; the
     /// ring thread has seen the new time when this returns.
     fn clock(&self, ns: i64) {
-        self.isp.set_test_clock(ns);
+        set_test_clock(&self.isp, ns);
         self.isp.wait_idle();
     }
 
@@ -1105,31 +1128,32 @@ fn a_paused_adapter_posts_a_selection_that_ran_out_meanwhile_when_it_resumes() {
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1);
 }
 
-/// On the real clock the time the machine stood still is not time spent
-/// selecting: a wait paused for longer than its timeout still has all it
-/// had left when the machine runs again.
+/// The time the machine stood still is not time spent selecting: a wait
+/// over a stopped clock for longer than its timeout still has all it had
+/// left when the machine runs again.
 #[test]
 fn time_the_machine_was_stopped_does_not_count_against_a_selection() {
-    let r = Rig::with_disk("selection-stopped", 1, 64);
+    let r = Rig::stepped("selection-stopped", 1, 64);
     r.init_rings(4, 4);
     assert_eq!(r.cmd(&[mbox::SET_SELECTION_TIMEOUT, 300]), mbox::COMPLETE);
     queue_absent(&r, 0, 0x6d);
     spin_until("a selection to begin", || r.isp.lock().ctl.selecting.is_some());
-    r.isp.pause();
-    let frozen = r.isp.now_ns(&r.isp.lock());
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(r.isp.now_ns(&r.isp.lock()), frozen, "the adapter's clock stands still with the machine");
-    r.isp.resume();
+    let clock = r.isp.ring.clock().clone();
+    clock.stop();
+    let frozen = r.isp.now_ns();
+    clock.step(600_000_000);
+    assert_eq!(r.isp.now_ns(), frozen, "the adapter's clock stands still with the machine");
+    clock.start();
     r.isp.wait_idle();
     assert!(!posted(&r, 0x6d), "twice its timeout passed on the host, none on the adapter's clock");
     let st = r.isp.lock();
-    assert!(st.ctl.selecting.as_ref().is_some_and(|sel| r.isp.now_ns(&st) < sel.due));
+    assert!(st.ctl.selecting.as_ref().is_some_and(|sel| r.isp.now_ns() < sel.due));
 }
 
-/// A snapshot taken mid-wait carries what is left of it, so the command
-/// completes that long after the load whatever the clock reads there.
+/// A snapshot taken mid-wait carries when the wait ends, so the command
+/// completes then on the clock the machine restores before the load.
 #[test]
-fn a_snapshot_taken_during_a_selection_resumes_with_the_time_left() {
+fn a_snapshot_taken_during_a_selection_resumes_at_the_time_it_ends() {
     let src = Rig::with_disk("selection-save-src", 1, 64);
     src.init_rings(4, 4);
     src.clock(100 * MS);
@@ -1143,20 +1167,18 @@ fn a_snapshot_taken_during_a_selection_resumes_with_the_time_left() {
     src.clock(100 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS);
     assert!(posted(&src, 0x6e));
 
-    // The load is on a machine whose clock starts from somewhere else.
-    for base in [0, 7_000 * MS] {
-        let dst = Rig::with_disk("selection-save-dst", 1, 64);
-        dst.put_entry(0, &request(0x6e, 3, &[0, 0, 0, 0, 0, 0], &[]));
-        dst.clock(base);
-        dst.isp.load_state(&saved).expect("load_state");
-        dst.clock(base + 200 * MS - 1);
-        assert!(!posted(&dst, 0x6e), "200 ms were left at the save; base {base}");
-        assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0);
-        dst.clock(base + 200 * MS);
-        assert!(posted(&dst, 0x6e), "completes when the time left is up; base {base}");
-        assert_eq!(dst.r(reg::RESPONSE_QUEUE), 1);
-        assert_eq!(dst.r(reg::REQUEST_QUEUE), 1);
-    }
+    // The machine puts the clock back to its saved reading, then loads.
+    let dst = Rig::with_disk("selection-save-dst", 1, 64);
+    dst.put_entry(0, &request(0x6e, 3, &[0, 0, 0, 0, 0, 0], &[]));
+    dst.clock(150 * MS);
+    dst.isp.load_state(&saved).expect("load_state");
+    dst.clock(350 * MS - 1);
+    assert!(!posted(&dst, 0x6e), "200 ms were left at the save");
+    assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0);
+    dst.clock(350 * MS);
+    assert!(posted(&dst, 0x6e), "completes when the selection ends");
+    assert_eq!(dst.r(reg::RESPONSE_QUEUE), 1);
+    assert_eq!(dst.r(reg::REQUEST_QUEUE), 1);
 }
 
 #[test]
@@ -1871,7 +1893,7 @@ fn a_controller_built_on_a_filled_bus_answers_for_its_target() {
     let img = image("filled", 64);
     let bus = Isp1040::new_bus();
     bus.attach_image(3, &img, false).unwrap();
-    let isp = Isp1040::new_at(1, bus);
+    let isp = Isp1040::new_at(1, bus, &Arc::new(crate::hptimer::TimerManager::new()));
     assert!(isp.bus().has_target(3));
     assert!(!isp.bus().has_target(4));
     let inquiry = crate::scsi::ScsiRequest {
@@ -2722,38 +2744,36 @@ fn a_refused_cdb_read_when_the_hold_ends_drops_the_command() {
     assert!(r.isp.notes().iter().any(|n| n.contains("dropped")), "logged: {:?}", r.isp.notes());
 }
 
-/// A snapshot carries each bus's remaining hold and where the parked
+/// A snapshot carries when each bus's hold ends and where the parked
 /// commands are.
 #[test]
-fn a_snapshot_taken_during_a_hold_resumes_with_the_time_left() {
+fn a_snapshot_taken_during_a_hold_resumes_at_the_time_it_ends() {
     let src = hold_rig("hold-save-src");
     bus_reset(&src, 2, 0);
     queue_absent(&src, 0, 0x6e);
     src.clock(500 * MS);
     let saved = src.isp.save_state();
 
-    for base in [0, 7_000 * MS] {
-        let dst = Rig::with_disk("hold-save-dst", 1, 64);
-        dst.put_entry(0, &request(0x6e, 3, &[0, 0, 0, 0, 0, 0], &[]));
-        dst.clock(base);
-        dst.isp.load_state(&saved).expect("load_state");
-        dst.isp.wait_idle();
-        assert_eq!(dst.r(reg::REQUEST_QUEUE), 0, "the parked command holds request-out; base {base}");
-        assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0);
-        // A second command joins the hold.
-        dst.put_entry(1, &request(0x6f, 3, &[0, 0, 0, 0, 0, 0], &[]));
-        dst.doorbell(2);
-        let ends = base + 1_500 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS;
-        dst.clock(ends - 1);
-        assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0, "1.5 s of hold and the timeout were left; base {base}");
-        dst.clock(ends);
-        assert_eq!(handles(&dst, 2), [0x6e, 0x6f], "both answered, oldest first; base {base}");
-        assert_eq!(dst.r(reg::REQUEST_QUEUE), 2);
-    }
+    let dst = Rig::with_disk("hold-save-dst", 1, 64);
+    dst.put_entry(0, &request(0x6e, 3, &[0, 0, 0, 0, 0, 0], &[]));
+    dst.clock(500 * MS);
+    dst.isp.load_state(&saved).expect("load_state");
+    dst.isp.wait_idle();
+    assert_eq!(dst.r(reg::REQUEST_QUEUE), 0, "the parked command holds request-out");
+    assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0);
+    // A second command joins the hold.
+    dst.put_entry(1, &request(0x6f, 3, &[0, 0, 0, 0, 0, 0], &[]));
+    dst.doorbell(2);
+    let ends = 2_000 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS;
+    dst.clock(ends - 1);
+    assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0, "the hold ends at 2 s and the timeout follows");
+    dst.clock(ends);
+    assert_eq!(handles(&dst, 2), [0x6e, 0x6f], "both answered, oldest first");
+    assert_eq!(dst.r(reg::REQUEST_QUEUE), 2);
 }
 
 /// A hold that has run out but that the ring thread had not yet acted on
-/// still crosses, and the load re-arms it at zero.
+/// still crosses, and the load acts on it at once.
 #[test]
 fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
     let src = hold_rig("hold-expired-src");
@@ -2765,7 +2785,7 @@ fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
     let hold = get_field(&saved, "bus_hold").expect("bus_hold");
     let toml::Value::Array(hold) = hold else { panic!("bus_hold is not an array") };
     assert_eq!(hold.len(), 1, "the ended hold is carried");
-    assert_eq!(get_field(&hold[0], "left_ns"), Some(&toml::Value::Integer(0)));
+    assert_eq!(get_field(&hold[0], "at_ns"), Some(&toml::Value::Integer(S)));
 
     let dst = Rig::with_disk("hold-expired-dst", 1, 64);
     dst.put_entry(0, &request(0x6c, 3, &[0, 0, 0, 0, 0, 0], &[]));
@@ -2777,6 +2797,33 @@ fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
     assert_eq!(handles(&dst, 1), [0x6c], "it starts at the load");
 }
 
+/// A hold or a selection without the time it ends at is refused, not loaded as ended.
+#[test]
+fn a_snapshot_without_its_deadlines_is_refused() {
+    let src = hold_rig("old-src");
+    bus_reset(&src, 1, 0);
+    queue_absent(&src, 0, 0x6c);
+    src.isp.pause();
+    src.clock(5 * S);
+    let saved = src.isp.save_state();
+    let hold = |v: &mut toml::Value| match v.get_mut("bus_hold") {
+        Some(toml::Value::Array(a)) => a[0].as_table_mut().unwrap().remove("at_ns"),
+        _ => None,
+    };
+    let mut old = saved.clone();
+    assert!(hold(&mut old).is_some());
+    let dst = Rig::with_disk("old-dst", 1, 64);
+    assert!(dst.isp.load_state(&old).is_err());
+
+    let sel = Rig::with_disk("old-sel", 1, 64);
+    sel.init_rings(4, 4);
+    sel.clock(100 * MS);
+    queue_absent(&sel, 0, 0x6d);
+    sel.clock(150 * MS);
+    let mut old = sel.isp.save_state();
+    assert!(old.get_mut("selecting").and_then(|s| s.as_table_mut()).unwrap().remove("at_ns").is_some());
+    assert!(dst.isp.load_state(&old).is_err());
+}
 
 // ---- the hold-off on the real clock, and thread timing ----
 /// How long a real-clock test waits for a completion it has every reason
@@ -2815,25 +2862,22 @@ fn a_hold_on_the_real_clock_releases_without_a_poke() {
 
 #[test]
 fn the_hold_does_not_run_while_the_machine_is_stopped() {
-    let r = Rig::with_disk("rv-pause", 1, 64);
+    let r = Rig::stepped("rv-pause", 1, 64);
     r.init_rings(8, 8);
-    let t = std::time::Instant::now();
     bus_reset(&r, 1, 0);
     r.put_entry(0, &tur1(0x42));
     r.doorbell(1);
+    // A machine stop parks the ring thread and holds the clock.
+    let clock = r.isp.ring.clock().clone();
     r.isp.pause();
-    // The time the hold has run is the stretch up to the pause and the
-    // stretch after the resume; the stopped time between does not count.
-    let before_pause = t.elapsed();
-    std::thread::sleep(Duration::from_millis(1400));
+    clock.stop();
+    clock.step(1_400_000_000);
+    clock.start();
     r.isp.resume();
-    let resumed = std::time::Instant::now();
-    std::thread::sleep(Duration::from_millis(100));
-    let posted = r.r(reg::RESPONSE_QUEUE);
-    if before_pause + resumed.elapsed() < Duration::from_millis(1000) {
-        assert_eq!(posted, 0, "hold ran while stopped");
-    }
-    assert!(wait_resp(&r, 1, WAIT), "never released after resume");
+    r.isp.wait_idle();
+    assert_eq!(r.r(reg::RESPONSE_QUEUE), 0, "hold ran while stopped");
+    r.clock(r.isp.now_ns() + S);
+    assert_eq!(r.r(reg::RESPONSE_QUEUE), 1, "never released after resume");
 }
 
 #[test]
@@ -2876,7 +2920,7 @@ fn a_full_response_ring_does_not_spin_the_thread_on_a_released_command() {
     bus_reset(&r, 1, 0);
     for i in 0..3 { r.put_entry(i, &tur1(0x60 + i)); }
     r.doorbell(3);
-    r.isp.set_test_clock(S);
+    set_test_clock(&r.isp, S);
     let isp = r.isp.core.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || { isp.wait_idle(); let _ = tx.send(()); });

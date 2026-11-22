@@ -196,7 +196,7 @@ fn build_baseio(
     // widget 15 and E as 14 is inferred from the port letters; head E's bus is empty.
     let pci = xbridge.bus(HEAD_F);
     // The on-board Fibre Channel adapter, with the disks of `[fibre_channel]`.
-    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci)?;
+    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci, timers)?;
     card.attach(pci, 1);
     // The slot runs 64-bit data phases, inferred from the PROM: its rings are right only if the
     // bridge reverses each adapter DMA doubleword as it does on such a slot.

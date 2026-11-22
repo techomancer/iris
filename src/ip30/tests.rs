@@ -540,7 +540,7 @@ impl Octane {
         eth.attach(link);
         ioc3.connect_superio_interrupt(bridge.bus().board_irq(crate::pci::BoardIrq(SUPERIO_PIN as u8)));
 
-        let isp = [Arc::new(Isp1040::new_at(0, Isp1040::new_bus())), Arc::new(Isp1040::new_at(1, Isp1040::new_bus()))];
+        let isp = [0, 1].map(|i| Arc::new(Isp1040::new_at(i, Isp1040::new_bus(), &Arc::new(crate::hptimer::TimerManager::new()))));
         let at = |slot: u32| crate::pci::DevFn { device: slot as u8, function: 0 };
         bridge.bus().attach(at(SLOT_ISP0 as u32), isp[0].clone());
         bridge.bus().attach(at(SLOT_ISP1 as u32), isp[1].clone());

@@ -7,7 +7,7 @@
 //!
 //! Ported from hw/net/ics1890.c in jamesbraid/qemu-sgi-origami.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::dev::mii::MiiPhy;
 use crate::snapshot::{field_bool, field_u16, field_u32, field_u64, field_u8, StateTable};
@@ -47,8 +47,8 @@ pub struct Ics1890 {
     last_link: bool,
     backend_up: bool,
     nego_done: bool,
-    deadline: Option<Instant>,
-    delay: Duration,
+    deadline: Option<u64>,
+    delay: u64,
     /// Accesses to registers the part does not implement.
     pub unimplemented_accesses: u32,
 }
@@ -74,10 +74,10 @@ impl Ics1890 {
             backend_up: true,
             nego_done: false,
             deadline: None,
-            delay,
+            delay: delay.as_nanos() as u64,
             unimplemented_accesses: 0,
         };
-        p.reset(Instant::now());
+        p.reset(0);
         p
     }
 
@@ -85,7 +85,7 @@ impl Ics1890 {
 
     /// Hardware and software reset: defaults, no override, no latches, and a
     /// fresh negotiation if enabled.
-    pub fn reset(&mut self, now: Instant) {
+    pub fn reset(&mut self, now: u64) {
         self.bmcr = 0x3000;
         self.bmsr_caps = 0x7800;
         self.id1 = 0x0015;
@@ -121,7 +121,7 @@ impl Ics1890 {
         !self.power_down() && self.backend_up && (!self.autoneg() || self.nego_done)
     }
 
-    fn start_negotiation(&mut self, now: Instant) {
+    fn start_negotiation(&mut self, now: u64) {
         self.nego_done = false;
         self.partner = 0;
         self.page_received = false;
@@ -174,7 +174,7 @@ impl Ics1890 {
 }
 
 // The transceiver's registers and auto-negotiation progress for a
-// snapshot. Its one deadline is saved as the time it had left.
+// snapshot. Its one deadline is saved as an absolute machine time.
 impl Ics1890 {
 
 
@@ -188,7 +188,7 @@ impl MiiPhy for Ics1890 {
     }
 
     /// When a negotiation in progress completes, if one is.
-    fn deadline(&self) -> Option<Instant> {
+    fn deadline(&self) -> Option<u64> {
         self.deadline
     }
 
@@ -205,7 +205,7 @@ impl MiiPhy for Ics1890 {
 
     /// Advance the negotiation deadline and note link transitions. Reads never
     /// start or postpone negotiation; this only observes the clock.
-    fn sync(&mut self, now: Instant) {
+    fn sync(&mut self, now: u64) {
         if let Some(d) = self.deadline {
             if now >= d && !self.power_down() && self.backend_up {
                 self.deadline = None;
@@ -221,7 +221,7 @@ impl MiiPhy for Ics1890 {
         self.last_link = link;
     }
 
-    fn read(&mut self, r: u8, now: Instant) -> u16 {
+    fn read(&mut self, r: u8, now: u64) -> u16 {
         self.sync(now);
         match r {
             0 => self.bmcr,
@@ -283,7 +283,7 @@ impl MiiPhy for Ics1890 {
         }
     }
 
-    fn write(&mut self, r: u8, val: u16, now: Instant) {
+    fn write(&mut self, r: u8, val: u16, now: u64) {
         self.sync(now);
         let r = usize::from(r);
         let armed = self.override_armed;
@@ -361,7 +361,7 @@ impl MiiPhy for Ics1890 {
     }
 
     /// The packet backend's cable state.
-    fn set_backend_link(&mut self, up: bool, now: Instant) {
+    fn set_backend_link(&mut self, up: bool, now: u64) {
         self.sync(now);
         if self.backend_up == up {
             return;
@@ -377,7 +377,7 @@ impl MiiPhy for Ics1890 {
         self.sync(now);
     }
 
-    fn save_state(&self, now: Instant) -> toml::Value {
+    fn save_state(&self) -> toml::Value {
         StateTable::new()
             .u8("addr", self.addr)
             .u16("bmcr", self.bmcr)
@@ -396,15 +396,14 @@ impl MiiPhy for Ics1890 {
             .bool("last_link", self.last_link)
             .bool("backend_up", self.backend_up)
             .bool("nego_done", self.nego_done)
-            // Nanoseconds left plus one; zero for none.
-            .u64("deadline", self.deadline.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1))
-            .u64("delay", self.delay.as_nanos() as u64)
+            // Machine nanoseconds plus one; zero for none.
+            .u64("deadline_at", self.deadline.map_or(0, |d| d + 1))
+            .u64("delay", self.delay)
             .u32("unimplemented_accesses", self.unimplemented_accesses)
             .build()
     }
 
-    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
-        let deadline = field_u64(v, "deadline")?;
+    fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
         *self = Self {
             addr: field_u8(v, "addr")?,
             bmcr: field_u16(v, "bmcr")?,
@@ -423,14 +422,14 @@ impl MiiPhy for Ics1890 {
             last_link: field_bool(v, "last_link")?,
             backend_up: field_bool(v, "backend_up")?,
             nego_done: field_bool(v, "nego_done")?,
-            deadline: (deadline != 0).then(|| now + Duration::from_nanos(deadline - 1)),
-            delay: Duration::from_nanos(field_u64(v, "delay")?),
+            deadline: field_u64(v, "deadline_at")?.checked_sub(1),
+            delay: field_u64(v, "delay")?,
             unimplemented_accesses: field_u32(v, "unimplemented_accesses")?,
         };
         Ok(())
     }
-    fn power_on(&mut self) {
-        Ics1890::reset(self, Instant::now());
+    fn power_on(&mut self, now: u64) {
+        Ics1890::reset(self, now);
     }
 }
 
@@ -438,9 +437,8 @@ impl MiiPhy for Ics1890 {
 mod tests {
     use super::*;
 
-    fn phy() -> (Ics1890, Instant) {
-        let now = Instant::now();
-        (Ics1890::new(1, Duration::from_millis(100)), now)
+    fn phy() -> (Ics1890, u64) {
+        (Ics1890::new(1, Duration::from_millis(100)), 0)
     }
 
     /// The identity and advertisement a driver's probe compares.

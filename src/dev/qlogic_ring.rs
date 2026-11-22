@@ -5,8 +5,7 @@
 //! and the register side tell each other does not depend on the adapter's
 //! ring format: a generation that a reset moves on, a fence so that no store
 //! of cancelled work reaches guest memory after the reset returns, a hold for
-//! saving state, a pause for a stopped machine with the time it stood still,
-//! and the thread's start and stop. The ring walks stay with the adapters.
+//! saving state, a pause for a stopped machine, and the thread's start and stop. The ring walks stay with the adapters.
 //!
 //! The notes list `scsi notes` prints and the guest-memory transfers are the
 //! same for every adapter too, and live here. The state lock is an
@@ -16,19 +15,15 @@
 //! A command's data length and how its buffer segments are placed and read
 //! are the same on every adapter, and live here as plain functions.
 //!
-//! The adapters' timed waits use the clock here, host time less the time the
-//! machine was stopped, because iris has no emulated-time source a device can
-//! read. [`crate::dev::heart::Clock`] does not suit: it has no stopped-time
-//! accounting, and the thread must know whether the clock it waits on is the
-//! host's or one a test moves.
+//! The adapters' timed waits read the machine clock, which stops with the machine.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Instant;
 
 use parking_lot::Mutex;
 
+use crate::clock::Clock;
 use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::pci::PciFunctionState;
 use crate::scsi::scsi_cmd;
@@ -51,10 +46,6 @@ pub struct RingCtl {
     /// The machine is stopped: the thread takes no further work.
     pub(crate) paused: bool,
     pub(crate) shutdown: bool,
-    /// When the adapter's clock last stopped with the machine, and how long
-    /// it has stood still in all.
-    pub(crate) stopped_at: Option<Instant>,
-    pub(crate) stopped_ns: i64,
 }
 
 /// An adapter's state, which carries a [`RingCtl`].
@@ -79,15 +70,12 @@ pub struct RingThread<S: IrqLevel> {
     /// Signals [`RingCtl`] changes both ways.
     pub(crate) wake: Condvar,
     pub(crate) worker: Mutex<Option<JoinHandle<()>>>,
-    /// Where the adapter's clock starts.
-    pub(crate) start: Instant,
-    /// When not `i64::MIN`, the clock in nanoseconds, for tests.
-    pub(crate) fake_ns: AtomicI64,
+    clock: Clock,
 }
 
 impl<S: RingState + IrqLevel> RingThread<S> {
     /// The interrupt line follows the level the state gives.
-    pub fn new(state: S) -> Self {
+    pub fn new(state: S, clock: Clock) -> Self {
         let gen = state.ring_ctl().gen;
         Self {
             st: IrqMutex::new(state),
@@ -95,9 +83,13 @@ impl<S: RingState + IrqLevel> RingThread<S> {
             fence: Mutex::new(()),
             wake: Condvar::new(),
             worker: Mutex::new(None),
-            start: Instant::now(),
-            fake_ns: AtomicI64::new(i64::MIN),
+            clock,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Tell the ring thread the ring may have moved.
@@ -123,17 +115,8 @@ impl<S: RingState + IrqLevel> RingThread<S> {
         (self.gen.load(Ordering::Acquire) == gen).then(store)
     }
 
-    /// The adapter's clock in nanoseconds: host time less the time the
-    /// machine was stopped.
-    pub fn now_ns(&self, st: &S) -> i64 {
-        match self.fake_ns.load(Ordering::Relaxed) {
-            i64::MIN => {
-                let ctl = st.ring_ctl();
-                let at = ctl.stopped_at.unwrap_or_else(Instant::now);
-                at.duration_since(self.start).as_nanos() as i64 - ctl.stopped_ns
-            }
-            t => t,
-        }
+    pub fn now_ns(&self) -> i64 {
+        self.clock.now() as i64
     }
 
     /// Start the ring thread (idempotent), running `run` on `core`, and let
@@ -171,7 +154,6 @@ impl<S: RingState + IrqLevel> RingThread<S> {
         let mut st = self.st.lock(line);
         let ctl = st.ring_ctl_mut();
         ctl.paused = true;
-        ctl.stopped_at.get_or_insert_with(Instant::now);
         // Parked mid-wait, the thread lets go of its entry.
         self.wake.notify_all();
         while st.ring_ctl().walking {
@@ -185,9 +167,6 @@ impl<S: RingState + IrqLevel> RingThread<S> {
         let mut st = self.st.lock(line);
         let ctl = st.ring_ctl_mut();
         ctl.paused = false;
-        if let Some(t) = ctl.stopped_at.take() {
-            ctl.stopped_ns += t.elapsed().as_nanos() as i64;
-        }
         self.kick(&mut st);
     }
 

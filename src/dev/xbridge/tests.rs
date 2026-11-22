@@ -192,7 +192,7 @@ fn a_link_reset_resets_the_head_and_its_bus_before_the_board() {
     use crate::dev::isp12160::Isp12160;
 
     let (c, _, _) = chip();
-    let isp = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+    let isp = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus(), &Arc::new(crate::hptimer::TimerManager::new())));
     c.bus(HEAD_F).attach(at(1), isp.clone());
     let f = c.widget(HEAD_F).unwrap();
     let pin1 = |f: &Arc<dyn BusDevice>| f.read32(INT_STATUS).data & 2 != 0;

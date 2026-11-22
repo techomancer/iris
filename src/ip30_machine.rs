@@ -372,7 +372,7 @@ impl OctaneMachine {
         // The buses are filled from `[scsi.N]` before the controllers exist.
         let [bus_a, bus_b] = [Isp1040::new_bus(), Isp1040::new_bus()];
         let (scratch_path, mut disks) = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
-        let scsi = [Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
+        let scsi = [Arc::new(Isp1040::new_at(0, bus_a, &timer_manager)), Arc::new(Isp1040::new_at(1, bus_b, &timer_manager))];
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
         }
@@ -399,7 +399,7 @@ impl OctaneMachine {
                 let board = &xio_boards[fc.board.unwrap_or(0)];
                 let slot = fc.slot.or_else(|| board.free_slot()).ok_or("[fibre_channel]: the board has no free slot")?;
                 board.check_slot(slot).map_err(|e| format!("[fibre_channel]: {e}"))?;
-                let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci)?;
+                let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci, &timer_manager)?;
                 card.fc.set_heartbeat(heartbeat.clone());
                 card.attach(board.bus(), slot);
                 eprintln!(
@@ -2132,15 +2132,10 @@ mod snapshot_tests {
             assert_eq!(digest(&a), at_save);
             assert_eq!(a.cpus[0].save_state(), cpu_at_save);
             assert_eq!(a.timer_manager.clock().now(), crate::snapshot::field_u64(&board, "clock_ns").unwrap());
-            // Two clocks run in host time while the machine is stopped: the
-            // PHY's negotiation countdown, whose time left can only have
-            // shrunk since the load, and the RTC, which keeps the host's time
-            // of day as on every machine. Everything else comes back as saved.
+            // The RTC runs in host time while the machine is stopped, as on
+            // every machine. Everything else comes back as saved.
             let (mut board, mut got) = (board, a.save_board());
-            let left = |t: &toml::Value| crate::snapshot::field_u64(&t["eth"]["phy"], "deadline").unwrap();
-            assert!(left(&got) <= left(&board));
             for t in [&mut board, &mut got] {
-                t["eth"]["phy"].as_table_mut().unwrap().remove("deadline");
                 t["ioc3"]["chip"].as_table_mut().unwrap().remove("rtc");
             }
             assert_eq!(got, board);

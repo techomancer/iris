@@ -4,11 +4,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::eeprom::{self, Eeprom};
 use super::phy::{self, Phy};
 use super::dma::{Doorbells, HeldCompletion, Ring, EngineDeadline};
+use crate::clock::Clock;
 use crate::cpu::smp::MAX_CPUS;
 use crate::cpu::mips_core::CyclesPtr;
 use crate::pci::PciDma;
@@ -213,7 +214,7 @@ pub(super) struct State {
     pub reg_win_base: u32,
     pub mem_win_base: u32,
     eeprom: Option<Eeprom>,
-    bufmgr_start: Option<Instant>,
+    bufmgr_start: Option<u64>,
     /// The mask set through the 0x0204 mailbox, and the latch a status-block
     /// update sets and the driver clears. The line is the latch with
     /// neither mask (this or MISC_CTL's) set.
@@ -222,7 +223,7 @@ pub(super) struct State {
     irq_level: bool,
     pub irq_events: Vec<bool>,
     pub phy: Phy,
-    pub now: Instant,
+    pub now: u64,
     refused: BTreeMap<Refused, u64>,
     pub(super) dma: Arc<dyn PciDma>,
     /// The send-ring consumer, and what the status block reports.
@@ -250,8 +251,8 @@ pub(super) struct State {
     pub(super) tx_coal_pending: u16,
     pub(super) rx_coal_expired: bool,
     pub(super) tx_coal_expired: bool,
-    pub(super) rx_coal_timer: Option<Instant>,
-    pub(super) tx_coal_timer: Option<Instant>,
+    pub(super) rx_coal_timer: Option<u64>,
+    pub(super) tx_coal_timer: Option<u64>,
     /// Completions held until their frame's arrival deadline.
     pub(super) rx_latency: VecDeque<HeldCompletion>,
     pub(super) rx_floor: Duration,
@@ -279,8 +280,9 @@ impl State {
         eeprom: Option<Eeprom>,
         rx_floor: Duration,
         rx_floor_cycles: u64,
-        now: Instant,
+        clock: Clock,
     ) -> Self {
+        let now = clock.now();
         let mut st = Self {
             cfg,
             pcistate: Self::pcistate_at_reset(req64),
@@ -296,7 +298,7 @@ impl State {
             irq_pending: false,
             irq_level: false,
             irq_events: Vec::new(),
-            phy: Phy::new(now),
+            phy: Phy::new(clock),
             now,
             refused: BTreeMap::new(),
             dma: Arc::new(super::dma::NullDma),
@@ -331,7 +333,7 @@ impl State {
     }
 
     /// Enter at `now`: run whatever came due since the last entry.
-    pub fn enter(&mut self, now: Instant) {
+    pub fn enter(&mut self, now: u64) {
         if now > self.now {
             self.now = now;
         }
@@ -347,7 +349,7 @@ impl State {
         while let Some((deadline, timer)) = self.timers().into_iter().filter(|(d, _)| *d <= target).min() {
             self.now = deadline;
             match timer {
-                EngineDeadline::PhySettle => self.phy.sync(deadline),
+                EngineDeadline::PhySettle => self.phy.sync(),
                 EngineDeadline::BufferManager => {
                     self.bufmgr_start = None;
                     let mode = self.rf(reg::BUFMGR_MODE);
@@ -361,7 +363,7 @@ impl State {
         self.now = target;
     }
 
-    fn timers(&self) -> Vec<(Instant, EngineDeadline)> {
+    fn timers(&self) -> Vec<(u64, EngineDeadline)> {
         [
             self.phy.deadline().map(|d| (d, EngineDeadline::PhySettle)),
             self.bufmgr_start.map(|d| (d, EngineDeadline::BufferManager)),
@@ -375,7 +377,7 @@ impl State {
     }
 
     /// The earliest moment something here needs attention.
-    pub fn deadline(&self) -> Option<Instant> {
+    pub fn deadline(&self) -> Option<u64> {
         self.timers().into_iter().map(|(d, _)| d).min()
     }
 
@@ -465,7 +467,7 @@ impl State {
         self.reset_engines();
         self.irq_masked = true;
         self.irq_pending = false;
-        self.phy.reset(self.now);
+        self.phy.reset();
         self.load_station_address();
         self.update_irq(true);
     }
@@ -667,7 +669,7 @@ impl State {
                     self.bufmgr_start = None;
                 } else if self.rf(off) & BUFMGR_MODE_ENABLE == 0 {
                     if self.bufmgr_start.is_none() {
-                        self.bufmgr_start = Some(self.now + BUFMGR_START);
+                        self.bufmgr_start = Some(self.now + BUFMGR_START.as_nanos() as u64);
                     }
                     val &= !BUFMGR_MODE_ENABLE;
                 }
@@ -707,12 +709,11 @@ impl State {
             self.set_rf(reg::MI_COMM, command);
             return;
         }
-        let now = self.now;
         let opcode = command & (mi::READ | mi::WRITE);
         let val = if opcode == mi::READ {
-            (command & mi::READ_FIELDS) | u32::from(self.phy.read(register, now))
+            (command & mi::READ_FIELDS) | u32::from(self.phy.read(register))
         } else if opcode == mi::WRITE {
-            self.phy.write(register, (command & mi::DATA) as u16, now);
+            self.phy.write(register, (command & mi::DATA) as u16);
             command & !mi::BUSY
         } else {
             self.refuse(Refused::MiOpcode(opcode >> 26));
@@ -728,7 +729,6 @@ impl State {
     pub fn reg_read(&mut self, off: u32) -> u32 {
         match off & (REG_FILE_SIZE - 1) {
             reg::MI_STS => {
-                self.phy.sync(self.now);
                 if self.phy.link_up() {
                     mi::LINK
                 } else {

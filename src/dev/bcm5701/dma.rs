@@ -7,7 +7,7 @@
 //! frame-data controls. What the host sees of those bytes is the bridge's
 //! business ([`PciDma`]).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::state::{reg, Refused, State};
 use crate::pci::{PciDma, PciDmaStatus};
@@ -110,7 +110,7 @@ const RX_CYCLES_RECHECK: Duration = Duration::from_micros(50);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct HeldCompletion {
     /// The host-time deadline.
-    pub(super) due: Instant,
+    pub(super) due: u64,
     /// The producer index the completion publishes.
     pub(super) prod: u16,
     /// Each processor's last send doorbell before the frame arrived.
@@ -524,7 +524,7 @@ impl State {
 
     fn coal_arm_one(&mut self, rx: bool) {
         let ticks = self.rf(if rx { reg::HCC_RX_COAL_TICKS } else { reg::HCC_TX_COAL_TICKS });
-        let deadline = (ticks != 0).then(|| self.now + COAL_TICK * ticks);
+        let deadline = (ticks != 0).then(|| self.now + (COAL_TICK * ticks).as_nanos() as u64);
         if rx {
             self.rx_coal_expired = false;
             self.rx_coal_timer = deadline;
@@ -558,7 +558,7 @@ impl State {
     fn coal_retry(&mut self, rx: bool) {
         let ticks = self.rf(if rx { reg::HCC_RX_COAL_TICKS } else { reg::HCC_TX_COAL_TICKS });
         let wait = (COAL_TICK * ticks.max(1)).min(COAL_RETRY_MAX);
-        let deadline = Some(self.now + wait);
+        let deadline = Some(self.now + wait.as_nanos() as u64);
         if rx {
             self.rx_coal_timer = deadline;
         } else {
@@ -1105,7 +1105,7 @@ impl State {
 
     /// Hold a completion until the frame's minimum arrival latency has passed.
     fn rx_hold(&mut self, status_rx_prod: u16) {
-        let held = HeldCompletion { due: self.now + self.rx_floor, prod: status_rx_prod, after: self.tx_doorbell };
+        let held = HeldCompletion { due: self.now + self.rx_floor.as_nanos() as u64, prod: status_rx_prod, after: self.tx_doorbell };
         if self.rx_floor.is_zero() && self.rx_latency.is_empty() && self.senders_ran_past(&held.after) {
             self.rx_publish(status_rx_prod);
         } else {
@@ -1127,14 +1127,14 @@ impl State {
     /// The head completion's deadline passed. One whose sender has not yet
     /// run far enough looks again shortly after `entered`, the time the
     /// model was entered at.
-    pub(super) fn rx_arrival_due(&mut self, entered: Instant) {
+    pub(super) fn rx_arrival_due(&mut self, entered: u64) {
         let mut published = false;
         while let Some(held) = self.rx_latency.front().copied() {
             if held.due > self.now {
                 break;
             }
             if !self.senders_ran_past(&held.after) {
-                self.rx_latency[0].due = entered.max(self.now) + RX_CYCLES_RECHECK;
+                self.rx_latency[0].due = entered.max(self.now) + RX_CYCLES_RECHECK.as_nanos() as u64;
                 break;
             }
             self.rx_latency.pop_front();

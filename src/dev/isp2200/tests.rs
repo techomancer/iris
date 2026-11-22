@@ -26,6 +26,18 @@ use crate::traits::Device;
 use crate::test_temp::TempPath;
 use std::cell::Cell;
 
+/// Set the clock to `ns` and bring the loop up from this thread, so a test can
+/// hold a command on a device and still see it come up.
+pub(crate) fn set_test_clock(isp: &Isp2200, ns: i64) {
+    let mut st = isp.lock();
+    crate::dev::isp1040::tests::step_ring_to(&isp.ring, ns);
+    if isp.bringup_left(&st).is_some_and(|left| left <= 0) {
+        st.bringup_done();
+        isp.post_waiting(&mut st);
+    }
+    isp.kick(&mut st);
+}
+
 const CSR_RESET: u16 = CSR_SOFT_RESET;
 const ICR_ENABLE: u16 = 0x8008;
 const SEM_LOCK: u16 = SEMAPHORE_LOCK;
@@ -93,7 +105,7 @@ impl Rig {
         isp.state().connect_dma(mem.clone());
         // I/O and memory decode, and bus mastering.
         isp.state().config().write(1, 0x7);
-        isp.set_test_clock(0);
+        set_test_clock(&isp, 0);
         Rig {
             isp,
             mem,

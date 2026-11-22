@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::Isp2200;
 use crate::config::{FibreChannelConfig, ScsiDeviceConfig};
+use crate::hptimer::TimerManager;
 use crate::dev::nvme::{BRIDGE_DEVICE, BRIDGE_VENDOR};
 use crate::pci::{DevFn, PciBus, PciToPciBridge};
 use crate::snapshot::DiskRef;
@@ -36,8 +37,8 @@ pub struct Card {
 impl Card {
     /// The adapter with its loop's disks attached. `ci` is a `--ci` run,
     /// which keeps each overlay in the temporary directory.
-    pub fn open(cfg: &FibreChannelConfig, ci: bool) -> Result<Card, String> {
-        let fc = Arc::new(Isp2200::new_at(ADAPTER_INDEX, Isp2200::new_bus()));
+    pub fn open(cfg: &FibreChannelConfig, ci: bool, tm: &Arc<TimerManager>) -> Result<Card, String> {
+        let fc = Arc::new(Isp2200::new_at(ADAPTER_INDEX, Isp2200::new_bus(), tm));
         for (&id, disk) in &cfg.disks {
             let at = format!("Fibre Channel loop ID {id}");
             let ci_overlay = (ci && disk.overlay).then(|| ScsiDeviceConfig::ci_overlay_path(CI_KEY_BASE + id));
