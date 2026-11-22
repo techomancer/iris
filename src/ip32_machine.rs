@@ -341,6 +341,8 @@ impl O2Machine {
         monitor.register_device(status.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
         monitor.register_device(bus.clone());
+        let mace_pci = bus.mace.pci.clone();
+        monitor.register_device(crate::pci::pci_host_commands("MACE", &[bus.mace.pci.bus()], Some(Box::new(move |w| mace_pci.write_status(w)))));
         // `phys`: the physical bus's decode table, memory and traces.
         monitor.register_device(bus.phys.clone());
         // The SCSI controllers' `scsi`/`scsi1` and `cow`/`cow1`.

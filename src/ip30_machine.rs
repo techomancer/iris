@@ -652,8 +652,10 @@ impl OctaneMachine {
         monitor.register_device(status.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         monitor.register_device(heart.clone());
-        // `pci`: the Bridge's bus, as the O2's MACE shows its own.
-        monitor.register_device(bridge.clone());
+        monitor.register_device(crate::pci::pci_host_commands("Bridge", &[bridge.bus()], None));
+        for b in &xio_boards {
+            monitor.register_device(crate::pci::pci_host_commands(b.kind().label(), &[b.bus()], None));
+        }
         // `nvme`: the card's registers, queues and copy-on-write disk.
         if let Some(n) = &nvme {
             monitor.register_device(n.clone());

@@ -393,6 +393,9 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     connect_serial_ports(cfg, "Tezro", &serial_ports(cfg, l1, &ioc4, &serial), console_index)?;
     let console = cfg.ci.then(|| serial[console_index].clone());
     let mut monitor: Vec<Arc<dyn Device>> = vec![scsi.clone(), ioc4.ps2()];
+    for pic in &pics {
+        monitor.push(crate::pci::pci_host_commands(&format!("PIC at widget {}", pic.widget_number()), &[pic.bus(0), pic.bus(1)], None));
+    }
     if let Some(vpro) = &vpro {
         monitor.push(vpro.clone());
     }

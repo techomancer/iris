@@ -23,7 +23,7 @@ use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1Config, L1};
 use crate::dev::odyssey::Odyssey;
 use crate::dev::timekeeper::Timekeeper;
-use crate::dev::xbridge::{XBridge, HEAD_F};
+use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F};
 use crate::hptimer::TimerManager;
 use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, fit_audio_card, xbridge_on};
 use crate::ip35::node::NodeSpec;
@@ -148,7 +148,7 @@ fn build_baseio(
             reset_clock.power_on();
         }),
         at_batch: None,
-        monitor: vec![scsi.clone(), ioc3.ps2()],
+        monitor: vec![scsi.clone(), ioc3.ps2(), crate::pci::pci_host_commands("XBridge", &[xbridge.bus(HEAD_E), pci], None)],
         ps2: ioc3.ps2(),
         flush_nvram: Box::new(move || timekeeper.flush_nvram()),
         console,

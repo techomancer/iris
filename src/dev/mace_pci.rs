@@ -187,6 +187,16 @@ impl PciHost for MacePci {
 }
 
 impl MacePci {
+    /// The chip's registers and lost DMA writes, for `pci status`.
+    pub fn write_status(&self, w: &mut dyn std::io::Write) {
+        let r = self.regs.lock().unwrap();
+        let reg = |off: u32| r[(off / 4) as usize];
+        writeln!(w, "MACE PCI: control {:#010x} revision {:#x} error flags {:#x} at {:#010x}, config address {:#010x}",
+            reg(macepci_reg::CONTROL), reg(macepci_reg::REVISION), reg(macepci_reg::ERROR_FLAGS),
+            reg(macepci_reg::ERROR_ADDR), *self.config_addr.lock().unwrap()).ok();
+        writeln!(w, "  DMA writes that found no memory: {}", self.dma.lost_writes()).ok();
+    }
+
     /// A bridge whose bus is wired as `wiring` (its outputs are `crime`'s
     /// inputs).
     pub fn new(wiring: &'static IntxRouting, crime: Arc<dyn InterruptController>, ram: Arc<O2Memory>) -> Arc<Self> {
@@ -361,30 +371,6 @@ impl crate::traits::Device for MacePci {
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
     fn get_clock(&self) -> u64 { 0 }
-
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("pci".to_string(), "MACE PCI bridge: pci status | pci config <slot>".to_string())]
-    }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
-        use std::io::Write;
-        if cmd != "pci" {
-            return Err("Command not found".to_string());
-        }
-        match args.first().copied().unwrap_or("status") {
-            "status" => {
-                let r = self.regs.lock().unwrap();
-                let reg = |off: u32| r[(off / 4) as usize];
-                writeln!(w, "MACE PCI: control {:#010x} revision {:#x} error flags {:#x} at {:#010x}, config address {:#010x}",
-                    reg(macepci_reg::CONTROL), reg(macepci_reg::REVISION), reg(macepci_reg::ERROR_FLAGS),
-                    reg(macepci_reg::ERROR_ADDR), *self.config_addr.lock().unwrap()).ok();
-                writeln!(w, "  DMA writes that found no memory: {}", self.dma.lost_writes()).ok();
-                self.bus.describe(&mut w);
-            }
-            _ => return self.bus.command(args, &mut w),
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

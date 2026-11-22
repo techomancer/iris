@@ -62,6 +62,28 @@ impl Monitor {
         self.devices.lock().push(device);
     }
 
+    /// What `cmd args` prints, from every device that offers it.
+    #[cfg(test)]
+    pub(crate) fn run(&self, cmd: &str, args: &[&str]) -> String {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let devs: Vec<_> = self.devices.lock().iter().filter(|d| d.register_commands().iter().any(|(c, _)| c == cmd)).cloned().collect();
+        for d in devs {
+            if let Err(e) = d.execute_command(cmd, args, Box::new(Capture(out.clone()))) {
+                out.lock().extend_from_slice(format!("Error: {e}\n").as_bytes());
+            }
+        }
+        let text = String::from_utf8_lossy(&out.lock()).into_owned();
+        text
+    }
+
     /// What `audio status` prints.
     #[cfg(test)]
     pub fn audio_status(&self) -> String {
