@@ -64,6 +64,28 @@ impl Slot {
     }
 }
 
+/// The producers' cached slowest head. Plain data that only the holder of the
+/// push lock touches; `loom` builds use its cell so the model checks that.
+#[cfg(not(loom))]
+type HeadCache = Cell<usize>;
+#[cfg(loom)]
+struct HeadCache(loom::cell::UnsafeCell<usize>);
+
+#[cfg(loom)]
+impl HeadCache {
+    fn new(v: usize) -> Self {
+        Self(loom::cell::UnsafeCell::new(v))
+    }
+
+    fn get(&self) -> usize {
+        self.0.with(|p| unsafe { *p })
+    }
+
+    fn set(&self, v: usize) {
+        self.0.with_mut(|p| unsafe { *p = v });
+    }
+}
+
 /// MPSC ring buffer for the GFIFO, or with `HEADS > 1` a broadcast queue:
 /// every consumer ("head") sees every entry, each at its own pace.
 ///
@@ -83,7 +105,7 @@ pub struct GFifo<const DEPTH: usize, const HEADS: usize = 1> {
     head: [CachePadded<AtomicUsize>; HEADS],
     tail: CachePadded<AtomicUsize>,
     /// Producer's cached slowest head.
-    shadow_head: CachePadded<Cell<usize>>,
+    shadow_head: CachePadded<HeadCache>,
     /// Each consumer's cached tail and private (unpublished) head.
     shadow_tail: [CachePadded<Cell<usize>>; HEADS],
     local_head: [CachePadded<Cell<usize>>; HEADS],
@@ -170,7 +192,7 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
             active: AtomicUsize::new(0),
             head: std::array::from_fn(|_| CachePadded::new(AtomicUsize::new(0))),
             tail: CachePadded::new(AtomicUsize::new(0)),
-            shadow_head: CachePadded::new(Cell::new(0)),
+            shadow_head: CachePadded::new(HeadCache::new(0)),
             shadow_tail: std::array::from_fn(|_| CachePadded::new(Cell::new(0))),
             local_head: std::array::from_fn(|_| CachePadded::new(Cell::new(0))),
             buf: std::array::from_fn(|_| Slot(loom::cell::UnsafeCell::new(GFIFOEntry { addr: 0, val: 0 }))),
@@ -1144,6 +1166,70 @@ mod loom_tests {
             let want: Vec<_> = (0..N).map(|v| (1, v)).collect();
             assert_eq!(seen[0], want);
             assert_eq!(seen[1], want);
+            assert!(f.is_empty());
+        });
+    }
+
+    /// Two producers race for the push lock while a consumer drains, as the
+    /// CPU's register stores and the DMA worker do on REX3. The ring is small
+    /// enough that the fourth entry has to refresh the producers' cached head,
+    /// which both share. Each push is attempted twice and may be refused, so
+    /// the model checks what landed rather than that everything did: the
+    /// consumer sees each producer's entries once and in order, and what it
+    /// missed is still in the ring afterwards. Loom's cells report a cached
+    /// head or a slot touched by two producers at once.
+    #[test]
+    fn two_producers_and_a_consumer_lose_nothing() {
+        const A: u32 = 0xA0;
+        const B: u32 = 0xB0;
+
+        fn attempt(mut push: impl FnMut() -> bool) -> bool {
+            push() || push()
+        }
+
+        check(|| {
+            let f = Arc::new(GFifo::<4, 1>::new());
+            let a = {
+                let f = f.clone();
+                thread::spawn(move || {
+                    // Two entries, the second pushed after the first.
+                    let first = attempt(|| f.try_push(A, 1));
+                    first && attempt(|| f.try_push(A, 2))
+                })
+            };
+            let b = {
+                let f = f.clone();
+                thread::spawn(move || {
+                    // A token with one payload word, as one unit.
+                    attempt(|| f.try_push_batch(B, 1, &[7]))
+                })
+            };
+            let mut seen = Vec::new();
+            while let Some(e) = f.peek_at(0) {
+                seen.push(e);
+                f.consume_at(0);
+            }
+            let a_both = a.join().unwrap();
+            let b_whole = b.join().unwrap();
+            f.flush_head_at(0);
+            while let Some(e) = f.peek_at(0) {
+                seen.push(e);
+                f.consume_at(0);
+            }
+
+            let of = |addr: u32| -> Vec<u64> {
+                seen.iter().filter(|e| e.0 == addr).map(|e| e.1).collect()
+            };
+            let a_seen = of(A);
+            assert!(a_seen == [1, 2] || a_seen == [1] || a_seen.is_empty(), "producer A's entries {a_seen:?}");
+            assert_eq!(a_seen.len() == 2, a_both, "A's result does not match what it pushed");
+            let b_seen: Vec<_> = seen.iter().filter(|e| e.0 == B || e.0 == GFIFO_PAYLOAD).collect();
+            if b_whole {
+                assert_eq!(b_seen, [&(B, 1), &(GFIFO_PAYLOAD, 7)], "the batch was split or reordered");
+            } else {
+                assert!(b_seen.is_empty(), "a refused batch left entries behind");
+            }
+            f.flush_head_at(0);
             assert!(f.is_empty());
         });
     }

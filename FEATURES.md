@@ -166,6 +166,42 @@ checkout), for the Help menu's version line. `PROFILE` and `CARGO_PKG_VERSION` a
 by Cargo. These build-time controls are
 separate from the runtime environment inventory below.
 
+### Offline and distribution builds
+
+CHD support comes from the `libchdman-rs` crate, which iris builds with its
+`prebuilt` feature: by default its build script downloads a static archive of
+MAME's CHD code for the host target. Distribution build systems have no
+network, so set `LIBCHDMAN_FORCE_SOURCE=1`. The build script then compiles the
+MAME CHD sources shipped inside the crate (and therefore inside `cargo
+vendor` output) with the host C/C++ toolchain, and nothing is downloaded. No
+other dependency fetches anything at build time.
+
+```sh
+cargo vendor vendor >> .cargo/config.toml     # online, once: copies every crate
+                                               # into vendor/ and points Cargo at it
+LIBCHDMAN_FORCE_SOURCE=1 cargo build --release --offline --locked
+LIBCHDMAN_FORCE_SOURCE=1 cargo build --release --offline --locked \
+    -p iris-gui --features iris/lightning,bundled   # the GUI, as the release builds it
+```
+
+CHD support stays on; there is no build without it.
+
+A prebuilt archive downloaded earlier is cached in `~/Library/Caches/libchdman-rs`
+(macOS), `~/.cache/libchdman-rs` (Linux) or `$XDG_CACHE_HOME/libchdman-rs`, and
+an offline build without `LIBCHDMAN_FORCE_SOURCE` uses it. Such a build passing
+on a developer machine therefore says nothing about a clean build host.
+[tools/offline-build-test.sh](tools/offline-build-test.sh) runs the steps above
+with the network denied and with a fresh `CARGO_HOME`, cache and target
+directory. Then the `chd-extract` it built unpacks a CHD made by MAME's
+`chdman`. With `--expect-download-failure` it first shows that the same build
+without `LIBCHDMAN_FORCE_SOURCE` fails.
+
+| Variable | Effect |
+|---|---|
+| `LIBCHDMAN_FORCE_SOURCE` | Any value: compile the bundled MAME CHD sources instead of downloading a prebuilt archive. Needs a C++20 compiler. |
+| `LIBCHDMAN_CPU` | `portable` compiles the FLAC codec as generic C. Without it an x86_64 source build passes `-mavx2 -mfma`, and the binary can fail with an illegal instruction on CPUs older than Haswell. Packages for a generic x86_64 baseline should set `portable`. |
+| `LIBCHDMAN_PREBUILT_FALLBACK` | Any value: compile from source if the prebuilt download fails, instead of stopping the build. |
+
 ## Shared machine configuration inventory
 
 Source: [src/config.rs](src/config.rs), `MachineConfig` and nested structs.

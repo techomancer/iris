@@ -17,7 +17,7 @@ mod attach;
 mod bus;
 
 pub use attach::{attach_failed, attach_from_config, attach_table, Attached, DaynaportRef, TableRef};
-pub use bus::{ScsiBus, ScsiIdentities, ScsiTarget, Targets};
+pub use bus::{DiskActivity, DiskCounts, ScsiBus, ScsiIdentities, ScsiTarget, Targets};
 
 use crate::block_node::{Background, ChangerNode, Removable, BlockNode};
 
@@ -215,6 +215,8 @@ pub struct ScsiDevice {
     /// The disk's media while a CHD sync has it closed and the tray answers
     /// empty in its place; see [`ScsiTarget::take_pending_chd_sync`].
     released: Option<Media>,
+    /// The bus's counters for this id, from the moment it is attached.
+    activity: Option<std::sync::Arc<bus::DiskActivity>>,
 }
 
 impl Drop for ScsiDevice {
@@ -268,6 +270,7 @@ impl ScsiDevice {
             power_on_write_cache: false,
             background,
             released: None,
+            activity: None,
         }
     }
 
@@ -288,6 +291,7 @@ impl ScsiDevice {
             power_on_write_cache: false,
             background: None,
             released: None,
+            activity: None,
         }
     }
 
@@ -518,6 +522,9 @@ impl ScsiDevice {
                 lba, count, self.logical_block_size, expected, data.len()
             );
         }
+        if let Some(a) = &self.activity {
+            a.read(data.len() as u64);
+        }
         Ok(ScsiResponse {
             status: 0x00,
             data,
@@ -581,6 +588,9 @@ impl ScsiDevice {
             }
         }
 
+        if let Some(a) = &self.activity {
+            a.write(data.len() as u64);
+        }
         Ok(ScsiResponse {
             status: 0x00,
             data: vec![],
@@ -1271,6 +1281,10 @@ impl ScsiTarget for ScsiDevice {
         }
 
         Ok(response)
+    }
+
+    fn set_activity(&mut self, activity: std::sync::Arc<DiskActivity>) {
+        self.activity = Some(activity);
     }
 
     fn flush(&mut self) -> io::Result<()> {

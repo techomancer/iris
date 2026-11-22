@@ -131,6 +131,11 @@ impl Meter {
         self.moved[output].load(Ordering::Relaxed)
     }
 
+    /// Frames moved by every input and output together, for an activity light.
+    pub fn total(&self) -> u64 {
+        self.moved.iter().map(|m| m.load(Ordering::Relaxed)).sum()
+    }
+
     /// The monitor's `audio status` text for one card.
     pub fn report(&self, rates: &[Option<u32>], outs: &[&Output]) -> String {
         let mut s = format!("audio: {}\n", self.card);
