@@ -669,7 +669,7 @@ impl Ioc {
 
         let ps2_irq = IrqLine::new(Arc::new(IocInputs(state.clone())), IocInterrupt::KbMouse.line());
 
-        let scc = Z85c30::new(Some(serial_irq));
+        let scc = Z85c30::new(Some(serial_irq), tm);
 
         Self {
             state,
