@@ -906,10 +906,9 @@ impl Workstation for O2Machine {
     fn ci_rollback(&mut self) -> Result<(), String> { O2Machine::ci_rollback(self) }
 
     fn scratch_path(&self) -> Option<&std::path::Path> { self.scratch_path.as_deref() }
-    /// Disc changes on the internal bus (controller 0), as the Indigo2 offers
-    /// its first controller.
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
-        self.bus.scsi.lock().unwrap().first().map(|c| c.clone() as Arc<dyn crate::workstation::DiscChanger>)
+        let ctls = self.bus.scsi.lock().unwrap().iter().map(|c| c.clone() as _).collect();
+        Some(Arc::new(crate::workstation::DiscChangers(ctls)))
     }
     /// The same `/CDROM` remount the Indy types: controller 0 is `dks0` to
     /// IRIX on the O2 as well.
