@@ -147,19 +147,18 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
 fn the_origin_200_controller_grants_from_the_start_and_survives_a_reset() {
     use crate::dev::pcf8584::ctl;
     use crate::dev::serial_host::CiSerialBackend;
-    use std::sync::atomic::Ordering;
-    let now = Arc::new(AtomicU64::new(0));
-    let ticks = now.clone();
-    let clock: Clock = Arc::new(move || ticks.load(Ordering::SeqCst));
-    let hub = Hub::new(HubConfig { cpus: 1, ni_revision: 3, ..Default::default() }, clock.clone(), None).unwrap();
-    let controller = Origin200Controller::new(&hub, &clock, None).unwrap();
+    let now = crate::clock::Clock::stepped();
+    let tm = Arc::new(crate::hptimer::TimerManager::with_clock(now.clone()));
+    let hub = Hub::new(HubConfig { cpus: 1, ni_revision: 3, ..Default::default() }, &tm, None).unwrap();
+    let controller = Origin200Controller::new(&hub, &tm, None).unwrap();
+    controller.elsc.start();
     let grants = || {
         // The PROM's setup as an I2C observer: a nonzero own address, then the interface on.
         controller.i2c.write_register(8, ctl::PIN);
         controller.i2c.write_register(0, 0x09);
         controller.i2c.write_register(8, ctl::PIN | ctl::ESO);
-        (0..10).any(|_| {
-            now.fetch_add(1_000_000, Ordering::SeqCst);
+        crate::test_board::until(std::time::Duration::from_secs(10), || {
+            now.step(1_000_000);
             controller.i2c.read_register(0) == 0xe0
         })
     };

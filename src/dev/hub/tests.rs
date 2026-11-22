@@ -67,9 +67,14 @@ impl BusDevice for Bytes {
 
 const RAM_SIZE: usize = 1 << 20;
 
+/// A timer manager on a clock that never moves.
+fn stepped() -> Arc<crate::hptimer::TimerManager> {
+    Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::stepped()))
+}
+
 /// A Hub with one 1 MiB bank, byte `i` of which holds `seed ^ i`.
 fn seeded(cfg: HubConfig, seed: u8) -> Arc<Hub> {
-    let hub = Hub::new(HubConfig { banks_mb: [1, 0, 0, 0], nodes: 2, ..cfg }, Arc::new(|| 0), None).unwrap();
+    let hub = Hub::new(HubConfig { banks_mb: [1, 0, 0, 0], nodes: 2, ..cfg }, &stepped(), None).unwrap();
     let bank = &hub.decode.physical().banks()[0];
     for i in (0..RAM_SIZE as u64).step_by(8) {
         bank.write64(i, u64::from_be_bytes(std::array::from_fn(|b| seed ^ (i as u8).wrapping_add(b as u8))));
@@ -624,13 +629,13 @@ fn the_interrupt_target_sets_and_clears_pending_bits_by_vector() {
 
 #[test]
 fn the_hub_is_a_device_whose_counter_is_its_clock() {
-    let now = Arc::new(AtomicU64::new(0));
-    let clock = now.clone();
-    let hub = Hub::new(HubConfig::default(), Arc::new(move || clock.load(Ordering::SeqCst)), None).unwrap();
+    let clock = crate::clock::Clock::stepped();
+    let tm = Arc::new(crate::hptimer::TimerManager::with_clock(clock.clone()));
+    let hub = Hub::new(HubConfig::default(), &tm, None).unwrap();
     assert!(!hub.is_running());
     hub.start();
     assert!(hub.is_running());
-    now.store(800 * 1234, Ordering::SeqCst);
+    clock.step(800 * 1234);
     assert_eq!(hub.get_clock(), 1234);
     hub.step(1);
     hub.stop();
@@ -647,10 +652,6 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     let phys = a.decode.physical().clone();
     // What a machine does: the I/O space as a node space, handles given to widgets.
     a.decode.set_space(UncachedSpace::Io, a.io_space());
-    // The manager's callbacks reach the processor and its bus, which reach the Hub.
-    let timers = Arc::new(crate::hptimer::TimerManager::new());
-    a.pi.set_timer_manager(timers.clone());
-    assert_eq!(Arc::strong_count(&timers), 1, "the interface holds the timer manager strongly");
     a.attach_i2c(Arc::new(Bytes::default()));
     a.io.connect_widget(9, Arc::new(Bytes::default()));
     a.io.connect_widget(8, a.widget_port());

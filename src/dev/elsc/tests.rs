@@ -7,6 +7,7 @@ use crate::dev::i2c::I2cBus;
 use crate::dev::pcf8584::{ctl, sts, Pcf8584};
 use std::io;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 const DATA: u64 = 0;
 const CTRL: u64 = 8;
@@ -46,17 +47,31 @@ impl Aux {
     }
 }
 
-/// Virtual time, set by hand.
-#[derive(Clone, Default)]
-pub(crate) struct TestClock(Arc<AtomicU64>);
+/// Virtual time, set by hand: a timer manager on a stepped clock, with hooks that run after each
+/// step and expire whatever came due.
+#[derive(Clone)]
+pub(crate) struct TestClock(Arc<TimerManager>, Arc<Mutex<Vec<Box<dyn Fn() + Send + Sync>>>>);
+
+impl Default for TestClock {
+    fn default() -> Self {
+        Self(Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped())), Default::default())
+    }
+}
 
 impl TestClock {
     pub(crate) fn now_ns(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        self.0.clock().now()
+    }
+
+    pub(crate) fn on_advance(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        self.1.lock().push(hook);
     }
 
     pub(crate) fn advance_ns(&self, ns: u64) {
-        self.0.fetch_add(ns, Ordering::SeqCst);
+        self.0.clock().step(ns);
+        for hook in self.1.lock().iter() {
+            hook();
+        }
     }
 
     pub(crate) fn advance_ms(&self, ms: u64) {
@@ -67,9 +82,29 @@ impl TestClock {
         self.advance_ms(s * 1000);
     }
 
-    pub(crate) fn clock(&self) -> Clock {
-        let now = self.0.clone();
-        Arc::new(move || now.load(Ordering::SeqCst))
+    pub(crate) fn tm(&self) -> &Arc<TimerManager> {
+        &self.0
+    }
+}
+
+impl Elsc {
+    /// When the oldest timer already due fell, and which it is.
+    pub(crate) fn due_timer(&self) -> Option<(u64, usize)> {
+        let st = self.state.lock();
+        let now = st.clock.now();
+        st.deadlines.iter().enumerate().filter_map(|(kind, d)| d.filter(|d| *d <= now).map(|d| (d, kind))).min()
+    }
+
+    pub(crate) fn expire_timer(&self, due: u64, kind: usize) {
+        self.expire(kind, due);
+    }
+
+    /// Expire every timer due by the test clock, oldest first, each at its own deadline. Production
+    /// promises no order between timers due together.
+    fn settle(&self) {
+        while let Some((due, kind)) = self.due_timer() {
+            self.expire(kind, due);
+        }
     }
 }
 
@@ -103,13 +138,15 @@ impl Rig {
         let clock = TestClock::default();
         let busy = BusBusy::default();
         let nvram = Arc::new(ElscNvram::origin200(None).unwrap());
-        let elsc = Arc::new(Elsc::new(cfg, nvram.clone(), clock.clock(), busy.clone()));
+        let elsc = Elsc::new(cfg, nvram.clone(), clock.tm(), busy.clone());
         let mut bus = I2cBus::new();
         bus.add(elsc.clone());
         bus.add(nvram.clone());
         let pcf = Pcf8584::new(bus, busy.clone());
         let aux = Arc::new(Aux::default());
         elsc.set_serial_backend(aux.clone());
+        let timed = elsc.clone();
+        clock.on_advance(Box::new(move || timed.settle()));
         pcf.power_on();
         elsc.power_on();
         Self { busy, clock, elsc, nvram, pcf, aux }
@@ -465,6 +502,25 @@ fn no_supervisor_on_i2c() {
 }
 
 // ---- arbitration -----------------------------------------------------------
+
+#[test]
+fn the_grant_tick_runs_only_while_an_adapter_polls() {
+    let rig = Rig::new();
+    let armed = || rig.elsc.state.lock().deadlines[T_ARB].is_some();
+    assert!(!armed(), "no adapter has asked for a grant");
+    rig.clock.advance_secs(10);
+    assert!(!armed());
+    rig.observer();
+    assert!(armed(), "a poll arms it");
+    let signal = rig.wait_for_signal();
+    assert!(Rig::is_signal(signal), "and the waiter gets its grant");
+    // Left alone for a tick it lapses, and the next poll catches up.
+    rig.clock.advance_ms(2);
+    rig.clock.advance_secs(10);
+    assert!(!armed());
+    let _ = rig.next_code();
+    assert!(armed());
+}
 
 #[test]
 fn arbitration_observes_a_grant_and_keeps_the_staged_start() {
@@ -1447,62 +1503,77 @@ fn pwr_d_posts_pd_remote_to_the_hubs() {
     rig.assert_reply("clr", "ok ");
 }
 
-/// Due: never when idle or for grant ticks; an NMI when its wait ends, its pulse then, a countdown
-/// at expiry.
+/// Each countdown is a timer for its own deadline: an NMI's wait, then its pulse, and a power-down.
 #[test]
-fn the_controller_reports_when_it_is_next_due() {
-    let ms = Duration::from_millis;
+fn the_countdowns_run_on_timers_at_their_deadlines() {
     let rig = Rig::new();
-    assert_eq!(rig.elsc.next_due(), None, "the ring ticks, but nothing is due");
+    let due = |kind| rig.elsc.state.lock().deadlines[kind];
+    let t0 = rig.clock.now_ns();
+    assert_eq!(due(T_NMI), None);
     rig.assert_reply("nmi", "ok ");
-    assert_eq!(rig.elsc.next_due(), Some(ms(1000)));
-    rig.step_ms(400);
-    assert_eq!(rig.elsc.next_due(), Some(ms(600)));
-    rig.step_ms(600);
-    assert_eq!(rig.elsc.next_due(), Some(ms(0)), "due now");
-    rig.elsc.poll();
+    assert_eq!(due(T_NMI), Some(t0 + 1_000_000_000));
+    rig.step_ms(999);
+    assert!(rig.events().is_empty());
+    rig.step_ms(1);
+    assert_eq!(due(T_NMI_PULSE), Some(t0 + 1_100_000_000), "the pulse counts from the wait's deadline");
     assert_eq!(rig.events(), [ModuleOutput::Nmi(true)]);
-    assert_eq!(rig.elsc.next_due(), Some(ms(100)), "the pulse ends");
     rig.step_ms(100);
-    rig.elsc.poll();
     assert_eq!(rig.events(), [ModuleOutput::Nmi(false)]);
-    assert_eq!(rig.elsc.next_due(), None);
+    assert_eq!(due(T_NMI_PULSE), None);
 
     rig.assert_reply("pwr d 3", "ok ");
-    let countdown = rig.elsc.next_due().expect("a power-down is counting down");
-    assert!(countdown > ms(2900) && countdown <= ms(3000), "{countdown:?}");
+    assert_eq!(due(T_PWR_DOWN), Some(t0 + 1_100_000_000 + 3_000_000_000));
     rig.step_secs(3);
     rig.elsc.poll();
     assert_eq!(power_events(&rig.events()), [false]);
 }
 
-/// An access past a deadline queues the output itself; the controller stays due until taken.
+/// A gap past several deadlines expires them in order, and the outputs wait to be taken.
 #[test]
-fn an_access_that_beats_the_visit_leaves_its_outputs_due() {
+fn outputs_queue_until_taken() {
     let rig = Rig::new();
     rig.assert_reply("nmi", "ok ");
     rig.step_ms(1100);
-    rig.assert_reply("ver", "ok V 3.1S  ");
-    assert_eq!(rig.elsc.next_due(), Some(Duration::ZERO), "the queued outputs are due now");
     assert_eq!(rig.events(), [ModuleOutput::Nmi(true), ModuleOutput::Nmi(false)]);
-    assert_eq!(rig.elsc.next_due(), None, "taken, so nothing is due");
+    assert!(rig.events().is_empty(), "taken, so nothing is left");
 }
 
-/// An access that moves the schedule wakes the machine; one that does not, does not.
+/// A timer that leaves outputs wakes the machine once a millisecond later; a query does not.
 #[test]
-fn an_access_wakes_the_machine_only_when_the_schedule_moved() {
+fn a_timer_that_leaves_outputs_wakes_the_machine_once() {
     let rig = Rig::new();
     let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let w = woken.clone();
+    let (w, elsc) = (woken.clone(), Arc::downgrade(&rig.elsc));
     rig.elsc.set_wake(Box::new(move || {
         w.fetch_add(1, Ordering::SeqCst);
+        let _ = elsc.upgrade().map(|e| e.take_events());
     }));
     rig.assert_reply("ver", "ok V 3.1S  ");
-    let after_first = woken.load(Ordering::SeqCst);
-    rig.assert_reply("ver", "ok V 3.1S  ");
-    assert_eq!(woken.load(Ordering::SeqCst), after_first, "a query changes nothing");
     rig.assert_reply("nmi", "ok ");
-    assert!(woken.load(Ordering::SeqCst) > after_first, "an NMI request arms a timer");
+    assert_eq!(woken.load(Ordering::SeqCst), 0, "nothing came due");
+    rig.step_ms(1000);
+    assert_eq!(woken.load(Ordering::SeqCst), 0, "the visit is a millisecond behind");
+    rig.step_ms(1);
+    assert_eq!(woken.load(Ordering::SeqCst), 1, "the NMI pulse rose");
+}
+
+/// A countdown expires on its timer with nothing touching the bus, and the machine is woken to
+/// collect the power-off.
+#[test]
+fn a_countdown_expires_on_its_timer_and_wakes_the_machine() {
+    let tm = Arc::new(TimerManager::new());
+    let nvram = Arc::new(ElscNvram::origin200(None).unwrap());
+    let elsc = Elsc::new(ElscConfig::default(), nvram, &tm, BusBusy::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    elsc.set_wake(Box::new(move || {
+        let _ = tx.send(());
+    }));
+    Resettable::power_on(&*elsc);
+    Device::start(&*elsc);
+    elsc.run(|st| st.arm_ms(T_PWR_DOWN, 20));
+    rx.recv_timeout(Duration::from_secs(10)).expect("the machine is woken");
+    assert_eq!(power_events(&elsc.take_events()), [false]);
+    Device::stop(&*elsc);
 }
 
 #[test]

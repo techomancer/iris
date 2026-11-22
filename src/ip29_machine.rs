@@ -29,13 +29,12 @@ use crate::hptimer::TimerManager;
 use crate::ip27::{attach_controller, pci_devices, ModuleController, NodeSpec};
 use crate::sn::BoardIo;
 use crate::sn::NodeBoard;
-use crate::traits::{MachineEvent, Resettable};
+use crate::traits::{Device, MachineEvent, Resettable};
 use std::sync::mpsc::Sender;
 use crate::xtalk::Upstream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// The Hub's own widget number: a small window there is not the Bridge's.
 const WIDGET_HUB: u8 = 1;
@@ -67,10 +66,10 @@ struct Origin200Controller {
 }
 
 impl Origin200Controller {
-    fn new(hub: &Hub, clock: &Clock, store: Option<&Path>) -> Result<Arc<Self>, String> {
+    fn new(hub: &Hub, timers: &Arc<TimerManager>, store: Option<&Path>) -> Result<Arc<Self>, String> {
         let store = ElscNvram::origin200(store).map(Arc::new).map_err(|e| format!("machine.controller_store: {e}"))?;
         let busy = BusBusy::default();
-        let elsc = Arc::new(Elsc::new(ElscConfig::default(), store.clone(), clock.clone(), busy.clone()));
+        let elsc = Elsc::new(ElscConfig::default(), store.clone(), timers, busy.clone());
         let mut bus = I2cBus::new();
         bus.add(elsc.clone());
         bus.add(store);
@@ -90,11 +89,11 @@ impl ModuleController for Origin200Controller {
     fn take_events(&self) -> Vec<ModuleOutput> {
         self.elsc.take_events()
     }
-    fn next_due(&self) -> Option<Duration> {
-        self.elsc.next_due()
-    }
     fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
         self.elsc.set_wake(wake);
+    }
+    fn device(&self) -> Arc<dyn Device> {
+        self.elsc.clone()
     }
 }
 
@@ -125,7 +124,7 @@ pub(crate) fn build_io(
     events: &Sender<MachineEvent>,
 ) -> Result<BoardIo, String> {
     let hub = &nodes[0].chip;
-    let controller = Origin200Controller::new(hub, clock, cfg.ip27_section().expect("an IP27 profile").controller_store.as_deref().map(Path::new))?;
+    let controller = Origin200Controller::new(hub, timers, cfg.ip27_section().expect("an IP27 profile").controller_store.as_deref().map(Path::new))?;
     let bridge = Bridge::new(Upstream::new().with(hub.host_port(HUB_HOST_WIDGET)), &PIN_WIRING);
     bridge.set_revision(BRIDGE_REVISION);
     bridge.set_microlan(board_record());
@@ -134,7 +133,7 @@ pub(crate) fn build_io(
         hub.io.connect_widget(widget, bridge.clone());
     }
     let mut io = pci_devices(timers, cfg, bridge, &crate::dev::ioc3::IP29, controller.clone(), Arc::new(AtomicU64::new(0)))?;
-    attach_controller(&mut io, controller, events, timers);
+    attach_controller(&mut io, controller, events);
     Ok(io)
 }
 

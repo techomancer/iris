@@ -2,6 +2,7 @@ use super::*;
 use crate::cpu::smp::HOST_PARK_BIT;
 use crate::dev::bedrock::{regs, BedrockConfig};
 use crate::traits::{BusDevice, Device, BUS_OK};
+use crate::hptimer::TimerManager;
 use std::sync::atomic::AtomicU64;
 
 /// A node of `count` processors with its register window, each processor a
@@ -12,18 +13,17 @@ struct Rig {
     words: Vec<Arc<AtomicU64>>,
     cycles: Vec<Arc<AtomicU64>>,
     slots: Vec<Arc<ParkSlot>>,
-    now: Arc<AtomicU64>,
+    clock: crate::clock::Clock,
 }
 
 impl Rig {
     fn new(count: usize) -> Self {
-        let now = Arc::new(AtomicU64::new(0));
-        let clock_now = now.clone();
-        let clock: Clock = Arc::new(move || clock_now.load(Ordering::SeqCst));
+        let clock = crate::clock::Clock::stepped();
+        let timers = Arc::new(TimerManager::with_clock(clock.clone()));
         let processors = Population::populated_cpus(count).unwrap();
         let bedrock = Bedrock::new(BedrockConfig {
             name: "test",
-            clock: clock.clone(),
+            timers: &timers,
             processors,
             banks_mib: &[64],
             nodes: 1,
@@ -32,7 +32,7 @@ impl Rig {
         })
         .unwrap();
         bedrock.start();
-        let hold = PresenceHold::new(processors, clock, &bedrock);
+        let hold = PresenceHold::new(processors, clock.reader(), &bedrock);
         let words: Vec<_> = (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let cycles: Vec<_> = (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let slots: Vec<_> = words.iter().enumerate().map(|(n, w)| Arc::new(ParkSlot::new(n as u8, Arc::as_ptr(w)))).collect();
@@ -40,7 +40,7 @@ impl Rig {
             let c = c.clone();
             Cpu { slot: slot.clone(), cycles: Box::new(move || c.load(Ordering::SeqCst)) }
         }).collect());
-        Self { hold, regs: bedrock.registers(), words, cycles, slots, now }
+        Self { hold, regs: bedrock.registers(), words, cycles, slots, clock }
     }
     /// II scratch 0, as a publisher's store leaves it.
     fn publish(&self, bits: u64) {
@@ -143,10 +143,10 @@ fn the_safety_net_ends_a_hold_whatever_the_cycles() {
     let rig = Rig::new(2);
     rig.publish(0x10);
     rig.hold.at_batch();
-    rig.now.store(SAFETY_NS - 1, Ordering::SeqCst);
+    rig.clock.step(SAFETY_NS - 1);
     rig.hold.at_batch();
     assert_eq!(rig.hold.held(), [0]);
-    rig.now.store(SAFETY_NS, Ordering::SeqCst);
+    rig.clock.step(1);
     rig.hold.at_batch();
     assert!(rig.hold.held().is_empty());
 }

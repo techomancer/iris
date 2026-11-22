@@ -12,6 +12,34 @@ const INVALID: u8 = 0x7f;
 const SECOND: u64 = 1000;
 const GRANT: u8 = 0xe0;
 
+impl Origin2000Module {
+    /// Expire every timer of the module and its controller due by the test clock, oldest first;
+    /// the module's go before the controller's at the same instant,
+    /// an order production does not promise.
+    fn settle(&self) {
+        loop {
+            let (module, elsc) = (self.shared.due_timer(), self.elsc.due_timer());
+            match (module, elsc) {
+                (None, None) => break,
+                (module, Some((due, kind))) if module.is_none_or(|m| due < m.0) => self.elsc.expire_timer(due, kind),
+                (Some((due, kind)), _) => self.shared.expire(kind, due),
+                (None, Some(_)) => unreachable!(),
+            }
+        }
+    }
+}
+
+impl Shared {
+    fn due_timer(&self) -> Option<(u64, usize)> {
+        let st = self.state.lock();
+        let now = st.clock.now();
+        [(st.message_deadline, K_MESSAGE), (st.pulse_deadline, K_PULSE), (st.service_armed.then_some(st.service_deadline), K_TICK)]
+            .into_iter()
+            .filter_map(|(d, kind)| d.filter(|d| *d <= now).map(|d| (d, kind)))
+            .min()
+    }
+}
+
 struct Rig {
     clock: TestClock,
     module: Arc<Origin2000Module>,
@@ -26,9 +54,11 @@ impl Rig {
     fn with(cfg: ModuleConfig) -> Self {
         let clock = TestClock::default();
         let nvram = Arc::new(ElscNvram::origin2000(cfg.module_number, None).unwrap());
-        let module = Origin2000Module::new(cfg, nvram, clock.clock());
+        let module = Origin2000Module::new(cfg, nvram, clock.tm());
         let aux = Arc::new(Aux::default());
         module.elsc().set_serial_backend(aux.clone());
+        let timed = module.clone();
+        clock.on_advance(Box::new(move || timed.settle()));
         module.power_on();
         let rig = Self { clock, module, aux };
         rig.init_adapters();
@@ -360,6 +390,30 @@ fn a_command_in_a_processors_turn_leaves_the_rotation_running() {
 }
 
 #[test]
+fn the_service_tick_runs_only_while_an_adapter_polls() {
+    let rig = Rig::new();
+    let armed = || rig.module.shared.state.lock().service_armed;
+    rig.step_ms(10);
+    assert!(!armed(), "it lapses once nothing polls");
+    rig.step_ms(100);
+    assert!(!armed());
+    assert_eq!(rig.r(0, DATA) & 0xf0, GRANT, "a poll still gets a grant");
+    assert!(armed());
+}
+
+#[test]
+fn a_request_after_a_lapse_waits_for_the_next_tick() {
+    let rig = Rig::new();
+    rig.step_ms(10);
+    rig.step_ms(6_000);
+    let link = Link(rig.module.shared.clone());
+    assert!(!link.serial_turn());
+    assert!(!link.serial_turn(), "the handoff is not made at the access that asked");
+    rig.step_ms(2);
+    assert!(link.serial_turn());
+}
+
+#[test]
 fn a_long_idle_gap_keeps_the_ring_on_its_grid() {
     let rig = Rig::new();
     rig.step_ms(1);
@@ -548,34 +602,21 @@ fn nmi_pulses_the_modules_output_after_a_second() {
     assert_eq!(rig.cmd(0, "ver"), "ok VER 3.2 ");
 }
 
-/// Due when the controller's reset wait ends and again when the 100 ms pulse does.
+/// The controller's reset wait ends at its deadline and the module's 100 ms pulse then runs.
 #[test]
-fn the_module_reports_when_it_is_next_due() {
-    let ms = Duration::from_millis;
+fn the_reset_wait_and_the_pulse_run_on_timers() {
     let rig = Rig::new();
     rig.events();
-    assert_eq!(rig.module.next_due(), None);
+    let pulse = || rig.module.shared.state.lock().pulse_deadline;
+    let t0 = rig.clock.now_ns();
+    assert_eq!(pulse(), None);
     rig.assert_cmd(1, "rst", "ok ");
-    assert_eq!(rig.module.next_due(), Some(ms(1000)));
     rig.step_ms(1000);
     assert_eq!(rig.events(), [ModuleOutput::Reset]);
-    assert_eq!(rig.module.next_due(), Some(ms(100)), "the pulse ends");
+    assert_eq!(pulse(), Some(t0 + 1_100_000_000), "the pulse counts from the wait's deadline");
     rig.step_ms(100);
     assert!(rig.events().is_empty());
-    assert_eq!(rig.module.next_due(), None);
-}
-
-/// An access that finds outputs already queued leaves the module due, so the machine takes them at
-/// once.
-#[test]
-fn queued_outputs_leave_the_module_due_now() {
-    let rig = Rig::new();
-    rig.events();
-    rig.assert_cmd(2, "nmi", "ok ");
-    rig.step_ms(1100);
-    assert_eq!(rig.cmd(0, "ver"), "ok VER 3.2 ");
-    assert_eq!(rig.module.next_due(), Some(Duration::ZERO), "the queued outputs are due now");
-    assert_eq!(rig.events(), [ModuleOutput::Nmi(true)]);
+    assert_eq!(pulse(), None);
 }
 
 #[test]
@@ -657,7 +698,7 @@ fn with_a_start_delay_the_module_starts_off_and_the_controller_powers_it_up() {
     rig.step_ms(7 * SECOND);
     assert!(rig.info().contains("powering up"));
     rig.step_ms(5 * SECOND);
-    rig.module.poll();
+    rig.module.elsc().poll();
     rig.init_adapters();
     assert!(rig.module.powered());
     rig.assert_cmd(0, "pwr", "ok u");
@@ -699,7 +740,7 @@ fn the_operators_serial_line_runs_when_the_scheduler_gives_it_a_turn() {
     // The line waits for the scheduler's turn at the next tick.
     assert_eq!(rig.aux.take(), "\r\nMSC> ver\r\n");
     rig.step_ms(1);
-    rig.module.poll();
+    rig.module.elsc().poll();
     assert_eq!(rig.aux.take(), "\x14ok VER 3.2 \r\n");
 }
 
@@ -714,14 +755,14 @@ fn an_unpowered_module_still_takes_serial_commands() {
             rig.module.elsc().serial_input(*b);
         }
         rig.step_ms(2);
-        rig.module.poll();
+        rig.module.elsc().poll();
         rig.aux.take()
     };
     assert_eq!(serial("pas none"), "\r\nMSC> pas none\r\n\x14ok\r\n");
     assert_eq!(serial("pwr"), "\r\nMSC> pwr\r\n\x14ok d\r\n");
     assert_eq!(serial("pwr u"), "\r\nMSC> pwr u\r\n\x14ok\r\n");
     rig.step_ms(5 * SECOND);
-    rig.module.poll();
+    rig.module.elsc().poll();
     assert!(rig.module.powered());
 }
 

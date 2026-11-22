@@ -19,6 +19,27 @@ fn reflect(rig: &Rig, level: bool) {
 use std::sync::Arc;
 use std::time::Duration;
 
+/// A reading taken on another socket can sit behind the last one; the counter does not go back.
+#[test]
+fn the_rt_counter_never_reads_below_the_last_reading() {
+    let rig = Rig::new();
+    let at = |ns: u64| rig.chip.pi[0].count(&(Arc::new(move || ns) as crate::dev::heart::Clock));
+    let first = at(10_000_000);
+    assert_eq!(at(9_998_400), first);
+    assert!(at(10_001_600) > first);
+}
+
+/// The clamp starts over when the guest writes the counter.
+#[test]
+fn a_counter_write_clears_the_rt_clamp() {
+    let rig = Rig::new();
+    rig.clock.step(8_000_000);
+    rig.r(reg::RT_COUNTER::OFFSET);
+    rig.clock.restore(1_000_000);
+    rig.w(reg::RT_COUNTER::OFFSET, 1000);
+    assert_eq!(rig.r(reg::RT_COUNTER::OFFSET), 1000);
+}
+
 /// The PROM reads PI slot presence and relies on the documented reset survivors.
 #[test]
 fn the_pi_reports_interface_state_and_retains_registers_across_reset() {
@@ -74,6 +95,46 @@ fn the_pi_reports_interface_state_and_retains_registers_across_reset() {
     }
 }
 
+/// Fire the comparator timers whose deadline has come, as the timer thread would.
+fn fire_due(chip: &Bedrock, now: u64) {
+    for pi in &chip.pi {
+        for kind in 0..3 {
+            let due = pi.timer.lock().due[kind];
+            if due <= now {
+                pi.expire(kind, due, now, &chip.levels);
+            }
+        }
+    }
+}
+fn at(rig: &Rig, ns: u64) {
+    rig.set_time(ns);
+    fire_due(&rig.chip, ns);
+}
+
+/// A store that moves a comparator keeps a match whose timer had not yet fired.
+#[test]
+fn a_comparator_store_keeps_a_match_the_timer_has_not_yet_delivered() {
+    let rig = Rig::new();
+    rig.w(reg::RT_COMPARE_A::OFFSET, 2);
+    rig.set_time(1600);
+    rig.w(reg::RT_COMPARE_A::OFFSET, 1000);
+    assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 1);
+}
+
+/// The counter equal to the compare sets the pending bit, so a compare stored equal to the
+/// counter matches at once; one stored behind it waits a revolution.
+#[test]
+fn a_comparator_stored_equal_to_the_counter_matches_at_once() {
+    let rig = Rig::new();
+    rig.set_time(1600);
+    rig.w(reg::RT_COMPARE_A::OFFSET, 2);
+    assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 1);
+    rig.w(reg::RT_INT_PEND_A::OFFSET, 0);
+    rig.w(reg::RT_COMPARE_A::OFFSET, 1);
+    at(&rig, 1_000_000);
+    assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 0);
+}
+
 /// The counter wraps, comparators latch at their tick, and the counter pauses while the machine is
 /// stopped.
 #[test]
@@ -82,9 +143,9 @@ fn the_pi_timer_wraps_and_pauses() {
         let rig = Rig::new();
         rig.w(reg::RT_COUNTER::OFFSET, 0x1_0000_0000);
         rig.w(reg::RT_COMPARE_A::OFFSET, 0x1_0000_0002);
-        rig.set_time(1599);
+        at(&rig, 1599);
         assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 0);
-        rig.set_time(1600);
+        at(&rig, 1600);
         assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 1);
         assert_eq!(rig.regs.read32(reg::RT_COUNTER::OFFSET).data, 1);
         assert_eq!(rig.regs.read32(reg::RT_COUNTER::OFFSET + 4).data, 2);
@@ -92,7 +153,7 @@ fn the_pi_timer_wraps_and_pauses() {
         assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 0);
         rig.w(reg::RT_COUNTER::OFFSET, RT_MASK);
         rig.w(reg::PROFILE_COMPARE::OFFSET, 0);
-        rig.set_time(2400);
+        at(&rig, 2400);
         assert_eq!(rig.r(reg::RT_COUNTER::OFFSET), 0);
         assert_eq!(rig.r(reg::PROF_INT_PEND_A::OFFSET), 1);
         assert_eq!(rig.r(reg::PROF_INT_PEND_B::OFFSET), 1);
@@ -101,20 +162,31 @@ fn the_pi_timer_wraps_and_pauses() {
         assert_eq!(rig.r(reg::PROF_INT_PEND_B::OFFSET), 1);
     }
     {
-        let rig = Rig::new();
-        rig.set_time(1_000_000);
-        rig.w(reg::RT_COUNTER::OFFSET, 0);
-        rig.w(reg::RT_COMPARE_A::OFFSET, 2);
-        rig.set_time(1_000_400);
-        rig.chip.stop();
-        rig.set_time(2_000_000);
-        assert_eq!(rig.r(reg::RT_COUNTER::OFFSET), 0);
-        assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 0, "no time passes while stopped");
-        rig.chip.start();
-        rig.set_time(2_001_199);
-        assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 0);
-        rig.set_time(2_001_200);
-        assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 1);
+        // The machine clock holds the counter and its deadline while the machine is stopped.
+        let clock = crate::clock::Clock::stepped();
+        let tm = Arc::new(crate::hptimer::TimerManager::with_clock(clock.clone()));
+        let chip = super::super::Bedrock::new(super::super::test_config(&tm)).unwrap();
+        let regs = chip.registers();
+        let pending = || regs.read64(reg::RT_INT_PEND_A::OFFSET).data;
+        chip.start();
+        clock.step(1_000_000);
+        regs.write64(reg::RT_COUNTER::OFFSET, 0);
+        regs.write64(reg::RT_COMPARE_A::OFFSET, 2);
+        clock.step(400);
+        chip.stop();
+        clock.stop();
+        clock.step(1_000_000);
+        fire_due(&chip, clock.now());
+        assert_eq!(regs.read64(reg::RT_COUNTER::OFFSET).data, 0);
+        assert_eq!(pending(), 0, "no time passes while stopped");
+        clock.start();
+        chip.start();
+        clock.step(1199);
+        fire_due(&chip, clock.now());
+        assert_eq!(pending(), 0);
+        clock.step(1);
+        fire_due(&chip, clock.now());
+        assert_eq!(pending(), 1);
     }
 }
 
@@ -137,7 +209,7 @@ fn pi_interrupt_outputs_follow_masks_into_the_cpus_word() {
     rig.w(reg::ERR_INT_MASK_A::OFFSET, 1);
     rig.w(reg::ERR_INT_PEND_WR::OFFSET, 1);
     assert_eq!(rig.cause(), 0b10011);
-    rig.set_time(1600);
+    at(&rig, 1600);
     assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 1);
     assert_eq!(rig.cause(), 31);
     rig.w(reg::RT_INT_PEND_A::OFFSET, 0);
@@ -153,12 +225,10 @@ fn pi_interrupt_outputs_follow_masks_into_the_cpus_word() {
 /// The host timer latches the comparator and raises IP4 with no register polling.
 #[test]
 fn the_timer_manager_delivers_expirations_without_mmio_polling() {
-    let config = super::super::test_config(crate::clock::Clock::new().reader());
-    let chip = super::super::Bedrock::new(config).unwrap();
+    let tm = Arc::new(crate::hptimer::TimerManager::new());
+    let chip = super::super::Bedrock::new(super::super::test_config(&tm)).unwrap();
     let word = Arc::new(std::sync::atomic::AtomicU64::new(0));
     chip.set_cpu_interrupts(0, &*word);
-    let tm = Arc::new(crate::hptimer::TimerManager::new());
-    chip.set_timer_manager(&tm);
     let regs = chip.registers();
     assert_eq!(regs.write64(reg::RT_COMPARE_A::OFFSET, 12500), BUS_OK);
     assert_eq!(regs.write64(reg::RT_INT_EN_A::OFFSET, 1), BUS_OK);

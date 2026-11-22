@@ -498,9 +498,9 @@ fn a_block_transfer_completion_reaches_the_node_it_names() {
 }
 
 /// A test chip's configuration: the Fuel's one processor and one 64 MiB
-/// bank, on `clock`.
-pub(super) fn test_config(clock: Clock) -> BedrockConfig<'static> {
-    BedrockConfig { name: "test", clock, processors: Population::SINGLE, banks_mib: &[64], nodes: 1, events: None, prom: None }
+/// bank, on `timers`.
+pub(super) fn test_config(timers: &Arc<TimerManager>) -> BedrockConfig<'_> {
+    BedrockConfig { name: "test", timers, processors: Population::SINGLE, banks_mib: &[64], nodes: 1, events: None, prom: None }
 }
 
 /// Two chips with their NI ports connected to each other, each on a clock of its own.
@@ -515,7 +515,7 @@ pub(super) fn connected_pair() -> (Rig, Rig) {
 /// and CPU 0's interrupt word.
 pub(super) struct Rig {
     pub(super) chip: Arc<Bedrock>,
-    now: Arc<AtomicU64>,
+    pub(super) clock: crate::clock::Clock,
     pub(super) word: Arc<AtomicU64>,
     pub(super) regs: Arc<dyn BusDevice>,
     /// The node's events.
@@ -532,16 +532,16 @@ impl Rig {
         Self::with(Population::populated_cpus(4).unwrap())
     }
     pub(super) fn with(processors: Population) -> Self {
-        let now = Arc::new(AtomicU64::new(0));
-        let clock = now.clone();
-        let config = test_config(Arc::new(move || clock.load(Ordering::SeqCst)));
+        let clock = crate::clock::Clock::stepped();
+        // The manager is dropped at the end: the comparator timers never run, and tests deliver them by hand.
+        let timers = Arc::new(TimerManager::with_clock(clock.clone()));
         let (events, receiver) = std::sync::mpsc::channel();
-        let chip = Bedrock::new(BedrockConfig { processors, events: Some(events), ..config }).unwrap();
+        let chip = Bedrock::new(BedrockConfig { processors, events: Some(events), ..test_config(&timers) }).unwrap();
         let word = Arc::new(AtomicU64::new(0));
         chip.set_cpu_interrupts(0, &*word);
         chip.start();
         let regs = chip.registers();
-        Self { chip, now, word, regs, events: parking_lot::Mutex::new(receiver) }
+        Self { chip, clock, word, regs, events: parking_lot::Mutex::new(receiver) }
     }
     pub(super) fn r(&self, at: u64) -> u64 {
         let r = self.regs.read64(at);
@@ -551,8 +551,9 @@ impl Rig {
     pub(super) fn w(&self, at: u64, value: u64) {
         assert_eq!(self.regs.write64(at, value), BUS_OK, "write at {at:#x}");
     }
+    /// Step the clock to `ns`; it never runs backwards.
     pub(super) fn set_time(&self, ns: u64) {
-        self.now.store(ns, Ordering::SeqCst);
+        self.clock.step(ns - self.clock.now());
     }
     /// Whether bank 1 bit `bit` is reflected, the same on both interfaces.
     pub(super) fn reflected(&self, bit: u32) -> bool {
