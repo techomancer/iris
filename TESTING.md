@@ -204,6 +204,40 @@ CI runs this on Linux x86-64 in the Test job, and it gates. If the bare
 sink or its setup is broken. If it passes and a card's test fails, the card
 is.
 
+## Linux file choosers
+
+iris-gui's 📁 buttons on Linux ask the XDG desktop portal for a chooser
+through a `libdbus` the AppImage must carry, and fall back to `zenity`.
+`scripts/appimage-file-chooser-test.sh` checks a built AppImage end to end.
+It starts the AppImage under Xvfb with a D-Bus session bus of its own,
+clicks the CD-ROM 📁 button in the "New machine" dialog a fresh profile
+opens with, and checks the result:
+
+- `portal`: the bus can start `xdg-desktop-portal` with its GTK backend, and
+  a window titled "Choose CD-ROM image" must appear. With
+  `HIDE_HOST_LIBDBUS=1` the host's `libdbus-1.so.3` is moved aside once the
+  portal runs, so only a `libdbus` inside the AppImage can reach it. A
+  32-bit host userland under a 64-bit AppImage looks like this.
+- `none`: the bus has no portal. No chooser may appear, and iris-gui must
+  show its "No file chooser" notice, which it also logs.
+
+zenity must not be installed. The script exits 0 on a pass and leaves
+screenshots and logs in `$OUT`. It needs root for `HIDE_HOST_LIBDBUS`, so
+run it in a throwaway container: build the AppImage with
+`scripts/dist/appimage.sh` in the Arch container CI uses, then run it in,
+for example, Ubuntu with `xvfb dbus dbus-x11 xdotool imagemagick
+xdg-desktop-portal xdg-desktop-portal-gtk` installed without recommended
+packages:
+
+```sh
+HIDE_HOST_LIBDBUS=1 scripts/appimage-file-chooser-test.sh IRIS-gui-linux-arm64-*.AppImage portal
+scripts/appimage-file-chooser-test.sh IRIS-gui-linux-arm64-*.AppImage none
+```
+
+What this proves: the AppImage reaches the portal without any `libdbus` on
+the host, and says so when no chooser exists. What it does not prove:
+the KDE or GNOME backends, Wayland, or x86-64 builds. CI does not run it.
+
 ## Strict synthetic REX3 replay corpus
 
 The redistributable [REX3 corpus](src/dev/ng1/testdata/README.md) contains

@@ -13,9 +13,9 @@ Installing `zenity` on the host "fixed" it.
 `libdbus-1.so.3` (then `libdbus-1.so`) when a dialog opens
 (`backend/xdg_desktop_portal/portal/ffi.rs`). quick-sharun's strace mode runs
 the app for a few seconds and never opens a dialog, so the library was not
-bundled, and sharun's loader does not search the host's library path. (The
-reporter's host had a 32-bit userland, so its libdbus could not have been used
-anyway.) With no portal connection rfd runs `zenity`; when that is missing too
+bundled. The AppImage's cross-libc-dlopen still lets it load the host's
+libdbus, so a host with a 64-bit `libdbus-1.so.3` worked; the reporter's host
+had a 32-bit userland, so there was none to load. With no portal connection rfd runs `zenity`; when that is missing too
 it logs the error and returns `None`, the same as a cancel.
 
 **Fix / rules.**
@@ -32,5 +32,11 @@ it logs the error and returns `None`, the same as a cancel.
 - That detection keys on rfd 0.17's log wording. After an rfd upgrade, re-check
   `backend/xdg_desktop_portal.rs` for the zenity failure message and update
   `filedialog::no_picker_shown` and its tests.
+- `scripts/appimage-file-chooser-test.sh` (TESTING.md, "Linux file
+  choosers") reproduces it: `HIDE_HOST_LIBDBUS=1 … portal` hides the host's
+  libdbus after the portal starts. Measured 2026-11-22 on arm64 AppImages:
+  upstream failed with the issue's exact two log lines, the fix opened the
+  GTK chooser; `none` showed the notice. Fresh build containers only: a
+  second `appimage.sh` run in the same container bundled no Mesa.
 - The standalone `iris` window (`src/ui.rs`) still calls rfd directly and has
   no notice.

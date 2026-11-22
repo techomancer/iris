@@ -231,6 +231,9 @@ fn watched(pick: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
     let picked = pick();
     let errors = PICK_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     if picked.is_none() && no_picker_shown(&errors) {
+        // Not an rfd target, so the tap does not collect it. The AppImage
+        // test (scripts/appimage-file-chooser-test.sh) waits for this line.
+        log::error!("no file chooser could be opened; showing the notice");
         *UNAVAILABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(errors);
     }
     picked
