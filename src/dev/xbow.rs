@@ -284,7 +284,7 @@ pub struct Xbow {
     on_link_change: OnceLock<Box<dyn Fn(u8, bool) + Send + Sync>>,
     /// Told of a link reset, with the widget, once the switch's own state
     /// has settled: the widget at the far end resets too.
-    on_link_reset: OnceLock<Box<dyn Fn(u8) + Send + Sync>>,
+    on_link_reset: Mutex<Vec<Arc<dyn Fn(u8) + Send + Sync>>>,
     /// The Bridges behind ports ([`Self::serve_bridge`]), reset with their
     /// port's link.
     served: Mutex<Vec<(u8, Weak<Bridge>)>>,
@@ -325,7 +325,7 @@ impl Xbow {
             irq_order: Mutex::new(()),
             host: OnceLock::new(),
             on_link_change: OnceLock::new(),
-            on_link_reset: OnceLock::new(),
+            on_link_reset: Mutex::new(Vec::new()),
             served: Mutex::new(Vec::new()),
             unsupported: Mutex::new(Vec::new()),
             unsupported_full: AtomicBool::new(false),
@@ -380,10 +380,11 @@ impl Xbow {
         let _ = self.on_link_change.set(f);
     }
 
-    /// What to do when a link reset reaches the widget on the far end.
+    /// What to do when a link reset reaches the widget on the far end; every
+    /// callback added runs, in order.
     /// Called with no Crossbow lock held.
     pub fn on_link_reset(&self, f: Box<dyn Fn(u8) + Send + Sync>) {
-        assert!(self.on_link_reset.set(f).is_ok(), "a Crossbow takes one link-reset callback");
+        self.on_link_reset.lock().push(f.into());
     }
 
     /// Serve the Bridge behind port `widget`: it sends only to widgets with a
@@ -428,7 +429,8 @@ impl Xbow {
             for b in served {
                 b.link_reset();
             }
-            if let Some(cb) = self.on_link_reset.get() {
+            let callbacks = self.on_link_reset.lock().clone();
+            for cb in callbacks {
                 cb(w);
             }
         }
@@ -1420,6 +1422,15 @@ mod tests {
         assert_eq!(bridge.register(reg::INT_ENABLE), 0x44, "port 14 is not the Bridge's");
         assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
         assert_eq!(bridge.register(reg::INT_ENABLE), 0, "port 15 is");
+    }
+
+    #[test]
+    fn every_link_reset_callback_runs_in_order() {
+        let x = Xbow::new(5, 0x8100);
+        let (a, b) = (resets(&x), resets(&x));
+        assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
+        assert_eq!(*a.lock(), [15]);
+        assert_eq!(*b.lock(), [15]);
     }
 
     #[test]
