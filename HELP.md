@@ -39,10 +39,10 @@ IRIX **System Manager** and `hinv` report a **CPU MHz** line (e.g. 166 MHz). Tha
 is **guest inventory** from the PROM and kernel — not how fast your PC is
 emulating the Indy.
 
-The **iris-gui status bar MIPS** figure (or the CLI window title `MIPS` readout)
-is **real throughput**: MIPS instructions executed per wall-clock second on the
-host. `lightning` builds and the JIT stack (`--features jitv2,gpujit`) give
-higher MIPS; the hinv MHz string stays the same.
+The **status bar MIPS** figure (and iris-gui's MIPS readout) is **real
+throughput**: MIPS instructions executed per wall-clock second on the host.
+`lightning` builds and the JIT stack (`--features jitv2,gpujit`) give higher
+MIPS; the hinv MHz string stays the same.
 
 The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at
 half the configured part's clock (75 MHz for the 150 MHz R4400 of an Indy or
@@ -50,16 +50,38 @@ Indigo2, 97.5 MHz for the 195 MHz R10000 of an IP28), anchored to host wall-cloc
 no calibration or inference. Override it with `[clock] fixed_mhz` or
 `--clock-fixed-mhz` if a guest needs something else.
 
-The status bar **Hz** value counts the guest kernel's fast clock: CP0 Compare
-(IP7) matches, or IOC 8254 timer 1 interrupts, depending on the kernel's timer
-source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
-100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
-needs it), so the figure reads 1000 while the fast clock runs. IRIX on the
-Octane runs both clocks on CP0 Compare, which fires for whichever is due
-next, so there the figure counts every Compare match as one interrupt and the
-two clocks cannot be told apart from outside the guest. At an idle desktop it
-reads about 107 (the 100 Hz tick plus a few extra Compare writes); during boot
-it reads about 1000 while IRIX calibrates the clock.
+### The status bar
+
+From the left, the bar under the guest's screen shows:
+
+- **The fastest CPU's MIPS**, then **one cell per CPU**: a bar from the
+  bottom showing that CPU's speed against the fastest one (which fills its
+  cell), with the CPU's number drawn faintly over it (0 to 9, then A to Z).
+- After each cell, that CPU's **clock-tick light**: green when its clock
+  interrupts arrive within 10% of the rate the guest programmed, orange when
+  they are off it (the host cannot keep up, or the guest asked for something
+  the emulator does not deliver), red when none arrived for half a second,
+  and dim green when ticks arrive but no timer has told the bar what rate to
+  expect.
+- **NET** TX and RX activity, and the **SCSI** target lights: 0 to F on
+  machines with wide SCSI or Fibre Channel, 0 to 7 on the Indy and Indigo2.
+  Every controller shares the lights, so target 1 on either bus lights 1;
+  Fibre Channel loop IDs fold onto 0 to F.
+- The front-panel **LED**s, the **JIT** code arena and compile queue
+  (`jitv2` builds), and **G**, the graphics command queue.
+
+Each gauge has a faint background showing how far it reaches.
+
+The monitor gives the same figures as text: `speed` (each CPU's MIPS),
+`ticks` (each CPU's tick rate against the programmed one), and
+`watch speed` or `watch ticks` to keep them updating on one line (see
+[debug.md](debug.md)).
+
+Which interrupt is the clock tick depends on the machine. IRIX on the Indy,
+Indigo2 and IP28 keeps time with the IOC's 8254: timer 0 is the 100 Hz
+system clock and timer 1 the 1000 Hz fast clock (parked when nothing needs
+it). IRIX on the Octane runs both clocks on CP0 Compare, which fires for
+whichever is due next.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).

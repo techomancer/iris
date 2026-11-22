@@ -39,7 +39,8 @@ What you can inspect depends on how iris was built:
 The `developer` *profile* alone only changes optimisation and debug-info
 settings; the instrumentation comes from the `developer` *feature*.
 Developer builds also show extra counters in the status bar (D: decode rate,
-I$: L1I hit rate, UC: uncached fetches, cs: step count).
+I$: L1I hit rate, UC: uncached fetches, cnt: the CP0 Count rate, g: the
+graphics queue depth).
 
 ## The monitor console
 
@@ -77,6 +78,12 @@ CPU for the duration of the command and resumes it afterwards, so `bp add`,
 
 A breakpoint hit while the CPU runs freely is reported by `status` and
 `wait`, not printed.
+
+`watch [-n SECONDS] <command> [args]` runs any command again every second
+(or every SECONDS, 0.1 to 3600), redrawing its answer on one line, until you
+press Enter: `watch speed`, `watch ticks`, `watch -n 0.5 rex status`. It is
+for an interactive client; `tools/mon.py` and the MCP server would wait for
+it forever.
 
 **[DEV]** below marks commands that need a `developer` build. Most are
 accepted in every build but do nothing without the feature; `si`, the CPU's
@@ -607,6 +614,7 @@ a forced termination; a normal stop saves them automatically.
 
 | Command | Description |
 |---|---|
+| `ports` | Every host socket iris is listening on, with what it is for: the monitor, port forwards (TCP and UDP), VNC, the GDB stub, the CI socket, serial and virtio console sockets, the O2 control port |
 | `seeq status` | SEEQ 8003 ethernet state |
 | `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
 | `net interfaces` | Host interfaces available for PCAP |
@@ -672,6 +680,8 @@ controller's accesses and values nothing establishes.
 
 | Command | Description |
 |---|---|
+| `speed` | Each CPU's MIPS over the last half second, and the total. Every machine, with a display or without |
+| `ticks` | Each CPU's clock-tick rate against the rate the guest programmed (`measured/programmed Hz`), and the status bar's verdict for it: `ok` within 10%, `off` outside, `stopped` with no ticks, `ticking` when no timer has published a rate |
 | `perf snapshot` | Performance counters (Indy, Indigo2 and the Bedrock machines) |
 | `locks` | Every registered lock, whether it is held, and by which thread and call site (for `SpinLock`s); Indy and Indigo2 |
 | `perfetto start FILE [cats=LIST] [clock=host\|guest]` | Start a Perfetto trace (`--features perfetto`; Indy, Indigo2, O2, Octane, Origin 200/2000, Fuel, Tezro and Origin 3000) |

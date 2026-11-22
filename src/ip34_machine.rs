@@ -67,6 +67,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let heartbeat = Arc::new(AtomicU64::new(0));
     let fasttick = Arc::new(AtomicU64::new(0));
     let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
+    status.set_scsi_wide(true);
     let graphics = cfg.graphics_board();
     let vpro = (graphics != GraphicsBoard::None)
         .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, bedrock.interrupt_sender(WIDGET_VPRO, None), &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))

@@ -13,6 +13,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Status bar and monitor
+
+- The status bar shows the fastest CPU's MIPS and a cell per CPU with its
+  speed against the fastest, its number, and a light for its clock tick
+  (green on the programmed rate, orange off it, red stopped), on every
+  machine; the multi-CPU figures no longer run off the bar.
+- Storage activity lights cover SCSI targets 0 to F (0 to 7 on Indy and
+  Indigo2) for every controller, now including Fibre Channel; the Onyx 3000's
+  network and storage lights work.
+- New monitor commands: `speed` and `ticks` (per-CPU MIPS and clock-tick
+  rates, on machines with or without a display), `ports` (every host socket
+  iris listens on), and `watch <command>` to keep any command's answer
+  updating on one line.
+
 ### Newport colour-index shading
 
 - With the REX3 JIT (always on in iris-gui), smooth-shaded colour-index

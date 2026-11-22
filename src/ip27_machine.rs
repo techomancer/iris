@@ -425,9 +425,10 @@ fn onyx2(
     let pci_bridge = bridge.clone();
     let mut io = pci_devices(timers, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, heartbeat)?;
     attach_mediaio(timers, cfg, &pci_bridge, &mut io);
+    status.set_scsi_wide(true);
+    io.status = Some(status);
     if let Some(p) = pipe {
         io.display = Some(p.display());
-        io.status = Some(status);
         io.devices.push(p.clone());
         io.monitor.push(p.clone());
         let reset = std::mem::replace(&mut io.reset, Box::new(|| {}));

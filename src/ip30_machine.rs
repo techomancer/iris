@@ -400,6 +400,7 @@ impl OctaneMachine {
                 let slot = fc.slot.or_else(|| board.free_slot()).ok_or("[fibre_channel]: the board has no free slot")?;
                 board.check_slot(slot).map_err(|e| format!("[fibre_channel]: {e}"))?;
                 let card = crate::dev::isp2200::card::Card::open(fc, cfg.ci)?;
+                card.fc.set_heartbeat(heartbeat.clone());
                 card.attach(board.bus(), slot);
                 eprintln!(
                     "iris: Fibre Channel in the {} on XIO slot {}, slot {slot}, {} loop disk(s)",
@@ -460,6 +461,7 @@ impl OctaneMachine {
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
         let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
+        status.set_scsi_wide(true);
         let gfx = board
             .map(|b| ImpactXio::with_raster(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone(), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str())))
             .transpose()?;

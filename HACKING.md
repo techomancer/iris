@@ -705,7 +705,7 @@ thread that owns it.
 
 One thread per machine, `Display-Refresh` (`src/display/`), drives every
 graphics board's display. A board implements `Head` and holds a `HeadHandle`,
-which it gets from the machine's `StatusSource`
+which it gets from the machine's `MachineStatus`
 (`status.refresh().head(..)`), attaches itself to, and starts and stops with
 the device. The thread keeps each head's `VideoTiming` (totals and pixel
 clock, so the refresh rate) on the host's monotonic clock and runs the same
@@ -1273,18 +1273,41 @@ divide through `div_exact` and keep products apart from sums; and a large
 struct copied by value into a lane's private memory gave silently wrong
 results, so records, slots and tables are read from their buffers in place.
 
-The status bar under the frame is fed by `StatusSource` (`src/disp.rs`),
-which the machine builds once and hands to every graphics board: the
-heartbeat word (front-panel LEDs and SCSI/network activity bits), the CPU
-cycle counter, the Compare-match count and, in developer builds, the fetch
-counters. The refresh thread calls `status.snapshot(now, gfifo_pending)` once
-per presented frame and passes the result to `Renderer::present`; the call
-clears the activity bits and keeps the LEDs. Only the board's own queue depth
-is supplied by the board. A new board takes the `Arc<StatusSource>` in its
-constructor, answers `GfxDisplay::cycles` from it, and does not build a
-`BarStats` itself. The machine wires the cycle counter in with one
-`set_cpu_cycles` once the CPU exists, and each further CPU with
-`add_cpu_stats`.
+### Machine status and the status bar
+
+`MachineStatus` (`src/status.rs`) is the one structure every CPU and device
+reports into. The machine builds it once and hands an `Arc` to everything
+that reports or reads; nothing on a reporting path takes a lock. It holds:
+
+- the heartbeat word (`status::hb`): front-panel LEDs, network activity and
+  16 storage lights. Devices keep a clone of its `Arc<AtomicU64>` and set
+  bits; a storage controller calls `status::scsi_blink(hb, target)`, which
+  folds any target or loop ID onto 0..15. `set_scsi_wide` says whether the
+  bar shows 16 lights or folds them onto 8;
+- a slot per CPU (`status.cpu(n)`): its cycle counter, its clock-tick
+  counter, and `tick_rate()`, where the timer that drives that CPU's clock
+  publishes the rate the guest programmed (millihertz, 0 when unknown). The
+  machine wires the first CPU's cycles with `set_cpu_cycles` once the CPU
+  exists and each further CPU with `add_cpu_stats`;
+- the JIT's gauges (a reference to the `jit_feedback` static, which the JIT
+  pool shared by all CPUs reports through) and, in developer builds, the
+  fetch counters.
+
+Rates (MIPS and tick Hz per CPU) come from one sampler inside it, over
+windows of at least half a second; the bar and the monitor's `speed` and
+`ticks` read the same figures. The status is also a monitor device on every
+machine, with a display or without.
+
+The bar is drawn by the display layer, never by a board: `HeadHandle`
+owns a `status::StatusBar` and `status_bar(gfifo_pending, width)` draws one
+frame of it, clearing the activity bits and keeping the LEDs. The refresh
+thread calls it once per presented frame; a board that presents from its own
+thread (Newport on the GPU) calls it there, after taking the renderer (the
+refresh thread's lock order is screen, renderer, bar). Renderers get the
+finished strip (`STATUS_BAR_HEIGHT` rows at `STRIP_STRIDE`) and only show
+it. Only the board's queue depth comes from the board (`Head::gfifo_pending`).
+A new board takes the `Arc<MachineStatus>` in its constructor, answers
+`GfxDisplay::cycles` from it, and does not draw a bar.
 
 ### The composed frame and the hardware cursor
 
