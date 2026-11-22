@@ -5,8 +5,8 @@
 //! two- and four-processor Tezro board adds a second at widget 11.
 //!
 //! A [`Pic`] is self-contained: the machine builds one per widget, hands the
-//! processor's view of it to Bedrock IO ([`Pic::widget`]), gives it a
-//! [`PicPeer`] for the packets it originates (interrupts and DMA), and
+//! processor's view of it to Bedrock IO ([`Pic::widget`]), gives it the
+//! [`Upstream`] its packets (interrupts and DMA) leave by, and
 //! attaches PCI functions to the bus slots. Each head owns a shared [`PciBus`] (`src/pci/`) for its
 //! functions, BAR decode and interrupt pins, and is that bus's [`PciHost`]:
 //! it supplies the DMA a slot gets and takes the level of each of its eight
@@ -31,7 +31,7 @@
 //! 32-bit access to the low half of an eight-byte slot) and the processor's
 //! byte-lane placement for PCI cycles are inferred from the public drivers.
 //! Translated (ATE) DMA, PCI-X errors and the bridge's own PCI function are
-//! unsupported and observable ([`Pic::unsupported`]). The packet face a peer
+//! unsupported and observable ([`Pic::unsupported`]). The packet face a host
 //! could read the heads through has no user and is not modeled. All
 //! transfers are synchronous.
 //!
@@ -43,7 +43,7 @@
 //! write force-with-pin at the end of each interrupt dispatch, so an input a
 //! handler leaves active is delivered again (established from the drivers);
 //! the chip has no timer that sends a packet again, and neither has the
-//! model. A packet the peer refuses is dropped and logged and the status
+//! model. A packet the host refuses is dropped and logged and the status
 //! bit stays set; whether the chip retries one is unknown, and the model
 //! leaves recovery to the next force write. Whether the interrupt enable
 //! gates a forced packet is unknown; the model does not gate it. A packet
@@ -69,7 +69,7 @@
 //! model). Each whole aligned unit reaches memory as one
 //! write, so a word a device updates is never seen torn; a burst as a whole
 //! is not atomic. A ragged end writes only its own bytes of the unit, as
-//! one packet; the peer then applies them as naturally aligned pieces, so
+//! one packet; the host then applies them as naturally aligned pieces, so
 //! an odd-sized end of three bytes is two writes (inferred; the chip's own
 //! byte-enable handling is unknown).
 //!
@@ -92,6 +92,7 @@ use crate::pci::{
     BarDevice, BarMapping, BoardIrq, ByteOrder, CpuWindow, DevFn, IntxRouting, PciBus, PciDma, PciDmaStatus, PciFunction,
     PciHost, Space,
 };
+use crate::xtalk::{HostPort, Upstream};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::{Mutex, RwLock};
 use std::sync::{Arc, OnceLock, Weak};
@@ -151,7 +152,6 @@ const MASTER_TIMEOUT: u64 = 1 << 11;
 /// The error view: the error bits, whether or not they are enabled.
 /// Read-only; any write to the reset register clears it.
 const ERROR_VIEW: usize = reg::INTERRUPT_MULTIPLE;
-const SET: u64 = 0x100;
 /// The force registers, one write-only slot per input: a write to
 /// force-always sends the input's set packet whatever its level, and to
 /// force-with-pin only while the input is active. The data is ignored.
@@ -220,15 +220,14 @@ impl PioDecode {
     }
 }
 
-/// Widget 0's interrupt packets, which go to the peer as the PIC's do.
+/// Widget 0's interrupt packets, which go to the host as the PIC's do.
 struct PxbowPackets(Arc<Wiring>);
 impl crate::irq::InterruptController for PxbowPackets {
     fn set_line(&self, line: u32, level: bool) {
         self.packet(0, 0, line, level);
     }
     fn packet(&self, _source: u8, address: u64, line: u32, level: bool) -> bool {
-        let payload = u64::from(line) | if level { SET } else { 0 };
-        let taken = self.0.peer.get().is_some_and(|peer| peer.interrupt(0, address, payload).is_ok());
+        let taken = self.0.interrupt(0, address, u64::from(line), level);
         if !taken {
             crate::dlog!(LogModule::Bedrock, "pic: PXBOW interrupt packet to {address:#x} refused");
         }
@@ -246,25 +245,6 @@ pub const fn identity(head: usize) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Unclaimed;
 
-/// What the machine's side of the XIO link refused: no target, a permission
-/// check, or an address with nothing behind it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Refused;
-
-/// The far end of the link: where the packets this chip originates go. On
-/// Tezro that is Bedrock IO. Bytes are in address order, as the XIO packet
-/// carries them.
-pub trait PicPeer: Send + Sync {
-    /// An interrupt packet: `payload` is the vector, with bit 8 for assert,
-    /// written to the 48-bit destination `address`.
-    fn interrupt(&self, source_widget: u8, address: u64, payload: u64) -> Result<(), Refused>;
-
-    /// A DMA read of `data.len()` bytes at the 48-bit `address` of `widget`.
-    fn dma_read(&self, source_widget: u8, widget: u8, address: u64, data: &mut [u8]) -> Result<(), Refused>;
-
-    fn dma_write(&self, source_widget: u8, widget: u8, address: u64, data: &[u8]) -> Result<(), Refused>;
-}
-
 /// How the board uses a PCI function's slot.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Function {
@@ -277,13 +257,23 @@ pub struct Function {
     pub req64: bool,
 }
 
-/// The peer was already connected.
-#[derive(Debug, PartialEq, Eq)]
-pub struct AlreadyConnected;
-
-/// Wiring set once before the machine runs.
+/// Where the packets this chip originates go: the hosts it can reach, by
+/// widget, and the one its interrupts name.
 struct Wiring {
-    peer: OnceLock<Arc<dyn PicPeer>>,
+    up: Upstream,
+    host: u8,
+}
+
+impl Wiring {
+    /// The host at `widget`, if there is one and its link is up.
+    fn port(&self, widget: u8) -> Option<&HostPort> {
+        self.up.get(widget).filter(|h| h.link_up())
+    }
+
+    /// An interrupt packet to the host: whether it took it.
+    fn interrupt(&self, source: u8, address: u64, vector: u64, set: bool) -> bool {
+        self.port(self.host).is_some_and(|h| h.irq.packet(source, address, vector as u32, set))
+    }
 }
 
 struct State {
@@ -413,7 +403,7 @@ fn natural(address: u64, remaining: usize) -> usize {
 }
 
 /// The next packet of an unswapped transfer: whole doublewords from an
-/// aligned address go as one run for the peer to apply a doubleword at a
+/// aligned address go as one run for the host to apply a doubleword at a
 /// time, as a burst on the bus is; the ragged bytes around it are each the
 /// largest naturally aligned field that fits.
 fn packet(address: u64, remaining: usize) -> usize {
@@ -422,6 +412,93 @@ fn packet(address: u64, remaining: usize) -> usize {
     } else {
         natural(address, remaining)
     }
+}
+
+/// The pieces of a transfer as (offset, bytes): whole doublewords from an
+/// 8-aligned address are one run; the ragged bytes around them are each the
+/// largest naturally aligned size of four or fewer.
+fn legs(address: u64, len: usize) -> impl Iterator<Item = (usize, usize)> {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        if offset == len {
+            return None;
+        }
+        let at = address + offset as u64;
+        let left = len - offset;
+        let size = if at.is_multiple_of(8) && left >= 8 {
+            left & !7
+        } else {
+            [4usize, 2, 1].into_iter().find(|&n| at.is_multiple_of(n as u64) && n <= left).unwrap_or(1)
+        };
+        let leg = (offset, size);
+        offset += size;
+        Some(leg)
+    })
+}
+
+/// Doublewords moved per block access. The stack buffer is zeroed per
+/// transfer, so it stays small: a whole page cost more than it saved.
+const BLOCK_WORDS: usize = 64;
+
+/// Read `data.len()` bytes at `address` of `mem` in naturally aligned legs,
+/// so a word a device reads is never torn. False on the first refusal.
+pub(crate) fn read_bytes(mem: &dyn BusDevice, address: u64, data: &mut [u8]) -> bool {
+    for (offset, size) in legs(address, data.len()) {
+        let at = address + offset as u64;
+        let out = &mut data[offset..offset + size];
+        if size < 8 {
+            let word = match size {
+                1 => Some(mem.read8(at)).and_then(|r| r.is_ok().then_some(u64::from(r.data))),
+                2 => Some(mem.read16(at)).and_then(|r| r.is_ok().then_some(u64::from(r.data))),
+                _ => Some(mem.read32(at)).and_then(|r| r.is_ok().then_some(u64::from(r.data))),
+            };
+            let Some(word) = word else { return false };
+            out.copy_from_slice(&word.to_be_bytes()[8 - size..]);
+            continue;
+        }
+        let mut words = [0u64; BLOCK_WORDS];
+        for (n, part) in out.chunks_mut(8 * BLOCK_WORDS).enumerate() {
+            let words = &mut words[..part.len() / 8];
+            if mem.read_block(at + (n * 8 * BLOCK_WORDS) as u64, words) != BUS_OK {
+                return false;
+            }
+            for (bytes, word) in part.chunks_exact_mut(8).zip(words.iter()) {
+                bytes.copy_from_slice(&word.to_be_bytes());
+            }
+        }
+    }
+    true
+}
+
+/// The write twin of [`read_bytes`].
+pub(crate) fn write_bytes(mem: &dyn BusDevice, address: u64, data: &[u8]) -> bool {
+    for (offset, size) in legs(address, data.len()) {
+        let at = address + offset as u64;
+        let part = &data[offset..offset + size];
+        if size < 8 {
+            let value = be_value(part);
+            let status = match size {
+                1 => mem.write8(at, value as u8),
+                2 => mem.write16(at, value as u16),
+                _ => mem.write32(at, value as u32),
+            };
+            if status != BUS_OK {
+                return false;
+            }
+            continue;
+        }
+        let mut words = [0u64; BLOCK_WORDS];
+        for (n, part) in part.chunks(8 * BLOCK_WORDS).enumerate() {
+            let words = &mut words[..part.len() / 8];
+            for (word, bytes) in words.iter_mut().zip(part.chunks_exact(8)) {
+                *word = u64::from_be_bytes(bytes.try_into().unwrap());
+            }
+            if mem.write_block(at + (n * 8 * BLOCK_WORDS) as u64, words) != BUS_OK {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn le_bytes(size: usize, value: u64) -> [u8; 8] {
@@ -445,7 +522,7 @@ fn be_value(bytes: &[u8]) -> u64 {
 }
 
 /// One bridge head: registers, one PCI bus, and its interrupt inputs.
-// Lock order: `order`, then `st`. Packets go to the peer and the PIs with
+// Lock order: `order`, then `st`. Packets go to the host and the PIs with
 // `st` dropped; `order` keeps two threads' packets in the order decided.
 struct Head {
     index: usize,
@@ -563,7 +640,7 @@ impl Head {
 
     // ---- interrupts ----
 
-    /// Send pin `pin`'s set or clear packet. True when the peer took it.
+    /// Send pin `pin`'s set or clear packet. True when the host took it.
     fn packet(&self, pin: usize, set: bool) -> bool {
         let (destination, source) = {
             let mut st = self.st.lock();
@@ -580,22 +657,11 @@ impl Head {
             crate::dlog!(LogModule::Bedrock, "pic: head {} pin {pin} rejected interrupt level {level:#x} for a PI", self.index);
             return false;
         }
-        let payload = level | if set { SET } else { 0 };
-        let sent = self.send_interrupt(source, address, payload);
+        let sent = self.wiring.interrupt(source, address, level, set);
         if !sent {
             crate::dlog!(LogModule::Bedrock, "pic: head {} interrupt destination {destination:#x} refused", self.index);
         }
         sent
-    }
-
-    fn send_interrupt(&self, source: u8, address: u64, payload: u64) -> bool {
-        match self.wiring.peer.get() {
-            Some(peer) => peer.interrupt(source, address, payload).is_ok(),
-            None => {
-                crate::dlog!(LogModule::Bedrock, "pic: head {} interrupt has no peer", self.index);
-                false
-            }
-        }
     }
 
     fn pin(&self, pin: usize, level: bool) {
@@ -668,7 +734,7 @@ impl Head {
         }
         let Some(address) = self.error_destination() else { return };
         let source = self.source_widget();
-        if !self.send_interrupt(source, address, number | SET) {
+        if !self.wiring.interrupt(source, address, number, true) {
             crate::dlog!(LogModule::Bedrock, "pic: head {} error destination {address:#x} refused", self.index);
         }
     }
@@ -1127,7 +1193,7 @@ impl Head {
 
     // ---- DMA ----
 
-    /// Carry `bytes` to or from the peer a page at a time. A write may leave
+    /// Carry `bytes` to or from the host a page at a time. A write may leave
     /// `bytes` swapped.
     fn dma(&self, device: u8, address: u64, bytes: &mut [u8], write: bool) -> PciDmaStatus {
         if !(1..=DEVICES).contains(&device) {
@@ -1164,36 +1230,32 @@ impl Head {
         self.direct32(device, at, chunk, write)
     }
 
-    fn send_dma(&self, source: u8, widget: u8, address: u64, data: &mut [u8], write: bool) -> bool {
-        let Some(peer) = self.wiring.peer.get() else {
-            crate::dlog!(LogModule::Bedrock, "pic: head {} DMA has no peer", self.index);
+    fn send_dma(&self, widget: u8, address: u64, data: &mut [u8], write: bool) -> bool {
+        let Some(host) = self.wiring.port(widget) else {
+            crate::dlog!(LogModule::Bedrock, "pic: head {} DMA to widget {widget} refused; it is not a host", self.index);
             return false;
         };
-        if write {
-            peer.dma_write(source, widget, address, data).is_ok()
-        } else {
-            peer.dma_read(source, widget, address, data).is_ok()
-        }
+        if write { write_bytes(&*host.mem, address, data) } else { read_bytes(&*host.mem, address, data) }
     }
 
     /// The direct map: PCI `0x80000000` and up reach the widget `DIR_MAP`
     /// names, at the address its high bits and the PCI offset make.
     fn direct32(&self, device: u8, at: u64, chunk: &mut [u8], write: bool) -> bool {
-        let (direct, attributes, source) = {
+        let (direct, attributes) = {
             let st = self.st.lock();
-            (st.r(reg::DIRECT_MAP), st.r(reg::DEVICE_BASE + (device as usize - 1) * 8), (st.r(reg::CONTROL) & 0xf) as u8)
+            (st.r(reg::DIRECT_MAP), st.r(reg::DEVICE_BASE + (device as usize - 1) * 8))
         };
         let widget = ((direct >> 20) & 0xf) as u8;
         let target = ((direct & 0x1ffff) << 31) | (at & 0x7fff_ffff);
         if attributes & DEVICE_ADDRESS_ORDER == 0 {
             // With the bit clear the slot keeps each 32-bit value, so a byte
             // lands at its address with the low two bits flipped.
-            return self.send_flipped(source, widget, target, chunk, write, 3, |_, _| true);
+            return self.send_flipped(widget, target, chunk, write, 3, |_, _| true);
         }
         let mut done = 0;
         while done < chunk.len() {
             let n = packet(target + done as u64, chunk.len() - done);
-            if !self.send_dma(source, widget, target + done as u64, &mut chunk[done..done + n], write) {
+            if !self.send_dma(widget, target + done as u64, &mut chunk[done..done + n], write) {
                 return false;
             }
             done += n;
@@ -1226,7 +1288,6 @@ impl Head {
     /// precise, prefetch) change nothing here.
     fn direct64(&self, device: u8, at: u64, chunk: &mut [u8], write: bool) -> bool {
         let wide = self.slots.read()[device as usize].is_some_and(|slot| slot.req64);
-        let source = self.source_widget();
         let check = |address: u64, size: usize| match Self::direct64_refusal(address, size) {
             Some(why) => {
                 crate::dlog!(LogModule::Bedrock, "pic: head {} direct64 {why} address {address:#018x} from device {device}", self.index);
@@ -1241,7 +1302,7 @@ impl Head {
         let payload = at & ((1 << PAYLOAD_BITS) - 1);
         if at & (1 << 55) == 0 {
             let mask = if wide { 7 } else { 3 };
-            return self.send_flipped(source, widget, payload, chunk, write, mask, |offset, n| check(at + offset, n));
+            return self.send_flipped(widget, payload, chunk, write, mask, |offset, n| check(at + offset, n));
         }
         let mut done = 0;
         while done < chunk.len() {
@@ -1251,7 +1312,7 @@ impl Head {
             let here = payload + done as u64;
             let left = chunk.len() - done;
             let n = if here % 8 == 0 && left >= 8 { left & !7 } else { (8 - (here & 7) as usize).min(left) };
-            if !check(at + done as u64, n) || !self.send_dma(source, widget, payload + done as u64, &mut chunk[done..done + n], write) {
+            if !check(at + done as u64, n) || !self.send_dma(widget, payload + done as u64, &mut chunk[done..done + n], write) {
                 return false;
             }
             done += n;
@@ -1263,7 +1324,7 @@ impl Head {
     /// bits in `mask` flipped, which reverses the bytes of each aligned
     /// group of `mask + 1`, the data phase. The flip moves bytes within a
     /// group, not the transfer apart: a run of whole groups goes as one
-    /// packet, which the peer applies one aligned group at a time, so a
+    /// packet, which the host applies one aligned group at a time, so a
     /// processor reading a word the device is updating sees all of it old
     /// or all of it new; the run as a whole is not atomic, as a burst on
     /// the bus is not. A group the transfer covers in part writes only
@@ -1274,7 +1335,6 @@ impl Head {
     #[allow(clippy::too_many_arguments)]
     fn send_flipped(
         &self,
-        source: u8,
         widget: u8,
         address: u64,
         chunk: &mut [u8],
@@ -1300,7 +1360,7 @@ impl Head {
             if write {
                 part.chunks_mut(n_group).for_each(<[u8]>::reverse);
             }
-            if !fits(done as u64, n) || !self.send_dma(source, widget, at, part, write) {
+            if !fits(done as u64, n) || !self.send_dma(widget, at, part, write) {
                 return false;
             }
             if !write {
@@ -1339,11 +1399,11 @@ pub struct Pic {
 }
 
 impl Pic {
-    /// A PIC that answers as XIO widget `widget`.
-    pub fn new(widget: u8) -> Arc<Self> {
-        let wiring = Arc::new(Wiring {
-            peer: OnceLock::new(),
-        });
+    /// A PIC that answers as XIO widget `widget`, sending its interrupts to
+    /// the host at widget `host` and its DMA to whichever of `up`'s hosts the
+    /// transfer names.
+    pub fn new(widget: u8, host: u8, up: Upstream) -> Arc<Self> {
+        let wiring = Arc::new(Wiring { up, host });
         Arc::new(Self {
             widget,
             heads: [Head::new(0, wiring.clone()), Head::new(1, wiring.clone())],
@@ -1365,7 +1425,7 @@ impl Pic {
     /// Give the chip its PXBOW, the widget-0 face of the board that owns
     /// it, reached from `host_widget`. On Tezro the PIC that carries IO9
     /// supplies widget 0; a second PIC gets none. The PIC's own widget is
-    /// attached behind it, and widget 0's interrupt goes to the peer when it
+    /// attached behind it, and widget 0's interrupt goes to the host when it
     /// targets the host. Once, before the machine runs.
     pub fn enable_pxbow(self: &Arc<Self>, host_widget: u8) -> Result<Arc<Pxbow>, AttachError> {
         let pxbow = Pxbow::new(host_widget, self.widget)?;
@@ -1378,12 +1438,6 @@ impl Pic {
     /// The chip's PXBOW, if it has one.
     pub fn pxbow(&self) -> Option<&Arc<Pxbow>> {
         self.pxbow.get()
-    }
-
-    /// Where interrupts and DMA this chip originates go. Once, before the
-    /// machine runs.
-    pub fn connect_peer(&self, peer: Arc<dyn PicPeer>) -> Result<(), AlreadyConnected> {
-        self.wiring.peer.set(peer).map_err(|_| AlreadyConnected)
     }
 
     /// Put a PCI function at configuration `device` (1 to 4) of `head`'s

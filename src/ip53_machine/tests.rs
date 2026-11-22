@@ -7,6 +7,7 @@ use crate::ip35::serial::connect_serial_ports;
 use crate::ip35::test_support::{machine, tezro_config, widget, with_machine};
 use crate::dev::bedrock::Bedrock;
 use crate::dev::bedrock_flash::Flash;
+use crate::dev::pic::{read_bytes, write_bytes};
 use crate::sn::Machine;
 use crate::test_temp::TempPath;
 use crate::traits::{BUS_ERR, BUS_OK};
@@ -299,24 +300,21 @@ fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on(
     assert_eq!(monitors, without + 1, "the audio card takes monitor commands");
 }
 
-/// PIC DMA reaches memory through Bedrock IO in naturally aligned legs, and
-/// DMA aimed at any widget but Bedrock IO is refused.
+/// PIC DMA reaches memory through Bedrock IO in naturally aligned legs.
 #[test]
-fn pic_dma_reaches_memory_through_bedrock_io_only() {
+fn pic_dma_reaches_memory_through_bedrock_io() {
     let dir = TempPath::dir("tezro-pic-dma");
     with_machine(tezro_config(&dir, 1), |m| {
         let chip = &m.nodes[0].chip;
         // Enable bank pair 0, as the Fuel's DMA tests do.
         assert_eq!(chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
-        let peer = BedrockPeer(Arc::downgrade(chip));
+        let peer = chip.inbound(15);
         let data: Vec<u8> = (1..=19).collect();
-        assert_eq!(peer.dma_write(15, HOST_WIDGET, 0x1003, &data), Ok(()));
+        assert!(write_bytes(&*peer, 0x1003, &data));
         let mut back = vec![0; data.len()];
-        assert_eq!(peer.dma_read(15, HOST_WIDGET, 0x1003, &mut back), Ok(()));
+        assert!(read_bytes(&*peer, 0x1003, &mut back));
         assert_eq!(back, data);
         assert_eq!(chip.decode.physical().read64(0x1000).data, 0x0000_0001_0203_0405);
-        assert_eq!(peer.dma_write(15, 12, 0x1003, &data), Err(Refused));
-        assert_eq!(peer.dma_read(15, 0, 0x1003, &mut back), Err(Refused));
     });
 }
 
@@ -328,35 +326,23 @@ fn a_long_pic_transfer_lands_byte_for_byte_in_memory() {
     with_machine(tezro_config(&dir, 1), |m| {
         let chip = &m.nodes[0].chip;
         assert_eq!(chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x33), BUS_OK);
-        let peer = BedrockPeer(Arc::downgrade(chip));
+        let peer = chip.inbound(15);
         let memory = chip.decode.physical();
         for (start, len) in [(0x10_0000u64, 20_000usize), (0x20_0003, 9_000), (0x30_0004, 4_100), (0x40_0000, 4_103)] {
             let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-            assert_eq!(peer.dma_write(15, HOST_WIDGET, start, &data), Ok(()));
+            assert!(write_bytes(&*peer, start, &data));
             for (i, byte) in data.iter().enumerate() {
                 assert_eq!(memory.read8(start + i as u64).data, *byte, "write at {start:#x}+{i}");
             }
             let mut back = vec![0; len];
-            assert_eq!(peer.dma_read(15, HOST_WIDGET, start, &mut back), Ok(()));
+            assert!(read_bytes(&*peer, start, &mut back));
             assert_eq!(back, data, "read at {start:#x}");
         }
         // Memory no bank holds refuses the transfer.
         let mut back = [0u8; 64];
-        assert_eq!(peer.dma_read(15, HOST_WIDGET, 6 << 30, &mut back), Err(Refused));
-        assert_eq!(peer.dma_write(15, HOST_WIDGET, 6 << 30, &back), Err(Refused));
+        assert!(!read_bytes(&*peer, 6 << 30, &mut back));
+        assert!(!write_bytes(&*peer, 6 << 30, &back));
     });
-}
-
-#[test]
-fn transfer_legs_keep_aligned_widths() {
-    let legs: Vec<_> = BedrockPeer::legs(0x1003, 19).collect();
-    assert_eq!(legs, [(0, 1), (1, 4), (5, 8), (13, 4), (17, 2)]);
-    // Whole doublewords from an aligned address are one run; ragged bytes
-    // around it stay as the fields they were.
-    assert_eq!(BedrockPeer::legs(0x2000, 16).collect::<Vec<_>>(), [(0, 16)]);
-    assert_eq!(BedrockPeer::legs(0x2004, 4100).collect::<Vec<_>>(), [(0, 4), (4, 4096)]);
-    assert_eq!(BedrockPeer::legs(0x2000, 4103).collect::<Vec<_>>(), [(0, 4096), (4096, 4), (4100, 2), (4102, 1)]);
-    assert_eq!(BedrockPeer::legs(0x2000, 0).count(), 0);
 }
 
 /// The two- and four-processor board adds a second PIC at widget 11 with nothing on its buses,

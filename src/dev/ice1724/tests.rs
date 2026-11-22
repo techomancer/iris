@@ -1613,21 +1613,50 @@ fn a_panicking_transfer_does_not_leave_the_card_waiting() {
 /// guest stored in address order.
 struct PicMemory(std::sync::Mutex<Vec<u8>>);
 
-impl crate::dev::pic::PicPeer for PicMemory {
-    fn interrupt(&self, _: u8, _: u64, _: u64) -> Result<(), crate::dev::pic::Refused> {
-        Ok(())
+impl PicMemory {
+    fn read(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().get(address as usize..address as usize + len).map(<[u8]>::to_vec)
     }
-    fn dma_read(&self, _: u8, _: u8, address: u64, data: &mut [u8]) -> Result<(), crate::dev::pic::Refused> {
-        let m = self.0.lock().unwrap();
-        let src = m.get(address as usize..address as usize + data.len()).ok_or(crate::dev::pic::Refused)?;
-        data.copy_from_slice(src);
-        Ok(())
+
+    fn write(&self, address: u64, data: &[u8]) -> u32 {
+        match self.0.lock().unwrap().get_mut(address as usize..address as usize + data.len()) {
+            Some(dst) => {
+                dst.copy_from_slice(data);
+                crate::traits::BUS_OK
+            }
+            None => crate::traits::BUS_ERR,
+        }
     }
-    fn dma_write(&self, _: u8, _: u8, address: u64, data: &[u8]) -> Result<(), crate::dev::pic::Refused> {
-        let mut m = self.0.lock().unwrap();
-        let dst = m.get_mut(address as usize..address as usize + data.len()).ok_or(crate::dev::pic::Refused)?;
-        dst.copy_from_slice(data);
-        Ok(())
+}
+
+impl crate::traits::BusDevice for PicMemory {
+    fn read8(&self, a: u64) -> crate::traits::BusRead8 {
+        self.read(a, 1).map_or_else(crate::traits::BusRead8::err, |b| crate::traits::BusRead8::ok(b[0]))
+    }
+    fn read16(&self, a: u64) -> crate::traits::BusRead16 {
+        self.read(a, 2).map_or_else(crate::traits::BusRead16::err, |b| crate::traits::BusRead16::ok(u16::from_be_bytes(b.try_into().unwrap())))
+    }
+    fn read32(&self, a: u64) -> crate::traits::BusRead32 {
+        self.read(a, 4).map_or_else(crate::traits::BusRead32::err, |b| crate::traits::BusRead32::ok(u32::from_be_bytes(b.try_into().unwrap())))
+    }
+    fn write8(&self, a: u64, v: u8) -> u32 {
+        self.write(a, &v.to_be_bytes())
+    }
+    fn write16(&self, a: u64, v: u16) -> u32 {
+        self.write(a, &v.to_be_bytes())
+    }
+    fn write32(&self, a: u64, v: u32) -> u32 {
+        self.write(a, &v.to_be_bytes())
+    }
+    fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 {
+        let Some(src) = self.read(a, 8 * buf.len()) else { return crate::traits::BUS_ERR };
+        for (word, bytes) in buf.iter_mut().zip(src.chunks_exact(8)) {
+            *word = u64::from_be_bytes(bytes.try_into().unwrap());
+        }
+        crate::traits::BUS_OK
+    }
+    fn write_block(&self, a: u64, buf: &[u64]) -> u32 {
+        self.write(a, &buf.iter().flat_map(|w| w.to_be_bytes()).collect::<Vec<_>>())
     }
 }
 
@@ -1640,9 +1669,10 @@ impl crate::dev::pic::PicPeer for PicMemory {
 fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
     use crate::dev::pic::{Function, Pic};
     use crate::traits::{BusDevice, BUS_OK};
-    let pic = Pic::new(15);
+    use crate::xtalk::{Upstream, XtalkHost};
     let mem = Arc::new(PicMemory(std::sync::Mutex::new(vec![0; 0x10000])));
-    pic.connect_peer(mem.clone()).unwrap();
+    let host = XtalkHost { widget: 10, int_packet: 0, int_packet_mask: 0, vectors: 256 };
+    let pic = Pic::new(15, 10, Upstream::single(host, mem.clone(), LevelProbe::line().0));
     let bus = pic.widget();
     // The direct map reaches widget 10; device 2's attributes as observed.
     assert_eq!(bus.write64(0x80, 10 << 20), BUS_OK);
