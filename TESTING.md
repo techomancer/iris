@@ -1021,3 +1021,27 @@ they enforce is in [hot-path-inlining-must-be-explicit.md](clanker/perf/hot-path
 cargo build --release --features lightning
 cargo test -p iris-checks -- --ignored   # IRIS_HOT_PATH_BINARY picks another binary
 ```
+
+## Timer and clock cost in a booted guest
+
+`tools/timer-cost.py` boots a machine with `--ci`, waits for the console login
+prompt, and reads the monitor's `timers` counters around two windows: the
+guest idle at the login prompt, and root printing lines on the serial console.
+It reports timer-worker wakes and host clock reads on device register paths
+per second and per printed line, then shuts the guest down from the console
+and checks that iris exited on a clean power-off. The rates come from the
+counters and the host time the command reports, so a loaded host changes them
+little. Each `--max-*` bound turns a number into a pass or fail.
+
+```sh
+tools/timer-cost.py --iris target/release/iris --config octane.toml \
+    --socket "$TMPDIR/iris.sock" --monitor-port 8888 \
+    --max-idle-wakes-per-s 200 --max-idle-clock-reads-per-s 50 \
+    --max-console-clock-reads-per-line 5
+```
+
+The config needs a disk with IRIX installed, a copy-on-write overlay (`--ci`
+gives one), a root account without a password, and the console on serial port
+A. On an Octane running IRIX 6.5.30 the idle guest takes about 130 wakes a
+second and no register-path clock reads, and the console about 0.4 clock reads
+per line.

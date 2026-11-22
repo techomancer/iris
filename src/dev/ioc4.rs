@@ -396,6 +396,13 @@ impl St {
         sdma.catch_up(now, &mut host);
     }
 
+    /// `sdma_catch_up` at the current time, for a register access: the
+    /// host clock is read only when a deadline is pending.
+    fn sdma_catch_up_now(&mut self) {
+        let (sdma, mut host) = self.sdma_engine_split();
+        sdma.catch_up_now(&mut host);
+    }
+
     // ----- the 16550s -----
 
     /// Keep the pass-through source on the port's interrupt level, and let
@@ -410,11 +417,9 @@ impl St {
     /// Move host input into the port, retry a byte the host end refused and
     /// let the receive timeout run out. Returns whether anything changed.
     fn uart_pump(&mut self, p: usize) -> bool {
-        let now = Instant::now();
         let u = &mut self.uart[p];
         let moved = u.pump();
-        let sent = u.poll_tx(now);
-        u.check_timeout(now) || moved || sent
+        u.poll_deadlines() || moved
     }
 
     fn uart_read(&mut self, p: usize, r: u32) -> u8 {
@@ -488,7 +493,7 @@ impl St {
     // ----- control registers -----
 
     fn read32(&mut self, a: u32) -> u32 {
-        self.sdma_catch_up(Instant::now());
+        self.sdma_catch_up_now();
         if let Some(r) = sdma_decode(a) {
             let (sdma, mut host) = self.sdma_engine_split();
             return match r {
@@ -514,7 +519,7 @@ impl St {
     }
 
     fn write32(&mut self, a: u32, v: u32) {
-        self.sdma_catch_up(Instant::now());
+        self.sdma_catch_up_now();
         if let Some(r) = sdma_decode(a) {
             match r {
                 SdmaReg::Base { pair, high } => {

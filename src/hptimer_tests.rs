@@ -262,3 +262,71 @@ fn recurring_timer_at_1khz_keeps_its_rate() {
     eprintln!("1 kHz recurring timer: {n} fires in 500 ms, mean lateness {mean_late_us:.0} us");
     assert!(n >= 300, "{n} fires in 500 ms: the host wait is rounding to its timer tick");
 }
+
+/// Wait for the worker to plan its next wait after a change.
+#[cfg(test)]
+fn settle(manager: &TimerManager) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while !manager.worker_waiting() {
+        assert!(Instant::now() < end, "the worker never planned a wait");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Re-arming a deadline that falls after the one the worker sleeps toward
+/// sends no wake: the worker takes it at that wake-up's scan. One that
+/// falls earlier wakes it, and fires on time.
+#[test]
+fn only_an_earlier_deadline_wakes_the_worker() {
+    let manager = TimerManager::new();
+    settle(&manager);
+    let first = manager.wakes_sent();
+    manager.add_one_shot(Duration::from_secs(3600), (), |_| TimerReturn::Delete);
+    assert_eq!(manager.wakes_sent(), first + 1, "a worker waiting for nothing is woken");
+    settle(&manager);
+
+    let later = manager.add_one_shot(Duration::from_secs(7200), (), |_| TimerReturn::Delete);
+    assert_eq!(manager.wakes_sent(), first + 1, "a later deadline needs no wake");
+    manager.disable(later);
+    manager.enable(later);
+    assert_eq!(manager.wakes_sent(), first + 1, "nor does enabling it again");
+
+    let fired = Arc::new(AtomicBool::new(false));
+    let f = fired.clone();
+    manager.add_one_shot(Duration::from_millis(5), (), move |_| {
+        f.store(true, Ordering::SeqCst);
+        TimerReturn::Delete
+    });
+    assert_eq!(manager.wakes_sent(), first + 2, "an earlier deadline wakes the worker");
+    let end = Instant::now() + Duration::from_secs(10);
+    while !fired.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "the earlier timer never fired");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A timer added later than the planned wake-up still fires, at that
+/// wake-up's scan.
+#[test]
+fn a_timer_added_without_a_wake_still_fires() {
+    let manager = TimerManager::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    manager.add_one_shot(Duration::from_millis(500), (), move |_| {
+        c.fetch_add(1, Ordering::SeqCst);
+        TimerReturn::Delete
+    });
+    settle(&manager);
+    let before = manager.wakes_sent();
+    let c = count.clone();
+    manager.add_one_shot(Duration::from_millis(600), (), move |_| {
+        c.fetch_add(1, Ordering::SeqCst);
+        TimerReturn::Delete
+    });
+    assert_eq!(manager.wakes_sent(), before);
+    let end = Instant::now() + Duration::from_secs(10);
+    while count.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < end, "the timer added without a wake never fired");
+        thread::sleep(Duration::from_millis(1));
+    }
+}

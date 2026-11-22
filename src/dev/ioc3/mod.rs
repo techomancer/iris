@@ -96,7 +96,8 @@ use crate::dev::w1::sgi;
 use crate::dev::serial_host::SerialBackend;
 use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::pci::{Bar, BoardIrq, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::dev::deadline_timers::DeadlineTimers;
+use crate::hptimer::{TimerManager, TimerReturn};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, StateTable};
 
@@ -486,6 +487,11 @@ const RX_IDLE: Duration = Duration::from_millis(2);
 /// every transition due in the meantime.
 const IO_REARM_MIN: Duration = Duration::from_micros(100);
 
+/// The least delay a timer for deadline `kind` is armed with.
+fn rearm_floor(kind: usize) -> Duration {
+    if kind == K_INT_OUT { IO_REARM_MIN } else { Duration::ZERO }
+}
+
 /// The deadlines the chip keeps on host time, one timer slot each.
 const K_RX: usize = 0;
 const K_TX_DELAY: usize = 2;
@@ -496,7 +502,7 @@ type Deadlines = [Option<Instant>; KINDS];
 
 /// Lock order: `gate`, then a child's lock (the serial engine's before the
 /// Super I/O's it reaches through), then the interrupt words' lock in `Core`,
-/// under which the SuperIO line is driven, then the Bridge's. `armed` and the
+/// under which the SuperIO line is driven, then the Bridge's. The timer table and the
 /// NVRAM hand-off are leaves; the lines are set once and read without a lock.
 /// The Bridge never calls back into the chip while it holds a lock of its
 /// own, so a child's lock may be held while the line is driven.
@@ -528,15 +534,12 @@ struct Shared {
     ssram: Mutex<Vec<u32>>,
     eth: Option<Arc<Ioc3Eth>>,
     me: Weak<Shared>,
-    timers: OnceLock<Arc<TimerManager>>,
+    /// One one-shot per deadline kind.
+    timers: DeadlineTimers<KINDS>,
     /// Between `start` and `stop`.
     running: AtomicBool,
     /// Held by a timer callback while it runs, so `stop` can wait one out.
     gate: Mutex<()>,
-    /// The timer pending for each deadline kind, and the deadline it serves.
-    armed: Mutex<[Option<(TimerId, Instant)>; KINDS]>,
-    /// The deadlines in `armed`, readable without its lock.
-    armed_due: [AtomicU64; KINDS],
 }
 
 impl Shared {
@@ -573,43 +576,13 @@ impl Shared {
     /// none set or the chip not running, deadlines are only evaluated lazily,
     /// by the next access.
     ///
-    /// The deadlines are read again once `armed` is held, never before. Each
-    /// child publishes its deadline under its own lock before its access
-    /// returns to arm, so a pass that takes `armed` afterwards reads at least
-    /// what that access left. A pass that read first and was held up (a
-    /// receive thread's poll just before a register write) would otherwise
-    /// arm from the older deadlines and remove the timer the write set.
+    /// Each child publishes its deadline under its own lock before its access
+    /// returns to arm, and `arm_with` reads them again once it holds the
+    /// table, so a pass held up between reading and arming (a receive
+    /// thread's poll just before a register write) cannot put back the older
+    /// deadlines and remove the timer the write set.
     fn arm(&self) {
-        let Some(tm) = self.timers.get() else { return };
-        // Unlocked, only to skip the table when nothing moved; a read that
-        // is stale here costs a pass the writer that made it stale also runs.
-        if self.deadlines().iter().zip(&self.armed_due).all(|(w, a)| encode(*w) == a.load(Ordering::SeqCst)) {
-            return;
-        }
-        let mut armed = self.armed.lock();
-        // Checked under the lock `stop` clears the slots with: a pass that
-        // sees `running` set has its timers removed by that stop.
-        if !self.running.load(Ordering::SeqCst) {
-            return;
-        }
-        let want = self.deadlines();
-        for (k, w) in want.iter().enumerate() {
-            if armed[k].map(|(_, d)| d) == *w {
-                continue;
-            }
-            if let Some((id, _)) = armed[k].take() {
-                tm.remove(id);
-            }
-            self.armed_due[k].store(0, Ordering::SeqCst);
-            let Some(due) = *w else { continue };
-            let mut delay = due.saturating_duration_since(Instant::now());
-            if k == K_INT_OUT {
-                delay = delay.max(IO_REARM_MIN);
-            }
-            let id = tm.add_one_shot(delay, self.me.clone(), move |me| Shared::fire(me, k, due));
-            armed[k] = Some((id, due));
-            self.armed_due[k].store(encode(Some(due)), Ordering::SeqCst);
-        }
+        self.timers.arm_with(|| self.deadlines(), &self.running, &self.me, rearm_floor, Shared::fire);
     }
 
     /// A deadline passed with no guest access to notice it. Runs on the timer
@@ -621,13 +594,7 @@ impl Shared {
         if !sh.running.load(Ordering::SeqCst) {
             return TimerReturn::Delete;
         }
-        {
-            let mut armed = sh.armed.lock();
-            if armed[kind].map(|(_, d)| d) == Some(due) {
-                armed[kind] = None;
-                sh.armed_due[kind].store(0, Ordering::SeqCst);
-            }
-        }
+        sh.timers.fired(kind, due);
         if kind == K_NVRAM {
             // The file is written by the clock's own thread, not here.
             if let Some(rtc) = &sh.rtc {
@@ -652,6 +619,14 @@ impl Shared {
     fn serial_catch_up(&self, now: Instant) {
         if let Some(s) = self.serial.iter().flatten().next() {
             s.catch_up(now);
+        }
+    }
+
+    /// `serial_catch_up` for a register access: the host clock is read only
+    /// when the engine holds a deadline.
+    fn serial_catch_up_now(&self) {
+        if let Some(s) = self.serial.iter().flatten().next() {
+            s.catch_up_now();
         }
     }
 
@@ -722,7 +697,7 @@ impl Shared {
         }
         match a {
             reg::INT_STATUS => {
-                self.serial_catch_up(Instant::now());
+                self.serial_catch_up_now();
                 self.core.status()
             }
             // The set alias reads back the live mask; the clear one does not.
@@ -758,7 +733,7 @@ impl Shared {
         match a {
             reg::INT_STATUS => {
                 // An acknowledgement must not be undone by a late expiry.
-                self.serial_catch_up(Instant::now());
+                self.serial_catch_up_now();
                 // Write-one-to-clear; level-following bits ignore the write.
                 self.core.clear_bits(val & !int::LEVELS);
             }
@@ -1069,11 +1044,9 @@ impl Ioc3 {
                 ssram: Mutex::new(vec![0; (reg::SSRAM_SIZE / 4) as usize]),
                 eth,
                 me: weak.clone(),
-                timers: OnceLock::new(),
+                timers: DeadlineTimers::new(),
                 running: AtomicBool::new(false),
                 gate: Mutex::new(()),
-                armed: Mutex::new([None; KINDS]),
-                armed_due: std::array::from_fn(|_| AtomicU64::new(0)),
                 board,
             }
         });
@@ -1082,7 +1055,7 @@ impl Ioc3 {
 
     /// The timer manager for device deadlines. Set it before start.
     pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.sh.timers.set(tm);
+        self.sh.timers.set_manager(tm);
     }
 
     /// Replace the MicroLAN wire the chip builds for itself (the station
@@ -1228,15 +1201,7 @@ impl Device for Ioc3 {
         if !self.sh.running.swap(false, Ordering::SeqCst) {
             return;
         }
-        {
-            let mut armed = self.sh.armed.lock();
-            for (k, slot) in armed.iter_mut().enumerate() {
-                if let (Some((id, _)), Some(tm)) = (slot.take(), self.sh.timers.get()) {
-                    tm.remove(id);
-                }
-                self.sh.armed_due[k].store(0, Ordering::SeqCst);
-            }
-        }
+        self.sh.timers.cancel_all();
         drop(self.sh.gate.lock());
         let mut threads = self.threads.lock();
         for t in threads.iter() {

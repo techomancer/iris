@@ -402,7 +402,7 @@ impl Ns16550 {
                 }
             }
             IIR_FCR => {
-                self.check_timeout(Instant::now());
+                self.check_timeout_now();
                 let ret = self.iir;
                 if ret & IIR_ID == IIR_TX_EMPTY {
                     self.thr_ipending = false;
@@ -414,7 +414,7 @@ impl Ns16550 {
             MCR => self.mcr,
             LSR => {
                 self.pump();
-                self.check_timeout(Instant::now());
+                self.check_timeout_now();
                 let ret = self.lsr;
                 // Reading clears the break and overrun latches.
                 if self.lsr & (LSR_BI | LSR_OE) != 0 {
@@ -558,7 +558,7 @@ impl Ns16550 {
             } else {
                 self.held.push_back(val);
             }
-            self.drain_tx(Instant::now());
+            self.drain_tx(crate::dev::deadline::register_now);
         }
         self.sync_tx_flags();
     }
@@ -581,13 +581,17 @@ impl Ns16550 {
     /// out. Past that the backend counts as disconnected and the byte goes
     /// to its `send_byte`, which drops it where the host end is full (a log
     /// tee still records it); further bytes are tried once and go the same
-    /// way if refused. Every byte counts as sent in the output tail.
-    fn drain_tx(&mut self, now: Instant) {
+    /// way if refused. Every byte counts as sent in the output tail. `now`
+    /// is asked only when a refused byte needs the time.
+    fn drain_tx(&mut self, now: impl FnOnce() -> Instant) {
+        let mut now = Some(now);
+        let mut at = None;
         while let Some(&b) = self.held.front() {
             if self.backend.try_send_byte(b) {
                 self.backend_dead = false;
             } else {
                 if !self.backend_dead {
+                    let now = *at.get_or_insert_with(|| (now.take().expect("asked once"))());
                     let since = *self.held_since.get_or_insert(now);
                     if now.saturating_duration_since(since) < XMIT_RETRY_TIMEOUT {
                         return;
@@ -609,6 +613,10 @@ impl Ns16550 {
     /// Retry held bytes at `now`. Returns whether any went, which is when a
     /// DMA engine waiting on the transmitter may go on.
     pub fn poll_tx(&mut self, now: Instant) -> bool {
+        self.poll_tx_with(|| now)
+    }
+
+    fn poll_tx_with(&mut self, now: impl FnOnce() -> Instant) -> bool {
         let before = self.held.len();
         if before == 0 {
             return false;
@@ -616,6 +624,16 @@ impl Ns16550 {
         self.drain_tx(now);
         self.sync_tx_flags();
         self.held.len() < before
+    }
+
+    /// The timed work between accesses, at the current time: retry held
+    /// bytes (`poll_tx`) and let the receive timeout run out
+    /// (`check_timeout`). The host clock is read only when a byte is held
+    /// or a timeout is pending, so a port polled with nothing in flight
+    /// costs no clock read. Returns whether anything changed.
+    pub fn poll_deadlines(&mut self) -> bool {
+        let sent = self.poll_tx_with(crate::dev::deadline::register_now);
+        self.check_timeout_now() || sent
     }
 
     /// When a refused byte stops being retried, if one is held.
@@ -765,6 +783,13 @@ impl Ns16550 {
             }
             _ => false,
         }
+    }
+
+    /// `check_timeout` at the current time, reading the host clock only
+    /// when a timeout is pending: line status and interrupt identification
+    /// are polled far more often than characters arrive.
+    pub fn check_timeout_now(&mut self) -> bool {
+        self.timeout_deadline.is_some() && self.check_timeout(crate::dev::deadline::register_now())
     }
 
     #[cfg(test)]

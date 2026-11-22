@@ -200,6 +200,12 @@ impl Serial {
         self.e.with(|st, h| st.catch_up(now, h));
     }
 
+    /// `catch_up` at the current time, reading the host clock only when a
+    /// deadline is pending.
+    pub(super) fn catch_up_now(&self) {
+        self.e.with(|st, h| st.catch_up_now(h));
+    }
+
     /// A register of this port's engine, at `off` bytes from its first.
     pub(super) fn read(&self, off: u32) -> u32 {
         self.e.with(|st, h| st.port_read(self.p, off, h))

@@ -1033,6 +1033,7 @@ impl Machine {
         let monitor = Monitor::new();
         monitor.register_device(devlog.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
+        monitor.register_device(crate::timer_monitor::TimersMonitor::new(timer_manager.clone()));
         monitor.register_device(Arc::new(mc.clone()));
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());

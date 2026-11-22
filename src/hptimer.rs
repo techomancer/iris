@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -67,6 +67,19 @@ struct Slot {
     timer: Option<TimerEntry>,
 }
 
+/// What the worker is waiting for, as it last planned under the lock.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sleep {
+    /// Scanning or running a callback: it scans again before it waits, so
+    /// a timer added now is seen without a wake.
+    Awake,
+    /// Asleep until this deadline: a timer due later is taken at that
+    /// wake-up's scan.
+    Until(Instant),
+    /// No timer is pending: anything added needs a wake.
+    Forever,
+}
+
 /// Internal state shielded by a Spinlock Mutex.
 struct TimerManagerInner {
     slots: Vec<Slot>,
@@ -75,6 +88,10 @@ struct TimerManagerInner {
     stop: bool,
     /// Wakes the worker out of its wait (`Waiter`), once the worker has made one.
     waker: Option<Waker>,
+    /// What the worker last planned to wait for.
+    sleep: Sleep,
+    /// Wakes sent to the worker (the `timers` command reports them).
+    wakes: u64,
 }
 
 impl TimerManagerInner {
@@ -98,6 +115,30 @@ impl TimerManagerInner {
         ((generation as u64) << 32) | (index as u64)
     }
 
+    /// A timer now expires `at`: wake the worker if it waits for something
+    /// later. Devices re-arm deadlines on register accesses, and a wake
+    /// costs the caller a syscall and the worker a scan of every slot, so
+    /// one is sent only when the worker would otherwise oversleep.
+    fn wake_for(&mut self, at: Instant, flag: &AtomicBool) {
+        let needed = match self.sleep {
+            Sleep::Awake => false,
+            Sleep::Until(t) => at < t,
+            Sleep::Forever => true,
+        };
+        if needed {
+            self.wake(flag);
+        }
+    }
+
+    fn wake(&mut self, flag: &AtomicBool) {
+        self.sleep = Sleep::Awake;
+        self.wakes += 1;
+        flag.store(true, Ordering::Release);
+        if let Some(w) = &self.waker {
+            w.wake();
+        }
+    }
+
     fn deallocate(&mut self, id: TimerId) -> bool {
         let (generation, idx) = ((id >> 32) as u32, (id & 0xFFFFFFFF) as usize);
         if let Some(slot) = self.slots.get_mut(idx) {
@@ -116,6 +157,14 @@ pub struct TimerManager {
     inner: Arc<Mutex<TimerManagerInner>>,
     thread_handle: Option<thread::JoinHandle<()>>,
     new_timer_added: Arc<AtomicBool>,
+    counters: Arc<TimerCounters>,
+}
+
+/// The worker's passes over the table, for the monitor's `timers` command.
+/// (The wakes sent to it are counted under the table lock, in `wakes`.)
+#[derive(Default)]
+struct TimerCounters {
+    scans: AtomicU64,
 }
 
 impl TimerManager {
@@ -127,12 +176,16 @@ impl TimerManager {
             fifo: VecDeque::new(),
             stop: false,
             waker: None,
+            sleep: Sleep::Awake,
+            wakes: 0,
         }));
 
         let new_timer_added = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(TimerCounters::default());
 
         let thread_inner = inner.clone();
         let thread_added = new_timer_added.clone();
+        let thread_counters = counters.clone();
 
         let thread_handle = thread::Builder::new().name("hptimer".into()).spawn(move || {
             let waiter = Waiter::new();
@@ -140,13 +193,14 @@ impl TimerManager {
                 let mut guard = thread_inner.lock();
                 guard.waker = Some(waiter.waker());
             }
-            timer_thread_loop(thread_inner, thread_added, &waiter);
+            timer_thread_loop(thread_inner, thread_added, &thread_counters, &waiter);
         }).expect("spawn hptimer thread");
 
         Self {
             inner,
             thread_handle: Some(thread_handle),
             new_timer_added,
+            counters,
         }
     }
 
@@ -155,8 +209,8 @@ impl TimerManager {
         {
             let mut inner = self.inner.lock();
             inner.stop = true;
+            inner.wake(&self.new_timer_added);
         }
-        self.wake_up();
         if let Some(h) = self.thread_handle.take() {
             let _ = h.join();
         }
@@ -168,16 +222,16 @@ impl TimerManager {
         C: Send + 'static,
         F: FnMut(&mut C) -> TimerReturn + Send + 'static,
     {
+        let at = Instant::now() + expire_in;
         let mut inner = self.inner.lock();
         let id = inner.allocate(TimerEntry {
-            next_expiration: Instant::now() + expire_in,
+            next_expiration: at,
             period: None,
             enabled: true,
             in_fifo: false,
             callback: Some(Box::new(CallbackWithContext { context, cb })),
         });
-        drop(inner);
-        self.wake_up();
+        inner.wake_for(at, &self.new_timer_added);
         id
     }
 
@@ -195,8 +249,7 @@ impl TimerManager {
             in_fifo: false,
             callback: Some(Box::new(CallbackWithContext { context, cb })),
         });
-        drop(inner);
-        self.wake_up();
+        inner.wake_for(expire_at, &self.new_timer_added);
         id
     }
 
@@ -214,8 +267,8 @@ impl TimerManager {
             if slot.generation == generation {
                 if let Some(t) = &mut slot.timer {
                     t.enabled = true;
-                    drop(inner);
-                    self.wake_up();
+                    let at = t.next_expiration;
+                    inner.wake_for(at, &self.new_timer_added);
                     return true;
                 }
             }
@@ -238,12 +291,22 @@ impl TimerManager {
         false
     }
 
-    fn wake_up(&self) {
-        self.new_timer_added.store(true, Ordering::Release);
-        let inner = self.inner.lock();
-        if let Some(w) = &inner.waker {
-            w.wake();
-        }
+    /// Wakes sent to the worker and passes it has made over the table, since
+    /// the manager was made.
+    pub fn counters(&self) -> (u64, u64) {
+        (self.inner.lock().wakes, self.counters.scans.load(Ordering::Relaxed))
+    }
+
+    /// Wakes sent to the worker so far.
+    #[cfg(test)]
+    pub(crate) fn wakes_sent(&self) -> u64 {
+        self.inner.lock().wakes
+    }
+
+    /// Whether the worker has planned a wait (it is asleep, or about to be).
+    #[cfg(test)]
+    pub(crate) fn worker_waiting(&self) -> bool {
+        self.inner.lock().sleep != Sleep::Awake
     }
 }
 
@@ -260,8 +323,9 @@ impl Drop for TimerManager {
 }
 
 /// The core loop tracking timeouts precisely.
-fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<AtomicBool>, waiter: &Waiter) {
+fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<AtomicBool>, counters: &TimerCounters, waiter: &Waiter) {
     loop {
+        counters.scans.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let mut next_wakeup = None;
         let mut to_call = None;
@@ -272,6 +336,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                 break;
             }
             new_timer_added.store(false, Ordering::Relaxed);
+            guard.sleep = Sleep::Awake;
 
             // 1. Scan for newly expired timers and register them in the FIFO to keep priority.
             for index in 0..guard.slots.len() {
@@ -316,6 +381,10 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                         }
                     }
                 }
+                // Published under the lock the adders take, so an adder
+                // either ran before this scan (and the scan saw its timer)
+                // or sees the plan and wakes the worker if it needs to.
+                guard.sleep = next_wakeup.map_or(Sleep::Forever, Sleep::Until);
             }
         }
 

@@ -177,12 +177,11 @@ impl Dp83843 {
 // are saved as the time they had left.
 impl Dp83843 {
     fn instant_left(at: Option<Instant>, now: Instant) -> u64 {
-        // Nanoseconds left plus one; zero for none.
-        at.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
+        crate::dev::deadline::until(at, now)
     }
 
     fn instant_from(left: u64, now: Instant) -> Option<Instant> {
-        (left != 0).then(|| now + Duration::from_nanos(left - 1))
+        crate::dev::deadline::due(left, now)
     }
 
 

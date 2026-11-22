@@ -9,6 +9,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::dev::deadline::{due, until};
 use crate::dev::mii::MiiPhy;
 use crate::snapshot::{field_bool, field_u16, field_u32, field_u64, field_u8, StateTable};
 
@@ -396,8 +397,7 @@ impl MiiPhy for Ics1890 {
             .bool("last_link", self.last_link)
             .bool("backend_up", self.backend_up)
             .bool("nego_done", self.nego_done)
-            // Nanoseconds left plus one; zero for none.
-            .u64("deadline", self.deadline.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1))
+            .u64("deadline", until(self.deadline, now))
             .u64("delay", self.delay.as_nanos() as u64)
             .u32("unimplemented_accesses", self.unimplemented_accesses)
             .build()
@@ -423,7 +423,7 @@ impl MiiPhy for Ics1890 {
             last_link: field_bool(v, "last_link")?,
             backend_up: field_bool(v, "backend_up")?,
             nego_done: field_bool(v, "nego_done")?,
-            deadline: (deadline != 0).then(|| now + Duration::from_nanos(deadline - 1)),
+            deadline: due(deadline, now),
             delay: Duration::from_nanos(field_u64(v, "delay")?),
             unimplemented_accesses: field_u32(v, "unimplemented_accesses")?,
         };

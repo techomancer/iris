@@ -353,6 +353,27 @@ or slower than real hardware sees the same time passing. `--features
 ci_clock` instead derives Count from retired instructions, for deterministic
 replays.
 
+A device with timed work (a receive timeout, a transmit delay, a PHY's
+negotiation) keeps each deadline as a host `Instant`. A register access first
+catches up on the deadlines already due, so the guest sees them when it looks.
+An `hptimer` one-shot per deadline does the same catch-up when the guest does
+not look. `src/dev/deadline_timers.rs` (`DeadlineTimers`) keeps the table of
+which timer serves which deadline for the IOC3 and IOC4. It replaces a timer
+whose deadline moved and removes them all in `stop`; an access that moves no
+deadline returns without taking its lock. Snapshots save a deadline as the time
+it had left (`src/dev/deadline.rs`, `until` and `due`). Two rules keep these
+paths cheap. A register access reads the host clock only when a deadline is
+pending (`Ns16550::poll_deadlines` and `check_timeout_now`,
+`SerialDma::catch_up_now`). Adding or enabling a timer wakes the `hptimer`
+worker only when the new deadline is earlier than the one it sleeps toward.
+
+Some devices keep a time base of their own rather than `Instant`:
+`dev::chip_clock` (the Indy's DS1386 and 8254, guest cycles under
+`ci_clock`), `dev::heart::Clock` (HEART, the Hubs, the ELSC and the module
+controllers), the QLogic ring clock in `dev::qlogic_ring` (host time minus
+the time the machine was stopped), and the calendar clocks of the DS1744 and
+the M48T35 timekeeper.
+
 ## 4. Threads
 
 Every device that has real work to do runs on its own thread:
