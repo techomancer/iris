@@ -26,6 +26,12 @@ cargo test --release [--features jitv2] --test cpu_tests -- --ignored   # judged
 emulator for the engine you name and compares the failing tests with
 `cpu-tests/expected-failures.txt` (see [Strict TAP](#strict-tap)).
 
+**`cpu-tests/e2e/`** — single-purpose bare-metal guests for bugs that need
+the running emulator from outside, such as a monitor command landing at the
+wrong moment. Each one has a driver in `cpu-tests/run/` that boots it, talks to
+the monitor, and exits 0 on the correct behaviour; see
+[cpu-tests/e2e/README.md](cpu-tests/e2e/README.md).
+
 **`bench/`** — how fast is this build, and is it still right after ten million
 of them? 46 kernels covering integer, FPU, the cache hierarchy, image and video
 editing inner loops, compression, and the emulator-only paths (TLB refill,

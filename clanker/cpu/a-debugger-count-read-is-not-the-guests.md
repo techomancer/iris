@@ -37,7 +37,7 @@ moved it without the guest:
 ## Checked and found sound (2026-11-19)
 
 The crossing test in `materialize_count` (wrap-safe `wrapping_sub`, any
-jump size), the ticket word (`ip7_ticket.rs`, loom-tested), the hptimer
+jump size), the ticket word (`ip7_seq_shared` and `claim_ip7` in `mips_core.rs`), the hptimer
 one-shot (add/remove/reuse races, lost wakeups), WAIT and idle-park (both
 end on any IP7 the timer raises), stop/start and Count writes (deliver a
 deadline passed before them), jitv2 (CP0 reads and writes run the
@@ -47,3 +47,12 @@ interpreter's `read_cp0`/`write_cp0`), and the device interrupt writers
 Not changed: the O2 and Indy leave `count_write_samples` off. If IRIX on
 the O2 writes Count before arming Compare, a stall there can still cost a
 wrap; the Octane and the NUMA machines turn it on for that reason.
+
+## End to end (2026-11-22)
+
+`cpu-tests/e2e/compare_after_debugger_read.c` with
+`cpu-tests/run/compare-after-debugger-read.sh cop0` boots a bare-metal Indy
+guest that reads Count, spins, and after the driver's monitor `cop0` dump
+writes Compare = read + 0x100. On upstream bd81b637 it sees no IP7 (exit 1);
+with the fix IP7 is pending at the write (exit 0). Mode `none` (no dump)
+passes on both, so the dump is the cause.
