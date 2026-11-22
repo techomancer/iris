@@ -91,6 +91,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [inlined-slot-pc-bd-bracket.md](jitv2/inlined-slot-pc-bd-bracket.md) | rule | The inlined delay slot's `core.pc` / `in_delay_slot` bracket |
 | [instructions-jitv2-still-interprets.md](jitv2/instructions-jitv2-still-interprets.md) | history | What jitv2 still interprets, and which of it is worth compiling |
 | [gpr-cache.md](jitv2/gpr-cache.md) | rule | Guest registers are cached in host registers only inside loops, and written through: the rule for callouts, the load/store join, suite and IRIX measurements, what was dropped, and compile time as the bigger lever |
+| [software-interrupts-must-show-in-the-pending-word.md](jitv2/software-interrupts-must-show-in-the-pending-word.md) | rule | Cause IP0/IP1 must be mirrored into `hot.interrupts`: compiled code polls only that word, so a pending software interrupt waited for the next hardware interrupt; Tezro quake froze up to 1.3 s on IRIX's deferred wake-up |
 | [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | measure | The pending-interrupt check, not block structure, is what blocks GPR forwarding |
 | [j2_per_instruction_category_toggle.md](jitv2/j2_per_instruction_category_toggle.md) | design | j2 per-instruction/category enable toggle |
 | [jit-page-probe-must-be-retired-on-drop.md](jitv2/jit-page-probe-must-be-retired-on-drop.md) | history | The jitv2 dirty-page probe must be retired when its cache dies |

@@ -9567,6 +9567,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.cp0_compare = snapshot.cp0_compare;
         self.core.cp0_status = snapshot.cp0_status;
         self.core.cp0_cause = snapshot.cp0_cause;
+        self.core.sync_soft_interrupts();
         self.core.cp0_epc = snapshot.cp0_epc;
         self.core.cp0_prid = snapshot.cp0_prid;
         self.core.cp0_config = snapshot.cp0_config;
@@ -10253,6 +10254,7 @@ impl LockstepSnapshot {
         exec.core.pc = self.pc;
         exec.core.cp0_status = self.status;
         exec.core.cp0_cause = self.cause;
+        exec.core.sync_soft_interrupts();
         exec.core.cp0_epc = self.epc;
         exec.core.fpr = self.fpr;
         exec.core.fpu_fcsr = self.fcsr;
@@ -11243,6 +11245,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         exec.core.cp0_compare = digest.cp0_compare;
         exec.core.cp0_status = digest.cp0_status;
         exec.core.cp0_cause = digest.cp0_cause;
+        exec.core.sync_soft_interrupts();
         exec.core.cp0_epc = digest.cp0_epc;
         exec.core.cp0_badvaddr = digest.cp0_badvaddr;
         exec.core.cp0_entryhi = digest.cp0_entryhi;
@@ -12016,6 +12019,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             // thread) so the live UI matches the restored core state.
             c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
+            c.sync_soft_interrupts();
             ld32!(cp0_config); ld64!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);

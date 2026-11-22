@@ -2004,6 +2004,25 @@ impl MipsCore {
         }
     }
 
+    /// Mirror the software interrupts (Cause IP0 and IP1) into
+    /// `hot.interrupts`. Compiled code polls only that word for a pending
+    /// interrupt, so a software interrupt kept in Cause alone was not taken
+    /// under the JIT until a hardware interrupt happened to send the CPU
+    /// through the interpreter's check: IRIX posts deferred work (such as
+    /// waking a process blocked on the graphics pipe) as a software
+    /// interrupt, and the Tezro's quake froze for most of a second at a time
+    /// while it sat pending behind clock ticks the handler serviced alone.
+    /// The interpreter merges only the external bits back into Cause, so the
+    /// mirror only makes the word nonzero; delivery still reads Cause.
+    pub fn sync_soft_interrupts(&self) {
+        let mask = (CAUSE_IP0 | CAUSE_IP1) as u64;
+        let soft = self.cp0_cause as u64 & mask;
+        self.hot.interrupts.fetch_and(!(mask & !soft), Ordering::SeqCst);
+        if soft != 0 {
+            self.hot.interrupts.fetch_or(soft, Ordering::SeqCst);
+        }
+    }
+
     /// ci_clock: raise IP7 once `hot.cycles` has reached the Compare
     /// deadline. A threshold, not an edge, so a caller that looks late still
     /// delivers it, once.
@@ -2336,6 +2355,7 @@ impl MipsCore {
                 // Cause register: Only IP0 and IP1 are writable software interrupts
                 let mask = CAUSE_IP0 | CAUSE_IP1;
                 self.cp0_cause = (self.cp0_cause & !mask) | ((value as u32) & mask);
+                self.sync_soft_interrupts();
             }
             14 => {
                 // A guest write of a 32-bit value here is where a 64-bit
@@ -2959,6 +2979,23 @@ mod ip7_ticket_tests {
         assert_eq!(shared, core.ip7_seq, "the armed one-shot's ticket must be the live sequence");
         assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count, core.cpu_id),
             "the restored deadline's one-shot could not deliver IP7");
+    }
+
+    /// A software interrupt the guest posts in Cause shows in the pending
+    /// word compiled code polls, and clearing it there leaves the hardware
+    /// lines alone. Kept only in Cause, it went untaken under the JIT until
+    /// a hardware interrupt passed through the interpreter's check.
+    #[test]
+    fn a_software_interrupt_shows_in_the_pending_word() {
+        let mut core = MipsCore::default();
+        core.hot.interrupts.store(CAUSE_IP7 as u64, Ordering::SeqCst);
+        core.write_cp0(13, CAUSE_IP0 as u64);
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), (CAUSE_IP7 | CAUSE_IP0) as u64);
+        core.write_cp0(13, CAUSE_IP1 as u64);
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), (CAUSE_IP7 | CAUSE_IP1) as u64);
+        core.write_cp0(13, 0);
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), CAUSE_IP7 as u64);
+        assert_eq!(core.cp0_cause & (CAUSE_IP0 | CAUSE_IP1), 0);
     }
 
     fn ip7_pending(core: &MipsCore) -> bool {
