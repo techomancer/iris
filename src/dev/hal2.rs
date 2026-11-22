@@ -1143,6 +1143,10 @@ impl Device for Hal2 {
 
     /// `audio status`: codec A is the only output counted. Its rate is the
     /// guest's while its timer runs.
+    fn audio_frames(&self) -> Option<u64> {
+        Some(self.meter.total())
+    }
+
     fn audio_report(&self) -> Option<String> {
         let ca = self.ca_state.lock();
         let rate = ca.timer_id.is_some().then(|| {

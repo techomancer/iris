@@ -2622,6 +2622,9 @@ impl Workstation for Machine {
     }
     fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
     fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        self.scsi_buses().iter().map(|b| b.activity()).collect()
+    }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.scsi_buses().iter().try_for_each(|b| b.flush())
     }

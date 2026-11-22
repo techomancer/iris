@@ -1885,6 +1885,12 @@ impl Device for Ice1724 {
         0
     }
 
+    fn audio_frames(&self) -> Option<u64> {
+        // The engines keep their own counts; the meter only mirrors them for a report.
+        let st = self.inner.state.lock().stats;
+        Some(st.capture_frames + st.analog_frames + st.spdif_frames)
+    }
+
     fn audio_report(&self) -> Option<String> {
         let i = &self.inner;
         let (rates, st) = {

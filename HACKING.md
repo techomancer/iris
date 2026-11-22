@@ -68,7 +68,8 @@ the monitor, the stored lifecycle state); its provided methods are either
 shared logic every machine wants the same way (`status`, and the idempotent
 `start_guest`/`stop_guest` behind `machine-start`/`machine-stop`, see
 `src/machine_state.rs`) or optional facilities (snapshots, CHD folding, the
-scratch volume, disc changes, the NAT controls) that default to "not
+scratch volume, disc changes, the NAT controls, the `disk_activity` and
+`audio_frames` counters behind a front-end's activity lights) that default to "not
 supported on this machine". `Machine` implements all of it. A machine built
 around a different chipset implements the same trait and gets the window,
 iris-ci, iris-gui and the monitor's `reset`/`save`/`load`/`machine-status`
@@ -171,7 +172,9 @@ pub trait Resettable { fn power_on(&self); }
   internals 32-bit; the GFIFO still carries a 32-bit register address.
 - **Device** is the lifecycle: devices with threads start and join them here.
   `register_commands`/`execute_command` give a device its own debug commands;
-  [debug.md](debug.md) documents them.
+  [debug.md](debug.md) documents them. A sound card also answers
+  `audio_report` (the monitor's `audio status`) and `audio_frames`, a count of
+  frames moved that only goes up while sound plays or records.
 - **Saveable** is snapshot state. A device that implements it gets a
   save → load → save round-trip test. State too big for a TOML table goes to the
   chunk store instead: the machine calls the device's own `save_chunks` and
@@ -198,7 +201,9 @@ outside `access`, or the hot path carries its stack frame.
 Devices connect to each other through device-specific `connect()` /
 `set_phys()` calls made by `Machine`, not through a generic graph. Smaller
 interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
-channel), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
+channel; `wait_active` lets a device thread block until the guest arms the
+channel, which HPC3 signals from the arming register write instead of being
+polled), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
 (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 

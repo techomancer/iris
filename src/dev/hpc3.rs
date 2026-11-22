@@ -326,8 +326,46 @@ impl InterruptController for Hpc3Interrupts {
     }
 }
 
+/// Tells a device thread that the guest has armed a channel (made it go
+/// from inactive to active). The device side waits on it, with the channel
+/// lock released, instead of sleep-polling the channel (see
+/// `DmaClient::wait_active`).
+///
+/// Lock order: the arming side holds the channel lock and then takes `gen`
+/// (a leaf). The waiting side never takes the channel lock while it holds
+/// `gen`: it reads the generation, drops `gen`, looks at the channel, and only
+/// then sleeps until the generation moves.
+#[derive(Default)]
+struct ArmSignal {
+    gen: Mutex<u64>,
+    cv: parking_lot::Condvar,
+}
+
+impl ArmSignal {
+    fn generation(&self) -> u64 { *self.gen.lock() }
+
+    fn notify(&self) {
+        *self.gen.lock() += 1;
+        self.cv.notify_all();
+    }
+
+    /// Sleep until the generation is no longer `seen` or `deadline` passes.
+    /// Returns whether it moved.
+    fn wait_past(&self, seen: u64, deadline: std::time::Instant) -> bool {
+        let mut g = self.gen.lock();
+        while *g == seen {
+            if self.cv.wait_until(&mut g, deadline).timed_out() {
+                return *g != seen;
+            }
+        }
+        true
+    }
+}
+
 struct PdmaChannel {
     id: usize,
+    /// Raised on every inactive-to-active transition (see `ArmSignal`).
+    armed: Arc<ArmSignal>,
     /// Device-side reads and writes since power-on (see `pdma status`).
     dev_reads: u64,
     dev_writes: u64,
@@ -387,6 +425,7 @@ impl PdmaChannel {
     fn new(id: usize, dump_enabled: Arc<AtomicU32>) -> Self {
         Self {
             id,
+            armed: Arc::new(ArmSignal::default()),
             cbp: 0, nbdp: 0x80000000, bc: 0, ctrl: 0,
             gio: 0, dev: 0, dmacfg: 0, piocfg: 0,
             eox: false, eop: false, xie: false,
@@ -434,7 +473,10 @@ fn start_transaction(&mut self) {
                 self.start_transaction();
                 crate::pf_begin!(crate::perfetto::events::PDMA_ACTIVE[self.id], self.nbdp);
             }
+            let rising = !self.is_active();
             self.ctrl |= self.active_mask;
+            // A device thread may be waiting for this (see `ArmSignal`).
+            if rising { self.armed.notify(); }
         } else {
             if self.is_active() {
                 if self.log_active() {
@@ -816,6 +858,15 @@ fn start_transaction(&mut self) {
 
 struct PdmaClientImpl {
     channel: Arc<Mutex<PdmaChannel>>,
+    /// The channel's own `armed`, held here so a wait needs no channel lock.
+    armed: Arc<ArmSignal>,
+}
+
+impl PdmaClientImpl {
+    fn new(channel: Arc<Mutex<PdmaChannel>>) -> Self {
+        let armed = channel.lock().armed.clone();
+        Self { channel, armed }
+    }
 }
 
 impl DmaClient for PdmaClientImpl {
@@ -833,6 +884,15 @@ impl DmaClient for PdmaClientImpl {
     }
     fn write(&self, val: u32, eop: bool) -> DmaStatus {
         self.channel.lock().dma_write(val, eop)
+    }
+    fn wait_active(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        // Generation first, channel second: an arming between the two moves
+        // the generation, so the wait below cannot miss it.
+        let seen = self.armed.generation();
+        if self.channel.lock().is_active() { return true; }
+        self.armed.wait_past(seen, deadline);
+        self.channel.lock().is_active()
     }
     fn rx_room(&self) -> RxRoom {
         let mut c = self.channel.lock();
@@ -1247,7 +1307,7 @@ impl Hpc3 {
             }
             
             pdma_channels.push(Arc::new(Mutex::new(chan)));
-            dma_clients.push(Arc::new(PdmaClientImpl { channel: pdma_channels.last().unwrap().clone() }));
+            dma_clients.push(Arc::new(PdmaClientImpl::new(pdma_channels.last().unwrap().clone())));
             if i <= HPC3_PDMA_CHAN_GENERIC as usize {
                 pdma_ops.push(Arc::new(PbusDmaOps));
             } else if i == HPC3_PDMA_CHAN_SCSI0 as usize {
@@ -1263,8 +1323,8 @@ impl Hpc3 {
             }
         }
 
-        let enet_rx_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[10].clone() });
-        let enet_tx_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[11].clone() });
+        let enet_rx_dma = Arc::new(PdmaClientImpl::new(pdma_channels[10].clone()));
+        let enet_tx_dma = Arc::new(PdmaClientImpl::new(pdma_channels[11].clone()));
 
         // The interrupt status, and its lines: each SCSI PDMA channel's
         // completion, each WD33C93A, the SEEQ. Enet channels 10/11 have no
@@ -1289,7 +1349,7 @@ impl Hpc3 {
         // Publish seeq to both the DMA ops (CTRL reads) and the irq (status checks in set_interrupt)
         let _ = enet_seeq_lock.set(seeq.clone());
         
-        let scsi0_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[8].clone() });
+        let scsi0_dma = Arc::new(PdmaClientImpl::new(pdma_channels[8].clone()));
         // A chip-INT ack (the kernel reads SCSI_STATUS) also drops any
         // lingering PDMA INT on the same line; see Hpc3Interrupts.
         let scsi0_irq = irqs.line(HPC3_INTSTAT_SCSI0_DEV);
@@ -1300,7 +1360,7 @@ impl Hpc3 {
 
         // Fullhouse's second WD33C93A — see scsi1_wd_lock's doc comment above.
         let scsi_dev1 = if !guinness {
-            let scsi1_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[9].clone() });
+            let scsi1_dma = Arc::new(PdmaClientImpl::new(pdma_channels[9].clone()));
             let scsi1_irq = irqs.line(HPC3_INTSTAT_SCSI1_DEV);
             let dev = Arc::new(Wd33c93a::new_with_id(Some(scsi1_dma), Some(scsi1_irq), heartbeat.clone(), scsi_deferred_int, 1,
                 scsi_buses.next().expect("a fullhouse board has a second SCSI bus")));
@@ -2734,7 +2794,7 @@ mod enet_rx_chain_tests {
     /// channel the way the SEEQ does: two pad bytes, the frame, the status
     /// byte. Returns the statuses of all the writes ORed together.
     fn deliver(hpc3: &Hpc3, len: usize, fill: u8) -> DmaStatus {
-        let rx = PdmaClientImpl { channel: hpc3.pdma_channels[10].clone() };
+        let rx = PdmaClientImpl::new(hpc3.pdma_channels[10].clone());
         let mut st = rx.write(0, false) | rx.write(0, false);
         for _ in 0..len {
             st |= rx.write(fill as u32, false);
@@ -2847,7 +2907,7 @@ mod enet_rx_chain_tests {
     #[test]
     fn rx_room_withholds_the_last_descriptor_until_the_driver_catches_up() {
         let (hpc3, ram) = ring(4, 2);
-        let rx = PdmaClientImpl { channel: hpc3.pdma_channels[10].clone() };
+        let rx = PdmaClientImpl::new(hpc3.pdma_channels[10].clone());
         assert_eq!(rx.rx_room(), RxRoom::Room);
         deliver(&hpc3, 60, 1);
         deliver(&hpc3, 60, 2);
@@ -2868,7 +2928,7 @@ mod enet_rx_chain_tests {
     #[test]
     fn rx_room_on_a_one_descriptor_ring() {
         let (hpc3, _ram) = ring(1, 0);
-        let rx = PdmaClientImpl { channel: hpc3.pdma_channels[10].clone() };
+        let rx = PdmaClientImpl::new(hpc3.pdma_channels[10].clone());
         assert_eq!(rx.rx_room(), RxRoom::Room);
         deliver(&hpc3, 60, 1);
         assert_eq!(rx.rx_room(), RxRoom::Stopped);
@@ -2921,7 +2981,7 @@ mod enet_rx_chain_tests {
         hpc3.write32(reg(ENET_RX_BASE + ENET_RX_CTRL), ENET_RX_CTRL_ACTIVE);
 
         // What the SEEQ sends: two pad bytes, a 60-byte frame, the status byte.
-        let rx = PdmaClientImpl { channel: hpc3.pdma_channels[10].clone() };
+        let rx = PdmaClientImpl::new(hpc3.pdma_channels[10].clone());
         for _ in 0..62 {
             assert!(!rx.write(0, false).refused());
         }
@@ -2942,7 +3002,7 @@ mod enet_rx_chain_tests {
         hpc3.write32(reg(ENET_TX_BASE + ENET_TX_NBDP), 0x100);
         hpc3.write32(reg(ENET_TX_BASE + ENET_TX_CTRL), ENET_TX_CTRL_ACTIVE);
 
-        let tx = PdmaClientImpl { channel: hpc3.pdma_channels[11].clone() };
+        let tx = PdmaClientImpl::new(hpc3.pdma_channels[11].clone());
         let mut sent = 0;
         while let Some((_, st)) = tx.read() {
             sent += 1;
@@ -2952,6 +3012,41 @@ mod enet_rx_chain_tests {
         assert_eq!(sent, 0x600);
         assert_eq!(hpc3.read32(reg(ENET_TX_BASE + ENET_TX_CTRL)).data & ENET_TX_CTRL_ACTIVE, 0);
         assert_ne!(ram.read32(0x104).data & ENET_BC_TXD as u32, 0, "the channel stopped before marking the packet sent");
+    }
+
+    /// The SCSI device thread waits for the driver to arm its channel. The
+    /// arming register write wakes it at once; it does not have to poll.
+    #[test]
+    fn arming_a_scsi_channel_wakes_a_thread_waiting_for_it() {
+        let (hpc3, _ram) = one_descriptor(0);
+        let dma = PdmaClientImpl::new(hpc3.pdma_channels[8].clone());
+        let waiter = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            (dma.wait_active(std::time::Duration::from_secs(20)), t.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        hpc3.write32(reg(SCSI0_BASE + SCSI_NBDP), 0x100);
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), SCSI_CTRL_ACTIVE);
+        let (active, waited) = waiter.join().unwrap();
+        assert!(active);
+        assert!(waited < std::time::Duration::from_secs(10), "woke only after {waited:?}: the arming did not wake it");
+    }
+
+    /// An already active channel does not wait; one nobody arms waits out
+    /// its timeout and says so.
+    #[test]
+    fn waiting_for_a_scsi_channel_ends_at_once_when_active_and_at_the_timeout_when_not() {
+        let (hpc3, _ram) = one_descriptor(0);
+        let dma = PdmaClientImpl::new(hpc3.pdma_channels[8].clone());
+        let t = std::time::Instant::now();
+        assert!(!dma.wait_active(std::time::Duration::from_millis(30)));
+        assert!(t.elapsed() >= std::time::Duration::from_millis(30));
+
+        hpc3.write32(reg(SCSI0_BASE + SCSI_NBDP), 0x100);
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), SCSI_CTRL_ACTIVE);
+        let t = std::time::Instant::now();
+        assert!(dma.wait_active(std::time::Duration::from_secs(20)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(10));
     }
 
     /// A target for controller 1 on an Indy, which has one, is an error that

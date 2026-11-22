@@ -37,7 +37,7 @@ use crate::dev::prom_image;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::Rex3Screen;
 use crate::hptimer::TimerManager;
-use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, PROM_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
+use crate::ip32::{Ip32Bus, Ip32Options, FIRMWARE_LOAD_VA, FIRMWARE_SPAN, NO_ECC_BASE, PCI_MEM_64_BASE, PCI_MEM_64_SIZE, PROM_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
@@ -148,6 +148,10 @@ pub struct O2Machine {
     /// `Workstation::lifecycle`); never `Running`, which `status` reads from
     /// the CPU.
     lifecycle: crate::machine_state::GuestState,
+    /// The snapshot the CI socket's last `restore` loaded, by name and as it
+    /// was read and checked, for `rollback` to put back without reading it
+    /// again. Only the disks' overlays are read anew, from its directory.
+    last_restore: Option<(String, Box<O2Snapshot>)>,
 }
 
 /// What an O2 snapshot's manifest names as its machine.
@@ -377,6 +381,7 @@ impl O2Machine {
             disks,
             flash_path: Some(cfg.nvram.clone()),
             scratch_path,
+            last_restore: None,
         })
     }
 
@@ -395,6 +400,8 @@ impl O2Machine {
         // The no-ECC alias of memory reaches memory, not the PCI window the
         // bus decodes at the same low 32 bits.
         exec.phys_alias = Some((NO_ECC_BASE, RAM_WINDOW_SIZE as u64, RAM_BASE as u64));
+        // MACE's 64-bit PCI memory window is PCI, whatever its low 32 bits.
+        exec.phys_alias_bypass = Some((PCI_MEM_64_BASE, PCI_MEM_64_SIZE));
         // CRIME's decode, like the MC's, is modelled on the low 32 bits.
         exec.phys_mask = u32::MAX as u64;
         exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, C>| {
@@ -663,13 +670,46 @@ impl O2Machine {
     /// as it was.
     pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
         let snap = self.read_snapshot(name)?;
+        self.restore_from(&snap)?;
+        println!("Snapshot loaded from saves/{name}");
+        Ok(())
+    }
+
+    /// Put a read snapshot into the machine and run it.
+    fn restore_from(&mut self, snap: &O2Snapshot) -> Result<(), String> {
         self.stop();
         let applied = self.apply_snapshot(snap);
         self.restart_peripherals();
         applied?;
         self.cpu.clone().as_device().start();
-        println!("Snapshot loaded from saves/{name}");
         Ok(())
+    }
+
+    /// The CI socket's `restore`: load `saves/<name>/` and keep it, read and
+    /// checked, for `rollback`. What the guest printed before is dropped, so
+    /// the next command does not read stale output.
+    pub fn ci_restore(&mut self, name: &str) -> Result<(), String> {
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+        let snap = self.read_snapshot(name)?;
+        self.restore_from(&snap)?;
+        self.last_restore = Some((name.to_string(), Box::new(snap)));
+        Ok(())
+    }
+
+    /// The CI socket's `rollback`: back to the state the last `ci_restore`
+    /// loaded. Memory and device state come from the copy kept then; the
+    /// disks' overlays are imported again from the snapshot's directory,
+    /// which the guest's writes since have not touched.
+    pub fn ci_rollback(&mut self) -> Result<(), String> {
+        let (name, snap) = self.last_restore.take().ok_or("no previous restore to roll back to")?;
+        if let Some(ci) = &self.ci_serial {
+            ci.reset();
+        }
+        let result = self.restore_from(&snap).map_err(|e| format!("rollback to {name}: {e}"));
+        self.last_restore = Some((name, snap));
+        result
     }
 
     fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
@@ -719,7 +759,7 @@ impl O2Machine {
 
     /// Put a read snapshot into the stopped machine: the hardware as at
     /// power-on first, so nothing the snapshot does not hold is left over.
-    fn apply_snapshot(&mut self, s: O2Snapshot) -> Result<(), String> {
+    fn apply_snapshot(&mut self, s: &O2Snapshot) -> Result<(), String> {
         use crate::traits::{Resettable, Saveable};
         Resettable::power_on(&*self.cpu);
         self.bus.power_on();
@@ -812,8 +852,8 @@ impl Drop for O2Machine {
     }
 }
 
-/// The O2 as the front ends see it. The CI rollback and `--load-elf` are not
-/// there yet; the trait's defaults say so.
+/// The O2 as the front ends see it. `--load-elf` is not there yet; the
+/// trait's default says so.
 impl Workstation for O2Machine {
     fn start(&mut self) { O2Machine::start(self) }
     fn stop(&mut self) { O2Machine::stop(self) }
@@ -862,6 +902,8 @@ impl Workstation for O2Machine {
 
     fn save_snapshot(&mut self, name: &str) -> Result<(), String> { O2Machine::save_snapshot(self, name) }
     fn load_snapshot(&mut self, name: &str) -> Result<(), String> { O2Machine::load_snapshot(self, name) }
+    fn ci_restore(&mut self, name: &str) -> Result<(), String> { O2Machine::ci_restore(self, name) }
+    fn ci_rollback(&mut self) -> Result<(), String> { O2Machine::ci_rollback(self) }
 
     fn scratch_path(&self) -> Option<&std::path::Path> { self.scratch_path.as_deref() }
     /// Disc changes on the internal bus (controller 0), as the Indigo2 offers
@@ -869,11 +911,25 @@ impl Workstation for O2Machine {
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
         self.bus.scsi.lock().unwrap().first().map(|c| c.clone() as Arc<dyn crate::workstation::DiscChanger>)
     }
+    /// The same `/CDROM` remount the Indy types: controller 0 is `dks0` to
+    /// IRIX on the O2 as well.
+    fn remount_cdrom_guest(&self, scsi_id: u8) {
+        let script = crate::machine::Machine::irix_cdrom_remount_command(scsi_id);
+        eprintln!("IRIX: remount /CDROM for SCSI #{scsi_id} (console shell must be active)");
+        self.inject_serial_console(script.as_bytes());
+    }
 
     fn pending_chd_sync_count(&self) -> usize {
         use crate::scsi_monitor::ScsiTargets;
         self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum::<usize>()
             + self.bus.nvme.get().map_or(0, |n| n.scsi_bus().pending_chd_sync_count())
+    }
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        use crate::scsi_monitor::ScsiTargets;
+        let controllers = self.bus.scsi.lock().unwrap().clone();
+        controllers.iter().map(|c| c.bus().activity())
+            .chain(self.bus.nvme.get().map(|n| n.scsi_bus().activity()))
+            .collect()
     }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.bus.flush_disks()
@@ -1343,6 +1399,77 @@ mod drop_tests {
         assert!(Workstation::save_nvram(&machine, Some("elsewhere.bin")).is_err());
         drop(machine);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `iris-ci rollback` on an O2 returns memory and a copy-on-write disk
+    /// to what the last `restore` loaded, again and again, without reading
+    /// the snapshot's state a second time; with no restore it says so.
+    /// Snapshots go under `saves/` in the working directory, so the test runs
+    /// again as a child in a directory of its own.
+    #[test]
+    fn ci_rollback_returns_to_the_last_restore() {
+        const CHILD: &str = "IRIS_O2_ROLLBACK_CHILD";
+        let Some(dir) = std::env::var_os(CHILD) else {
+            let dir = scratch("o2-rollback");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .current_dir(&*dir)
+                .env(CHILD, &*dir)
+                .args(["--exact", "ip32_machine::drop_tests::ci_rollback_returns_to_the_last_restore",
+                       "--nocapture", "--test-threads=1"])
+                .output().unwrap();
+            assert!(output.status.success(), "rollback child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let disk = dir.join("disk.raw");
+        std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.scsi.insert(1, crate::config::ScsiDeviceConfig {
+            path: disk.to_string_lossy().into_owned(), overlay: true, ..Default::default()
+        });
+        let mut machine = big_stack(move || Box::new(O2Machine::new(&cfg).expect("O2")));
+        let at = crate::ip32::RAM_BASE as usize + 0x10_0000;
+        let write = |m: &O2Machine, fill: u8| {
+            m.bus.ram.write(at, &[fill; 4]);
+            let req = crate::scsi::ScsiRequest {
+                cdb: vec![0x2a, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+                data_len: crate::scsi::ScsiDataLength::Unlimited,
+                data_in: Some(vec![fill; 512]),
+            };
+            let r = m.bus.scsi.lock().unwrap()[0].bus().request(1, &req).unwrap().unwrap();
+            assert_eq!(r.status, 0, "the write reaches the disk");
+        };
+        let read = |m: &O2Machine| {
+            let req = crate::scsi::ScsiRequest {
+                cdb: vec![0x28, 0, 0, 0, 0, 2, 0, 0, 1, 0],
+                data_len: crate::scsi::ScsiDataLength::Unlimited,
+                data_in: None,
+            };
+            let r = m.bus.scsi.lock().unwrap()[0].bus().request(1, &req).unwrap().unwrap();
+            (m.bus.ram.bytes(at, 4)[0], r.data[0])
+        };
+
+        assert!(machine.ci_rollback().is_err(), "nothing restored yet");
+        machine.stop();
+        write(&machine, 0x11);
+        machine.save_snapshot("o2-rollback").unwrap();
+        machine.stop();
+        write(&machine, 0x22);
+        machine.ci_restore("o2-rollback").unwrap();
+        machine.stop();
+        assert_eq!(read(&machine), (0x11, 0x11), "the restore puts back memory and disk");
+        // The rollback keeps what the restore read; only the overlays are
+        // read again.
+        std::fs::remove_file(std::path::Path::new("saves/o2-rollback/snapshot.toml")).unwrap();
+        for fill in [0x33, 0x44] {
+            write(&machine, fill);
+            machine.ci_rollback().unwrap();
+            assert!(machine.cpu_is_running(), "the CPU runs on after a rollback");
+            machine.stop();
+            assert_eq!(read(&machine), (0x11, 0x11), "rolled back from {fill:#x}");
+        }
+        drop(machine);
     }
 
     /// `[nvme]` puts a card in the "PCI option" slot and records its disk;

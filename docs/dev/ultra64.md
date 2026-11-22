@@ -149,6 +149,12 @@ Both sides use `Gp0` (GIO interrupt 0) as the single interrupt line. The
 `PROD_ID` register on the Indy encodes which sub-event fired so the ISR
 can dispatch correctly.
 
+On the Indy, `Gp0` is high while any of its three sources is pending: the
+N64's GIO interrupt (cleared by reading `GIO_INT_ACK`), `PROD_ID` bit 31
+(cleared through `GIO_RDB_WRITE_INTR_REG`) and `PROD_ID` bit 30 (cleared
+through `GIO_RDB_READ_INTR_REG`). Clearing one leaves the line up while
+another is still pending.
+
 ## Reset and NMI behavior
 
 ### Hard reset (`_U64_RESET_CONTROL_RESET = 0x2`)

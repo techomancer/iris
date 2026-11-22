@@ -92,26 +92,36 @@ The stall therefore advances cycles **paced off the host clock** at 10ns/cycle,
 sampled from `Instant`, not counted per iteration. An idle guest's clock then
 tracks wall time the same way a running one does.
 
-### An unreleasable WAIT returns `EXEC_RETRY` *before* the PC update
+### WAIT with IE clear: `EXEC_RETRY` until a requested interrupt, then complete
 
-A WAIT executed with `Status.IE` clear (or `EXL`/`ERL` set) can never be
-released by an interrupt. Handled by returning `EXEC_RETRY` **before**
-`handle_exec_complete()`, so PC stays on the instruction:
+A WAIT executed with `Status.IE` clear (or `EXL`/`ERL` set) is handled
+**before** `handle_exec_complete()`:
 
-- the guest correctly never progresses — matching hardware, which hangs;
-- the CPU thread still returns to its run loop every iteration, so the monitor,
-  the debugger and the soft-reset check stay responsive.
+- nothing requested (no `Cause.IP` / `hot.interrupts` bit that the IM bits
+  pass): return `EXEC_RETRY`, PC stays on the WAIT, and the CPU thread still
+  returns to its run loop every iteration, so the monitor, the debugger and
+  the soft-reset check stay responsive;
+- a requested interrupt that IM passes: the WAIT graduates (PC + 4) with no
+  exception; the interrupt is taken once software sets IE again.
 
-Falling *through* instead (letting the guest walk past a WAIT that should have
-blocked) is wrong, and spinning inside the instruction freezes the monitor and
-debugger with it. Proven: replacing the early return with `if false` makes
-`test_wait_with_interrupts_disabled_retries_without_advancing` **hang** rather
-than fail.
+Spinning inside the instruction instead freezes the monitor and debugger
+(`test_wait_with_interrupts_disabled_retries_without_advancing` hangs rather
+than fails if the early return goes).
+
+The second half was added 2026-11-20. It used to be "never completes,
+matching hardware, which hangs", and that is wrong for the parts that
+implement WAIT: OpenBSD's R5000/RM52xx/RM7000 idle, `cpu_idle_cycle_rm7k`
+(`mips64/context.S`), is `mfc0 a0,SR; clear IE; mtc0; sync; mtc0; wait; mtc0
+a0,SR`, and Linux's `r4k_wait_irqoff` does the same; both rely on a requested
+interrupt restarting the pipeline with IE clear. With RETRY an idle OpenBSD
+O2 (R5000) sat on the WAIT forever with IP7 and IP2 pending and IM7/IM2 set:
+the RAMDISK kernel stopped after `boot device: sd0`. Test:
+`test_wait_with_ie_clear_completes_on_a_requested_interrupt`.
 
 IRIX never reaches this case — `wait_for_interrupt_fix_loc` requires the
-`mtc0 a1,C0_SR` that re-enables interrupts to be *adjacent* to the WAIT, which
-is what its "must be adjacent to avoid a race with an interrupt" comment is
-about.
+`mtc0 a1,C0_SR` that re-enables interrupts to be *adjacent* to the WAIT,
+which is what its "must be adjacent to avoid a race with an interrupt"
+comment is about.
 
 ## JIT
 

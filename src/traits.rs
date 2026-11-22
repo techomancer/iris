@@ -417,6 +417,15 @@ pub trait DmaClient: Send + Sync {
     fn overflow(&self) {}
     /// Whether a receive channel can take a frame now; see [`RxRoom`].
     fn rx_room(&self) -> RxRoom { RxRoom::Room }
+    /// Wait up to `timeout` for the guest to make the channel active, for a
+    /// device that reached its data phase before the driver armed the
+    /// channel. Returns whether the channel is active. A channel that can
+    /// signal its arming wakes the caller at once (HPC3); the default sleeps
+    /// a short slice and returns false, so a caller retrying in a loop polls.
+    fn wait_active(&self, timeout: std::time::Duration) -> bool {
+        std::thread::sleep(timeout.min(std::time::Duration::from_micros(100)));
+        false
+    }
 }
 
 /// What a receive channel can take now. The emulator's host side uses it to
@@ -495,6 +504,14 @@ pub trait Device: Send + Sync {
     /// A sound card's report for the monitor's `audio status`
     /// (see `host_audio::Meter::report`); other devices have none.
     fn audio_report(&self) -> Option<String> {
+        None
+    }
+
+    /// Frames a sound card has moved between the guest and the host, inputs
+    /// and outputs together, since it was built; other devices have none.
+    /// It only goes up while sound plays or records, so a front-end compares
+    /// two samples for an activity light.
+    fn audio_frames(&self) -> Option<u64> {
         None
     }
 }

@@ -350,6 +350,7 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 |---|---|
 | `scsi status` | Attached devices, disc lists and queue positions |
 | `scsi regs` | WD33C93A registers |
+| `scsi armwait [reset]` | WD33C93A data phases that started before the driver armed the HPC3 DMA channel, across both controllers: how many, how often the chip checked the channel again, how long each waited (mean, max, histogram) and how many gave up after 100 ms. `reset` zeroes them first |
 | `scsi eject <id>` | Cycle to the next disc on CD-ROM `id` |
 | `scsi add <id> <path>` | Insert a disc image as next in the queue (checks the file exists). With the `http-media` feature (on by default) the path may be an `http://` or `https://` URL |
 | `scsi list <id>` | Discs in the queue with ordinals |

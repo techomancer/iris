@@ -1649,6 +1649,11 @@ pub struct CrimeRe {
     /// so what was just drawn is in it.
     trace: Mutex<std::collections::VecDeque<(u32, u64, u8)>>,
     trace_cap: usize,
+    /// Test aid (IRIS_IP32_RE_LAG_US): the engine's thread waits this long
+    /// before each MTE transfer, as if the host had kept it off a processor.
+    /// It opens the window of the race a status read guards against (see
+    /// `read_reg_now`) on any host; zero, the default, waits not at all.
+    transfer_lag: std::time::Duration,
     /// The engine runs on its own thread ([`Self::start`]), working
     /// through the writes the CPU leaves in `ib`, as the real one works
     /// through its interface buffer while the CPU runs on. A write that
@@ -1790,6 +1795,9 @@ impl CrimeRe {
             drawn: std::sync::atomic::AtomicU64::new(0),
             trace: Mutex::new(std::collections::VecDeque::new()),
             trace_cap: std::env::var("IRIS_IP32_RE_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            transfer_lag: std::time::Duration::from_micros(
+                std::env::var("IRIS_IP32_RE_LAG_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
         }
     }
 
@@ -3310,6 +3318,9 @@ impl CrimeRe {
     /// Carry out an MTE transfer, and count it done for a status read
     /// waiting on it.
     fn transfer(&self) {
+        if !self.transfer_lag.is_zero() {
+            std::thread::sleep(self.transfer_lag);
+        }
         self.mte();
         self.transfers_done.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
