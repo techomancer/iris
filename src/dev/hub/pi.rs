@@ -42,11 +42,17 @@
 //!   record (valid, overrun, address); the other fields stay zero.
 //! - The Hub error interrupt, cross-calls and processor-bus checking are not modelled.
 //! - PI_CPU_NUM names the reader by CPU thread index; a store is logged and ignored.
+//! - The PROM's pair liveness check assumes both slices run at one rate, which host threads do not:
+//!   a slice that polls the other's comparator is held until the other has done its part, and slice
+//!   B until A has stored the I/O flag word after the match. An approximation shaped by this PROM,
+//!   with no hardware counterpart; it ends after 2 billion cycles of the other slice, or 120 s of
+//!   machine time (the only bound on a partner that retires nothing), leaving the check to the PROM.
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
 use crate::cpu::mips_exec::SOFT_RESET_BIT;
-use crate::cpu::smp::on_cpu_thread;
+use crate::cpu::smp::{on_cpu_thread, HOLD_RENDEZVOUS};
+use crate::ip35::presence::{Cpu, HOLD_CYCLES, SAFETY_NS};
 use crate::clock::Clock;
 use super::{Effect, PENDING_BANKS};
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
@@ -55,7 +61,7 @@ use crate::hptimer::{Timer, TimerManager};
 use crate::traits::Resettable;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use super::regs as reg;
 /// The end of the graphics credit registers.
@@ -95,6 +101,19 @@ pub const LINES_PER_CPU: usize = 4;
 /// four lines run to IP5 (bit 13). The Hub touches no other bit.
 const CAUSE_SHIFT: u32 = 10;
 const LINE_MASK: u64 = (1 << LINES_PER_CPU) - 1;
+/// How often a hold's bounds are looked at, in machine nanoseconds.
+const POLL_CHECK_NS: u64 = 50_000_000;
+
+/// What a slice held at the liveness poll waits for the other slice to do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Await {
+    /// Store to its comparator.
+    Post,
+    /// Read this slice's comparator equal to its own.
+    Seen,
+    /// Slice A to store the I/O flag word, publishing that it lives.
+    Published,
+}
 
 pub use crate::sn::calias_bytes;
 
@@ -108,6 +127,15 @@ fn unimp(what: &str, off: u64, value: Option<u64>) {
         Some(v) => crate::dlog!(LogModule::Hub, "Hub PI: write of {v:#x} to unimplemented {what} {off:#x}"),
         None => crate::dlog!(LogModule::Hub, "Hub PI: read of unimplemented {what} {off:#x}"),
     }
+}
+
+/// A slice held at the liveness poll: what for, when (machine nanoseconds), and the other
+/// slice's retired cycles then.
+#[derive(Clone, Copy)]
+struct Held {
+    wait: Await,
+    since: u64,
+    progress: u64,
 }
 
 struct State {
@@ -127,6 +155,12 @@ struct State {
     err_stack_size: u64,
     err_status0: [u64; 2],
     gfx: PiGfx,
+    /// The liveness poll: whether it still holds, each slice's hold, and when the holds end.
+    poll_armed: bool,
+    held: [Option<Held>; 2],
+    seen: [bool; 2],
+    published: bool,
+    hold_due: Option<u64>,
 }
 impl State {
     /// Reset values, with the enable of each of the `cpus` populated slices set as the module's strap does.
@@ -142,6 +176,11 @@ impl State {
             err_stack_size: reg::PI_ERR_STACK_SIZE::RESET,
             err_status0: [0; 2],
             gfx: PiGfx::default(),
+            poll_armed: cpus == 2,
+            held: [None; 2],
+            seen: [false; 2],
+            published: false,
+            hold_due: None,
         }
     }
 }
@@ -187,8 +226,10 @@ pub struct Pi {
     /// a test that stalls the writer there.
     #[cfg(test)]
     stall: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// The two processors' comparators, then the profiling one.
-    timers: [Timer; 3],
+    /// Both slices' park slots and retired cycles, once the machine gives them.
+    pair: OnceLock<[Cpu; 2]>,
+    /// The two processors' comparators, the profiling one, then the end of the poll's holds.
+    timers: [Timer; 4],
     running: AtomicBool,
 }
 
@@ -224,7 +265,8 @@ impl Pi {
             falls: Default::default(),
             #[cfg(test)]
             stall: Mutex::new(None),
-            timers: [0, 1, 2].map(|kind| Timer::new(tm, weak, move |pi: &Self, due| pi.expire(kind, due))),
+            pair: OnceLock::new(),
+            timers: [0, 1, 2, 3].map(|kind| Timer::new(tm, weak, move |pi: &Self, due| pi.expire(kind, due))),
             running: AtomicBool::new(false),
         })
     }
@@ -306,9 +348,110 @@ impl Pi {
     /// A comparator's timer fired for `due`; a fire after the deadline moved does nothing.
     fn expire(&self, kind: usize, due: u64) {
         let mut s = self.state.lock();
-        if [s.due[0], s.due[1], s.prof_due][kind] == Some(due) {
-            self.latch(&mut s, kind);
+        if [s.due[0], s.due[1], s.prof_due, s.hold_due][kind] == Some(due) {
+            if kind == 3 {
+                self.check_holds(&mut s);
+            } else {
+                self.latch(&mut s, kind);
+            }
         }
+    }
+
+    /// End the poll if a held slice has waited out its bound; else look again later.
+    fn check_holds(&self, s: &mut State) {
+        let (Some(pair), now) = (self.pair.get(), self.clock.now()) else { return };
+        let ran_out = (0..2).any(|slice| {
+            s.held[slice].is_some_and(|h| {
+                (pair[1 - slice].cycles)().saturating_sub(h.progress) >= HOLD_CYCLES || now.saturating_sub(h.since) >= SAFETY_NS
+            })
+        });
+        if ran_out {
+            crate::dlog!(LogModule::Hub, "Hub PI: a slice held at the liveness poll ran out; the PROM decides");
+            self.end_poll(s);
+        } else {
+            s.hold_due = s.held.iter().any(Option::is_some).then(|| now.saturating_add(POLL_CHECK_NS));
+            self.schedule(s);
+        }
+    }
+
+    /// Slices A and B, for the liveness poll's holds. Once, with both populated.
+    pub fn set_pair(&self, cpus: [Cpu; 2]) {
+        assert!(self.cpus == 2 && self.pair.set(cpus).is_ok(), "Hub PI: a pair set twice or on one slice");
+    }
+
+    fn release(&self, s: &mut State, slice: usize, ended: Await) {
+        if s.held[slice].is_some_and(|h| h.wait == ended) {
+            s.held[slice] = None;
+            if let Some(pair) = self.pair.get() {
+                pair[slice].slot.release(HOLD_RENDEZVOUS);
+            }
+        }
+    }
+
+    /// No more holds until the next reset.
+    fn end_poll(&self, s: &mut State) {
+        s.poll_armed = false;
+        for slice in 0..2 {
+            for ended in [Await::Post, Await::Seen, Await::Published] {
+                self.release(s, slice, ended);
+            }
+        }
+        s.hold_due = None;
+        self.schedule(s);
+    }
+
+    /// Slice `reader` read the other's comparator, `slot`: hold it as the module comment says.
+    fn poll_read(&self, s: &mut State, reader: usize, slot: usize) {
+        let Some(pair) = self.pair.get() else { return };
+        let wait = if s.rt_compare[slot] == s.rt_compare[reader] {
+            s.seen[reader] = true;
+            self.release(s, slot, Await::Seen);
+            if reader == 1 && !s.published {
+                Await::Published
+            } else if s.seen[slot] || s.published {
+                if s.seen[slot] && s.published {
+                    self.end_poll(s);
+                }
+                return;
+            } else {
+                Await::Seen
+            }
+        } else {
+            Await::Post
+        };
+        if s.held[reader].is_none() {
+            let now = self.clock.now();
+            s.held[reader] = Some(Held { wait, since: now, progress: (pair[slot].cycles)() });
+            pair[reader].slot.hold(HOLD_RENDEZVOUS);
+            s.hold_due = Some(now.saturating_add(POLL_CHECK_NS));
+            self.schedule(s);
+        }
+    }
+
+    /// A store to the I/O flag word: from slice A after it has seen the match, it publishes A's liveness.
+    pub fn flag_word_stored(&self) {
+        if self.cpus < 2 {
+            return;
+        }
+        let mut s = self.state.lock();
+        if s.poll_armed && s.seen[0] && self.reader_slice() == Some(0) {
+            s.published = true;
+            self.release(&mut s, 1, Await::Published);
+            if s.seen == [true; 2] {
+                self.end_poll(&mut s);
+            }
+        }
+    }
+
+    /// A comparator read. Until the liveness poll has passed, reading the other slice's may hold the reader.
+    fn read_compare(&self, slot: usize) -> u64 {
+        let mut s = self.state.lock();
+        if s.poll_armed {
+            if let Some(reader) = self.reader_slice().filter(|&r| r != slot) {
+                self.poll_read(&mut s, reader, slot);
+            }
+        }
+        s.rt_compare[slot]
     }
 
     /// What slice `slot`'s four lines say: banks 0 and 1 through their masks,
@@ -388,9 +531,9 @@ impl Pi {
         }
     }
 
-    /// Give each timer its comparator's deadline. Under the lock `s` is read under.
+    /// Give each timer its deadline. Under the lock `s` is read under.
     fn schedule(&self, s: &State) {
-        for (timer, due) in self.timers.iter().zip([s.due[0], s.due[1], s.prof_due]) {
+        for (timer, due) in self.timers.iter().zip([s.due[0], s.due[1], s.prof_due, s.hold_due]) {
             timer.set_due(due);
         }
     }
@@ -494,6 +637,7 @@ impl Pi {
             // The registers a waiting processor polls take no lock.
             reg::PI_INT_PEND0::OFFSET => self.pend[0].load(Ordering::Acquire),
             reg::PI_INT_PEND1::OFFSET => self.pend[1].load(Ordering::Acquire),
+            reg::PI_RT_COMPARE_A::OFFSET | reg::PI_RT_COMPARE_B::OFFSET => self.read_compare(idx(off, reg::PI_RT_COMPARE_A::OFFSET)),
             reg::PI_ERR_STATUS1_A::OFFSET | reg::PI_ERR_STATUS1_A_RCLR::OFFSET | reg::PI_ERR_STATUS1_B::OFFSET | reg::PI_ERR_STATUS1_B_RCLR::OFFSET
             | reg::PI_CRB_TIMEOUT_A::OFFSET | reg::PI_CRB_TIMEOUT_B::OFFSET => 0,
             reg::PI_ERR_STATUS0_A_RCLR::OFFSET | reg::PI_ERR_STATUS0_B_RCLR::OFFSET => {
@@ -561,6 +705,7 @@ impl Pi {
                 let slot = idx(off, reg::PI_RT_COMPARE_A::OFFSET);
                 let mut s = self.state.lock();
                 s.rt_compare[slot] = value & RT_MASK;
+                self.release(&mut s, 1 - slot, Await::Post);
                 let now = now();
                 self.arm(&mut s, slot, now, true);
                 if s.due[slot] == Some(now) {
@@ -668,6 +813,7 @@ impl Resettable for Pi {
         let now = self.clock.now();
         let mut s = self.state.lock();
         let addr = s.err_stack_addr;
+        self.end_poll(&mut s);
         *s = State::new(self.cpus);
         s.err_stack_addr = addr;
         drop(s);

@@ -895,3 +895,176 @@ fn a_failed_read_sets_the_error_pending_bit_a_store_of_ones_clears() {
     t.pi.power_on();
     assert_eq!(t.r(reg::PI_ERR_INT_PEND::OFFSET), 0);
 }
+
+/// The liveness poll's holds: a slice reading the other's comparator waits for the other to post
+/// there, then for the other to see the codes equal, and B for A to publish in the flag word;
+/// then the poll is over until a reset.
+#[test]
+fn a_slice_polling_the_others_comparator_is_held_until_both_have_seen_the_code() {
+    use crate::cpu::smp::{set_current_cpu, ParkSlot, HOLD_RENDEZVOUS};
+    let t = Fixture::new(2);
+    let slots = [0, 1].map(|n| Arc::new(ParkSlot::new(n as u8, &t.lines.0[n])));
+    let cycles = [0, 1].map(|_| Arc::new(AtomicU64::new(0)));
+    t.pi.set_pair(pair(&slots, &cycles));
+    let held = |n: usize| slots[n].holds() & HOLD_RENDEZVOUS != 0;
+    let on = |cpu: u8, f: &(dyn Fn(&Pi) + Sync)| {
+        let pi = t.pi.clone();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                set_current_cpu(cpu);
+                f(&pi);
+            });
+        });
+    };
+    let post = |pi: &Pi, slot: u64, code| pi.write_sized(reg::PI_RT_COMPARE_A::OFFSET + 8 * slot, code, 8);
+    let poll = |pi: &Pi, slot: u64| pi.read(reg::PI_RT_COMPARE_A::OFFSET + 8 * slot, true);
+    on(0, &|pi| {
+        post(pi, 0, 0x24);
+        assert_eq!(poll(pi, 1), 0);
+    });
+    assert!(held(0) && !held(1), "A waits for B to post");
+    on(1, &|pi| {
+        post(pi, 1, 0x5);
+    });
+    assert!(!held(0), "any post by B lets A look again");
+    on(0, &|pi| assert_eq!(poll(pi, 1), 0x5));
+    on(1, &|pi| {
+        post(pi, 1, 0x24);
+        assert_eq!(poll(pi, 0), 0x24);
+    });
+    assert!(!held(0) && held(1), "B has seen A's code and waits for A to publish");
+    on(0, &|pi| assert_eq!(poll(pi, 1), 0x24));
+    assert!(!held(0) && held(1), "A has seen B's code, but has not published");
+    on(0, &|pi| pi.flag_word_stored());
+    assert!(!held(0) && !held(1));
+    on(0, &|pi| {
+        post(pi, 0, 0x30);
+        assert_eq!(poll(pi, 1), 0x24);
+    });
+    assert!(!held(0), "the poll is over");
+
+    // A reset arms it again; a hold the other slice never ends runs out at the machine-time bound.
+    t.pi.power_on();
+    on(1, &|pi| {
+        post(pi, 1, 0x24);
+        assert_eq!(poll(pi, 0), reg::PI_RT_COMPARE_A::RESET);
+    });
+    assert!(held(1));
+    t.clock.step(POLL_CHECK_NS);
+    let due = t.pi.state.lock().hold_due.unwrap();
+    t.pi.expire(3, due);
+    assert!(held(1), "the other slice has retired nothing and little time has passed");
+    t.clock.step(SAFETY_NS);
+    let due = t.pi.state.lock().hold_due.unwrap();
+    t.pi.expire(3, due);
+    assert!(!held(1), "the PROM's own bound decides");
+}
+
+/// A hold ends when the slice it waits for has retired HOLD_CYCLES since the hold began, however
+/// little machine time that took, and not before.
+#[test]
+fn a_hold_ends_when_the_other_slice_has_retired_enough_cycles() {
+    use crate::cpu::smp::{set_current_cpu, ParkSlot, HOLD_RENDEZVOUS};
+    let t = Fixture::new(2);
+    let slots = [0, 1].map(|n| Arc::new(ParkSlot::new(n as u8, &t.lines.0[n])));
+    let cycles = [0, 1].map(|_| Arc::new(AtomicU64::new(0)));
+    t.pi.set_pair(pair(&slots, &cycles));
+    let held = |n: usize| slots[n].holds() & HOLD_RENDEZVOUS != 0;
+    let expire = || {
+        t.clock.step(POLL_CHECK_NS);
+        let due = t.pi.state.lock().hold_due;
+        due.map(|due| t.pi.expire(3, due));
+    };
+    cycles[0].store(5_000, Ordering::Relaxed);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            set_current_cpu(1);
+            t.pi.write_sized(reg::PI_RT_COMPARE_A::OFFSET + 8, 0x24, 8);
+            t.pi.read(reg::PI_RT_COMPARE_A::OFFSET, true);
+        });
+    });
+    assert!(held(1));
+    cycles[0].fetch_add(HOLD_CYCLES - 1, Ordering::Relaxed);
+    expire();
+    assert!(held(1), "one cycle short");
+    cycles[0].fetch_add(1, Ordering::Relaxed);
+    expire();
+    assert!(!held(1), "the bound is reached");
+    assert!(!t.pi.state.lock().poll_armed, "the poll is over");
+}
+
+/// The pair as the machine gives it: each slice's slot and a retired-cycle count the test moves.
+fn pair(slots: &[Arc<crate::cpu::smp::ParkSlot>; 2], cycles: &[Arc<AtomicU64>; 2]) -> [crate::ip35::presence::Cpu; 2] {
+    [0, 1].map(|n| {
+        let c = cycles[n].clone();
+        crate::ip35::presence::Cpu { slot: slots[n].clone(), cycles: Box::new(move || c.load(Ordering::Relaxed)) }
+    })
+}
+
+/// PROM 6.156's slice B delays 1 ms after the match, then takes A for dead at its barrier unless
+/// A's liveness bit is in the flag word. B is held from its match to A's store there, in either order.
+#[test]
+fn slice_b_waits_for_a_to_publish_after_the_match() {
+    use crate::cpu::smp::{set_current_cpu, ParkSlot, HOLD_RENDEZVOUS};
+    let t = Fixture::new(2);
+    let slots = [0, 1].map(|n| Arc::new(ParkSlot::new(n as u8, &t.lines.0[n])));
+    let cycles = [0, 1].map(|_| Arc::new(AtomicU64::new(0)));
+    t.pi.set_pair(pair(&slots, &cycles));
+    let held = |n: usize| slots[n].holds() & HOLD_RENDEZVOUS != 0;
+    let on = |cpu: u8, f: &(dyn Fn(&Pi) + Sync)| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                set_current_cpu(cpu);
+                f(&t.pi);
+            });
+        });
+    };
+    let post = |pi: &Pi, slot: u64| {
+        pi.write_sized(reg::PI_RT_COMPARE_A::OFFSET + 8 * slot, 0x24, 8);
+    };
+    let poll = |pi: &Pi, slot: u64| pi.read(reg::PI_RT_COMPARE_A::OFFSET + 8 * slot, true);
+    on(0, &|pi| post(pi, 0));
+    on(1, &|pi| post(pi, 1));
+    on(0, &|pi| assert_eq!(poll(pi, 1), 0x24));
+    assert!(held(0) && !held(1), "A has seen first and waits for B to see");
+    on(1, &|pi| assert_eq!(poll(pi, 0), 0x24));
+    assert!(!held(0) && held(1), "A runs on to publish; B waits for it");
+    on(1, &|pi| pi.flag_word_stored());
+    assert!(held(1), "only slice A publishes");
+    on(0, &|pi| pi.flag_word_stored());
+    assert!(!held(0) && !held(1));
+    assert!(!t.pi.state.lock().poll_armed, "the poll is over");
+}
+
+/// A flag-word store by A before it has seen the match is not its liveness publication: B, having
+/// seen the match, is still held until A stores it again.
+#[test]
+fn an_early_flag_word_store_does_not_publish() {
+    use crate::cpu::smp::{set_current_cpu, ParkSlot, HOLD_RENDEZVOUS};
+    let t = Fixture::new(2);
+    let slots = [0, 1].map(|n| Arc::new(ParkSlot::new(n as u8, &t.lines.0[n])));
+    let cycles = [0, 1].map(|_| Arc::new(AtomicU64::new(0)));
+    t.pi.set_pair(pair(&slots, &cycles));
+    let held = |n: usize| slots[n].holds() & HOLD_RENDEZVOUS != 0;
+    let on = |cpu: u8, f: &(dyn Fn(&Pi) + Sync)| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                set_current_cpu(cpu);
+                f(&t.pi);
+            });
+        });
+    };
+    let post = |pi: &Pi, slot: u64| {
+        pi.write_sized(reg::PI_RT_COMPARE_A::OFFSET + 8 * slot, 0x24, 8);
+    };
+    let poll = |pi: &Pi, slot: u64| pi.read(reg::PI_RT_COMPARE_A::OFFSET + 8 * slot, true);
+    on(0, &|pi| post(pi, 0));
+    on(1, &|pi| post(pi, 1));
+    on(0, &|pi| pi.flag_word_stored());
+    on(0, &|pi| assert_eq!(poll(pi, 1), 0x24));
+    on(1, &|pi| assert_eq!(poll(pi, 0), 0x24));
+    assert!(held(1), "A's early store did not publish");
+    on(0, &|pi| pi.flag_word_stored());
+    assert!(!held(0) && !held(1));
+    assert!(!t.pi.state.lock().poll_armed, "the poll is over");
+}
