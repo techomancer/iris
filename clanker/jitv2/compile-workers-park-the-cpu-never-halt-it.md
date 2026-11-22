@@ -46,3 +46,12 @@ values before they spawn.
 forces a worker flush (`PoolBarrier::force_flush`, test-only) against a fake
 CPU that flushes the moment it is held. Without the world it deadlocks and the
 test fails after 20 s.
+
+**End to end.** `tools/jitv2-flush-race.py` (see `TESTING.md`) boots a guest
+with `IRIS_JIT_ARENA_FLUSH_MB=1` and loops `stop` / `j2 flush` / `start` at the
+monitor. On the Indigo2 R10000 with IRIX 6.5.22, before the fix `j2 flush`
+hung after 22 rounds (73 s) and after 1 round (during PROM diagnostics): the
+monitor thread in `CompileQueue::stop` joining `jitv2-compile-0`, the worker in
+`MipsCpu::halt` waiting for the executor lock the monitor holds. With the fix
+it ran 1115 rounds in 600 s, 1234 worker-led flushes, and the guest reached its
+login prompt.
