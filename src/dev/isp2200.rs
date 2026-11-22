@@ -41,7 +41,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -53,6 +53,7 @@ use crate::dev::isp1040::{
 use crate::dev::qlogic_ring::{
     self, Notes, RingCtl, RingState, RingThread, CONT_OFF_SEGS32, CONT_OFF_SEGS64, CONT_SEGS32, CONT_SEGS64, SEG32_SIZE, SEG64_SIZE,
 };
+use crate::hptimer::{Timer, TimerManager};
 use crate::irq::{IrqGuard, IrqLevel, IrqMutex};
 use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState, PCI_INTA};
 use crate::scsi::{get_cdb_length, scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
@@ -1043,6 +1044,11 @@ pub struct Core {
     /// The machine's activity lights (`crate::status::scsi_blink`), once
     /// wired.
     heartbeat: std::sync::OnceLock<Arc<AtomicU64>>,
+    /// Wakes the ring thread when the loop comes up.
+    bringup: Timer,
+    #[cfg(test)]
+    /// The test constructors build their own manager; the timer holds it weakly.
+    _tm: Arc<TimerManager>,
 }
 
 impl std::ops::Deref for Core {
@@ -1069,21 +1075,22 @@ impl Isp2200 {
     /// The adapter on an empty loop, for the tests.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::new_at(0, Self::new_bus())
+        Self::new_at(0, Self::new_bus(), &Arc::new(TimerManager::new()))
     }
 
     /// The adapter at `index` on `bus`. Its port name's serial is a hash of
     /// the index, so two adapters in one machine differ and each keeps its
     /// name from run to run.
-    pub fn new_at(index: u8, bus: ScsiBus) -> Self {
+    pub fn new_at(index: u8, bus: ScsiBus, tm: &Arc<TimerManager>) -> Self {
         let serial = fnv1a(&format!("isp2200-{index}")) % NVRAM_SERIAL_MAX + 1;
-        Self { core: Arc::new(Core::new_at(index, bus, serial)) }
+        Self { core: Arc::new_cyclic(|me| Core::new_at(index, bus, serial, tm, me)) }
     }
 
     /// Start the ring thread (idempotent) and let it take whatever was
     /// published while the adapter was stopped.
     fn start_ring(&self) {
         self.ring.start_thread(self.pci.irq_cell(), &self.core, format!("isp2200-{}", self.core.index), Core::run_ring);
+        self.bringup.start();
     }
 
     /// Park the ring between entries, then end and join the thread. A
@@ -1091,6 +1098,7 @@ impl Isp2200 {
     /// touches guest memory or the interrupt line.
     fn stop_ring(&self) {
         self.ring.stop_thread(self.pci.irq_cell());
+        self.bringup.stop();
     }
 }
 
@@ -1102,13 +1110,13 @@ impl Drop for Isp2200 {
 }
 
 impl Core {
-    fn new_at(index: u8, bus: ScsiBus, serial: u32) -> Self {
+    fn new_at(index: u8, bus: ScsiBus, serial: u32, tm: &Arc<TimerManager>, me: &Weak<Self>) -> Self {
         let bars = [Bar::Io(reg::WINDOW_SIZE), Bar::Mem(reg::WINDOW_SIZE), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused];
         let pci = PciConfig::new(PCI_VENDOR_QLOGIC, PCI_DEVICE_ISP2200, PCI_CLASS_FIBRE_CHANNEL, 0, bars, PCI_INTA);
         // The subsystem dword is the board's: a bus reset keeps what is written here.
         pci.write(11, PCI_SUBSYSTEM_ID);
         Self {
-            ring: RingThread::new(State::new()),
+            ring: RingThread::new(State::new(), tm.clock().clone()),
             cancel: AtomicU64::new(0),
             bus,
             index,
@@ -1118,6 +1126,9 @@ impl Core {
             odd_accesses: AtomicU64::new(0),
             wide_accesses: AtomicU64::new(0),
             heartbeat: std::sync::OnceLock::new(),
+            bringup: Timer::new(tm, me, Self::fire),
+            #[cfg(test)]
+            _tm: tm.clone(),
         }
     }
 
@@ -1415,8 +1426,9 @@ impl Core {
     }
 
     fn start_bringup(&self, st: &mut State, lip_reset: bool) {
-        let due = self.now_ns(st) + BRINGUP.as_nanos() as i64;
+        let due = self.now_ns() + BRINGUP.as_nanos() as i64;
         st.bringup(lip_reset, due);
+        self.arm(st);
         self.kick(st);
     }
 
@@ -1576,27 +1588,20 @@ impl Core {
 
     // ---- the ring thread ---------------------------------------------
 
-    /// Take the clock off the host's and set it to `ns` (tests). The thread
-    /// reads the clock with `st` held and then waits on `wake` with no
-    /// timeout, so the move is made with `st` held too.
-    ///
-    /// The loop comes up on the ring thread, which a command blocked on a
-    /// device keeps from looking at the clock; the test's thread does it
-    /// here, so a test can hold a command and still see the loop come up.
-    #[cfg(test)]
-    pub(crate) fn set_test_clock(&self, ns: i64) {
-        let mut st = self.lock();
-        self.fake_ns.store(ns, Ordering::Relaxed);
-        if self.bringup_left(&st).is_some_and(|left| left <= 0) {
-            st.bringup_done();
-            self.post_waiting(&mut st);
-        }
-        self.kick(&mut st);
-    }
-
     /// How long until the loop is up, if it is coming up.
     fn bringup_left(&self, st: &State) -> Option<i64> {
-        st.bringup_due.map(|due| due - self.now_ns(st))
+        st.bringup_due.map(|due| due - self.now_ns())
+    }
+
+    /// Time the loop's coming up, read under the state lock.
+    fn arm(&self, st: &State) {
+        self.bringup.set_due(st.bringup_due.map(|d| d as u64));
+    }
+
+    /// The loop's bring-up time has passed: wake the ring thread to post it.
+    fn fire(&self, _due: u64) {
+        drop(self.lock());
+        self.wake.notify_all();
     }
 
     /// Block until the ring thread has run everything it was given and is
@@ -1618,19 +1623,10 @@ impl Core {
                     return;
                 }
                 let runnable = st.ctl.hold == 0 && !st.ctl.paused;
-                let left = self.bringup_left(&st);
-                if runnable && (st.ctl.work || left.is_some_and(|left| left <= 0)) {
+                if runnable && (st.ctl.work || self.bringup_left(&st).is_some_and(|left| left <= 0)) {
                     break;
                 }
-                match left {
-                    // A test clock only moves when the test moves it.
-                    Some(left) if runnable && self.fake_ns.load(Ordering::Relaxed) == i64::MIN => {
-                        st.wait_for(&self.wake, Duration::from_nanos(left as u64));
-                    }
-                    _ => {
-                        st.wait(&self.wake);
-                    }
-                }
+                st.wait(&self.wake);
             }
             st.ctl.work = false;
             st.ctl.walking = true;
@@ -2417,7 +2413,7 @@ impl Core {
         self.lock().commands
     }
 
-    fn save_locked(&self, st: &State, now: i64) -> toml::Value {
+    fn save_locked(&self, st: &State) -> toml::Value {
         let mut t = toml::map::Map::new();
         for (k, v) in [
             ("csr", st.csr),
@@ -2483,16 +2479,16 @@ impl Core {
         }
         t.insert("events".into(), toml::Value::Array(st.events.iter().map(|mb| u16_slice_to_toml(mb)).collect()));
         t.insert("held".into(), toml::Value::Array(st.held.iter().map(|entry| u8_slice_to_toml(entry)).collect()));
-        // Absolute deadlines mean nothing on another run's clock.
+        // The machine clock is restored with the board: a machine time.
         if let Some(due) = st.bringup_due {
-            t.insert("bringup_left_ns".into(), toml::Value::Integer((due - now).max(0)));
+            t.insert("bringup_at_ns".into(), toml::Value::Integer(due));
         }
         toml::Value::Table(t)
     }
 
     /// Whatever the file says, indices fold into their rings and counts stay
     /// within what this build could have queued.
-    fn load_locked(&self, st: &mut State, v: &toml::Value, now: i64) {
+    fn load_locked(&self, st: &mut State, v: &toml::Value) -> Result<(), String> {
         let ctl = std::mem::take(&mut st.ctl);
         *st = State::new();
         st.ctl = ctl;
@@ -2587,9 +2583,12 @@ impl Core {
                 st.held.push_back(entry);
             }
         }
-        // The wait goes on for what was left of it, from this clock.
-        st.bringup_due = int("bringup_left_ns").filter(|_| st.loop_active).map(|left| now.saturating_add(left.max(0)));
+        st.bringup_due = int("bringup_at_ns");
+        if st.loop_active && st.loop_state == FW_STATE_WAIT_AL_PA && st.bringup_due.is_none() {
+            return Err("bring-up in progress: missing bringup_at_ns".into());
+        }
         self.ports_unknown(st);
+        Ok(())
     }
 
     /// Ports are read off the bus again by the next command that needs them.
@@ -2954,18 +2953,18 @@ impl crate::scsi_monitor::ScsiTargets for Isp2200 {
 impl crate::traits::Saveable for Isp2200 {
     fn save_state(&self) -> toml::Value {
         self.quiesced(|st| {
-            let now = self.now_ns(st);
-            self.save_locked(st, now)
+            self.save_locked(st)
         })
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         self.quiesced(|st| {
-            let now = self.now_ns(st);
-            self.load_locked(st, v, now);
+            self.load_locked(st, v)?;
+            self.arm(st);
             self.publish_gen(st);
             st.ctl.work = true;
-        });
+            Ok::<(), String>(())
+        })?;
         // The controller took its own state from the snapshot.
         self.resync_irq();
         Ok(())

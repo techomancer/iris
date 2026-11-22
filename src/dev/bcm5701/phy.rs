@@ -13,7 +13,9 @@
 //!
 //! Ported from hw/net/bcm570x_phy.c in jamesbraid/qemu-sgi-origami.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::Clock;
 
 pub mod reg {
     pub const BMCR: u8 = 0x00;
@@ -91,12 +93,13 @@ pub struct Phy {
     autoneg_done: bool,
     link_down: bool,
     settle_armed: bool,
-    settle: Option<Instant>,
+    settle: Option<u64>,
+    clock: Clock,
     pub refused: Vec<Refusal>,
 }
 
 impl Phy {
-    pub fn new(now: Instant) -> Self {
+    pub fn new(clock: Clock) -> Self {
         let mut phy = Self {
             bmcr: 0,
             anar: 0,
@@ -105,20 +108,20 @@ impl Phy {
             link_down: false,
             settle_armed: false,
             settle: None,
+            clock,
             refused: Vec::new(),
         };
-        phy.reset(now);
+        phy.reset();
         phy
     }
 
-    /// The deadline at which the settle completes.
-    pub fn deadline(&self) -> Option<Instant> {
+    pub fn deadline(&self) -> Option<u64> {
         self.settle
     }
 
     /// Complete the settle if its time has come.
-    pub fn sync(&mut self, now: Instant) {
-        if self.settle.is_some_and(|d| d <= now) {
+    pub fn sync(&mut self) {
+        if self.settle.is_some_and(|d| d <= self.clock.now()) {
             self.settle = None;
             self.autoneg_done = true;
         }
@@ -158,10 +161,10 @@ impl Phy {
     /// A real PHY negotiates as soon as autonegotiation is enabled, so the
     /// settle runs from reset and from the write that restarts it, not from
     /// the driver's first look at link status.
-    fn arm_settle(&mut self, now: Instant) {
+    fn arm_settle(&mut self) {
         if !self.settle_armed && !self.autoneg_done && self.bmcr & bmcr::AUTOEN != 0 {
             self.settle_armed = true;
-            self.settle = Some(now + SETTLE);
+            self.settle = Some(self.clock.now() + SETTLE.as_nanos() as u64);
         }
     }
 
@@ -171,13 +174,12 @@ impl Phy {
         }
     }
 
-    pub fn read(&mut self, register: u8, now: Instant) -> u16 {
-        self.sync(now);
+    pub fn read(&mut self, register: u8) -> u16 {
         let up = self.link_up();
         match register {
             reg::BMCR => self.bmcr,
             reg::BMSR => {
-                self.arm_settle(now);
+                self.arm_settle();
                 self.status()
             }
             reg::IDR1 => IDR1_VALUE,
@@ -204,7 +206,7 @@ impl Phy {
             // The register the driver gates its link-up path on, so a poll
             // that reads only this one still brings the link up.
             reg::AUXSTS => {
-                self.arm_settle(now);
+                self.arm_settle();
                 if self.link_up() {
                     AUXSTS_UP
                 } else {
@@ -218,13 +220,12 @@ impl Phy {
         }
     }
 
-    pub fn write(&mut self, register: u8, value: u16, now: Instant) {
-        self.sync(now);
+    pub fn write(&mut self, register: u8, value: u16) {
         match register {
             reg::BMCR => {
                 // Reset and restart are self-clearing.
                 if value & bmcr::RESET != 0 {
-                    self.reset(now);
+                    self.reset();
                     return;
                 }
                 // Only a restart (or isolating the part) restarts
@@ -238,7 +239,7 @@ impl Phy {
                 }
                 self.bmcr = value & !(bmcr::RESET | bmcr::STARTNEG);
                 if value & bmcr::ISOLATE == 0 {
-                    self.arm_settle(now);
+                    self.arm_settle();
                 }
             }
             reg::ANAR => self.anar = value,
@@ -250,7 +251,7 @@ impl Phy {
         }
     }
 
-    pub fn reset(&mut self, now: Instant) {
+    pub fn reset(&mut self) {
         self.bmcr = BMCR_RESET_VALUE;
         self.anar = ANAR_RESET_VALUE;
         self.gtcr = GTCR_ADV_1000TFDX;
@@ -258,6 +259,6 @@ impl Phy {
         self.settle_armed = false;
         self.settle = None;
         // Out of reset autonegotiation is enabled, so the part starts it.
-        self.arm_settle(now);
+        self.arm_settle();
     }
 }

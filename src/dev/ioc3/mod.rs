@@ -1001,7 +1001,7 @@ impl Ioc3 {
         let kbd = cells.kbd.then(|| Kbd::new(core.clone()));
         let parallel = cells.parallel.then(|| Parallel::new(core.clone(), sio.clone().expect("a parallel port has a Super I/O")));
         let gpio = Gpio::new(board.gpio);
-        let eth = cells.eth.then(|| Ioc3Eth::new(core.clone(), mac, board.phy));
+        let eth = cells.eth.then(|| Ioc3Eth::new(core.clone(), mac, board.phy, tm));
         let (timekeeper, rtc) = match byte_bus {
             ByteBus::M48t35(clock) => (Some(clock), None),
             ByteBus::Ds1685(rtc) => (None, Some(rtc)),

@@ -27,11 +27,8 @@
 //!
 //! # What is approximated
 //!
-//! - Iris has no virtual clock, so timing is wall-clock. Deadlines (the PHY's
-//!   100 ms settle, the buffer manager's 8 ms startup, the coalescing budgets
-//!   and the arrival latency) are evaluated when the device is touched and by
-//!   the receive thread, each at its own expiry and earliest first, as the
-//!   model's virtual clock would fire them.
+//! - Deadlines (PHY settle, buffer manager startup, coalescing, arrival
+//!   latency) are machine time, run on access and by one timer for the earliest.
 //! - Wall-clock time passes whether or not the guest runs, so the arrival
 //!   latency also waits for each processor that rang the send doorbell to run
 //!   20,000 cycles past it, 20 to 29 microseconds at the R16000's 700 MHz to
@@ -75,10 +72,11 @@ mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_INTA};
 use crate::traits::{Device, Resettable};
@@ -187,13 +185,12 @@ pub struct Bcm5701 {
     /// The receive thread, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     me: Weak<Self>,
-    /// Tests freeze the clock to step it exactly.
-    #[cfg(test)]
-    frozen: Mutex<Option<Instant>>,
+    /// One timer, for the earliest deadline the chip holds.
+    timer: Timer,
 }
 
 impl Bcm5701 {
-    pub fn new(config: Bcm5701Config) -> Result<Arc<Self>, String> {
+    pub fn new(tm: &Arc<TimerManager>, config: Bcm5701Config) -> Result<Arc<Self>, String> {
         if config.mac[0] & 1 != 0 {
             return Err("bcm5701: station address must be unicast".into());
         }
@@ -246,7 +243,6 @@ impl Bcm5701 {
             policy,
         );
         pci.set_subsystem_identity(u32::from(SUBSYSTEM_ID) << 16 | u32::from(SUBSYSTEM_VENDOR_ID));
-        let now = Instant::now();
         let dev = Arc::new_cyclic(|me| Self {
             st: Mutex::new(State::new(
                 Header::new(me.clone()),
@@ -255,7 +251,7 @@ impl Bcm5701 {
                 config.eeprom,
                 config.rx_arrival_latency,
                 config.rx_arrival_cycles,
-                now,
+                tm.clock().clone(),
             )),
             pci: PciFunctionState::new(pci),
             irq: Mutex::new(IrqLine::unconnected()),
@@ -266,8 +262,7 @@ impl Bcm5701 {
             session: Mutex::new(Default::default()),
             threads: Mutex::new(Vec::new()),
             me: me.clone(),
-            #[cfg(test)]
-            frozen: Mutex::new(None),
+            timer: Timer::new(tm, me, Self::fire),
         });
         Ok(dev)
     }
@@ -277,22 +272,31 @@ impl Bcm5701 {
         self.pci.config()
     }
 
-    fn now(&self) -> Instant {
-        #[cfg(test)]
-        if let Some(t) = *self.frozen.lock() {
-            return t;
-        }
-        Instant::now()
+    fn now(&self) -> u64 {
+        self.timer.now()
+    }
+
+    /// Time the earliest deadline, read under the state lock.
+    fn arm(&self, st: &State) {
+        self.timer.set_due(st.deadline());
+    }
+
+    /// A deadline passed with no guest access to notice it: run the timers
+    /// that came due and let the receive thread offer a held frame again.
+    fn fire(&self, _due: u64) {
+        self.enter(self.now(), |_| ());
+        self.wake_rx();
     }
 
     /// Run `f` with the state at `now`, then deliver what it produced: any
     /// interrupt level it changed, frames to send, and a wake-up for the
     /// receive thread if the guest made room.
-    fn enter<R>(&self, now: Instant, f: impl FnOnce(&mut State) -> R) -> R {
+    fn enter<R>(&self, now: u64, f: impl FnOnce(&mut State) -> R) -> R {
         let (result, wire, wake, purge) = {
             let mut st = self.st.lock();
             st.enter(now);
             let result = f(&mut st);
+            self.arm(&st);
             (
                 result,
                 std::mem::take(&mut st.wire),
@@ -418,18 +422,11 @@ impl Bcm5701 {
     }
 
     /// Take frames into guest memory as they arrive and as the guest makes
-    /// room, and run the device's timers, until it stops. The wait ends early
-    /// for a wake from the guest or the NAT engine.
+    /// room, until it stops: the guest, the NAT engine and the deadline timer
+    /// wake it.
     fn rx_loop(me: Weak<Self>, running: Arc<AtomicBool>, wake: Arc<crate::net::Wake>) {
         while running.load(Ordering::SeqCst) {
-            let timeout = {
-                let Some(this) = me.upgrade() else { return };
-                let now = this.now();
-                this.enter(now, |_| ());
-                let next = this.st.lock().deadline();
-                next.and_then(|d| d.checked_duration_since(now)).unwrap_or(RX_IDLE)
-            };
-            wake.wait(timeout);
+            wake.wait(Duration::MAX);
             if !running.load(Ordering::SeqCst) {
                 return;
             }
@@ -456,7 +453,9 @@ impl Bcm5701 {
                     let Ok(frame) = link.from_net.peek() else { break };
                     let mut st = self.st.lock();
                     st.enter(now);
-                    st.receive(frame)
+                    let outcome = st.receive(frame);
+                    self.arm(&st);
+                    outcome
                 };
                 if outcome == RxOutcome::Deferred {
                     break;
@@ -634,10 +633,6 @@ impl PciFunction for Bcm5701 {
     }
 }
 
-/// How long the receive thread sleeps with no deadline to wait for: it is
-/// woken by the guest and the NAT engine, so this is only a bound.
-const RX_IDLE: Duration = Duration::from_secs(60);
-
 impl Device for Bcm5701 {
     fn step(&self, _cycles: u64) {}
 
@@ -657,6 +652,7 @@ impl Device for Bcm5701 {
             .spawn(move || Self::rx_loop(me, running, wake))
             .expect("bcm5701 rx thread");
         self.threads.lock().push(rx);
+        self.timer.start();
         // Frames queued while stopped.
         self.wake_rx();
     }
@@ -667,6 +663,7 @@ impl Device for Bcm5701 {
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
+        self.timer.stop();
         self.wake_rx();
         self.session.lock().stop();
         // The receive thread can hold the last reference for a moment, and

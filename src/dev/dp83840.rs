@@ -17,8 +17,6 @@
 //!
 //! Ported from hw/net/dp83840.c in jamesbraid/qemu-sgi-origami.
 
-use std::time::{Duration, Instant};
-
 use crate::dev::mii::MiiPhy;
 use crate::snapshot::{field_bool, field_u16, field_u64, field_u8, StateTable};
 
@@ -44,7 +42,7 @@ const TENBT_RESET: u16 = 0x80b9;
 const LOOPBACK_RESET: u16 = 0x8020;
 /// Both ends offer every mode; what a real machine negotiates is unrecorded.
 const ADVERTISE_RESET: u16 = 0x1e1;
-const SETTLE: Duration = Duration::from_secs(2);
+const SETTLE: u64 = 2_000_000_000;
 
 const BMCR_RESET: u16 = 1 << 15;
 const BMCR_LOOPBACK: u16 = 1 << 14;
@@ -65,7 +63,7 @@ pub struct Dp83840 {
     tenbt_config: u16,
     negotiated: bool,
     armed: bool,
-    deadline: Option<Instant>,
+    deadline: Option<u64>,
     forced: bool,
     backend_up: bool,
 }
@@ -129,7 +127,7 @@ impl MiiPhy for Dp83840 {
         self.addr
     }
 
-    fn deadline(&self) -> Option<Instant> {
+    fn deadline(&self) -> Option<u64> {
         self.deadline
     }
 
@@ -143,14 +141,14 @@ impl MiiPhy for Dp83840 {
         self.control & BMCR_LOOPBACK != 0 || self.loopback_bypass & LBREMR_LOOPBACK != 0
     }
 
-    fn sync(&mut self, now: Instant) {
+    fn sync(&mut self, now: u64) {
         if self.deadline.is_some_and(|d| now >= d) {
             self.deadline = None;
             self.negotiated = true;
         }
     }
 
-    fn read(&mut self, register: u8, now: Instant) -> u16 {
+    fn read(&mut self, register: u8, now: u64) -> u16 {
         self.sync(now);
         match register {
             reg::CONTROL => self.control,
@@ -187,7 +185,7 @@ impl MiiPhy for Dp83840 {
         }
     }
 
-    fn write(&mut self, register: u8, value: u16, now: Instant) {
+    fn write(&mut self, register: u8, value: u16, now: u64) {
         self.sync(now);
         match register {
             reg::CONTROL => {
@@ -214,16 +212,16 @@ impl MiiPhy for Dp83840 {
         }
     }
 
-    fn set_backend_link(&mut self, up: bool, now: Instant) {
+    fn set_backend_link(&mut self, up: bool, now: u64) {
         self.sync(now);
         self.backend_up = up;
     }
 
-    fn power_on(&mut self) {
+    fn power_on(&mut self, _now: u64) {
         self.reset();
     }
 
-    fn save_state(&self, now: Instant) -> toml::Value {
+    fn save_state(&self) -> toml::Value {
         StateTable::new()
             .u8("addr", self.addr)
             .u16("control", self.control)
@@ -233,14 +231,13 @@ impl MiiPhy for Dp83840 {
             .u16("tenbt_config", self.tenbt_config)
             .bool("negotiated", self.negotiated)
             .bool("armed", self.armed)
-            .u64("deadline", self.deadline.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1))
+            .u64("deadline_at", self.deadline.map_or(0, |d| d + 1))
             .bool("forced", self.forced)
             .bool("backend_up", self.backend_up)
             .build()
     }
 
-    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
-        let left = field_u64(v, "deadline")?;
+    fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
         *self = Self {
             addr: field_u8(v, "addr")?,
             control: field_u16(v, "control")?,
@@ -250,7 +247,7 @@ impl MiiPhy for Dp83840 {
             tenbt_config: field_u16(v, "tenbt_config")?,
             negotiated: field_bool(v, "negotiated")?,
             armed: field_bool(v, "armed")?,
-            deadline: (left != 0).then(|| now + Duration::from_nanos(left - 1)),
+            deadline: field_u64(v, "deadline_at")?.checked_sub(1),
             forced: field_bool(v, "forced")?,
             backend_up: field_bool(v, "backend_up")?,
         };
@@ -265,7 +262,7 @@ mod tests {
 
     #[test]
     fn the_reset_values_are_the_ones_sgis_diagnostic_compares() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83840::new(31);
         assert_eq!(p.address(), 31);
         assert_eq!(p.read(reg::CONTROL, now), 0x3100);
@@ -279,19 +276,19 @@ mod tests {
 
     #[test]
     fn the_link_is_down_until_the_settle_after_the_first_status_read() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83840::new(31);
         assert_eq!(p.read(reg::STATUS, now) & 0x4, 0);
-        assert_eq!(p.read(reg::STATUS, now + Duration::from_millis(1999)) & 0x4, 0);
-        let up = p.read(reg::STATUS, now + Duration::from_secs(2));
+        assert_eq!(p.read(reg::STATUS, now + 1_999_000_000) & 0x4, 0);
+        let up = p.read(reg::STATUS, now + SETTLE);
         assert_eq!(up & (0x24), 0x24);
-        p.set_backend_link(false, now + Duration::from_secs(3));
-        assert_eq!(p.read(reg::STATUS, now + Duration::from_secs(3)) & 0x4, 0);
+        p.set_backend_link(false, now + 3_000_000_000);
+        assert_eq!(p.read(reg::STATUS, now + 3_000_000_000) & 0x4, 0);
     }
 
     #[test]
     fn a_control_write_links_at_once_and_isolate_does_not() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83840::new(31);
         p.write(reg::CONTROL, 0x1000, now);
         assert_eq!(p.read(reg::STATUS, now) & 0x4, 0x4);
@@ -303,7 +300,7 @@ mod tests {
 
     #[test]
     fn any_of_three_switches_selects_loopback() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83840::new(31);
         assert!(!p.in_loopback());
         p.write(reg::CONTROL, 0x5000, now);
@@ -319,7 +316,7 @@ mod tests {
 
     #[test]
     fn read_only_and_unknown_registers_keep_their_value_and_read_zero() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83840::new(31);
         p.write(reg::ID2, 0, now);
         assert_eq!(p.read(reg::ID2, now), 0x5c01);
@@ -328,13 +325,13 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_keeps_the_settle_it_had_left() {
-        let now = Instant::now();
+    fn a_snapshot_keeps_the_settle_deadline() {
+        let now = 0;
         let mut p = Dp83840::new(31);
         p.read(reg::STATUS, now);
-        let saved = p.save_state(now + Duration::from_millis(500));
+        let saved = p.save_state();
         let mut q = Dp83840::new(31);
-        q.load_state(&saved, now).unwrap();
-        assert_eq!(q.deadline(), Some(now + Duration::from_millis(1500)));
+        q.load_state(&saved).unwrap();
+        assert_eq!(q.deadline(), Some(now + SETTLE));
     }
 }

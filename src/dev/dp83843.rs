@@ -9,8 +9,6 @@
 //!
 //! Ported from hw/net/dp83840.c in jamesbraid/qemu-sgi-origami.
 
-use std::time::{Duration, Instant};
-
 use crate::dev::mii::MiiPhy;
 
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, toml_u16, StateTable};
@@ -34,8 +32,8 @@ pub mod reg {
     pub const TEN_BASE_T_STATUS: u8 = 0x18;
     pub const PHY_CONTROL: u8 = 0x19;
 }
-const SETTLE: Duration = Duration::from_secs(2);
-const BREAK: Duration = Duration::from_millis(1500);
+const SETTLE: u64 = 2_000_000_000;
+const BREAK: u64 = 1_500_000_000;
 
 /// Management state for one transceiver. No board GPIO reset is connected.
 pub struct Dp83843 {
@@ -46,8 +44,8 @@ pub struct Dp83843 {
     forced: bool,
     resolved: u8,
     armed: bool,
-    deadline: Option<Instant>,
-    complete: Option<Instant>,
+    deadline: Option<u64>,
+    complete: Option<u64>,
     pending: bool,
     restarting: bool,
     pub unimplemented_accesses: u32,
@@ -173,30 +171,12 @@ impl Dp83843 {
 
 
 }
-// The registers and negotiation progress for a snapshot. The two instants
-// are saved as the time they had left.
-impl Dp83843 {
-    fn instant_left(at: Option<Instant>, now: Instant) -> u64 {
-        // Nanoseconds left plus one; zero for none.
-        at.map_or(0, |d| d.saturating_duration_since(now).as_nanos() as u64 + 1)
-    }
-
-    fn instant_from(left: u64, now: Instant) -> Option<Instant> {
-        (left != 0).then(|| now + Duration::from_nanos(left - 1))
-    }
-
-
-
-
-}
-
-
 impl MiiPhy for Dp83843 {
     fn address(&self) -> u8 {
         (self.regs[reg::PHY_CONTROL as usize] & 31) as u8
     }
 
-    fn deadline(&self) -> Option<Instant> {
+    fn deadline(&self) -> Option<u64> {
         self.deadline
     }
 
@@ -208,7 +188,7 @@ impl MiiPhy for Dp83843 {
         self.data_path() && self.loopback_selected()
     }
 
-    fn sync(&mut self, now: Instant) {
+    fn sync(&mut self, now: u64) {
         if self.deadline.is_some_and(|d| now >= d) {
             let before = self.status();
             if let Some(end) = self.complete.take() {
@@ -226,7 +206,7 @@ impl MiiPhy for Dp83843 {
         }
     }
 
-    fn read(&mut self, r: u8, now: Instant) -> u16 {
+    fn read(&mut self, r: u8, now: u64) -> u16 {
         self.sync(now);
         let v = match r {
             reg::BASIC_CONTROL => self.regs[reg::BASIC_CONTROL as usize],
@@ -303,7 +283,7 @@ impl MiiPhy for Dp83843 {
         v
     }
 
-    fn write(&mut self, r: u8, val: u16, now: Instant) {
+    fn write(&mut self, r: u8, val: u16, now: u64) {
         self.sync(now);
         let before = self.status();
         match r {
@@ -401,14 +381,14 @@ impl MiiPhy for Dp83843 {
         }
     }
 
-    fn set_backend_link(&mut self, up: bool, now: Instant) {
+    fn set_backend_link(&mut self, up: bool, now: u64) {
         self.sync(now);
         let before = self.status();
         self.backend_up = up;
         self.event(before);
     }
 
-    fn save_state(&self, now: Instant) -> toml::Value {
+    fn save_state(&self) -> toml::Value {
         StateTable::new()
             .u8("configured_addr", self.configured_addr)
             .u16s("regs", &self.regs)
@@ -417,15 +397,15 @@ impl MiiPhy for Dp83843 {
             .bool("forced", self.forced)
             .u8("resolved", self.resolved)
             .bool("armed", self.armed)
-            .u64("deadline", Self::instant_left(self.deadline, now))
-            .u64("complete", Self::instant_left(self.complete, now))
+            .u64("deadline_at", self.deadline.map_or(0, |d| d + 1))
+            .u64("complete_at", self.complete.map_or(0, |d| d + 1))
             .bool("pending", self.pending)
             .bool("restarting", self.restarting)
             .u32("unimplemented_accesses", self.unimplemented_accesses)
             .build()
     }
 
-    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String> {
+    fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
         let items = field(v, "regs")?.as_array().ok_or("regs: not a list")?;
         if items.len() != 32 {
             return Err(format!("regs: {} entries, expected 32", items.len()));
@@ -442,15 +422,15 @@ impl MiiPhy for Dp83843 {
             forced: field_bool(v, "forced")?,
             resolved: field_u8(v, "resolved")?,
             armed: field_bool(v, "armed")?,
-            deadline: Self::instant_from(field_u64(v, "deadline")?, now),
-            complete: Self::instant_from(field_u64(v, "complete")?, now),
+            deadline: field_u64(v, "deadline_at")?.checked_sub(1),
+            complete: field_u64(v, "complete_at")?.checked_sub(1),
             pending: field_bool(v, "pending")?,
             restarting: field_bool(v, "restarting")?,
             unimplemented_accesses: field_u32(v, "unimplemented_accesses")?,
         };
         Ok(())
     }
-    fn power_on(&mut self) {
+    fn power_on(&mut self, _now: u64) {
         Dp83843::reset(self);
     }
 }
@@ -463,26 +443,26 @@ mod tests {
     /// The guest observes link and negotiation changes through MII status registers.
     #[test]
     fn the_phy_restarts_negotiation_and_resets_the_link() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83843::new(1);
         assert_eq!(p.read(reg::BASIC_STATUS, now) & 0x24, 0);
         assert!(!p.wire_enabled());
-        assert_eq!(p.read(reg::BASIC_STATUS, now + Duration::from_secs(2)) & 0x24, 0x24);
-        p.write(reg::BASIC_CONTROL, 0x3300, now + Duration::from_secs(3));
+        assert_eq!(p.read(reg::BASIC_STATUS, now + 2_000_000_000) & 0x24, 0x24);
+        p.write(reg::BASIC_CONTROL, 0x3300, now + 3_000_000_000);
         for (millis, restart, link) in [(4499, true, false), (4500, false, false), (6500, false, true)] {
-            let at = now + Duration::from_millis(millis);
+            let at = now + millis * 1_000_000;
             assert_eq!(p.read(reg::BASIC_CONTROL, at) & 0x200 != 0, restart);
             assert_eq!(p.read(reg::BASIC_STATUS, at) & 4 != 0, link);
             assert_eq!(p.wire_enabled(), link);
         }
-        let at = now + Duration::from_secs(7);
+        let at = now + 7_000_000_000;
         p.set_backend_link(false, at);
         p.write(reg::PHY_CONTROL, 7, at);
         p.write(reg::BASIC_CONTROL, 0x8000, at);
         assert_eq!(p.address(), 1);
         assert_eq!(p.read(reg::BASIC_STATUS, at) & 4, 0);
-        assert_eq!(p.read(reg::BASIC_STATUS, at + Duration::from_secs(2)) & 4, 0);
-        p.set_backend_link(true, at + Duration::from_secs(2));
+        assert_eq!(p.read(reg::BASIC_STATUS, at + 2_000_000_000) & 4, 0);
+        p.set_backend_link(true, at + 2_000_000_000);
         assert!(p.wire_enabled());
     }
 
@@ -490,7 +470,7 @@ mod tests {
     /// writes it back; the read-only toggle bit must survive every write.
     #[test]
     fn the_next_page_register_keeps_its_toggle_bit_and_resets_to_0x2001() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83843::new(1);
         assert_eq!(p.read(reg::NEXT_PAGE_TRANSMIT, now), 0x2001);
         for bit in 0..16 {
@@ -509,7 +489,7 @@ mod tests {
     /// power-on and after a BMCR reset.
     #[test]
     fn the_phy_reads_the_probe_values_the_prom_expects_before_and_after_reset() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83843::new(1);
         for round in 0..2 {
             assert_eq!(p.read(reg::BASIC_STATUS, now) & 0x7849, 0x7849, "round {round}");
@@ -527,7 +507,7 @@ mod tests {
     /// MAC consults, and leaving it must drop the stale bypass bits.
     #[test]
     fn bmcr_loopback_selects_the_loopback_register_and_clears_the_bypass_bits() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83843::new(1);
         p.write(reg::LOOPBACK, 0x0180, now);
         p.write(reg::BASIC_CONTROL, 0x7300, now);
@@ -546,7 +526,7 @@ mod tests {
     /// since the previous read, not a running total.
     #[test]
     fn the_error_counters_clear_when_read() {
-        let now = Instant::now();
+        let now = 0;
         let mut p = Dp83843::new(1);
         for r in [reg::DISCONNECT_COUNTER, reg::FALSE_CARRIER_COUNTER, reg::RECEIVE_ERROR_COUNTER] {
             p.write(r, 0xbeef, now);
@@ -559,8 +539,8 @@ mod tests {
     /// interval from the second write, not a shortened one from the first.
     #[test]
     fn a_second_restart_request_rearms_the_break_interval() {
-        let now = Instant::now();
-        let ms = |m: u64| now + Duration::from_millis(m);
+        let now = 0;
+        let ms = |m: u64| now + m * 1_000_000;
         let mut p = Dp83843::new(1);
         p.write(reg::BASIC_CONTROL, 0x3200, ms(0));
         p.write(reg::BASIC_CONTROL, 0x3200, ms(750));
@@ -571,17 +551,17 @@ mod tests {
     }
 
     /// A snapshot keeps the registers, the negotiation in progress and its
-    /// time left.
+    /// deadlines.
     #[test]
     fn a_snapshot_round_trips_a_negotiation_in_progress() {
-        let now = Instant::now();
+        let now = 0;
         let mut src = Dp83843::new(1);
         src.write(reg::BASIC_CONTROL, 0x3300, now);
-        let v = src.save_state(now);
+        let v = src.save_state();
         let mut dst = Dp83843::new(1);
-        dst.load_state(&v, now).unwrap();
-        assert_eq!(v, dst.save_state(now));
+        dst.load_state(&v).unwrap();
+        assert_eq!(v, dst.save_state());
         assert_eq!(src.deadline(), dst.deadline());
-        assert!(dst.load_state(&toml::Value::Table(Default::default()), now).is_err());
+        assert!(dst.load_state(&toml::Value::Table(Default::default())).is_err());
     }
 }

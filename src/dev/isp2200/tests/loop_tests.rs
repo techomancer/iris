@@ -20,7 +20,7 @@ impl Rig {
     /// Move the adapter's clock on and let the ring thread see it.
     pub(super) fn step(&self, ns: i64) {
         self.now.set(self.now.get() + ns);
-        self.isp.set_test_clock(self.now.get());
+        super::set_test_clock(&self.isp, self.now.get());
         self.settle();
     }
 

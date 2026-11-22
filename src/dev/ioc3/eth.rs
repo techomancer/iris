@@ -32,7 +32,7 @@
 //!   with no modelled minimum arrival latency.
 //! - A non-zero receive timer reload is stored but not timed; only the
 //!   "interrupt immediately" setting every public driver uses is modelled.
-//! - The PHY's 100 ms negotiation delay is wall-clock time and the synthetic
+//! - The PHY's 100 ms negotiation delay is machine time and the synthetic
 //!   peer never faults.
 //! - Quick Poll status (PHY register 0x11) reports live state without the
 //!   per-bit latches the datasheet describes.
@@ -47,13 +47,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::Core;
 use crate::dev::dp83840::Dp83840;
 use crate::dev::dp83843::Dp83843;
 use crate::dev::ics1890::Ics1890;
 use crate::dev::mii::MiiPhy;
+use crate::hptimer::{Timer, TimerManager};
 use crate::irq::{IrqGuard, IrqLevel, IrqMutex};
 use crate::pci::{PciDma, PciDmaStatus};
 use crate::snapshot::{field, field_bool, field_u16, field_u32, field_u32s, field_u64, StateTable};
@@ -335,8 +336,8 @@ impl State {
         }
     }
 
-    fn power_on(&mut self) {
-        self.phy.power_on();
+    fn power_on(&mut self, now: u64) {
+        self.phy.power_on(now);
         self.regs = [0; NREGS];
         self.int_deferred = 0;
         self.mii_data = MII_ABSENT;
@@ -603,7 +604,7 @@ impl State {
         self.raise_int(raised);
     }
 
-    fn read(&mut self, off: u32, now: Instant) -> u32 {
+    fn read(&mut self, off: u32, now: u64) -> u32 {
         self.phy.sync(now);
         match off {
             // Reading the counters clears them.
@@ -616,7 +617,7 @@ impl State {
 
     /// Apply a register write. Returns whether the pin must take a fall and
     /// a rise: the caller does it through the guard (`IrqGuard::retrigger`).
-    fn write(&mut self, off: u32, val: u32, now: Instant, dma: &dyn PciDma, wire: &mut Vec<Vec<u8>>, wake_rx: &mut bool) -> bool {
+    fn write(&mut self, off: u32, val: u32, now: u64, dma: &dyn PciDma, wire: &mut Vec<Vec<u8>>, wake_rx: &mut bool) -> bool {
         let mut reedge = false;
         self.phy.sync(now);
         match off {
@@ -736,21 +737,19 @@ pub struct Ioc3Eth {
     me: Weak<Self>,
     /// The status bar's activity bits, shared with the display thread.
     heartbeat: OnceLock<Arc<AtomicU64>>,
+    /// The PHY's one deadline.
+    timer: Timer,
 }
-
-/// How long the receive thread sleeps with no negotiation to wait for: it is
-/// woken by the guest and the NAT engine, so this is only a bound.
-const RX_IDLE: Duration = Duration::from_secs(60);
 
 impl Ioc3Eth {
     /// The MAC a board has behind `phy`. `mac` is the station address the
     /// board's one-wire chip carries; the guest programs the receive filter
     /// itself, and this is kept for the integrator (`mac()`).
-    pub(super) fn new(core: Arc<Core>, mac: [u8; 6], phy: Phy) -> Arc<Self> {
-        Self::with_phy(core, mac, phy.build())
+    pub(super) fn new(core: Arc<Core>, mac: [u8; 6], phy: Phy, tm: &Arc<TimerManager>) -> Arc<Self> {
+        Self::with_phy(core, mac, phy.build(), tm)
     }
 
-    fn with_phy(core: Arc<Core>, mac: [u8; 6], phy: Box<dyn MiiPhy>) -> Arc<Self> {
+    fn with_phy(core: Arc<Core>, mac: [u8; 6], phy: Box<dyn MiiPhy>, tm: &Arc<TimerManager>) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             mac,
             core,
@@ -762,6 +761,7 @@ impl Ioc3Eth {
             threads: Mutex::new(Vec::new()),
             me: me.clone(),
             heartbeat: OnceLock::new(),
+            timer: Timer::new(tm, me, Self::fire),
         })
     }
 
@@ -783,8 +783,29 @@ impl Ioc3Eth {
     /// A machine reset: the MAC's registers and the PHY as at power-on,
     /// the interrupt dropped. The network link stays.
     pub fn reset(&self) {
-        self.lock().power_on();
+        self.with(|st, now| st.power_on(now));
         self.wake_rx();
+    }
+
+    /// Run `f` on the state at the machine time, then time the PHY's
+    /// deadline and wake the receive thread if it moved.
+    fn with<R>(&self, f: impl FnOnce(&mut IrqGuard<'_, State>, u64) -> R) -> R {
+        let mut st = self.lock();
+        let before = st.phy.deadline();
+        let r = f(&mut st, self.timer.now());
+        let after = st.phy.deadline();
+        self.timer.set_due(after);
+        let moved = after != before;
+        drop(st);
+        if moved {
+            self.wake_rx();
+        }
+        r
+    }
+
+    /// The PHY's deadline passed: update its link and let a held frame in.
+    fn fire(&self, _due: u64) {
+        self.with(|st, now| st.phy.sync(now));
     }
 
     /// The MAC's state, whose guard drives the PCI pin before it lets go.
@@ -841,18 +862,11 @@ impl Ioc3Eth {
     }
 
     /// Take frames into guest memory as they arrive and as the guest makes
-    /// room, until the device stops. The wait ends early for a wake from the
-    /// guest or the NAT engine, or for the PHY's negotiation deadline.
+    /// room, until the device stops: the guest, the NAT engine and the PHY's
+    /// deadline timer wake it.
     fn rx_loop(me: Weak<Self>, running: Arc<AtomicBool>, wake: Arc<crate::net::Wake>) {
         while running.load(Ordering::SeqCst) {
-            let timeout = {
-                let Some(this) = me.upgrade() else { return };
-                let now = Instant::now();
-                let mut st = this.lock();
-                st.phy.sync(now);
-                st.phy.deadline().and_then(|d| d.checked_duration_since(now)).unwrap_or(RX_IDLE)
-            };
-            wake.wait(timeout);
+            wake.wait(Duration::MAX);
             if !running.load(Ordering::SeqCst) {
                 return;
             }
@@ -875,7 +889,7 @@ impl Ioc3Eth {
 
     /// The packet backend's cable state; the PHY reports it as link status.
     pub fn set_backend_link(&self, up: bool) {
-        self.lock().phy.set_backend_link(up, Instant::now());
+        self.with(|st, now| st.phy.set_backend_link(up, now));
         self.wake_rx();
     }
 
@@ -901,12 +915,8 @@ impl Ioc3Eth {
             let frame = {
                 let mut link = self.link.lock();
                 let Some(link) = link.as_mut() else { break };
-                {
-                    let mut st = self.lock();
-                    st.phy.sync(Instant::now());
-                    if !st.rx_ready() {
-                        break;
-                    }
+                if !self.lock().rx_ready() {
+                    break;
                 }
                 let Ok(frame) = link.from_net.pop() else { break };
                 frame
@@ -943,6 +953,7 @@ impl Device for Ioc3Eth {
             .spawn(move || Self::rx_loop(me, running, wake))
             .expect("ioc3 eth rx thread");
         self.threads.lock().push(rx);
+        self.timer.start();
         // Frames queued while stopped.
         self.wake_rx();
     }
@@ -953,6 +964,7 @@ impl Device for Ioc3Eth {
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
+        self.timer.stop();
         self.wake_rx();
         self.session.lock().stop();
         // The receive thread can hold the last reference for a moment, and
@@ -992,7 +1004,7 @@ impl Ioc3Eth {
     /// Replace the Octane's transceiver with one whose negotiation ends at
     /// once, for tests of a whole machine.
     pub(crate) fn negotiate_at_once(&self) {
-        self.lock().phy = Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO));
+        self.with(|st, _| st.phy = Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO)));
     }
 }
 
@@ -1002,7 +1014,7 @@ impl Ioc3Eth {
         if !(MAC_CONTROL..=MII_DATA_W).contains(&off) || off & 3 != 0 {
             return 0;
         }
-        self.lock().read(off, Instant::now())
+        self.with(|st, now| st.read(off, now))
     }
 
     /// A 32-bit write of the MAC register at `off`.
@@ -1013,15 +1025,11 @@ impl Ioc3Eth {
         let dma = self.dma();
         let mut wire = Vec::new();
         let mut wake = false;
-        {
-            let mut st = self.lock();
-            let before = st.phy.deadline();
-            if st.write(off, val, Instant::now(), &*dma, &mut wire, &mut wake) {
+        self.with(|st, now| {
+            if st.write(off, val, now, &*dma, &mut wire, &mut wake) {
                 st.retrigger();
             }
-            // A negotiation started or ended: the receive thread's wait moves.
-            wake |= st.phy.deadline() != before;
-        }
+        });
         self.send(wire);
         if wake {
             self.wake_rx();
@@ -1048,7 +1056,7 @@ impl Saveable for Ioc3Eth {
             .u16("mii_data", st.mii_data)
             .u16("mii_data_w", st.mii_data_w)
             .bool("rx_timer_armed", st.rx_timer_armed)
-            .value("phy", st.phy.save_state(Instant::now()))
+            .value("phy", st.phy.save_state())
             // Not state any more, but a build that still requires the key
             // loads this snapshot: write the level the pin is at.
             .bool("irq_asserted", st.irq_level())
@@ -1059,9 +1067,8 @@ impl Saveable for Ioc3Eth {
 
     /// Called with the block stopped.
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        {
-            let mut st = self.lock();
-            st.phy.load_state(field(v, "phy")?, Instant::now()).map_err(|e| format!("phy: {e}"))?;
+        self.with(|st, _| {
+            st.phy.load_state(field(v, "phy")?).map_err(|e| format!("phy: {e}"))?;
             st.regs = field_u32s(v, "regs")?;
             st.int_deferred = field_u32(v, "int_deferred")?;
             st.mii_data = field_u16(v, "mii_data")?;
@@ -1072,7 +1079,7 @@ impl Saveable for Ioc3Eth {
             // The pin is where the loaded registers put it, whatever it was
             // left at.
             st.forget();
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }

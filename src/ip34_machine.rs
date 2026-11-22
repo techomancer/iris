@@ -106,7 +106,7 @@ fn build_baseio(
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
     let (ioc3, serial) = attach_ioc3(timers, cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());
     let eth = ioc3.eth().expect("the Fuel's IOC3 has Ethernet").clone();
-    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus()));
+    let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus(), timers));
     scsi.set_heartbeat(heartbeat.clone());
     ioc3.set_heartbeat(heartbeat);
     pci.attach(DevFn { device: 1, function: 0 }, scsi.clone());

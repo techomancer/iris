@@ -10,7 +10,8 @@ use super::state::{reg, Refused, FW_MAGIC, SRAM_FW_MBOX};
 use super::*;
 use crate::irq::LevelProbe;
 use crate::pci::{PciDma, PciDmaStatus};
-use std::time::Duration;
+use crate::clock::Clock;
+use std::time::{Duration, Instant};
 
 const SRAM_WINDOW: u32 = 0x8000;
 const MISC_CFG_RESET: u32 = 1;
@@ -64,6 +65,9 @@ struct Rig {
     sent: rtrb::Consumer<Vec<u8>>,
     inject: rtrb::Producer<Vec<u8>>,
     ring_slots: usize,
+    clock: Clock,
+    /// The timers hold it weakly.
+    _tm: Arc<TimerManager>,
 }
 
 impl Rig {
@@ -72,8 +76,13 @@ impl Rig {
     }
 
     fn with(config: Bcm5701Config) -> Self {
-        let dev = Bcm5701::new(config).unwrap();
-        *dev.frozen.lock() = Some(Instant::now());
+        Self::on(config, Clock::stepped())
+    }
+
+    /// A rig whose chip runs on `clock`.
+    fn on(config: Bcm5701Config, clock: Clock) -> Self {
+        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+        let dev = Bcm5701::new(&tm, config).unwrap();
         let (irq, line) = LevelProbe::line();
         let mem = Arc::new(Mem(std::sync::Mutex::new(vec![0; MEM_SIZE])));
         dev.state().connect_irq(line);
@@ -83,15 +92,12 @@ impl Rig {
         dev.attach(link);
         dev.reset();
         let ring_slots = inject.slots();
-        Self { dev, irq, mem, sent, inject, ring_slots }
+        Self { dev, irq, mem, sent, inject, ring_slots, clock, _tm: tm }
     }
 
     /// Advance the clock and run whatever came due.
     fn step(&self, by: Duration) {
-        {
-            let mut t = self.dev.frozen.lock();
-            *t = Some(t.unwrap() + by);
-        }
+        self.clock.step(by.as_nanos() as u64);
         self.dev.enter(self.dev.now(), |_| ());
     }
 
@@ -868,7 +874,7 @@ fn eeprom_backings_are_validated() {
     assert!(Eeprom::from_image(3, vec![]).is_err());
     assert!(Eeprom::from_image(3, vec![0; 65540]).is_err());
     assert!(Eeprom::from_image(8, vec![0; 4]).unwrap_err().contains("0..=7"));
-    assert!(Bcm5701::new(Bcm5701Config::new([1, 0, 0, 0, 0, 0])).is_err());
+    assert!(Bcm5701::new(&Arc::new(TimerManager::new()), Bcm5701Config::new([1, 0, 0, 0, 0, 0])).is_err());
 }
 
 /// Direct serial-pin control is unsupported and observable, not faked.
@@ -2058,8 +2064,7 @@ fn a_reset_cancels_coalescing_timers_and_held_completions() {
 /// replace with explicit steps.
 #[test]
 fn the_receive_thread_delivers_and_publishes_on_its_own() {
-    let mut rig = Rig::new();
-    *rig.dev.frozen.lock() = None;
+    let mut rig = Rig::on(Bcm5701Config::new(MAC), Clock::new());
     let frame = broadcast(64, 3);
     rig.rx_open(RX_RING_LEN, 1, 0);
     Device::start(&*rig.dev);
@@ -2068,15 +2073,26 @@ fn the_receive_thread_delivers_and_publishes_on_its_own() {
     rig.inject.push(frame.clone()).unwrap();
     rig.dev.wake_rx();
     rig.rx_post_std(1);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while rig.status_rx_prod() != 1 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    crate::test_board::until(Duration::from_secs(5), || rig.status_rx_prod() == 1);
     Device::stop(&*rig.dev);
     assert!(!Device::is_running(&*rig.dev));
     assert_eq!(rig.status_rx_prod(), 1);
     assert_eq!(rig.mem_read(RX_BUF, 64), frame);
     assert!(rig.line_up());
+}
+
+/// A coalescing budget that runs out with the guest idle posts its update
+/// from the deadline timer: nothing touches the chip after the doorbell.
+#[test]
+fn a_coalescing_update_is_posted_with_no_access() {
+    let clock = Clock::new();
+    let rig = Rig::on(Bcm5701Config::new(MAC), clock);
+    Device::start(&*rig.dev);
+    rig.tx_open(64, 8, 50);
+    rig.tx_send_one(0, &broadcast(64, 3), 0);
+    crate::test_board::until(Duration::from_secs(5), || rig.status_tag() == 1);
+    Device::stop(&*rig.dev);
+    assert_eq!(rig.status_tag(), 1);
 }
 
 // ---- the rest of the plain-memory qtests ----
@@ -2631,7 +2647,8 @@ fn the_receive_checksum_report_covers_every_malformed_case() {
 fn a_restart_keeps_the_port_forwards() {
     use crate::traits::Device;
     let (_hold, port, config) = crate::net::Link::forward_on_a_held_port();
-    let dev = Bcm5701::new(Bcm5701Config::new(MAC)).unwrap();
+    let tm = Arc::new(TimerManager::new());
+    let dev = Bcm5701::new(&tm, Bcm5701Config::new(MAC)).unwrap();
     dev.attach(crate::net::Link::with_gateway(config).unwrap().unwrap());
     crate::net::Link::assert_restart_keeps_the_forward(port, &|| dev.start(), &|| dev.stop());
 }

@@ -36,6 +36,18 @@ fn save_and_load_round_trip() {
     loaded.tur(0x52);
 }
 
+/// A snapshot made while the loop is coming up, without the time it comes up at, is refused.
+#[test]
+fn a_bringup_without_its_deadline_is_refused() {
+    let r = Rig::with_disks("save-old", &[5]);
+    r.loop_up(ICB_OPT_PORT_DB_EVENTS, 0);
+    assert_eq!(r.call(mbox::INITIATE_LIP, 0, 0, 0), mbox::COMPLETE);
+    let mut saved = Saveable::save_state(&r.isp);
+    assert!(saved.as_table_mut().unwrap().remove("bringup_at_ns").is_some());
+    let loaded = Rig::with_disks("save-old-loaded", &[5]);
+    assert!(Saveable::load_state(&loaded.isp, &saved).is_err());
+}
+
 const BRINGUP_NS_FOR_TEST: i64 = BRINGUP.as_nanos() as i64;
 
 /// The controller took its own state from the snapshot, so the line is
