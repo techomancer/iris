@@ -112,6 +112,26 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
     if let Some(gdb) = cfg.gdb_port {
         ports.push(("gdb_port", gdb));
     }
+    // The listeners a board adds. Defaults match the machines' own.
+    let l1 = |p: Option<u16>| ("machine.l1_port", p.unwrap_or(8882));
+    match cfg.machine.profile {
+        MachineProfile::FuelIp34 => ports.push(l1(cfg.fuel.l1_port)),
+        MachineProfile::TezroIp53 => ports.extend([
+            l1(cfg.tezro.l1_port),
+            ("machine.serial_port_c", cfg.tezro.serial_port_c.unwrap_or(8883)),
+            ("machine.serial_port_d", cfg.tezro.serial_port_d.unwrap_or(8884)),
+        ]),
+        MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => ports.push(l1(cfg.ip35_section().l1_port)),
+        MachineProfile::O2Ip32 => ports.extend(cfg.o2.control_port.map(|p| ("machine.control_port", p))),
+        _ => {}
+    }
+    let virtio = &cfg.virtio_serial;
+    if virtio.enabled {
+        let default = [crate::dev::virtio::console::DEFAULT_TCP_PORT];
+        let tcp = virtio.ports.iter().filter_map(|p| p.tcp_port);
+        ports.extend(if virtio.ports.is_empty() { default.to_vec() } else { tcp.collect() }.into_iter().map(|p| ("virtio_serial tcp_port", p)));
+    }
+    ports.extend(cfg.port_forward.iter().filter(|f| f.proto == crate::config::ForwardProto::Tcp).map(|f| ("port_forward host_port", f.host_port)));
     let mut seen: BTreeMap<u16, &str> = BTreeMap::new();
     for (setting, port) in ports {
         if port == 0 {
@@ -234,6 +254,29 @@ mod tests {
         }
         assert_eq!(report("bad.toml", &cfg), 1);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A board's L1 port and a Tezro's extra serial ports are listeners too.
+    #[test]
+    fn the_board_ports_join_the_clash_check() {
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.clear();
+        cfg.machine.profile = MachineProfile::FuelIp34;
+        cfg.fuel.l1_port = Some(8880);
+        assert!(problems(&cfg).iter().any(|p| p == "machine.l1_port and serial_port_a both use port 8880"), "{:?}", problems(&cfg));
+        cfg.machine.profile = MachineProfile::TezroIp53;
+        cfg.tezro.l1_port = None;
+        cfg.tezro.serial_port_c = Some(8881);
+        assert!(problems(&cfg).iter().any(|p| p == "machine.serial_port_c and serial_port_b both use port 8881"), "{:?}", problems(&cfg));
+        cfg.tezro.serial_port_c = None;
+        assert!(!problems(&cfg).iter().any(|p| p.contains("both use port")), "{:?}", problems(&cfg));
+        cfg.machine.profile = MachineProfile::O2Ip32;
+        cfg.o2.control_port = Some(8888);
+        assert!(problems(&cfg).iter().any(|p| p == "machine.control_port and monitor_port both use port 8888"), "{:?}", problems(&cfg));
+        cfg.o2.control_port = None;
+        cfg.virtio_serial.enabled = true;
+        cfg.serial_port_a = Some(8890);
+        assert!(problems(&cfg).iter().any(|p| p == "virtio_serial tcp_port and serial_port_a both use port 8890"), "{:?}", problems(&cfg));
     }
 
     /// A `prom` the user names must be there, on every machine; "(embedded)" and the
