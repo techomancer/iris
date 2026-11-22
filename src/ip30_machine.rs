@@ -1096,9 +1096,7 @@ impl OctaneMachine {
     fn load_board(&self, v: &toml::Value) -> Result<(), String> {
         let load = |key: &str, dev: &dyn Saveable| dev.load_state(field(v, key)?).map_err(|e| format!("{key}: {e}"));
         // The machine is stopped, so the clock holds at the saved reading while the devices re-arm.
-        if crate::snapshot::get_field(v, "clock_ns").is_some() {
-            self.timer_manager.clock().restore(crate::snapshot::field_u64(v, "clock_ns")?);
-        }
+        self.timer_manager.clock().restore(crate::snapshot::field_u64(v, "clock_ns")?);
         load("ioc3", &*self.ioc3)?;
         load("eth", &*self.eth)?;
         load("scsi0", &*self.scsi[0])?;
@@ -1374,9 +1372,8 @@ impl OctaneMachine {
         self.cpus[0].load_state(&s.cpu).map_err(|e| format!("cpu: {e}"))?;
         self.flash.restore_contents(&s.flash)?;
         self.ram.restore_bank_words(&s.memory)?;
-        // The overlays first: an import can take minutes, and the devices
-        // count their deadlines from their load, so they load last, just
-        // before the machine starts.
+        // The overlays first: an import can take minutes, so the devices load last, just before
+        // the machine starts.
         for (i, ctl) in self.scsi.iter().enumerate() {
             if let Some(sets) = &s.overlays[i] {
                 ctl.bus().import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
@@ -2139,6 +2136,11 @@ mod snapshot_tests {
                 t["ioc3"]["chip"].as_table_mut().unwrap().remove("rtc");
             }
             assert_eq!(got, board);
+            // A snapshot from before the machine clock was saved is refused.
+            let mut old = a.read_snapshot(&dir.join("saves"), "bare").unwrap();
+            old.board.as_table_mut().unwrap().remove("clock_ns");
+            a.stop();
+            assert!(a.apply_snapshot(old).unwrap_err().contains("clock_ns"));
         }).unwrap().join().unwrap();
     }
 
