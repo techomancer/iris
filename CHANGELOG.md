@@ -17,6 +17,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - NetBSD/sgimips boots on an Indy with `--cpu r5000`; its kernel
   stopped with `panic: r5k picache line size 16` before reaching the installer.
+### InfiniteReality graphics
+
+- The InfiniteReality pipe's tile renderer no longer hangs when one of its
+  jobs is handed to a worker at the same moment that worker goes idle, which
+  happened in about 1 in 15 test runs on Apple Silicon (Onyx2, Origin 3200).
 
 ### Volume headers
 
@@ -526,6 +531,10 @@ image) where the guest test suites showed they differed:
   every CPU, interpreter and jitv2; the Octane PROM's `ide fpu` tests pass.
 - `TRUNC`, `ROUND`, `CEIL`, `FLOOR`, `CVT.W` and `CVT.L` set the Inexact
   cause and flag, and raise an enabled Inexact trap, when they drop a fraction.
+- FPU conversions follow the R4400, R5000 and R10000 rules (#71): an
+  unrepresentable result, a denormal or quiet-NaN source, and a long past the
+  part's range go to the kernel's FP emulator. `CVT.S.D` raises Inexact with
+  Overflow and flushes or traps an underflow by FCSR.FS. Interpreter and jitv2.
 
 ### Interpreter
 
@@ -606,6 +615,8 @@ image) where the guest test suites showed they differed:
 
 - The `developer` profile uses thin LTO, so a rebuild after an edit takes one
   to three minutes instead of about nine; measure performance with `--release`.
+- Distribution packagers can build iris and iris-gui without network access,
+  CHD support included: `cargo vendor`, then `LIBCHDMAN_FORCE_SOURCE=1` (issue 213).
 
 ### iris-gui
 

@@ -37,6 +37,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [decode-cache-index-must-survive-page-colouring.md](cpu/decode-cache-index-must-survive-page-colouring.md) | rule | Decode cache indexed by `pfn % 64` thrashed on the O2's coloured text pages; hash the page number. Also: O2 shadow model ran with an empty RAM bitmap in interpreter builds |
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [cvt-to-int-inexact-is-judged-against-the-source.md](cpu/cvt-to-int-inexact-is-judged-against-the-source.md) | rule | A float-to-integer conversion's Inexact is judged against the source, in both engines |
+| [fpu-conversions-hand-the-hard-cases-to-software.md](cpu/fpu-conversions-hand-the-hard-cases-to-software.md) | rule | Conversions take Unimplemented Operation for denormal/quiet-NaN sources, unrepresentable results and longs past the part's range; Invalid default is 2^31-1 whatever the sign; CVT.S.D overflow raises I too |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
 | [fused-load-store-passes-retry-through.md](cpu/fused-load-store-passes-retry-through.md) | rule | A fused ADDU/ADDIU+load/store must pass EXEC_RETRY through; raising it gave IP22+IMPACT a spurious ExcCode 0 PROM panic under `lightning` (#270) |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
@@ -353,6 +354,7 @@ The InfiniteReality (KONA) graphics pipe's host interface.
 |---|---|---|
 | [front-end.md](kona/front-end.md) | design | The Host Interface Processor: attach interface, the command queue on `GFifo`, which accesses wait, the job seam to a back end, approximations |
 | [token-census.md](kona/token-census.md) | measurement | The token families two recorded streams (the PROM to its graphics menu, IRIX to the 4Dwm desktop) send, how far a replay into `NullBackend` stays exact, and the selectors QEMU's decoder leaves unresolved |
+| [tile-scheduled-flag-needs-seqcst.md](kona/tile-scheduled-flag-needs-seqcst.md) | rule | The tile scheduler's `tail`/`scheduled` hand-off is a store-buffering pair: SeqCst on all four accesses, or a job is never run and `submit`/`drain` spin forever |
 
 ## hostgl/
 
@@ -527,6 +529,7 @@ Toolchain, dependency upgrades, platform build issues.
 | Note | Kind | Title |
 |---|---|---|
 | [chd-disks-need-features-chd-at-build-time.md](build/chd-disks-need-features-chd-at-build-time.md) | history | CHD disk images require `--features chd` at build time |
+| [libchdman-offline-needs-force-source.md](build/libchdman-offline-needs-force-source.md) | rule | libchdman-rs builds offline only with LIBCHDMAN_FORCE_SOURCE |
 | [dependency-upgrade-gotchas.md](build/dependency-upgrade-gotchas.md) | howto | Dependency upgrade gotchas (2026-08 sweep) |
 | [mmap-rs-fixed-address-aliasing.md](build/mmap-rs-fixed-address-aliasing.md) | design | Host memory aliasing: what mmap-rs actually supports (and where it doesn't) |
 
@@ -541,6 +544,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
 | [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
+| [kona-tile-handoff-race.md](plans/kona-tile-handoff-race.md) | open | KONA tile scheduler strands a job when a tile changes hands (tail store `Release` / load `Acquire` in a store-then-load hand-over): `a_tiled_run_is_bit_exact_with_the_inline_one` hangs on Apple silicon and is ignored; stuck-state dump, cause, candidate two-line `SeqCst` fix with measurements |
 | [iris-daynaport-target.md](plans/iris-daynaport-target.md) | plan | Task: add a DaynaPort SCSI/Link target to the IRIS emulator |
 | [origin-octane-o2-landing-review.md](plans/origin-octane-o2-landing-review.md) | plan | Review of James Braid's SGI series (547 commits to 2026-11-11, two passes): Origin/Onyx2 two-node, Octane, O2, Fuel/Tezro (IP35), InfiniteReality (KONA); cache-as-RAM, DMA and interrupt paths per machine; ranked findings with status (KONA texture-bind race, Origin node-1 code never JIT-compiled, cross-node IRQs land on node 0, byte-wise DMA on Origin/IP35, BCM5701 lost coalescing wake) |
 | [irix7-fork-review.md](plans/irix7-fork-review.md) | plan | The `irix7/iris` fork — change inventory and triage |
