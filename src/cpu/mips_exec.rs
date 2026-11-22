@@ -2635,8 +2635,8 @@ macro_rules! step_preamble {
 
         // For the trace: IP7 pending and not deliverable here.
         crate::pf_level!(
-            crate::perfetto::events::IP7_HELD_LEVEL,
-            crate::perfetto::events::IP7_HELD,
+            crate::perfetto::events::IP7_HELD_LEVEL[$self.core.cpu_id as usize % crate::perfetto::events::IP7_CPUS],
+            crate::perfetto::events::IP7_HELD[$self.core.cpu_id as usize % crate::perfetto::events::IP7_CPUS],
             pending as u32 & crate::cpu::mips_core::CAUSE_IP7 != 0
                 && !($self.core.interrupts_enabled() && $self.core.cp0_status & crate::cpu::mips_core::CAUSE_IP7 != 0),
             (($self.core.cp0_status as u64) << 32) | (pc & 0xffff_ffff)
@@ -3996,8 +3996,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // The clock interrupt's mask, for the trace (IE and IM7; see
         // events::IP7_MASKED).
         crate::pf_level!(
-            crate::perfetto::events::IP7_MASKED_LEVEL,
-            crate::perfetto::events::IP7_MASKED,
+            crate::perfetto::events::IP7_MASKED_LEVEL[self.core.cpu_id as usize % crate::perfetto::events::IP7_CPUS],
+            crate::perfetto::events::IP7_MASKED[self.core.cpu_id as usize % crate::perfetto::events::IP7_CPUS],
             self.core.cp0_status & crate::cpu::mips_core::STATUS_IE == 0 || self.core.cp0_status & (1 << (crate::cpu::mips_core::STATUS_IM_SHIFT + 7)) == 0
         );
         #[cfg(feature = "cache-ecc")]

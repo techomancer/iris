@@ -51,11 +51,31 @@ pub static IOC_LINES: [EventDef; 32] = [
     pin("IP6 (bus error)"), pin("unused 29"), pin("unused 30"), pin("unused 31"),
 ];
 
+/// Per-CPU tracks for the clock interrupt: one each for processors 0 to 7
+/// (`MipsCore::cpu_id`; a higher number shares track `id & 7`).
+pub const IP7_CPUS: usize = 8;
+macro_rules! per_cpu {
+    ($ctor:ident, $base:literal) => {
+        [
+            $ctor(concat!($base, " cpu 0")), $ctor(concat!($base, " cpu 1")), $ctor(concat!($base, " cpu 2")), $ctor(concat!($base, " cpu 3")),
+            $ctor(concat!($base, " cpu 4")), $ctor(concat!($base, " cpu 5")), $ctor(concat!($base, " cpu 6")), $ctor(concat!($base, " cpu 7")),
+        ]
+    };
+}
+const fn ip7_compare(track: &'static str) -> EventDef {
+    EventDef::new("IP7 (count/compare)", cat::IRQ | cat::TIMER).on_track(track).in_group(PIN_GROUP)
+}
+const fn ip7_masked(track: &'static str) -> EventDef {
+    EventDef::new("IP7 masked (Status)", cat::CPU | cat::IRQ).on_track(track).in_group(PIN_GROUP)
+}
+const fn ip7_held(track: &'static str) -> EventDef {
+    EventDef::new("IP7 pending, held", cat::CPU | cat::IRQ).on_track(track).in_group(PIN_GROUP).with_arg("status<<32|pc")
+}
+
 /// CP0 Count/Compare match, asserted by the timer thread, ended by the
 /// guest's Compare write.
-pub static IP7_COMPARE: EventDef =
-    EventDef::new("IP7 (count/compare)", cat::IRQ | cat::TIMER).on_track("IP7 (count/compare)").in_group(PIN_GROUP);
-pub static IP7_LEVEL: crate::PfLevel = crate::PfLevel::new();
+pub static IP7_COMPARE: [EventDef; IP7_CPUS] = per_cpu!(ip7_compare, "IP7 (count/compare)");
+pub static IP7_LEVEL: [crate::PfLevel; IP7_CPUS] = [const { crate::PfLevel::new() }; IP7_CPUS];
 
 /// The CPU took an interrupt exception (arg: Cause.IP & Status.IM >> 8).
 pub static INT_TAKEN: EventDef = EventDef::new("interrupt taken", cat::CPU | cat::IRQ).with_arg("ip");
@@ -64,14 +84,14 @@ pub static INT_TAKEN: EventDef = EventDef::new("interrupt taken", cat::CPU | cat
 /// (IRIX's spl levels; EXL and ERL, held only for an exception's entry, are
 /// left out to keep the edge rate down). A slice here while IP7 is raised is
 /// the guest's own hold-off of its clock tick.
-pub static IP7_MASKED: EventDef = EventDef::new("IP7 masked (Status)", cat::CPU | cat::IRQ).on_track("IP7 masked (Status)").in_group(PIN_GROUP);
-pub static IP7_MASKED_LEVEL: crate::PfLevel = crate::PfLevel::new();
+pub static IP7_MASKED: [EventDef; IP7_CPUS] = per_cpu!(ip7_masked, "IP7 masked (Status)");
+pub static IP7_MASKED_LEVEL: [crate::PfLevel; IP7_CPUS] = [const { crate::PfLevel::new() }; IP7_CPUS];
 /// IP7 is pending but the CPU cannot take it (interrupts disabled by IE,
 /// EXL or ERL, or IM7 clear), seen at the instruction boundaries where a
 /// pending interrupt is examined (arg at the rising edge: Status << 32 | the
 /// PC's low 32 bits).
-pub static IP7_HELD: EventDef = EventDef::new("IP7 pending, held", cat::CPU | cat::IRQ).on_track("IP7 pending, held").in_group(PIN_GROUP).with_arg("status<<32|pc");
-pub static IP7_HELD_LEVEL: crate::PfLevel = crate::PfLevel::new();
+pub static IP7_HELD: [EventDef; IP7_CPUS] = per_cpu!(ip7_held, "IP7 pending, held");
+pub static IP7_HELD_LEVEL: [crate::PfLevel; IP7_CPUS] = [const { crate::PfLevel::new() }; IP7_CPUS];
 
 const fn rt_tick(track: &'static str) -> EventDef {
     EventDef::new("rt tick", cat::IRQ | cat::TIMER).on_track(track).in_group(PIN_GROUP)
