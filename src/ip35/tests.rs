@@ -661,9 +661,8 @@ fn a_stop_and_start_keeps_a_flash_erase_in_flight() {
     let dir = TempPath::dir("fuel-flash-clock");
     with_machine(fuel_config(&dir), move |m| {
         // An erase takes 512 ms of machine time: age the machine past it first.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        // The running machine's batch hook keeps the flash's clock at the machine's.
-        m.nodes[0].flash.advance_to(m.get_timer_manager().clock().now());
+        let clock = m.get_timer_manager().clock().clone();
+        clock.restore(clock.now() + 600_000_000);
         let v = m.nodes[0].flash.boot_view();
         let unlock = || {
             assert_eq!(v.write64(8 * 0x555, 0xaa), BUS_OK);
@@ -675,8 +674,6 @@ fn a_stop_and_start_keeps_a_flash_erase_in_flight() {
         assert_eq!(v.write64(4 * 0x200, 0x30), BUS_OK);
         m.stop();
         m.restart_peripherals();
-        // What the first batch after the start does.
-        m.nodes[0].flash.advance_to(m.get_timer_manager().clock().now());
         assert_eq!(v.read16(0x200).data & 0x80, 0, "the erase is still in flight");
     });
 }

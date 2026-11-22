@@ -64,11 +64,10 @@ impl NodeBoard<Bedrock, Flash> {
     ) -> Result<Self, String> {
         let NodeSpec { name, firmware, board_id, processors, .. } = *spec;
         let records = disabled_positions_environment(spec.absent);
-        let flash = Arc::new(match &spec.flash {
-            Some(path) => Flash::with_file_seeded(payload, path, firmware, &records).map_err(|e| format!("machine.flash {}: {e}", path.display())),
-            None => Flash::seeded(payload, firmware, &records).map_err(|e| e.to_string()),
-        }?);
-        flash.use_clock(timers.clock().reader());
+        let flash = match &spec.flash {
+            Some(path) => Flash::with_file_seeded(payload, path, firmware, &records, timers).map_err(|e| format!("machine.flash {}: {e}", path.display())),
+            None => Flash::seeded(payload, firmware, &records, timers).map_err(|e| e.to_string()),
+        }?;
         let prom = Arc::new(flash.array_view(0, PART_SIZE).map_err(|e| e.to_string())?);
         // A bank 0 over the reset window keeps its RAM there for cached references;
         // otherwise the chip maps the PROM there.

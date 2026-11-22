@@ -18,7 +18,7 @@
 use super::regs::IIO_PROTECT_OVRRD_KEY;
 use crate::dev::pi_gfx::{PiGfx, PI_GFX_REGS};
 use super::Bedrock;
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::hptimer::{Timer, TimerManager};
 use parking_lot::Mutex;
 use std::sync::{Arc, Weak};
@@ -209,7 +209,7 @@ impl Pi {
             seen: AtomicU64::new(0),
             timer: Mutex::new(Comparators { rt_compare: [0; 2], profile_compare: 0, due: [0; 3] }),
             timers: [0, 1, 2].map(|kind| {
-                Timer::new(tm, chip, move |c: &Bedrock, due| c.pi[usize::from(interface)].expire(kind, due, (c.clock)(), &c.levels))
+                Timer::new(tm, chip, move |c: &Bedrock, due| c.pi[usize::from(interface)].expire(kind, due, c.clock.now(), &c.levels))
             }),
             running: AtomicBool::new(false),
             stored: std::array::from_fn(|i| {
@@ -361,7 +361,7 @@ impl Pi {
     /// The origin is read before the clock, so a store that moves it is never read against a stale clock.
     pub(super) fn count(&self, clock: &Clock) -> u64 {
         let origin = self.origin.load(Acquire);
-        let now = clock();
+        let now = clock.now();
         let now = self.seen.fetch_max(now, Relaxed).max(now);
         (now / TICK).wrapping_sub(origin) & RT_MASK
     }
@@ -559,7 +559,7 @@ impl Pi {
                 }
             }
             reg::RT_COMPARE_A::OFFSET | reg::RT_COMPARE_B::OFFSET | reg::PROFILE_COMPARE::OFFSET | reg::RT_COUNTER::OFFSET => {
-                let now = clock();
+                let now = clock.now();
                 let mut t = self.timer.lock();
                 // A match whose timer has not fired yet still happened before this store.
                 for kind in 0..3 {

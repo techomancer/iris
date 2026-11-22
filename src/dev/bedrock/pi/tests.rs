@@ -23,10 +23,13 @@ use std::time::Duration;
 #[test]
 fn the_rt_counter_never_reads_below_the_last_reading() {
     let rig = Rig::new();
-    let at = |ns: u64| rig.chip.pi[0].count(&(Arc::new(move || ns) as crate::dev::heart::Clock));
-    let first = at(10_000_000);
-    assert_eq!(at(9_998_400), first);
-    assert!(at(10_001_600) > first);
+    let clock = crate::clock::Clock::stepped();
+    clock.step(10_000_000);
+    let first = rig.chip.pi[0].count(&clock);
+    clock.restore(9_998_400);
+    assert_eq!(rig.chip.pi[0].count(&clock), first);
+    clock.restore(10_001_600);
+    assert!(rig.chip.pi[0].count(&clock) > first);
 }
 
 /// The clamp starts over when the guest writes the counter.
