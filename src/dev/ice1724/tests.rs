@@ -13,7 +13,8 @@
 //! card on a real bus to check that the bus agrees.
 
 use super::*;
-use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
+use crate::dev::host_pcm::test_time::{stepped, Stepped};
+use crate::dev::host_pcm::CardClock;
 use crate::dev::host_pcm::PcmOut;
 use crate::host_audio::test_signal::{detached, TestHost};
 use crate::irq::LevelProbe;
@@ -72,8 +73,8 @@ fn rig(variant: Variant) -> Rig {
 
 /// As [`rig`], with no way to memory: every transfer fails.
 fn bare(variant: Variant) -> Rig {
-    let c = Ice1724::with_clock(variant, TestTime::clock());
-    c.fake_ns().store(0, Ordering::Relaxed);
+    let c = Ice1724::new(&stepped(), variant);
+    c.set_ns(0);
     let (irq, line) = LevelProbe::line();
     c.state().connect_irq(line);
     c.attached();
@@ -137,7 +138,7 @@ fn mt_wl(c: &Ice1724, off: u32, v: u32) { c.bar_write(1, off, v, 4) }
 /// Let the fake clock run `ns` and bring the engines up to date, as the
 /// timer would.
 fn step(c: &Ice1724, ns: i64) {
-    c.fake_ns().fetch_add(ns, Ordering::Relaxed);
+    c.add_ns(ns);
     let _ = c.stats();
 }
 
@@ -219,7 +220,7 @@ fn config_identity() {
 
 #[test]
 fn config_writes_obey_the_masks() {
-    let c = Ice1724::with_clock(Variant::Dm8, TestTime::clock());
+    let c = Ice1724::new(&stepped(), Variant::Dm8);
     // BAR sizes: 32 and 128 bytes of I/O space.
     cfg_dw(&c, 4, 0xffff_ffff);
     cfg_dw(&c, 5, 0xffff_ffff);
@@ -1032,13 +1033,14 @@ fn on_time_ticks_hold_nothing_back() {
     fill_playback_buffer(&r);
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
-    let gen = r.state.lock().timer_gen;
+    r.armed.store(true, Ordering::SeqCst);
     let first = r.next_deadline(&r.state.lock(), 0).unwrap();
-    r.state.lock().timer_due = first;
+    r.state.lock().timer_due = Some(first);
     for _ in 0..100 {
-        let due = r.state.lock().timer_due;
-        r.fake_ns().store(due, Ordering::Relaxed);
-        assert!(matches!(r.timer_fire(gen), TimerReturn::RescheduleOneShot(_)));
+        let due = r.state.lock().timer_due.unwrap();
+        r.set_ns(due);
+        r.timer_fire(due as u64);
+        assert_ne!(r.state.lock().timer_due, Some(due), "the next tick is a later one");
     }
     assert_eq!(r.stalled_ns.load(Ordering::SeqCst), 0);
     // 100 flow ticks of 2 ms at 48 kHz.
@@ -1054,20 +1056,17 @@ fn a_held_up_timer_does_not_replay_the_gap() {
     fill_playback_buffer(&r);
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
-    let gen = {
-        let mut s = r.state.lock();
-        s.timer_due = FLOW_NS;
-        s.timer_gen
-    };
-    r.fake_ns().store(500_000_000, Ordering::Relaxed);
-    r.timer_fire(gen);
+    r.armed.store(true, Ordering::SeqCst);
+    r.state.lock().timer_due = Some(FLOW_NS);
+    r.set_ns(500_000_000);
+    r.timer_fire(FLOW_NS as u64);
     // 500 ms late, 200 ms taken back: 300 ms of audio, not 500.
     assert_eq!(r.stats().analog_frames, 300 * 48);
     assert_eq!(r.stalled_ns.load(Ordering::SeqCst), 200_000_000);
     // A tick on time wins a share back.
-    let due = r.state.lock().timer_due;
-    r.fake_ns().store(due + 1, Ordering::Relaxed);
-    r.timer_fire(gen);
+    let due = r.state.lock().timer_due.unwrap();
+    r.set_ns(due + 1);
+    r.timer_fire((due + r.stalled_ns.load(Ordering::SeqCst)) as u64);
     assert!(r.stalled_ns.load(Ordering::SeqCst) < 200_000_000);
 }
 
@@ -1335,8 +1334,8 @@ fn the_dm8_variant_has_no_ac97_codec() {
 
 #[test]
 fn a_line_connected_late_is_driven_to_the_present_level() {
-    let c = Ice1724::with_clock(Variant::Dm8, TestTime::clock());
-    c.fake_ns().store(0, Ordering::Relaxed);
+    let c = Ice1724::new(&stepped(), Variant::Dm8);
+    c.set_ns(0);
     map(&c);
     c.state().connect_dma(Arc::new(Ram(std::sync::Mutex::new(vec![0; 0x2000]))));
     program_playback(&c);
@@ -1399,8 +1398,8 @@ fn behind_a_bridge_the_io_window_reaches_the_bars_and_the_slot_carries_dma_and_i
     let bus = PciBus::new(0, &WIRING, up);
     let ppb = PciToPciBridge::with_wide_windows(&bus, at(2), 0x104c, 0xac28, 1);
     bus.attach(at(2), ppb.clone());
-    let card = Arc::new(Ice1724::with_clock(Variant::Dm8, TestTime::clock()));
-    card.fake_ns().store(0, Ordering::Relaxed);
+    let card = Arc::new(Ice1724::new(&stepped(), Variant::Dm8));
+    card.set_ns(0);
     ppb.secondary().attach(at(2), card.clone());
     assert_eq!(host.requesters.lock().unwrap().as_slice(), [2, 2], "the bridge's slot masters for both");
 
@@ -1487,7 +1486,7 @@ fn a_running_engine_resumes_where_it_was_saved() {
     // The restored card is built the machine's way: the clock is wherever
     // its own host is, and the saved age puts the anchor behind it.
     let b = rig(Variant::Dm8);
-    b.fake_ns().store(a.fake_ns().load(Ordering::Relaxed) + 7_000_000, Ordering::Relaxed);
+    b.set_ns(a.test_clock().now() as i64 + 7_000_000);
     b.ram.0.lock().unwrap().copy_from_slice(&a.ram.0.lock().unwrap());
     b.load_state(&saved).expect("load");
     assert_eq!(b.save_state(), saved, "a load and a save round-trip");
@@ -1517,7 +1516,7 @@ fn a_save_that_would_break_the_card_is_refused() {
     step(&a, 1_000_000);
     let good = a.save_state();
 
-    let ac97 = Ice1724::with_clock(Variant::Ac97, TestTime::clock());
+    let ac97 = Ice1724::new(&stepped(), Variant::Ac97);
     assert!(ac97.load_state(&good).unwrap_err().contains("other variant"));
 
     let mut bad = good.clone();
@@ -1648,8 +1647,8 @@ fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
     // The direct map reaches widget 10; device 2's attributes as observed.
     assert_eq!(bus.write64(0x80, 10 << 20), BUS_OK);
     assert_eq!(bus.write64(0x208, 0x1000_0002), BUS_OK);
-    let c = Ice1724::with_clock(Variant::Dm8, TestTime::clock());
-    c.fake_ns().store(0, Ordering::Relaxed);
+    let c = Ice1724::new(&stepped(), Variant::Dm8);
+    c.set_ns(0);
     let c = Arc::new(c);
     pic.attach(0, 2, c.clone(), Function::default());
     map(&c);
@@ -1693,12 +1692,11 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
     let Some(ear) = Listener::new(backend, "ice1724-underrun") else { return };
     const RATE: f64 = 48000.0;
     let (left, right) = (440.0, 880.0);
-    let c = Ice1724::with_clock(Variant::Dm8, TestTime::clock());
+    let c = Ice1724::new(&Arc::new(TimerManager::new()), Variant::Dm8);
     let ram = Arc::new(Ram(std::sync::Mutex::new(vec![0; 0x10_0000])));
     c.state().connect_dma(ram.clone());
     c.attached();
     map(&c);
-    c.set_timer_manager(Arc::new(TimerManager::new()));
     c.enable_output(ear.cfg.clone());
     Device::start(&c);
     // The frames the card hands the host, before the host stream converts

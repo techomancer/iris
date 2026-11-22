@@ -15,8 +15,10 @@ use parking_lot::Mutex;
 
 use iris_audio::MAX_CHANNELS;
 
+use crate::clock::Clock;
 use crate::dev::audio_dump::AudioDump;
 use crate::host_audio::Output;
+use crate::hptimer::TimerManager;
 
 /// Words a host frame carries: the mixer takes two channels.
 pub const PCM_CHANNELS: usize = 2;
@@ -291,19 +293,10 @@ impl PcmOut {
     }
 }
 
-/// A card's sample clock: host time less the time the machine was stopped
-/// and less the time held back after a late timer. Lock order: `tick_pass`,
-/// then `stopped_at` (a leaf, taken by `now`).
+/// A card's sample clock: the machine clock less the time held back after a
+/// late timer. Lock order: `tick_pass`, then the state lock.
 pub struct CardClock {
-    pub start: Instant,
-    /// In tests, the clock in nanoseconds once a test sets it; `i64::MIN`
-    /// follows the host.
-    pub(crate) fake_ns: AtomicI64,
-    /// Nanoseconds the clock stood still while the machine was stopped, and
-    /// when the current stop began: the sample clock and whatever is
-    /// scheduled from it do not run on while the guest cannot see them.
-    pub stopped_ns: AtomicI64,
-    pub stopped_at: Mutex<Option<Instant>>,
+    clock: Clock,
     /// Nanoseconds taken off the clock for timer hold-ups (see
     /// [`CardClock::absorb_stall`]), and the latest time it has handed out.
     pub stalled_ns: AtomicI64,
@@ -315,61 +308,35 @@ pub struct CardClock {
     pub armed: AtomicBool,
 }
 
-impl Default for CardClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CardClock {
-    pub fn new() -> Self {
+    pub fn new(clock: Clock) -> Self {
         Self {
-            start: Instant::now(),
-            fake_ns: AtomicI64::new(i64::MIN),
-            stopped_ns: AtomicI64::new(0),
+            clock,
             stalled_ns: AtomicI64::new(0),
             seen_ns: AtomicI64::new(i64::MIN),
-            stopped_at: Mutex::new(None),
             tick_pass: Mutex::new(()),
             armed: AtomicBool::new(false),
         }
     }
 
+    pub(crate) fn clock(&self) -> &Clock {
+        &self.clock
+    }
+
     pub fn now(&self) -> i64 {
-        let at = self.stopped_at.lock();
-        let t = self.clock_locked(&at);
+        let t = self.clock_ns();
         self.seen_ns.fetch_max(t, Ordering::SeqCst);
         t
     }
 
-    /// The card's clock, with `stopped_at` held; not recorded as seen.
-    pub fn clock_locked(&self, at: &Option<Instant>) -> i64 {
-        let at = at.unwrap_or_else(Instant::now);
-        let host = at.duration_since(self.start).as_nanos() as i64 - self.stopped_ns.load(Ordering::SeqCst);
-        let host = match self.fake_ns.load(Ordering::Relaxed) {
-            i64::MIN => host,
-            t => t,
-        };
-        host - self.stalled_ns.load(Ordering::SeqCst)
+    pub fn clock_ns(&self) -> i64 {
+        self.clock().now() as i64 - self.stalled_ns.load(Ordering::SeqCst)
     }
 
-    /// Whether time passes by itself, so timers may be armed.
-    pub fn runs_by_itself(&self) -> bool {
-        self.fake_ns.load(Ordering::Relaxed) == i64::MIN
-    }
-
-    /// Set the clock to read `now` with `stalled` held back, as a restored
-    /// card's clock does.
+    /// A restored card's clock has `stalled` held back, and nothing later
+    /// than `now` has been handed out; the machine restored the clock itself.
     pub fn restore(&self, now: i64, stalled: i64) {
         self.stalled_ns.store(stalled, Ordering::SeqCst);
-        if self.fake_ns.load(Ordering::Relaxed) != i64::MIN {
-            self.fake_ns.store(now + stalled, Ordering::Relaxed);
-            self.seen_ns.store(now, Ordering::SeqCst);
-            return;
-        }
-        let at = self.stopped_at.lock().unwrap_or_else(Instant::now);
-        let since_start = at.duration_since(self.start).as_nanos() as i64;
-        self.stopped_ns.store(since_start - now - stalled, Ordering::SeqCst);
         self.seen_ns.store(now, Ordering::SeqCst);
     }
 
@@ -391,8 +358,7 @@ impl CardClock {
     }
 
     fn held_clock(&self, due: i64, interval: i64, completes: bool) -> i64 {
-        let at = self.stopped_at.lock();
-        let t = self.clock_locked(&at);
+        let t = self.clock_ns();
         let held = self.stalled_ns.load(Ordering::SeqCst);
         let late = t - due;
         if completes && late > interval {
@@ -411,49 +377,30 @@ impl CardClock {
         self.seen_ns.fetch_max(t, Ordering::SeqCst);
         t
     }
-
-    /// Stop the clock where it is.
-    pub fn stop_clock(&self) {
-        let mut at = self.stopped_at.lock();
-        if at.is_none() {
-            *at = Some(Instant::now());
-        }
-    }
-
-    /// Run the clock again from where it stopped.
-    pub fn start_clock(&self) {
-        let mut at = self.stopped_at.lock();
-        if let Some(t) = at.take() {
-            self.stopped_ns.fetch_add(t.elapsed().as_nanos() as i64, Ordering::SeqCst);
-        }
-    }
-
-    pub fn stopped(&self) -> bool {
-        self.stopped_at.lock().is_some()
-    }
 }
 
-/// The test clock's value, to read and set by hand.
 #[cfg(test)]
 pub(crate) mod test_time {
     use super::*;
 
-    pub(crate) struct TestTime;
+    pub(crate) fn stepped() -> Arc<TimerManager> {
+        Arc::new(TimerManager::with_clock(Clock::stepped()))
+    }
 
-    impl TestTime {
-        /// A clock that follows the host until a test sets `fake_ns`.
-        pub(crate) fn clock() -> CardClock {
-            CardClock::new()
+    pub(crate) trait Stepped {
+        fn test_clock(&self) -> Clock;
+        fn set_ns(&self, ns: i64) {
+            let c = self.test_clock();
+            c.step((ns - c.now() as i64).max(0) as u64);
+        }
+        fn add_ns(&self, ns: i64) {
+            self.test_clock().step(ns as u64);
         }
     }
 
-    pub(crate) trait FakeNs {
-        fn fake_ns(&self) -> &AtomicI64;
-    }
-
-    impl FakeNs for CardClock {
-        fn fake_ns(&self) -> &AtomicI64 {
-            &self.fake_ns
+    impl Stepped for CardClock {
+        fn test_clock(&self) -> Clock {
+            self.clock().clone()
         }
     }
 }

@@ -82,7 +82,7 @@ use crate::dev::audio_dump::AudioDump;
 use crate::dev::host_pcm::{CardClock, Sink, PCM_CHANNELS};
 use crate::devlog::LogModule;
 use crate::host_audio::{Meter, Output, Skip};
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::hptimer::{Timer, TimerId, TimerManager, TimerReturn};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
 use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState};
@@ -347,9 +347,10 @@ struct State {
     status_cursor: u32,
     status_slots: u32,
     /// The recurring timer pumping the analog output while it runs with
-    /// host audio enabled, and the one-shot for the next status completion.
+    /// host audio enabled.
     audio_timer: Option<TimerId>,
-    status_timer: Option<TimerId>,
+    /// When `Inner::status` is due, in machine nanoseconds.
+    status_due: Option<u64>,
 }
 
 impl State {
@@ -380,7 +381,7 @@ impl State {
             status_cursor: 0,
             status_slots: 0,
             audio_timer: None,
-            status_timer: None,
+            status_due: None,
         }
     }
 
@@ -606,27 +607,16 @@ impl Deref for Rad1 {
     }
 }
 
-impl Default for Rad1 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Rad1 {
-    pub fn new() -> Self {
-        Self::with_clock(CardClock::new())
-    }
-
-    /// The card on a sample clock of the caller's.
-    pub(crate) fn with_clock(clock: CardClock) -> Self {
-        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), clock, RAD1_REVISION)) }
+    pub fn new(tm: &Arc<TimerManager>) -> Self {
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), tm, RAD1_REVISION)) }
     }
 
     /// The RAD1 on the Onyx2's MediaIO daughtercard. Its PCI revision byte
     /// differs from the Octane's, and 0x88 and 0x8c do not mute it; the rest
     /// of the model is the same.
-    pub fn mediaio() -> Self {
-        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), CardClock::new(), RAD1_REVISION_MEDIAIO)) }
+    pub fn mediaio(tm: &Arc<TimerManager>) -> Self {
+        Self { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), tm, RAD1_REVISION_MEDIAIO)) }
     }
 }
 
@@ -650,7 +640,9 @@ pub struct Inner {
     /// The sample clock, its stops and hold-ups, and the timer bookkeeping
     /// shared with other audio cards; reached through `Deref`.
     clock: CardClock,
-    timers: OnceLock<Arc<TimerManager>>,
+    timers: Arc<TimerManager>,
+    /// The next status completion, in machine nanoseconds.
+    status: Timer,
     /// `[audio]` settings once host output is enabled; `None` (tests,
     /// `no_audio`) keeps the output channel running silently.
     audio_cfg: Mutex<Option<AudioConfig>>,
@@ -685,7 +677,7 @@ impl Deref for Inner {
 }
 
 impl Inner {
-    fn new(me: Weak<Inner>, clock: CardClock, revision: u8) -> Self {
+    fn new(me: Weak<Inner>, tm: &Arc<TimerManager>, revision: u8) -> Self {
         let ust_free_running = revision == RAD1_REVISION_MEDIAIO;
         Self {
             pci: PciFunctionState::new(PciConfig::new(
@@ -697,8 +689,9 @@ impl Inner {
                 0,
             )),
             state: Mutex::new(State::new(0, ust_free_running)),
-            clock,
-            timers: OnceLock::new(),
+            clock: CardClock::new(tm.clock().clone()),
+            timers: tm.clone(),
+            status: Timer::new(tm, &me, |i: &Inner, due| i.status_timer_tick(due)),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
             meter: Meter::new(if ust_free_running { "RAD1 (MediaIO)" } else { "RAD1" }, &["analog in", "analog out"]),
@@ -728,13 +721,9 @@ impl Inner {
         self.arm_audio(&mut s);
     }
 
-    /// Whether timers may be armed: started, on a real clock, with a
-    /// manager.
+    /// Whether timers may be armed: started.
     fn timers_live(&self) -> Option<&Arc<TimerManager>> {
-        if !self.armed.load(Ordering::SeqCst) || !self.runs_by_itself() {
-            return None;
-        }
-        self.timers.get()
+        self.armed.load(Ordering::SeqCst).then_some(&self.timers)
     }
 
     /// Run the output pump exactly while the analog output channel runs with
@@ -754,9 +743,7 @@ impl Inner {
             }
             (false, Some(id)) => {
                 s.audio_timer = None;
-                if let Some(tm) = self.timers.get() {
-                    tm.remove(id);
-                }
+                self.timers.remove(id);
             }
             _ => {}
         }
@@ -766,7 +753,7 @@ impl Inner {
     /// produced, and end the timer when the channel has stopped.
     fn pump(&self) -> TimerReturn {
         let _pass = self.tick_pass.lock();
-        if self.stopped() {
+        if !self.armed.load(Ordering::SeqCst) {
             return TimerReturn::Continue;
         }
         // Status completions move the output while they run; a pump read
@@ -782,11 +769,6 @@ impl Inner {
             s.audio_timer = None;
             TimerReturn::Delete
         }
-    }
-
-    /// Give the card the machine's timers. Called before `Device::start`.
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timers.set(tm);
     }
 
     /// Open the output sink, once, when host output is enabled.
@@ -816,35 +798,33 @@ impl Inner {
         self.meter.skipped(idx, Skip::Dry, frames);
     }
 
-    /// Stop the card's clock and hold the timers off guest memory while the
-    /// machine is stopped. Once this returns no timer callback is under way.
+    /// Hold the timers off guest memory while the machine is stopped. Once
+    /// this returns no timer callback is under way.
     fn pause(&self) {
-        self.stop_clock();
         self.disarm();
+        self.status.stop();
         drop(self.tick_pass.lock());
     }
 
-    /// Run the clock again from where it stopped. The first start opens the
+    /// Bring the timers back. The first start opens the
     /// host stream (see [`Inner::enable_output`]).
     fn resume(&self) {
         self.open_sink();
-        self.start_clock();
         self.armed.store(true, Ordering::SeqCst);
         let mut s = self.state.lock();
         self.arm_audio(&mut s);
         if s.status_running {
             self.arm_status(&mut s);
         }
+        self.status.start();
     }
 
-    /// Remove both timers; they come back with [`Inner::resume`].
+    /// Remove the output pump; it comes back with [`Inner::resume`].
     fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
         let mut s = self.state.lock();
-        for id in [s.audio_timer.take(), s.status_timer.take()].into_iter().flatten() {
-            if let Some(tm) = self.timers.get() {
-                tm.remove(id);
-            }
+        if let Some(id) = s.audio_timer.take() {
+            self.timers.remove(id);
         }
     }
 
@@ -853,12 +833,10 @@ impl Inner {
         let now = self.now();
         let mut s = self.state.lock();
         let gen = s.status_gen + 1;
-        let (audio, status) = (s.audio_timer.take(), s.status_timer.take());
-        for id in [audio, status].into_iter().flatten() {
-            if let Some(tm) = self.timers.get() {
-                tm.remove(id);
-            }
+        if let Some(id) = s.audio_timer.take() {
+            self.timers.remove(id);
         }
+        self.status.cancel();
         *s = State::new(now, self.ust_free_running);
         s.status_gen = gen;
     }
@@ -1138,9 +1116,8 @@ impl Inner {
     }
 
     fn cancel_status(&self, s: &mut State) {
-        if let (Some(id), Some(tm)) = (s.status_timer.take(), self.timers.get()) {
-            tm.remove(id);
-        }
+        s.status_due = None;
+        self.status.cancel();
     }
 
     fn status_base(s: &State) -> u64 {
@@ -1181,37 +1158,37 @@ impl Inner {
         self.arm_status(s);
     }
 
-    /// Arm the one-shot for the next completion of the running schedule.
-    /// It reschedules itself from each completion, so one is pending at a
-    /// time; a replaced schedule's callback ends by its generation.
+    /// Arm the timer for the next completion of the running schedule. A
+    /// completion arms the one after, so one is pending at a time.
     fn arm_status(&self, s: &mut State) {
-        self.cancel_status(s);
-        let Some(tm) = self.timers_live() else { return };
-        let gen = s.status_gen;
-        let wait = Self::status_deadline(s, s.status_done + 1) - self.now();
-        let me = self.me.clone();
-        s.status_timer = Some(tm.add_one_shot(Duration::from_nanos(wait.max(0) as u64), (), move |_| {
-            let Some(i) = me.upgrade() else { return TimerReturn::Delete };
-            i.status_timer_tick(gen)
-        }));
+        // The timer counts machine time; the card's clock is that less the time held back.
+        let due = (Self::status_deadline(s, s.status_done + 1) + self.stalled_ns.load(Ordering::SeqCst)).max(0) as u64;
+        s.status_due = Some(due);
+        self.status.arm_at(due);
     }
 
-    /// The status timer fired: complete one slot and wait for the next.
-    fn status_timer_tick(&self, gen: u64) -> TimerReturn {
+    /// The status timer fired: complete one slot and arm the next. A fire for
+    /// a deadline the schedule has since replaced does nothing.
+    fn status_timer_tick(&self, due: u64) {
         let _pass = self.tick_pass.lock();
-        if self.stopped() {
-            return TimerReturn::Delete;
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
         }
-        match self.status_tick(gen) {
-            Some(next) => TimerReturn::RescheduleOneShot(self.wait_until(next)),
-            None => TimerReturn::Delete,
+        let gen = {
+            let s = self.state.lock();
+            if s.status_due != Some(due) {
+                return;
+            }
+            s.status_gen
+        };
+        if self.status_tick(gen).is_some() {
+            let mut s = self.state.lock();
+            if s.status_running && s.status_gen == gen {
+                // Read through the hold-up rule, as the wait for the next completion always was.
+                self.clock_now(&s);
+                self.arm_status(&mut s);
+            }
         }
-    }
-
-    /// The wait for a completion due at `next`, read through the hold-up rule.
-    fn wait_until(&self, next: i64) -> Duration {
-        let s = self.state.lock();
-        Duration::from_nanos((next - self.clock_now(&s)).max(0) as u64)
     }
 
     /// The clock for reads other than completions; see [`CardClock::look`].
@@ -1250,7 +1227,7 @@ impl Inner {
         if !slot.is_some_and(|slot| self.fill_slot(&mut s, slot, now)) {
             // Ring base unmapped: stop rather than spin on a failing DMA.
             s.status_running = false;
-            s.status_timer = None;
+            s.status_due = None;
             return None;
         }
         if s.status_slots != 0 {
@@ -1567,7 +1544,7 @@ impl Saveable for Rad1 {
             .flat_map(|l| l.map_or([0, 0, 0], |(c, r)| [1, u64::from(c), u64::from(r)]))
             .collect();
         StateTable::new()
-            .u64("clock_ns", now as u64)
+            .u64("clock_at_ns", now as u64)
             .u64("stalled_ns", i.stalled_ns.load(Ordering::SeqCst) as u64)
             .u32s("startup", &s.startup)
             .u64s("subcode", &s.subcode)
@@ -1608,7 +1585,7 @@ impl Saveable for Rad1 {
         if subcode.len() != SUBCODE_WORDS {
             return Err(format!("subcode: {} words, expected {SUBCODE_WORDS}", subcode.len()));
         }
-        let saved_now = field_u64(v, "clock_ns")? as i64;
+        let saved_now = field_u64(v, "clock_at_ns")? as i64;
         let saved_stalled = field_u64(v, "stalled_ns")? as i64;
         let out_cg = field_u64(v, "out_cg")? as usize;
         if out_cg >= NUM_CG {
@@ -1681,15 +1658,17 @@ impl Saveable for Rad1 {
             // The card is stopped: its timers were removed, and come back
             // when it starts.
             audio_timer: None,
-            status_timer: None,
+            status_due: None,
         };
         loaded.check()?;
         {
             let mut s = i.state.lock();
-            if s.audio_timer.is_some() || s.status_timer.is_some() {
+            if s.audio_timer.is_some() || i.armed.load(Ordering::SeqCst) {
                 return Err("RAD1 loaded while its timers run".into());
             }
             *s = loaded;
+            // Starting the card arms the schedule it loaded.
+            i.status.cancel();
         }
         // The clock reads `saved_now` again, with the same time held back
         // for timer hold-ups, which later on-time completions repay; and

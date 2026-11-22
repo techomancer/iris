@@ -167,13 +167,12 @@ pub(crate) const AUDIO_CARD_DEVICE: u8 = 2;
 /// The ICE1724 audio card as `[machine] audio_card` fits it, playing to the host as `[audio]`
 /// sets unless `no_audio`. The board attaches it to a bus.
 pub(crate) fn audio_card(cfg: &MachineConfig, timers: &Arc<TimerManager>) -> Arc<Ice1724> {
-    let card = Arc::new(Ice1724::new(Variant::Dm8));
+    let card = Arc::new(Ice1724::new(timers, Variant::Dm8));
     if cfg.no_audio {
         eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
     } else {
         card.enable_output(cfg.audio.clone());
     }
-    card.set_timer_manager(timers.clone());
     card
 }
 

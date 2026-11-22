@@ -1052,19 +1052,25 @@ mod tests {
         assert!((1590..=1600).contains(&frames), "200 ms at 8 kHz played, got {frames}");
     }
 
-    /// The whole way from guest memory to the host as the O2 runs it: an
-    /// output ring the guest keeps full, played by the machine's service
-    /// pass on the host's clock, into the host output `enable_output`
-    /// opens -- an `[audio] file`, so no sound card -- drained in real time.
-    /// The file holds the ring's two tones, each on its own side at full
-    /// level. The DAC mute bits silence what follows.
+    /// Detached host outputs for both DACs, and the host that hears the first. The service
+    /// pass and the host step a virtual clock 2 ms at a time.
+    fn detached_player(a: &MaceAudio) -> crate::host_audio::test_signal::TestHost {
+        use crate::host_audio::test_signal::detached;
+        let ((out0, host), (out1, _)) = (detached(48000, 2), detached(IDLE_RATE, 2));
+        let mut p = a.player.lock();
+        p.out = Some(vec![out0, out1]);
+        p.tried_open = true;
+        host
+    }
+
+    /// Guest memory to a detached host output through the service pass: the host hears the
+    /// ring's two tones, each on its own side, and the DAC mute bits silence what follows.
     #[test]
-    fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
+    fn a_tone_in_guest_memory_reaches_the_host_on_a_stepped_clock() {
         use crate::host_audio::test_signal::*;
         let ram = O2Memory::single(8 << 20);
         let a = MaceAudio::new();
-        let (cfg, path) = file_config("o2-tone");
-        a.enable_output(cfg);
+        let mut host = detached_player(&a);
         a.write(MACE_AUDIO, 0);
         write_codec(&a, 28, 0x0800); // clock 1 on, converters up
         write_codec(&a, 17, 48000);
@@ -1082,33 +1088,23 @@ mod tests {
         a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
         let io = AudioIo { ram: &ram, ring_base, ust: 0 };
         // The guest keeps the ring full and the service pass plays it.
-        let run = |ms: u64| {
-            let end = Instant::now() + std::time::Duration::from_millis(ms);
-            while Instant::now() < end {
+        let (t0, mut ms, mut pcm) = (Instant::now(), 0u64, Vec::new());
+        let mut run = |n: u64| {
+            for _ in 0..n / 2 {
                 let rptr = a.read(MACE_AUDIO + 0x48) as u32;
                 a.write(MACE_AUDIO + 0x50, u64::from(rptr.wrapping_sub(BLOCK) & PTR_MASK));
-                a.poll(&io);
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                a.poll_at(&io, t0 + std::time::Duration::from_millis(ms));
+                ms += 2;
+                pcm.extend(host.render(96));
             }
         };
-        let started = Instant::now();
         run(600);
         let loud = a.msc_ust(1) >> 32;
         write_codec(&a, 9, 0x8888); // both sides muted
         run(300);
-        let wall = started.elapsed().as_secs_f64();
+        let wall = 0.9;
         let moved = a.msc_ust(1) >> 32;
-        // A file thread held up by a busy host (a loaded CI runner) lets the
-        // queue pass its ceiling, and the stream skips ahead rather than
-        // play late. Those pairs reached the host and were let go on
-        // purpose.
-        let skipped: u64 = a.player.lock().out.iter().flatten().map(|o| { let s = o.stats(); s.overruns + s.dropped }).sum();
-        // Dropping the output completes the file.
-        *a.player.lock() = Player::default();
-        let (rate, channels, pcm) = read_wav(&path.0);
-        assert_eq!((rate, channels), (48000, 2));
-        // Half at least: a timer held up by a busy host holds the clock back.
-        assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} pairs in {wall:.3} s");
+        assert!(moved as f64 >= 0.99 * wall * 48000.0, "the clock ran: {moved} pairs in {wall:.3} s");
         let heard = sounding(&pcm, 2);
         let frames = (heard.len() / 2) as u64;
         // The rate converter's filter rings for a few frames at each end of
@@ -1116,8 +1112,7 @@ mod tests {
         // this test from refilling the ring in time.
         // The stream also follows the card's clock, by up to 0.5% slower.
         let most = loud + loud / 200 + 48 * bursts(&pcm, 2) as u64;
-        assert!(frames + skipped + 9600 >= loud && frames <= most,
-            "{frames} pairs heard of {loud} played before the mute ({skipped} skipped by the host stream)");
+        assert!(frames + 9600 >= loud && frames <= most, "{frames} pairs heard of {loud} played before the mute");
         assert_tones(&heard, 2, 48000, left, right, 15000);
     }
 
@@ -1170,18 +1165,27 @@ mod tests {
         assert_tones(heard, 2, rate, 440.0, 880.0, 15000);
     }
 
-    /// The O2 playing a tone, the guest stopping the output for 0.3 s so
-    /// the host stream runs dry, then starting it again. Both sides of the
-    /// gap must be the tone with each channel on its own side, as long as
-    /// the ring moved, and the gap must count as an underrun. The 512-pair
-    /// ring holds five and ten whole cycles, so the tones are 468.75 and
-    /// 937.5 Hz rather than 440 and 880.
-    fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
+    /// A tone, a 0.3 s stop that runs the host stream dry, then the tone again: both sides of
+    /// the gap are the tone and the gap counts an underrun. The ring holds whole cycles, so
+    /// 468.75 and 937.5 Hz. Real time on a real device, a virtual clock without one.
+    fn a_tone_survives_an_underrun(backend: Option<crate::host_audio::test_signal::Backend>) {
         use crate::host_audio::test_signal::*;
-        let Some(ear) = Listener::new(backend, "o2-underrun") else { return };
+        let ear = match backend {
+            Some(b) => match Listener::new(b, "o2-underrun") {
+                Some(ear) => Some(ear),
+                None => return,
+            },
+            None => None,
+        };
         let ram = O2Memory::single(8 << 20);
         let a = MaceAudio::new();
-        a.enable_output(ear.cfg.clone());
+        let mut host = match &ear {
+            Some(ear) => {
+                a.enable_output(ear.cfg.clone());
+                None
+            }
+            None => Some(detached_player(&a)),
+        };
         a.write(MACE_AUDIO, 0);
         write_codec(&a, 28, 0x0800);
         write_codec(&a, 17, 48000);
@@ -1197,13 +1201,26 @@ mod tests {
         let io = AudioIo { ram: &ram, ring_base, ust: 0 };
         // The guest keeps the ring full and the service pass plays it, on
         // or off.
-        let run = |ms: u64| {
+        let (t0, mut at, mut pcm) = (Instant::now(), 0u64, Vec::new());
+        let mut run = |ms: u64| {
             let end = Instant::now() + std::time::Duration::from_millis(ms);
-            while Instant::now() < end {
+            for _ in 0..ms / 2 {
+                if host.is_none() && Instant::now() >= end {
+                    break;
+                }
                 let rptr = a.read(MACE_AUDIO + 0x48) as u32;
                 a.write(MACE_AUDIO + 0x50, u64::from(rptr.wrapping_sub(BLOCK) & PTR_MASK));
-                a.poll(&io);
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                match &mut host {
+                    Some(h) => {
+                        a.poll_at(&io, t0 + std::time::Duration::from_millis(at));
+                        at += 2;
+                        pcm.extend(h.render(96));
+                    }
+                    None => {
+                        a.poll(&io);
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
             }
         };
         let frames = || (a.msc_ust(1) >> 32) as f64;
@@ -1219,19 +1236,25 @@ mod tests {
         let second = frames() - paused;
         // What the host still holds plays out.
         run(300);
-        *a.player.lock() = Player::default();
-        let heard = ear.heard();
+        let heard = match ear {
+            Some(ear) => {
+                *a.player.lock() = Player::default();
+                ear.heard()
+            }
+            None => Heard { rate: 48000, channels: 2, pcm },
+        };
         assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 48000.0, second / 48000.0]);
         assert!(underran > 0, "the host stream ran dry while the output was stopped");
     }
 
+    /// The same, stepped on a virtual clock: nothing here waits on the host's.
     #[test]
-    fn a_tone_survives_an_underrun_into_a_file() {
-        a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
+    fn a_tone_survives_an_underrun_on_a_stepped_host() {
+        a_tone_survives_an_underrun(None);
     }
 
     #[test]
     fn a_tone_survives_an_underrun_on_the_real_device() {
-        a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+        a_tone_survives_an_underrun(Some(crate::host_audio::test_signal::Backend::RealDevice));
     }
 }
