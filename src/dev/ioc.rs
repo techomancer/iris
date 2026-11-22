@@ -679,7 +679,7 @@ impl Ioc {
             state,
             scc,
             pit: Pit8254::new(1_000_000, Some(timer0_cb), Some(timer1_cb), None),
-            ps2: Arc::new(Ps2Controller::new(Some(ps2_irq))),
+            ps2: Arc::new(Ps2Controller::new_8042(Some(ps2_irq))),
             guinness,
             event_tx: Arc::new(std::sync::OnceLock::new()),
             heartbeat: Arc::new(std::sync::OnceLock::new()),

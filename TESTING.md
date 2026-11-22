@@ -115,6 +115,17 @@ recordings of a failing case (`vpro rec`) replay on both raster units offline:
 unit and the GPU unit with live-style slice ends, and compares what the board
 wrote to guest memory and its final memory.
 
+**Other guest systems** — `tools/tests/netbsd-indy-keyboard.py` boots the
+NetBSD/sgimips install CD on an R4400 Indy with the Newport console, presses
+keys at sysinst's first menu, and follows the console's text cursor in
+screenshots. Down, Down and Up must move the menu's highlight by one row each,
+and the letter `a` must change the screen once and then leave it still, with no
+key repeating. It takes about five minutes, needs the CD image (which is not in
+the repository), and attaches it through a copy-on-write overlay.
+
+```sh
+cargo build --release --bin iris --bin iris-ci
+tools/tests/netbsd-indy-keyboard.py --iso NetBSD-11.1-sgimips.iso   # exit 0 pass, 1 fail, 2 setup error
 **NetBSD install CD** — `tools/netbsd-cd-boot.py` boots a NetBSD/sgimips
 install CD on a headless Indy with a blank NVRAM, runs the CD's install kernel
 from the PROM Command Monitor and passes when the sysinst menu appears. It

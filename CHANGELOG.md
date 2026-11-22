@@ -13,6 +13,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Indy and Indigo2 keyboard
+
+- The Indy and Indigo2 keyboard controller now translates key codes when the
+  guest asks it to. NetBSD's installer and console get working cursor keys,
+  and a key no longer repeats forever after it is pressed
+  ([#765](https://github.com/techomancer/iris/issues/765)).
 ### NetBSD on the R5000 Indy
 
 - NetBSD/sgimips boots on an Indy with `--cpu r5000`; its kernel
