@@ -81,7 +81,7 @@ The IO9's PCI bus, head 0 of the PIC at widget 15, holds the IOC4 at device
 ISP12160 at device 3 and the BCM5701 at device 4. Every Tezro capture that
 prints widget 15 shows the TI bridge there, and no Origin 350 or Onyx 350 IO9
 capture does; why is not known. Its secondary bus is empty unless
-`[tezro] audio = true` adds the audio controller, and only its type 1 header
+`[machine] audio_card = true` adds the audio controller, and only its type 1 header
 is modelled, with the PCI2050's wide windows: 32-bit I/O addressing and
 stored upper 32 bits of the prefetchable base and limit (the window itself is
 32-bit; one above 4 GiB is stored and never forwarded). IRIX lists it as an
@@ -115,7 +115,7 @@ the 4 GiB layout of 1024, 1024 and four 512 MiB banks, which follows QEMU and
 matches a captured Tezro. One processor needs at least 512 MiB, two or four at least
 1 GiB.
 
-The `[tezro]` settings also select the flash backing file, the console and
+`[machine]` also selects the flash backing file, the console and
 the L1 port and log. The console options are `l1` (the default) and `ioc4_a`
 to `ioc4_d`, the IOC4's ports 0 to 3. IOC4 ports 0 and 1 listen on
 `serial_port_a` and `serial_port_b`, ports 2 and 3 on `tezro.serial_port_c`
@@ -160,7 +160,7 @@ processor's clock rule and the bit pattern of the 700 to 900 MHz rows, with
 the cache clock and tap its inventories print. A read from a 1 GHz board is
 the only thing that would confirm it. A flash store keeps the block it was
 formatted with, and the PROM checks its mode word against the processor's, so
-give a different chip a fresh `[tezro] flash` file.
+give a different chip a fresh `[machine] flash` file.
 
 ## Limits
 

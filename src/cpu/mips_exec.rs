@@ -1304,6 +1304,14 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
     /// there. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
+    /// A window of full physical addresses, `(base, size)`, that the board
+    /// decodes as its own and [`Self::phys_alias`] never applies to: cut to
+    /// [`Self::phys_mask`] and nothing more. The O2's 64-bit PCI memory
+    /// window at 0x2_0000_0000 has the same low 32 bits as the no-ECC alias
+    /// from 0x2_8000_0000, where OpenBSD puts every PCI device; matched on
+    /// the cut address alone, its register accesses reached RAM. None on the
+    /// other machines.
+    pub phys_alias_bypass: Option<(u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
     /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
     /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
@@ -1910,7 +1918,7 @@ unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: CpuModel>(
     rm: u32,
 ) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, C::CVT_L_51_BITS, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
+    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, C::CVT_L_RANGE_BITS, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
 }
 
 /// Single-implementation CVT.S.W/D.W/S.L/D.L — see `cvt_int_to_float_and_commit`'s
@@ -1925,7 +1933,7 @@ unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: CpuModel>(
     dst_f64: u32,
 ) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    cvt_int_to_float_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, src_i64 != 0, dst_f64 != 0) as u32
+    cvt_int_to_float_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, C::CVT_FROM_L_RANGE_BITS, src_i64 != 0, dst_f64 != 0) as u32
 }
 
 /// Single-implementation CVT.S.D — see `cvt_d_to_s_and_commit`'s doc
@@ -1934,6 +1942,14 @@ unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: CpuModel>(
 unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, fs_reg: u32, fd_reg: u32, fr1: u32) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     cvt_d_to_s_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER) as u32
+}
+
+/// CVT.D.S for an operand with an all-zero or all-one exponent — see
+/// `cvt_s_to_d_and_commit`'s doc comment. Same shape as `jit_cvt_d_to_s`.
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_cvt_s_to_d<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, fs_reg: u32, fd_reg: u32, fr1: u32) -> u32 {
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
+    cvt_s_to_d_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0) as u32
 }
 
 /// Everything about an ADD/SUB/MUL/DIV that compiled code does not handle
@@ -2236,32 +2252,26 @@ fn round_f32_to_int_mode(x: f32, rm: u8) -> f32 {
 /// clanker/cpu/fpu-exception-model-vs-r4400.md.
 ///
 /// `x` must already be rounded to an integral value via
-/// `round_f32_to_int_mode`/`round_f64_to_int_mode` — this only classifies
-/// and saturates. Two competing specs exist for NaN/out-of-range CVT (R4000
-/// manual: Unimplemented Operation, destination untouched; MIPS IV ISA:
-/// Invalid Operation, result saturates to the largest representable
-/// magnitude) — this implements the MIPS IV ISA route (Invalid, not
-/// Unimplemented) since it's expressible without a caller-side branch on
-/// whether to skip the write, matching `fpu/cvt_out_of_range`'s accepted
-/// second branch (`cpu-tests/tests/fpu/fpu_breadth.c`).
+/// `round_f32_to_int_mode`/`round_f64_to_int_mode` — this only classifies.
+/// A value the destination cannot hold (NaN, infinity, out of range) is an
+/// Invalid Operation whose untrapped default result is 2^31-1 for a word and
+/// 2^63-1 for a long, whatever the source's sign (R4000 UM appendix B,
+/// CVT.W.fmt and the other conversions: "2^31-1 is returned"; MIPS64 Vol. II,
+/// CVT.W.fmt: "the default result, 2^31-1, is written to fd"). Every part
+/// IRIS models takes Unimplemented Operation there instead
+/// (`CpuModel::CVT_UNREPRESENTABLE_UNIMPLEMENTED`), and `cvt_to_int_and_commit`
+/// decides which.
 ///
-/// Returns `(result_bits, invalid, inexact)`. `result_bits` is the raw
-/// destination bit pattern (already reinterpreted as unsigned, sign-extended
-/// by the caller through the usual GPR/FPR write path); `dst_bits` selects
-/// 32- vs 64-bit destination width (`CVT.W` vs `CVT.L`).
-fn cvt_f32_to_int_by_value(x: f32, dst_bits: u32) -> (u64, bool, bool) {
-    let (max_pos, max_neg): (i64, i64) = if dst_bits == 32 {
-        (i32::MAX as i64, i32::MIN as i64)
-    } else {
-        (i64::MAX, i64::MIN)
-    };
-    if x.is_nan() {
-        return (max_pos as u64, true, false);
-    }
+/// Returns `(result_bits, invalid)`. `result_bits` is the raw destination
+/// bit pattern (already reinterpreted as unsigned, sign-extended by the
+/// caller through the usual GPR/FPR write path); `dst_bits` selects 32- vs
+/// 64-bit destination width (`CVT.W` vs `CVT.L`).
+fn cvt_f32_to_int_by_value(x: f32, dst_bits: u32) -> (u64, bool) {
+    let default = if dst_bits == 32 { i32::MAX as i64 } else { i64::MAX };
     // x is already integral (post-rounding); out-of-range iff it does not lie
     // in the destination width at all. `i32::MAX as f32` rounds up to 2^31,
     // which is out of range, so the word bound is 2^31 exclusive like the long
-    // one below.
+    // one below. A NaN fails both comparisons.
     let in_range = if dst_bits == 32 {
         x >= -2147483648.0f32 && x < 2147483648.0f32
     } else {
@@ -2271,89 +2281,123 @@ fn cvt_f32_to_int_by_value(x: f32, dst_bits: u32) -> (u64, bool, bool) {
         x >= -(9223372036854775808.0f32) && x < 9223372036854775808.0f32
     };
     if !in_range {
-        let result = if x.is_sign_negative() { max_neg } else { max_pos };
-        return (result as u64, true, false);
+        return (default as u64, true);
     }
     let result = if dst_bits == 32 { x as i32 as i64 } else { x as i64 };
-    let inexact = (result as f32) != x;
-    (result as u64, false, inexact)
+    (result as u64, false)
 }
 
 /// `f64` counterpart of `cvt_f32_to_int_by_value` — see that function's doc
 /// comment for the full design rationale.
-fn cvt_f64_to_int_by_value(x: f64, dst_bits: u32) -> (u64, bool, bool) {
-    let (max_pos, max_neg): (i64, i64) = if dst_bits == 32 {
-        (i32::MAX as i64, i32::MIN as i64)
-    } else {
-        (i64::MAX, i64::MIN)
-    };
-    if x.is_nan() {
-        return (max_pos as u64, true, false);
-    }
+fn cvt_f64_to_int_by_value(x: f64, dst_bits: u32) -> (u64, bool) {
+    let default = if dst_bits == 32 { i32::MAX as i64 } else { i64::MAX };
     let in_range = if dst_bits == 32 {
         x >= i32::MIN as f64 && x <= i32::MAX as f64
     } else {
         x >= -(9223372036854775808.0f64) && x < 9223372036854775808.0f64
     };
     if !in_range {
-        let result = if x.is_sign_negative() { max_neg } else { max_pos };
-        return (result as u64, true, false);
+        return (default as u64, true);
     }
     let result = if dst_bits == 32 { x as i32 as i64 } else { x as i64 };
-    let inexact = (result as f64) != x;
-    (result as u64, false, inexact)
+    (result as u64, false)
+}
+
+/// A conversion source the R4000-class FPU hands to software: a denormal or
+/// a quiet NaN (MIPS encoding: fraction MSB clear). R4000 UM 7.x and VR5000
+/// UM 9.4.6, Unimplemented Instruction Exception: "Denormalized operand" and
+/// "Quiet Not a Number operand", "only trapped if the instruction is a
+/// convert or computational operation"; the R10000 takes the same exception
+/// for a denormal operand (R10000 UM p. 309). The same test as
+/// `fpu_check_denorm_operand_s/d`, for the shared conversion helpers, which
+/// have no executor to raise it with.
+#[inline]
+fn cvt_operand_unimplemented_s(bits: u32) -> bool {
+    let e = bits & 0x7F80_0000;
+    if e != 0 && e != 0x7F80_0000 {
+        return false;
+    }
+    f32::from_bits(bits).is_subnormal() || is_qnan_s(bits)
+}
+#[inline]
+fn cvt_operand_unimplemented_d(bits: u64) -> bool {
+    let e = bits & 0x7FF0_0000_0000_0000;
+    if e != 0 && e != 0x7FF0_0000_0000_0000 {
+        return false;
+    }
+    f64::from_bits(bits).is_subnormal() || is_qnan_d(bits)
+}
+
+/// Raise Unimplemented Operation from a shared conversion helper: Cause is
+/// E alone, the destination and the Flags are untouched, and the caller
+/// takes `EXC_FPE` (the helpers return `true`).
+#[inline]
+fn cvt_unimplemented(core: &mut MipsCore) -> bool {
+    core.fpu_fcsr = (core.fpu_fcsr & !FCSR_CM) | FCSR_CE;
+    true
 }
 
 /// CVT.W/L.S/D, all in one: reads the source FPR, rounds via
-/// `round_f32/64_to_int_mode`, classifies/saturates via
-/// `cvt_f32/64_to_int_by_value`, and commits the result and FCSR Cause/Flag
-/// bits directly against `core` — mirroring `MipsExecutor::fpu_commit_cvt_to_int`
-/// exactly, just operating on `&mut MipsCore` instead of `&mut Self` so a
-/// free function (not a `MipsExecutor<T, C>` method) can call it. This is
-/// the single function both engines share: the interpreter calls it
-/// directly from `exec_fcvt_w_s` et al.; jitv2 calls it through
-/// `core.fpu_cvt_to_int_fn` — one `call_indirect` that reads/writes `core`
-/// itself, so the JIT never has to carry a partially-computed result or
-/// Invalid/Inexact `Value` across the call boundary (Cranelift only needs
-/// to know the call may have touched `core.fpr`/`core.fpu_fcsr`, which every
-/// access already re-`load`s fresh — no stale cached `Value` risk). Returns
-/// `true` if the conversion trapped (Cause set, destination/Flag untouched,
-/// caller must raise `EXC_FPE`), `false` if it committed normally.
+/// `round_f32/64_to_int_mode`, classifies via `cvt_f32/64_to_int_by_value`,
+/// and commits the result and FCSR Cause/Flag bits directly against `core` —
+/// operating on `&mut MipsCore` instead of an executor so a free function
+/// (not a `MipsExecutor<T, C>` method) can call it. This is the single
+/// function both engines share: the interpreter calls it from
+/// `exec_fcvt_w_s` et al.; jitv2 calls it through `core.fpu_cvt_to_int_fn` —
+/// one `call_indirect` that reads/writes `core` itself, so the JIT never has
+/// to carry a partially-computed result or Invalid/Inexact `Value` across
+/// the call boundary (Cranelift only needs to know the call may have touched
+/// `core.fpr`/`core.fpu_fcsr`, which every access already re-`load`s fresh —
+/// no stale cached `Value` risk). Returns `true` if the conversion trapped
+/// (Cause set, destination/Flag untouched, caller must raise `EXC_FPE`),
+/// `false` if it committed normally.
+///
+/// In order: a denormal or quiet-NaN source is Unimplemented Operation
+/// (`cvt_operand_unimplemented_s/d`); a result the destination cannot hold
+/// is Unimplemented Operation where `unrep_traps`, else Invalid with the
+/// 2^31-1 / 2^63-1 default result; a long result outside
+/// [-2^l_range_bits, 2^l_range_bits) is Unimplemented Operation; a result
+/// that differs from the source is Inexact.
 ///
 /// `fr1`: FR=1 (paired-64) vs FR=0 register addressing — see
 /// `read_fpr_w_fr0`/`write_fpr_w_fr0`. `src_f64`/`dst_i64`: source is
 /// D-format (else S); destination is L (else W). `rm`: MIPS FCSR.RM
 /// encoding (0=nearest-even, 1=toward-zero, 2=toward+inf, 3=toward-inf) —
 /// callers pass a fixed mode for ROUND/TRUNC/CEIL/FLOOR or FCSR's live low
-/// 2 bits for plain CVT.W/CVT.L. `unrep_traps`: an unrepresentable result
-/// takes Unimplemented Operation rather than Invalid
-/// (`CpuModel::CVT_UNREPRESENTABLE_UNIMPLEMENTED`). `l_51`: a long result
-/// outside [-2^51, 2^51) takes Unimplemented Operation (`CpuModel::CVT_L_51_BITS`).
-fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, unrep_traps: bool, l_51: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
+/// 2 bits for plain CVT.W/CVT.L. `unrep_traps`:
+/// `CpuModel::CVT_UNREPRESENTABLE_UNIMPLEMENTED`. `l_range_bits`:
+/// `CpuModel::CVT_L_RANGE_BITS` (63: the format's own range).
+fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, unrep_traps: bool, l_range_bits: u32, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
     let dst_bits = if dst_i64 { 64 } else { 32 };
     // Inexact is judged against the source, not the rounded intermediate:
-    // the by-value helpers only ever see an integral value, so their own
-    // inexact result cannot tell 3.7 -> 3 from 3.0 -> 3.
+    // the by-value helpers only ever see an integral value, so they cannot
+    // tell 3.7 -> 3 from 3.0 -> 3.
     let (result, invalid, inexact) = if src_f64 {
         let bits = if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) };
+        if cvt_operand_unimplemented_d(bits) {
+            return cvt_unimplemented(core);
+        }
         let x = f64::from_bits(bits);
         let rounded = round_f64_to_int_mode(x, rm);
-        let (result, invalid, _) = cvt_f64_to_int_by_value(rounded, dst_bits);
+        let (result, invalid) = cvt_f64_to_int_by_value(rounded, dst_bits);
         (result, invalid, !invalid && rounded != x)
     } else {
         let bits = if fr1 { core.read_fpr_w(fs_reg) } else { read_fpr_w_fr0(core, fs_reg) };
+        if cvt_operand_unimplemented_s(bits) {
+            return cvt_unimplemented(core);
+        }
         let x = f32::from_bits(bits);
         let rounded = round_f32_to_int_mode(x, rm);
-        let (result, invalid, _) = cvt_f32_to_int_by_value(rounded, dst_bits);
+        let (result, invalid) = cvt_f32_to_int_by_value(rounded, dst_bits);
         (result, invalid, !invalid && rounded != x)
     };
 
-    core.fpu_fcsr &= !FCSR_CM;
-    let too_wide = l_51 && dst_i64 && !invalid && !(-(1i64 << 51)..(1i64 << 51)).contains(&(result as i64));
+    let too_wide = dst_i64 && l_range_bits < 63 && !invalid
+        && !(-(1i64 << l_range_bits)..(1i64 << l_range_bits)).contains(&(result as i64));
     if (invalid && unrep_traps) || too_wide {
-        core.fpu_fcsr |= FCSR_CE;
-        return true;
+        return cvt_unimplemented(core);
     }
+    core.fpu_fcsr &= !FCSR_CM;
     let write_result = |core: &mut MipsCore| {
         if dst_i64 {
             if fr1 { core.write_fpr_l(fd_reg, result) } else { write_fpr_l_fr0(core, fd_reg, result) }
@@ -2374,7 +2418,7 @@ fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
         return true;
     }
     write_result(core);
-    core.fpu_fcsr |= if invalid { 0x40 } else { FCSR_FI };
+    core.fpu_fcsr |= if invalid { FCSR_FV } else { FCSR_FI };
     false
 }
 
@@ -2382,83 +2426,150 @@ fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
 /// only ever be Inexact (the source is always exactly representable as an
 /// integer; loss can only occur fitting it into the destination float's
 /// mantissa) — never Invalid, never Overflow. Computed by value: convert,
-/// then compare the converted-back-to-int value against the original
-/// source, the same "did round-tripping change it" test
-/// `round_f32/64_to_int_mode`'s callers already use, avoiding the host
-/// MXCSR/FPSR race `cvt_to_int_and_commit`'s doc comment describes (found
-/// live in the opposite conversion direction; the same hazard applies here
-/// since `fcvt_from_sint` is just as real a hardware instruction).
-fn cvt_int_to_float_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, src_i64: bool, dst_f64: bool) -> bool {
+/// then compare the result with the source exactly, in i128 so that a long
+/// that rounds up to 2^63 (`i64::MAX` itself, in either precision) is not
+/// mistaken for exact by a saturating cast back to i64. This avoids the
+/// host MXCSR/FPSR race `cvt_to_int_and_commit`'s doc comment describes
+/// (found live in the opposite conversion direction; the same hazard
+/// applies here since `fcvt_from_sint` is just as real a hardware
+/// instruction). The conversion itself rounds per the host rounding mode,
+/// which follows FCSR.RM (`platform::set_fpu_mode`).
+///
+/// A long source outside [-2^from_l_range_bits, 2^from_l_range_bits) is
+/// Unimplemented Operation (`CpuModel::CVT_FROM_L_RANGE_BITS`; 63 converts
+/// every long). An enabled Inexact traps with the destination unwritten.
+fn cvt_int_to_float_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, from_l_range_bits: u32, src_i64: bool, dst_f64: bool) -> bool {
     let src: i64 = if src_i64 {
         (if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) }) as i64
     } else {
         (if fr1 { core.read_fpr_w(fs_reg) } else { read_fpr_w_fr0(core, fs_reg) }) as i32 as i64
     };
-    let inexact = if dst_f64 {
+    if src_i64 && from_l_range_bits < 63 && !(-(1i64 << from_l_range_bits)..(1i64 << from_l_range_bits)).contains(&src) {
+        return cvt_unimplemented(core);
+    }
+    let (bits, inexact) = if dst_f64 {
         let result = src as f64;
-        let bits = result.to_bits();
-        if fr1 { core.write_fpr_l(fd_reg, bits) } else { write_fpr_l_fr0(core, fd_reg, bits) }
-        (result as i64) != src
+        (result.to_bits(), result as i128 != src as i128)
     } else {
         let result = src as f32;
-        let bits = result.to_bits();
-        if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
-        (result as i64) != src
+        (u64::from(result.to_bits()), result as i128 != src as i128)
+    };
+    let write = |core: &mut MipsCore| {
+        if dst_f64 {
+            if fr1 { core.write_fpr_l(fd_reg, bits) } else { write_fpr_l_fr0(core, fd_reg, bits) }
+        } else if fr1 {
+            write_fpr_w_fr1_for(core, clears_upper, fd_reg, bits as u32)
+        } else {
+            write_fpr_w_fr0(core, fd_reg, bits as u32)
+        }
     };
     core.fpu_fcsr &= !FCSR_CM;
     if !inexact {
+        write(core);
         return false;
     }
     core.fpu_fcsr |= FCSR_CI;
     if (core.fpu_fcsr & FCSR_IM) != 0 {
         return true;
     }
+    write(core);
     core.fpu_fcsr |= FCSR_FI;
     false
 }
 
-/// CVT.S.D (narrowing, D source only — the widening CVT.D.S can never raise
-/// any FCSR condition and skips this machinery entirely): Rust's `as f32`
-/// narrowing cast is round-to-nearest-even, matching the MIPS-mandated
-/// narrowing behavior, but (same hazard as
-/// `cvt_int_to_float_and_commit`/`cvt_to_int_and_commit`) computed by value
-/// rather than trusted from a host MXCSR read after the cast. Inexact: the
-/// narrowed result doesn't widen back to the original bit-for-bit. Overflow:
-/// the magnitude exceeds `f32::MAX`, in which case the destination is
-/// infinity with the source's sign — matches Rust's own narrowing behavior
-/// for this case, so no manual saturation is needed, just cause reporting.
+/// CVT.S.D (narrowing). Rust's `as f32` rounds per the host rounding mode,
+/// which follows FCSR.RM, and the FCSR consequences are computed by value
+/// rather than trusted from a host MXCSR read after the cast (same hazard as
+/// `cvt_int_to_float_and_commit`/`cvt_to_int_and_commit`):
+///
+/// - A denormal or quiet-NaN source is Unimplemented Operation
+///   (`cvt_operand_unimplemented_d`). A signalling NaN is Invalid and
+///   delivers the MIPS default NaN.
+/// - Overflow: the result is an infinity from a finite source, or ±MAX from
+///   a source of magnitude 2^128 or more (a mode that rounds toward zero for
+///   that sign; between MAX and 2^128 the rounded value with an unbounded
+///   exponent is MAX itself and only Inexact is raised). Overflow raises
+///   Inexact with it (R4000 UM Table 7-1, VR5000 UM 9.4.4), and either
+///   enable traps.
+/// - Underflow: a nonzero source whose result is a denormal or zero. As for
+///   arithmetic (`fpu_update_fcsr_full`), that is Unimplemented Operation
+///   unless FCSR.FS is set and neither the Underflow nor the Inexact enable
+///   is, in which case the result is flushed to a zero of the source's sign
+///   with Underflow and Inexact.
+/// - Otherwise Inexact when the result does not widen back to the source.
 fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool) -> bool {
-    let src = if fr1 { core.read_fpr_d(fs_reg) } else { read_fpr_d_fr0(core, fs_reg) };
+    let src_bits = if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) };
+    if cvt_operand_unimplemented_d(src_bits) {
+        return cvt_unimplemented(core);
+    }
+    let src = f64::from_bits(src_bits);
     let result = src as f32;
-    let overflow = result.is_infinite() && !src.is_infinite();
-    let inexact = !overflow && (result as f64) != src;
-    let bits = result.to_bits();
-    core.fpu_fcsr &= !FCSR_CM;
-    if !overflow && !inexact {
+    let write = |core: &mut MipsCore, bits: u32| {
         if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
+    };
+    core.fpu_fcsr &= !FCSR_CM;
+    // A NaN source is never equal to its narrowed result, so the exact path
+    // costs an ordinary conversion one compare.
+    if result as f64 == src {
+        write(core, result.to_bits());
         return false;
     }
-    // A NaN source never takes the path above (it is not equal to itself),
-    // so the signalling test costs an ordinary conversion nothing. A
-    // signalling NaN is an Invalid Operation: V, and the MIPS default NaN
-    // rather than the host's. A quiet NaN converts as before.
-    if is_snan_d(src.to_bits()) {
+    let tiny = result.abs() < f32::MIN_POSITIVE && src != 0.0;
+    if tiny {
+        if core.fpu_fcsr & FCSR_FS == 0 || core.fpu_fcsr & (FCSR_UM | FCSR_IM) != 0 {
+            return cvt_unimplemented(core);
+        }
+        core.fpu_fcsr |= FCSR_CU | FCSR_CI;
+        write(core, (src_bits >> 32) as u32 & 0x8000_0000);
+        core.fpu_fcsr |= FCSR_FU | FCSR_FI;
+        return false;
+    }
+    // A signalling NaN is an Invalid Operation: V, and the MIPS default NaN
+    // rather than the host's. (A quiet one has trapped above.)
+    let (flags, bits) = if src.is_nan() {
+        (FCSR_FV, FPU_DEFAULT_NAN_S)
+    } else if (result.is_infinite() && src.is_finite())
+        || (result.abs() == f32::MAX && src.abs() >= f64::from_bits(0x47F0_0000_0000_0000)) // 2^128
+    {
+        (FCSR_FO | FCSR_FI, result.to_bits())
+    } else {
+        (FCSR_FI, result.to_bits())
+    };
+    let causes = flags << 10;
+    core.fpu_fcsr |= causes;
+    if ((causes >> 5) & core.fpu_fcsr & FCSR_EM) != 0 {
+        return true;
+    }
+    write(core, bits);
+    core.fpu_fcsr |= flags;
+    false
+}
+
+/// CVT.D.S (widening): exact for every finite single, so the only FCSR
+/// consequences are the operand's. A denormal or quiet-NaN source is
+/// Unimplemented Operation (`cvt_operand_unimplemented_s`); a signalling NaN
+/// is Invalid and delivers the MIPS default NaN, where the host's widening
+/// would set the fraction MSB and so hand on another signalling NaN.
+/// Otherwise Cause is cleared and the widened value written. The JIT widens
+/// inline and calls this only for an operand with an all-zero or all-one
+/// exponent.
+fn cvt_s_to_d_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool) -> bool {
+    let src_bits = if fr1 { core.read_fpr_w(fs_reg) } else { read_fpr_w_fr0(core, fs_reg) };
+    if cvt_operand_unimplemented_s(src_bits) {
+        return cvt_unimplemented(core);
+    }
+    core.fpu_fcsr &= !FCSR_CM;
+    let bits = if is_snan_s(src_bits) {
         core.fpu_fcsr |= FCSR_CV;
         if core.fpu_fcsr & 0x800 != 0 { // Enable.V = bit 11
             return true;
         }
-        if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, FPU_DEFAULT_NAN_S) } else { write_fpr_w_fr0(core, fd_reg, FPU_DEFAULT_NAN_S) }
         core.fpu_fcsr |= FCSR_FV;
-        return false;
-    }
-    let cause = if overflow { FCSR_CO } else { FCSR_CI };
-    core.fpu_fcsr |= cause;
-    let enable_bit = if overflow { 0x200 } else { FCSR_IM }; // Enable.O = bit 9
-    if (core.fpu_fcsr & enable_bit) != 0 {
-        return true;
-    }
-    if fr1 { write_fpr_w_fr1_for(core, clears_upper, fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
-    core.fpu_fcsr |= if overflow { FCSR_FO } else { FCSR_FI };
+        FPU_DEFAULT_NAN_D
+    } else {
+        (f32::from_bits(src_bits) as f64).to_bits()
+    };
+    if fr1 { core.write_fpr_l(fd_reg, bits) } else { write_fpr_l_fr0(core, fd_reg, bits) }
     false
 }
 
@@ -2976,6 +3087,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
             batch_hook: None,
             phys_alias: None,
+            phys_alias_bypass: None,
             phys_mask: u64::MAX,
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
@@ -3170,7 +3282,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 core: if self.core.smp || std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
                 lwr_keeps_upper: C::PARTIAL_LWR_KEEPS_UPPER,
                 single_clears_upper: C::SINGLE_CLEARS_UPPER,
-                cvt_l_51_bits: C::CVT_L_51_BITS,
+                cvt_l_range_bits: C::CVT_L_RANGE_BITS as u8,
+                cvt_from_l_range_bits: C::CVT_FROM_L_RANGE_BITS as u8,
             };
             *j.compile_queue.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -3254,6 +3367,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.fpu_cvt_to_int_fn = jit_cvt_to_int::<T, C>;
         self.core.fpu_cvt_int_to_float_fn = jit_cvt_int_to_float::<T, C>;
         self.core.fpu_cvt_d_to_s_fn = jit_cvt_d_to_s::<T, C>;
+        self.core.fpu_cvt_s_to_d_fn = jit_cvt_s_to_d::<T, C>;
         self.core.fpu_binop_commit_fn = jit_fpu_binop_commit::<C>;
         #[cfg(feature = "jitv2_lockstep")]
         {
@@ -3624,6 +3738,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         {
             let mut j = jit.lock();
             j.set_space(space, self.jitv2_frames as usize, self.jitv2_split);
+            j.compile_queue.set_world(world.clone());
             self.jitv2_compile_queue_handle = j.compile_queue.queue_handle();
             self.jitv2_hot_queue_handle = j.compile_queue.hot_handle();
             self.jitv2_stats = j.stats.clone();
@@ -5214,9 +5329,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     /// A CPU physical address as the board decodes it: cut to
-    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
+    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in
+    /// it, unless the full address is in [`Self::phys_alias_bypass`].
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
+        if let Some((base, size)) = self.phys_alias_bypass {
+            if pa.wrapping_sub(base) < size {
+                return pa & self.phys_mask;
+            }
+        }
         // Cut first: the PTE software bits above the PFN are not part of the
         // address the alias window sees. Window and target lie within the mask.
         let pa = pa & self.phys_mask;
@@ -7957,26 +8078,37 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// - under `ci_clock`, `hot.cycles` reaches the Compare deadline with IP7
     ///   unmasked (the stall raises IP7 itself, as `step_cycles!` would).
     ///
-    /// A WAIT that can never be released (`Status.IE` clear, or `EXL`/`ERL`
-    /// set) is handled *before* the PC update instead: see the top of the
-    /// body. It returns `EXEC_RETRY` with PC still on the WAIT, so the guest
-    /// correctly never progresses while the CPU thread keeps returning to its
-    /// run loop.
+    /// A WAIT whose interrupts cannot be taken (`Status.IE` clear, or
+    /// `EXL`/`ERL` set) is handled *before* the PC update instead: see the top
+    /// of the body. It completes once an interrupt the IM bits pass is
+    /// requested, and until then returns `EXEC_RETRY` with PC still on the
+    /// WAIT, so the CPU thread keeps returning to its run loop.
     fn exec_wait(&mut self) -> ExecStatus {
-        // Unreleasable WAIT (IE clear, or EXL/ERL set): no interrupt can ever
-        // end this stall. Checked BEFORE the PC update and answered with
+        // WAIT with its interrupts not takeable (IE clear, or EXL/ERL set).
+        // Checked BEFORE the PC update; until it may complete it answers
         // EXEC_RETRY, so PC stays on the WAIT and the run loop simply
-        // re-dispatches it. That reproduces the hardware behaviour (a WAIT
-        // with interrupts disabled never completes) while keeping the CPU
-        // thread returning to its loop every iteration, so the monitor, the
-        // debugger and the soft-reset check all stay responsive — none of
-        // which would be true if we spun inside this one instruction.
+        // re-dispatches it, keeping the CPU thread returning to its loop every
+        // iteration, so the monitor, the debugger and the soft-reset check all
+        // stay responsive — none of which would be true if we spun inside
+        // this one instruction.
         //
         // IRIX never gets here: `wait_for_interrupt_fix_loc` requires the
         // `mtc0 a1,C0_SR` that re-enables interrupts to be *adjacent* to the
         // WAIT, which is what its "must be adjacent to avoid a race with an
         // interrupt" comment is about.
+        //
+        // A requested interrupt that IE (or EXL/ERL) keeps from being taken
+        // still ends the stall: the WAIT graduates and the interrupt is taken
+        // once software enables it. OpenBSD's R5000/RM52xx/RM7000 idle
+        // (`cpu_idle_cycle_rm7k`) clears IE, executes WAIT and restores Status
+        // after it, as Linux's `r4k_wait_irqoff` does; answering RETRY there
+        // held an idle OpenBSD O2 on the WAIT for good with its clock
+        // interrupt pending. So the masked case polls once per dispatch and
+        // completes when an interrupt the IM bits pass is pending.
         if !self.core.interrupts_enabled() {
+            if self.wait_wake_pending() {
+                return self.handle_exec_complete();
+            }
             return EXEC_RETRY;
         }
 
@@ -8040,6 +8172,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
 
         status
+    }
+
+    /// Whether an interrupt the IM bits pass is requested (`Cause.IP` or a
+    /// device's line in `hot.interrupts`), whatever IE, EXL and ERL say.
+    fn wait_wake_pending(&self) -> bool {
+        let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
+        let ip = (self.core.cp0_cause | (pending as u32)) & crate::cpu::mips_core::CAUSE_IP_MASK;
+        ip & self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK != 0
     }
 
     fn exec_eret(&mut self) -> ExecStatus {
@@ -8770,10 +8910,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
     fn exec_fcvt_d_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)) as f64;
-        let write_d = self.fpr_write_d;
-        self.fpu_update_fcsr(0, |exec| write_d(&mut exec.core, fd_reg, result))
+        let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
+        if cvt_s_to_d_and_commit(&mut self.core, d.rd as u32, d.sa as u32, fr1) {
+            let s = exec_exception(EXC_FPE);
+            self.handle_exception(s)
+        } else {
+            self.handle_exec_complete()
+        }
     }
     /// Shared tail for every ROUND/TRUNC/CEIL/FLOOR/CVT.W/CVT.L handler
     /// (S or D source, W or L dest, fixed or FCSR-dynamic rounding mode):
@@ -8784,7 +8927,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn fpu_cvt_to_int(&mut self, fs_reg: u32, fd_reg: u32, src_f64: bool, dst_i64: bool, rm: u8) -> ExecStatus {
         let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
-        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, C::CVT_L_51_BITS, src_f64, dst_i64, rm) {
+        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, C::CVT_L_RANGE_BITS, src_f64, dst_i64, rm) {
             let s = exec_exception(EXC_FPE);
             self.handle_exception(s)
         } else {
@@ -8795,7 +8938,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn fpu_cvt_int_to_float(&mut self, fs_reg: u32, fd_reg: u32, src_i64: bool, dst_f64: bool) -> ExecStatus {
         let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
-        if cvt_int_to_float_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, src_i64, dst_f64) {
+        if cvt_int_to_float_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, C::CVT_FROM_L_RANGE_BITS, src_i64, dst_f64) {
             let s = exec_exception(EXC_FPE);
             self.handle_exception(s)
         } else {
@@ -10712,6 +10855,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         let ppmem_bitmap_ptr = executor_arc.lock().ppmem_bitmap_ptr();
         #[cfg(feature = "jitv2")]
         executor_arc.lock().install_jit_hooks();
+        let park = Arc::new(crate::cpu::smp::ParkSlot::new(cpu_id, interrupts_ptr));
+        // This CPU's own compile pool stops it the way a shared pool stops
+        // several: by parking it, and taking turns with the CPU's own flushes.
+        // Halting it instead joins the CPU thread, which may itself be joining
+        // the worker for a flush of its own. A machine whose CPUs share a pool,
+        // or that has a world of its own, replaces this one (`share_jitv2`).
+        #[cfg(feature = "jitv2")]
+        {
+            let mut exec = executor_arc.lock();
+            let world = Arc::new(crate::cpu::smp::World::solo(park.clone()));
+            exec.jitv2.lock().compile_queue.set_world(world.clone());
+            exec.jitv2_world = Some(world);
+        }
 
         Self {
             executor: executor_arc,
@@ -10721,7 +10877,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             cycles_ptr,
             interrupts_ptr,
             ppmem_bitmap_ptr,
-            park: Arc::new(crate::cpu::smp::ParkSlot::new(cpu_id, interrupts_ptr)),
+            park,
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
@@ -11266,9 +11422,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // `pcp == null` is an invariant of "CPU is stopped" — established
             // here, unconditionally, rather than left to every caller that
             // stops the CPU around a `jitv2.pages` mutation to remember.
-            // `Jitv2::flush_from_jit_thread` (the compile thread's own
-            // Codegen-growth flush — see `Jitv2::codegen`'s doc comment)
-            // relies on exactly this: it calls `cpu.stop()`, mutates the
+            // A compile worker's own flush (`Jitv2::flush_from_jit_thread`)
+            // parks the CPU through its world instead, and the park path
+            // clears `pcp` the same way; only a bare pool in a test still
+            // relies on this: it calls `cpu.stop()`, mutates the
             // page pool while nothing can race it (the CPU is provably not
             // running), then `cpu.start()` — the next dispatch re-derives
             // `pcp` fresh against whatever the pool looks like now, same as
@@ -11582,12 +11739,13 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn monitor_commands(&self) -> Vec<(String, String)>;
     /// Where another thread holds this CPU still.
     fn park_slot(&self) -> Arc<crate::cpu::smp::ParkSlot>;
-    /// Use this page pool and compiled code, shared with the other CPUs, whose
-    /// flushes `world` coordinates. Before the CPU first runs.
-    #[cfg(feature = "jitv2")]
-    /// Run on `jit`, a pool other CPUs run on too, as its CPU number `cpu`,
+    /// Run on `jit`, a pool other CPUs may run on too, as its CPU number `cpu`,
     /// looking pages up in its address space `space` (the same for CPUs that
-    /// see memory at the same addresses, as the CPUs of one node do).
+    /// see memory at the same addresses, as the CPUs of one node do); `world`
+    /// coordinates the pool's flushes. Before the CPU first runs. `jit` may be
+    /// the CPU's own pool: a machine with a world of its own passes that world,
+    /// since a CPU belongs to one.
+    #[cfg(feature = "jitv2")]
     fn share_jitv2(&self, jit: Arc<Mutex<crate::cpu::jitv2::Jitv2>>, world: Arc<crate::cpu::smp::World>, cpu: usize, space: usize);
     fn monitor_execute(&self, cmd: &str, args: &[&str], writer: Box<dyn Write + Send>) -> Result<(), String>;
     /// The symbol table this CPU's monitor commands and breakpoints resolve
@@ -12243,5 +12401,47 @@ mod undo_range_tests {
         let rom = MemRange::new("prom", MemKind::Rom, 0x1fc0_0000, 0x1fd0_0000);
         assert_eq!(tracked(vec![alias.clone(), rom.clone()], kseg1(0x1000)), 1);
         assert_eq!(tracked(vec![alias, rom], kseg1(0x1fc0_0000)), 0);
+    }
+}
+
+#[cfg(test)]
+mod cvt_default_result_tests {
+    use super::*;
+
+    /// An untrapped Invalid conversion delivers 2^31-1 (word) or 2^63-1
+    /// (long) whatever the sign of the source (R4000 UM appendix B, CVT.W.fmt
+    /// and the fixed-mode conversions; MIPS64 Vol. II CVT.W.fmt). It used to
+    /// deliver -2^31 / -2^63 for a negative source. No modelled part reaches
+    /// this path (they all take Unimplemented Operation), so it is pinned on
+    /// the shared helper with `unrep_traps` clear.
+    #[test]
+    fn untrapped_invalid_conversion_delivers_the_largest_positive_integer() {
+        let mut core = MipsCore::new();
+        for (src, dst_i64, want) in [
+            ((-1.0e20f64).to_bits(), false, i32::MAX as u32 as u64),
+            (f64::NEG_INFINITY.to_bits(), false, i32::MAX as u32 as u64),
+            ((-2147483649.0f64).to_bits(), false, i32::MAX as u32 as u64),
+            (0x7FF8_0000_0000_0000, false, i32::MAX as u32 as u64), // signalling NaN
+            ((-1.0e20f64).to_bits(), true, i64::MAX as u64),
+            (f64::INFINITY.to_bits(), true, i64::MAX as u64),
+        ] {
+            core.fpu_fcsr = 0;
+            core.write_fpr_l(1, src);
+            core.write_fpr_l(2, 0);
+            let trapped = cvt_to_int_and_commit(&mut core, 1, 2, true, false, false, 63, true, dst_i64, RM_TOWARD_ZERO);
+            assert!(!trapped, "{src:#x}");
+            let got = if dst_i64 { core.read_fpr_l(2) } else { core.read_fpr_w(2) as u64 };
+            assert_eq!(got, want, "{src:#x}");
+            assert_eq!(core.fpu_fcsr & FCSR_CM, FCSR_CV, "{src:#x} Cause.V");
+            assert_eq!(core.fpu_fcsr & FCSR_FM, FCSR_FV, "{src:#x} Flag.V");
+        }
+        // With Enable.V the conversion traps and fd keeps its value.
+        core.fpu_fcsr = 0x800;
+        core.write_fpr_l(1, (-1.0e20f64).to_bits());
+        core.write_fpr_l(2, 0x5a5a);
+        assert!(cvt_to_int_and_commit(&mut core, 1, 2, true, false, false, 63, true, false, RM_TOWARD_ZERO));
+        assert_eq!(core.read_fpr_l(2), 0x5a5a);
+        assert_eq!(core.fpu_fcsr & FCSR_CM, FCSR_CV);
+        assert_eq!(core.fpu_fcsr & FCSR_FM, 0);
     }
 }

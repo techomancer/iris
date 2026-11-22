@@ -26,7 +26,7 @@ The sample selects `machine.profile = "origin200_ip29"`.
   flash's reset address: cached references reach the bank, and the reset
   fetch, which is uncached, reaches the flash. Memory that is not fitted
   answers every access with a bus error, logged under `hub`.
-- `[origin200] flash` keeps the 1 MiB node boot flash, where the PROM stores
+- `[machine] flash` keeps the 1 MiB node boot flash, where the PROM stores
   its environment log. Unset, the flash starts fresh every run.
   `controller_store` does the same for the module controller's store.
 - The stock IP27 PROM 6.156 from the IRIX 6.5.30 media is built in and runs
@@ -36,7 +36,7 @@ The sample selects `machine.profile = "origin200_ip29"`.
   `prom = "(embedded)"` selects the built-in PROM outright. The flash
   configuration block is patched for the product and processor module before
   the PROM runs.
-- The Origin 200 has no BaseIO card, so `[origin200] io_prom` is refused.
+- The Origin 200 has no BaseIO card, so `[machine] io_prom` is refused.
 
 The PROM runs its diagnostics and reaches the System Maintenance Menu and the
 Command Monitor on the first serial port, and an installed IRIX 6.5.30 disk

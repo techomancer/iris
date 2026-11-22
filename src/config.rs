@@ -959,27 +959,45 @@ impl MachineProfile {
         Self::EVERY.iter().map(|p| format!("{:<14}{}\n", p.name(), p.label())).collect()
     }
 
-    /// The processors populated at most: four on the Tezro, two on the Octane,
-    /// one elsewhere.
+    /// The processors one node board holds at most: four on the Tezro and on
+    /// a C-brick (Origin 3200, Onyx 3000), two on the Octane, one elsewhere.
+    /// A Hub node board (Origin 200, Origin 2000, Onyx2) has two slots, but
+    /// the PROM does not start with both filled yet, so it takes one.
     pub fn max_cpus(self) -> u8 {
         match self {
-            Self::TezroIp53 => 4,
+            Self::TezroIp53 | Self::Origin3200Ip35 | Self::Onyx3000Ip35 => 4,
             Self::OctaneIp30 => 2,
             _ => 1,
         }
     }
 
-    /// Whether this profile can have `cpus` processors, and why not if it
-    /// cannot.
+    /// A Hub machine: two processor slots on each node board, one modelled.
+    fn hub_node(self) -> bool {
+        matches!(self, Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27)
+    }
+
+    /// Whether this profile can have `cpus` processors on a node board, and
+    /// why not if it cannot. A board of four slots is populated with one, two
+    /// or four.
     pub fn accepts_cpus(self, cpus: u8) -> Result<(), String> {
-        if cpus != 1 && self.max_cpus() == 1 {
-            Err(format!("[machine] cpus = {cpus}: only the Octane and the Tezro have more than one processor"))
-        } else if !(1..=self.max_cpus()).contains(&cpus) {
-            let counts = if self == Self::TezroIp53 { "1, 2 or 4" } else { "1 or 2" };
-            Err(format!("[machine] cpus = {cpus}: IRIX runs the {} with {counts}", self.label()))
+        let max = self.max_cpus();
+        if cpus == 2 && self.hub_node() {
+            Err(format!("[machine] cpus = 2: the {}'s second processor on a node board is not working yet (the PROM does not start); use two node boards for two processors", self.label()))
+        } else if cpus != 1 && max == 1 {
+            Err(format!("[machine] cpus = {cpus}: the {} has one processor", self.label()))
+        } else if !(1..=max).contains(&cpus) || cpus == 3 {
+            let counts = if max == 4 { "1, 2 or 4" } else { "1 or 2" };
+            let each = if self.node_boards_vary() { " on each node board" } else { "" };
+            Err(format!("[machine] cpus = {cpus}: IRIX runs the {} with {counts}{each}", self.label()))
         } else {
             Ok(())
         }
+    }
+
+    /// Whether the machine can have more than one node board, so that
+    /// `[machine] cpus` counts the processors of each.
+    pub fn node_boards_vary(self) -> bool {
+        matches!(self, Self::Origin2000Ip27 | Self::Onyx2Ip27 | Self::Origin3200Ip35 | Self::Onyx3000Ip35)
     }
 
     /// The processor `cpu` names on this machine (none: the default, the
@@ -1332,6 +1350,15 @@ pub struct GraphicsSection {
     /// and Guest resolution. See [`MachineConfig::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<GraphicsBoard>,
+    /// Where the board plugs in, for a machine with a choice: the node board
+    /// (C-brick, from 0) whose XIO link reaches it. Unset: the machine's
+    /// own placement. Onyx 3000 only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<u8>,
+    /// The Crosstalk widget (port) the board answers at. Unset: the
+    /// machine's own. Onyx 3000 and Tezro.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget: Option<u8>,
     /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 in GIO
     /// expansion slot 0, which the Ultra64 board then cannot have.
     #[serde(default = "default_graphics_heads")]
@@ -1426,6 +1453,8 @@ impl Default for GraphicsSection {
             newport_mode: None,
             gpu_backend: default_gpu_backend(),
             flash: None,
+            node: None,
+            widget: None,
         }
     }
 }
@@ -1505,7 +1534,7 @@ impl CacheModel {
 }
 
 /// `[machine]` section — platform identity (not performance knobs).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineSection {
     #[serde(default)]
@@ -1516,9 +1545,10 @@ pub struct MachineSection {
     pub cpu: Option<String>,
     #[serde(default)]
     pub cache: CacheModel,
-    /// Processors populated, or the machine's default when unset: read it with
-    /// [`MachineSection::cpus`]. More than one only on the Octane and the
-    /// Tezro.
+    /// Processors populated on each node board, or the machine's default
+    /// when unset: read it with [`MachineSection::cpus`]. A machine of two
+    /// node boards (two C-bricks, two Origin 2000 or Onyx2 nodes) runs twice
+    /// as many: [`MachineConfig::total_cpus`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u8>,
     /// Mints the machine's system id (what `sysinfo -s` and `lmhostid`
@@ -1528,6 +1558,61 @@ pub struct MachineSection {
     /// [`crate::identity`].
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub emu_id: u32,
+
+    // The keys below are how a file spells what a machine has beyond the
+    // shared keys. In memory they live in the machine's own section
+    // (`tezro`, `onyx3000`, ...): [`MachineConfig::fold_machine_keys`] moves
+    // them there when a file is loaded, [`MachineConfig::for_writing`] back
+    // when one is written, and the code reads the sections. The sections are
+    // still read from a file, as the older spelling.
+    /// Node boards: the C-bricks of an Origin 3200 or Onyx 3000, the node
+    /// boards of an Origin 2000 or Onyx2. Read it with
+    /// [`MachineConfig::node_boards`].
+    #[serde(default, alias = "c_bricks", skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<u8>,
+    /// The file that keeps the boot flash between runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash: Option<String>,
+    /// The console connection: `l1`, `ioc3_a`, `ioc3_b`, or on the Tezro
+    /// `ioc4_a` to `ioc4_d`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l1_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brick_serial: Option<String>,
+    /// Tezro: host TCP ports of IOC4 ports 2 and 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_port_c: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_port_d: Option<u16>,
+    /// Tezro, Fuel, Origin 3200, Onyx 3000: fit the ICE1724 audio card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_card: Option<bool>,
+    /// Fuel: which keyboard and mouse the host's reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ps2_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_input: Option<bool>,
+    /// Origin 200, Origin 2000, Onyx2: the module controller's store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_store: Option<String>,
+    /// Origin 2000, Onyx2: the BaseIO card's I/O PROM image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_prom: Option<String>,
+    /// O2: a PS/2 mouse on the second port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
+    /// O2: the scripting control port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_port: Option<u16>,
+    /// O2 test aid: lend a kernel the FPU inside the PROM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arcs_fpu: Option<bool>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -1535,7 +1620,7 @@ fn is_zero_u32(v: &u32) -> bool {
 }
 
 impl MachineSection {
-    /// The processors populated: `cpus` as set, or the profile's default. A
+    /// The processors populated on each node board: `cpus` as set, or the profile's default. A
     /// machine owns its own default (the Tezro's is
     /// `ip53_machine::DEFAULT_CPUS`); every other profile populates one.
     pub fn cpus(&self) -> u8 {
@@ -1543,12 +1628,6 @@ impl MachineSection {
             MachineProfile::TezroIp53 => crate::ip53_machine::DEFAULT_CPUS,
             _ => 1,
         })
-    }
-}
-
-impl Default for MachineSection {
-    fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: None, cache: CacheModel::default(), cpus: None, emu_id: 0 }
     }
 }
 
@@ -1610,6 +1689,26 @@ pub struct O2Section {
     /// Deprecated: `[[port_forward]]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<PortForwardConfig>,
+}
+
+impl O2Section {
+    /// Left out of a written config when nothing in it was set.
+    fn is_default(&self) -> bool {
+        self.mouse
+            && self.control_port.is_none()
+            && !self.arcs_fpu
+            && self.prom.is_none()
+            && self.flash.is_none()
+            && self.ram_mb.is_none()
+            && self.dimms.is_none()
+            && self.disks.is_empty()
+            && self.serial_port.is_none()
+            && self.serial_log.is_none()
+            && self.graphics.is_none()
+            && self.cpu_mhz.is_none()
+            && self.net.is_none()
+            && self.forwards.is_empty()
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -2258,6 +2357,9 @@ pub struct FuelSection {
     /// the marked synthetic `EMUN00`.
     #[serde(default)]
     pub brick_serial: Option<String>,
+    /// Fit the audio card (IC Ensemble ICE1724) in a PCI slot. Off by default.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 fn default_fuel_input() -> bool { true }
@@ -2273,6 +2375,7 @@ impl Default for FuelSection {
             usb_input: false,
             l1_revision: None,
             brick_serial: None,
+            audio: false,
         }
     }
 }
@@ -2288,6 +2391,7 @@ impl FuelSection {
             && !self.usb_input
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
+            && !self.audio
     }
 }
 
@@ -2314,9 +2418,11 @@ impl Ip35Console {
 #[serde(deny_unknown_fields)]
 pub struct Ip35Section {
     /// C-bricks: 1 or 2. Two are joined by the direct NUMAlink cable, with no
-    /// router. The I-brick is cabled to the first.
-    #[serde(default = "default_c_bricks")]
-    pub c_bricks: u8,
+    /// router. The I-brick is cabled to the first. Unset: 1, or 2 on an Onyx
+    /// 3000 with a V12, whose V-brick then has a C-brick of its own
+    /// ([`MachineConfig::c_bricks`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c_bricks: Option<u8>,
     /// Persistent 16 MiB boot flash of the first C-brick (the second keeps its
     /// own beside it, at the name with `.1` added). Absent means volatile.
     #[serde(default)]
@@ -2338,20 +2444,23 @@ pub struct Ip35Section {
     /// bytes. Unset: the marked synthetic `EMUN00`.
     #[serde(default)]
     pub brick_serial: Option<String>,
+    /// Fit the audio card (IC Ensemble ICE1724) in an I-brick PCI slot. Off
+    /// by default.
+    #[serde(default)]
+    pub audio: bool,
 }
-
-fn default_c_bricks() -> u8 { 1 }
 
 impl Default for Ip35Section {
     fn default() -> Self {
         Self {
-            c_bricks: default_c_bricks(),
+            c_bricks: None,
             flash: None,
             console: Ip35Console::default(),
             l1_port: None,
             l1_log: None,
             l1_revision: None,
             brick_serial: None,
+            audio: false,
         }
     }
 }
@@ -2359,13 +2468,14 @@ impl Default for Ip35Section {
 impl Ip35Section {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
-        self.c_bricks == default_c_bricks()
+        self.c_bricks.is_none()
             && self.flash.is_none()
             && self.console == Ip35Console::default()
             && self.l1_port.is_none()
             && self.l1_log.is_none()
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
+            && !self.audio
     }
 }
 
@@ -2713,7 +2823,7 @@ pub struct MachineConfig {
     pub jitv2: Jitv2Config,
 
     /// The O2 (`[o2]` section), used when `[machine] profile = "o2_ip32"`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "O2Section::is_default")]
     pub o2: O2Section,
 
     /// Deprecated `[impact]` section; see [`LegacyImpactSection`].
@@ -2746,8 +2856,7 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Ip35Section::is_default")]
     pub origin3200: Ip35Section,
 
-    /// `[onyx3000]`: the keys of `[origin3200]`; `c_bricks` is refused, the
-    /// graphics board fixes it.
+    /// `[onyx3000]`: the keys of `[origin3200]`.
     #[serde(default, skip_serializing_if = "Ip35Section::is_default")]
     pub onyx3000: Ip35Section,
 
@@ -3280,8 +3389,217 @@ impl MachineConfig {
         cfg.banks_set = table.contains_key("banks");
         cfg.jitv2_threads_set = table.get("jitv2").and_then(|j| j.get("threads")).is_some();
         cfg.fold_deprecated();
+        cfg.fold_machine_keys().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         cfg.settle_jitv2_threads();
         Ok(cfg)
+    }
+
+    /// Move the `[machine]` keys a machine has beyond the shared ones into its own section, where
+    /// the code reads them. A key the profile does not have is refused; one also set in the
+    /// machine's older section wins over it.
+    pub fn fold_machine_keys(&mut self) -> Result<(), String> {
+        use MachineProfile as P;
+        let p = self.machine.profile;
+        let not_here = |key: &str| format!("machine.{key} is not a key of machine.profile {}", p.name());
+        let console = |text: &str| format!("machine.console \"{text}\" is not a console of machine.profile {}", p.name());
+        if let Some(nodes) = self.machine.nodes.take() {
+            match p {
+                P::Origin3200Ip35 => self.origin3200.c_bricks = Some(nodes),
+                P::Onyx3000Ip35 => self.onyx3000.c_bricks = Some(nodes),
+                P::Origin2000Ip27 => self.origin2000.nodes = nodes,
+                P::Onyx2Ip27 => self.onyx2.nodes = nodes,
+                _ if nodes == 1 => {}
+                _ => return Err(format!("machine.nodes {nodes}: machine.profile {} has one node board", p.name())),
+            }
+        }
+        if let Some(flash) = self.machine.flash.take() {
+            let slot = match p {
+                P::OctaneIp30 => &mut self.octane.flash,
+                P::Origin200Ip29 => &mut self.origin200.flash,
+                P::Origin2000Ip27 => &mut self.origin2000.flash,
+                P::Onyx2Ip27 => &mut self.onyx2.flash,
+                P::FuelIp34 => &mut self.fuel.flash,
+                P::TezroIp53 => &mut self.tezro.flash,
+                P::Origin3200Ip35 => &mut self.origin3200.flash,
+                P::Onyx3000Ip35 => &mut self.onyx3000.flash,
+                _ => return Err(not_here("flash")),
+            };
+            *slot = Some(flash);
+        }
+        if let Some(text) = self.machine.console.take() {
+            let value = toml::Value::String(text.clone());
+            match p {
+                P::FuelIp34 => self.fuel.console = value.try_into().map_err(|_| console(&text))?,
+                P::Origin3200Ip35 => self.origin3200.console = value.try_into().map_err(|_| console(&text))?,
+                P::Onyx3000Ip35 => self.onyx3000.console = value.try_into().map_err(|_| console(&text))?,
+                P::TezroIp53 => self.tezro.console = value.try_into().map_err(|_| console(&text))?,
+                _ => return Err(not_here("console")),
+            }
+        }
+        if let Some(port) = self.machine.l1_port.take() {
+            let slot = match p {
+                P::FuelIp34 => &mut self.fuel.l1_port,
+                P::TezroIp53 => &mut self.tezro.l1_port,
+                P::Origin3200Ip35 => &mut self.origin3200.l1_port,
+                P::Onyx3000Ip35 => &mut self.onyx3000.l1_port,
+                _ => return Err(not_here("l1_port")),
+            };
+            *slot = Some(port);
+        }
+        if let Some(log) = self.machine.l1_log.take() {
+            let slot = match p {
+                P::FuelIp34 => &mut self.fuel.l1_log,
+                P::TezroIp53 => &mut self.tezro.l1_log,
+                P::Origin3200Ip35 => &mut self.origin3200.l1_log,
+                P::Onyx3000Ip35 => &mut self.onyx3000.l1_log,
+                _ => return Err(not_here("l1_log")),
+            };
+            *slot = Some(log);
+        }
+        if let Some(revision) = self.machine.l1_revision.take() {
+            let slot = match p {
+                P::FuelIp34 => &mut self.fuel.l1_revision,
+                P::Origin3200Ip35 => &mut self.origin3200.l1_revision,
+                P::Onyx3000Ip35 => &mut self.onyx3000.l1_revision,
+                _ => return Err(not_here("l1_revision")),
+            };
+            *slot = Some(revision);
+        }
+        if let Some(serial) = self.machine.brick_serial.take() {
+            let slot = match p {
+                P::FuelIp34 => &mut self.fuel.brick_serial,
+                P::Origin3200Ip35 => &mut self.origin3200.brick_serial,
+                P::Onyx3000Ip35 => &mut self.onyx3000.brick_serial,
+                _ => return Err(not_here("brick_serial")),
+            };
+            *slot = Some(serial);
+        }
+        let tezro = p == P::TezroIp53;
+        if let Some(port) = self.machine.serial_port_c.take() {
+            if !tezro { return Err(not_here("serial_port_c")); }
+            self.tezro.serial_port_c = Some(port);
+        }
+        if let Some(port) = self.machine.serial_port_d.take() {
+            if !tezro { return Err(not_here("serial_port_d")); }
+            self.tezro.serial_port_d = Some(port);
+        }
+        if let Some(card) = self.machine.audio_card.take() {
+            let slot = match p {
+                P::TezroIp53 => &mut self.tezro.audio,
+                P::FuelIp34 => &mut self.fuel.audio,
+                P::Origin3200Ip35 => &mut self.origin3200.audio,
+                P::Onyx3000Ip35 => &mut self.onyx3000.audio,
+                _ => return Err(not_here("audio_card")),
+            };
+            *slot = card;
+        }
+        let fuel = p == P::FuelIp34;
+        if let Some(on) = self.machine.ps2_input.take() {
+            if !fuel { return Err(not_here("ps2_input")); }
+            self.fuel.ps2_input = on;
+        }
+        if let Some(on) = self.machine.usb_input.take() {
+            if !fuel { return Err(not_here("usb_input")); }
+            self.fuel.usb_input = on;
+        }
+        if let Some(store) = self.machine.controller_store.take() {
+            let slot = match p {
+                P::Origin200Ip29 => &mut self.origin200.controller_store,
+                P::Origin2000Ip27 => &mut self.origin2000.controller_store,
+                P::Onyx2Ip27 => &mut self.onyx2.controller_store,
+                _ => return Err(not_here("controller_store")),
+            };
+            *slot = Some(store);
+        }
+        if let Some(image) = self.machine.io_prom.take() {
+            let slot = match p {
+                P::Origin200Ip29 => &mut self.origin200.io_prom,
+                P::Origin2000Ip27 => &mut self.origin2000.io_prom,
+                P::Onyx2Ip27 => &mut self.onyx2.io_prom,
+                _ => return Err(not_here("io_prom")),
+            };
+            *slot = Some(image);
+        }
+        let o2 = p == P::O2Ip32;
+        if let Some(mouse) = self.machine.mouse.take() {
+            if !o2 { return Err(not_here("mouse")); }
+            self.o2.mouse = mouse;
+        }
+        if let Some(port) = self.machine.control_port.take() {
+            if !o2 { return Err(not_here("control_port")); }
+            self.o2.control_port = Some(port);
+        }
+        if let Some(on) = self.machine.arcs_fpu.take() {
+            if !o2 { return Err(not_here("arcs_fpu")); }
+            self.o2.arcs_fpu = on;
+        }
+        Ok(())
+    }
+
+    /// The config as a file spells it: what the profile's own section holds, as `[machine]` keys,
+    /// and that section left out. The inverse of [`Self::fold_machine_keys`]; serialize the result.
+    pub fn for_writing(&self) -> Self {
+        use MachineProfile as P;
+        fn name<T: Serialize>(value: &T) -> Option<String> {
+            toml::Value::try_from(value).ok().and_then(|v| v.as_str().map(str::to_owned))
+        }
+        let mut out = self.clone();
+        let m = &mut out.machine;
+        match self.machine.profile {
+            P::O2Ip32 => {
+                let o2 = std::mem::take(&mut out.o2);
+                m.mouse = (!o2.mouse).then_some(false);
+                m.control_port = o2.control_port;
+                m.arcs_fpu = o2.arcs_fpu.then_some(true);
+            }
+            P::OctaneIp30 => m.flash = std::mem::take(&mut out.octane).flash,
+            P::Origin200Ip29 | P::Origin2000Ip27 | P::Onyx2Ip27 => {
+                let section = std::mem::take(match self.machine.profile {
+                    P::Origin200Ip29 => &mut out.origin200,
+                    P::Origin2000Ip27 => &mut out.origin2000,
+                    _ => &mut out.onyx2,
+                });
+                m.nodes = (section.nodes != default_ip27_nodes()).then_some(section.nodes);
+                m.flash = section.flash;
+                m.controller_store = section.controller_store;
+                m.io_prom = section.io_prom;
+            }
+            P::FuelIp34 => {
+                let fuel = std::mem::take(&mut out.fuel);
+                m.flash = fuel.flash;
+                m.console = (fuel.console != Ip35Console::default()).then(|| name(&fuel.console)).flatten();
+                m.l1_port = fuel.l1_port;
+                m.l1_log = fuel.l1_log;
+                m.ps2_input = (!fuel.ps2_input).then_some(false);
+                m.usb_input = fuel.usb_input.then_some(true);
+                m.l1_revision = fuel.l1_revision;
+                m.brick_serial = fuel.brick_serial;
+                m.audio_card = fuel.audio.then_some(true);
+            }
+            P::TezroIp53 => {
+                let tezro = std::mem::take(&mut out.tezro);
+                m.flash = tezro.flash;
+                m.console = (tezro.console != TezroConsole::default()).then(|| name(&tezro.console)).flatten();
+                m.l1_port = tezro.l1_port;
+                m.l1_log = tezro.l1_log;
+                m.serial_port_c = tezro.serial_port_c;
+                m.serial_port_d = tezro.serial_port_d;
+                m.audio_card = tezro.audio.then_some(true);
+            }
+            P::Origin3200Ip35 | P::Onyx3000Ip35 => {
+                let section = std::mem::take(if self.machine.profile == P::Onyx3000Ip35 { &mut out.onyx3000 } else { &mut out.origin3200 });
+                m.nodes = section.c_bricks;
+                m.flash = section.flash;
+                m.console = (section.console != Ip35Console::default()).then(|| name(&section.console)).flatten();
+                m.l1_port = section.l1_port;
+                m.l1_log = section.l1_log;
+                m.l1_revision = section.l1_revision;
+                m.brick_serial = section.brick_serial;
+                m.audio_card = section.audio.then_some(true);
+            }
+            _ => {}
+        }
+        out
     }
 
     /// Give an unset `[jitv2] threads` a size that fits both the guest and
@@ -3311,7 +3629,30 @@ impl MachineConfig {
             let threads = self.jitv2.threads;
             return (threads, format!("set explicitly ({threads} worker(s))"));
         }
-        auto_jitv2_threads(self.machine.cpus() as usize, host_parallelism())
+        auto_jitv2_threads(self.total_cpus(), host_parallelism())
+    }
+
+    /// The C-bricks of an Origin 3200 or an Onyx 3000: `c_bricks` of its
+    /// section. Unset, one, except an Onyx 3000 with a V12: two, the V-brick
+    /// on the second.
+    pub fn c_bricks(&self) -> usize {
+        let vbrick = self.machine.profile == MachineProfile::Onyx3000Ip35 && self.graphics_board().is_vpro();
+        self.ip35_section().c_bricks.map_or(if vbrick { 2 } else { 1 }, usize::from)
+    }
+
+    /// The node boards the machine has: the C-bricks of an Origin 3200 or an
+    /// Onyx 3000, the nodes of an Origin 2000 or Onyx2, one elsewhere.
+    pub fn node_boards(&self) -> usize {
+        match self.machine.profile {
+            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => self.c_bricks(),
+            MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => self.ip27_section().map_or(1, |s| usize::from(s.nodes)),
+            _ => 1,
+        }
+    }
+
+    /// The processors the machine runs: `[machine] cpus` on each node board.
+    pub fn total_cpus(&self) -> usize {
+        self.node_boards() * usize::from(self.machine.cpus())
     }
 
     /// Load from `iris.toml` if it exists, otherwise return defaults.
@@ -3473,6 +3814,17 @@ impl MachineConfig {
     }
 
     /// The section that configures an IP35 brick machine: `[origin3200]` or `[onyx3000]`.
+    /// Whether the ICE1724 audio card is fitted (`[machine] audio_card`), on
+    /// the machines that take one.
+    pub fn audio_card(&self) -> bool {
+        match self.machine.profile {
+            MachineProfile::TezroIp53 => self.tezro.audio,
+            MachineProfile::FuelIp34 => self.fuel.audio,
+            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => self.ip35_section().audio,
+            _ => false,
+        }
+    }
+
     pub fn ip35_section(&self) -> &Ip35Section {
         if self.machine.profile == MachineProfile::Onyx3000Ip35 { &self.onyx3000 } else { &self.origin3200 }
     }
@@ -3589,15 +3941,28 @@ impl MachineConfig {
             });
         }
         if profile == MachineProfile::Origin200Ip29 && self.origin200.nodes != default_ip27_nodes() {
-            return Err("origin200.nodes: an Origin 200 has one node board".into());
+            return Err("machine.nodes: an Origin 200 has one node board".into());
         }
         if let (Some(table), Some(section)) = (profile.table_name(), self.ip27_section()) {
             if matches!(profile, MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) && !(1..=2).contains(&section.nodes) {
-                return Err(format!("{table}.nodes {} is invalid (valid: 1, 2)", section.nodes));
+                return Err(format!("machine.nodes {} is invalid (valid: 1, 2)", section.nodes));
             }
         }
         if profile == MachineProfile::Origin200Ip29 && self.origin200.io_prom.is_some() {
-            return Err("origin200.io_prom: an Origin 200 has no BaseIO card".into());
+            return Err("machine.io_prom: an Origin 200 has no BaseIO card".into());
+        }
+        Ok(())
+    }
+
+    /// `[graphics] node` and `widget` only where the machine has a choice of where the board
+    /// plugs in: the Onyx 3000 (both) and the Tezro (the widget). Each checks its own values.
+    fn validate_graphics_placement(&self) -> Result<(), String> {
+        let p = self.machine.profile;
+        if self.graphics.node.is_some_and(|node| node != 0) && p != MachineProfile::Onyx3000Ip35 {
+            return Err(format!("graphics.node: machine.profile {} has one place for its graphics board", p.name()));
+        }
+        if self.graphics.widget.is_some() && !matches!(p, MachineProfile::Onyx3000Ip35 | MachineProfile::TezroIp53) {
+            return Err(format!("graphics.widget: machine.profile {} has one place for its graphics board", p.name()));
         }
         Ok(())
     }
@@ -3606,6 +3971,7 @@ impl MachineConfig {
         self.validate_virtio_serial()?;
         self.validate_ip27_sections()?;
         self.xio_widgets()?;
+        self.validate_graphics_placement()?;
         self.validate_nvme()?;
         self.validate_fibre_channel()?;
         self.cpu_part()?;
@@ -3768,24 +4134,23 @@ impl MachineConfig {
                 return Err(format!("graphics.board \"{}\" is not a Fuel board (valid: v12, v10, none)", board.as_str()));
             }
             if let Some(text) = &self.fuel.l1_revision {
-                crate::dev::l1::parse_revision(text).map_err(|e| format!("fuel.l1_revision: {e}"))?;
+                crate::dev::l1::parse_revision(text).map_err(|e| format!("machine.l1_revision: {e}"))?;
             }
             if self.fuel.brick_serial.as_ref().is_some_and(|s| s.len() > 37 || s.contains('\0')) {
-                return Err("fuel.brick_serial must be at most 37 bytes with no NUL".into());
+                return Err("machine.brick_serial must be at most 37 bytes with no NUL".into());
             }
         } else if self.machine.profile.is_ip35_bricks() {
             let section = self.ip35_section();
             let name = self.machine.profile.table_name().unwrap_or_default();
             let onyx = self.machine.profile == MachineProfile::Onyx3000Ip35;
+            if let Some(count) = section.c_bricks.filter(|count| !(1..=2).contains(count)) {
+                return Err(format!("machine.nodes {count} is invalid (valid: 1, 2)"));
+            }
             if onyx {
-                if section.c_bricks != default_c_bricks() {
-                    return Err("onyx3000.c_bricks is not a key of the Onyx 3000".into());
-                }
+                crate::ip35_machine::check_placement(self)?;
                 if let Some((product, _)) = board.kona() {
                     product.spec().check_host(crate::dev::kona::KonaHost::Onyx3000)?;
                 }
-            } else if !(1..=2).contains(&section.c_bricks) {
-                return Err(format!("origin3200.c_bricks {} is invalid (valid: 1, 2)", section.c_bricks));
             }
             self.ip35_banks()?;
             if !board.supports(self.machine.profile) {
@@ -3796,10 +4161,10 @@ impl MachineConfig {
                 });
             }
             if let Some(text) = &section.l1_revision {
-                crate::dev::l1::parse_revision(text).map_err(|e| format!("{name}.l1_revision: {e}"))?;
+                crate::dev::l1::parse_revision(text).map_err(|e| format!("machine.l1_revision: {e}"))?;
             }
             if section.brick_serial.as_ref().is_some_and(|s| s.len() > 37 || s.contains('\0')) {
-                return Err(format!("{name}.brick_serial must be at most 37 bytes with no NUL"));
+                return Err(format!("machine.brick_serial must be at most 37 bytes with no NUL"));
             }
         } else if self.machine.profile == MachineProfile::TezroIp53 {
             if !TEZRO_CPUS.contains(&self.machine.cpus()) {
@@ -3809,6 +4174,9 @@ impl MachineConfig {
             crate::ip53_machine::check_banks_for_cpus(&self.tezro_memory()?, usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
             if !board.supports(MachineProfile::TezroIp53) {
                 return Err(format!("graphics.board \"{}\" is not a Tezro board (valid: v12, none)", board.as_str()));
+            }
+            if let Some(widget) = self.graphics.widget {
+                crate::ip53_machine::check_vpro_widget(widget)?;
             }
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
             // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
@@ -3945,7 +4313,7 @@ impl MachineConfig {
             if cfg!(feature = "lightning") {
                 return Err("jitv2.compile = \"sync\" is not available in a `lightning` build, which always compiles on the pool".into());
             }
-            if self.machine.cpus() > 1 {
+            if self.total_cpus() > 1 {
                 return Err("jitv2.compile = \"sync\" needs one CPU: several share the compile pool's threads".into());
             }
         }
@@ -5298,6 +5666,74 @@ mod export_tests {
         toml::from_str(&format!("[machine]\nprofile = \"{profile}\"\n{tables}")).unwrap()
     }
 
+    /// `[machine]` holds what a machine has beyond the shared keys; `c_bricks` is `nodes`. A file
+    /// written from the loaded config says the same there and has no table named for the machine.
+    #[test]
+    fn the_machine_section_holds_each_machines_own_keys() {
+        let load = |text: &str| MachineConfig::from_toml_str(text).map_err(|e| e.to_string());
+        let onyx = load("[machine]\nprofile = \"onyx3000_ip35\"\nc_bricks = 2\nflash = \"f\"\nconsole = \"ioc3_a\"\nl1_port = 9000\nbrick_serial = \"S\"\n").unwrap();
+        assert_eq!((onyx.c_bricks(), onyx.node_boards()), (2, 2));
+        assert_eq!((onyx.onyx3000.flash.as_deref(), onyx.onyx3000.console, onyx.onyx3000.l1_port), (Some("f"), Ip35Console::Ioc3A, Some(9000)));
+        assert_eq!(onyx.machine.nodes, None, "moved to the machine's section");
+        let text = toml::to_string_pretty(&onyx.for_writing()).unwrap();
+        assert!(text.contains("nodes = 2") && text.contains("console = \"ioc3_a\"") && !text.contains("[onyx3000]"), "{text}");
+        let back = load(&text).unwrap();
+        assert_eq!((back.c_bricks(), back.onyx3000.brick_serial.as_deref()), (2, Some("S")));
+
+        let tezro = load("[machine]\nprofile = \"tezro_ip53\"\nconsole = \"ioc4_c\"\nserial_port_c = 9003\naudio_card = true\n").unwrap();
+        assert_eq!((tezro.tezro.console, tezro.tezro.serial_port_c, tezro.tezro.audio), (TezroConsole::Ioc4C, Some(9003), true));
+        let text = toml::to_string_pretty(&tezro.for_writing()).unwrap();
+        assert!(text.contains("audio_card = true") && !text.contains("[tezro]"), "{text}");
+        // The Fuel, Origin 3200 and Onyx 3000 take the same card; no other machine does.
+        for (profile, cpu) in [("fuel_ip34", "r14000"), ("origin3200_ip35", "r12000"), ("onyx3000_ip35", "r12000")] {
+            let cfg = load(&format!("[machine]\nprofile = \"{profile}\"\ncpu = \"{cpu}\"\naudio_card = true\n")).unwrap();
+            assert!(cfg.audio_card(), "{profile}");
+            let text = toml::to_string_pretty(&cfg.for_writing()).unwrap();
+            assert!(text.contains("audio_card = true"), "{profile}: {text}");
+            assert!(MachineConfig::parse_toml(&text).unwrap().audio_card(), "{profile}");
+        }
+        assert!(load("[machine]\nprofile = \"octane_ip30\"\naudio_card = true\n").unwrap_err().contains("machine.audio_card is not a key"));
+
+        let onyx2 = load("[machine]\nprofile = \"onyx2_ip27\"\nnodes = 2\nio_prom = \"io6prom.img\"\n").unwrap();
+        assert_eq!((onyx2.node_boards(), onyx2.onyx2.io_prom.as_deref()), (2, Some("io6prom.img")));
+        let fuel = load("[machine]\nprofile = \"fuel_ip34\"\nps2_input = false\nusb_input = true\n").unwrap();
+        assert!(!fuel.fuel.ps2_input && fuel.fuel.usb_input);
+        let o2 = load("[machine]\nprofile = \"o2_ip32\"\nmouse = false\ncontrol_port = 7000\n").unwrap();
+        assert_eq!((o2.o2.mouse, o2.o2.control_port), (false, Some(7000)));
+        assert!(toml::to_string_pretty(&o2.for_writing()).unwrap().contains("control_port = 7000"));
+
+        // The machine's older table still loads, and a `[machine]` key wins over it.
+        let old = load("[machine]\nprofile = \"origin3200_ip35\"\n[origin3200]\nc_bricks = 2\nflash = \"old\"\n").unwrap();
+        assert_eq!((old.c_bricks(), old.origin3200.flash.as_deref()), (2, Some("old")));
+        let both = load("[machine]\nprofile = \"origin3200_ip35\"\nnodes = 1\n[origin3200]\nc_bricks = 2\n").unwrap();
+        assert_eq!(both.c_bricks(), 1);
+
+        // A key the machine does not have, a second node board on a machine of one, a console of
+        // another machine.
+        assert!(load("[machine]\nprofile = \"indy_ip24\"\nflash = \"f\"\n").unwrap_err().contains("machine.flash is not a key"));
+        assert!(load("[machine]\nprofile = \"tezro_ip53\"\nnodes = 2\n").unwrap_err().contains("one node board"));
+        load("[machine]\nprofile = \"tezro_ip53\"\nnodes = 1\n").unwrap();
+        assert!(load("[machine]\nprofile = \"fuel_ip34\"\nconsole = \"ioc4_a\"\n").unwrap_err().contains("is not a console"));
+    }
+
+    /// `[graphics] node` and `widget` say where the board plugs in, on the machines with a choice.
+    #[test]
+    fn the_graphics_section_places_the_board() {
+        let onyx = |keys: &str| MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"onyx3000_ip35\"\n{keys}")).unwrap().validate();
+        onyx("nodes = 2\n[graphics]\nboard = \"v12\"\nnode = 0\n").unwrap();
+        onyx("nodes = 2\n[graphics]\nboard = \"v12\"\nnode = 1\nwidget = 12\n").unwrap();
+        onyx("nodes = 2\n[graphics]\nboard = \"ir3\"\nnode = 1\n").unwrap();
+        assert!(onyx("nodes = 1\n[graphics]\nboard = \"ir3\"\nnode = 1\n").unwrap_err().contains("graphics.node 1"));
+        assert!(onyx("nodes = 1\n[graphics]\nboard = \"v12\"\nwidget = 8\n").unwrap_err().contains("port B"));
+        assert!(onyx("nodes = 2\n[graphics]\nboard = \"v12\"\nwidget = 10\n").unwrap_err().contains("graphics.widget 10"));
+        let tezro = |keys: &str| MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"tezro_ip53\"\n[graphics]\nboard = \"v12\"\n{keys}")).unwrap().validate();
+        tezro("widget = 13\n").unwrap();
+        assert!(tezro("widget = 11\n").unwrap_err().contains("graphics.widget 11"));
+        assert!(tezro("node = 1\n").unwrap_err().contains("graphics.node"));
+        let octane = MachineConfig::from_toml_str("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\n[graphics]\nwidget = 9\n").unwrap();
+        assert!(octane.validate().unwrap_err().contains("graphics.widget"));
+    }
+
     /// Each IP27 product reads the table named for it, and only that one.
     #[test]
     fn each_ip27_product_reads_its_own_table() {
@@ -5345,7 +5781,7 @@ mod export_tests {
             }
             for nodes in [0, 3] {
                 let e = ip27_config(profile, &format!("[{table}]\nnodes = {nodes}\n")).validate().unwrap_err();
-                assert!(e.contains(&format!("{table}.nodes {nodes} is invalid (valid: 1, 2)")), "{e}");
+                assert!(e.contains(&format!("machine.nodes {nodes} is invalid (valid: 1, 2)")), "{e}");
             }
         }
     }
@@ -5382,14 +5818,14 @@ mod export_tests {
     #[test]
     fn the_origin_200_has_one_node() {
         let e = ip27_config("origin200_ip29", "[origin200]\nnodes = 2\n").validate().unwrap_err();
-        assert!(e.contains("origin200.nodes"), "{e}");
+        assert!(e.contains("machine.nodes"), "{e}");
         ip27_config("origin200_ip29", "[origin200]\nnodes = 1\n").validate().unwrap();
     }
 
     #[test]
     fn the_origin_200_has_no_baseio_card_to_attach_an_io_prom() {
         let e = ip27_config("origin200_ip29", "[origin200]\nio_prom = \"io6prom.img\"\n").validate().unwrap_err();
-        assert!(e.contains("origin200.io_prom"), "{e}");
+        assert!(e.contains("machine.io_prom"), "{e}");
         for (profile, table) in [("origin2000_ip27", "origin2000"), ("onyx2_ip27", "onyx2")] {
             ip27_config(profile, &format!("[{table}]\nio_prom = \"io6prom.img\"\n")).validate().unwrap();
         }
@@ -5412,16 +5848,15 @@ mod export_tests {
             for cpus in 0..=4u8 {
                 let old_ok = match p {
                     MachineProfile::OctaneIp30 => (1..=2).contains(&cpus),
-                    MachineProfile::TezroIp53 => (1..=4).contains(&cpus),
+                    MachineProfile::TezroIp53 => [1, 2, 4].contains(&cpus),
                     _ => cpus == 1,
                 };
                 assert_eq!(p.accepts_cpus(cpus).is_ok(), old_ok, "{p:?} with {cpus}");
             }
-            if !matches!(p, MachineProfile::OctaneIp30 | MachineProfile::TezroIp53) {
-                assert_eq!(
-                    p.accepts_cpus(2).unwrap_err(),
-                    "[machine] cpus = 2: only the Octane and the Tezro have more than one processor"
-                );
+            if p == MachineProfile::Origin200Ip29 {
+                assert!(p.accepts_cpus(2).unwrap_err().contains("second processor on a node board is not working yet"));
+            } else if p.max_cpus() == 1 {
+                assert_eq!(p.accepts_cpus(2).unwrap_err(), format!("[machine] cpus = 2: the {} has one processor", p.label()));
             }
         }
 
@@ -6009,10 +6444,10 @@ mod fuel_input_tests {
         plain.validate().unwrap();
         assert!(plain.fuel.l1_revision.is_none() && plain.fuel.brick_serial.is_none());
         let bad_rev: MachineConfig = toml::from_str(&format!("{base}[fuel]\nl1_revision = \"1.48\"\n")).unwrap();
-        assert!(bad_rev.validate().unwrap_err().contains("fuel.l1_revision"));
+        assert!(bad_rev.validate().unwrap_err().contains("machine.l1_revision"));
         let long = "x".repeat(38);
         let bad_serial: MachineConfig = toml::from_str(&format!("{base}[fuel]\nbrick_serial = \"{long}\"\n")).unwrap();
-        assert!(bad_serial.validate().unwrap_err().contains("fuel.brick_serial"));
+        assert!(bad_serial.validate().unwrap_err().contains("machine.brick_serial"));
     }
 
     #[test]
@@ -6241,7 +6676,7 @@ mod tezro_config_tests {
         fuel.machine.profile = MachineProfile::FuelIp34;
         fuel.set_cpu(&parts::R14000_500);
         fuel.machine.cpus = Some(2);
-        assert!(fuel.validate().unwrap_err().contains("only the Octane and the Tezro"));
+        assert!(fuel.validate().unwrap_err().contains("has one processor"));
     }
 
     /// The 700 MHz chip is populated as one, two or four processors, the 1000

@@ -16,8 +16,8 @@ Copy [`onyx2.toml.example`](../onyx2.toml.example) to `onyx2.toml`, provide the
 disk named there, and run `iris --config onyx2.toml`. The node PROM and the
 BaseIO PROM are built in, and `prom` overrides the first as on the
 [Origin 200](origin200-ip29.md). The sample
-selects `machine.profile = "onyx2_ip27"`; `[onyx2]` (`nodes`, `flash`,
-`controller_store`, `io_prom`) holds its own keys. The BaseIO's boot flash
+selects `machine.profile = "onyx2_ip27"`; `[machine]` also holds its own keys (`nodes`, `flash`,
+`controller_store`, `io_prom`); the `[onyx2]` table of older configs is still read. The BaseIO's boot flash
 holds the I/O PROM built into iris (6.156, the image the IRIX 6.5.30 media ship
 beside the node PROM), or the image `io_prom` names. The graphics console needs
 that PROM, since the node PROM's own internal copy has none; the

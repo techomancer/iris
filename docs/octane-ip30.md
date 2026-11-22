@@ -30,8 +30,8 @@ NVRAM seeding and Ethernet-address row do not apply and are skipped.
 
 ## Configure the machine
 
-An Octane is set up with the shared keys; `[octane]` holds what only an
-Octane has.
+An Octane is set up with the shared keys; `[machine] flash` is the one key
+only it has. (`[machine] flash` is the older spelling, still read.)
 
 ```toml
 # prom = "IP30prom.bin"      # optional: overrides the built-in 4.17 PROM
@@ -44,8 +44,6 @@ nat_subnet = "192.0.2.0/24"
 [machine]
 profile = "octane_ip30"
 cpu = "r10000"
-
-[octane]
 flash = "flash-ip30.bin"      # keep the PROM's flash records between runs
 
 [graphics]
@@ -78,7 +76,7 @@ and a file `prom` names must load (at most 1 MiB) or iris stops with an error.
 
 The PROM is loaded into the boot flash, a 1 MiB part with the Intel/Sharp
 command set on the Bridge's first chip select, where the PROM also keeps its
-persistent records. `[octane] flash` names a file holding the whole flash, so
+persistent records. `[machine] flash` names a file holding the whole flash, so
 those records survive from run to run; it is created from the PROM when missing
 or empty, and an existing file of exactly 1 MiB is used as it stands (delete it
 after changing `prom`). A file of any other size is refused with an error and
@@ -109,6 +107,17 @@ machines ([STORAGE.md](../STORAGE.md)). The controller's own firmware is
 stored and never run; SCSI commands go to iris's shared target model. The
 monitor's `scsi` and `cow` commands reach controller 0 (`scsi1`, `cow1` the
 external bus).
+
+The PROM loads a file from a disk's volume header
+(`boot -f dksc(0,1,8)vmlinux`) one ELF segment per SCSI read, and its
+ISP1040 driver cannot issue a read of more than about 720 KB: a larger one
+times out, and one over about 1.1 MB also corrupts the PROM's adapter state
+and panics it. This is the PROM's own limit, not the emulator's. IRIX's
+volume-header files are small enough; an 11 MB Linux `vmlinux` is not.
+`mkvh build` splits each larger segment of an ELF executable into 512 KB
+segments, which the PROM loads one after another, so a Linux kernel put in
+the volume header with `mkvh` boots from disk (`--no-split` copies a file
+unchanged). Loading over the network (`bootp()vmlinux`) has no such limit.
 
 More storage goes on an option board in a spare XIO slot (`[[xio_board]]`, a
 PCI shoehorn or the PCI module; see [pci.md](pci.md#option-boards-in-xio-slots)):

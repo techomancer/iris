@@ -16,15 +16,16 @@ serial_port_b = 18881
 
 [machine]
 profile = "origin3200_ip35"
+# 1 or 2 C-bricks; two are joined by the direct NUMAlink cable.
+nodes = 2
+console = "l1"
+l1_port = 18882
+# Fit the ICE1724 audio card in an I-brick PCI slot (default false). It plays as [audio]
+# sets; unset no_audio for sound.
+# audio_card = true
 
 [graphics]
 board = "none"
-
-[origin3200]
-# 1 or 2 C-bricks; two are joined by the direct NUMAlink cable.
-c_bricks = 2
-console = "l1"
-l1_port = 18882
 
 [network]
 mode = "off"

@@ -347,7 +347,7 @@ impl OctaneMachine {
         // `[octane] flash` they last from run to run.
         let flash = Arc::new(match &cfg.octane.flash {
             Some(path) => {
-                CfiFlash::with_file(&prom, FLASH_SIZE, path).map_err(|e| format!("octane.flash {path}: {e}"))?
+                CfiFlash::with_file(&prom, FLASH_SIZE, path).map_err(|e| format!("machine.flash {path}: {e}"))?
             }
             None => CfiFlash::new(&prom, FLASH_SIZE),
         });
@@ -565,11 +565,15 @@ impl OctaneMachine {
         let cpu = cpus[0].clone();
         world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
         // One page pool and one body of compiled code: it reaches each CPU's
-        // state through the core pointer it is called with.
+        // state through the core pointer it is called with. A lone CPU shares
+        // its own pool too, so its flushes go through this world: a CPU
+        // belongs to one.
         #[cfg(feature = "jitv2")]
-        if cpu_count > 1 {
+        {
             #[cfg(feature = "jitv2_lockstep")]
-            return Err("[machine] cpus = 2 cannot run with jitv2_lockstep".into());
+            if cpu_count > 1 {
+                return Err("[machine] cpus = 2 cannot run with jitv2_lockstep".into());
+            }
             let jit = cpu.jitv2();
             // Every CPU sees memory at the same addresses: one address space.
             for (n, c) in cpus.iter().enumerate() {
@@ -620,7 +624,7 @@ impl OctaneMachine {
             cfg.jitv2_pool_size(),
             cfg.jitv2.compile,
             phys.phys.clone(),
-            (cpu_count > 1).then(|| world.clone()),
+            world.clone(),
         );
 
         // HEART's levels 0 to 4 are each CPU's IP2 to IP6.
@@ -1240,7 +1244,6 @@ impl OctaneMachine {
         self.restart_peripherals();
         applied?;
         self.start_cpus();
-        self.lifecycle = crate::machine_state::GuestState::Running;
         println!("Snapshot loaded from {}/{name}", saves.display());
         Ok(())
     }
@@ -1518,6 +1521,9 @@ impl Workstation for OctaneMachine {
     }
     fn pending_chd_sync_count(&self) -> usize {
         self.disk_buses().iter().map(|b| b.pending_chd_sync_count()).sum()
+    }
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        self.disk_buses().iter().map(|b| b.activity()).collect()
     }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.disk_buses().iter().try_for_each(|b| b.flush())
@@ -2264,6 +2270,27 @@ mod snapshot_tests {
             let e = a.load_snapshot_in(&dir.join("saves"), "flash").unwrap_err();
             assert!(e.contains("flash"), "{e}");
             assert_eq!(digest(&a), before, "the machine is as it was");
+        }).unwrap().join().unwrap();
+    }
+
+    /// After a restore, a CPU stopped by a breakpoint or the monitor must show
+    /// as stopped, and `machine-start` must run it again.
+    #[test]
+    fn a_restored_octane_can_be_started_again() {
+        use crate::machine_state::GuestState;
+        use crate::workstation::Workstation;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("restore-state");
+            let prom = empty_prom(&dir);
+            let mut m = machine(&prom, &dir);
+            m.save_snapshot_in(&dir.join("saves"), "s").unwrap();
+            m.load_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert_eq!(m.status().state, GuestState::Running);
+            m.stop_cpus();
+            assert_ne!(m.status().state, GuestState::Running);
+            m.start_guest().unwrap();
+            assert!(m.cpu_is_running());
+            m.stop();
         }).unwrap().join().unwrap();
     }
 }

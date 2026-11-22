@@ -24,19 +24,20 @@ cpu = "r14000"
 # are IRIX's host id (emu_id 7 prints 69e20070). 0, the default, keeps
 # 08:00:69:12:34:56.
 # emu_id = 7
+flash = "ignore/fuel/flash.bin"
+console = "l1"
+l1_port = 18882
+# Fit the ICE1724 audio card in a PCI slot (default false). It plays as [audio]
+# sets; unset no_audio for sound.
+# audio_card = true
+# Send the host's keyboard and mouse (from the window or VNC) to a USB keyboard
+# and mouse on the OHCI controller instead of the PS/2 pair (docs/fuel-ip34.md).
+# usb_input = true
 
 [graphics]
 # "v12" or "v10" fits a VPro in the graphics slot; IRIX needs a kernel with
 # the VPro driver. The console stays on serial either way.
 board = "none"
-
-[fuel]
-flash = "ignore/fuel/flash.bin"
-console = "l1"
-l1_port = 18882
-# Send the host's keyboard and mouse (from the window or VNC) to a USB keyboard
-# and mouse on the OHCI controller instead of the PS/2 pair (docs/fuel-ip34.md).
-# usb_input = true
 
 [network]
 # Disconnected cable. For NAT, use mode = "nat".

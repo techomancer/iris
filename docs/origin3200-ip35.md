@@ -2,16 +2,16 @@
 
 The Origin 3200 is built from bricks. A C-brick is a compute node: a Bedrock
 node controller with its processors and memory. An I-brick carries the base
-I/O on an XBridge. One or two C-bricks, each a 400 MHz R12000 with an 8 MiB
-secondary cache and 512 MiB in two 256 MiB banks, are cabled to an I-brick on
-the first. Two C-bricks are joined by a direct NUMAlink cable with no router.
+I/O on an XBridge. One or two C-bricks, each with one, two or four 400 MHz
+R12000s (8 MiB secondary cache) and 512 MiB in two 256 MiB banks, are cabled to
+an I-brick on the first. Two C-bricks are joined by a direct NUMAlink cable with no router.
 
 ## Configuration
 
 Select `machine.profile = "origin3200_ip35"`. The IP35 PROM 6.210 is built
-in; `prom` overrides it as on the [Fuel](fuel-ip34.md). `[origin3200]` takes `c_bricks` (1 or 2), `flash`,
+in; `prom` overrides it as on the [Fuel](fuel-ip34.md). `[machine]` takes `nodes` (1 or 2 C-bricks; `c_bricks` is another name for it), `flash`,
 `console`, `l1_port`, `l1_log`, `l1_revision` and `brick_serial`; see
-[FEATURES.md](../FEATURES.md#origin3200). `banks` is per C-brick: left unset it
+[FEATURES.md](../FEATURES.md#origin3200). The `[origin3200]` table of older configs is still read. `banks` is per C-brick: left unset it
 is two 256 MiB banks. Banks of 256 or 512 MiB are accepted, up to eight, in pairs of one size.
 Graphics are `none`. The I-brick's Fibre Channel adapter takes its disks from
 `[fibre_channel.disk.N]`, N the disk's loop ID (see [the Fibre Channel guide](fibre-channel.md));
@@ -19,9 +19,15 @@ Graphics are `none`. The I-brick's Fibre Channel adapter takes its disks from
 is a complete file.
 
 Each C-brick has its own L1; the first carries the console
-(`console = "l1"`, port `l1_port`). Each C-brick runs one processor; the other
-three positions are listed disabled in the node's flash, which spares the PROM
-three power cycles for each.
+(`console = "l1"`, port `l1_port`).
+
+`[machine] cpus` is the processors on each C-brick: 1 (the default), 2 or 4, so
+two C-bricks run up to eight, each on its own host thread. The positions left
+empty are listed disabled in a new flash, which spares the PROM three power
+cycles for each. Raising `cpus` on a machine with a kept `flash` file ends the
+disable records iris wrote for the positions now filled, and the PROM reports
+them as newly present and enabled. Lowering it leaves the PROM to find the
+empty positions itself on the next start.
 
 ## The I-brick
 
@@ -39,6 +45,14 @@ disks, and its slot runs 64-bit data phases (inferred from the PROM's behaviour:
 the control block and rings it builds are right only if the bridge reverses
 each doubleword of the adapter's DMA). A `[scsi.N]` table is refused.
 
+`[machine] audio_card = true` fits an audio card at device 2 of head F: the IC
+Ensemble ICE1724 with the DMediaPro DM8's converters, the same model as the
+[Tezro's](tezro-ip53.md). The device number is the model's choice; which
+devices the I-brick's option slots are is not established. On an Onyx 3000,
+IRIX 6.5.30 lists it as `Iris Audio Processor: version MAD revision 1` and
+plays through it; it has not been run in an Origin 3200 guest. It plays to the
+host as `[audio]` sets, or silently with `no_audio`.
+
 ## Nodes and the link
 
 Address bits 39:33 name a node. Each node's local block holds the number the PROM
@@ -55,13 +69,15 @@ memory without the bus. Processors are numbered across the machine, and one
 
 PROM 6.210 reaches the System Maintenance Menu with one C-brick (1 CPU, 512 MB)
 and with two (2 CPUs, 1024 MB), both `ALL DIAGS PASSED`, and Start System boots
-IRIX 6.5 from a disk on loop ID 1 to a login on both. The I-brick's IEEE 1394
+IRIX 6.5 from a disk on loop ID 1 to a login on both. Two C-bricks of two and
+of four processors (4 and 8 CPUs) boot the same way, and IRIX runs all of them. The I-brick's IEEE 1394
 controller is absent, so the first diagnostic prints `No 1394 Firewire found on
 BASEIO` and carries on.
 
 ## Approximations and limits
 
-- One processor per C-brick; the other positions are disabled in the flash.
+- The L1 names one processor module for each processor interface in use; the
+  real module count for a population is not established.
 - Which low nibble of the board identification word a C-brick presents is a
   choice (2, the 400 MHz, 8 MiB row). The L1's node board and PIMM records are
   placeholders (`NOTOBSERVED0`), with synthetic serials.

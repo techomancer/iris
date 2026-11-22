@@ -22,6 +22,7 @@ mod scsi_menu;
 mod serial_console;
 mod settings;
 mod single_instance;
+mod summary;
 
 use config_ui::{show_tab, ConfigAction, MemoryUiContext, Tab};
 use dialogs::create_disk::CreateDiskDialog;
@@ -164,7 +165,9 @@ fn fb_draw_rect(outer: egui::Rect, px: egui::Vec2, ppp: f32, max_scale: f32) -> 
 static CLOSE_ON_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> eframe::Result<()> {
-    env_logger::init();
+    // env_logger, plus the tap that tells a file dialog that never appeared
+    // from one the user cancelled (see `filedialog`).
+    filedialog::init_logging();
     // Prevent the iris lib from calling process::exit on guest soft-power-off
     // or CI `quit`. iris-gui never wants the embedder to die from a guest event.
     // Set this once, before any worker thread can read it.
@@ -253,6 +256,8 @@ struct App {
     bench: bench_ui::BenchState,
     emu: EmulatorHandle,
     toast: Option<(String, std::time::Instant)>,
+    /// rfd's reasons, when a Browse button found no file dialog to open.
+    picker_unavailable: Option<Vec<String>>,
     fullscreen: bool,
     stop_modal: Option<StopModal>,
     missing_modal: Option<MissingDiskModal>,
@@ -413,13 +418,6 @@ struct NetSanityModal {
     revert_to: Option<String>,
 }
 
-/// One SCSI device that is missing its backing file at Start time.
-struct MissingDisk {
-    id: u8,
-    path: String,
-    cdrom: bool,
-}
-
 /// True if `path` can actually be *read*. The Start preflight uses this instead
 /// of `Path::exists()` because under the macOS App Sandbox a user-selected file
 /// we hold no current grant for (e.g. a disk image picked in a previous session,
@@ -481,7 +479,7 @@ fn folder_accessible(path: &str) -> bool {
 /// `Machine::new` would otherwise call `std::process::exit(1)` and take
 /// the whole GUI down with it.
 struct MissingDiskModal {
-    missing: Vec<MissingDisk>,
+    missing: Vec<summary::MissingDisk>,
 }
 
 /// One attached CHD whose containing folder the app can't write to, so its
@@ -544,6 +542,7 @@ impl App {
             bench: bench_ui::BenchState::default(),
             emu: EmulatorHandle::spawn(),
             toast: startup_toast,
+            picker_unavailable: None,
             stop_modal: None,
             missing_modal: None,
             chd_grant_modal: None,
@@ -792,13 +791,11 @@ impl App {
         // Preflight: Machine::new will call std::process::exit(1) on the
         // first SCSI device whose backing file is missing — we'd lose the
         // GUI process. Catch that case here and prompt the user instead.
-        let expansion_paths = self.cfg.fibre_channel.iter().flat_map(|fc| fc.disks.values().map(|d| d.path.as_str()))
-            .chain((!self.cfg.nvme.path.is_empty()).then_some(self.cfg.nvme.path.as_str()));
-        if let Some(path) = expansion_paths.into_iter().find(|p| !disk_readable(p)) {
+        if let Some(path) = summary::expansion_paths(&self.cfg).into_iter().find(|p| !disk_readable(p)) {
             self.toast(t!("extra-unreadable-disk", path = path));
             return;
         }
-        let missing = self.missing_disks();
+        let missing = summary::missing_disks(&self.cfg, disk_readable);
         if !missing.is_empty() {
             self.missing_modal = Some(MissingDiskModal { missing });
             return;
@@ -835,11 +832,11 @@ impl App {
         // running status footer can report PCAP vs NAT (and which interface)
         // independent of any later edits to the config editor. On a build without
         // PCAP support the runtime forces NAT (even for an imported `mode =
-        // "pcap"`), so reflect that here and never surface PCAP.
-        self.launched_net = Some(if iris::build_features::PCAP {
-            (self.cfg.network.mode, self.cfg.network.pcap_interface.clone())
-        } else {
-            (iris::config::NetMode::Nat, None)
+        // "pcap"`), so reflect that here and never surface PCAP. Off and
+        // stream stay what they are.
+        self.launched_net = Some(match self.cfg.network.mode {
+            iris::config::NetMode::Pcap if !iris::build_features::PCAP => (iris::config::NetMode::Nat, None),
+            mode => (mode, self.cfg.network.pcap_interface.clone()),
         });
         self.started_banks = Some(self.cfg.banks);
         self.started_cpu = Some(self.cfg.cpu());
@@ -912,33 +909,6 @@ impl App {
         }
     }
 
-
-    /// Walk the configured SCSI devices and report any whose image file
-    /// is missing. Scratch volumes are skipped (iris auto-creates those).
-    /// For CD-ROMs the device is "present" if either the primary path or
-    /// any disc in the changer list exists.
-    fn missing_disks(&self) -> Vec<MissingDisk> {
-        let mut out = Vec::new();
-        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
-        for (&id, dev) in &self.cfg.scsi {
-            if dev.scratch { continue; }
-            // A DaynaPort is a network adapter — no image to be missing.
-            if dev.is_daynaport() { continue; }
-            // Empty CD-ROM (no path, no changer entries) means "drive present,
-            // tray empty" — a valid configured state, not missing.
-            if dev.is_cdrom() && dev.path.is_empty() && dev.discs.is_empty() {
-                continue;
-            }
-            let primary_ok = disk_readable(&dev.path);
-            let any_disc_ok = dev.discs.iter().any(|d| disk_readable(d));
-            let present = primary_ok || (dev.is_cdrom() && any_disc_ok);
-            if !present {
-                out.push(MissingDisk { id, path: dev.path.clone(), cdrom: dev.is_cdrom() });
-            }
-        }
-        out.sort_by_key(|m| m.id);
-        out
-    }
 
     /// Detach the given SCSI IDs from the live config and (optionally) try Start again.
     fn detach_and_start(&mut self, ids: &[u8]) {
@@ -1677,13 +1647,11 @@ impl App {
         let running = self.emu.is_running();
         let full = egui::vec2(ui.available_width(), 0.0);
         if !running {
-            if ui.add_sized(full, egui::Button::new(RichText::new(t!("main-start")).size(16.0))
-                .fill(Color32::from_rgb(40, 110, 40))).clicked()
+            if ui.add_sized(full, crate::extra_ui::filled_button(RichText::new(t!("main-start")).size(16.0), Color32::from_rgb(40, 110, 40))).clicked()
             {
                 self.start_emulator();
             }
-        } else if ui.add_sized(full, egui::Button::new(RichText::new(t!("main-stop")).size(16.0))
-            .fill(Color32::from_rgb(160, 60, 60))).clicked()
+        } else if ui.add_sized(full, crate::extra_ui::filled_button(RichText::new(t!("main-stop")).size(16.0), Color32::from_rgb(160, 60, 60))).clicked()
         {
             self.request_stop();
         }
@@ -1929,8 +1897,18 @@ impl App {
                 };
                 (t!("status-net-nat"), tip)
             }
+            (true, Some((NetMode::Stream, _))) => {
+                let tip = match state {
+                    NetState::Active => t!("status-net-stream-active-tip"),
+                    _ => t!("status-net-stream-idle-tip"),
+                };
+                (t!("status-net-stream"), tip)
+            }
             _ => (t!("status-net"), t!("status-net-off-tip")),
         };
+        // A machine with no Ethernet has no light: nothing can carry traffic.
+        let net_mode = if running { backend.as_ref().map(|(m, _)| *m) } else { Some(self.cfg.network.mode) };
+        let unplugged = net_mode == Some(NetMode::Off);
         // "check" diagnoses the guest IP against the NAT subnet — only meaningful
         // in NAT mode, so it's hidden in PCAP.
         let nat_running = running && matches!(backend.as_ref(), Some((NetMode::Nat, _)));
@@ -1938,6 +1916,11 @@ impl App {
         ui.horizontal(|ui| {
             // U+2022 (bullet) as a status light. NOT U+25CF (●), which renders as
             // tofu in egui's font chain. See clanker/gui/egui-…-tofu.md.
+            if unplugged {
+                ui.label(RichText::new(t!("status-net-unplugged")).weak())
+                    .tip(t!("status-net-unplugged-tip"));
+                return;
+            }
             ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).tip(net_tip.clone());
             ui.label(net_label).tip(net_tip);
             if nat_running && ui.small_button(t!("status-net-check")).tip(t!("status-net-check-tip")).clicked() {
@@ -3064,8 +3047,7 @@ impl App {
                     if ui.button(t!("common-cancel")).clicked() {
                         decision = Some(false);
                     }
-                    if ui.add(egui::Button::new(RichText::new(t!("modal-discard-confirm")).color(Color32::WHITE))
-                        .fill(Color32::from_rgb(140, 40, 40))).clicked()
+                    if ui.add(crate::extra_ui::filled_button(RichText::new(t!("modal-discard-confirm")).color(Color32::WHITE), Color32::from_rgb(140, 40, 40))).clicked()
                     {
                         decision = Some(true);
                     }
@@ -3096,8 +3078,21 @@ impl App {
         ui.add_space(8.0);
 
         let ram_line = ram_summary(&self.cfg.banks);
+        // Paths are shown relative to the machine folder (the working
+        // directory) and cut to the panel's width; the tooltip has them whole.
+        let machine_dir = std::env::current_dir().ok();
+        let path_label = |ui: &mut egui::Ui, text: String, path: &str| {
+            ui.add(egui::Label::new(text).truncate()).on_hover_text(abs_path(path));
+        };
+        let shown = |path: &str| summary::shown_path(path, machine_dir.as_deref());
         ui.label(RichText::new(t!("welcome-summary")).strong());
         egui::Grid::new("summary_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label(t!("welcome-folder"));
+            if let Some(dir) = &machine_dir {
+                let dir = dir.to_string_lossy().into_owned();
+                path_label(ui, dir.clone(), &dir);
+            }
+            ui.end_row();
             ui.label(t!("welcome-platform"));
             ui.label(self.cfg.machine.profile.label());
             ui.end_row();
@@ -3114,18 +3109,18 @@ impl App {
                 }
             }
             ui.label(t!("welcome-prom"));
-            ui.label(if crate::extra_ui::builtin_prom(&self.cfg) {
+            let prom = if crate::extra_ui::builtin_prom(&self.cfg) || self.cfg.prom.is_empty() {
                 t!("welcome-prom-builtin")
             } else if std::path::Path::new(&self.cfg.prom).exists() {
-                abs_path(&self.cfg.prom)
-            } else if self.cfg.prom.is_empty() {
-                t!("welcome-prom-builtin")
+                shown(&self.cfg.prom)
             } else {
-                t!("welcome-prom-missing", path = &self.cfg.prom)
-            });
+                let s = shown(&self.cfg.prom);
+                t!("welcome-prom-missing", path = &s)
+            };
+            path_label(ui, prom, &self.cfg.prom);
             ui.end_row();
             ui.label(t!("welcome-nvram"));
-            ui.label(abs_path(&self.cfg.nvram));
+            path_label(ui, shown(&self.cfg.nvram), &self.cfg.nvram);
             ui.end_row();
             ui.label(t!("welcome-memory"));
             ui.label(ram_line);
@@ -3139,24 +3134,22 @@ impl App {
             }
             ui.label(t!("welcome-drives"));
             ui.vertical(|ui| {
-                let mut ids: Vec<u8> = self.cfg.scsi.keys().copied().collect();
-                ids.sort();
-                if ids.is_empty() {
+                let drives = summary::drives(&self.cfg);
+                if drives.is_empty() {
                     ui.label(RichText::new(t!("common-none")).weak());
                 }
-                for key in ids {
-                    let d = &self.cfg.scsi[&key];
-                    let id = crate::extra_ui::scsi_name(&self.cfg, key);
-                    if d.is_daynaport() {
-                        ui.label(t!("welcome-drive-daynaport", id = &id));
-                        continue;
-                    }
-                    let path = abs_path(&d.path);
-                    ui.label(if d.is_cdrom() {
-                        t!("welcome-drive-cdrom", id = &id, path = &path)
-                    } else {
-                        t!("welcome-drive-disk", id = &id, path = &path)
-                    });
+                for drive in drives {
+                    use summary::Drive;
+                    let (text, path) = match drive {
+                        Drive::Daynaport { id } => (t!("welcome-drive-daynaport", id = &id), String::new()),
+                        Drive::Cdrom { id, path } if path.is_empty() => (t!("welcome-drive-cdrom-empty", id = &id), path),
+                        Drive::Cdrom { id, path } => { let s = shown(&path); (t!("welcome-drive-cdrom", id = &id, path = &s), path) }
+                        Drive::Disk { id, path } if path.is_empty() => (t!("welcome-drive-disk-no-image", id = &id), path),
+                        Drive::Disk { id, path } => { let s = shown(&path); (t!("welcome-drive-disk", id = &id, path = &s), path) }
+                        Drive::Nvme { path } => { let s = shown(&path); (t!("welcome-drive-nvme", path = &s), path) }
+                        Drive::FibreChannel { id, path } => { let s = shown(&path); (t!("welcome-drive-fc", id = id, path = &s), path) }
+                    };
+                    path_label(ui, text, &path);
                 }
                 subtitle(ui, t!("welcome-drives-subtitle"));
             });
@@ -3164,21 +3157,20 @@ impl App {
             ui.label(t!("welcome-network"));
             // On a build without PCAP support, the runtime always uses NAT
             // regardless of any imported `mode = "pcap"`, and the UI must never
-            // surface PCAP — so report NAT unconditionally there.
-            let effective_pcap = iris::build_features::PCAP
-                && self.cfg.network.mode == iris::config::NetMode::Pcap;
-            if effective_pcap {
-                let iface = match self.cfg.network.pcap_interface.as_deref() {
-                    Some(s) if !s.is_empty() => s.to_string(),
-                    _ => t!("common-auto"),
-                };
-                ui.label(t!("welcome-network-bridged", iface = &iface));
-            } else {
-                ui.label(match self.cfg.nat_subnet.as_deref() {
-                    Some(subnet) => t!("welcome-network-nat", subnet = subnet),
-                    None => t!("welcome-network-nat-default"),
-                });
-            }
+            // surface PCAP (`summary::network` reports NAT there).
+            ui.label(match summary::network(&self.cfg, iris::build_features::PCAP) {
+                summary::Network::Bridged(iface) => {
+                    let iface = iface.unwrap_or_else(|| t!("common-auto"));
+                    t!("welcome-network-bridged", iface = &iface)
+                }
+                summary::Network::Nat(Some(subnet)) => t!("welcome-network-nat", subnet = &subnet),
+                summary::Network::Nat(None) => t!("welcome-network-nat-default"),
+                summary::Network::Off => t!("welcome-network-off"),
+                summary::Network::Stream(peer) => {
+                    let peer = peer.unwrap_or_else(|| t!("common-none"));
+                    t!("welcome-network-stream", peer = &peer)
+                }
+            });
             ui.end_row();
         });
 
@@ -3186,8 +3178,7 @@ impl App {
         // Welcome panel is only rendered when the emulator is stopped
         // (the central panel switches to the framebuffer when running),
         // so a single Start button is sufficient here.
-        if ui.add(egui::Button::new(RichText::new(t!("welcome-start")).size(20.0))
-            .fill(Color32::from_rgb(40, 120, 40))
+        if ui.add(crate::extra_ui::filled_button(RichText::new(t!("welcome-start")).size(20.0), Color32::from_rgb(40, 120, 40))
             .min_size(egui::vec2(220.0, 44.0))).clicked()
         {
             self.start_emulator();
@@ -3407,7 +3398,7 @@ impl eframe::App for App {
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        let ok = ui.add(egui::Button::new(t!("modal-rename-confirm")).fill(Color32::from_rgb(60, 90, 140))).clicked();
+                        let ok = ui.add(crate::extra_ui::filled_button(t!("modal-rename-confirm"), Color32::from_rgb(60, 90, 140))).clicked();
                         if (ok || entered) && !buf.trim().is_empty() {
                             rename_result = Some(Some(buf.clone()));
                         }
@@ -3490,8 +3481,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { close_modal = true; }
                         if ui.button(t!("modal-stop-halt")).clicked() { do_halt = true; close_modal = true; }
-                        if ui.add(egui::Button::new(RichText::new(t!("modal-stop-force")).color(Color32::WHITE))
-                            .fill(Color32::from_rgb(140, 40, 40))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(RichText::new(t!("modal-stop-force")).color(Color32::WHITE), Color32::from_rgb(140, 40, 40))).clicked()
                         {
                             do_force = true; close_modal = true;
                         }
@@ -3511,6 +3501,32 @@ impl eframe::App for App {
             // message appears.
             self.emu.send(Cmd::HaltIrix);
             self.toast(t!("toast-halt-sent"));
+        }
+
+        // A Browse button found no file dialog to open (Linux without a
+        // desktop portal or zenity): say so instead of doing nothing.
+        if let Some(reasons) = filedialog::take_unavailable() {
+            self.picker_unavailable = Some(reasons);
+        }
+        if let Some(reasons) = &self.picker_unavailable {
+            let mut close = false;
+            egui::Window::new(t!("modal-no-picker-title"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(RichText::new(t!("modal-no-picker-body")).strong());
+                    ui.add_space(4.0);
+                    ui.label(t!("modal-no-picker-fix"));
+                    ui.add_space(4.0);
+                    for r in reasons {
+                        ui.label(RichText::new(r).weak().small());
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(t!("common-close")).clicked() { close = true; }
+                });
+            if close { self.picker_unavailable = None; }
         }
 
         // Confirm switching from a custom PROM back to the built-in image.
@@ -3559,13 +3575,11 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { do_revert = true; close = true; }
-                        if ui.add(egui::Button::new(t!("modal-net-use", subnet = &suggestion))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-net-use", subnet = &suggestion), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             do_suggest = true; close = true;
                         }
-                        if ui.add(egui::Button::new(t!("modal-net-override"))
-                            .fill(Color32::from_rgb(140, 90, 40))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-net-override"), Color32::from_rgb(140, 90, 40))).clicked()
                         {
                             close = true;
                         }
@@ -3594,8 +3608,7 @@ impl eframe::App for App {
                     ui.label(RichText::new(capture_access::permission_hint()).weak());
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new(t!("modal-pcap-enable"))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-pcap-enable"), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             do_enable = true;
                         }
@@ -3618,9 +3631,9 @@ impl eframe::App for App {
                     ui.label(RichText::new(t!("modal-missing-body")).strong());
                     for m in &modal.missing {
                         ui.label(if m.cdrom {
-                            t!("modal-missing-cdrom", id = m.id, path = &m.path)
+                            t!("modal-missing-cdrom", id = &m.name, path = &m.path)
                         } else {
-                            t!("modal-missing-disk", id = m.id, path = &m.path)
+                            t!("modal-missing-disk", id = &m.name, path = &m.path)
                         });
                     }
                     ui.add_space(8.0);
@@ -3636,8 +3649,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { choice = MissingChoice::Cancel; }
                         if ui.button(t!("modal-missing-edit")).clicked() { choice = MissingChoice::EditDisks; }
-                        if ui.add(egui::Button::new(t!("modal-missing-detach"))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-missing-detach"), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             choice = MissingChoice::Detach;
                         }
@@ -3657,7 +3669,7 @@ impl eframe::App for App {
             }
             MissingChoice::Detach => {
                 let ids: Vec<u8> = self.missing_modal.as_ref()
-                    .map(|m| m.missing.iter().map(|d| d.id).collect())
+                    .map(|m| m.missing.iter().map(|d| d.key).collect())
                     .unwrap_or_default();
                 self.missing_modal = None;
                 self.detach_and_start(&ids);
@@ -3721,8 +3733,7 @@ impl eframe::App for App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button(t!("common-cancel")).clicked() { chd_choice = ChdGrantChoice::Cancel; }
-                        if ui.add(egui::Button::new(t!("modal-grant-start-anyway"))
-                            .fill(Color32::from_rgb(60, 90, 140))).clicked()
+                        if ui.add(crate::extra_ui::filled_button(t!("modal-grant-start-anyway"), Color32::from_rgb(60, 90, 140))).clicked()
                         {
                             chd_choice = ChdGrantChoice::StartAnyway;
                         }

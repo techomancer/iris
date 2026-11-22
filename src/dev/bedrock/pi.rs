@@ -73,7 +73,7 @@ impl Population {
     }
     /// The same slots for a node whose CPU 0 is the machine's CPU `first`.
     pub fn with_first_cpu(self, first: usize) -> Self {
-        Self { first: u8::try_from(first).expect("a machine has at most four processors"), ..self }
+        Self { first: u8::try_from(first).expect("a machine numbers its processors in a byte"), ..self }
     }
     /// The node's own number for the machine's CPU `cpu`, if it is one of
     /// the node's.

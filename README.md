@@ -91,11 +91,13 @@ boots to a usable system: shell, networking, X11, the works.
   ISP1040 SCSI, RAD audio
 - **Origin 200/2000, Onyx2 IP27:** SN0 NUMA machines; Onyx2 supports InfiniteReality graphics
 - **Fuel IP34:** IP35 platform, R14000, IOC3, ISP12160, L1 console, VPro optional,
-  PS/2 or USB (`[fuel] usb_input`) keyboard and mouse
+  PS/2 or USB (`[machine] usb_input`) keyboard and mouse, optional ICE1724 audio
+  (`[machine] audio_card`)
 - **Tezro IP53:** IP35 platform, up to 4 R16000 CPUs, PIC/PXBOW, IOC4, ISP12160, VPro optional,
-  ICE1724 audio (`[tezro] audio`)
+  ICE1724 audio (`[machine] audio_card`)
 - **Origin 3200 / Onyx 3000 IP35:** R12000 C-bricks and Fibre Channel storage;
-  Onyx 3000 adds InfiniteReality3 or VPro V12 graphics
+  Onyx 3000 adds InfiniteReality3 or VPro V12 graphics; optional ICE1724 audio
+  (`[machine] audio_card`)
 - R4400, R5000, R10000, R12000, R14000, R16000 CPUs, selected per machine at runtime
 - A built-in PROM for every machine (the stock SGI images, packed into the
   binary); `prom` names a file to run instead
@@ -275,7 +277,7 @@ Right Ctrl); in `iris-gui` it is Ctrl+Alt (Option+Command on macOS), with
 Ctrl+Alt+Esc as a fallback. When the window loses focus, keys and mouse
 buttons still held in the guest are released. Mouse and keyboard use standard PS/2 emulation,
 including an IntelliMouse scroll wheel (the Fuel can take a USB keyboard and
-mouse instead, with `[fuel] usb_input`). Keys are sent by
+mouse instead, with `[machine] usb_input`). Keys are sent by
 physical position, so set IRIX's `keybd` to your layout.
 
 **Note:** Alt-tabbing away from the window can garble keyboard input in IRIX

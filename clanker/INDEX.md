@@ -28,6 +28,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [cache-lines-live-in-the-cpus-view.md](cpu/cache-lines-live-in-the-cpus-view.md) | design | A valid R10000-family cache line, or R5000 primary data line, makes its page private in that CPU's own copy of ppmem's window; the uncached path and other masters keep memory. How CACHE operands translate, the limits, and how to see what is held |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
 | [cache-tag-index-and-check-bits.md](cpu/cache-tag-index-and-check-bits.md) | rule | Cache tags: index ops index by address; check bits are generated, not stored |
+| [config-line-size-bits-are-read-only.md](cpu/config-line-size-bits-are-read-only.md) | rule | Config IB/DB (line sizes) ignore MTC0; the Indy PROM clears them and NetBSD on an R5000 then panicked "r5k picache line size 16" |
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
 | [cp0-index-masks-never-wraps.md](cpu/cp0-index-masks-never-wraps.md) | rule | CP0 `Index` selects a TLB slot by masking, never modulo |
 | [cp0-status-writes-must-resync-privilege-state.md](cpu/cp0-status-writes-must-resync-privilege-state.md) | rule | Every `cp0_status` write must call `resync_privilege_state()` |
@@ -36,6 +37,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [decode-cache-index-must-survive-page-colouring.md](cpu/decode-cache-index-must-survive-page-colouring.md) | rule | Decode cache indexed by `pfn % 64` thrashed on the O2's coloured text pages; hash the page number. Also: O2 shadow model ran with an empty RAM bitmap in interpreter builds |
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [cvt-to-int-inexact-is-judged-against-the-source.md](cpu/cvt-to-int-inexact-is-judged-against-the-source.md) | rule | A float-to-integer conversion's Inexact is judged against the source, in both engines |
+| [fpu-conversions-hand-the-hard-cases-to-software.md](cpu/fpu-conversions-hand-the-hard-cases-to-software.md) | rule | Conversions take Unimplemented Operation for denormal/quiet-NaN sources, unrepresentable results and longs past the part's range; Invalid default is 2^31-1 whatever the sign; CVT.S.D overflow raises I too |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
 | [fused-load-store-passes-retry-through.md](cpu/fused-load-store-passes-retry-through.md) | rule | A fused ADDU/ADDIU+load/store must pass EXEC_RETRY through; raising it gave IP22+IMPACT a spurious ExcCode 0 PROM panic under `lightning` (#270) |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
@@ -52,7 +54,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [tlb-c-field-uses-the-models-table.md](cpu/tlb-c-field-uses-the-models-table.md) | rule | The TLB decodes EntryLo C with the CPU model's table; C=4 read as uncached sent every Octane user access to the bus |
 | [tlbcheck-vmap-dangling-slot-bug.md](cpu/tlbcheck-vmap-dangling-slot-bug.md) | rule | tlbcheck: vmap fast-path can strand a still-valid TLB entry as a phantom Miss |
 | [tlbcheck-vmap-scan-performance.md](cpu/tlbcheck-vmap-scan-performance.md) | measure | tlbcheck: naive vmap re-derivation cost ~800us/call, dominated boot time |
-| [wait-is-not-a-nop.md](cpu/wait-is-not-a-nop.md) | rule | `WAIT` is not a NOP — and `InstrKind::Nop` never meant "nop" |
+| [wait-is-not-a-nop.md](cpu/wait-is-not-a-nop.md) | rule | `WAIT` is not a NOP — and `InstrKind::Nop` never meant "nop"; with IE clear it completes once an IM-passed interrupt is requested (OpenBSD R5000 idle) |
 | [xtlb-vector-follows-mode-not-address.md](cpu/xtlb-vector-follows-mode-not-address.md) | rule | The XTLB refill vector follows the MODE, not the address shape |
 
 ## jitv2/
@@ -69,6 +71,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
 | [compile-pool-size-on-small-hosts.md](jitv2/compile-pool-size-on-small-hosts.md) | rule | The compile pool is sized for the host as well as the guest: one worker per guest CPU, capped by the host's usable CPUs; the guest's own CPUs are not counted against it |
+| [compile-workers-park-the-cpu-never-halt-it.md](jitv2/compile-workers-park-the-cpu-never-halt-it.md) | rule | A compile worker parks the CPU for a flush through the CPU's world, never halts it; every CPU has one world (`World::solo` when alone) |
 | [compile-pool-starts-after-the-windows.md](jitv2/compile-pool-starts-after-the-windows.md) | rule | Start the compile pool after the ppmem windows: workers read the cache geometry once, and an early one compiles every load and store as a call out |
 | [compile-workers-park-instead-of-polling.md](jitv2/compile-workers-park-instead-of-polling.md) | rule | The compile pool parks; the producer wakes it: an idle worker cost 1.4% of a core polling every 200µs |
 | [compile-time-profile.md](jitv2/compile-time-profile.md) | measure | An IRIX boot is bound by how much jitv2 compiles: workers saturated, where a compile's time goes (regalloc 37%, egraph 20%), and why a faster allocator or `opt_level=none` only buys more recompiles |
@@ -115,6 +118,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip35-board-eeprom-cpu-config.md](devices/ip35-board-eeprom-cpu-config.md) | rule | The IP35 PROM checks its flash CPU record against the node board EEPROM's format-3 extended data (`CpuContext`); the field layout and how it was read out of the PROM |
 | [a-dropped-machine-must-free-its-cpus.md](devices/a-dropped-machine-must-free-its-cpus.md) | rule | Never `forget` a CPU `Arc` after handing out a weak one: CPU 0's batch hook holds the board, so the Fuel, Tezro and Origin 3200 kept every disk and the flash open after drop (failed on Windows) |
 | [ip35-boot-window-memory-is-the-zero-holders.md](devices/ip35-boot-window-memory-is-the-zero-holders.md) | rule | Two-node IP35: memory behind the boot window at node field zero is the zero holder's for every node; keeping it on the reader gave node 1 its own RAM for 4 MiB of node 0 and corrupted IRIX (found by bisecting FC, JIT, graphics, second CPU, then diffing a piped disk region) |
+| [hub-second-processor-slice-runs-zeros.md](devices/hub-second-processor-slice-runs-zeros.md) | open | IP27: with both slices of a Hub node populated the PROM prints nothing; slice B executes zeroed words in the PROM's mapped image, slice A waits. `cpus = 2` is refused on the Hub machines meanwhile; the builders already take it |
 | [ip35-rendezvous-hold-must-stop-the-cpu-at-once.md](devices/ip35-rendezvous-hold-must-stop-the-cpu-at-once.md) | rule | A held CPU must retire nothing more; running out its batch let a Tezro PROM's PI1 pass a barrier alone and start the copied PROM early (measured on a fork's rendezvous) |
 | [draw-marks-tell-the-display-what-shows.md](devices/draw-marks-tell-the-display-what-shows.md) | rule | IMPACT and VPro compose only when drawing landed in a buffer the screen shows: a draw marks its store, planes and box after its stores (`display::Marks`); a path that cannot must say "anything"; `IRIS_DISPLAY_VERIFY=1` checks the verdicts; measurements |
 | [pci-layer-design.md](devices/pci-layer-design.md) | design | The PCI layer: headers change only through the bus, byte orders are per-window values, `pci/` imports no card or SCSI; the stale-run and delivery-order hazards, the SeqCst handshake, and what the first attempt got wrong |
@@ -134,23 +138,25 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [decode-table-is-host-mapped.md](devices/decode-table-is-host-mapped.md) | rule | The physical decode table is a sparse host mapping over 40 bits: change it only through `fill`, set the default first, compare entries with `entry_eq` |
 | [mc-decodes-32-physical-bits.md](devices/mc-decodes-32-physical-bits.md) | rule | Indy/Indigo2/O2 decode 32 physical bits; IRIX PTE software bits reach PA[35:32]; fold with `MipsExecutor::phys_mask`, never decode them |
 | [extended-ram-memcfg.md](devices/extended-ram-memcfg.md) | rule | Extended RAM — MEMCFG synthesis for himem banks |
+| [hpc3-arming-wakes-the-dma-peripheral.md](devices/hpc3-arming-wakes-the-dma-peripheral.md) | rule | HPC3 arming wakes the DMA peripheral; device threads do not poll for it |
 | [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | history | A receive channel that refuses while reporting itself active |
 | [indigo2-eeprom-byte-lane-gap.md](devices/indigo2-eeprom-byte-lane-gap.md) | rule | Indigo2 motherboard EEPROM: PROM writes via byte access, HPC3 only handled 32-bit |
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
 | [o2-icon-backdrop-crosshatch.md](devices/o2-icon-backdrop-crosshatch.md) | open | O2 icon boxes crosshatch: GL dithers the panel's own colour, truncated just under the 5-bit grid; the guest's drawing, unconfirmed against hardware; `re dither off` compares |
 | [o2-timing-interrupts-are-line-compares.md](devices/o2-timing-interrupts-are-line-compares.md) | rule | GBE has four line-compare interrupts and no vblank one; IRIX uses lines 1028 and ~976; the refresh thread raises them as line events; the old "dispatcher never returns" hang did not reproduce |
+| [ioc-shared-status-bits-are-wired-or.md](devices/ioc-shared-status-bits-are-wired-or.md) | rule | An IOC status bit several sources drive (Indigo2 GIO slots, direct graphics pins) is the OR of their levels; acks drop a source's level, not the bit; snapshots keep levels. Open: the Indy second head's pins |
 | [second-newport-needs-slot0-and-board-rev-4.md](devices/second-newport-needs-slot0-and-board-rev-4.md) | rule | IRIX probes a second Newport only at 0x1F4F0000; an Indy needs board revision 4; its retrace and FIFO share the slot's GIO_EXP0 pin |
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |
-| [o2-prom-does-not-wait-for-its-mte-clear.md](devices/o2-prom-does-not-wait-for-its-mte-clear.md) | rule | O2 PROM 4.18 clears low memory with the MTE and reads RE status once without waiting; a late engine thread wiped its cookie (`SL-9600-8E>`) or its POST code. A status read now answers busy until every queued transfer is done |
+| [o2-prom-does-not-wait-for-its-mte-clear.md](devices/o2-prom-does-not-wait-for-its-mte-clear.md) | rule | O2 PROM 4.18 clears low memory with the MTE and reads RE status once without waiting; a late engine thread wiped its cookie (`SL-9600-8E>`) or its POST code. A status read now answers busy until every queued transfer is done. Issue #301's 1-in-70 serial loader was this: 0 of 400 stressed boots since. `IRIS_IP32_RE_LAG_US` opens the window on demand |
 | [ip30-octane-bringup.md](devices/ip30-octane-bringup.md) | rule | What the Octane's PROM insists on (memory sizing, the Bridge status bit, empty slots, IOC3 bits, the one-wire parts' formats, its device tree) and what booting it through to IRIX added (cached flash lines, low-memory JIT counters, the ISP stall, HQ4 before a context switch) |
 | [ip30-memory-past-4gb-takes-a-16gb-window.md](devices/ip30-memory-past-4gb-takes-a-16gb-window.md) | design | Octane past 4 GB: 16 GB window, 256 MB per bitmap bit, per-machine shift |
 | [ip30-module-name-must-match-active-cpus.md](devices/ip30-module-name-must-match-active-cpus.md) | rule | Octane: the module record must say PM10 for one CPU and PM20 for two, or the PROM fails its NIC diagnostic |
 | [ip30-low-memory-aliases-sdram.md](devices/ip30-low-memory-aliases-sdram.md) | rule | Octane: the 16 KiB at physical 0 is the first 16 KiB of SDRAM, which the processor reaches only there (0x2000_0000..+16 KiB bus-errors, as the stock IDE memory diagnostics expect); shares its JIT page generations; the guard holds on the table path only (the ppmem window maps whole units); DMA reach unknown |
 | [ip30-prom-stores-into-flash-stay-in-cache.md](devices/ip30-prom-stores-into-flash-stay-in-cache.md) | rule | Octane: the PROM's cached stores into its own flash never reach the Bridge; `CachedFlashLines` holds them (approximation: no write-back) |
-| [ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md](devices/ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md) | open | Octane: the PROM loading an 11 MB ELF (Linux vmlinux) from the volume header writes its 16 KB-page DMA list over its adapter list and panics; TFTP boot works |
-| [ip30-linux-7.3-guest.md](devices/ip30-linux-7.3-guest.md) | howto | Octane: mainline Linux 7.3 config, the PROM/Linux PCI window mismatch and the root-bus scan past device 7 (kernel patch), TFTP boot, no power-off |
+| [ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md](devices/ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md) | rule | Octane PROM 4.17 reads a volume-header ELF segment in one SCSI command; over ~720 KB it times out (8-entry ring), over ~1.1 MB its page list overruns the adapter array and it panics. `mkvh` splits segments to 512 KB |
+| [ip30-linux-7.3-guest.md](devices/ip30-linux-7.3-guest.md) | howto | Octane: mainline Linux 7.3 config, the PROM/Linux PCI window mismatch and the root-bus scan past device 7 (kernel patch), TFTP or volume-header boot, no power-off |
 | [ip30-device-timing-on-hptimer.md](devices/ip30-device-timing-on-hptimer.md) | design | Octane: IOC3, RAD1 and ISP1040 pace themselves on `hptimer` one-shots, with threads only where something blocks (the ISP1040 ring, serial receive, NVRAM writer) |
 | [ip30-openbsd-needs-64gb-window-and-slot-4-empty.md](devices/ip30-openbsd-needs-64gb-window-and-slot-4-empty.md) | rule | Octane: OpenBSD 6.9 reaches PCI through the Bridges' 64 GB windows (IOC3 at 0xF0_4050_0000) and takes the SuperIO interrupt from the first empty Bridge slot, so virtio goes in slots 6 and 7 (`bridge_slot`); what it attaches |
 | [ip30-ps2-keyboard-runs-set-3.md](devices/ip30-ps2-keyboard-runs-set-3.md) | rule | Octane: PROM 4.17 and IRIX's `ioc3_pckm` put the PS/2 keyboard in scan code set 3 (Linux/OpenBSD use 2); K_RD slot order, CLAMP_THREE, role by F2 answer; how the PROM's keyboard sequence was traced |
@@ -158,11 +164,13 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [aic7880-emulation-vs-spec.md](devices/aic7880-emulation-vs-spec.md) | open | AIC-7880: where the O2 SCSI model departs from `docs/dev/aic7880.md` (HLE above the sequencer, reset values, wide strap, residuals, interrupt gating, config space) |
 | [aic7880-seqdis.py](devices/aic7880-seqdis.py) | howto | Disassembler for an AIC-7xxx sequencer image in a C byte array (the HIM's image the O2 downloads) |
 | [aic7880-patchsim.py](devices/aic7880-patchsim.py) | howto | Reproduces the Linux aic7xxx firmware patch selection and critical sections for a 7880 |
-| [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones) |
+| [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones); the 64-bit PCI memory window at 0x2_0000_0000 bypasses it (OpenBSD `ahc` not responding) |
+| [o2-openbsd-warm-reboot-loop.md](devices/o2-openbsd-warm-reboot-loop.md) | open | O2: issue 308 (OpenBSD 6.9 damaged after a warm reboot) not reproduced in 89 warm reboots on R5000/R10000, HEAD and 5e871a2b^; the reboot-and-checksum loop, what is ruled out and not covered |
 | [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | history | O2 cache as it was until 2026-10-30: the full model through POST, the shadow model after, switched by PC range and a tag-store trigger |
 | [o2-prom-stack-is-a-cached-page-at-phys-0.md](devices/o2-prom-stack-is-a-cached-page-at-phys-0.md) | design | O2 PROM stack: one tag-installed page at physical 0 that the memory test overwrites through KSEG1. Retired: the CPU's cached view holds it now |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
+| [ip22-8042-translates-when-command-byte-bit-6-is-set.md](devices/ip22-8042-translates-when-command-byte-bit-6-is-set.md) | rule | Indy/Indigo2: the 8042 must translate set 2 to set 1 while command-byte bit 6 is on (NetBSD sysinst cursor keys, endless repeat, #765); direct-port hosts never translate |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
 | [vdma-gio-side-is-always-whole-qwords.md](devices/vdma-gio-side-is-always-whole-qwords.md) | rule | The GIO side of a VDMA transfer is always whole qwords — only memory is ragged |
 | [vdma-transfers-are-always-translated.md](devices/vdma-transfers-are-always-translated.md) | rule | VDMA image transfers are always address-translated |
@@ -193,6 +201,7 @@ The NAT stack and its built-in services: DNS, TCP, NFS, rsh, BOOTP/TFTP.
 | [nat-dns-host-resolver.md](net/nat-dns-host-resolver.md) | rule | NAT DNS follows the host's DNS server |
 | [nat-tcp-slow-host-reader.md](net/nat-tcp-slow-host-reader.md) | rule | NAT TCP: a slow host reader must not lose the guest's data |
 | [a-nic-restart-must-join-its-old-backend.md](net/a-nic-restart-must-join-its-old-backend.md) | rule | Every NIC runs its backend through `net::link::Session`: a restart joins the old backend before the new one binds, or a reset loses the port forwards |
+| [a-held-test-port-must-be-wildcard-on-macos.md](net/a-held-test-port-must-be-wildcard-on-macos.md) | rule | A test that holds a forward's port must hold the wildcard address: macOS refuses a second bind of the same address and port without SO_REUSEPORT |
 | [nat-throughput-and-latency.md](net/nat-throughput-and-latency.md) | measure | NAT throughput and latency: what actually limited it |
 | [nfs-irix-6530-mount.md](net/nfs-irix-6530-mount.md) | rule | IRIX 6.5.30 asks for mountd over TCP; the share is UDP only, so mount with `-o proto=udp` (a plain mount fails); MOUNT v3 must list AUTH_UNIX |
 | [nfs-dot-and-dotdot-must-resolve-server-side.md](net/nfs-dot-and-dotdot-must-resolve-server-side.md) | rule | NFS LOOKUP `..` must resolve on the server — the client does not synthesize it |
@@ -350,6 +359,7 @@ The InfiniteReality (KONA) graphics pipe's host interface.
 |---|---|---|
 | [front-end.md](kona/front-end.md) | design | The Host Interface Processor: attach interface, the command queue on `GFifo`, which accesses wait, the job seam to a back end, approximations |
 | [token-census.md](kona/token-census.md) | measurement | The token families two recorded streams (the PROM to its graphics menu, IRIX to the 4Dwm desktop) send, how far a replay into `NullBackend` stays exact, and the selectors QEMU's decoder leaves unresolved |
+| [tile-scheduled-flag-needs-seqcst.md](kona/tile-scheduled-flag-needs-seqcst.md) | rule | The tile scheduler's `tail`/`scheduled` hand-off is a store-buffering pair: SeqCst on all four accesses, or a job is never run and `submit`/`drain` spin forever |
 
 ## hostgl/
 
@@ -370,6 +380,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [cdrom-hot-insert-remount.md](gui/cdrom-hot-insert-remount.md) | rule | GUI CD-ROM insert must hot-load + remount /CDROM |
 | [cmd-q-bypasses-close-intercept-fold-on-poweroff.md](gui/cmd-q-bypasses-close-intercept-fold-on-poweroff.md) | rule | macOS Cmd+Q bypasses the close-intercept — fold CHD overlays on power-off, not just quit |
 | [cycles-ptr-must-be-cleared-before-dropping-the-machine.md](gui/cycles-ptr-must-be-cleared-before-dropping-the-machine.md) | rule | iris-gui: clear the cached `CyclesPtr` before dropping the Machine |
+| [summary-and-disk-preflight-live-in-summary-rs.md](gui/summary-and-disk-preflight-live-in-summary-rs.md) | rule | iris-gui summary and missing-disk preflight are per-profile, in `summary.rs` |
 | [removed-config-keys-must-be-folded-not-deleted.md](gui/removed-config-keys-must-be-folded-not-deleted.md) | rule | Retired MachineConfig keys: keep + fold in `fold_deprecated`, or old gui.json locks the GUI |
 | [egui-default-font-glyph-coverage-avoid-tofu.md](gui/egui-default-font-glyph-coverage-avoid-tofu.md) | rule | egui default fonts: which glyphs render, which are tofu |
 | [gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md](gui/gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md) | design | A new graphics board needs no `iris-gui` capture wiring |
@@ -386,6 +397,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [windows-silent-exit-0xc000041d.md](gui/windows-silent-exit-0xc000041d.md) | rule | Windows: CLI vanishes with exit 0xC000041D and no message |
 | [winit-window-calls-must-be-on-event-thread.md](gui/winit-window-calls-must-be-on-event-thread.md) | rule | Window methods must only be called on the event-loop thread (Windows crash) |
 | [wgpu-raster-needs-egl-not-glx.md](gui/wgpu-raster-needs-egl-not-glx.md) | rule | `--raster wgpu` panics in `eglMakeCurrent` (BadAccess) unless the window's GL is EGL, not GLX |
+| [rfd-linux-dlopens-libdbus-bundle-it-in-the-appimage.md](gui/rfd-linux-dlopens-libdbus-bundle-it-in-the-appimage.md) | rule | rfd on Linux dlopens libdbus: bundle it in the AppImage, and detect "no picker" from rfd's log |
 
 ## vnc/
 
@@ -418,6 +430,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
 | [per-device-saveloadsave-round-trip-is-the-regression-net.md](snapshot/per-device-saveloadsave-round-trip-is-the-regression-net.md) | rule | Per-device save→load→save round-trip is the regression net |
+| [rollback-differs-per-machine.md](snapshot/rollback-differs-per-machine.md) | design | `iris-ci rollback` per machine: Indy captures a live checkpoint, O2 keeps the read snapshot, Octane rereads from disk; all reimport COW overlays |
 | [scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md](snapshot/scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md) | howto | Scratch SCSI volume - SGI VH layout and IRIX raw-device gotchas |
 | [snapshot-manifest-format-snapshottoml-schema-version1.md](snapshot/snapshot-manifest-format-snapshottoml-schema-version1.md) | history | Snapshot manifest format (snapshot.toml schema_version=1) |
 | [snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md](snapshot/snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md) | design | Snapshot v2 device state is postcard-encoded BinValue *.bin |
@@ -524,6 +537,7 @@ Toolchain, dependency upgrades, platform build issues.
 | Note | Kind | Title |
 |---|---|---|
 | [chd-disks-need-features-chd-at-build-time.md](build/chd-disks-need-features-chd-at-build-time.md) | history | CHD disk images require `--features chd` at build time |
+| [libchdman-offline-needs-force-source.md](build/libchdman-offline-needs-force-source.md) | rule | libchdman-rs builds offline only with LIBCHDMAN_FORCE_SOURCE |
 | [dependency-upgrade-gotchas.md](build/dependency-upgrade-gotchas.md) | howto | Dependency upgrade gotchas (2026-08 sweep) |
 | [mmap-rs-fixed-address-aliasing.md](build/mmap-rs-fixed-address-aliasing.md) | design | Host memory aliasing: what mmap-rs actually supports (and where it doesn't) |
 
@@ -538,9 +552,11 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
 | [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
+| [kona-tile-handoff-race.md](plans/kona-tile-handoff-race.md) | open | KONA tile scheduler strands a job when a tile changes hands (tail store `Release` / load `Acquire` in a store-then-load hand-over): `a_tiled_run_is_bit_exact_with_the_inline_one` hangs on Apple silicon and is ignored; stuck-state dump, cause, candidate two-line `SeqCst` fix with measurements |
 | [iris-daynaport-target.md](plans/iris-daynaport-target.md) | plan | Task: add a DaynaPort SCSI/Link target to the IRIS emulator |
 | [origin-octane-o2-landing-review.md](plans/origin-octane-o2-landing-review.md) | plan | Review of James Braid's SGI series (547 commits to 2026-11-11, two passes): Origin/Onyx2 two-node, Octane, O2, Fuel/Tezro (IP35), InfiniteReality (KONA); cache-as-RAM, DMA and interrupt paths per machine; ranked findings with status (KONA texture-bind race, Origin node-1 code never JIT-compiled, cross-node IRQs land on node 0, byte-wise DMA on Origin/IP35, BCM5701 lost coalescing wake) |
 | [irix7-fork-review.md](plans/irix7-fork-review.md) | plan | The `irix7/iris` fork — change inventory and triage |
+| [jitv2-double-buffered-arena.md](plans/jitv2-double-buffered-arena.md) | plan | Two jitv2 code arenas rotated without stopping a CPU: epoch-checked publish, a sweep that poisons old code, a per-CPU retire request as the grace period, the old arena recycled in place; no refcount |
 | [jitv2_performance_analysis.md](plans/jitv2_performance_analysis.md) | plan | jitv2 performance — where to spend effort next |
 | [net-stack.md](plans/net-stack.md) | plan | The NAT network stack: analysis and redesign plan |
 | [odyssey-architecture-review.md](plans/odyssey-architecture-review.md) | plan | The VPro (Odyssey) model after the merge: data path, threads, debug tooling vs the other boards, T&L overlap, float vs fixed, texture specialisations, JIT feasibility, quad scanline raster |

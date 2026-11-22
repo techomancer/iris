@@ -350,6 +350,7 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 |---|---|
 | `scsi status` | Attached devices, disc lists and queue positions |
 | `scsi regs` | WD33C93A registers |
+| `scsi armwait [reset]` | WD33C93A data phases that started before the driver armed the HPC3 DMA channel, across both controllers: how many, how often the chip checked the channel again, how long each waited (mean, max, histogram) and how many gave up after 100 ms. `reset` zeroes them first |
 | `scsi eject <id>` | Cycle to the next disc on CD-ROM `id` |
 | `scsi add <id> <path>` | Insert a disc image as next in the queue (checks the file exists). With the `http-media` feature (on by default) the path may be an `http://` or `https://` URL |
 | `scsi list <id>` | Discs in the queue with ordinals |
@@ -587,7 +588,7 @@ devices are [listed below](#sgi-o2-ip32).
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
 | `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
 | `audio status` | Every sound card's frames moved and skipped (stale, dry, ring full) and its host stream, or `No audio device.` |
-| `ice1724 [status]` | Tezro audio (`[tezro] audio`): the interrupt line (high or low, for how long, rises), the interrupt status and mask registers, the engine start, pause and FIFO-error bits, the pending timer, per engine whether it runs, its buffer address, size, position, interrupt interval, frames moved, times its interrupt fired and latched, and when the guest last read its position; frame and converter counts, PCI command and status |
+| `ice1724 [status]` | The ICE1724 audio card (`[machine] audio_card`; Tezro, Fuel, Origin 3200, Onyx 3000): the interrupt line (high or low, for how long, rises), the interrupt status and mask registers, the engine start, pause and FIFO-error bits, the pending timer, per engine whether it runs, its buffer address, size, position, interrupt interval, frames moved, times its interrupt fired and latched, and when the guest last read its position; frame and converter counts, PCI command and status |
 | `ice1724 regs` | Hex dump of the controller (CCS, BAR0) and multi-channel (MT, BAR1) registers |
 | `ice1724 log [n]` | The guest's last 64 (or n) register accesses, oldest first, with their age on the card clock; a run of the same access with the same value is one line with a count |
 | `ice1724 clear` | Start the counts and the access log again |

@@ -17,7 +17,7 @@
 //! - The PCI devices at 1 to 4 and the IOC4 (0x53), ISP12160 (6) and BCM5701 (0x15) revisions
 //!   are as consoles print them (established). INTA and INTC reaching PIC input d - 1 is IRIX's
 //!   pin rule; the board wiring, INTB and INTD are unknown.
-//! - The audio controller (`[tezro] audio`) is the ICE1724 with the DM8's converters, at device 2
+//! - The audio controller (`[machine] audio_card`) is the ICE1724 with the DM8's converters, at device 2
 //!   of the TI bridge's bus (`AUDIO_DEVICE`, inferred by exclusion); its converters, subsystem
 //!   IDs and EEPROM are a model choice, not Tezro evidence. Its INTA reaches PIC input 1 via the
 //!   bridge's rotation (wiring unknown).
@@ -45,7 +45,6 @@ use crate::dev::bedrock::{Bedrock, Population, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::ds1744::{Ds1744, YearBase};
 use crate::dev::heart::Clock;
-use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};
@@ -321,7 +320,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     l1.set_serial_backend(serial[0].clone());
 
     let io9 = Pic::new(IO9_WIDGET);
-    let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
+    let pxbow = io9.enable_pxbow(HOST_WIDGET).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
     bedrock.io.connect_widget(0, pxbow.widget_zero());
     bedrock.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
     let presence = PresenceHold::new(running, clock.clone(), bedrock);
@@ -332,9 +331,11 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     // processors' stores into its graphics page or returns credits for them.
     let vpro = (cfg.graphics_board() == GraphicsBoard::V12)
         .then(|| {
-            attach_vpro(cfg, bedrock, VPRO_WIDGET, bedrock.interrupt_sender(VPRO_WIDGET, Some(INBOUND_DEVICE)), &status, |vpro| {
-                pxbow.attach_widget(VPRO_WIDGET, vpro).map_err(|e| format!("Tezro V12: {e:?}"))?;
-                Ok(pxbow.route(VPRO_WIDGET))
+            let widget = cfg.graphics.widget.unwrap_or(VPRO_WIDGET);
+            check_vpro_widget(widget)?;
+            attach_vpro(cfg, bedrock, widget, bedrock.interrupt_sender(widget, Some(INBOUND_DEVICE)), &status, |vpro| {
+                pxbow.attach_widget(widget, vpro).map_err(|e| format!("Tezro V12: {e:?}"))?;
+                Ok(pxbow.route(widget))
             })
         })
         .transpose()?;
@@ -375,14 +376,8 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     );
     io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
     let audio = cfg.tezro.audio.then(|| {
-        let card = Arc::new(Ice1724::new(Variant::Dm8));
-        if cfg.no_audio {
-            eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
-        } else {
-            card.enable_output(cfg.audio.clone());
-        }
+        let card = crate::ip35::audio_card(cfg, timers);
         ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
-        card.set_timer_manager(timers.clone());
         card
     });
     io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
@@ -475,7 +470,7 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
         SerialPort {
             label: "L1",
             port: cfg.tezro.l1_port.unwrap_or(8882),
-            setting: "tezro.l1_port",
+            setting: "machine.l1_port",
             ci: serial[0].clone(),
             log: cfg.tezro.l1_log.clone(),
             socket: None,
@@ -486,7 +481,7 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
         SerialPort {
             label: "IOC4 2",
             port: cfg.tezro.serial_port_c.unwrap_or(8883),
-            setting: "tezro.serial_port_c",
+            setting: "machine.serial_port_c",
             ci: serial[3].clone(),
             log: None,
             socket: None,
@@ -495,7 +490,7 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
         SerialPort {
             label: "IOC4 3",
             port: cfg.tezro.serial_port_d.unwrap_or(8884),
-            setting: "tezro.serial_port_d",
+            setting: "machine.serial_port_d",
             ci: serial[4].clone(),
             log: None,
             socket: None,
@@ -525,14 +520,20 @@ fn attach_virtio(cfg: &MachineConfig, io9: &Arc<Pic>) -> Vec<Arc<crate::dev::vir
     attached
 }
 
-/// Said at startup and by `--validate` when the audio card is added with
-/// `no_audio` set: the guest sees the card and nothing is played.
-pub(crate) const AUDIO_WITH_NO_AUDIO: &str =
-    "[tezro] audio is set but no_audio is too: the audio card is added and plays to nowhere";
 
 /// Where the V12 sits: widget 12 behind the PIC that owns widget 0 (QEMU's graphics slot). On the
 /// one-processor board the guide names no widget or route for it; this is inferred.
 const VPRO_WIDGET: u8 = 12;
+
+/// `[graphics] widget`: a port of the crossbar the V12 can take, which the host port, the second
+/// PIC and the IO9 are not. Only 12 is known to work; the others are for experiment.
+pub(crate) fn check_vpro_widget(widget: u8) -> Result<(), String> {
+    if (8..=14).contains(&widget) && widget != HOST_WIDGET && widget != SECOND_PIC_WIDGET {
+        Ok(())
+    } else {
+        Err(format!("graphics.widget {widget} is not a free port of the Tezro's crossbar (valid: 8, 9, 12, 13, 14)"))
+    }
+}
 
 /// The far end of a PIC's link: Bedrock IO, where interrupt packets and DMA arrive as inbound
 /// packets from the PIC's widget. DMA aimed at another widget is refused (no peer-to-peer XIO).

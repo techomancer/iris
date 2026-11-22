@@ -140,14 +140,31 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
 }
 
 
-/// The module controller is independent of the machine: a reset leaves it mid-command, as the
-/// deskside's does.
+/// The PROM waits for an arbitration grant from the module controller before every exchange with
+/// it, and prints "Timeout waiting for arbitration signal" when none comes. The controller grants
+/// from the moment the machine is built, and a machine reset leaves it running, mid-command.
 #[test]
-fn a_machine_reset_leaves_the_origin_200_controller_mid_command() {
-    use crate::dev::heart::host_clock;
+fn the_origin_200_controller_grants_from_the_start_and_survives_a_reset() {
+    use crate::dev::pcf8584::ctl;
     use crate::dev::serial_host::CiSerialBackend;
-    let hub = Hub::new(HubConfig { cpus: 1, ni_revision: 3, ..Default::default() }, host_clock(), None).unwrap();
-    let controller = Origin200Controller::new(&hub, &host_clock(), None).unwrap();
+    use std::sync::atomic::Ordering;
+    let now = Arc::new(AtomicU64::new(0));
+    let ticks = now.clone();
+    let clock: Clock = Arc::new(move || ticks.load(Ordering::SeqCst));
+    let hub = Hub::new(HubConfig { cpus: 1, ni_revision: 3, ..Default::default() }, clock.clone(), None).unwrap();
+    let controller = Origin200Controller::new(&hub, &clock, None).unwrap();
+    let grants = || {
+        // The PROM's setup as an I2C observer: a nonzero own address, then the interface on.
+        controller.i2c.write_register(8, ctl::PIN);
+        controller.i2c.write_register(0, 0x09);
+        controller.i2c.write_register(8, ctl::PIN | ctl::ESO);
+        (0..10).any(|_| {
+            now.fetch_add(1_000_000, Ordering::SeqCst);
+            controller.i2c.read_register(0) == 0xe0
+        })
+    };
+    assert!(grants(), "processor 0's arbitration grant never appeared");
+
     let console = Arc::new(CiSerialBackend::new());
     controller.elsc.set_serial_backend(console.clone());
     controller.elsc.serial_input(0x14);
@@ -155,4 +172,5 @@ fn a_machine_reset_leaves_the_origin_200_controller_mid_command() {
     controller.reset();
     controller.elsc.serial_input(b'x');
     assert_eq!(console.drain_guest(), b"x", "the line being typed was echoed, so the command mode held");
+    assert!(grants(), "processor 0's arbitration grant stopped after a machine reset");
 }

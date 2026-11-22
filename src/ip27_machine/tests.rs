@@ -509,7 +509,7 @@ fn the_io_prom_image_fills_the_baseio_flash() {
         assert_eq!(flash(&m, 0), 0xdead_beef);
         assert_eq!(flash(&m, 4), 0x01ff_ffff);
         cfg.onyx2.io_prom = Some(dir.join("missing").to_string_lossy().into_owned());
-        assert!(test_support::machine(&cfg).err().unwrap().contains("onyx2.io_prom"));
+        assert!(test_support::machine(&cfg).err().unwrap().contains("machine.io_prom"));
         // "(embedded)" loads the BaseIO PROM built into iris.
         cfg.onyx2.io_prom = Some("(embedded)".into());
         let m = test_support::machine(&cfg).unwrap();

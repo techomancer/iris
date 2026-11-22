@@ -28,6 +28,29 @@ fn the_ibricks_slots_read_back_as_wired() {
         assert_eq!(pio.read32(widget(u64::from(SPARE_PORT), 0)).status, BUS_ERR, "port B is empty");
     });
 }
+/// `[machine] audio_card` fits the ICE1724 at device 2 of the I-brick's head F, on either product,
+/// with the monitor's audio report; without it the slot is empty.
+#[test]
+fn the_audio_card_sits_at_device_2_of_the_ibrick_when_asked_for() {
+    let dir = TempPath::dir("o3k-audio");
+    let slot = |cfg: MachineConfig| {
+        with_machine(cfg, |m| {
+            let read = m.nodes[0].chip.pio().read32(widget(u64::from(HEAD_F), 0x2_0000 + (u64::from(crate::ip35::AUDIO_CARD_DEVICE) << 12)));
+            ((read.status == BUS_OK).then_some(read.data), m.io.monitor.iter().any(|d| d.audio_report().is_some()))
+        })
+    };
+    let fitted = |mut cfg: MachineConfig| {
+        cfg.no_audio = true;
+        if cfg.machine.profile == MachineProfile::Onyx3000Ip35 { cfg.onyx3000.audio = true } else { cfg.origin3200.audio = true }
+        cfg
+    };
+    for cfg in [config(&dir, 1), onyx_config(&dir, GraphicsBoard::Ir3)] {
+        let (id, report) = slot(cfg.clone());
+        assert!(id.is_none_or(|id| id == u32::MAX) && !report, "{:?}: empty without the key", cfg.machine.profile);
+        assert_eq!(slot(fitted(cfg.clone())), (Some(0x1724_1412), true), "{:?}", cfg.machine.profile);
+    }
+}
+
 /// A processor's thread is a processor of the node it runs on and of no
 /// other: the second node's chip numbers the machine's CPU 1 its own
 /// processor 0, and takes the first node's thread for no processor.
@@ -50,7 +73,7 @@ fn the_configuration_refuses_what_the_row_does_not_hold() {
     let dir = TempPath::dir("o3k-config");
     config(&dir, 1).validate().unwrap();
     config(&dir, 2).validate().unwrap();
-    assert!(refused(&config(&dir, 3)).contains("origin3200.c_bricks"));
+    assert!(refused(&config(&dir, 3)).contains("machine.nodes 3"));
     let mut cfg = config(&dir, 1);
     cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
     cfg.banks_set = true;
@@ -218,8 +241,8 @@ fn a_link_reset_of_the_pipes_port_leaves_the_boards_own_registers() {
     });
 }
 
-/// The profile's limits: the pipe is a product the table ships in an Onyx 3000; the C-bricks are
-/// the graphics brick's, not a key; the machine has graphics, so none is the Origin 3200.
+/// The profile's limits: the pipe is a product the table ships in an Onyx 3000; the machine has
+/// one or two C-bricks with either board; it has graphics, so none is the Origin 3200.
 #[test]
 fn the_configuration_refuses_what_the_onyx_does_not_hold() {
     let dir = TempPath::dir("o3k-ir-config");
@@ -227,14 +250,22 @@ fn the_configuration_refuses_what_the_onyx_does_not_hold() {
     for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2e, GraphicsBoard::None, GraphicsBoard::V10, GraphicsBoard::V8] {
         assert!(refused(&onyx_config(&dir, board)).contains("Onyx 3000"), "{}", board.as_str());
     }
-    // Its graphics board fixes the C-bricks, so `[onyx3000]` has no count.
-    let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
-    cfg.onyx3000.c_bricks = 2;
-    assert!(refused(&cfg).contains("onyx3000.c_bricks"), "{}", refused(&cfg));
+    // The C-bricks are `[onyx3000] c_bricks`, whichever the board: unset, one, or two with a V12.
+    for board in [GraphicsBoard::Ir3, GraphicsBoard::V12] {
+        let mut cfg = onyx_config(&dir, board);
+        assert_eq!(cfg.c_bricks(), if board == GraphicsBoard::V12 { 2 } else { 1 });
+        for count in [1u8, 2] {
+            cfg.onyx3000.c_bricks = Some(count);
+            cfg.validate().unwrap();
+            assert_eq!((cfg.c_bricks(), node_specs(&cfg).unwrap().len()), (usize::from(count), usize::from(count)));
+        }
+        cfg.onyx3000.c_bricks = Some(3);
+        assert!(refused(&cfg).contains("machine.nodes 3"), "{}", refused(&cfg));
+    }
     // The brick keys are read from `[onyx3000]`, and an error names it.
     let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
     cfg.onyx3000.brick_serial = Some("X".repeat(38));
-    assert!(refused(&cfg).starts_with("onyx3000.brick_serial"), "{}", refused(&cfg));
+    assert!(refused(&cfg).starts_with("machine.brick_serial"), "{}", refused(&cfg));
     let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
     cfg.origin3200.brick_serial = Some("X".repeat(38));
     cfg.validate().unwrap();
@@ -277,4 +308,100 @@ fn each_c_bricks_controller_names_its_brick() {
     let g = node_specs(&onyx_config(&dir, GraphicsBoard::Ir3)).unwrap();
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].l1.attached.map(|b| (b.type_code, b.graphics_bay)), Some((0x49, Some(G_BRICK_BAY))));
+}
+
+/// With one C-brick the V12 answers at widget 11 of the I-brick's crossbar, and the I-brick's
+/// controller names a brick on that port; a pipe with two C-bricks stays on the first.
+#[test]
+fn either_board_takes_one_or_two_c_bricks() {
+    let dir = TempPath::dir("o3k-free-bricks");
+    let mut cfg = onyx_config(&dir, GraphicsBoard::V12);
+    cfg.onyx3000.c_bricks = Some(1);
+    let specs = node_specs(&cfg).unwrap();
+    assert_eq!(specs[0].l1.attached.map(|b| (b.type_code, b.graphics_bay)), Some((0x49, Some(G_BRICK_BAY))));
+    with_machine(cfg, |m| {
+        assert_eq!(m.nodes.len(), 1);
+        let id = m.nodes[0].chip.pio().read32(widget(u64::from(PIPE_WIDGET), 0x04));
+        assert_eq!(id.status, BUS_OK, "the V12 answers");
+        assert_ne!(id.data, 0xffff_ffff);
+    });
+    let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
+    cfg.onyx3000.c_bricks = Some(2);
+    let attached: Vec<_> = node_specs(&cfg).unwrap().iter().map(|s| s.l1.attached.map(|b| (b.type_code, b.graphics_bay))).collect();
+    assert_eq!(attached, [Some((0x49, Some(G_BRICK_BAY))), None]);
+    with_machine(cfg, |m| {
+        assert_eq!(m.nodes.len(), 2);
+        assert_eq!(m.nodes[0].chip.pio().read32(widget(u64::from(PIPE_WIDGET), 0x04)).status, BUS_OK, "the pipe answers");
+        assert_ne!(m.nodes[1].chip.pio().read32(widget(0, 0x04)).status, BUS_OK, "the second C-brick has no I/O brick");
+    });
+}
+
+/// `[graphics] node` and `widget` move the board: a V12 in a brick of its own answers at the
+/// widget named, and a pipe named onto the second C-brick answers there and not on the I-brick.
+#[test]
+fn the_graphics_keys_place_the_board() {
+    let dir = TempPath::dir("o3k-placement");
+    let mut cfg = onyx_config(&dir, GraphicsBoard::V12);
+    cfg.graphics.widget = Some(12);
+    assert_eq!(placement(&cfg), Placement { node: 1, widget: 12 });
+    with_machine(cfg, |m| {
+        let second = m.nodes[1].chip.pio();
+        assert_eq!(second.read32(widget(12, 0x04)).status, BUS_OK);
+        assert_ne!(second.read32(widget(u64::from(VPRO_WIDGET), 0x04)).status, BUS_OK);
+    });
+    let mut cfg = onyx_config(&dir, GraphicsBoard::V12);
+    cfg.graphics.node = Some(0);
+    assert_eq!(placement(&cfg), Placement { node: 0, widget: PIPE_WIDGET });
+    let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
+    cfg.onyx3000.c_bricks = Some(2);
+    cfg.graphics.node = Some(1);
+    let attached: Vec<_> = node_specs(&cfg).unwrap().iter().map(|s| s.l1.attached.map(|b| (b.type_code, b.graphics_bay))).collect();
+    assert_eq!(attached, [Some((0x49, None)), Some((0x58, Some(G_BRICK_BAY)))]);
+    with_machine(cfg, |m| {
+        assert_eq!(m.nodes[1].chip.pio().read32(widget(u64::from(PIPE_WIDGET), 0x04)).status, BUS_OK, "the pipe answers on the second");
+        assert_ne!(m.nodes[0].chip.pio().read32(widget(u64::from(PIPE_WIDGET), 0x04)).status, BUS_OK, "and not on the I-brick");
+    });
+}
+
+/// `[machine] cpus` fits one, two or four processors on each C-brick: the positions left empty
+/// are the ones a fresh flash lists disabled, and the machine runs the bricks' processors
+/// together, eight at most.
+#[test]
+fn each_c_brick_takes_one_two_or_four_processors() {
+    let dir = TempPath::dir("o3k-populations");
+    for (cpus, mask, absent, pimms) in [(1u8, 0b0001, "BCD", 0b01), (2, 0b0101, "BD", 0b11), (4, 0b1111, "", 0b11)] {
+        let mut cfg = config(&dir, 2);
+        cfg.machine.cpus = Some(cpus);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.total_cpus(), 2 * usize::from(cpus));
+        let specs = node_specs(&cfg).unwrap();
+        for spec in &specs {
+            assert_eq!((spec.processors.mask(), spec.absent), (mask, absent), "{cpus} per brick");
+            assert_eq!(spec.l1.compute_node.as_ref().map(|n| n.pimm_mask), Some(pimms), "{cpus} per brick");
+        }
+    }
+    let mut cfg = config(&dir, 2);
+    for cpus in [0u8, 3, 5] {
+        cfg.machine.cpus = Some(cpus);
+        assert!(refused(&cfg).contains("1, 2 or 4 on each node board"), "{}", refused(&cfg));
+    }
+    // The V12 Onyx 3000 is two C-bricks; the G-brick one is one.
+    let mut onyx = onyx_config(&dir, GraphicsBoard::V12);
+    onyx.machine.cpus = Some(4);
+    assert_eq!(onyx.total_cpus(), 8);
+    let mut onyx = onyx_config(&dir, GraphicsBoard::Ir3);
+    onyx.machine.cpus = Some(4);
+    assert_eq!(onyx.total_cpus(), 4);
+}
+
+/// Two C-bricks of four build a machine of eight processors, numbered across the bricks in order.
+#[test]
+fn two_c_bricks_of_four_build_eight_processors() {
+    let dir = TempPath::dir("o3k-eight");
+    let mut cfg = config(&dir, 2);
+    cfg.machine.cpus = Some(4);
+    with_machine(cfg, |m| {
+        assert_eq!(m.cpus().count(), 8);
+        assert_eq!(m.nodes.iter().map(|n| n.first_cpu).collect::<Vec<_>>(), [0, 4]);
+    });
 }

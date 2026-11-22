@@ -9,6 +9,19 @@ pub fn mc_machine(profile: MachineProfile) -> bool {
     matches!(profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
 }
 
+/// A button filled with `fill` (the green Start, the red Stop, the blue
+/// confirm buttons). Its text is white: the theme's text colour is dark grey
+/// in light mode, which can hardly be read on these fills.
+pub fn filled_button<'a>(text: impl Into<egui::RichText>, fill: egui::Color32) -> egui::Button<'a> {
+    egui::Button::new(text.into().color(egui::Color32::WHITE)).fill(fill)
+}
+
+/// Whether `profile` has the Indigo2's motherboard EEPROM (`nveeprom`). The
+/// Indy keeps its PROM environment in the NVRAM, the O2 in its flash.
+pub fn has_nveeprom(profile: MachineProfile) -> bool {
+    matches!(profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
+}
+
 /// Whether `cfg.prom` runs the PROM built into iris: `(embedded)`, an empty
 /// value the GUI writes as `(embedded)` before a start, or the default name
 /// with neither it nor the machine's release file name in the machine
@@ -318,6 +331,7 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
+                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
                 ui.checkbox(&mut s.ps2_input, t!("extra-ps2"));
                 ui.checkbox(&mut s.usb_input, t!("extra-usb-input"));
             }
@@ -347,7 +361,10 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 let s = &mut cfg.origin3200;
                 ui.horizontal(|ui| {
                     ui.label(t!("extra-c-bricks"));
-                    ui.add(DragValue::new(&mut s.c_bricks).range(1..=2));
+                    let mut count = s.c_bricks.unwrap_or(1);
+                    if ui.add(DragValue::new(&mut count).range(1..=2)).changed() {
+                        s.c_bricks = Some(count);
+                    }
                 });
                 text(ui, &t!("extra-flash"), &mut s.flash);
                 choice(
@@ -365,9 +382,17 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
+                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
             }
             MachineProfile::Onyx3000Ip35 => {
+                let mut count = cfg.c_bricks() as u8;
                 let s = &mut cfg.onyx3000;
+                ui.horizontal(|ui| {
+                    ui.label(t!("extra-c-bricks"));
+                    if ui.add(DragValue::new(&mut count).range(1..=2)).changed() {
+                        s.c_bricks = Some(count);
+                    }
+                });
                 text(ui, &t!("extra-flash"), &mut s.flash);
                 choice(
                     ui,
@@ -384,6 +409,7 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
+                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
             }
             _ => (),
         }

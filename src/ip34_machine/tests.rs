@@ -137,6 +137,25 @@ fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
     assert_eq!(status.map(|s| s & 1), [0, 0], "nothing plugged in");
     assert!(mouse, "without the USB pair the PS/2 mouse does");
 }
+/// `[machine] audio_card` fits the ICE1724 at device 2 of head F, its two I/O BARs reachable once
+/// placed; without it the slot is empty.
+#[test]
+fn the_fuel_takes_the_audio_card_at_device_2() {
+    let dir = TempPath::dir("fuel-audio");
+    let slot = |audio| {
+        let mut cfg = fuel_config(&dir);
+        cfg.fuel.audio = audio;
+        cfg.no_audio = true;
+        with_machine(cfg, |m| {
+            let read = m.nodes[0].chip.pio().read32(pio_widget(15, 0x2_0000 + (u64::from(crate::ip35::AUDIO_CARD_DEVICE) << 12)));
+            ((read.status == BUS_OK).then_some(read.data), m.io.monitor.iter().any(|d| d.audio_report().is_some()))
+        })
+    };
+    assert_eq!(slot(true), (Some(0x1724_1412), true));
+    let (id, report) = slot(false);
+    assert!(id.is_none_or(|id| id == u32::MAX) && !report, "empty without the key");
+}
+
 /// A Fuel with `graphics` in its graphics slot.
 fn fuel_with_graphics(dir: &TempPath, graphics: crate::config::GraphicsBoard) -> crate::config::MachineConfig {
     let mut cfg = fuel_config(dir);

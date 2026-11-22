@@ -15,13 +15,13 @@ Copy [`origin2000.toml.example`](../origin2000.toml.example) to
 built in. The sample selects
 `machine.profile = "origin2000_ip27"`.
 
-- `[origin2000] nodes` is 1 or 2. The memory in `banks` is fitted to every
+- `[machine] nodes` is 1 or 2. The memory in `banks` is fitted to every
   node.
-- `[origin2000] io_prom` names the I/O PROM image (`io6prom.img`, beside the
+- `[machine] io_prom` names the I/O PROM image (`io6prom.img`, beside the
   node PROM on the IRIX 6.5.30 media) to load in the BaseIO's boot flash;
   without it the PROM built into iris is loaded.
 - `machine.cpu` is `r10000` or `r12000`. Each node has one processor.
-- `[origin2000] flash` and `controller_store` keep the boot flash (the second
+- `[machine] flash` and `controller_store` keep the boot flash (the second
   node's at the same name with `.1` added) and the module controller's store
   between runs.
 - `prom` overrides the built-in IP27 PROM, as for the
@@ -50,7 +50,7 @@ PROMs when it packs them, and this one must stay packed. Two PROM-only boots wit
 | the published container | `DONE` | `BASEIO PROM Monitor SGI Version 6.156 built 11:26:28 AM Nov 18, 2003`, then the System Maintenance Menu |
 | the unwrapped 773,406-byte payload | `PROM magic incorrect: 0x7000000200000004` | `Retrying using the IP27 PROM internal copy of BASEIO PROM`, built 11:05:48 AM Nov 18, 2003 |
 
-With `[origin2000] io_prom` unset iris loads the built-in BaseIO PROM, so the graphics
+With `[machine] io_prom` unset iris loads the built-in BaseIO PROM, so the graphics
 console works without setup. `io_prom` names an image to use instead.
 
 ## Limits
@@ -60,6 +60,9 @@ console works without setup. `io_prom` names an image to use instead.
 - Two nodes: the PROM finds both Hubs, numbers them, chooses the first as the
   global master, passes its diagnostics with both processors and 256 MB, and
   IRIX 6.5.30 boots to a root login with both processors.
+- One processor on each node board. A node board has two processor slots;
+  with both filled the PROM does not start, so `[machine] cpus = 2` is
+  refused. Two node boards give two processors.
 - The BaseIO is the only board; the second Crossbow has no widgets but its
   node.
 - The module's midplane one-wire part is not fitted.

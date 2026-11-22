@@ -68,7 +68,8 @@ the monitor, the stored lifecycle state); its provided methods are either
 shared logic every machine wants the same way (`status`, and the idempotent
 `start_guest`/`stop_guest` behind `machine-start`/`machine-stop`, see
 `src/machine_state.rs`) or optional facilities (snapshots, CHD folding, the
-scratch volume, disc changes, the NAT controls) that default to "not
+scratch volume, disc changes, the NAT controls, the `disk_activity` and
+`audio_frames` counters behind a front-end's activity lights) that default to "not
 supported on this machine". `Machine` implements all of it. A machine built
 around a different chipset implements the same trait and gets the window,
 iris-ci, iris-gui and the monitor's `reset`/`save`/`load`/`machine-status`
@@ -171,7 +172,9 @@ pub trait Resettable { fn power_on(&self); }
   internals 32-bit; the GFIFO still carries a 32-bit register address.
 - **Device** is the lifecycle: devices with threads start and join them here.
   `register_commands`/`execute_command` give a device its own debug commands;
-  [debug.md](debug.md) documents them.
+  [debug.md](debug.md) documents them. A sound card also answers
+  `audio_report` (the monitor's `audio status`) and `audio_frames`, a count of
+  frames moved that only goes up while sound plays or records.
 - **Saveable** is snapshot state. A device that implements it gets a
   save → load → save round-trip test. State too big for a TOML table goes to the
   chunk store instead: the machine calls the device's own `save_chunks` and
@@ -198,7 +201,9 @@ outside `access`, or the hot path carries its stack frame.
 Devices connect to each other through device-specific `connect()` /
 `set_phys()` calls made by `Machine`, not through a generic graph. Smaller
 interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
-channel), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
+channel; `wait_active` lets a device thread block until the guest arms the
+channel, which HPC3 signals from the arming register write instead of being
+polled), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
 (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 
@@ -543,7 +548,11 @@ one `Physical`. `src/cpu/smp.rs` holds what they share:
   on. Two callers take turns, and the one waiting counts as parked. Remapping
   memory and flushing jitv2 go through it. A remap that moved memory then asks
   every CPU (`World::layout_changed`) to forget the addresses of its JIT code
-  pages; no compiled code is dropped for it (section 8).
+  pages; no compiled code is dropped for it (section 8). A CPU belongs to one
+  `World`: every machine hands its world to its CPUs' jitv2 pool
+  (`share_jitv2`, `attach_pool`), and a CPU built without one (in a test) gets
+  a world of one (`World::solo`, in `MipsCpu::new`), so its pool's flushes and
+  its own take turns the same way.
 
 The monitor reaches CPUs through `CpuMonitor` (`src/cpu/cpu_monitor.rs`), on
 every machine: it routes each command and the commands themselves live in
@@ -1410,6 +1419,15 @@ code into host code with Cranelift. The concepts:
   and stores are plain host accesses, so on a multiprocessor a guest `SYNC`
   compiles to a host fence on hosts that are not x86 (the interpreter's
   `SYNC` does the same).
+- **Flushes take turns through the CPU's world.** A CPU flushes from inside
+  `World::stop_others` and joins the compile workers there, holding the
+  `Jitv2` lock. A worker that leads a flush takes the world with `try_lead`,
+  parks the CPUs, and only then takes the `Jitv2` lock; it gives way if the
+  pool stops while it waits. So a worker never halts a CPU thread (which may
+  be joining that worker) and never waits on the lock a joining thread holds.
+  Workers get their start-up data (cache geometry, JIT constants) before they
+  spawn, for the same reason. A thread that runs no CPU stops the pool with
+  `Jitv2::stop_pool`, which joins with the lock released.
 - **Uncached fetches the board decodes apart.** A frame table is indexed by
   the physical address of the fetch. The IP35 reset PROM answers an uncached fetch
   at 0x1fc00000 whatever RAM sits behind the cached view there, so a board whose

@@ -653,14 +653,11 @@ pub fn handle_request(
 /// (`Codegen::finalize_batch_nonforced`), it is fully self-describing there
 /// — nothing about *which* entry is still needed here, only a rough count to
 /// decide whether `publish_ready_nonforced`/`force_publish_pending` are
-/// worth calling at all. A plain counter can also be conservative in the
-/// harmless direction: `publish_sealed`-derived saturating decrements mean
-/// it can undercount slightly (a sweep triggered by *this* worker's own
-/// gap-blocked entry can incidentally also unblock and publish some *other*
-/// worker's entries, which never incremented this counter — see
-/// `publish_all`'s own doc comment) but never overcounts into a permanent
-/// "stuck thinking there's still something pending" state, since it only
-/// ever grows by exactly 1 per genuinely gap-blocked compile.
+/// worth calling at all. It is only a hint. Another worker's seal can
+/// publish this worker's entries without telling it, so it can stay high
+/// (the idle sweeps zero it once the queue is empty, see
+/// `reconcile_with_seal_queue`) or, by subtracting entries this worker never
+/// counted, fall to 0 while its own entry is still queued.
 pub type PendingCount = usize;
 
 /// Deferred counterpart to `handle_request`: identical compile-from-snapshot
@@ -836,9 +833,13 @@ pub fn handle_request_deferred(
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);
+            // Entries this seal released were counted when they queued; uncount
+            // them, or `pending` never returns to 0 and the worker polls at 200us.
+            let own = codegen.finalized_fn_is_among(&sealed);
+            *pending = pending.saturating_sub(sealed.len() - own as usize);
             if codegen.last_finalize_failed() {
                 page.mark_finalize_failed();
-            } else if !codegen.finalized_fn_is_among(&sealed) {
+            } else if !own {
                 // Own range still unsealed. `sealed` may be non-empty all the
                 // same (this allocation vacated the previous host page and
                 // released what waited there), so test for our own function,
@@ -919,6 +920,15 @@ fn publish_all(sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) {
     }
 }
 
+/// `pending` is per worker, but any worker's seal can release this worker's
+/// entries. With the shared seal queue empty nothing is left to publish,
+/// whatever the count says.
+fn reconcile_with_seal_queue(codegen: &Codegen, pending: &mut PendingCount) {
+    if *pending > 0 && codegen.seal_queue_snapshot().queue_len == 0 {
+        *pending = 0;
+    }
+}
+
 /// Non-forced retry sweep for the async worker's idle-timeout scheme (see
 /// `worker_loop`'s own doc comment): re-attempts sealing whatever the
 /// shared arena's seal queue currently has queued (this worker's own
@@ -935,6 +945,7 @@ pub fn publish_ready_nonforced(codegen: &mut Codegen, pending: &mut PendingCount
     let sealed = codegen.try_seal_ready();
     *pending = pending.saturating_sub(sealed.len());
     publish_all(&sealed);
+    reconcile_with_seal_queue(codegen, pending);
 }
 
 /// Idle-timeout counterpart: force-seal whatever the shared arena's seal
@@ -949,6 +960,7 @@ pub fn force_publish_pending(codegen: &mut Codegen, pending: &mut PendingCount) 
     let sealed = codegen.force_seal_pending();
     *pending = pending.saturating_sub(sealed.len());
     publish_all(&sealed);
+    reconcile_with_seal_queue(codegen, pending);
 }
 
 #[cfg(test)]
@@ -1331,6 +1343,39 @@ mod tests {
         let mut pending: PendingCount = 1;
         force_publish_pending(&mut codegen, &mut pending);
         assert!(pages.iter().all(|p| p.is_runnable(4)), "the forced sweep must leave every page published");
+    }
+
+    #[test]
+    fn idle_sweep_zeroes_pending_when_another_worker_released_its_entry() {
+        // Worker `a` queues one entry. Worker `b`, on the same arena, seals
+        // past it. `a` is never told, so its count must still reach 0 once
+        // the queue is empty, or it polls every 200us for good.
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        const N: usize = 64;
+        let counters: Vec<AtomicU64> = (0..=N).map(|_| AtomicU64::new(0)).collect();
+        let mut pages: Vec<PhysicalCodePage> = counters.iter().enumerate()
+            .map(|(i, c)| PhysicalCodePage::new(i as u32, c as *const AtomicU64))
+            .collect();
+        let mut a = Codegen::new();
+        let (shared, state) = a.shared_arena();
+        let mut b = Codegen::new_with_shared_arena(shared, state);
+        let mut analyzer = Analyzer::new();
+        let (mut pending_a, mut pending_b): (PendingCount, PendingCount) = (0, 0);
+        pages[0].mark_requested(4);
+        let req = CompileRequest { page: &mut pages[0] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut a, &mut pending_a);
+        assert_eq!(pending_a, 1, "a's compile must be queued and counted");
+        for i in 1..=N {
+            pages[i].mark_requested(4);
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut b, &mut pending_b);
+        }
+        force_publish_pending(&mut b, &mut pending_b);
+        assert_eq!(pending_b, 0);
+        assert_eq!(b.seal_queue_snapshot().queue_len, 0, "nothing may be left to publish");
+        publish_ready_nonforced(&mut a, &mut pending_a);
+        assert_eq!(pending_a, 0, "a's entry was released by b, so a has nothing pending");
     }
 
     /// One thread stores into a page through `bus` (each `write32` bumps the

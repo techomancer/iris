@@ -58,7 +58,9 @@ path*, sized as if it were the wake path:
   `Ip30Bus::service()` returns `()`).
 - **wd33c93a**: both "channel not yet armed" waits sleep 100µs between
   attempts instead of `yield_now()`. Still far below SCSI command timescales;
-  the deadline stays 100ms.
+  the deadline stays 100ms. *Superseded (issue 346):* they now block in
+  `DmaClient::wait_active`, woken by HPC3 on the channel's inactive→active
+  edge; see `clanker/devices/hpc3-arming-wakes-the-dma-peripheral.md`.
 
 Deliberately **not** changed:
 

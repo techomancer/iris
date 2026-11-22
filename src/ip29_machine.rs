@@ -68,7 +68,7 @@ struct Origin200Controller {
 
 impl Origin200Controller {
     fn new(hub: &Hub, clock: &Clock, store: Option<&Path>) -> Result<Arc<Self>, String> {
-        let store = ElscNvram::origin200(store).map(Arc::new).map_err(|e| format!("origin200.controller_store: {e}"))?;
+        let store = ElscNvram::origin200(store).map(Arc::new).map_err(|e| format!("machine.controller_store: {e}"))?;
         let busy = BusBusy::default();
         let elsc = Arc::new(Elsc::new(ElscConfig::default(), store.clone(), clock.clone(), busy.clone()));
         let mut bus = I2cBus::new();
@@ -76,6 +76,8 @@ impl Origin200Controller {
         bus.add(store);
         let i2c = Arc::new(Pcf8584::new(bus, busy));
         hub.attach_i2c(i2c.clone());
+        // Power it on once, here: reset() leaves it running, as on the Origin 2000.
+        elsc.power_on();
         Ok(Arc::new(Self { elsc, i2c }))
     }
 }
@@ -101,7 +103,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let module = parts::cpu_module(part).ok_or("an Origin 200 has an R10000 or an R12000")?;
     Ok(vec![NodeSpec {
         // Hub 2.1 on the Origin 200; the node is not in a numbered midplane slot.
-        hub: HubConfig { cpus: 1, ni_revision: 3, banks_mb: std::array::from_fn(|i| cfg.banks[i]), ..Default::default() },
+        hub: HubConfig { cpus: cfg.machine.cpus(), ni_revision: 3, banks_mb: std::array::from_fn(|i| cfg.banks[i]), ..Default::default() },
         module,
         firmware: FlashValues {
             cpu_mode_bits: module.mode_word,

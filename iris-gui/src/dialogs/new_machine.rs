@@ -41,7 +41,7 @@ impl Default for NewMachineDialog {
     fn default() -> Self {
         Self {
             open: false,
-            name: "indy".into(),
+            name: default_name(MachineProfile::default()).into(),
             profile: MachineProfile::default(),
             cpu: &parts::R4400_150,
             graphics: iris::config::GraphicsBoard::Newport,
@@ -60,6 +60,13 @@ impl Default for NewMachineDialog {
             result: None,
         }
     }
+}
+
+/// The name a new machine of `profile` gets until the user types one:
+/// the profile's name up to its board number (`o2`, `octane`, `indigo2`).
+pub fn default_name(profile: MachineProfile) -> &'static str {
+    let name = profile.name();
+    name.split_once('_').map_or(name, |(model, _)| model)
 }
 
 /// Fill the profile's banks largest first, without gaps.
@@ -118,6 +125,11 @@ impl NewMachineDialog {
                             }
                         });
                     if self.profile != profile_before {
+                        // A name the user has not changed follows the model.
+                        let name = self.name.trim();
+                        if name.is_empty() || name == default_name(profile_before) {
+                            self.name = default_name(self.profile).into();
+                        }
                         self.cpu = self.profile.cpus()[0];
                         self.graphics = if self.profile.ip28() { iris::config::GraphicsBoard::SolidImpact } else { iris::config::GraphicsBoard::default_for(self.profile) };
                         self.use_embedded_prom = true;
@@ -204,9 +216,9 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
 
-                    // The O2's NVRAM is its own PROM flash, already asked for
-                    // above; it has no separate motherboard EEPROM.
-                    if crate::extra_ui::mc_machine(self.profile) {
+                    // Only the Indigo2 has a motherboard EEPROM; the Indy keeps
+                    // its PROM environment in the NVRAM, the O2 in its flash.
+                    if crate::extra_ui::has_nveeprom(self.profile) {
                         ui.label(t!("dialog-new-machine-eeprom"))
                             .tip(t!("dialog-new-machine-eeprom-tip"));
                         ui.horizontal(|ui| {
@@ -338,11 +350,10 @@ impl NewMachineDialog {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button(t!("common-cancel")).clicked() { close = true; }
-                    let name = if self.name.trim().is_empty() { "indy" } else { self.name.trim() };
+                    let name = if self.name.trim().is_empty() { default_name(self.profile) } else { self.name.trim() };
                     let valid = crate::machines::validate_name(name);
                     if let Err(e) = &valid { ui.colored_label(Color32::from_rgb(230, 140, 70), e); }
-                    if ui.add_enabled(valid.is_ok(), egui::Button::new(RichText::new(t!("dialog-new-machine-create")).strong())
-                        .fill(Color32::from_rgb(60, 110, 60))).clicked()
+                    if ui.add_enabled(valid.is_ok(), crate::extra_ui::filled_button(RichText::new(t!("dialog-new-machine-create")).strong(), Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         let mut cfg = MachineConfig::default();
                         cfg.machine.profile = self.profile;
@@ -385,13 +396,36 @@ impl NewMachineDialog {
                                 ..Default::default()
                             });
                         }
-                        let name = if self.name.trim().is_empty() { "indy".to_string() } else { self.name.trim().to_string() };
+                        let name = if self.name.trim().is_empty() { default_name(self.profile) } else { self.name.trim() }.to_string();
                         self.result = Some(NewMachineResult { name, cfg });
                         close = true;
                     }
                 });
             });
         if close { self.open = false; }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::{default_name, MachineProfile};
+    use crate::extra_ui::has_nveeprom;
+
+    #[test]
+    fn default_names_follow_the_model() {
+        assert_eq!(default_name(MachineProfile::IndyIp24), "indy");
+        assert_eq!(default_name(MachineProfile::O2Ip32), "o2");
+        assert_eq!(default_name(MachineProfile::OctaneIp30), "octane");
+        assert_eq!(default_name(MachineProfile::Indigo2Ip28), "indigo2");
+        for p in MachineProfile::ALL {
+            assert!(crate::machines::validate_name(default_name(p)).is_ok(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_indigo2_has_a_motherboard_eeprom() {
+        let with: Vec<_> = MachineProfile::ALL.into_iter().filter(|&p| has_nveeprom(p)).collect();
+        assert_eq!(with, vec![MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28]);
     }
 }
 

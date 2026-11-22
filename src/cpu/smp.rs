@@ -20,10 +20,11 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-/// Most CPUs one machine runs: the four HEART has slots for (IRIX's Octane
-/// kernel and PROM use two), and a Tezro's four. Per-CPU tables size to it.
-/// The CPU ids it bounds also index the idle parker's `u8` masks.
-pub const MAX_CPUS: usize = 4;
+/// Most CPUs one machine runs: two node boards of four (two C-bricks). HEART
+/// has slots for four (IRIX's Octane kernel and PROM use two) and a Tezro
+/// holds four. Per-CPU tables size to it. The CPU ids it bounds also index the
+/// idle parker's `u8` masks, one bit each, so eight is as far as those go.
+pub const MAX_CPUS: usize = 8;
 
 /// Bit of `MipsCore::hot.interrupts` asking the CPU to stop: it retires
 /// nothing more and parks at its next batch boundary. Bit 63 is the
@@ -172,6 +173,9 @@ impl ParkSlot {
 }
 
 /// Every CPU's slot: how one thread gets the machine to itself.
+///
+/// A CPU belongs to one `World`: two would both hold it with
+/// [`HOLD_WORLD`], and either one's release would let it run under the other.
 #[derive(Default)]
 pub struct World {
     slots: OnceLock<Vec<Arc<ParkSlot>>>,
@@ -181,6 +185,14 @@ pub struct World {
 impl World {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The world of one CPU that shares its compile pool with no other. Its
+    /// own flushes and its pool's then take turns as a machine's CPUs do.
+    pub fn solo(slot: Arc<ParkSlot>) -> Self {
+        let world = Self::default();
+        world.set_slots(vec![slot]);
+        world
     }
 
     /// The machine's CPUs, once they exist.
@@ -379,6 +391,31 @@ mod tests {
         s.hold(HOLD_HEART);
         assert!(s.release(REQUEST_JIT_REMAP));
         assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+    }
+
+
+    /// A CPU with its own compile pool is in a world of one, whatever its id.
+    /// Its own thread has no one to hold; anyone else holds it.
+    #[test]
+    fn a_solo_world_holds_its_cpu_for_others_but_not_for_itself() {
+        let (s, word) = slot(3);
+        let world = Arc::new(World::solo(s.clone()));
+        s.set_active(true);
+        let mine = {
+            let world = world.clone();
+            std::thread::spawn(move || {
+                set_current_cpu(3);
+                // Returns without waiting for itself to park.
+                world.stop_others(|| ())
+            })
+        };
+        mine.join().unwrap();
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        s.set_active(false);
+        let hold = world.try_lead().expect("nobody leads");
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0, "a non-CPU leader holds the CPU");
+        drop(hold);
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
     }
 
     /// Both CPUs want the machine at once, as two CPUs running out of JIT pages

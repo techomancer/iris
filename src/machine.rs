@@ -963,6 +963,9 @@ impl Machine {
         status.set_count_hz(cpu.count_hz_atomic());
 
         world.set_slots(vec![cpu.park_slot()]);
+        // The CPU's pool flushes through this world too: a CPU belongs to one.
+        #[cfg(feature = "jitv2")]
+        cpu.share_jitv2(cpu.jitv2(), world.clone(), 0, 0);
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
         mc.set_cpu(Arc::downgrade(&cpu_device));
@@ -1021,7 +1024,7 @@ impl Machine {
         // default, so this can only happen here, after `Arc::new(MipsCpu::new(..))`,
         // same reasoning as `mc.set_cpu` right above).
         #[cfg(feature = "jitv2")]
-        crate::cpu::jitv2::jitv2::attach_pool(&cpu, (jitv2_threads, jitv2_threads_reason), jitv2_compile, phys.clone(), None);
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, (jitv2_threads, jitv2_threads_reason), jitv2_compile, phys.clone(), world.clone());
 
         // Setup DevLog (must be before Monitor so log command is available)
         let devlog = crate::devlog::init_devlog();
@@ -2619,6 +2622,9 @@ impl Workstation for Machine {
     }
     fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
     fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
+    fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
+        self.scsi_buses().iter().map(|b| b.activity()).collect()
+    }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.scsi_buses().iter().try_for_each(|b| b.flush())
     }

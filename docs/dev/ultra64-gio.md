@@ -127,7 +127,8 @@ Selects which 1 MB page of the 16 MB RAMROM is visible through the `0x1F500000` 
 | :---  | :--- |
 | [5:0] | 6-bit payload written by the N64 to `0x18000000` |
 
-Reading this register simultaneously de-asserts the GIO interrupt line on the Indy.
+Reading this register clears the pending N64→host GIO interrupt. The Indy's GIO interrupt
+line falls unless an RDB interrupt (`PROD_ID` bit 30 or 31) is still pending.
 
 ### 2.6 GIO Sync Register (`0x1F400E00` / N64 `0x18000400` — Read/Write both sides)
 
@@ -290,15 +291,17 @@ not used by current SDK code.
 ### 5.1 Shared Memory Layout (`/iris_n64_bridge`)
 
 The shm region begins with two embedded `raw_sync` Events (auto-reset, semaphore semantics) in a
-fixed 256-byte area, followed by the header and the 16 MB RAMROM. The layout is defined once, in
-`src/ultra_proto.rs`, which both IRIS and gopher64 compile.
+fixed 512-byte area, followed by the header and the 16 MB RAMROM. The layout is defined once, in
+`src/ultra_proto.rs`, which both IRIS and gopher64 compile, so both sides must be built from the
+same version of it. The area was 256 bytes until November 2026; on macOS the second event ran
+past it into the header and the Indy never woke for an N64 message.
 
 ```
-[0x000–0x0FF]   Event area (256 bytes)
+[0x000–0x1FF]   Event area (512 bytes)
                   EVT_H2N at offset 0    — Indy signals, N64 waits
                   EVT_N2H after h2n      — N64 signals, Indy waits
 
-[0x100– ]       ShmHeader
+[0x200– ]       ShmHeader
                   magic:     u32      0x4E36344D ("N64M")
                   version:   u32      1
                   h2n_ring:  IpcRing  Indy → N64

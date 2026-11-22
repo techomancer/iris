@@ -229,13 +229,19 @@ impl Link {
     /// not listening, by the returned socket, so no other test is handed the
     /// port meanwhile. Where a held port cannot be bound twice (not Unix) the
     /// socket is let go first.
+    ///
+    /// The hold is on the wildcard address and the forward binds localhost:
+    /// macOS, like the BSDs, refuses a second bind of the very same address
+    /// and port unless both sockets set SO_REUSEPORT, which the forward
+    /// listener does not, but lets a specific address share a port with a
+    /// wildcard bind. Linux allows either while the hold is not listening.
     #[cfg(test)]
     pub(crate) fn forward_on_a_held_port() -> (Option<socket2::Socket>, u16, GatewayConfig) {
         use crate::config::{ForwardBind, ForwardProto, PortForwardConfig};
         let hold = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
         #[cfg(unix)]
         hold.set_reuse_address(true).unwrap();
-        hold.bind(&"127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
+        hold.bind(&"0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
         let port = hold.local_addr().unwrap().as_socket().unwrap().port();
         let hold = cfg!(unix).then_some(hold);
         let config = GatewayConfig {

@@ -2773,6 +2773,22 @@ impl Jitv2 {
         g.buses().clear();
     }
 
+    /// Stop the compile pool from a thread that runs no CPU (the monitor's
+    /// `j2 inline on`) and hand back the workers' `Codegen`s, as
+    /// `CompileQueue::stop` does, but join them with `jit` unlocked: a worker
+    /// leading a flush takes that lock, and would wait on it for ever.
+    pub fn stop_pool(jit: &Mutex<Jitv2>) -> Vec<crate::cpu::jitv2::codegen::Codegen> {
+        let workers = {
+            let mut g = jit.lock();
+            g.compile_queue.barrier.stop();
+            std::mem::take(&mut g.compile_queue.threads)
+        };
+        let stopped = workers.into_iter().filter_map(|w| w.join().ok()).collect();
+        jit.lock().compile_queue.drain_pending_queue();
+        crate::cpu::jit_feedback::JIT_FEEDBACK.set_queue_fill(0, COMPILE_QUEUE_CAPACITY);
+        stopped
+    }
+
     /// Allocate the full page pool up front, `capacity` slots, every one
     /// starting unclaimed (`PhysicalCodePage::new(UNCLAIMED_PFN, null)`) —
     /// see `Jitv2`'s own doc comment for why this is a single one-shot
@@ -3246,13 +3262,15 @@ pub fn start_compiling(
 }
 
 /// Give `cpu`'s JIT its compile pool and start compiling as `mode` asks,
-/// reading code through `bus`. Under lockstep no pool starts.
+/// reading code through `bus`. The pool's flushes park the CPUs through
+/// `world`, the machine's, which every CPU on the pool shares
+/// (`CpuDevice::share_jitv2`). Under lockstep no pool starts.
 pub fn attach_pool(
     cpu: &Arc<dyn crate::cpu::mips_exec::CpuDevice>,
     (threads, threads_reason): (usize, String),
     mode: crate::config::JitCompile,
     bus: Arc<dyn BusDevice>,
-    world: Option<Arc<crate::cpu::smp::World>>,
+    world: Arc<crate::cpu::smp::World>,
 ) {
     // Weak handles only: a strong one would keep the board alive after the machine.
     let device: Arc<dyn Device> = cpu.clone().as_device();
@@ -3262,9 +3280,7 @@ pub fn attach_pool(
         g.compile_queue.set_thread_count_with_reason(threads.max(1), &threads_reason);
         g.compile_queue.set_cpu(Arc::downgrade(&device));
         g.compile_queue.set_owner(Arc::downgrade(&jit));
-        if let Some(world) = world {
-            g.compile_queue.set_world(world);
-        }
+        g.compile_queue.set_world(world);
     }
     #[cfg(not(feature = "jitv2_lockstep"))]
     start_compiling(&**cpu, &jit, mode, bus);
@@ -3306,20 +3322,20 @@ pub fn share_pool(
             continue;
         };
         let several = group.iter().map(|n| n.cpus.len()).sum::<usize>() > 1;
-        if several {
-            if cfg!(feature = "jitv2_lockstep") {
-                return Err("several processors cannot run with jitv2_lockstep".into());
-            }
-            let jit = lead.jitv2();
-            let mut number = 0;
-            for (space, node) in group.iter().enumerate() {
-                for cpu in node.cpus {
-                    cpu.share_jitv2(jit.clone(), world.clone(), number, space);
-                    number += 1;
-                }
+        if several && cfg!(feature = "jitv2_lockstep") {
+            return Err("several processors cannot run with jitv2_lockstep".into());
+        }
+        // A lone processor shares its own pool too, so the pool's flushes go
+        // through the machine's world: a CPU belongs to one.
+        let jit = lead.jitv2();
+        let mut number = 0;
+        for (space, node) in group.iter().enumerate() {
+            for cpu in node.cpus {
+                cpu.share_jitv2(jit.clone(), world.clone(), number, space);
+                number += 1;
             }
         }
-        attach_pool(lead, pool_size.clone(), mode, group[0].bus.clone(), several.then(|| world.clone()));
+        attach_pool(lead, pool_size.clone(), mode, group[0].bus.clone(), world.clone());
     }
     Ok(())
 }
@@ -3384,9 +3400,13 @@ pub struct CompileQueue {
     /// mid-teardown and there's nothing to stop/start anymore, which is fine
     /// to skip.
     cpu: Mutex<Option<Weak<dyn Device>>>,
-    /// With several CPUs sharing this pool, how a flush stops them all. `cpu`
-    /// is not used then: stopping and restarting one CPU's thread leaves the
-    /// others running, and would restart a CPU the monitor has stopped.
+    /// How a flush stops the CPUs this pool compiles for: it parks them, and
+    /// takes turns with their own flushes (`MipsExecutor::jitv2_flush_from_here`).
+    /// Every `MipsCpu` sets one, a world of one CPU when it shares its pool
+    /// with no other. `cpu` is not used then: stopping a CPU joins its thread,
+    /// which may itself be joining this pool for a flush of its own, and
+    /// restarting it would start a CPU the monitor has stopped. Without a
+    /// world (a bare `CompileQueue` in a test) the leader stops `cpu`.
     world: Mutex<Option<Arc<crate::cpu::smp::World>>>,
     /// Weak handle back to the owning `Jitv2` (behind whatever `Arc<Mutex<..>>`
     /// the caller shares it in) — the worker needs this to clear the page
@@ -3575,7 +3595,7 @@ impl CompileQueue {
         *self.cpu.lock() = Some(cpu);
     }
 
-    /// Several CPUs share this pool: see the `world` field.
+    /// How a flush parks the CPUs on this pool: see the `world` field.
     pub fn set_world(&self, world: Arc<crate::cpu::smp::World>) {
         *self.world.lock() = Some(world);
     }
@@ -4001,9 +4021,10 @@ impl CompileQueue {
                 // (flush_from_jit_thread's own doc comment), release before
                 // cpu.start().
                 //
-                // Several CPUs: park them all instead, without blocking on a
-                // CPU that leads a flush of its own. That CPU joins this
-                // thread, so give way once the pool is stopping.
+                // With a world (every real CPU has one): park the CPUs
+                // instead, without blocking on a CPU that leads a flush of
+                // its own. That CPU joins this thread, so give way once the
+                // pool is stopping.
                 let world_hold = match &world {
                     Some(w) => loop {
                         if let Some(hold) = w.try_lead() {
@@ -4140,6 +4161,11 @@ impl CompileQueue {
                     function_count.store(codegen.function_count(), Ordering::Relaxed);
                 } else {
                 }
+                continue;
+            }
+            #[cfg(all(test, not(loom)))]
+            if barrier.take_forced_flush() {
+                try_flush(&mut codegen, &function_count, &mut pending);
                 continue;
             }
             // The hot lane first: pages being executed right now that are
@@ -5795,6 +5821,105 @@ mod tests {
         let stamped = done_rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("the second flush is still joining a worker that waits for the pool");
         assert!(!stamped.is_empty() && stamped.iter().all(|&s| s), "a restarted worker missed the published constants: {stamped:?}");
+    }
+
+    /// A CPU thread as a compile pool sees one: it parks while held, and
+    /// stops the way `MipsCpu::halt` does, with the park bit and a join. The
+    /// first time it is held it flushes the pool itself instead, as a CPU whose
+    /// page pool runs out just as a worker leads an arena flush would.
+    struct FlushingCpu {
+        word: Arc<AtomicU64>,
+        slot: Arc<crate::cpu::smp::ParkSlot>,
+        running: Arc<AtomicBool>,
+        flushes: Arc<AtomicU32>,
+        thread: Mutex<Option<JoinHandle<()>>>,
+    }
+
+    impl FlushingCpu {
+        fn start(jit: Arc<Mutex<Jitv2>>, world: Option<Arc<crate::cpu::smp::World>>, bus: Arc<dyn BusDevice>, word: Arc<AtomicU64>, slot: Arc<crate::cpu::smp::ParkSlot>) -> Arc<Self> {
+            use crate::cpu::smp::HOST_PARK_BIT;
+            let cpu = Arc::new(Self { word: word.clone(), slot: slot.clone(), running: Arc::new(AtomicBool::new(true)), flushes: Arc::new(AtomicU32::new(0)), thread: Mutex::new(None) });
+            let (running, flushes) = (cpu.running.clone(), cpu.flushes.clone());
+            slot.set_active(true);
+            *cpu.thread.lock() = Some(std::thread::spawn(move || {
+                crate::cpu::smp::set_current_cpu(0);
+                while running.load(Ordering::SeqCst) {
+                    if word.load(Ordering::SeqCst) & HOST_PARK_BIT == 0 {
+                        std::thread::yield_now();
+                    } else if flushes.load(Ordering::SeqCst) == 0 {
+                        // `MipsExecutor::jitv2_flush_from_here`.
+                        let flush = || unsafe { jit.lock().flush_from_cpu_thread(bus.clone()) };
+                        match &world {
+                            Some(w) => w.stop_others(flush),
+                            None => flush(),
+                        }
+                        flushes.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        slot.park(&running);
+                    }
+                }
+                slot.set_active(false);
+            }));
+            cpu
+        }
+    }
+
+    impl Device for FlushingCpu {
+        fn step(&self, _cycles: u64) {}
+        fn stop(&self) {
+            self.running.store(false, Ordering::SeqCst);
+            self.word.fetch_or(crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
+            if let Some(t) = self.thread.lock().take() {
+                let _ = t.join();
+            }
+            self.word.fetch_and(!crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
+        }
+        fn start(&self) {}
+        fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
+        fn get_clock(&self) -> u64 { 0 }
+    }
+
+    /// A worker leads an arena flush and stops the CPU; the CPU, before it
+    /// stops, flushes the pool itself and joins that worker (issue #306).
+    /// Stopping the CPU by halting it waits for the CPU thread while the CPU
+    /// thread waits for the worker. Through the CPU's world the worker parks
+    /// it instead, and the CPU waiting its turn to flush counts as parked, so
+    /// both flushes finish, one after the other. Run on a spawned thread so a
+    /// regression fails here instead of hanging the test binary.
+    #[test]
+    fn a_cpu_flush_inside_a_worker_led_flush_takes_its_turn() {
+        let epoch = crate::cpu::jitv2::hashstats::FLUSH_EPOCH.load(Ordering::SeqCst);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+            let jit = Arc::new(Mutex::new(Jitv2::new(4)));
+            let word = Arc::new(AtomicU64::new(0));
+            let slot = Arc::new(crate::cpu::smp::ParkSlot::new(0, Arc::as_ptr(&word)));
+            let world = Arc::new(crate::cpu::smp::World::solo(slot.clone()));
+            let cpu = FlushingCpu::start(jit.clone(), Some(world.clone()), dev.clone(), word.clone(), slot);
+            let cpu_device: Arc<dyn Device> = cpu.clone();
+            {
+                let mut g = jit.lock();
+                g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
+                g.compile_queue.set_owner(Arc::downgrade(&jit));
+                g.compile_queue.set_world(world);
+                let stats = g.stats.clone();
+                g.compile_queue.start(dev, stats);
+                g.compile_queue.barrier.force_flush();
+            }
+            while cpu.flushes.load(Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            cpu_device.stop();
+            let restarted = !Jitv2::stop_pool(&jit).is_empty();
+            let _ = done_tx.send(restarted);
+            drop(word);
+        });
+        let restarted = done_rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the CPU's flush and the worker's flush are waiting for each other");
+        assert!(restarted, "the CPU's flush did not restart the pool");
+        let flushes = crate::cpu::jitv2::hashstats::FLUSH_EPOCH.load(Ordering::SeqCst) - epoch;
+        assert!(flushes >= 2, "expected the worker's and the CPU's flush, saw {flushes}");
     }
 
     /// Minimal `Device` (not `BusDevice`) stand-in for `CompileQueue::set_cpu` —

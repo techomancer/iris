@@ -25,18 +25,16 @@ cpus = 4
 # 0 to 4095: the system serial the L1 answers with, LEMU2<emu_id>0, whose fold
 # is IRIX's host id (emu_id 42 prints d5200420). 0, the default, is generic.
 # emu_id = 42
-
-[graphics]
-board = "none"
-
-[tezro]
 flash = "ignore/tezro/flash.bin"
 console = "l1"
 l1_port = 18882
 # Add the ICE1724 audio controller behind the IO9's PCI bridge (default false).
 # It plays as [audio] sets (unset no_audio for sound); [audio] channels = 2, 4,
 # 6 or 8 is how many speakers its channels fold down to.
-# audio = true
+# audio_card = true
+
+[graphics]
+board = "none"
 
 [network]
 # Disconnected cable. For NAT, use mode = "nat".

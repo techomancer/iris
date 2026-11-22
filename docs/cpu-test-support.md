@@ -22,6 +22,12 @@ partition is type 5 (`PT_SYSV`)**, not 7 — see
 
 From the PROM: `boot -f dksc(0,<scsi-id>,8)<name>`.
 
+An ELF executable with a segment of more than 512 KB is written with that
+segment split into 512 KB segments, because the PROM reads a segment from the
+volume header in one SCSI command and the Octane's PROM cannot read more than
+about 720 KB in one (see [octane-ip30.md](octane-ip30.md#disks)). `--no-split`
+copies every file unchanged.
+
 ## B — `--load-elf` / monitor `loadelf`
 
 Load a static ELF32 MSB `ET_EXEC` for `EM_MIPS` straight into RAM and jump to

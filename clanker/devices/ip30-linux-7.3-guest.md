@@ -9,8 +9,9 @@ Bridge driver defers its probe for ever until it can read each board's
 part number from the one-wire NIC); RTC_DRV_DS1685_FAMILY; DEVTMPFS;
 `qlogic/1040.bin` built in for qla1280 (it calls request_firmware before any
 root exists); qla2xxx wants `ql2200_fw.bin`. The PROM loads the ELF64
-`vmlinux` (load address 0xa800000020004000) from `bootp()` but not from the
-volume header (`ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md`).
+`vmlinux` (load address 0xa800000020004000) from `bootp()`, and from the
+volume header (`dksc(0,1,8)vmlinux`) once `mkvh build` has split its segment
+into 512 KB pieces (`ip30-prom-disk-load-of-a-large-elf-overruns-a-dma-list.md`).
 
 **Kernel-side problems, not iris's** (fixed with a patch to
 `arch/mips/pci/pci-xtalk-bridge.c`):
