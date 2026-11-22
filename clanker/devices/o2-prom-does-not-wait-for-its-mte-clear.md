@@ -52,3 +52,24 @@ The `0xff800000` TLB miss was seen once and not again; not reproduced here. A
 wiped POST code or stack sends POST to arbitrary addresses, which fits, but that
 is not shown. If it comes back on a current build, keep the serial log and look
 at the CPU's PC and `ra` from the monitor before stopping iris.
+
+## The race on demand: `IRIS_IP32_RE_LAG_US` (2026-11-22)
+
+`IRIS_IP32_RE_LAG_US=N` makes the engine's thread sleep N us before every MTE
+transfer, so the window opens without loading the host. Same O2 config, macOS
+arm64, release build, R5000, a quiet host (load ~2), the status guard disabled
+(`if false &&`) as the control:
+
+| Lag (us) | Guard disabled | Upstream (guarded) |
+|---|---|---|
+| 0, 500 | 20/20 ok | 20/20 ok |
+| 600 | 24 of 25 stop at `SL-9600-8E>` in about 1.5 s | 20/20 ok |
+| 800 to 5000 | every start hangs, no serial output (50 of 50) | 40/40 ok |
+| 20000 | 5 of 10 hang | 10/10 ok, 25 s a start |
+
+The hang is the POST copy wiped: Cause RI, EPC `0xa0006008` (inside the copy at
+`0xa0004000`), PC spinning at `0xbfc003a4` in the PROM's BEV handler. 600 us
+here and 1400 us on the Linux host of e013d1e0 are the same window; where it sits
+depends on how fast the CPU thread reaches the cookie store. A regression check
+is one or two starts at 600 and at 5000: any start that is not ok means the
+status read stopped waiting for the engine.

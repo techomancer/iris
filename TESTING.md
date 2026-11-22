@@ -142,6 +142,20 @@ script's help has an O2 config with no disks that reaches the menu in about
 five seconds. Races between the CPU thread and a device thread show up more
 often when the host is busy, so run it beside a few busy loops.
 
+The O2 PROM clears memory with its rendering engine and reuses it after one
+status read, so it reaches its menu only while that read waits for the
+engine's memory transfers. `IRIS_IP32_RE_LAG_US` holds each transfer on the
+engine's thread for that many microseconds, which opens the window on any host
+without loading it:
+
+```bash
+IRIS_IP32_RE_LAG_US=5000 tools/prom-boot-loop.py --iris target/release/iris --config o2.toml --count 10 --timeout 60
+```
+
+Every start must reach the menu, at 1500, 5000 or 20000 alike; a start that
+stops at `SL-9600-8E>` or hangs with no output means a status read no longer
+waits for the engine.
+
 ## Host audio
 
 A sound card can break anywhere between guest memory and the host's
