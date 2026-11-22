@@ -5821,6 +5821,58 @@ mod jit_tests {
         );
     }
 
+    /// Shaded colour-index spans at 12bpp, as IRIS GL draws lit CI surfaces
+    /// (SideFX PRISMS "smooth"/"facet", issue #798): the index is the red
+    /// DDA's integer part. The JIT used to pack clamped R/G/B bytes instead,
+    /// so the green and blue registers (left holding floats by the client)
+    /// leaked into the index and the surface drew as stripes. DRAWMODE1 is
+    /// the guest's: 12bpp CI with DITHER, single and double buffered.
+    #[test]
+    fn jit_span_shade_ci12() {
+        for dm1 in [0x3009_7011u32, 0x3009_7031] {
+            let dm0 = DM0_DRAW_SPAN | (1 << 18) | (1 << 12); // SHADE, ENZPAT
+            compare_jit_interp(0, 0, 40, 0,
+                |rex| {
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK,    0xFFF);
+                    // 12bpp CI takes COLORRED as o12.9: index 0x950 + 0.5.
+                    reg(rex, REX3_COLORRED,  0x46d2_a100);
+                    reg(rex, REX3_COLORGRN,  0x3f72_3ede);
+                    reg(rex, REX3_COLORBLUE, 0x3f72_3ede);
+                    reg(rex, REX3_SLOPERED,  3 << 9);
+                    reg(rex, REX3_SLOPEGRN,  0x4580_0018);
+                    reg(rex, REX3_SLOPEBLUE, 0x4580_0018);
+                    reg(rex, REX3_ZPATTERN,  0xFFFF_FBFF);
+                    reg(rex, REX3_XYENDI,    xy(40, 0));
+                    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+                },
+                dm0, dm1,
+            );
+        }
+    }
+
+    /// The line shader's copy of the same colour selection.
+    #[test]
+    fn jit_iline_shade_ci12() {
+        let dm1 = 0x3009_7011u32;
+        let dm0 = DM0_DRAW_ILINE | (1 << 18);
+        compare_jit_interp(0, 0, 16, 6,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFF);
+                reg(rex, REX3_COLORRED,  0x46d1_e000);
+                reg(rex, REX3_COLORGRN,  0x3f50_bf9e);
+                reg(rex, REX3_COLORBLUE, 0x3f50_bf9e);
+                reg(rex, REX3_SLOPERED,  5 << 9);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(14, 4));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
     /// F_LINE with a fractional (half-pixel) start endpoint. Exercises the
     /// same fractional-endpoint Bresenham correction (fline_apply_fract) as
     /// the interpreter-only test_fline_all_octants_half_pixel, but now
