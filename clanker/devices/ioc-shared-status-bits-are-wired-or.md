@@ -1,7 +1,8 @@
 # IOC status bits shared by several sources are the OR of their levels
 
-Status: fixed 2026-11-19 (issue techomancer/iris#262), unit-tested; the Indy
-second-head mapping is still an open question (below).
+Status: fixed 2026-11-19 (issue techomancer/iris#262), unit-tested and
+checked end to end by `tools/ioc-shared-bit-e2e.py`; the Indy second-head
+mapping is still an open question (below).
 
 ## Symptom
 
@@ -11,6 +12,14 @@ interrupt was lost until it rose again. On an Indigo2 every GIO slot's
 `GioSg*`/`GioS0*`/`GioS1*` source sets the same `FIFO_FULL`, `GRAPHICS` or
 `VERTICAL_RETRACE` bit; the direct `FifoFull`/`Graphics`/`VerticalRetrace`
 sources share them too.
+
+In a configuration IRIS builds today, the case left after 36bb98dc is an
+Indigo2 with virtio-serial or virtio-9p in GIO expansion slot 1 (their
+default): the device drives `GioS1Graphics`, which shares L0 `GRAPHICS` with
+the graphics board (Newport's retrace, IMPACT's general interrupt). Each
+Newport retrace release cleared the bit under a pending virtio interrupt,
+and a virtio acknowledgement cleared it under a pending retrace. The e2e
+harness reproduces both in every iteration on a build without the fix.
 
 ## Cause
 
