@@ -23,6 +23,57 @@ use crate::snapshot::{get_field, toml_u8, toml_bool, u8_slice_to_toml, load_u8_s
 use crate::scsi::{self, ScsiBus, ScsiIdentities, scsi_cmd, ScsiRequest, ScsiDataLength};
 use std::io::Write;
 
+/// Data phases that found the DMA channel not yet armed (the driver issues
+/// TRANSFER_INFO before dmago), counted across every controller: how often,
+/// how many times the chip looked at the channel again before it was armed,
+/// and how long the data phase waited. `scsi armwait` prints them.
+pub struct ArmWaits {
+    late: AtomicU64,
+    polls: AtomicU64,
+    timeouts: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    /// Waits by length: <50 µs, <100 µs, <200 µs, <500 µs, <1 ms, <10 ms, longer.
+    hist: [AtomicU64; 7],
+}
+const ARM_WAIT_BUCKETS_US: [u64; 6] = [50, 100, 200, 500, 1_000, 10_000];
+const ARM_WAIT_LABELS: [&str; 7] = ["<50us", "<100us", "<200us", "<500us", "<1ms", "<10ms", ">=10ms"];
+pub static ARM_WAITS: ArmWaits = ArmWaits {
+    late: AtomicU64::new(0), polls: AtomicU64::new(0), timeouts: AtomicU64::new(0),
+    total_ns: AtomicU64::new(0), max_ns: AtomicU64::new(0),
+    hist: [const { AtomicU64::new(0) }; 7],
+};
+impl ArmWaits {
+    fn record(&self, polls: u64, waited: std::time::Duration, armed: bool) {
+        let ns = waited.as_nanos().min(u64::MAX as u128) as u64;
+        self.late.fetch_add(1, Ordering::Relaxed);
+        self.polls.fetch_add(polls, Ordering::Relaxed);
+        if !armed { self.timeouts.fetch_add(1, Ordering::Relaxed); }
+        self.total_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        let us = ns / 1_000;
+        let b = ARM_WAIT_BUCKETS_US.iter().position(|&lim| us < lim).unwrap_or(ARM_WAIT_BUCKETS_US.len());
+        self.hist[b].fetch_add(1, Ordering::Relaxed);
+    }
+    fn reset(&self) {
+        for c in [&self.late, &self.polls, &self.timeouts, &self.total_ns, &self.max_ns].into_iter().chain(self.hist.iter()) {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+    fn report(&self, w: &mut dyn Write) {
+        let late = self.late.load(Ordering::Relaxed);
+        let polls = self.polls.load(Ordering::Relaxed);
+        let total = self.total_ns.load(Ordering::Relaxed);
+        let per = |n: u64| if late == 0 { 0.0 } else { n as f64 / late as f64 };
+        let _ = writeln!(w, "armwait late={} polls={} polls_per_late={:.2} timeouts={} mean_us={:.1} max_us={}",
+            late, polls, per(polls), self.timeouts.load(Ordering::Relaxed),
+            per(total) / 1_000.0, self.max_ns.load(Ordering::Relaxed) / 1_000);
+        let hist: Vec<String> = ARM_WAIT_LABELS.iter().zip(self.hist.iter())
+            .map(|(l, c)| format!("{}={}", l, c.load(Ordering::Relaxed))).collect();
+        let _ = writeln!(w, "armwait hist {}", hist.join(" "));
+    }
+}
+
 // Ring-buffer trace of WD33C93 register accesses with consecutive-dedup, so
 // long polling loops compress to one "(x N)" line and the ring covers a much
 // wider window of activity.
@@ -913,7 +964,7 @@ impl Device for Wd33c93a {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi dayna | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV] | scsi defer <on|off>".to_string()),
+            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi armwait [reset] | scsi dayna | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV] | scsi defer <on|off>".to_string()),
             ("cow".to_string(), "COW overlay: cow status | cow commit [id] | cow reset [id]".to_string()),
         ]
     }
@@ -925,6 +976,13 @@ impl Device for Wd33c93a {
                 return done;
             }
             match args.first().copied() {
+                Some("armwait") => {
+                    if args.get(1).copied() == Some("reset") {
+                        ARM_WAITS.reset();
+                    }
+                    ARM_WAITS.report(&mut *writer);
+                    return Ok(());
+                }
                 Some("wdt") => {
                     #[cfg(feature = "developer")] {
                         // "scsi wdt [N]"          — dump last N entries to console
@@ -1847,11 +1905,15 @@ impl Wd33c93aState {
                     // pins this thread's core and hammers the channel lock the CPU thread
                     // needs, which on few-core hosts delays the very arming it waits for.
                     // 100 µs is far below the command timescales SCSI runs at.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    let start = std::time::Instant::now();
+                    let deadline = start + std::time::Duration::from_millis(100);
+                    let mut polls = 0u64;
                     while st.not_active() && std::time::Instant::now() < deadline {
                         std::thread::sleep(std::time::Duration::from_micros(100));
+                        polls += 1;
                         st = dma_dev.write(data[i] as u32, is_last);
                     }
+                    ARM_WAITS.record(polls, start.elapsed(), !st.not_active());
                     if st.not_active() {
                         dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — pausing", self.id);
                     }
@@ -1925,11 +1987,15 @@ impl Wd33c93aState {
                                 // between attempts: a yield_now() hot loop steals the core the
                                 // CPU thread needs to arm the channel (see send_data_chunked).
                                 wdt!("DMA_IN spin-wait: channel not yet active");
-                                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                                let start = std::time::Instant::now();
+                                let deadline = start + std::time::Duration::from_millis(100);
                                 let mut got = false;
+                                let mut polls = 0u64;
                                 while std::time::Instant::now() < deadline {
                                     std::thread::sleep(std::time::Duration::from_micros(100));
+                                    polls += 1;
                                     if let Some((val, st)) = dma_dev.read() {
+                                        ARM_WAITS.record(polls, start.elapsed(), true);
                                         data.push(val as u8);
                                         self.decrement_transfer_count();
                                         let pause = st.eox() && data.len() < total;
@@ -1946,6 +2012,7 @@ impl Wd33c93aState {
                                     }
                                 }
                                 if !got {
+                                    ARM_WAITS.record(polls, start.elapsed(), false);
                                     dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — giving up", self.id);
                                     //eprintln!("WD33C93A: receive_data_chunked: DMA not active after 100ms");
                                     wdt!("DMA_IN spin-wait TIMEOUT: channel never became active");
