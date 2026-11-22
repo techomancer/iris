@@ -12,8 +12,8 @@
 //! PROM or guest data, so what they exercise is the format of each machine's
 //! tables and of `chunks.bin`. Three are kept: the Indy at schema 6 (the
 //! oldest schema it still reads, which also covers `chunks.bin` before the
-//! KONA lists) and the O2 and Octane at schema 7, the ones with a PCI layer
-//! whose saved table can change. They are 19.5 KiB as packed git objects.
+//! KONA lists), the O2 at schema 7 and the Octane at schema 10, the ones with a PCI
+//! layer whose saved table can change. They are 19.5 KiB as packed git objects.
 
 #![cfg(unix)]
 
@@ -182,6 +182,6 @@ fn o2_loads_schema_7() {
     loads("o2-v7", O2.0, O2.1, O2.2);
 }
 #[test]
-fn octane_loads_schema_7() {
-    loads("octane-v7", OCTANE.0, OCTANE.1, OCTANE.2);
+fn octane_loads_schema_10() {
+    loads("octane-v10", OCTANE.0, OCTANE.1, OCTANE.2);
 }
