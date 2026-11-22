@@ -1040,6 +1040,9 @@ pub struct Core {
     notes: Notes,
     odd_accesses: AtomicU64,
     wide_accesses: AtomicU64,
+    /// The machine's activity lights (`crate::status::scsi_blink`), once
+    /// wired.
+    heartbeat: std::sync::OnceLock<Arc<AtomicU64>>,
 }
 
 impl std::ops::Deref for Core {
@@ -1114,7 +1117,14 @@ impl Core {
             notes: Notes::default(),
             odd_accesses: AtomicU64::new(0),
             wide_accesses: AtomicU64::new(0),
+            heartbeat: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Light the status bar's storage light for each loop port the adapter
+    /// commands (folded to 0..15).
+    pub fn set_heartbeat(&self, heartbeat: Arc<AtomicU64>) {
+        let _ = self.heartbeat.set(heartbeat);
     }
 
     pub fn index(&self) -> u8 {
@@ -2235,6 +2245,9 @@ impl Core {
     /// None when a reset or a recovery cancelled the command while it waited
     /// for the target.
     fn scsi(&self, gen: u64, cancel: u64, id: u8, cdb: &[u8], data: Option<Vec<u8>>) -> Option<(Vec<u8>, u8)> {
+        if let Some(hb) = self.heartbeat.get() {
+            crate::status::scsi_blink(hb, u32::from(id));
+        }
         let mut targets = self.bus.lock();
         if self.gen.load(Ordering::Acquire) != gen || self.cancel.load(Ordering::Acquire) != cancel {
             return None;

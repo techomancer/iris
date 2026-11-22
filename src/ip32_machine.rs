@@ -309,6 +309,7 @@ impl O2Machine {
         bus.crime.re.start(bus.clone(), |b: &Ip32Bus| &b.crime.re);
         let running = Arc::new(AtomicBool::new(false));
         let status = crate::status::MachineStatus::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
+        status.set_scsi_wide(true);
         status.set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
         let paused = Arc::new(AtomicBool::new(false));
