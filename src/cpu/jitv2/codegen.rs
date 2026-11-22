@@ -997,9 +997,7 @@ impl Codegen {
         if self.jit_consts.single_clears_upper {
             s.push_str(" single_zx=1");
         }
-        if self.jit_consts.cvt_l_51_bits {
-            s.push_str(" cvt_l51=1");
-        }
+        let _ = write!(s, " cvt_l={} cvt_from_l={}", self.jit_consts.cvt_l_range_bits, self.jit_consts.cvt_from_l_range_bits);
         s.push_str(" ops=");
         s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
         Some(blake3::hash(s.as_bytes()).as_bytes()[..16].try_into().unwrap())
@@ -3879,6 +3877,8 @@ fn core_offset_of_fpu_cvt_int_to_float_fn() -> i32 { std::mem::offset_of!(MipsCo
 #[cfg(feature = "jitv2")]
 fn core_offset_of_fpu_cvt_d_to_s_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_d_to_s_fn) as i32 }
 #[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_cvt_s_to_d_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_s_to_d_fn) as i32 }
+#[cfg(feature = "jitv2")]
 fn core_offset_of_fpu_binop_commit_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_binop_commit_fn) as i32 }
 fn core_offset_of_fpu_fir() -> i32 { std::mem::offset_of!(MipsCore, fpu_fir) as i32 }
 fn core_offset_of_fpu_fexr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fexr) as i32 }
@@ -4667,7 +4667,7 @@ fn emit_mem_read_split(
 /// and copied into each worker's own `Codegen` as it is spawned — the same route
 /// `dc_geometry` takes, and for the same reason (a worker owns its `Codegen`
 /// by value, so the CPU thread cannot stamp it directly).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitConsts {
     /// Address of the one `MipsCore` this `Codegen`'s output may run against.
     /// `None` until `install_jit_mem_ptrs` publishes it — codegen falls back
@@ -4683,10 +4683,30 @@ pub struct JitConsts {
     /// destination (`CpuModel::SINGLE_CLEARS_UPPER`). Published and
     /// fingerprinted the same way as `lwr_keeps_upper`.
     pub single_clears_upper: bool,
-    /// A long conversion's result must lie in [-2^51, 2^51)
-    /// (`CpuModel::CVT_L_51_BITS`), so the inline range test narrows to it.
-    /// Published and fingerprinted the same way as `lwr_keeps_upper`.
-    pub cvt_l_51_bits: bool,
+    /// A long conversion's result must lie in [-2^N, 2^N) for this N, where
+    /// 63 is the format's own range (`CpuModel::CVT_L_RANGE_BITS`), so the
+    /// inline range test narrows to it. Published and fingerprinted the same
+    /// way as `lwr_keeps_upper`.
+    pub cvt_l_range_bits: u8,
+    /// CVT.S.L and CVT.D.L convert inline only a source in [-2^N, 2^N) for
+    /// this N, where 63 is every long (`CpuModel::CVT_FROM_L_RANGE_BITS`);
+    /// the rest take the callout, which raises Unimplemented Operation.
+    pub cvt_from_l_range_bits: u8,
+}
+
+/// Nothing published yet, and the R4400's model choices: the `CpuModel`
+/// defaults. Codegen built without a core (tests, the corpus tools) then
+/// compiles what an interpreter on the default model executes.
+impl Default for JitConsts {
+    fn default() -> Self {
+        JitConsts {
+            core: None,
+            lwr_keeps_upper: false,
+            single_clears_upper: false,
+            cvt_l_range_bits: 53,
+            cvt_from_l_range_bits: 52,
+        }
+    }
 }
 
 impl JitConsts {
@@ -8847,16 +8867,16 @@ fn emit_fpu_clear_cause_if_set(ctx: &mut EmitCtx) {
 /// `<= MAX` for W from a double (both exact), `>= -2^31 && < 2^31` for W from
 /// a single (`i32::MAX` is not a single, and 2^31 is the first one out of
 /// range), and `>= -2^63 && < 2^63` for L (2^63 is exact in both formats
-/// and is the first value out of range), or `>= -2^51 && < 2^51` on a
-/// part that limits L to that (`JitConsts::cvt_l_51_bits`). Returned as
+/// and is the first value out of range), or `>= -2^N && < 2^N` on a
+/// part that limits L to that (`JitConsts::cvt_l_range_bits`). Returned as
 /// `(min, max, max_inclusive)`.
 fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Value, bool) {
-    if dst_i64 && ctx.jit_consts.cvt_l_51_bits {
-        const LIMIT: f64 = 2251799813685248.0; // 2^51, exact in both formats
+    if dst_i64 && ctx.jit_consts.cvt_l_range_bits < 63 {
+        let limit = (1u64 << ctx.jit_consts.cvt_l_range_bits) as f64; // a power of two, exact in both formats
         return if src_f64 {
-            (ctx.builder.ins().f64const(-LIMIT), ctx.builder.ins().f64const(LIMIT), false)
+            (ctx.builder.ins().f64const(-limit), ctx.builder.ins().f64const(limit), false)
         } else {
-            (ctx.builder.ins().f32const(-LIMIT as f32), ctx.builder.ins().f32const(LIMIT as f32), false)
+            (ctx.builder.ins().f32const(-limit as f32), ctx.builder.ins().f32const(limit as f32), false)
         };
     }
     if src_f64 {
@@ -8990,8 +9010,20 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     };
     // NaN fails both comparisons and takes the callout. So does every source
     // while Inexact is enabled: one test, cheaper than also testing exactness.
+    // A denormal source rounds into range but is Unimplemented Operation
+    // (`cvt_operand_unimplemented_s/d`), so it takes the callout too: its
+    // magnitude bits less one fall below the smallest normal's.
     let in_range = ctx.builder.ins().band(ge_min, le_max);
     let exact = ctx.builder.ins().fcmp(FloatCC::Equal, rounded, x);
+    let (abs_mask, min_normal) = if src_f64 {
+        (0x7FFF_FFFF_FFFF_FFFFu64 as i64, 0x0010_0000_0000_0000i64)
+    } else {
+        (0x7FFF_FFFFi64, 0x0080_0000i64)
+    };
+    let src_abs = ctx.builder.ins().band_imm_s(src_bits, abs_mask);
+    let src_abs_less_one = ctx.builder.ins().iadd_imm_s(src_abs, -1);
+    let not_denormal = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, src_abs_less_one, min_normal - 1);
+    let in_range = ctx.builder.ins().band(in_range, not_denormal);
     let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
     let inexact_enable = ctx.builder.ins().band_imm_s(fcsr, FCSR_IM);
     let inexact_quiet = ctx.builder.ins().icmp_imm_s(IntCC::Equal, inexact_enable, 0);
@@ -9087,23 +9119,23 @@ fn emit_fcvt_to_int_callout(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, d
 /// Shared body for int-source-to-float conversions (CVT.S.W/D.W/S.L/D.L).
 ///
 /// **Inlined fast path, gated on host rounding mode.** `cvt_int_to_float_and_commit`
-/// is small by value — convert, write the destination, then report Inexact
-/// iff converting back changes the value — but its `src as f32/f64` is a
-/// round-to-nearest-even conversion in the *interpreter*, while the JIT's
-/// `fcvt_from_sint` lowers to `cvtsi2ss`/`cvtsi2sd`, which round per the
-/// host MXCSR. The JIT syncs MXCSR from FCSR.RM on every FCSR write
-/// (`emit_fpu_set_mode`), so the host mode is only known to be RN-even when
+/// is small by value — convert, then report Inexact iff the result differs
+/// from the source — but its `src as f32/f64` rounds per the host mode. The
+/// JIT syncs the host mode from FCSR.RM on every FCSR write
+/// (`emit_fpu_set_mode`), but the inline path is only taken under
 /// `FCSR.RM == 0`; every other mode takes the callout, which computes by
-/// value and is therefore unconditionally correct. Under RM == 0 the two
-/// agree exactly: both round to nearest, ties to even.
+/// value and is therefore unconditionally correct.
 ///
-/// The Inexact test is the interpreter's own `(result as i64) != src`,
-/// reproduced as a truncating saturating cast back to i64 (exact for the
-/// integral result, and saturating at ±2^63 exactly as Rust's `as` does).
-/// Note the ordering this preserves from `cvt_int_to_float_and_commit`: the
-/// destination is written *before* the exception check, so a trapping
-/// conversion still leaves the converted value in the FPR.
+/// A long source outside the part's range (`JitConsts::cvt_from_l_range_bits`)
+/// takes the callout too, which raises Unimplemented Operation.
+///
+/// The Inexact test is the interpreter's exact comparison: a truncating
+/// saturating cast back to i64 differs from the source, or (long sources
+/// only) the result reached 2^63, which no long equals but which saturates
+/// back to `i64::MAX`. The destination is written only when the
+/// instruction does not trap, as in `cvt_int_to_float_and_commit`.
 fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64: bool) {
+    use cranelift_codegen::ir::condcodes::FloatCC;
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let mem = MemFlagsData::trusted();
@@ -9121,13 +9153,6 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     let rm = ctx.builder.ins().band_imm_s(fcsr0, 0x3);
     let rn_even = ctx.builder.ins().icmp_imm_s(IntCC::Equal, rm, 0);
 
-    let inline_block = ctx.builder.create_block();
-    let callout_block = ctx.builder.create_block();
-    let continue_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(rn_even, inline_block, &[], callout_block, &[]);
-
-    ctx.builder.switch_to_block(inline_block);
-    ctx.builder.seal_block(inline_block);
     // src: W sign-extends from 32 bits, exactly like `read_fpr_w(..) as i32
     // as i64` in cvt_int_to_float_and_commit.
     let src = if src_i64 {
@@ -9136,16 +9161,43 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
         let w = emit_read_fpr_w(ctx, fs, fr_mode);
         ctx.builder.ins().sextend(i64t, w)
     };
+    let limit = if src_i64 { ctx.jit_consts.cvt_from_l_range_bits } else { 63 };
+    let inline_ok = if limit < 63 {
+        // src in [-2^N, 2^N) iff src + 2^N, as unsigned, is below 2^(N+1).
+        let biased = ctx.builder.ins().iadd_imm_s(src, 1i64 << limit);
+        let in_range = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, biased, 1i64 << (limit + 1));
+        ctx.builder.ins().band(rn_even, in_range)
+    } else {
+        rn_even
+    };
+
+    let inline_block = ctx.builder.create_block();
+    let callout_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(inline_ok, inline_block, &[], callout_block, &[]);
+
+    ctx.builder.switch_to_block(inline_block);
+    ctx.builder.seal_block(inline_block);
     let result = ctx.builder.ins().fcvt_from_sint(float_ty, src);
     let bits = ctx.builder.ins().bitcast(bits_ty, MemFlagsData::new(), result);
-    // Destination write happens first — including on the trapping path below.
-    if dst_f64 {
-        emit_write_fpr_l(ctx, fd, bits, fr_mode);
-    } else {
-        emit_write_fpr_w(ctx, fd, bits, fr_mode);
-    }
     let back = ctx.builder.ins().fcvt_to_sint_sat(i64t, result);
-    let inexact = ctx.builder.ins().icmp(IntCC::NotEqual, back, src);
+    let mut inexact = ctx.builder.ins().icmp(IntCC::NotEqual, back, src);
+    if src_i64 && limit >= 63 {
+        let two_63 = if dst_f64 {
+            ctx.builder.ins().f64const(9223372036854775808.0f64)
+        } else {
+            ctx.builder.ins().f32const(9223372036854775808.0f32)
+        };
+        let reached = ctx.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, result, two_63);
+        inexact = ctx.builder.ins().bor(inexact, reached);
+    }
+    let write = |ctx: &mut EmitCtx| {
+        if dst_f64 {
+            emit_write_fpr_l(ctx, fd, bits, fr_mode);
+        } else {
+            emit_write_fpr_w(ctx, fd, bits, fr_mode);
+        }
+    };
 
     let inexact_block = ctx.builder.create_block();
     let exact_block = ctx.builder.create_block();
@@ -9154,6 +9206,7 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     // Exact: only Cause has to be rewritten (to zero).
     ctx.builder.switch_to_block(exact_block);
     ctx.builder.seal_block(exact_block);
+    write(ctx);
     emit_fpu_clear_cause_if_set(ctx);
     ctx.builder.ins().jump(continue_block, &[]);
 
@@ -9171,6 +9224,7 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     let flag_block = ctx.builder.create_block();
     ctx.builder.ins().brif(im_set, raise_block, &[], flag_block, &[]);
 
+    // Trapped: Cause only, the destination unwritten.
     ctx.builder.switch_to_block(raise_block);
     ctx.builder.seal_block(raise_block);
     let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
@@ -9179,6 +9233,7 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
 
     ctx.builder.switch_to_block(flag_block);
     ctx.builder.seal_block(flag_block);
+    write(ctx);
     let with_flag = ctx.builder.ins().bor_imm_s(with_cause, FCSR_FI);
     ctx.builder.ins().store(mem, with_flag, ctx.core_ptr, fcsr_off);
     ctx.builder.ins().jump(continue_block, &[]);
@@ -9226,35 +9281,67 @@ fn emit_fcvt_from_int_callout(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool,
     emit_trap_if_nonzero(ctx, trapped);
 }
 
-/// CVT.D.S: widening float<->float, always exact per the R4000/VR5000
-/// manuals (Table 7-2/9-1 list no exception CVT.D.S can raise) — the
-/// conversion itself is a plain Cranelift `fpromote` with no host-status
-/// read to race. It is still a floating-point *computational* instruction,
-/// though, so it rewrites (clears) the FCSR Cause field like every other one
-/// — "Cause holds only the last instruction's exceptions ... rewritten every
-/// FP instruction, even when this instruction raised nothing"
-/// (`fpu_update_fcsr_full`). The interpreter's `exec_fcvt_d_s` does exactly
-/// this via `fpu_update_fcsr(0, …)`; skipping it here let a stale Cause.I
-/// from a preceding inexact CVT survive a CVT.D.S, surfacing as a
+/// CVT.D.S: widening float<->float, exact for every finite single. An
+/// ordinary operand — normal or zero — widens inline with a plain Cranelift
+/// `fpromote` (no host-status read to race). It is still a floating-point
+/// *computational* instruction, so it rewrites (clears) the FCSR Cause field
+/// like every other one — "Cause holds only the last instruction's
+/// exceptions ... rewritten every FP instruction, even when this instruction
+/// raised nothing" (`fpu_update_fcsr_full`); skipping that once let a stale
+/// Cause.I from a preceding inexact CVT survive a CVT.D.S, surfacing as a
 /// `jitv2_lockstep` `fcsr` divergence (`jit=0x1004 interp=0x0004`).
+///
+/// A denormal, infinite or NaN operand takes the cold callout into
+/// `core.fpu_cvt_s_to_d_fn` (`cvt_s_to_d_and_commit`, which the interpreter
+/// runs for every CVT.D.S): a denormal or quiet NaN is Unimplemented
+/// Operation and a signalling NaN is Invalid with the MIPS default NaN.
 fn emit_fcvt_d_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
-    let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
+    let fs = field_rd(ctx.raw);
     let bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    // Normal: |bits| - 2^23 (the smallest normal) below 0xFF << 23 - 2^23.
+    let abs = ctx.builder.ins().band_imm_s(bits, 0x7FFF_FFFF);
+    let rebased = ctx.builder.ins().iadd_imm_s(abs, -0x0080_0000);
+    let normal = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, rebased, 0x7F00_0000);
+    let zero = ctx.builder.ins().icmp_imm_s(IntCC::Equal, abs, 0);
+    let ordinary = ctx.builder.ins().bor(normal, zero);
+
+    let inline_block = ctx.builder.create_block();
+    let callout_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(ordinary, inline_block, &[], callout_block, &[]);
+
+    ctx.builder.switch_to_block(inline_block);
+    ctx.builder.seal_block(inline_block);
     let val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), bits);
     let result = ctx.builder.ins().fpromote(ir::types::F64, val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    let no_flags = ctx.builder.ins().iconst(ir::types::I32, 0);
-    emit_fpu_update_fcsr(ctx, no_flags, |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    emit_fpu_update_fcsr_no_flags(ctx, |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(callout_block);
+    ctx.builder.set_cold_block(callout_block);
+    ctx.builder.seal_block(callout_block);
+    emit_fcvt_fp_callout(ctx, fr_mode, core_offset_of_fpu_cvt_s_to_d_fn());
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
 }
 /// CVT.S.D: single `call_indirect` into `core.fpu_cvt_d_to_s_fn`
 /// (`mips_exec.rs::jit_cvt_d_to_s`, calling `cvt_d_to_s_and_commit`) — same
 /// race-avoidance shape as `emit_fcvt_from_int`/`emit_fcvt_to_int`; unlike
-/// the widen direction, narrowing can raise Inexact or Overflow.
+/// the widen direction, narrowing can raise Inexact, Overflow or Underflow.
 fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    emit_fcvt_fp_callout(ctx, fr_mode, core_offset_of_fpu_cvt_d_to_s_fn());
+}
+
+/// One `call_indirect` into a float-to-float conversion hook
+/// (`fpu_cvt_d_to_s_fn` or `fpu_cvt_s_to_d_fn`, both taking `fs_reg, fd_reg,
+/// fr1`) and `EXC_FPE` if it reports a trap.
+fn emit_fcvt_fp_callout(ctx: &mut EmitCtx, fr_mode: FrMode, hook_offset: i32) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
     let i32t = ir::types::I32;
 
@@ -9264,7 +9351,7 @@ fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 
     // arg 0 is `ctx.core_ptr`; the helper recovers its executor via
     // `exec_from_core`. See `emit_fcvt_to_int`'s matching comment.
-    let callee = emit_hook_callee(ctx, core_offset_of_fpu_cvt_d_to_s_fn());
+    let callee = emit_hook_callee(ctx, hook_offset);
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty));
     sig.params.push(AbiParam::new(i32t));

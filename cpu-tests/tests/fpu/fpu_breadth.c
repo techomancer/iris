@@ -190,6 +190,157 @@ static void t_convert_infinity(void)
                o.exceptions, o.cause, o.result);
 }
 
+/* ── conversion operands and results the FPU hands to software ───────────── */
+
+FPOP_S(op_trunc_w_s, "trunc.w.s $f4, $f0")
+FPOP_D(op_cvt_w_d,   "cvt.w.d $f4, $f0")
+FPOP_D(op_cvt_l_d,   "cvt.l.d $f4, $f0")
+FPOP_D(op_cvt_d_s,   "cvt.d.s $f4, $f0")   /* the single is $f0's low word */
+
+/* Double at d[0] -> single at w[2], with the sentinel in w[3]. */
+static void op_cvt_s_d(void)
+{
+    __asm__ __volatile__(AF "ldc1 $f0, 0(%0)\n\t"
+                            "lwc1 $f4, 12(%0)\n\t"
+                            "cvt.s.d $f4, $f0\n\t"
+                            "swc1 $f4, 8(%0)" Z :: "r"(w()) : "memory");
+}
+
+/* A double to op_cvt_s_d: w[2] cleared and the single sentinel in w[3]. */
+static struct fp_obs observe_s_from_d(u64 a, u32 fcsr_init)
+{
+    return observe_d(a, (u64)SENTINEL_S, fcsr_init, op_cvt_s_d);
+}
+
+/* "sets the Unimplemented bit ... and traps": E, ExcCode 15, nothing stored,
+ * no Flag. */
+static void check_cvt_unimplemented(const char *what, const struct fp_obs *o, int dbl)
+{
+    con_printf("\n      [%s: exc=%u cause=%x]", what, o->exceptions, o->cause);
+    CHECK_EQ(o->exceptions, 1u);
+    CHECK_EQ(o->excode, (u32)EXC_FPE);
+    CHECK_EQ(o->cause & FP_E, (u32)FP_E);
+    CHECK_EQ(o->flags, 0u);
+    if (dbl) CHECK_EQ(o->result_d, SENTINEL_D);
+    else     CHECK_EQ(o->result, SENTINEL_S);
+}
+
+/*
+ * "Denormalized operand" is a cause of Unimplemented Operation for "a convert
+ * or computational operation" (R4000 manual, Unimplemented Instruction
+ * Exception; VR5000 manual 9.4.6), and the R10000 takes it for a denormal
+ * operand too (R10000 UM p. 309). IRIS used to round a denormal to zero with
+ * Inexact, and narrow or widen it on the host. Expectations from the manuals:
+ * fpu/denorm_operand measured the arithmetic case on an Indy R4400, not this.
+ */
+static void t_convert_denormal_source(void)
+{
+    struct fp_obs o;
+
+    o = observe_s(F_DENORM, 0, 0, op_trunc_w_s);
+    check_cvt_unimplemented("trunc.w.s denormal", &o, 0);
+    o = observe_d(D_DENORM, 0, 0, op_cvt_w_d);
+    check_cvt_unimplemented("cvt.w.d denormal", &o, 1);
+    o = observe_d((u64)F_DENORM, 0, 0, op_cvt_d_s);
+    check_cvt_unimplemented("cvt.d.s denormal", &o, 1);
+    o = observe_s_from_d(D_DENORM, 0);
+    check_cvt_unimplemented("cvt.s.d denormal", &o, 0);
+}
+
+/*
+ * The NaN operands, in this suite's naming (docs/gotchas.md): F_SNAN/D_SNAN,
+ * whose fraction MSB is clear, are what an R4400's arithmetic traps with
+ * Unimplemented Operation, and a conversion takes the same exception
+ * ("Quiet Not a Number operand", R4000 manual). F_QNAN completes in hardware
+ * as an Invalid Operation with the default NaN. The R5000's answer for the
+ * second is not established (fpu/qnan_operand reports it), so it is reported.
+ */
+static void t_convert_nan_source(void)
+{
+    struct fp_obs o;
+
+    o = observe_d((u64)F_SNAN, 0, 0, op_cvt_d_s);
+    check_cvt_unimplemented("cvt.d.s F_SNAN", &o, 1);
+    o = observe_s_from_d(D_SNAN, 0);
+    check_cvt_unimplemented("cvt.s.d D_SNAN", &o, 0);
+
+    o = observe_d((u64)F_QNAN, 0, 0, op_cvt_d_s);
+    con_printf("\n      [cvt.d.s F_QNAN: exc=%u cause=%x flags=%x result=",
+               o.exceptions, o.cause, o.flags);
+    con_hex64(o.result_d);
+    con_puts("]");
+    if (!is_r5000()) {
+        CHECK_EQ(o.exceptions, 0u);
+        CHECK_EQ(o.cause, (u32)FP_V);
+        CHECK_EQ(o.flags, (u32)FP_V);
+        CHECK_EQ(o.result_d, 0x7FF7FFFFFFFFFFFFull);
+    }
+}
+
+/*
+ * A narrowed result too small for a normal single underflows. With FS clear
+ * the FPU hands it to software; with FS set and neither Underflow nor Inexact
+ * enabled it is flushed to zero with U and I (R4000 manual, Underflow
+ * Exception, and Table 7-1), as fpu/denorm_result_fs1 measures for
+ * arithmetic.
+ */
+static void t_convert_double_to_single_underflow(void)
+{
+    struct fp_obs o;
+    const u64 tiny = 0x37A16C262777579Cull;   /* 1e-40, a single denormal */
+
+    o = observe_s_from_d(tiny, 0);
+    check_cvt_unimplemented("cvt.s.d 1e-40 FS=0", &o, 0);
+
+    o = observe_s_from_d(tiny, FCSR_FS);
+    con_printf("\n      [cvt.s.d 1e-40 FS=1: exc=%u cause=%x flags=%x result=%x]",
+               o.exceptions, o.cause, o.flags, o.result);
+    CHECK_EQ(o.exceptions, 0u);
+    CHECK_EQ(o.result, F_0);
+    CHECK_EQ(o.cause, (u32)(FP_U | FP_I));
+    CHECK_EQ(o.flags, (u32)(FP_U | FP_I));
+}
+
+/*
+ * Overflow raises Inexact with it in every rounding mode (R4000 manual,
+ * Table 7-1), including round-toward-zero, which delivers the largest finite
+ * single rather than an infinity. fpu/cvt_s_d_rounds covers round-to-nearest.
+ */
+static void t_convert_double_to_single_overflow_rz(void)
+{
+    struct fp_obs o = observe_s_from_d(0x4C70000000000000ull, FCSR_RM_RZ); /* 2^200 */
+
+    CHECK_EQ(o.exceptions, 0u);
+    CHECK_EQ(o.result, F_MAX);
+    CHECK_EQ(o.cause, (u32)(FP_O | FP_I));
+    CHECK_EQ(o.flags, (u32)(FP_O | FP_I));
+}
+
+/*
+ * A floating-point to long conversion "with an output that would be greater
+ * than 2^53-1 ... or less than -2^53" is Unimplemented Operation on the
+ * VR5000 (manual 9.4.6). The R4400 is taken to match, as it does for the long
+ * sources in fpu/vec_cvt_from_l; that is not measured. A real R4600 and the
+ * R10000 family have their own limits (r10k/cvt_l_limit).
+ */
+static void t_convert_to_long_limit(void)
+{
+    struct fp_obs o;
+
+    if (is_r10000() || is_r4600()) {
+        CHECK(1);
+        return;
+    }
+    o = observe_d(0x433FFFFFFFFFFFFFull, 0, 0, op_cvt_l_d);  /* 2^53 - 1 */
+    CHECK_EQ(o.exceptions, 0u);
+    CHECK_EQ(o.result_d, 0x001FFFFFFFFFFFFFull);
+    o = observe_d(0xC340000000000000ull, 0, 0, op_cvt_l_d);  /* -2^53 */
+    CHECK_EQ(o.exceptions, 0u);
+    CHECK_EQ(o.result_d, 0xFFE0000000000000ull);
+    o = observe_d(0x4340000000000000ull, 0, 0, op_cvt_l_d);  /* 2^53 */
+    check_cvt_unimplemented("cvt.l.d 2^53", &o, 1);
+}
+
 /* ── unaligned floating-point loads and stores ────────────────────────────── */
 
 /*
@@ -247,6 +398,11 @@ static const struct test tests[] = {
     TEST("fpu/snan_operands",       t_signalling_nan_operands,       CPU_ALL),
     TEST("fpu/cvt_out_of_range",    t_convert_out_of_range,          CPU_ALL),
     TEST("fpu/cvt_infinity",        t_convert_infinity,              CPU_ALL),
+    TEST("fpu/cvt_denormal_source", t_convert_denormal_source,       CPU_ALL),
+    TEST("fpu/cvt_nan_source",      t_convert_nan_source,            CPU_ALL),
+    TEST("fpu/cvt_s_d_underflow",   t_convert_double_to_single_underflow, CPU_ALL),
+    TEST("fpu/cvt_s_d_overflow_rz", t_convert_double_to_single_overflow_rz, CPU_ALL),
+    TEST("fpu/cvt_l_limit",         t_convert_to_long_limit,         CPU_ALL),
     TEST("fpu/unaligned_access",    t_unaligned_fp_access,           CPU_ALL),
     TEST("fpu/unaligned_badvaddr",  t_unaligned_badvaddr,            CPU_ALL),
 };

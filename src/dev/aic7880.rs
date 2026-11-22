@@ -2384,6 +2384,57 @@ mod tests {
         assert_eq!(c.read(reg::QINCNT, 1), 0);
     }
 
+    /// A disc changed under IRIX (`iris-ci cdrom-eject`, the window's disc
+    /// key) reaches the driver as the drive reports it: the next command
+    /// ends in CHECK CONDITION, the HIM's auto-sense collects UNIT ATTENTION
+    /// with "medium may have changed", and reads then come from the new
+    /// disc.
+    #[test]
+    fn a_disc_change_reaches_the_him_as_unit_attention() {
+        use crate::workstation::DiscChanger;
+        let (c, ram) = him_rig("him-discswap");
+        let first = image_path("disc-a.iso");
+        let second = image_path("disc-b.iso");
+        std::fs::write(&first, vec![0xa1u8; 16 * 2048]).unwrap();
+        std::fs::write(&second, vec![0xb2u8; 16 * 2048]).unwrap();
+        let (a, b) = (first.to_str().unwrap().to_string(), second.to_str().unwrap().to_string());
+        c.bus().attach_device(4, &a, true, vec![a.clone(), b.clone()], false, None, false).expect("attach CD");
+
+        put_cmd(&ram, 0, 4, &TUR, 0);
+        c.write(reg::QINFIFO, 0, 1);
+        assert_eq!(qout(&ram)[7], 0, "the drive is ready with its first disc");
+        c.write(reg::ERROR_CLRINT, intstat::CMDCMPLT as u32, 1);
+
+        assert_eq!(c.eject_disc(4), Ok(b.clone()), "the eject loads the next disc");
+        assert_eq!(c.disc_status().iter().find(|d| d.0 == 4).map(|d| d.1.clone()), Some(b.clone()));
+
+        let tag = 1u8;
+        put_cmd(&ram, tag, 4, &TUR, 0);
+        c.write(reg::QINFIFO, tag as u32, 1);
+        assert_eq!(c.read(reg::INTSTAT, 1), 0x51, "SEQINT with the bad-status code");
+        assert_eq!(c.read(him::STATUS, 1), 0x02, "CHECK CONDITION");
+
+        let sense_list = scb_at(tag) + 32;
+        let sense_buf = 0x9000u32;
+        put32(&ram, sense_list, sense_buf);
+        put32(&ram, sense_list + 4, 18 | SG_LAST);
+        put32(&ram, scb_at(tag) + scb::SG_PTR as u32, crate::ip32::RAM_BASE + sense_list);
+        ram.write(cdb_at(tag) as usize, &[0x03, 0, 0, 0, 18, 0]);
+        c.write(reg::QINFIFO, tag as u32, 1);
+        c.write(reg::ERROR_CLRINT, intstat::SEQINT as u32, 1);
+        c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
+        assert_eq!(ram[sense_buf as usize + 2] & 0x0f, 0x06, "UNIT ATTENTION");
+        assert_eq!(ram[sense_buf as usize + 12], 0x28, "medium may have changed");
+        assert_eq!(qout(&ram)[3], tag, "the sense command completes");
+        c.write(reg::ERROR_CLRINT, intstat::CMDCMPLT as u32, 1);
+
+        let read = [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        put_cmd(&ram, 2, 4, &read, 2048);
+        c.write(reg::QINFIFO, 2, 1);
+        assert_eq!(qout(&ram)[0xff], 2, "the read completes without another attention");
+        assert!(ram.bytes(buf_at(2) as usize, BLOCK_SIZE).iter().all(|&x| x == 0xb2), "from the new disc");
+    }
+
     /// The PROM's build of the program keeps the answers it boots with
     /// today: an empty id is "no device" with GOOD status, and completes.
     #[test]
