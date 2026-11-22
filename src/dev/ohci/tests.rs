@@ -7,6 +7,8 @@ use crate::pci::{PciDmaStatus, PciFunction};
 use crate::traits::{Device, Resettable};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Weak;
+use crate::clock::Clock;
+use crate::hptimer::TimerManager;
 
 pub(super) struct Memory {
     pub(super) bytes: Mutex<Vec<u8>>,
@@ -224,8 +226,9 @@ fn nak_stall_and_short_in_completions_keep_the_endpoint_consistent() {
 /// Port and controller reset paths retain attached USB functions.
 #[test]
 fn attached_functions_survive_port_and_controller_resets() {
-    let h = Ohci::new();
-    h.start();
+    // Stepped clock: only advance_frames may run frames, or the port reset
+    // can finish before the assertions that count them.
+    let (h, _) = fake_clock_ohci(0);
     h.attach(1, Function::new(UsbOutcome::Nak)).unwrap();
     assert_eq!(h.bar_read(0, 0x58, 4) & 1, 0);
     start_port_reset(&h, 1);
@@ -358,11 +361,7 @@ fn packet_crosses_nonadjacent_pages() {
 /// The frame counter catches up after its host timer was delayed.
 #[test]
 fn clock_read_catches_up_after_timer_starvation() {
-    let h = Ohci::new();
-    let now = Arc::new(AtomicUsize::new(0));
-    let t = now.clone();
-    h.set_clock(Arc::new(move || t.load(Ordering::Relaxed) as u64));
-    h.start();
+    let (h, now) = fake_clock_ohci(0);
     h.bar_write(0, 4, 0x80, 4);
     now.store(5_000_000, Ordering::Relaxed);
     assert!(h.bar_read(0, 0x3c, 4) >= 5);
@@ -378,11 +377,7 @@ fn clock_read_catches_up_after_timer_starvation() {
 /// controller in between (a slow or descheduled host thread).
 #[test]
 fn frame_number_follows_the_clock_with_no_poll_or_timer() {
-    let h = Ohci::new();
-    let now = Arc::new(AtomicUsize::new(10_000_000));
-    let t = now.clone();
-    h.set_clock(Arc::new(move || t.load(Ordering::Relaxed) as u64));
-    h.start();
+    let (h, now) = fake_clock_ohci(10_000_000);
     // Part-way into a frame period when the guest sets operational.
     now.store(10_400_000, Ordering::Relaxed);
     h.bar_write(0, 4, 0x80, 4);
@@ -399,11 +394,89 @@ fn frame_number_follows_the_clock_with_no_poll_or_timer() {
     h.stop();
 }
 
-pub(super) fn fake_clock_ohci(start_ns: usize) -> (Arc<Ohci>, Arc<AtomicUsize>) {
-    let h = Ohci::new();
-    let now = Arc::new(AtomicUsize::new(start_ns));
-    let t = now.clone();
-    h.set_clock(Arc::new(move || t.load(Ordering::Relaxed) as u64));
+/// With the CPU idle (no register access), the timer still runs the frames an
+/// enabled list needs, and it is armed only while there is such work.
+#[test]
+fn the_frame_timer_runs_frames_while_the_guest_is_idle_and_only_then() {
+    let (h, now) = fake_clock_ohci(10_000_000);
+    let m = Memory::new();
+    m.words(0x1000, &[0; 64]);
+    h.state().connect_dma(m.clone());
+    h.state().config().write(1, 6);
+    h.bar_write(0, 0x18, 0x1000, 4);
+    h.bar_write(0, 4, 0x80, 4);
+    assert!(!h.timer.is_armed(), "no list or SOF interrupt: no timer");
+    h.bar_write(0, 4, 0x84, 4);
+    assert!(!h.timer.is_armed(), "a list with nothing plugged in: no timer");
+    h.attach(0, Function::new(UsbOutcome::Nak)).unwrap();
+    assert!(h.timer.is_armed());
+    now.step(3_500_000);
+    assert!(
+        crate::test_board::until(std::time::Duration::from_secs(5), || m.bytes.lock()[0x1080] == 4),
+        "frames ran with no register access"
+    );
+    h.stop();
+    assert!(!h.timer.is_armed());
+}
+
+/// Register reads and control writes race the timer's own catch-up as the
+/// clock steps, then stop: the state lock is taken alone, so they finish.
+#[test]
+fn register_access_the_timer_and_stop_do_not_deadlock() {
+    let (h, now) = fake_clock_ohci(0);
+    let m = Memory::new();
+    m.words(0x1000, &[0; 64]);
+    h.state().connect_dma(m);
+    h.state().config().write(1, 6);
+    h.bar_write(0, 0x18, 0x1000, 4);
+    h.bar_write(0, 4, 0x84, 4);
+    h.attach(0, Function::new(UsbOutcome::Nak)).unwrap();
+    let (done, wait) = std::sync::mpsc::channel();
+    let threads: Vec<_> = (0..4)
+        .map(|n| {
+            let (h, now, done) = (h.clone(), now.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    match n {
+                        0 => now.step(1_000_000),
+                        1 => h.bar_write(0, 4, 0x84, 4),
+                        _ => {
+                            h.bar_read(0, 0x3c, 4);
+                        }
+                    }
+                }
+                done.send(()).unwrap();
+            })
+        })
+        .collect();
+    for _ in 0..4 {
+        wait.recv_timeout(std::time::Duration::from_secs(30)).expect("a thread is stuck");
+    }
+    threads.into_iter().for_each(|t| t.join().unwrap());
+    h.stop();
+}
+
+/// The controller's clock, set to a time by hand; it only moves forward.
+#[derive(Clone)]
+/// The timer manager rides along: the controller's timer holds it weakly.
+pub(super) struct FakeTime(Clock, Arc<TimerManager>);
+
+impl FakeTime {
+    pub(super) fn step(&self, ns: u64) {
+        self.0.step(ns);
+    }
+
+    pub(super) fn store(&self, ns: usize, _: Ordering) {
+        self.0.step((ns as u64).saturating_sub(self.0.now()));
+    }
+}
+
+pub(super) fn fake_clock_ohci(start_ns: usize) -> (Arc<Ohci>, FakeTime) {
+    let clock = Clock::stepped();
+    let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+    let h = Ohci::new(&tm);
+    let now = FakeTime(clock, tm);
+    now.store(start_ns, Ordering::Relaxed);
     h.start();
     (h, now)
 }
@@ -510,7 +583,7 @@ fn a_late_driver_raises_the_line_once() {
         held: Mutex::new(Some(held)),
         release: Mutex::new(Some(released)),
     });
-    let h = Ohci::new();
+    let h = Ohci::new(&Arc::new(TimerManager::new()));
     h.state().connect_irq(IrqLine::new(line.clone(), 0));
     // Interrupts on, for the ownership change alone.
     h.bar_write(0, 0x10, 0x8000_0000 | 1 << 30, 4);
@@ -547,7 +620,7 @@ fn a_late_driver_raises_the_line_once() {
 /// The guest sees the documented write masks, HCR exemptions, and ownership bit.
 #[test]
 fn register_masks_preserve_hcr_exempt_fields_and_ownership_status() {
-    let h = Ohci::new();
+    let h = Ohci::new(&Arc::new(TimerManager::new()));
     h.bar_write(0, 0x18, 0x123456ff, 4);
     assert_eq!(h.bar_read(0, 0x18, 4), 0x12345600);
     h.bar_write(0, 0x20, 0x123456ff, 4);

@@ -141,9 +141,8 @@ pub(crate) fn attach_ioc3(
 /// The OHCI controller at device 5 of head `pci`. With `input`, a USB keyboard and mouse sit on its
 /// first two root ports and take the host's input instead of `ioc3`'s PS/2 pair, or a guest that
 /// opened both would see every key twice.
-pub(crate) fn attach_usb(pci: &PciBus, ioc3: &Ioc3, clock: &Clock, input: bool) -> Result<Arc<Ohci>, String> {
-    let usb = Ohci::new();
-    usb.set_clock(clock.clone());
+pub(crate) fn attach_usb(pci: &PciBus, ioc3: &Ioc3, timers: &Arc<TimerManager>, input: bool) -> Result<Arc<Ohci>, String> {
+    let usb = Ohci::new(timers);
     if input {
         let (keyboard, mouse) = (HidFunction::keyboard(), HidFunction::mouse());
         usb.attach(0, keyboard.clone())?;
@@ -293,14 +292,9 @@ pub(crate) fn machine(
         let several = spec.processors.count() > 1;
         let cpus: Vec<_> = (0..spec.processors.count())
             .map(|n| {
-                // The first node's first processor brings the board's devices up to date; every
-                // processor of a node of several joins the PROM's holds.
-                let board = (index == 0 && n == 0).then(|| io.poll.clone()).flatten();
+                // Every processor of a node of several joins the PROM's holds.
                 let held = io.at_batch.clone().filter(|_| several);
                 let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    if let Some(board) = &board {
-                        board();
-                    }
                     if let Some(held) = &held {
                         held();
                     }

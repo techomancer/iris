@@ -401,7 +401,6 @@ pub(crate) fn pci_devices(
         reset,
         display: None,
         status: None,
-        poll: None,
         at_batch: None,
         fasttick: None,
         cpus: None,

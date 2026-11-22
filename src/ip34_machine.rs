@@ -110,7 +110,7 @@ fn build_baseio(
     scsi.set_heartbeat(heartbeat.clone());
     ioc3.set_heartbeat(heartbeat);
     pci.attach(DevFn { device: 1, function: 0 }, scsi.clone());
-    let usb = attach_usb(pci, &ioc3, clock, cfg.fuel.usb_input)?;
+    let usb = attach_usb(pci, &ioc3, timers, cfg.fuel.usb_input)?;
     let (reset_ioc3, reset_scsi, reset_usb) = (ioc3.clone(), scsi.clone(), usb.clone());
     let reset_vpro = vpro.as_ref().map(Arc::downgrade);
     xbridge.set_reset_output(Arc::new(move |port| {
@@ -137,7 +137,6 @@ fn build_baseio(
     ioc3.register_locks();
     xbridge.register_locks();
     let (reset_xbridge, reset_ioc3, reset_scsi, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), scsi.clone(), usb.clone(), timekeeper.clone());
-    let poll_usb = usb.clone();
     let disks = scsi.clone();
     Ok(BoardIo {
         devices: vec![ioc3.clone(), scsi.clone(), usb],
@@ -148,7 +147,6 @@ fn build_baseio(
             reset_usb.power_on();
             reset_clock.power_on();
         }),
-        poll: Some(Arc::new(move || poll_usb.sync_clock())),
         at_batch: None,
         monitor: vec![scsi.clone(), ioc3.ps2()],
         ps2: ioc3.ps2(),

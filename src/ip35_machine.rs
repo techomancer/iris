@@ -219,7 +219,7 @@ fn build_baseio(
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("the IO7's IOC3 has Ethernet").clone();
     // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
-    let usb = attach_usb(pci, &ioc3, clock, true)?;
+    let usb = attach_usb(pci, &ioc3, timers, true)?;
     let (reset_ioc3, reset_usb) = (ioc3.clone(), usb.clone());
     xbridge.set_reset_output(Arc::new(move |port| {
         if port == HEAD_F {
@@ -235,7 +235,6 @@ fn build_baseio(
     connect_serial_ports(cfg, cfg.machine.profile.product_name().unwrap_or_default(), &serial, console_index)?;
     let console = cfg.ci.then(|| serial[console_index].ci.clone());
     let (reset_xbridge, reset_ioc3, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), usb.clone(), timekeeper.clone());
-    let poll_usb = usb.clone();
     // `scsi2` and `cow2`: the Fibre Channel loop's disks.
     let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone()];
     let scsi_fibre = fibre.clone();
@@ -247,7 +246,6 @@ fn build_baseio(
             reset_usb.power_on();
             reset_clock.power_on();
         }),
-        poll: Some(Arc::new(move || poll_usb.sync_clock())),
         at_batch: None,
         monitor,
         ps2: ioc3.ps2(),

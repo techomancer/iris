@@ -15,7 +15,7 @@
 //! Ported from src/mame/shared/xbox_usb.cpp and xbox_usb.h in MAME,
 //! revision 2ee9b1e30299b122b131cab0bd7912abc2b095ba.
 
-use crate::dev::heart::Clock;
+use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::traits::{Device, Resettable};
@@ -156,14 +156,11 @@ pub struct Ohci {
     pci: PciFunctionState,
     state: Mutex<State>,
     running: AtomicBool,
-    /// Source of the frame count: the machine's own clock, so the guest's
-    /// idea of a millisecond and the controller's agree.
-    time: OnceLock<Clock>,
-    /// `time` reading at the last frame boundary counted; `None` while stopped.
-    clock: Mutex<Option<u64>>,
-    /// `time` reading of the next frame boundary (`u64::MAX` while stopped),
-    /// so a caller with no boundary to deliver takes no lock.
-    due: AtomicU64,
+    /// The frame timer. Its clock is the machine's, so the guest's idea of a
+    /// millisecond and the controller's agree.
+    timer: Timer,
+    /// Machine clock reading at the last frame boundary counted; `u64::MAX` while stopped.
+    anchor: AtomicU64,
     /// Frames counted from the clock that no thread has run yet.
     owed: AtomicU64,
     /// A thread is running frames. Frames run one at a time, in order, on
@@ -172,7 +169,7 @@ pub struct Ohci {
     busy: AtomicBool,
 }
 impl Ohci {
-    pub fn new() -> Arc<Self> {
+    pub fn new(tm: &Arc<TimerManager>) -> Arc<Self> {
         let config = PciConfig::new_with_policy(
             0x11c1,
             0x5802,
@@ -197,45 +194,40 @@ impl Ohci {
             },
         );
         config.set_subsystem_identity(0xffff_ffff);
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             pci: PciFunctionState::new(config),
             state: Mutex::new(State::new()),
             running: AtomicBool::new(false),
-            time: OnceLock::new(),
-            clock: Mutex::new(None),
-            due: AtomicU64::new(u64::MAX),
+            timer: Timer::new(tm, me, |h: &Ohci, _| h.sync_clock()),
+            anchor: AtomicU64::new(u64::MAX),
             owed: AtomicU64::new(0),
             busy: AtomicBool::new(false),
         })
     }
-    /// Use `clock` for frame timing. Call before `start`.
-    pub fn set_clock(&self, clock: Clock) {
-        assert!(
-            !self.running.load(Ordering::Acquire) && self.time.set(clock).is_ok(),
-            "connect the OHCI clock once, before start"
-        );
-    }
-    fn now(&self) -> u64 {
-        (self.time.get_or_init(|| crate::clock::Clock::new().reader()))()
-    }
     /// Deliver every frame boundary the clock has passed. Every register
     /// access calls this, so a read sees the frame count the guest's own
-    /// clock implies, however late the machine's poll ran. The clock lock
-    /// covers the count alone; the frames run with no lock held.
+    /// clock implies, however late the timer ran.
     pub fn sync_clock(&self) {
-        let now = self.now();
-        if now < self.due.load(Ordering::Acquire) {
-            return;
+        let now = self.timer.now();
+        let mut elapsed = 0;
+        let _ = self.anchor.fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+            elapsed = now.saturating_sub(at) / 1_000_000;
+            (elapsed != 0).then(|| at + elapsed * 1_000_000)
+        });
+        if elapsed != 0 {
+            self.advance_frames(elapsed);
+            self.rearm();
         }
-        let elapsed = {
-            let mut clock = self.clock.lock();
-            let Some(at) = clock.as_mut() else { return };
-            let elapsed = now.saturating_sub(*at) / 1_000_000;
-            *at += elapsed * 1_000_000;
-            self.due.store(*at + 1_000_000, Ordering::Release);
-            elapsed
-        };
-        self.advance_frames(elapsed);
+    }
+    /// Arm the frame timer only while frames have an effect (a port reset, a done head,
+    /// an enabled list or an SOF/FNO interrupt); idle, an access catches up.
+    fn rearm(&self) {
+        let s = self.state.lock();
+        let busy = s.reset_ms != [0; 2]
+            || s.r[12] != 0
+            || (s.r[1] & 0xc0 == 0x80 && s.r[3] & UE == 0 && ((s.r[1] & 0x34 != 0 && s.ports.iter().any(Option::is_some)) || s.r[4] & 0x24 != 0));
+        let anchor = self.anchor.load(Ordering::Acquire);
+        self.timer.set_due((busy && anchor != u64::MAX).then(|| anchor + 1_000_000));
     }
     /// Drive the line to the level the state gives, under the state lock,
     /// when it differs from the level last driven. The lock orders the
@@ -276,6 +268,7 @@ impl Ohci {
             s.r[3] |= RHSC;
         }
         self.drive_irq();
+        self.rearm();
         Ok(())
     }
     pub fn detach(&self, port: usize) -> Result<(), String> {
@@ -293,9 +286,10 @@ impl Ohci {
             s.r[3] |= RHSC;
         }
         self.drive_irq();
+        self.rearm();
         Ok(())
     }
-    /// Deterministic millisecond ticks; `sync_clock` delivers the same ticks from the clock.
+    /// Deterministic millisecond ticks; the timer and `sync_clock` deliver the same ticks from the clock.
     pub fn advance_frames(&self, count: u64) {
         if count != 0 {
             self.owed.fetch_add(count, Ordering::AcqRel);
@@ -386,9 +380,6 @@ impl PciFunction for Ohci {
             return;
         }
         self.sync_clock();
-        // Only a control write can restart the frame phase. The clock lock is
-        // taken before the state lock; nothing takes them the other way round.
-        let mut anchor = (off == 4).then(|| self.clock.lock());
         let mut reset = None;
         {
             let mut s = self.state.lock();
@@ -411,9 +402,8 @@ impl PciFunction for Ohci {
                         if (old_frame ^ frame) & 0x8000 != 0 {
                             s.r[3] |= 32;
                         }
-                        if let Some(Some(at)) = anchor.as_deref_mut() {
-                            *at = self.now();
-                            self.due.store(*at + 1_000_000, Ordering::Release);
+                        if self.anchor.load(Ordering::Acquire) != u64::MAX {
+                            self.anchor.store(self.timer.now(), Ordering::Release);
                         }
                     }
                     if val & 0xc0 == 0 && old & 0xc0 != 0 {
@@ -530,11 +520,11 @@ impl PciFunction for Ohci {
                 }
             }
         }
-        drop(anchor);
         if let Some(f) = reset {
             f.reset();
         }
         self.drive_irq();
+        self.rearm();
     }
 }
 impl Resettable for Ohci {
@@ -559,15 +549,16 @@ impl Device for Ohci {
         if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
-        let now = self.now();
-        *self.clock.lock() = Some(now);
-        self.due.store(now + 1_000_000, Ordering::Release);
+        self.anchor.store(self.timer.now(), Ordering::Release);
+        self.rearm();
+        self.timer.start();
     }
     fn stop(&self) {
         self.sync_clock();
         self.running.store(false, Ordering::Release);
-        *self.clock.lock() = None;
-        self.due.store(u64::MAX, Ordering::Release);
+        self.anchor.store(u64::MAX, Ordering::Release);
+        self.timer.cancel();
+        self.timer.stop();
         // A frame another thread is running finishes before stop returns.
         while self.busy.load(Ordering::Acquire) {
             std::hint::spin_loop();
@@ -590,7 +581,7 @@ mod register_tests {
 
     #[test]
     fn lucent_identity_and_reset_contract() {
-        let hc = Ohci::new();
+        let hc = Ohci::new(&Arc::new(TimerManager::new()));
         assert_eq!(hc.state().config().read(0), 0x5802_11c1);
         assert_eq!(hc.state().config().read(2), 0x0c03_1010);
         assert_eq!(hc.state().config().read(11), 0xffff_ffff);
