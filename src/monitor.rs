@@ -213,7 +213,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             continue;
         }
         
-        let mut target_device: Option<Arc<dyn Device>> = None;
+        let mut targets: Vec<Arc<dyn Device>> = Vec::new();
         let mut is_help = false;
         let audio = cmd == "audio" && (args.is_empty() || args == ["status"]);
         if cmd == "ports" {
@@ -235,15 +235,18 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
                 if !cmds.iter().any(|(c, _)| c == "audio") {
                     let _ = writeln!(writer, "{:12} - {}", "audio", "audio status: each sound card's frames moved and skipped, and its host stream");
                 }
+                // Several devices may offer one command (`pci`, one per host): list it once.
+                let mut seen = std::collections::HashSet::new();
                 for (c, h) in cmds {
-                    let _ = writeln!(writer, "{:12} - {}", c, h);
+                    if seen.insert(c.clone()) {
+                        let _ = writeln!(writer, "{:12} - {}", c, h);
+                    }
                 }
             } else if !audio {
                 for dev in devs.iter() {
                     let cmds = dev.register_commands();
                     if cmds.iter().any(|(c, _)| c == cmd) {
-                        target_device = Some(dev.clone());
-                        break;
+                        targets.push(dev.clone());
                     }
                 }
             }
@@ -253,13 +256,16 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             let text = audio_status(&devices.lock());
             let _ = write!(writer, "{}", text);
         } else if !is_help {
-            if let Some(dev) = target_device {
-                let cmd_writer = Box::new(BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap())));
-                match dev.execute_command(cmd, args, cmd_writer) {
-                    Ok(_) => {
-                    }
-                    Err(e) => {
-                        let _ = write!(writer, "Error: {}\n", e);
+            // Every device that offers the command runs it, in registration order.
+            if !targets.is_empty() {
+                for dev in targets {
+                    let cmd_writer = Box::new(BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap())));
+                    match dev.execute_command(cmd, args, cmd_writer) {
+                        Ok(_) => {
+                        }
+                        Err(e) => {
+                            let _ = write!(writer, "Error: {}\n", e);
+                        }
                     }
                 }
             } else {
@@ -406,6 +412,27 @@ mod tests {
         for want in ["ping", "help", "quit"] {
             assert!(names.iter().any(|n| n == want), "{want} missing from {names:?}");
         }
+    }
+
+    /// A command two devices both offer runs on each, and `help` lists it once.
+    #[test]
+    fn a_shared_command_runs_on_every_device_that_offers_it() {
+        struct Say(&'static str);
+        impl Device for Say {
+            fn step(&self, _: u64) {}
+            fn stop(&self) {}
+            fn start(&self) {}
+            fn is_running(&self) -> bool { true }
+            fn get_clock(&self) -> u64 { 0 }
+            fn register_commands(&self) -> Vec<(String, String)> { vec![("say".into(), "say".into())] }
+            fn execute_command(&self, _: &str, _: &[&str], mut w: Box<dyn Write + Send>) -> Result<(), String> {
+                writeln!(w, "{}", self.0).map_err(|e| e.to_string())
+            }
+        }
+        let both = || vec![Arc::new(Say("one")) as Arc<dyn Device>, Arc::new(Say("two"))];
+        let out = converse_with(both(), b"say\nhelp\n");
+        assert!(out.find("one").unwrap() < out.find("two").unwrap(), "{out}");
+        assert_eq!(out.lines().filter(|l| l.trim_start_matches("> ").starts_with("say ")).count(), 1, "{out}");
     }
 
     /// A port already in use (another iris's monitor) leaves this monitor
