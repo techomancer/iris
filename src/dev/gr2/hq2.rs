@@ -1515,7 +1515,8 @@ impl Hq2Engine {
         match cmd {
             PUC_INIT => self.init(out),
             PUC_COLOR => {
-                out.reg(re3::REG_R, (a[0] & 0xfff) << 11);
+                // The pixel is one byte; OpenBSD repeats the index in all four (rasops).
+                out.reg(re3::REG_R, (a[0] & 0xff) << 11);
                 out.reg(re3::REG_G, 0);
                 out.reg(re3::REG_B, 0);
             }

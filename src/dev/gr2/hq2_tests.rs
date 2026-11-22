@@ -76,6 +76,20 @@ fn textport_clear_and_rect() {
     assert_eq!(pixel(g, 10, 22), 0);
 }
 
+/// OpenBSD passes rasops' 8-bit colour, the index repeated in all four bytes.
+#[test]
+fn textport_color_uses_the_low_byte_as_the_pixel() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    tp_init(g);
+    cmd(g, hq2::PUC_COLOR, 0x0707_0707);
+    cmd(g, hq2::PUC_RECTI2D, 10);
+    data(g, 20);
+    data(g, 12);
+    data(g, 21);
+    g.wait_idle();
+    assert_eq!(pixel(g, 10, 20), 7);
+}
+
 #[test]
 fn textport_drawchar_places_glyph_bottom_row_first() {
     let g = &live_gr2(Gr2Variant::Xz);
