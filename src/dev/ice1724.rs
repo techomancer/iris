@@ -141,8 +141,8 @@
 use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
@@ -150,7 +150,7 @@ use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
 use crate::host_audio::{Meter, Output, Skip};
 use crate::devlog::LogModule;
-use crate::hptimer::{TimerId, TimerManager, TimerReturn};
+use crate::hptimer::{Timer, TimerManager};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, load_u16_slice, StateTable};
 use crate::traits::{Device, Saveable};
@@ -512,12 +512,8 @@ struct State {
     ak4355: [u8; AK4355_REGS],
     ac97: [u16; AC97_REGS],
     stats: Stats,
-    /// The timer that next brings the engines up to date, and which of
-    /// them is current.
-    timer: Option<TimerId>,
-    timer_gen: u64,
-    /// When the pending timer is due, on the card's clock.
-    timer_due: i64,
+    /// When the engine timer is due, on the card's clock.
+    timer_due: Option<i64>,
     /// Samples read from or written to guest memory, a chunk at a time.
     scratch: Vec<u8>,
     /// A transfer is under way with `state` let go; nothing else moves the
@@ -547,9 +543,7 @@ impl State {
             ak4355: [0; AK4355_REGS],
             ac97: [0; AC97_REGS],
             stats: Stats::default(),
-            timer: None,
-            timer_gen: 0,
-            timer_due: 0,
+            timer_due: None,
             scratch: Vec::new(),
             moving: false,
             diag: Diag::default(),
@@ -697,13 +691,8 @@ impl Deref for Ice1724 {
 }
 
 impl Ice1724 {
-    pub fn new(variant: Variant) -> Self {
-        Self::with_clock(variant, CardClock::new())
-    }
-
-    /// The card on a sample clock of the caller's.
-    pub(crate) fn with_clock(variant: Variant, clock: CardClock) -> Self {
-        Self { inner: Arc::new_cyclic(|me| Inner::new(variant, me.clone(), clock)) }
+    pub fn new(tm: &Arc<TimerManager>, variant: Variant) -> Self {
+        Self { inner: Arc::new_cyclic(|me| Inner::new(variant, me.clone(), tm)) }
     }
 
     /// Name the card's state lock in the lock registry, which holds only a
@@ -743,7 +732,8 @@ pub struct Inner {
     /// The sample clock and the timer bookkeeping shared with other audio
     /// cards; reached through `Deref`.
     clock: CardClock,
-    timers: OnceLock<Arc<TimerManager>>,
+    /// Brings the engines up to date; counts machine time.
+    timer: Timer,
     /// `[audio]` settings once host output is enabled.
     audio_cfg: Mutex<Option<AudioConfig>>,
     sink: Mutex<Option<PcmOut>>,
@@ -765,7 +755,7 @@ impl Deref for Inner {
 }
 
 impl Inner {
-    fn new(variant: Variant, me: Weak<Inner>, clock: CardClock) -> Self {
+    fn new(variant: Variant, me: Weak<Inner>, tm: &Arc<TimerManager>) -> Self {
         // The header as the chip powers up (see [`config_policy`]); the
         // board's subsystem pair survives a function reset.
         let config = PciConfig::new_with_policy(
@@ -796,8 +786,8 @@ impl Inner {
             pci,
             state: Mutex::new(State::new(variant)),
             idle: Condvar::new(),
-            clock,
-            timers: OnceLock::new(),
+            clock: CardClock::new(tm.clock().clone()),
+            timer: Timer::new(tm, &me, |i: &Inner, due| i.timer_fire(due)),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
             meter: Meter::new("ICE1724", &["analog in", "analog out", "S/PDIF out"]),
@@ -857,21 +847,7 @@ impl Inner {
         *self.audio_cfg.lock() = Some(audio);
     }
 
-    /// Give the card the machine's timers. Called before `Device::start`.
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timers.set(tm);
-    }
-
     // ---- clock and timer ----
-
-    /// Whether the timer may be armed: started, on a real clock, with a
-    /// manager.
-    fn timers_live(&self) -> Option<&Arc<TimerManager>> {
-        if !self.armed.load(Ordering::SeqCst) || !self.runs_by_itself() {
-            return None;
-        }
-        self.timers.get()
-    }
 
     /// When the next running engine's interrupt interval ends, or a flow
     /// tick, whichever is first; `None` when no engine runs.
@@ -892,72 +868,42 @@ impl Inner {
         next
     }
 
-    /// Replace the pending timer with one for the engines' present state.
+    /// Set the timer for the engines' present state.
     fn arm_timer(&self, s: &mut State, now: i64) {
-        s.timer_gen += 1;
-        if let Some(id) = s.timer.take() {
-            if let Some(tm) = self.timers.get() {
-                tm.remove(id);
-            }
-        }
-        let Some(tm) = self.timers_live() else { return };
-        let Some(when) = self.next_deadline(s, now) else { return };
+        let when = self.next_deadline(s, now);
         s.timer_due = when;
-        let (me, gen) = (self.me.clone(), s.timer_gen);
-        s.timer = Some(tm.add_one_shot(Duration::from_nanos((when - now).max(0) as u64), (), move |_| {
-            let Some(i) = me.upgrade() else { return TimerReturn::Delete };
-            i.timer_fire(gen)
-        }));
+        // The timer counts machine time; the card's clock is that less the time held back.
+        self.timer.set_due(when.map(|w| (w + self.stalled_ns.load(Ordering::SeqCst)) as u64));
     }
 
-    /// The timer fired: bring the engines up to date and wait for the next
-    /// deadline.
-    fn timer_fire(&self, gen: u64) -> TimerReturn {
+    /// The timer fired: bring the engines up to date and set the next deadline.
+    fn timer_fire(&self, due: u64) {
         let _pass = self.tick_pass.lock();
-        if self.stopped() {
-            return TimerReturn::Delete;
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
         }
         let mut s = self.lock_idle();
-        if s.timer_gen != gen {
-            return TimerReturn::Delete;
+        let Some(timer_due) = s.timer_due else { return };
+        if (timer_due + self.stalled_ns.load(Ordering::SeqCst)) as u64 != due {
+            return;
         }
         // A timer far behind its deadline means the host held up this
         // thread; the clock is set back rather than replaying the time in a
         // burst (see the module notes).
-        let now = self.absorb_stall(s.timer_due, FLOW_NS);
+        let now = self.absorb_stall(timer_due, FLOW_NS);
         self.sync(&mut s, now);
-        match self.next_deadline(&s, now) {
-            Some(when) => {
-                s.timer_due = when;
-                TimerReturn::RescheduleOneShot(Duration::from_nanos((when - now).max(0) as u64))
-            }
-            None => {
-                s.timer = None;
-                TimerReturn::Delete
-            }
-        }
+        self.arm_timer(&mut s, now);
     }
 
     fn pause(&self) {
-        self.stop_clock();
         self.armed.store(false, Ordering::SeqCst);
-        {
-            let mut s = self.state.lock();
-            s.timer_gen += 1;
-            if let Some(id) = s.timer.take() {
-                if let Some(tm) = self.timers.get() {
-                    tm.remove(id);
-                }
-            }
-        }
-        // Once this returns no timer callback is under way.
-        drop(self.tick_pass.lock());
+        self.timer.stop();
     }
 
     fn resume(&self) {
         self.open_sink();
-        self.start_clock();
         self.armed.store(true, Ordering::SeqCst);
+        self.timer.start();
         let now = self.now();
         let mut s = self.lock_idle();
         self.arm_timer(&mut s, now);
@@ -1775,8 +1721,8 @@ impl Inner {
                     s.mt(MT_RATE),
                     s.ccs(CCS_POWER_DOWN)
                 );
-                let timer = if s.timer.is_some() { format!("due in {:.2} ms", -ms(s.timer_due)) } else { "none".into() };
-                let _ = writeln!(o, "timer {timer}, gen {}, transfer {}", s.timer_gen, if s.moving { "in progress" } else { "idle" });
+                let timer = s.timer_due.map_or("none".into(), |due| format!("due in {:.2} ms", -ms(due)));
+                let _ = writeln!(o, "timer {timer}, transfer {}", if s.moving { "in progress" } else { "idle" });
                 let _ = writeln!(o, "accesses: {} reads, {} writes, {} unexpected", d.reads, d.writes, self.unexpected.load(Ordering::Relaxed));
                 let _ = writeln!(o, "engine          run  addr       bytes   pos      tc(dw)  tc_pos  frames      fired/latched  polled");
                 for (i, e) in s.eng.iter().enumerate() {
@@ -2081,15 +2027,13 @@ impl Saveable for Ice1724 {
                 ak4355_writes: field_u32(v, "ak4355_writes")?,
                 codec_rejects: field_u32(v, "codec_rejects")?,
             },
-            timer: None,
-            timer_gen: s.timer_gen + 1,
-            timer_due: 0,
+            timer_due: None,
             scratch: std::mem::take(&mut s.scratch),
             moving: false,
             diag: std::mem::take(&mut s.diag),
         };
         loaded.check()?;
-        if s.timer.is_some() {
+        if i.armed.load(Ordering::SeqCst) {
             return Err("ice1724 loaded while its timer runs".into());
         }
         *s = loaded;

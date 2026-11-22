@@ -1,6 +1,6 @@
 # IRIX calibrates its microsecond delay loop cold, so JIT runs make every delay short
 
-Status: open (measured 2026-10-28 on IP30, IRIX 6.5.22; no fix chosen).
+Status: open (measured 2026-10-28 on IP30, IRIX 6.5.22; no fix chosen; host clock note 2026-11-22).
 
 **Symptom.** Some Octane boots print
 `ALERT: /hw/node/xtalk/15/pci/3: RAD UST not incrementing` before
@@ -31,6 +31,15 @@ was asked. For the RAD check, "10 µs" took 1.6–2.7 µs of host time, which is
 
 On the interpreter the calibration matches the steady speed and the check
 passes (29 ticks in a traced boot).
+
+**Host clock cost hid it.** On a host whose kernel judged its TSC unstable
+and fell back to the HPET clocksource, `Instant::now` is a syscall of about
+1.8 us. While the RAD1 read its clock that way, each UST read put most of one
+such call between the two samples and padded the gap to 3.8-4.8 us. Moving the
+card to the machine clock (a TSC read) removed the padding, and the alert went
+from 0 of 13 boots to 16 of 23 (6.5.22, jitv2, 2026-11-22). Putting one
+`Instant::now` back after the read took it from 7 of 10 to 0 of 10 in the same
+batch. The UST counts correctly in both; do not restore the slow read as a fix.
 
 **Wider impact.** This is not specific to RAD. Every driver delay and every
 delay-counted timeout in the kernel is about 5× short on jitv2. Most of our

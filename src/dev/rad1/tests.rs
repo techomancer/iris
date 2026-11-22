@@ -3,7 +3,7 @@
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
-use crate::dev::host_pcm::test_time::{FakeNs, TestTime};
+use crate::dev::host_pcm::test_time::{stepped, Stepped};
 use crate::host_audio::test_signal::{detached, TestHost};
 use crate::hptimer::TimerManager;
 use crate::pci::PciDma;
@@ -14,13 +14,20 @@ const BAR: u64 = 0x1300_0000;
 
 /// A card with BAR0 assigned and memory decoding on, as firmware leaves it.
 fn card() -> Rad1 {
-    let r = Rad1::with_clock(TestTime::clock());
+    card_on(stepped())
+}
+
+fn card_on(tm: Arc<TimerManager>) -> Rad1 {
+    let r = Rad1::new(&tm);
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns().store(0, Ordering::Relaxed);
     r
 }
 const PCI_COMMAND_MEMORY_ON: u32 = 2;
+
+fn mediaio_on(tm: Arc<TimerManager>) -> Rad1 {
+    Rad1 { inner: Arc::new_cyclic(|me| Inner::new(me.clone(), &tm, RAD1_REVISION_MEDIAIO)) }
+}
 
 fn wr(r: &Rad1, off: u32, v: u32) {
     r.bar_write(0, off, v, 4);
@@ -41,7 +48,7 @@ const STARTUP: [(u32, u32); 28] = [
 
 #[test]
 fn pci_identity() {
-    let r = Rad1::new();
+    let r = Rad1::new(&stepped());
     let c = r.state().config();
     assert_eq!(c.read(0), 0x0005_10a9);
     assert_eq!(c.read(2) & 0xff, 0xc0);
@@ -57,7 +64,7 @@ fn pci_identity() {
 
 #[test]
 fn bar_sizing_and_assignment() {
-    let r = Rad1::new();
+    let r = Rad1::new(&stepped());
     let c = r.state().config();
     c.write(4, 0xffff_ffff);
     assert_eq!(c.read(4), 0xffff_e000);
@@ -165,7 +172,7 @@ fn descriptor_bank_storage() {
 #[test]
 fn ust_counter_and_control() {
     let r = card();
-    let at = |ns: i64| r.fake_ns().store(ns, Ordering::Relaxed);
+    let at = |ns: i64| r.set_ns(ns);
     assert_eq!(rd(&r, 0x30), 0);
     at(100_000);
     assert_eq!(rd(&r, 0x30), 0, "stopped at reset");
@@ -198,7 +205,7 @@ fn ust_wraps_to_32_bits() {
     r.state.lock().ust_count = u32::MAX - 1;
     wr(&r, 0x40, 0x0e);
     wr(&r, 0x40, 0x0a);
-    r.fake_ns().store(960 * 3, Ordering::Relaxed);
+    r.set_ns(960 * 3);
     assert_eq!(rd(&r, 0x30), 1);
 }
 
@@ -313,7 +320,11 @@ use crate::pci::PciDmaStatus;
 use crate::pci::testing::FlatMem as Ram;
 
 fn dma_card() -> (Rad1, Arc<Ram>) {
-    let r = card();
+    dma_card_on(stepped())
+}
+
+fn dma_card_on(tm: Arc<TimerManager>) -> (Rad1, Arc<Ram>) {
+    let r = card_on(tm);
     let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
     r.state().connect_dma(ram.clone());
     (r, ram)
@@ -325,7 +336,7 @@ fn word(ram: &Ram, addr: u64) -> u32 {
 }
 
 fn at(r: &Rad1, ns: i64) {
-    r.fake_ns().store(ns, Ordering::Relaxed);
+    r.set_ns(ns);
 }
 
 fn start_ust(r: &Rad1) {
@@ -619,18 +630,20 @@ fn rings_at_the_top_of_the_bus_fail_rather_than_wrap() {
     assert_eq!(r.status_tick(gen), None, "the schedule stops on the failed slot");
 }
 
-/// While the machine is stopped the card's clock stands still: a ring
+/// While the machine is stopped its clock stands still: a ring
 /// does not jump on by the length of the stop.
 #[test]
 fn the_clock_stands_still_while_paused() {
-    let (r, _ram) = dma_card();
-    r.fake_ns().store(i64::MIN, Ordering::Relaxed);
+    let (r, _ram) = dma_card_on(Arc::new(TimerManager::new()));
     start_ust(&r);
+    let clock = r.test_clock();
     r.pause();
+    clock.stop();
     let before = std::time::Instant::now();
     let ust = rd(&r, 0x30);
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(rd(&r, 0x30), ust, "no UST ticks while paused");
+    clock.start();
     r.resume();
     let mut ticks = 0;
     assert!(eventually(|| {
@@ -648,10 +661,8 @@ fn the_clock_stands_still_while_paused() {
 /// A card on the real clock with the machine's timers, started, and a
 /// status ring programmed; the schedule is not started yet.
 fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
-    let (r, ram) = dma_card();
-    r.fake_ns().store(i64::MIN, Ordering::Relaxed);
     let tm = Arc::new(TimerManager::new());
-    r.set_timer_manager(tm.clone());
+    let (r, ram) = dma_card_on(tm.clone());
     Device::start(&r);
     wr(&r, 0x500, 0x30_0000);
     wr(&r, 0x504, 0xffff_c078);
@@ -680,7 +691,7 @@ fn a_status_completion_fires_from_the_timer_with_no_guest_access() {
     let (r, ram, _tm) = timed_card();
     // 3300 units of the 33 MHz status clock: 100 us.
     wr(&r, 0x5c, 0x40003 | (3300 << 2));
-    assert!(r.state.lock().status_timer.is_some());
+    assert!(r.status.is_armed());
     assert!(wait_done(&r, 2), "completions arrive unprompted");
     assert_eq!(word(&ram, 0x30_0000 + SLOT_STRIDE + SLOT_DONE_OFFSET), SLOT_DONE_WORD);
     Device::stop(&r);
@@ -695,7 +706,6 @@ fn stopping_ends_the_status_timer_and_starting_resumes_it() {
     assert!(wait_done(&r, 1));
     Device::stop(&r);
     assert!(!r.is_running());
-    assert!(r.state.lock().status_timer.is_none());
     let done = r.state.lock().status_done;
     std::thread::sleep(Duration::from_millis(30));
     assert_eq!(r.state.lock().status_done, done, "nothing completes while stopped");
@@ -709,9 +719,9 @@ fn stopping_ends_the_status_timer_and_starting_resumes_it() {
 fn stopping_the_status_engine_removes_its_timer() {
     let (r, _ram, _tm) = timed_card();
     wr(&r, 0x5c, 0x40003 | (3300 << 2));
-    assert!(r.state.lock().status_timer.is_some());
+    assert!(r.status.is_armed());
     wr(&r, 0x5c, STATUS_STOP);
-    assert!(r.state.lock().status_timer.is_none());
+    assert!(!r.status.is_armed());
     Device::stop(&r);
 }
 
@@ -1119,7 +1129,7 @@ thread_local! {
 /// the card's clock runs on meanwhile. 32 kHz, so the tune passes through
 /// unresampled.
 fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<Output> {
-    card.fake_ns().fetch_add(300 * SEC / 1000, Ordering::Relaxed);
+    card.add_ns(300 * SEC / 1000);
     let (out, host) = detached(32_000, 2);
     HOST_END.with(|h| *h.borrow_mut() = Some(host));
     Some(out)
@@ -1136,10 +1146,10 @@ fn host_heard(r: &Rad1, host: &mut TestHost) -> Vec<i16> {
 /// more than the host stream queues, and the tune loses its start.
 #[test]
 fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
-    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone(), TestTime::clock(), RAD1_REVISION) }) };
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone(), &stepped(), RAD1_REVISION) }) };
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns().store(0, Ordering::Relaxed);
+    r.set_ns(0);
     let ram = Arc::new(Ram(Mutex::new(vec![0; 0x40_0000])));
     // A recognisable tune: every frame's samples count up from 1.
     for (f, w) in ram.0.lock().unwrap()[TUNE_BUF as usize..][..TUNE_FRAMES * 8].chunks_exact_mut(4).enumerate() {
@@ -1149,7 +1159,7 @@ fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
     r.enable_output(crate::config::AudioConfig::default());
     Device::start(&r);
     prom_tune(&r, TUNE_CTRL);
-    let start = r.fake_ns().load(Ordering::Relaxed);
+    let start = r.test_clock().now() as i64;
     let mut played = Vec::new();
     for step in 1..=25 {
         at(&r, start + step * 100 * SEC / 1000);
@@ -1220,11 +1230,32 @@ fn the_clock_never_reads_behind_a_time_it_handed_out() {
         r.now();
         r.status_tick(gen);
         let seen = r.seen_ns.load(Ordering::SeqCst);
-        assert!(r.clock_locked(&None) >= seen, "completion {k}: clock behind {seen}");
+        assert!(r.clock_ns() >= seen, "completion {k}: clock behind {seen}");
     }
     let seen = r.seen_ns.load(Ordering::SeqCst);
     let v = r.save_state();
-    assert_eq!(crate::snapshot::field_u64(&v, "clock_ns").unwrap() as i64, seen.max(r.now()));
+    assert_eq!(crate::snapshot::field_u64(&v, "clock_at_ns").unwrap() as i64, seen.max(r.now()));
+}
+
+/// A card that is running has timers a load would leave pointing at the old schedule.
+#[test]
+fn a_started_card_refuses_a_load() {
+    let r = card();
+    let v = r.save_state();
+    Device::start(&r);
+    assert!(r.load_state(&v).is_err());
+    Device::stop(&r);
+    r.load_state(&v).expect("a stopped card loads");
+}
+
+/// The clock key changed meaning, so a save under the old name is refused.
+#[test]
+fn a_save_under_the_old_clock_key_is_refused() {
+    let mut v = card().save_state();
+    let t = v.as_table_mut().unwrap();
+    let at = t.remove("clock_at_ns").unwrap();
+    t.insert("clock_ns".into(), at);
+    assert!(card().load_state(&v).is_err());
 }
 
 /// A register read in a hold-up must not carry the output through it, or the
@@ -1247,10 +1278,16 @@ fn rescheduling_after_a_long_completion_leaves_the_next_one_free_to_hold() {
     let (r, _ram) = dma_card();
     let gen = running_with_status(&r);
     at(&r, irix_due(1));
-    let next = r.status_tick(gen).unwrap();
+    r.status_tick(gen).unwrap();
     let frames = r.state.lock().chan[CH_OUT].frames;
     at(&r, irix_due(1) + 5_000_000);
-    assert_eq!(r.wait_until(next), Duration::ZERO, "the next completion is overdue");
+    {
+        // What the timer's callback does after a completion.
+        let mut s = r.state.lock();
+        r.clock_now(&s);
+        r.arm_status(&mut s);
+    }
+    assert!(r.status.due().unwrap() <= r.status.now(), "the next completion is overdue");
     r.status_tick(gen).unwrap();
     assert!(r.state.lock().chan[CH_OUT].frames <= frames + 12, "moved over the hold-up");
     assert!(held(&r) >= 5_000_000 - 2 * irix_due(1), "held {} ns", held(&r));
@@ -1315,8 +1352,8 @@ fn a_save_from_before_register_0x84_still_loads() {
     assert!(e.contains("startup: 25 entries, expected 27"), "{e}");
 }
 
-/// A saved card loads into a fresh one: its registers come back, and its
-/// clock reads what it read at the save rather than the restoring card's.
+/// A saved card loads into a fresh one: its registers come back, and with the
+/// machine clock at the saved reading its clock reads what it read at the save.
 #[test]
 fn save_load_round_trip_keeps_the_cards_clock() {
     use crate::traits::Saveable;
@@ -1335,11 +1372,11 @@ fn save_load_round_trip_keeps_the_cards_clock() {
         s.dac_muted = Some(false);
     }
     src.stalled_ns.store(3_000_000, Ordering::SeqCst);
-    src.fake_ns().store(8_000_000, Ordering::Relaxed);
+    src.set_ns(8_000_000);
     let v = src.save_state();
     let dst = card();
-    dst.fake_ns().store(9_000_000_000, Ordering::Relaxed);
-    dst.now();
+    // The machine restores its own clock to the saved reading first.
+    dst.set_ns(8_000_000);
     dst.load_state(&v).expect("load_state");
     assert_eq!(dst.seen_ns.load(Ordering::SeqCst), 5_000_000, "nothing later handed out than the saved time");
     assert_eq!(v, dst.save_state());
@@ -1381,6 +1418,7 @@ fn a_transfer_saved_partway_carries_on_the_same_in_a_fresh_card() {
     let v = src.save_state();
 
     let (dst, _dst_ram, dst_tap) = tune_card();
+    dst.set_ns(src.test_clock().now() as i64);
     dst.load_state(&v).expect("load_state");
     assert_eq!(v, dst.save_state());
     for ms in [12, 16, 20, 30, 1000] {
@@ -1392,27 +1430,6 @@ fn a_transfer_saved_partway_carries_on_the_same_in_a_fresh_card() {
     assert_eq!(rd(&dst, 0x58), 0x4000_0000, "the linked descriptor ended the transfer");
     assert_eq!(src_tap.lock()[played_before..], dst_tap.lock()[..], "the same frames after the save");
     assert_eq!(played_before + dst_tap.lock().len(), (512 + 256) * 2);
-}
-
-/// On the host clock too: a stopped card restored later reads the time it
-/// stopped at, not the time the snapshot sat on disk.
-#[test]
-fn a_stopped_cards_host_clock_resumes_where_it_stopped() {
-    use crate::traits::Saveable;
-    let src = card();
-    src.fake_ns().store(i64::MIN, Ordering::Relaxed);
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    Device::stop(&src);
-    src.stalled_ns.store(2_000_000, Ordering::SeqCst);
-    let at_save = src.now();
-    let v = src.save_state();
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let dst = card();
-    dst.fake_ns().store(i64::MIN, Ordering::Relaxed);
-    Device::stop(&dst);
-    dst.load_state(&v).expect("load_state");
-    assert_eq!(dst.now(), at_save);
-    assert_eq!(held(&dst), 2_000_000);
 }
 
 /// A save holding a value the card cannot take is refused, naming the
@@ -1460,7 +1477,7 @@ fn a_corrupt_save_is_refused_naming_the_field() {
 #[test]
 fn the_mediaio_card_presents_revision_7() {
     // The Octane's onboard part keeps 0xc0.
-    assert_eq!(Rad1::mediaio().state().config().read(2), u32::from(RAD1_REVISION_MEDIAIO));
+    assert_eq!(Rad1::mediaio(&stepped()).state().config().read(2), u32::from(RAD1_REVISION_MEDIAIO));
     assert_eq!(card().state().config().read(2), u32::from(RAD1_REVISION));
 }
 
@@ -1470,10 +1487,9 @@ fn the_mediaio_card_presents_revision_7() {
 /// as the Octane's DAC mute silenced every other second of a playback.
 #[test]
 fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
-    let r = Rad1::mediaio();
+    let r = mediaio_on(stepped());
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns.store(0, Ordering::Relaxed);
     let ram = Arc::new(Ram(Mutex::new(vec![0x55; 0x40_0000])));
     r.state().connect_dma(ram.clone());
     // A 44.1 kHz host stream, so the ring's samples arrive unresampled.
@@ -1492,23 +1508,89 @@ fn the_mediaio_card_plays_through_its_0x88_and_0x8c_writes() {
     }
 }
 
-/// The whole way from guest memory to the host as a running machine takes
-/// it: the card on the host's clock with the machine's timers, its output
-/// pump moving the ring with no register access, the host output opened by
-/// `enable_output` -- an `[audio] file`, so no sound card -- and resampled
-/// from the card's 44.1 kHz to the file's 48 kHz in real time. The file
-/// holds the guest's two tones on their own channels at full level; the
-/// DAC mute word silences what follows while the transfer runs on.
+/// A card with a 512-frame ring of the two tones at 44.1 kHz, on a stepped
+/// clock, whose host output is detached: `run` moves the clock on 2 ms at a
+/// time, syncs the card as a register read does, and has the host take the
+/// frames that period holds, so nothing waits on a wall clock.
+struct SteppedTone {
+    r: Rad1,
+    host: TestHost,
+    pcm: Vec<i16>,
+    ms: i64,
+}
+
+impl SteppedTone {
+    fn new() -> Self {
+        use crate::host_audio::test_signal::*;
+        let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
+        let (r, ram) = dma_card();
+        {
+            let mut m = ram.0.lock().unwrap();
+            for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
+                let at = 0x10_0000 + n * 8;
+                m[at..at + 4].copy_from_slice(&sample_to_word(f[0]).to_le_bytes());
+                m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
+            }
+        }
+        let (out, host) = detached(44_100, 2);
+        *r.sink.lock() = Some(Sink { host: Some(out), dump: None, tap: None });
+        start_ust(&r);
+        program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+        Self { r, host, pcm: Vec::new(), ms: 0 }
+    }
+
+    fn run(&mut self, ms: i64) {
+        let per = |t: i64| (t * 44_100 / 1000) as usize;
+        for _ in 0..ms / 2 {
+            at(&self.r, (self.ms + 2) * 1_000_000);
+            rd(&self.r, 0x58);
+            self.pcm.extend(self.host.render(per(self.ms + 2) - per(self.ms)));
+            self.ms += 2;
+        }
+    }
+
+    fn frames(&self) -> u64 {
+        self.r.state.lock().chan[CH_OUT].frames
+    }
+
+    fn underruns(&self) -> u64 {
+        self.r.sink.lock().as_ref().unwrap().host.as_ref().unwrap().stats().underruns
+    }
+}
+
+/// The whole way from guest memory to the host: the card on a stepped
+/// clock, its output moved as a register read brings it up to date, into a
+/// detached host stream the test reads as a device would. The host hears
+/// the guest's two tones on their own channels at full level; the DAC mute
+/// word silences what follows while the transfer runs on. The real timers
+/// and the resampling to a file's 48 kHz are not exercised here.
 #[test]
-fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
+fn a_tone_in_guest_memory_reaches_the_host_on_a_stepped_clock() {
     use crate::host_audio::test_signal::*;
-    // Five and ten cycles fill the 512-frame ring exactly at 44.1 kHz.
     let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
-    let r = Rad1::new();
-    r.state().config().write(4, BAR as u32);
-    r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
-    r.state().connect_dma(ram.clone());
+    let mut t = SteppedTone::new();
+    wr(&t.r, 0x58, 0x2000_0001);
+    t.run(600);
+    let loud = t.frames();
+    wr(&t.r, 0x8c, 3);
+    t.run(300);
+    let moved = t.frames();
+    assert!(moved >= 44100 * 900 / 1000 - 441, "the clock ran: {moved} frames in 0.9 s");
+    assert!(moved > loud, "the transfer runs on while muted");
+    let heard = sounding(&t.pcm, 2);
+    let n = (heard.len() / 2) as u64;
+    assert!(n + 9600 >= loud && n <= loud, "{n} frames heard, {loud} played before the mute");
+    assert_tones(&heard, 2, 44100, left, right, 15000);
+}
+
+/// The real output pump and the resampling to a file's 48 kHz, which the
+/// stepped tests skip. It waits for frames, not for a time, so a loaded host
+/// only makes it slower.
+#[test]
+fn a_tone_reaches_a_file_through_the_real_pump() {
+    use crate::host_audio::test_signal::*;
+    let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
+    let (r, ram) = dma_card_on(Arc::new(TimerManager::new()));
     {
         let mut m = ram.0.lock().unwrap();
         for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
@@ -1517,44 +1599,26 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
             m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
         }
     }
-    let tm = Arc::new(TimerManager::new());
-    r.set_timer_manager(tm.clone());
-    let (cfg, path) = file_config("rad1-tone");
+    let (cfg, path) = file_config("rad1-pump");
     r.enable_output(cfg);
     Device::start(&r);
     start_ust(&r);
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
-    let started = std::time::Instant::now();
     wr(&r, 0x58, 0x2000_0001);
-    std::thread::sleep(Duration::from_millis(600));
-    // The DAC mute word: the rest plays as silence. The frames played
-    // before it are counted in the same step, with no output tick between
-    // to play more unmuted.
+    assert!(crate::test_board::until(Duration::from_secs(60), || r.state.lock().chan[CH_OUT].frames >= 8820), "the pump never moved the ring");
+    // The frames played before the DAC mute are counted in the same step.
     let loud = {
         let _tick = r.tick_pass.lock();
         let loud = r.state.lock().chan[CH_OUT].frames;
         wr(&r, 0x8c, 3);
         loud
     };
-    std::thread::sleep(Duration::from_millis(300));
     Device::stop(&r);
-    let wall = started.elapsed().as_secs_f64();
-    let moved = r.state.lock().chan[CH_OUT].frames;
-    // A file thread held up by a busy host (a loaded CI runner) lets the
-    // queue pass its ceiling, and the stream skips ahead rather than play
-    // late. Those frames reached the host and were let go on purpose.
     let skipped = r.sink.lock().as_ref().and_then(|sk| sk.host.as_ref()).map_or(0, |o| { let s = o.stats(); s.overruns + s.dropped });
     r.sink.lock().take();
     let (rate, channels, pcm) = read_wav(&path.0);
     assert_eq!((rate, channels), (crate::host_audio::FILE_RATE, 2));
-    // Half at least: a timer held up by a busy host holds the clock back.
-    assert!(moved as f64 >= 0.5 * wall * 44100.0, "the clock ran: {moved} frames in {wall:.3} s");
-    assert!(moved > loud, "the transfer runs on while muted");
     let heard = sounding(&pcm, 2);
-    // Resampled to 48 kHz: as many frames as the card played before the
-    // mute, less what was still in the ring. At most 0.5% more, the stream
-    // following the card's clock, and the converter's ringing at each end
-    // of a stretch of sound: one, or more where a busy host held the card up.
     let expect = loud as f64 * 48000.0 / 44100.0;
     let most = expect * 1.005 + 48.0 * bursts(&pcm, 2) as f64;
     let least = expect - skipped as f64 * 48000.0 / 44100.0 - 9600.0;
@@ -1568,12 +1632,33 @@ fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
 /// must be the tone with each channel on its own side, as long as the ring
 /// moved, and the gap must count as an underrun. The 512-frame ring holds
 /// five and ten whole cycles at 44.1 kHz, so the tones are about 431 and
-/// 861 Hz rather than 440 and 880; the host output resamples them.
-fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
+/// 861 Hz rather than 440 and 880. On a real device this runs in real time
+/// and the host output resamples; otherwise the clock is stepped.
+fn a_tone_survives_an_underrun(backend: Option<crate::host_audio::test_signal::Backend>) {
     use crate::host_audio::test_signal::*;
-    let Some(ear) = Listener::new(backend, "rad1-underrun") else { return };
     let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
-    let r = Rad1::new();
+    let Some(backend) = backend else {
+        let mut t = SteppedTone::new();
+        wr(&t.r, 0x58, 0x2000_0001);
+        t.run(600);
+        wr(&t.r, 0x58, 0x2000_0000);
+        let (first, before) = (t.frames(), t.underruns());
+        t.run(300);
+        let underran = t.underruns() - before;
+        // Starting the channel again counts its frames from zero.
+        wr(&t.r, 0x58, 0x2000_0001);
+        t.run(600);
+        wr(&t.r, 0x58, 0x2000_0000);
+        let second = t.frames();
+        t.run(300);
+        let heard = Heard { rate: 44100, channels: 2, pcm: std::mem::take(&mut t.pcm) };
+        assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first as f64 / 44100.0, second as f64 / 44100.0]);
+        assert!(underran > 0, "the host stream ran dry while the output was stopped");
+        return;
+    };
+    let Some(ear) = Listener::new(backend, "rad1-underrun") else { return };
+    let tm = Arc::new(TimerManager::new());
+    let r = Rad1::new(&tm);
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
     let ram = Arc::new(Ram(Mutex::new(vec![0xaa; 0x40_0000])));
@@ -1586,7 +1671,6 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
             m[at + 4..at + 8].copy_from_slice(&sample_to_word(f[1]).to_le_bytes());
         }
     }
-    r.set_timer_manager(Arc::new(TimerManager::new()));
     r.enable_output(ear.cfg.clone());
     Device::start(&r);
     start_ust(&r);
@@ -1613,13 +1697,13 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
 }
 
 #[test]
-fn a_tone_survives_an_underrun_into_a_file() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
+fn a_tone_survives_an_underrun_on_a_stepped_clock() {
+    a_tone_survives_an_underrun(None);
 }
 
 #[test]
 fn a_tone_survives_an_underrun_on_the_real_device() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+    a_tone_survives_an_underrun(Some(crate::host_audio::test_signal::Backend::RealDevice));
 }
 
 /// The MediaIO start-up writes 0x84 with 0 (and the model once dropped the
@@ -1638,10 +1722,9 @@ fn register_0x84_stores_what_is_written() {
 /// start-up requires register 0x30 to advance by 3 in 10 us.
 #[test]
 fn the_mediaio_counter_runs_from_reset_and_through_a_reset() {
-    let r = Rad1::mediaio();
+    let r = mediaio_on(stepped());
     r.state().config().write(4, BAR as u32);
     r.state().config().write(1, PCI_COMMAND_MEMORY_ON);
-    r.fake_ns.store(0, Ordering::Relaxed);
     let a = rd(&r, 0x30);
     at(&r, 10_000);
     assert!(rd(&r, 0x30).wrapping_sub(a) >= 3, "advances with no control write");

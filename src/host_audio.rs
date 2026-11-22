@@ -556,6 +556,14 @@ pub(crate) mod test_signal {
     }
 
     impl TestHost {
+        /// The device asks for `frames` frames, written or not; less queued counts an underrun.
+        pub(crate) fn render(&mut self, frames: usize) -> Vec<i16> {
+            use iris_audio::{Render, Sample};
+            let mut buf = vec![0f32; frames * self.channels];
+            self.renderer.render(&mut buf, &iris_audio::RenderInfo::default());
+            buf.into_iter().map(i16::from_f32).collect()
+        }
+
         /// Everything `out` has been given since the last call.
         pub(crate) fn drain(&mut self, out: &iris_audio::Output) -> Vec<i16> {
             use iris_audio::{Render, Sample};
@@ -709,51 +717,79 @@ mod tests {
         assert!(std::panic::catch_unwind(|| assert_tones(&swapped, 2, 48000, 440.0, 880.0, 9900)).is_err());
     }
 
-    /// Frames written to an output as a card writes them, in real time: a
-    /// 440 Hz tone on the left and 880 Hz on the right, nothing for 0.3 s so
-    /// the stream runs dry, then the tone again. Both sides of the gap must
-    /// be the tone on its own channels, as long as was written, and the gap
-    /// must count as an underrun. The host end alone, with no card.
-    fn a_tone_survives_an_underrun(backend: Backend) {
-        let Some(ear) = Listener::new(backend, "host-underrun") else { return };
+    /// A 440/880 Hz tone, 0.3 s of nothing that runs the stream dry, then the tone again:
+    /// both sides of the gap are the tone and the gap counts an underrun. Virtual clock without a device.
+    fn a_tone_survives_an_underrun(backend: Option<Backend>) {
+        let ear = match backend {
+            Some(b) => match Listener::new(b, "host-underrun") {
+                Some(ear) => Some(ear),
+                None => return,
+            },
+            None => None,
+        };
         let rate = 44100;
-        let mut out = open_output(&ear.cfg, "test", 2, rate, "IRIS_TEST_CAPTURE").expect("the output opens");
+        let (mut out, mut host) = match &ear {
+            Some(ear) => (open_output(&ear.cfg, "test", 2, rate, "IRIS_TEST_CAPTURE").expect("the output opens"), None),
+            None => {
+                let (out, host) = detached(rate, 2);
+                (out, Some(host))
+            }
+        };
         // One second holds whole cycles of both.
         let tone = tones(rate as usize, rate, 440.0, 880.0, 16000.0);
-        let mut at = 0usize;
+        let (mut at, mut stepped) = (0usize, Vec::new());
         // Write what is due every 2 ms for `ms`; returns the seconds written.
-        let mut play = |out: &mut Output, ms: u64| {
+        // Stepped, the device takes what each 2 ms period asks for.
+        fn play(out: &mut Output, host: &mut Option<TestHost>, heard: &mut Vec<i16>, tone: &[i16], at: &mut usize, rate: u32, ms: u64) -> f64 {
             let (start, mut pushed) = (Instant::now(), 0u64);
-            while start.elapsed() < Duration::from_millis(ms) {
-                let due = (start.elapsed().as_nanos() * u128::from(rate) / 1_000_000_000) as u64;
-                while pushed < due && out.write(&tone[at * 2..at * 2 + 2]) == 1 {
-                    at = (at + 1) % (rate as usize);
+            for k in 1..=ms / 2 {
+                let due = match host {
+                    Some(_) => k * 2 * u64::from(rate) / 1000,
+                    None => (start.elapsed().as_nanos() * u128::from(rate) / 1_000_000_000) as u64,
+                };
+                while pushed < due && out.write(&tone[*at * 2..*at * 2 + 2]) == 1 {
+                    *at = (*at + 1) % (rate as usize);
                     pushed += 1;
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                match host {
+                    Some(h) => heard.extend(h.render((k * 2 * u64::from(rate) / 1000 - (k - 1) * 2 * u64::from(rate) / 1000) as usize)),
+                    None => std::thread::sleep(Duration::from_millis(2)),
+                }
             }
             pushed as f64 / f64::from(rate)
-        };
-        let first = play(&mut out, 600);
+        }
+        let first = play(&mut out, &mut host, &mut stepped, &tone, &mut at, rate, 600);
         let before = out.stats().underruns;
-        std::thread::sleep(Duration::from_millis(300));
+        if let Some(h) = &mut host {
+            for _ in 0..150 {
+                stepped.extend(h.render(rate as usize * 2 / 1000));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         let underran = out.stats().underruns - before;
-        let second = play(&mut out, 600);
+        let second = play(&mut out, &mut host, &mut stepped, &tone, &mut at, rate, 600);
         // What the stream still holds plays out.
-        std::thread::sleep(Duration::from_millis(300));
-        drop(out);
-        let heard = ear.heard();
+        let heard = match ear {
+            Some(ear) => {
+                std::thread::sleep(Duration::from_millis(300));
+                drop(out);
+                ear.heard()
+            }
+            None => Heard { rate, channels: 2, pcm: stepped },
+        };
         assert_a_tone_either_side_of_a_pause(&heard, 440.0, 880.0, 8000, [first, second]);
         assert!(underran > 0, "the stream ran dry while nothing was written");
     }
 
+    /// The same, stepped on a virtual clock: nothing here waits on the host's.
     #[test]
-    fn a_tone_survives_an_underrun_into_a_file() {
-        a_tone_survives_an_underrun(Backend::File);
+    fn a_tone_survives_an_underrun_on_a_stepped_host() {
+        a_tone_survives_an_underrun(None);
     }
 
     #[test]
     fn a_tone_survives_an_underrun_on_the_real_device() {
-        a_tone_survives_an_underrun(Backend::RealDevice);
+        a_tone_survives_an_underrun(Some(Backend::RealDevice));
     }
 }

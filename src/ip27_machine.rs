@@ -216,8 +216,7 @@ fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Brid
     mio.register_locks();
     io.devices.push(mio.clone());
     io.monitor.push(mio.ps2());
-    let rad = Arc::new(Rad1::mediaio());
-    rad.set_timer_manager(timers.clone());
+    let rad = Arc::new(Rad1::mediaio(timers));
     if !cfg.no_audio {
         rad.enable_output(cfg.audio.clone());
     }

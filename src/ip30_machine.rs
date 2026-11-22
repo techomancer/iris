@@ -427,8 +427,7 @@ impl OctaneMachine {
         heart.on_soft_reset(Box::new(move || {
             let _ = event_tx.try_send(MachineEvent::HardReset);
         }));
-        let rad = Arc::new(Rad1::new());
-        rad.set_timer_manager(timer_manager.clone());
+        let rad = Arc::new(Rad1::new(&timer_manager));
         if !cfg.no_audio {
             rad.enable_output(cfg.audio.clone());
         }
