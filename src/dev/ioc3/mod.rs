@@ -532,7 +532,7 @@ struct Shared {
     timers: [Timer; KINDS],
     /// Between `start` and `stop`.
     running: AtomicBool,
-    /// Held by a timer callback while it runs, so `stop` can wait one out.
+    /// Held by a timer callback, a receive thread and `reset` while each runs, so a reset falls between passes.
     gate: Mutex<()>,
     /// Orders the passes that read the deadlines and set the timers.
     order: Mutex<()>,
@@ -1193,7 +1193,6 @@ impl Device for Ioc3 {
             return;
         }
         self.sh.timers.iter().for_each(Timer::stop);
-        drop(self.sh.gate.lock());
         let mut threads = self.threads.lock();
         for t in threads.iter() {
             t.thread().unpark();
