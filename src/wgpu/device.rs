@@ -416,6 +416,22 @@ impl Gpu {
         }
     }
 
+    /// Configure `surface` for this device. wgpu waits for the queue to
+    /// drain first and fails the configure if another thread submitted
+    /// meanwhile (a board's raster thread does, all the time), so the
+    /// uploads lock that every submission takes is held across it. A
+    /// failure is the surface's, returned here: an uncaptured one would
+    /// stay in [`Gpu::check`] and fail every board on the device after it.
+    pub fn configure_surface(&self, surface: &wgpu::Surface<'_>, config: &wgpu::SurfaceConfiguration) -> Result<(), String> {
+        let _submits = self.uploads.lock();
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        surface.configure(&self.device, config);
+        match pollster::block_on(scope.pop()) {
+            Some(e) => Err(format!("configure surface {}x{}: {e}", config.width, config.height)),
+            None => Ok(()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_device_loss(&self, message: &str) {
         self.error.lock().get_or_insert(format!("wgpu device lost (test): {message}"));

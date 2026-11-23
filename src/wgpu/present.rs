@@ -71,6 +71,8 @@ pub struct Presenter {
     /// The bind group for the last device frame unpacked, and its buffer.
     unpack_group: Option<(wgpu::Buffer, wgpu::BindGroup)>,
     status_rows: u32,
+    /// The last configure failed: configure again before the next frame.
+    stale: bool,
     pub frames: u64,
 }
 
@@ -143,7 +145,7 @@ impl Presenter {
             view_formats: vec![],
             color_space: Default::default(),
         };
-        surface.configure(&gpu.device, &config);
+        gpu.configure_surface(&surface, &config)?;
 
         let device = &gpu.device;
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -292,6 +294,7 @@ impl Presenter {
             unpack_size,
             unpack_group: None,
             status_rows,
+            stale: false,
             frames: 0,
         })
     }
@@ -312,7 +315,21 @@ impl Presenter {
         if (w, h) != (self.config.width, self.config.height) {
             self.config.width = w;
             self.config.height = h;
-            self.surface.configure(&self.gpu.device, &self.config);
+            self.configure();
+        }
+    }
+
+    /// Configure the surface for `config`. One that fails (the window
+    /// changing under it) is logged and tried again at the next frame.
+    fn configure(&mut self) {
+        match self.gpu.configure_surface(&self.surface, &self.config) {
+            Ok(()) => self.stale = false,
+            Err(e) => {
+                if !self.stale {
+                    log::warn!("wgpu present: {e}; retrying at the next frame");
+                }
+                self.stale = true;
+            }
         }
     }
 
@@ -342,6 +359,12 @@ impl Presenter {
         // with a texture of its outstanding, and that refusal left the
         // surface stale for every frame after. One retry on the fresh
         // configuration; a frame that still cannot be had is skipped.
+        if self.stale {
+            self.configure();
+            if self.stale {
+                return Ok(());
+            }
+        }
         let mut target = None;
         for attempt in 0..2 {
             match self.surface.get_current_texture() {
@@ -357,10 +380,13 @@ impl Presenter {
                         break;
                     }
                     drop(t);
-                    self.surface.configure(&self.gpu.device, &self.config);
+                    self.configure();
+                    if self.stale {
+                        return Ok(());
+                    }
                 }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    self.surface.configure(&self.gpu.device, &self.config);
+                    self.configure();
                     return Ok(());
                 }
                 wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
