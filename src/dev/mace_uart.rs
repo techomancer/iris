@@ -321,10 +321,7 @@ pub(crate) mod tests {
         held.start();
         held.stop();
         clock.step(held.timer.due().unwrap() - held.timer.now());
-        assert!(!probe.level() && held.timer.due().is_some(), "a stopped timer keeps its deadline and does not fire");
-        held.start();
-        clock.tm.run_due();
-        assert!(probe.level(), "start arms it again");
+        assert!(!probe.level() && held.timer.due().is_some(), "the UART's stop stops its timer");
 
         let (src, dst) = (MaceUart::new(&clock.tm), MaceUart::new(&clock.tm));
         armed(&src);

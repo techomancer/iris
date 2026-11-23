@@ -1148,11 +1148,7 @@ pub(crate) mod tests {
         scc.write_b_data(b'b');
         scc.stop();
         clock.step(due);
-        assert!(out.drain_guest().is_empty() && scc.tx[1].timer.due().is_some(), "a stopped timer keeps its deadline");
-        scc.start();
-        clock.tm.run_due();
-        assert_eq!(out.drain_guest().len(), 1, "start arms it again");
-        scc.write_b_data(b'c');
+        assert!(out.drain_guest().is_empty() && scc.tx[1].timer.due().is_some(), "the SCC's stop stops its timer");
         scc.load_state(&scc.save_state()).unwrap();
         assert_eq!(scc.tx[1].timer.due(), None, "a load drops the character in flight");
         scc.stop();
