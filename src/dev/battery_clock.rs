@@ -19,7 +19,7 @@
 //! takes the image's calendar without adding the time since.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{format_unix_utc, RtcOffset};
 
@@ -101,17 +101,19 @@ pub fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Host Unix time in whole seconds.
 pub fn unix_now() -> i64 {
-    host_second().0
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
-/// Host time in whole seconds since 1970, and the instant that second began.
-/// A clock started from it ticks with the host's seconds, so a reference
-/// saved from it and read back lands on the same second.
-pub fn host_second() -> (i64, Instant) {
+/// Host time in whole seconds since 1970, and a reading of `clock` to count them from: where the
+/// host's second began, or 0 while the clock is younger than the subsecond part. Under `ci_clock`
+/// there is no host second to align to: it is now.
+pub fn host_second(clock: &crate::clock::Clock) -> (i64, u64) {
     let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let now = Instant::now();
-    let into = Duration::from_nanos(u64::from(since.subsec_nanos()));
-    (since.as_secs() as i64, now.checked_sub(into).unwrap_or(now))
+    #[cfg(not(feature = "ci_clock"))]
+    let at = clock.now().saturating_sub(u64::from(since.subsec_nanos()));
+    #[cfg(feature = "ci_clock")]
+    let at = clock.now();
+    (since.as_secs() as i64, at)
 }
 
 /// How far a guest's write may move the clock and still not count as
