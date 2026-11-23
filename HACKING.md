@@ -911,9 +911,12 @@ tile's ordinary per-lane value. `copy::copy_mode` decides on the CPU. When
 the written box and the box moved back by `XYMOVE` do not overlap, lanes read
 the source in place. When they overlap but the walk runs against the move
 (every position's source is overwritten only by a later position, as X
-scrolls), the source plane is first copied into a snapshot buffer on the
-queue and lanes read that. Otherwise (the walk smears pixels along the move)
-and for copy lines, one shader lane walks the complete primitive and reads and
+scrolls), the box the copy reads (`copy::copy_source_box`) is first copied
+into a snapshot buffer at the same addresses, on the queue, and lanes read
+that: one run of rows when the box is at least half the plane wide, a copy a
+row otherwise. Otherwise (the walk smears pixels along the move, which the
+REX3 specification leaves to the host to avoid) and for copy lines (which
+REX3 does not define for SCR2SCR), one shader lane walks the complete primitive and reads and
 writes the selected authoritative plane directly, which takes the GPU about
 0.7 µs a pixel. Packed `DBLSRC` slots, unconditional `XYMOVE`, clipping, YFLIP
 and architectural shade/pattern advancement match the CPU walker on every

@@ -45,10 +45,10 @@ use super::command::{
     STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
     PayloadRef,
 };
-use super::copy::{copy_mode, prepare_copy_fill};
+use super::copy::{copy_mode, copy_source_box, prepare_copy_fill, CopyFill};
 use super::host::prepare_host_fill;
 use super::line::{prepare_copy_line, prepare_host_line, prepare_line};
-use super::telemetry::{duration_ns, Coverage, DrawSample, FlushReason, Workload};
+use super::telemetry::{duration_ns, CopyPath, Coverage, DrawSample, FlushReason, Workload};
 
 const STRIDE: u32 = 2048;
 const HEIGHT: u32 = 1024;
@@ -1281,7 +1281,9 @@ impl ResidentGpu {
             let line = prepared.line();
             self.current_coverage = line.and_then(|line|
                 Coverage::new(line.min_x, line.min_y, line.max_x, line.max_y));
-            crate::pf_scope!(crate::perfetto::events::REX3_GPU_COPY, self.current_coverage.map_or(0, Coverage::area));
+            let pixels = self.current_coverage.map_or(0, Coverage::area);
+            crate::pf_scope!(crate::perfetto::events::REX3_GPU_COPY[CopyPath::Line as usize], pixels);
+            self.progress.lock().workload.record_copy(CopyPath::Line, pixels, 0).map_err(ResidentError::InvalidState)?;
             if line.is_some() && prepared.payload().len() > MAX_PAYLOAD_WORDS {
                 return Err(ResidentError::Unsupported("copy line payload length"));
             }
@@ -1323,21 +1325,21 @@ impl ResidentGpu {
         let fill = prepared.fill();
         self.current_coverage = fill.and_then(|fill|
             Coverage::new(fill.min_x, fill.min_y, fill.max_x, fill.max_y));
-        crate::pf_scope!(crate::perfetto::events::REX3_GPU_COPY, self.current_coverage.map_or(0, Coverage::area));
+        let mode = fill.map_or(CopyMode::Parallel, |fill| copy_mode(context, &fill));
+        let path = match mode {
+            CopyMode::Parallel => CopyPath::Parallel,
+            CopyMode::Snapshot => CopyPath::Snapshot,
+            CopyMode::Serial => CopyPath::Serial,
+        };
+        let pixels = self.current_coverage.map_or(0, Coverage::area);
+        crate::pf_scope!(crate::perfetto::events::REX3_GPU_COPY[path as usize], pixels);
         self.submit_for(FlushReason::CopyHazard)?;
         let position = self.progress.lock().next_position()?;
+        let mut snapshot_bytes = 0;
         if let Some(fill) = fill {
             let slot = RexStateSlot::for_copy(context);
-            let mode = copy_mode(context, &fill);
             if mode == CopyMode::Snapshot {
-                // Ordered on the queue before this batch's dispatches.
-                let source = match fill.plane {
-                    FillPlane::Rgb => &self.planes.rgb,
-                    FillPlane::Aux => &self.planes.aux,
-                };
-                let mut encoder = self.gpu.encoder("resident rex3 copy source");
-                encoder.copy_buffer_to_buffer(source, 0, &self.planes.copy_source, 0, PLANE_BYTES);
-                self.gpu.submit(encoder);
+                snapshot_bytes = self.snapshot_copy_source(context, &fill);
             }
             // A serial copy is one lane of its first tile; a parallel one
             // covers its destination, a lane a pixel.
@@ -1360,9 +1362,41 @@ impl ResidentGpu {
                 }
             }
         }
+        self.progress.lock().workload.record_copy(path, pixels, snapshot_bytes).map_err(ResidentError::InvalidState)?;
         self.progress.lock().accept(position, fill.map(|fill| fill.plane));
         prepared.finish(context);
         self.submit_for(FlushReason::CopyHazard)
+    }
+
+    /// Copies the box a snapshot copy reads into `copy_source`, at the same
+    /// addresses, ordered on the queue before the copy's batch. A box at
+    /// least half the plane wide goes as one run from its first word to its
+    /// last; a narrower one a row at a time. Returns the bytes copied.
+    fn snapshot_copy_source(&self, context: &Rex3Context, fill: &CopyFill) -> u64 {
+        let Some((x0, y0, x1, y1)) = copy_source_box(context, fill, STRIDE as i32, HEIGHT as i32) else {
+            return 0;
+        };
+        let source = match fill.plane {
+            FillPlane::Rgb => &self.planes.rgb,
+            FillPlane::Aux => &self.planes.aux,
+        };
+        let word = size_of::<u32>() as u64;
+        let width = u64::from(x1 - x0 + 1);
+        let mut encoder = self.gpu.encoder("resident rex3 copy source");
+        let bytes = if width * 2 >= u64::from(STRIDE) {
+            let first = (u64::from(y0) * u64::from(STRIDE) + u64::from(x0)) * word;
+            let end = (u64::from(y1) * u64::from(STRIDE) + u64::from(x1) + 1) * word;
+            encoder.copy_buffer_to_buffer(source, first, &self.planes.copy_source, first, end - first);
+            end - first
+        } else {
+            for y in y0..=y1 {
+                let at = (u64::from(y) * u64::from(STRIDE) + u64::from(x0)) * word;
+                encoder.copy_buffer_to_buffer(source, at, &self.planes.copy_source, at, width * word);
+            }
+            width * word * u64::from(y1 - y0 + 1)
+        };
+        self.gpu.submit(encoder);
+        bytes
     }
 
     fn enqueue_line(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
@@ -1852,6 +1886,11 @@ impl ResidentBackend for ResidentGpu {
         let mut status = self.progress.lock();
         status.workload.record_flush(reason, commands, tile_pairs, elapsed, waits, wait_ns)
             .map_err(ResidentError::InvalidState)?;
+        let changes = &self.batch.slot_changes;
+        status.workload.slots = changes.slots;
+        status.workload.slots_identical = changes.identical;
+        status.workload.slot_words_changed = changes.words;
+        status.workload.slot_word_changes = changes.per_word.to_vec();
         if commands != 0 {
             if let (Some(before), Some(after)) = (profile_before, self.batch.timing.as_ref()) {
                 let workload = &mut status.workload;

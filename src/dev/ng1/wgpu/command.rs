@@ -53,7 +53,7 @@ pub(super) const FLAG_COPY_SNAPSHOT: u32 = 1 << 13;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CopyMode {
     /// One lane walks it in the hardware's order: a copy whose walk reads
-    /// pixels it wrote earlier (overlapping, against the move).
+    /// pixels it wrote earlier (overlapping, walked along the move).
     Serial,
     /// A lane a destination pixel, reading the source in place: the source
     /// and destination do not overlap.

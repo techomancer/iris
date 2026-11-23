@@ -524,6 +524,49 @@ impl<R: Pod, S: Pod> Recording<R, S> {
     }
 }
 
+/// Slots compared with the slot before them, a 32-bit word at a time (the
+/// first 64 words): how much of each slot is new.
+#[derive(Clone, Debug)]
+pub struct SlotChanges {
+    pub slots: u64,
+    /// Slots equal to the one before.
+    pub identical: u64,
+    /// Words that differ from the slot before, summed over slots.
+    pub words: u64,
+    /// Per word index, the slots in which that word changed.
+    pub per_word: [u64; 64],
+    last: [u32; 64],
+    last_len: usize,
+}
+
+impl Default for SlotChanges {
+    fn default() -> Self {
+        Self { slots: 0, identical: 0, words: 0, per_word: [0; 64], last: [0; 64], last_len: 0 }
+    }
+}
+
+impl SlotChanges {
+    fn note(&mut self, bytes: &[u8]) {
+        let mut changed = 0;
+        let mut n = 0;
+        for (i, w) in bytes.chunks_exact(4).take(64).enumerate() {
+            let w = u32::from_ne_bytes(w.try_into().expect("four bytes"));
+            if i >= self.last_len || self.last[i] != w {
+                changed += 1;
+                self.per_word[i] += 1;
+            }
+            self.last[i] = w;
+            n = i + 1;
+        }
+        self.last_len = n;
+        self.slots += 1;
+        if changed == 0 {
+            self.identical += 1;
+        }
+        self.words += changed;
+    }
+}
+
 /// The recorder and its GPU buffers. `R` is the board's setup record, `S`
 /// its state slot; both are plain `repr(C)` data laid out as the board's
 /// WGSL declares them.
@@ -547,6 +590,8 @@ pub struct Batch<R: Pod, S: Pod> {
     pub flushes: u64,
     /// Primitives drawn so far.
     pub prims_total: u64,
+    /// How each slot differs from the one before it (`prim_with_slot`).
+    pub slot_changes: SlotChanges,
     /// GPU times, with WGPU_BATCH_TIMING.
     pub timing: Option<Timing>,
     wait_stats: BatchWaitStats,
@@ -626,6 +671,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             last_set: 0,
             flushes: 0,
             prims_total: 0,
+            slot_changes: SlotChanges::default(),
             timing: if environment_timing { Timing::new(gpu) } else { None },
             wait_stats: BatchWaitStats::default(),
             #[cfg(test)]
@@ -834,7 +880,11 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         y1: i32,
         record: impl FnOnce(u32) -> R,
     ) -> Result<Option<(u32, u32)>, Full> {
-        self.recording.prim_with_slot(slot, self.grid.tile_box(x0, y0, x1, y1), record)
+        let result = self.recording.prim_with_slot(slot, self.grid.tile_box(x0, y0, x1, y1), record);
+        if let Ok(Some(_)) = result {
+            self.slot_changes.note(bytemuck::bytes_of(&slot));
+        }
+        result
     }
 
     /// Upload and draw what was recorded, with `groups` bound from group 2

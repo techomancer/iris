@@ -66,7 +66,7 @@ pub mod library {
     pub const F64: Fragment = Fragment::new("f64.wgsl", include_str!("shaders/f64.wgsl"));
 }
 
-pub use batch::{ArchShaders, Batch, BatchPipelines, Full};
+pub use batch::{ArchShaders, Batch, BatchPipelines, Full, SlotChanges};
 pub use device::{set_display, Gpu, GpuOptions};
 pub use memory::{GpuMemory, Staging};
 pub use present::{Frame, Placement, Presenter};

@@ -183,20 +183,7 @@ impl Rex3 {
                 return Err(error);
             }
         };
-        let decode = |bytes: Option<&[u8]>| -> Option<Vec<u32>> {
-            let bytes = bytes.filter(|bytes| bytes.len() == PLANE_WORDS * size_of::<u32>())?;
-            Some(bytes.chunks_exact(4).map(|word| {
-                u32::from_ne_bytes(word.try_into().expect("four-byte framebuffer word"))
-            }).collect())
-        };
-        let planes = if observation.reason() == ObservationReason::Snapshot
-            && observation.planes() == PlaneMask::Both
-        {
-            decode(observation.rgb()).zip(decode(observation.aux()))
-        } else {
-            None
-        };
-        match planes {
+        match Self::decode_observed_planes(&observation, ObservationReason::Snapshot) {
             Some(planes) => Ok(planes),
             None => {
                 let error = ResidentError::Failed("incomplete resident snapshot observation".into());
@@ -204,6 +191,39 @@ impl Rex3 {
                 Err(error)
             }
         }
+    }
+
+    fn decode_observed_planes(
+        observation: &crate::dev::ng1::wgpu::resident::Observation,
+        reason: ObservationReason,
+    ) -> Option<(Vec<u32>, Vec<u32>)> {
+        let decode = |bytes: Option<&[u8]>| -> Option<Vec<u32>> {
+            let bytes = bytes.filter(|bytes| bytes.len() == PLANE_WORDS * size_of::<u32>())?;
+            Some(bytes.chunks_exact(4).map(|word| {
+                u32::from_ne_bytes(word.try_into().expect("four-byte framebuffer word"))
+            }).collect())
+        };
+        if observation.reason() == reason && observation.planes() == PlaneMask::Both {
+            decode(observation.rgb()).zip(decode(observation.aux()))
+        } else {
+            None
+        }
+    }
+
+    /// Both planes as the GPU holds them, with the board running but its
+    /// GFIFO drained: a recording's checkpoint on the GPU raster. Unlike a
+    /// snapshot it does not need the worker stopped.
+    pub(crate) fn observe_resident_checkpoint(&self) -> Result<(Vec<u32>, Vec<u32>), ResidentError> {
+        self.wait_resident_idle()?;
+        let observation = {
+            let mut mode = self.raster.lock();
+            match &mut *mode {
+                RasterMode::Resident(raster) => raster.observe(ObservationReason::Recording, PlaneMask::Both)?,
+                _ => return Err(ResidentError::InvalidState("resident raster is not active")),
+            }
+        };
+        Self::decode_observed_planes(&observation, ObservationReason::Recording)
+            .ok_or_else(|| ResidentError::Failed("incomplete resident checkpoint observation".into()))
     }
 
     pub(super) fn save_resident_framebuffers(&self, dir: &Path, prefix: &str) -> io::Result<()> {
