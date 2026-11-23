@@ -3,7 +3,7 @@
 //! the DMA engines of codec A, codec B and the AES transmitter and receiver.
 //!
 //! Each running engine is paced by a recurring `hptimer` callback
-//! (`PACE_PERIOD`) that moves the frames the wall clock says are due, with
+//! (`PACE_PERIOD`) that moves the frames the machine clock says are due, with
 //! bounded catch-up. Codec A plays to the host through
 //! [`crate::host_audio`], scaled by the CS4216's mute and DAC attenuators
 //! and by the 8-bit MDAC volume registers HPC3 forwards
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use std::io::Write;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
 use crate::config::{AudioConfig, AudioHost};
+use crate::clock::Clock;
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use crate::dev::audio_dump::AudioDump;
 use crate::host_audio::{Meter, Output as AudioOut, Skip};
@@ -158,7 +159,7 @@ const DRY_LIMIT: u32 = 100;
 /// (every 21-91 us) cannot keep real time on a host thread: every late or
 /// coalesced tick consumed guest audio more slowly than the codec rate, which
 /// played as stretched, ever more delayed sound. Instead each wake moves the
-/// number of frames the wall clock says are due.
+/// number of frames the machine clock says are due.
 ///
 /// It must be well under a millisecond. IRIX refills its 202-frame playback
 /// ring from a 1 kHz callback that reads the DMA position each time; at 2 ms
@@ -177,7 +178,7 @@ const PACE_CATCHUP_NUM: u64 = 5;
 /// the guest last polled. IRIX refills its 202-frame playback ring from a
 /// 1 kHz callback, writing only a little ahead of the position it reads.
 /// Emulated, that callback runs late when the host is busy (GLQuake), and a
-/// channel paced by the wall clock alone then ran into slots not yet
+/// channel paced by the clock alone then ran into slots not yet
 /// refilled and replayed the previous lap (18 ms chunks at 11025 Hz: the
 /// "robot" sound). Coupled to the guest's polls, the channel waits for a
 /// late callback instead; the host output buffer covers the wait. A guest
@@ -185,9 +186,11 @@ const PACE_CATCHUP_NUM: u64 = 5;
 const READ_AHEAD_MS: u64 = 1;
 const PACE_CATCHUP_DEN: u64 = 4;
 
-/// Wall-clock frame pacing for one channel: how many frames are due now.
+/// Machine-clock frame pacing for one channel: how many frames are due now.
 struct Pacer {
-    start: Instant,
+    clock: Clock,
+    /// The clock's reading when the channel started, in nanoseconds.
+    start: u64,
     rate: u64,
     done: u64,
     /// Frames of stalls `due` has skipped, until the caller takes them.
@@ -195,11 +198,11 @@ struct Pacer {
 }
 
 impl Pacer {
-    fn new(rate: u32) -> Self {
-        Self { start: Instant::now(), rate: rate as u64, done: 0, skipped: 0 }
+    fn new(rate: u32, clock: &Clock) -> Self {
+        Self { clock: clock.clone(), start: clock.now(), rate: rate as u64, done: 0, skipped: 0 }
     }
 
-    /// Frames to move now, counting them as done: what the wall clock says is
+    /// Frames to move now, counting them as done: what the machine clock says is
     /// due, but never much more than one period's worth.
     ///
     /// The DMA position must move smoothly, as on the hardware. IRIX writes
@@ -210,7 +213,7 @@ impl Pacer {
     /// 18 ms chunks. A late wake now moves at most PACE_CATCHUP times a
     /// period's frames and the backlog drains over the next wakes.
     fn due(&mut self) -> u64 {
-        self.due_at(self.start.elapsed())
+        self.due_at(Duration::from_nanos(self.clock.now().saturating_sub(self.start)))
     }
 
     /// [`Pacer::due`] with `elapsed` as the time since the start.
@@ -507,7 +510,7 @@ impl Hal2 {
         let dma_client = self.dma_clients[dma_ch].clone();
         let state = self.state.clone();
         let ca_state = self.ca_state.clone();
-        let mut pacer = Pacer::new(pitch_rate);
+        let mut pacer = Pacer::new(pitch_rate, tm.clock());
         let meter = self.meter.clone();
         let dump = self.dump.clone();
         // The frames one wake moves, kept between wakes: for the host, and as read.
@@ -615,7 +618,7 @@ impl Hal2 {
         crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 1 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
-        let mut pacer = Pacer::new(rate);
+        let mut pacer = Pacer::new(rate, tm.clock());
 
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
@@ -652,7 +655,7 @@ impl Hal2 {
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
-        let mut pacer = Pacer::new(rate);
+        let mut pacer = Pacer::new(rate, tm.clock());
 
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
@@ -686,7 +689,7 @@ impl Hal2 {
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
-        let mut pacer = Pacer::new(rate);
+        let mut pacer = Pacer::new(rate, tm.clock());
 
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
@@ -1140,8 +1143,9 @@ mod tests {
 
     #[test]
     fn pacer_spreads_catch_up_after_a_late_wake() {
-        let mut p = Pacer::new(11025);
-        p.start -= Duration::from_millis(10);
+        let clock = Clock::stepped();
+        let mut p = Pacer::new(11025, &clock);
+        clock.step(10_000_000);
         let per_period = (11025 * PACE_PERIOD.as_micros() as u64).div_ceil(1_000_000);
         let first = p.due();
         assert!(first <= (per_period * 5).div_ceil(4).max(per_period + 1), "moved {} at once", first);
@@ -1150,10 +1154,21 @@ mod tests {
         assert!(total >= 110, "backlog not delivered: {}", total);
     }
 
+    /// No frame is due while the machine clock stands still.
+    #[test]
+    fn pacer_waits_for_the_machine_clock() {
+        let board = crate::test_board::Stepped::new();
+        let mut p = Pacer::new(44100, &board.clock);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(p.due(), 0);
+        board.step(1_000_000);
+        assert!(p.due() > 0);
+    }
+
     /// A stall past PACE_MAX_BACKLOG is dropped and counted.
     #[test]
     fn pacer_counts_the_stall_it_skips() {
-        let mut p = Pacer::new(11025);
+        let mut p = Pacer::new(11025, &Clock::stepped());
         p.due_at(Duration::from_secs(5));
         assert_eq!(p.take_skipped(), 11025 * 5 - 11025 * PACE_MAX_BACKLOG.as_millis() as u64 / 1000);
     }
