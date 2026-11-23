@@ -411,7 +411,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 
 | Command | Description |
 |---|---|
-| `rex status` | All REX3 drawing registers; on the GPU raster also a `TELEMETRY` line (batches and flush reasons, copies by path and pixels, snapshot bytes, state-slot words changed per slot, GFIFO pressure, waits) |
+| `rex status` | All REX3 drawing registers; on the GPU raster also a `TELEMETRY` line (batches and flush reasons, copies by path and pixels, snapshot bytes, state-slot words changed per slot and command generation time with `IRIS_REX3_GPU_STATS` set, GFIFO pressure, waits) |
 | `rex jit <on\|off\|status\|list>` | REX3 shader JIT (`rex-jit`): switch, counters, compiled and failed shaders |
 | `rex jit <disable\|enable> <dm0> <dm1>` | Take one draw mode out of (or back into) JIT dispatch |
 | `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (also `IRIS_REX3_TRACE=<file>`) |

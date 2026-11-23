@@ -5,7 +5,7 @@
 //! read back only at an explicit observation; this is not a live renderer.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -55,7 +55,15 @@ const HEIGHT: u32 = 1024;
 pub(crate) const PLANE_WORDS: usize = (STRIDE * HEIGHT) as usize;
 const PLANE_BYTES: u64 = PLANE_WORDS as u64 * size_of::<u32>() as u64;
 const READBACK_BYTES: u64 = 2 * PLANE_BYTES;
-const MAX_SLOTS: u32 = 1024;
+// A slot a primitive, so a batch holds as many slots as primitives (1 MB of
+// slots a set). At 1024 the slots, not the primitives, ended almost every
+// batch the guest's span stream made, and the submission cost came four
+// times as often.
+const MAX_SLOTS: u32 = crate::wgpu::tiles::MAX_PRIMS;
+/// GOs between clock reads while a batch is open: its age is checked against
+/// a time up to this many GOs old (a 1024-span batch fills in well under a
+/// millisecond). A new batch and an empty GFIFO always read the clock.
+const GOS_PER_CLOCK_READ: u32 = 32;
 const MAX_SETS: usize = 3;
 /// Flush at the next GFIFO command boundary after four milliseconds. A single
 /// long command or a bounded GPU-set wait cannot be preempted by this policy.
@@ -646,6 +654,9 @@ pub(crate) trait ResidentBackend: Send {
 pub(crate) struct ResidentRaster {
     backend: Box<dyn ResidentBackend>,
     fault: Option<ResidentError>,
+    /// Whether `fault` is set, readable without the raster's lock (the
+    /// board checks it on every GO).
+    faulted: Arc<AtomicBool>,
     host_read: HostReadSnapshot,
 }
 
@@ -672,8 +683,20 @@ impl ResidentRaster {
         Self {
             backend: Box::new(backend),
             fault: None,
+            faulted: Arc::new(AtomicBool::new(false)),
             host_read: HostReadSnapshot::default(),
         }
+    }
+
+    /// Keep `flag` equal to whether this raster has a fault, from now on.
+    pub(crate) fn share_fault_flag(&mut self, flag: Arc<AtomicBool>) {
+        flag.store(self.fault.is_some(), Ordering::Release);
+        self.faulted = flag;
+    }
+
+    fn set_fault(&mut self, fault: Option<ResidentError>) {
+        self.faulted.store(fault.is_some(), Ordering::Release);
+        self.fault = fault;
     }
 
     pub(crate) fn gpu(&self) -> Option<Arc<Gpu>> {
@@ -704,7 +727,7 @@ impl ResidentRaster {
                 } else {
                     error
                 };
-                self.fault = Some(error.clone());
+                self.set_fault(Some(error.clone()));
                 Err(error)
             }
         }
@@ -870,12 +893,12 @@ impl ResidentRaster {
         }
         match self.backend.reset(rgb, aux) {
             Ok(()) => {
-                self.fault = None;
+                self.set_fault(None);
                 self.host_read = HostReadSnapshot::default();
                 Ok(())
             }
             Err(error) => {
-                self.fault = Some(error.clone());
+                self.set_fault(Some(error.clone()));
                 Err(error)
             }
         }
@@ -902,7 +925,9 @@ impl ResidentRaster {
     }
 
     pub(crate) fn fail(&mut self, error: ResidentError) {
-        self.fault.get_or_insert(error);
+        if self.fault.is_none() {
+            self.set_fault(Some(error));
+        }
     }
 
     #[cfg(test)]
@@ -934,6 +959,17 @@ pub(crate) struct ResidentGpu {
     max_sets: NonZeroUsize,
     batch_started: Option<Instant>,
     current_coverage: Option<Coverage>,
+    /// The GO being enqueued accepted a write to a plane.
+    wrote: bool,
+    /// Submission time so far, the raster thread's copy of the workload's
+    /// `submission_ns` (read around each GO without the status lock).
+    submission_ns: u64,
+    /// `IRIS_REX3_GPU_STATS`: also time each GO's command generation and
+    /// count which state-slot words change. Both cost every GO.
+    detailed_stats: bool,
+    /// The last clock read and the GOs since (`GOS_PER_CLOCK_READ`).
+    last_now: Instant,
+    gos_since_clock: u32,
 }
 
 struct RasterSet {
@@ -1122,13 +1158,15 @@ impl ResidentGpu {
                 RasterSet { payload, group }
             })
             .collect();
-        let batch = Batch::new_bounded_unprofiled(
+        let mut batch = Batch::new_bounded_unprofiled(
             &gpu,
             &pipelines,
             TileGrid::new(REX3_SCREEN_WIDTH as u32, REX3_SCREEN_HEIGHT as u32),
             max_slots,
             max_sets,
         );
+        let detailed_stats = std::env::var_os("IRIS_REX3_GPU_STATS").is_some();
+        batch.track_slot_changes = detailed_stats;
         gpu.instance.poll_all(false);
         gpu.check().map_err(gpu_error)?;
 
@@ -1156,6 +1194,11 @@ impl ResidentGpu {
             max_slots, max_sets,
             batch_started: None,
             current_coverage: None,
+            wrote: false,
+            submission_ns: 0,
+            detailed_stats,
+            last_now: Instant::now(),
+            gos_since_clock: 0,
         })
     }
 
@@ -1316,7 +1359,7 @@ impl ResidentGpu {
                     }
                 }
             }
-            self.progress.lock().accept(position, line.map(|line| line.plane));
+            self.accept(position, line.map(|line| line.plane));
             prepared.finish(context);
             return self.submit_for(FlushReason::CopyHazard);
         }
@@ -1363,7 +1406,7 @@ impl ResidentGpu {
             }
         }
         self.progress.lock().workload.record_copy(path, pixels, snapshot_bytes).map_err(ResidentError::InvalidState)?;
-        self.progress.lock().accept(position, fill.map(|fill| fill.plane));
+        self.accept(position, fill.map(|fill| fill.plane));
         prepared.finish(context);
         self.submit_for(FlushReason::CopyHazard)
     }
@@ -1455,7 +1498,7 @@ impl ResidentGpu {
                 }
             }
         }
-        self.progress.lock().accept(position, line.map(|line| line.plane));
+        self.accept(position, line.map(|line| line.plane));
         command.finish(context);
         Ok(())
     }
@@ -1570,6 +1613,7 @@ impl ResidentGpu {
             status.host_write_transfers += 1;
             status.host_write_qwords += payload_qwords;
             status.accept(position, line.map(|line| line.plane));
+            self.wrote |= line.is_some();
         }
         prepared.finish(context);
         Ok(())
@@ -1636,9 +1680,15 @@ impl ResidentGpu {
             status.host_write_transfers += 1;
             status.host_write_qwords += payload_qwords;
             status.accept(position, fill.map(|fill| fill.plane));
+            self.wrote |= fill.is_some();
         }
         prepared.finish(context);
         Ok(())
+    }
+
+    fn accept(&mut self, position: Position, plane: Option<FillPlane>) {
+        self.wrote |= plane.is_some();
+        self.progress.lock().accept(position, plane);
     }
 
     fn enqueue_fill(
@@ -1700,14 +1750,14 @@ impl ResidentGpu {
         let opcode = context.drawmode0.opcode();
         if opcode == DRAWMODE0_OPCODE_NOOP {
             let position = self.progress.lock().next_position()?;
-            self.progress.lock().accept(position, None);
+            self.accept(position, None);
             context.host_len = 1;
             context.host_cursor = 0;
             return Ok(());
         }
         if opcode == DRAWMODE0_OPCODE_READ {
             let position = self.progress.lock().next_position()?;
-            self.progress.lock().accept(position, None);
+            self.accept(position, None);
             return Ok(());
         }
         if opcode == DRAWMODE0_OPCODE_SCR2SCR {
@@ -1731,7 +1781,6 @@ impl ResidentGpu {
             return self.enqueue_line(context);
         }
         let command = prepare_resident_flat_fill(context).map_err(ResidentError::Unsupported)?;
-        let position = self.progress.lock().next_position()?;
         let fill = command.fill();
         self.current_coverage = fill.and_then(|fill| Coverage::new(
             fill.min_x as i32, fill.min_y as i32,
@@ -1747,42 +1796,54 @@ impl ResidentGpu {
             }
             self.enqueue_fill(context, fill, slot, words, shade_payload.is_some())?;
         }
-        self.progress.lock().accept(position, fill.map(|fill| fill.plane));
+        // Nothing above needs the stream position: take and accept it in
+        // one lock (the common GO, a span or block).
+        {
+            let plane = fill.map(|fill| fill.plane);
+            let mut status = self.progress.lock();
+            let position = status.next_position()?;
+            status.accept(position, plane);
+            self.wrote |= plane.is_some();
+        }
         command.finish(context);
         Ok(())
     }
 
     fn enqueue_at(&mut self, context: &mut Rex3Context, now: Instant) -> Result<(), ResidentError> {
         self.flush_if_due(now)?;
-        let start = Instant::now();
         let sample = DrawSample::from_context(context);
         let requested_qwords = u64::from(context.host_len.max(1));
-        let (rgb, aux, host_qwords, submit_ns) = {
-            let status = self.progress.lock();
-            (status.rgb.last_write, status.aux.last_write, status.host_write_qwords,
-                status.workload.submission_ns)
+        // Only a HostW GO needs the status before it runs.
+        let host_qwords = if sample.is_host_write() {
+            Some(self.progress.lock().host_write_qwords)
+        } else {
+            None
         };
+        let submit_ns = self.submission_ns;
         self.current_coverage = None;
+        self.wrote = false;
         let result = self.enqueue_inner(context);
-        let elapsed = duration_ns(start.elapsed()).map_err(ResidentError::InvalidState)?;
+        let generation = if self.detailed_stats {
+            let elapsed = duration_ns(now.elapsed()).map_err(ResidentError::InvalidState)?;
+            let nested_submit = self.submission_ns.checked_sub(submit_ns)
+                .ok_or(ResidentError::InvalidState("submission time decreased"))?;
+            elapsed.checked_sub(nested_submit)
+                .ok_or(ResidentError::InvalidState("nested submission exceeds command time"))?
+        } else {
+            0
+        };
         let pending = {
             let mut status = self.progress.lock();
-            let nested_submit = status.workload.submission_ns.checked_sub(submit_ns)
-                .ok_or(ResidentError::InvalidState("submission time decreased"))?;
-            let generation = elapsed.checked_sub(nested_submit)
-                .ok_or(ResidentError::InvalidState("nested submission exceeds command time"))?;
             if matches!(result, Err(ResidentError::Unsupported(_))) {
                 status.workload.unsupported = status.workload.unsupported.checked_add(1)
                     .ok_or(ResidentError::InvalidState("unsupported counter exhausted"))?;
             }
             if result.is_ok() {
-                let noop = !sample.is_host_read()
-                    && status.rgb.last_write == rgb && status.aux.last_write == aux;
-                let transfer = if sample.is_host_write() {
-                    status.host_write_qwords.checked_sub(host_qwords)
-                        .ok_or(ResidentError::InvalidState("HostW qword counter decreased"))?
-                } else {
-                    requested_qwords
+                let noop = !sample.is_host_read() && !self.wrote;
+                let transfer = match host_qwords {
+                    Some(before) => status.host_write_qwords.checked_sub(before)
+                        .ok_or(ResidentError::InvalidState("HostW qword counter decreased"))?,
+                    None => requested_qwords,
                 };
                 status.workload.record_draw(sample, self.current_coverage, noop, transfer, generation)
                     .map_err(ResidentError::InvalidState)?;
@@ -1805,7 +1866,12 @@ impl ResidentBackend for ResidentGpu {
     }
 
     fn enqueue(&mut self, context: &mut Rex3Context) -> Result<(), ResidentError> {
-        self.enqueue_at(context, Instant::now())
+        self.gos_since_clock += 1;
+        if self.batch_started.is_none() || self.detailed_stats || self.gos_since_clock >= GOS_PER_CLOCK_READ {
+            self.gos_since_clock = 0;
+            self.last_now = Instant::now();
+        }
+        self.enqueue_at(context, self.last_now)
     }
 
     fn submit(&mut self) -> Result<(), ResidentError> {
@@ -1883,6 +1949,7 @@ impl ResidentBackend for ResidentGpu {
         let wait_ns = waits_after.nanoseconds.checked_sub(waits_before.nanoseconds)
             .ok_or(ResidentError::InvalidState("bounded-set wait time decreased"))?;
         let profile_error = self.batch.timing.as_ref().and_then(|timing| timing.failure);
+        self.submission_ns = self.submission_ns.saturating_add(elapsed);
         let mut status = self.progress.lock();
         status.workload.record_flush(reason, commands, tile_pairs, elapsed, waits, wait_ns)
             .map_err(ResidentError::InvalidState)?;

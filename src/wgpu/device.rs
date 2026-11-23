@@ -101,6 +101,9 @@ pub struct Gpu {
     /// The first asynchronous error (validation outside an error scope, or
     /// device loss). Checked by `check()`; a kernel bug shows up here.
     error: Arc<Mutex<Option<String>>>,
+    /// Set once `error` holds one: `check()` runs on every primitive a
+    /// board queues and reads only this until something has failed.
+    failed: Arc<std::sync::atomic::AtomicBool>,
     /// Writes waiting for the next submission (`write`).
     uploads: Mutex<Uploads>,
 }
@@ -377,17 +380,20 @@ impl Gpu {
         .map_err(|e| format!("request device on {}: {e}", info.name))?;
 
         let error = Arc::new(Mutex::new(None));
-        let sink = Arc::clone(&error);
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sink, flag) = (Arc::clone(&error), Arc::clone(&failed));
         device.on_uncaptured_error(Arc::new(move |e| {
             let msg = format!("wgpu error: {e}");
             log::error!("{msg}");
             sink.lock().get_or_insert(msg);
+            flag.store(true, std::sync::atomic::Ordering::Release);
         }));
-        let sink = Arc::clone(&error);
+        let (sink, flag) = (Arc::clone(&error), Arc::clone(&failed));
         device.set_device_lost_callback(move |reason, msg| {
             let msg = format!("wgpu device lost ({reason:?}): {msg}");
             log::error!("{msg}");
             sink.lock().get_or_insert(msg);
+            flag.store(true, std::sync::atomic::Ordering::Release);
         });
 
         let caps = Caps {
@@ -404,12 +410,15 @@ impl Gpu {
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
         };
         let uploads = Mutex::new(Uploads::new(&device));
-        Ok(Arc::new(Gpu { instance, adapter, device, queue, caps, error, uploads }))
+        Ok(Arc::new(Gpu { instance, adapter, device, queue, caps, error, failed, uploads }))
     }
 
     /// The first asynchronous error, if any. Kernels that misbehave are
     /// reported here, not at the call that queued them.
     pub fn check(&self) -> Result<(), String> {
+        if !self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         match self.error.lock().clone() {
             Some(e) => Err(e),
             None => Ok(()),
@@ -435,6 +444,7 @@ impl Gpu {
     #[cfg(test)]
     pub(crate) fn inject_device_loss(&self, message: &str) {
         self.error.lock().get_or_insert(format!("wgpu device lost (test): {message}"));
+        self.failed.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Submit one command buffer, after the writes queued so far.

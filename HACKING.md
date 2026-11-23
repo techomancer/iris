@@ -1104,14 +1104,22 @@ An explicit profiling option waits for each nonempty batch and maps one
 indirect dispatch. Profiling metadata is separate from raw-plane and composed
 capture traffic.
 
-In addition to capacity and architectural boundaries, a continuously fed
-resident batch is submitted at the next GO after 4 ms. An empty GFIFO does
-not submit by itself: the guest pauses between primitives all the time, and a
-submission each time cost the processor thread a fifth of its time in small
-batches. The batch goes when it is 4 ms old, checked after each GO and each
-time the idle processor thread is about to park (a 2 ms park), so a batch
-waits at most about 6 ms; every reader (a frame cut, HostR, a wait for idle)
-submits first.
+A batch holds up to 4096 primitives, each with its own state slot. An empty
+GFIFO does not submit by itself: the guest pauses between primitives all the
+time, and a submission each time cost the processor thread a fifth of its
+time in small batches. The batch goes when it is 4 ms old, checked as each
+GO starts (against a clock read once every 32 GOs while a batch is open, and
+always when one opens), every 256 GFIFO entries, and each time the idle
+processor thread is about to park (a 2 ms park), so a batch waits at most
+about 6 ms; every reader (a frame cut, HostR, a wait for idle) submits first.
+
+The processor thread's work per GO is what limits the GL demos, which draw
+millions of spans of a few pixels each. A GO takes the raster lock once
+(whether the raster has a fault is an atomic beside it), the status lock
+twice, and no allocation for a span's shade checkpoints up to 256 pixels.
+Timing each GO's command generation and counting which state-slot words
+change from one primitive to the next cost every GO, so both are off unless
+`IRIS_REX3_GPU_STATS` is set; the rest of the telemetry is always on.
 This cannot split a command, HostRW transfer or bounded-set wait. A replay of
 66,741 embedded-PROM command-monitor records on Vulkan and D3D12 accepted
 20,987 operations with no unsupported operation or read mismatch. It formed
