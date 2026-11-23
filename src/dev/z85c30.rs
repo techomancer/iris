@@ -9,6 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+use crate::clock::Clock;
 use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
 use std::thread;
@@ -361,6 +362,8 @@ pub struct Z85c30 {
     pub channel_b: Arc<Mutex<Channel>>,
     /// Each channel's transmitter, paced on the machine clock.
     tx: [Arc<Tx>; 2],
+    /// Paces the receive side's characters.
+    clock: Clock,
     // Swappable so CI mode can replace the default TCP backend with a
     // `CiSerialBackend` before `start()` is called. Wrapped in `Arc<Mutex<_>>`
     // so `Z85c30` stays `Clone` and the swap is thread-safe.
@@ -426,6 +429,18 @@ impl Tx {
     }
 }
 
+/// Wait for the machine clock to reach `until`, in host slices so a stopped clock
+/// or a stopped device does not strand the thread.
+fn wait_until(clock: &Clock, running: &AtomicBool, until: u64) {
+    loop {
+        let now = clock.now();
+        if now >= until || !running.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(Duration::from_nanos(until - now).min(Duration::from_millis(1)));
+    }
+}
+
 /// Cap on the channel-B console mirror (`console_buf`). 64 KiB is far more than
 /// any single probe response; the buffer is drained on each read.
 const CONSOLE_TAP_CAP: usize = 64 * 1024;
@@ -461,6 +476,7 @@ impl Z85c30 {
         };
         Self {
             tx: [tx("A", &channel_a, &backend_a, None), tx("B", &channel_b, &backend_b, Some(console_buf.clone()))],
+            clock: tm.clock().clone(),
             channel_a,
             channel_b,
             backend_a,
@@ -658,12 +674,13 @@ impl Device for Z85c30 {
             let rx_channel = channel_arc.clone();
             let rx_backend = backend.clone();
             let running = self.running.clone();
+            let clock = self.clock.clone();
             // Only channel B (the IRIX serial console) accepts in-process
             // injection; channel A has no queue.
             let rx_inject = if i == 1 { Some(self.inject_b.clone()) } else { None };
 
             threads.push(thread::Builder::new().name(format!("SCC-RX-{}", ch_name)).spawn(move || {
-                let mut last_rx_time = Instant::now();
+                let mut last_rx_time = clock.now();
                 // When the SCC's 8-byte rx_queue is full, hold the just-read
                 // byte here and retry on the next iteration instead of
                 // dropping it. This prevents loss when the host pushes a
@@ -703,7 +720,7 @@ impl Device for Z85c30 {
                     let wr3 = channel.regs[scc_regs::WR3 as usize];
                     let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
                     let delay_micros = channel.tx_delay;
-                    let char_duration = Duration::from_micros(delay_micros);
+                    let char_ns = delay_micros * 1000;
 
                     if !rx_enabled {
                         // RX disabled — drop the byte (matches real hw with
@@ -731,17 +748,12 @@ impl Device for Z85c30 {
                     drop(channel);
 
                     // Pacing — simulate baud-rate inter-character spacing.
-                    let now = Instant::now();
-                    if last_rx_time < now {
-                        if now.duration_since(last_rx_time) > Duration::from_millis(100) {
-                            last_rx_time = now;
-                        }
+                    let now = clock.now();
+                    if last_rx_time < now && now - last_rx_time > 100_000_000 {
+                        last_rx_time = now;
                     }
-                    last_rx_time += char_duration;
-                    let wait = last_rx_time.saturating_duration_since(now);
-                    if !wait.is_zero() {
-                        thread::sleep(wait);
-                    }
+                    last_rx_time += char_ns;
+                    wait_until(&clock, &running, last_rx_time);
                 }
             }).unwrap());
         }
@@ -952,6 +964,27 @@ pub(crate) mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Z85c30 save_state mismatch after load_state round-trip");
+    }
+
+    /// A received character waits out its time on the line on the machine
+    /// clock: the next one reaches the guest only once the clock has moved.
+    #[test]
+    fn received_characters_are_spaced_on_the_machine_clock() {
+        let board = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &board.tm);
+        scc.write_b_control(scc_regs::WR3);
+        scc.write_b_control(wr3::RX_ENABLE);
+        let char_ns = scc.channel_b.lock().tx_delay * 1000;
+        assert!(char_ns > 0 && char_ns <= 1_000_000, "the step below must cover one character");
+        scc.inject_b(b"ab");
+        scc.start();
+        let queued = || scc.channel_b.lock().rx_queue.len();
+        assert!(crate::test_board::until(|| queued() == 1));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(queued(), 1, "the second character must wait for the clock");
+        board.step(1_000_000);
+        assert!(crate::test_board::until(|| queued() == 2));
+        scc.stop();
     }
 
     /// Phase 3.5: a long single-line `serial-send` from the host must arrive
