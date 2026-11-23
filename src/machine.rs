@@ -503,6 +503,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
         #[cfg(not(feature = "ci_clock"))]
         let timer_manager = Arc::new(TimerManager::new());
+        mc.set_clock(timer_manager.clock().clone());
         let ioc = Ioc::new_for_profile(&timer_manager, guinness, cfg.machine.profile.ip28());
         ioc.ps2().set_layout(cfg.keyboard);
 

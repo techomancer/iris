@@ -46,6 +46,7 @@ pub const REG_RPSS_CTR: u32 = 0x1000;
 
 /// The MC clock of the IP22/IP24 models (see `MemoryController::set_clock_hz`).
 pub const DEFAULT_CLOCK_HZ: u64 = 50_000_000;
+const NS_PER_SEC: u64 = 1_000_000_000;
 pub const REG_SEMAPHORE_0: u32 = 0x10000;
 
 // ... Semaphores 1-15 follow pattern +0x1000
@@ -57,8 +58,9 @@ struct MemoryControllerState {
     user_semaphores: [bool; 16],
     
     // Timer state
-    last_host_ticks: u64,
-    host_freq: u64,
+    /// The machine clock the counters follow.
+    clock: crate::clock::Clock,
+    last_ns: u64,
     /// The clock the refresh, watchdog and RPSS counters count (see
     /// `set_clock_hz`).
     clock_hz: u64,
@@ -133,8 +135,8 @@ impl MemoryController {
     ) -> Self {
         let base_shift = if ip28 { 24 } else { 22 };
         let regs = Self::init_registers_for(guinness, base_shift);
-        let host_freq = crate::platform::get_host_tick_frequency();
-        let last_host_ticks = crate::platform::get_host_ticks();
+        let clock = crate::clock::Clock::new();
+        let last_ns = clock.now();
 
         Self {
             state: Arc::new(Mutex::new(MemoryControllerState {
@@ -142,8 +144,8 @@ impl MemoryController {
                 eeprom,
                 sys_semaphore: false,
                 user_semaphores: [false; 16],
-                last_host_ticks,
-                host_freq,
+                clock,
+                last_ns,
                 clock_hz: DEFAULT_CLOCK_HZ,
                 cpu_cycle_acc: 0,
                 rpss_cycle_acc: 0,
@@ -243,6 +245,13 @@ impl MemoryController {
         // Initialize GIO_MEMACC: 0x00004333
         regs[(REG_GIO_MEMACC / 4) as usize] = 0x00004333;
         regs
+    }
+
+    /// Count on the machine clock instead of the host's.
+    pub fn set_clock(&self, clock: crate::clock::Clock) {
+        let mut st = self.state.lock();
+        st.last_ns = clock.now();
+        st.clock = clock;
     }
 
     /// Set the clock the MC's counters count. IRIX derives the RPSS cycle
@@ -586,23 +595,23 @@ impl MemoryController {
 
 impl MemoryControllerState {
     fn update_timers(&mut self) {
-        let now = crate::platform::get_host_ticks();
-        // A reading a few hundred ns behind the last (another socket's TSC) is no time passing.
-        let diff = match now.wrapping_sub(self.last_host_ticks) {
+        let now = self.clock.now();
+        // A reading behind the last (another thread's, or the clock set back) is no time passing.
+        let diff = match now.wrapping_sub(self.last_ns) {
             d if d > u64::MAX / 2 => 0,
             d => d,
         };
         if diff > 0 {
-            self.last_host_ticks = now;
+            self.last_ns = now;
         }
 
         // Scale to cycles of the MC clock (`clock_hz`).
-        // cycles = (diff * clock_hz) / host_freq
+        // cycles = (diff * clock_hz) / 1e9
         // Use accumulator to maintain precision over many small updates
         // Use u128 to prevent overflow during multiplication
         let total_ticks = (diff as u128) * (self.clock_hz as u128) + (self.cpu_cycle_acc as u128);
-        let cpu_cycles = (total_ticks / (self.host_freq as u128)) as u64;
-        self.cpu_cycle_acc = (total_ticks % (self.host_freq as u128)) as u64;
+        let cpu_cycles = (total_ticks / NS_PER_SEC as u128) as u64;
+        self.cpu_cycle_acc = (total_ticks % NS_PER_SEC as u128) as u64;
 
         if cpu_cycles == 0 { return; }
 
@@ -1091,7 +1100,8 @@ impl Device for MemoryController {
         // A stale anchor makes the first update_timers bill the guest for the
         // pause. Catches every mc.stop()/start() pair; a CPU-only pause is
         // still billed, since it never stops the MC.
-        self.state.lock().last_host_ticks = crate::platform::get_host_ticks();
+        let mut st = self.state.lock();
+        st.last_ns = st.clock.now();
         let mc = self.clone();
         self.threads.lock().push(thread::Builder::new().name("MC-DMA".to_string()).spawn(move || {
             mc.dma_worker();
@@ -1483,11 +1493,31 @@ mod tests {
     fn a_reading_behind_the_last_is_no_time_passing() {
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
         let mc = MemoryController::new(eeprom, true, [0u32; 4]);
-        let ahead = crate::platform::get_host_ticks() + 1_000_000;
+        let clock = crate::clock::Clock::stepped();
+        clock.step(2_000_000);
+        mc.set_clock(clock);
         let mut st = mc.state.lock();
-        st.last_host_ticks = ahead;
+        st.last_ns = 3_000_000;
         st.update_timers();
-        assert_eq!(st.last_host_ticks, ahead);
+        assert_eq!(st.last_ns, 3_000_000);
+    }
+
+    /// Nothing counts until the machine clock moves.
+    #[test]
+    fn counters_wait_for_the_machine_clock() {
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let mc = MemoryController::new(eeprom, true, [0u32; 4]);
+        let clock = crate::clock::Clock::stepped();
+        mc.set_clock(clock.clone());
+        let ref_ctr = || {
+            mc.state.lock().update_timers();
+            mc.state.lock().regs[(REG_REF_CTR / 4) as usize]
+        };
+        let before = ref_ctr();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(ref_ctr(), before);
+        clock.step(1_000_000);
+        assert_ne!(ref_ctr(), before);
     }
 
     /// A restore into a machine whose PROM never ran must place the saved
@@ -1518,9 +1548,10 @@ mod tests {
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
         let mc = MemoryController::new(eeprom, true, [0u32; 4]);
 
-        let freq = crate::platform::get_host_tick_frequency();
-        mc.state.lock().last_host_ticks =
-            crate::platform::get_host_ticks().wrapping_sub(freq * 100);
+        let clock = crate::clock::Clock::stepped();
+        clock.step(100 * NS_PER_SEC);
+        mc.set_clock(clock);
+        mc.state.lock().last_ns = 0;
 
         mc.start();
         let rpss = mc.read32((MC_BASE + REG_RPSS_CTR) as u64).data;
