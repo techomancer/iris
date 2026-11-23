@@ -1159,25 +1159,13 @@ mod tests {
 
     /// A tone, a 0.3 s stop that runs the host stream dry, then the tone again: both sides of
     /// the gap are the tone and the gap counts an underrun. The ring holds whole cycles, so
-    /// 468.75 and 937.5 Hz. Real time on a real device, a virtual clock without one.
-    fn a_tone_survives_an_underrun(backend: Option<crate::host_audio::test_signal::Backend>) {
+    /// 468.75 and 937.5 Hz. On a virtual clock; the host stream itself is tested in `host_audio`.
+    #[test]
+    fn a_tone_survives_an_underrun_on_a_stepped_host() {
         use crate::host_audio::test_signal::*;
-        let ear = match backend {
-            Some(b) => match Listener::new(b, "o2-underrun") {
-                Some(ear) => Some(ear),
-                None => return,
-            },
-            None => None,
-        };
         let ram = O2Memory::single(8 << 20);
         let a = MaceAudio::new();
-        let mut host = match &ear {
-            Some(ear) => {
-                a.enable_output(ear.cfg.clone());
-                None
-            }
-            None => Some(detached_player(&a)),
-        };
+        let mut host = detached_player(&a);
         a.write(MACE_AUDIO, 0);
         write_codec(&a, 28, 0x0800);
         write_codec(&a, 17, 48000);
@@ -1191,28 +1179,15 @@ mod tests {
             ram.put_be(o, 4, (i32::from(v) << 8) as u32);
         }
         let io = AudioIo { ram: &ram, ring_base, ust: 0 };
-        // The guest keeps the ring full and the service pass plays it, on
-        // or off.
+        // The guest keeps the ring full and the service pass plays it.
         let (t0, mut at, mut pcm) = (Instant::now(), 0u64, Vec::new());
         let mut run = |ms: u64| {
-            let end = Instant::now() + std::time::Duration::from_millis(ms);
             for _ in 0..ms / 2 {
-                if host.is_none() && Instant::now() >= end {
-                    break;
-                }
                 let rptr = a.read(MACE_AUDIO + 0x48) as u32;
                 a.write(MACE_AUDIO + 0x50, u64::from(rptr.wrapping_sub(BLOCK) & PTR_MASK));
-                match &mut host {
-                    Some(h) => {
-                        a.poll_at(&io, t0 + std::time::Duration::from_millis(at));
-                        at += 2;
-                        pcm.extend(h.render(96));
-                    }
-                    None => {
-                        a.poll(&io);
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                }
+                a.poll_at(&io, t0 + std::time::Duration::from_millis(at));
+                at += 2;
+                pcm.extend(host.render(96));
             }
         };
         let frames = || (a.msc_ust(1) >> 32) as f64;
@@ -1228,25 +1203,8 @@ mod tests {
         let second = frames() - paused;
         // What the host still holds plays out.
         run(300);
-        let heard = match ear {
-            Some(ear) => {
-                *a.player.lock() = Player::default();
-                ear.heard()
-            }
-            None => Heard { rate: 48000, channels: 2, pcm },
-        };
+        let heard = Heard { rate: 48000, channels: 2, pcm };
         assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / 48000.0, second / 48000.0]);
         assert!(underran > 0, "the host stream ran dry while the output was stopped");
-    }
-
-    /// The same, stepped on a virtual clock: nothing here waits on the host's.
-    #[test]
-    fn a_tone_survives_an_underrun_on_a_stepped_host() {
-        a_tone_survives_an_underrun(None);
-    }
-
-    #[test]
-    fn a_tone_survives_an_underrun_on_the_real_device() {
-        a_tone_survives_an_underrun(Some(crate::host_audio::test_signal::Backend::RealDevice));
     }
 }

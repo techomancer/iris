@@ -774,7 +774,7 @@ fn the_receive_timeout_runs_on_a_timer_on_the_machine_clock() {
     assert!(!irq.level(), "not before the deadline");
     l1.stop();
     clock.step(1);
-    assert!(!irq.level() && l1.rx_timer.due() == Some(due), "a stopped timer keeps its deadline and does not fire");
+    assert!(!irq.level() && l1.rx_timer.due() == Some(due), "the L1's stop stops its timer");
     l1.start();
     clock.tm.run_due();
     assert!(irq.level(), "start arms it again");

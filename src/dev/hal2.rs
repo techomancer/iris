@@ -1295,8 +1295,7 @@ mod host_tests {
     /// the guest falling behind for 0.3 s so the host stream runs dry, then
     /// catching up. Both sides of the gap must be the tone with each
     /// channel on its own side, as long as the channel moved, and the gap
-    /// must count as an underrun. On an `[audio] file` this runs everywhere;
-    /// on the real device it checks the host's sound server too.
+    /// must count as an underrun. The stream's own underrun handling is tested in `host_audio`.
     fn a_tone_survives_an_underrun(backend: Backend) {
         let Some(ear) = Listener::new(backend, "hal2-underrun") else { return };
         // 11 and 22 cycles fill the 1200-frame buffer exactly.
@@ -1332,11 +1331,6 @@ mod host_tests {
     #[test]
     fn a_tone_survives_an_underrun_into_a_file() {
         a_tone_survives_an_underrun(Backend::File);
-    }
-
-    #[test]
-    fn a_tone_survives_an_underrun_on_the_real_device() {
-        a_tone_survives_an_underrun(Backend::RealDevice);
     }
 }
 

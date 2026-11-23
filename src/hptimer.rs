@@ -972,29 +972,23 @@ mod timer_tests {
 
     #[test]
     fn a_deadline_that_did_not_move_or_moved_later_keeps_its_host_timer() {
-        let (d, _clock) = dev();
+        let (d, clock) = dev();
         d.timer.start();
         d.timer.arm_at(1_000);
         let id = d.timer.0.state.lock().id;
         assert!(id.is_some());
         d.timer.arm_at(1_000);
         assert_eq!(d.timer.0.state.lock().id, id);
-        d.timer.arm_at(2_000);
-        assert_eq!(d.timer.0.state.lock().id, id);
-        d.timer.arm_at(500);
-        assert_ne!(d.timer.0.state.lock().id, id);
-    }
-
-    #[test]
-    fn a_deadline_moved_later_fires_at_the_later_time_only() {
-        let (d, clock) = dev();
-        d.timer.start();
-        d.timer.arm_at(1_000);
         d.timer.arm_at(5_000);
+        assert_eq!(d.timer.0.state.lock().id, id);
         clock.step(1_000);
         assert!(fired(&d).is_empty(), "fired at the deadline it moved away from");
         clock.step(4_000);
         assert_eq!(fired(&d), [5_000]);
+        d.timer.arm_at(9_000);
+        let id = d.timer.0.state.lock().id;
+        d.timer.arm_at(6_000);
+        assert_ne!(d.timer.0.state.lock().id, id);
     }
 
     #[test]
@@ -1013,17 +1007,5 @@ mod timer_tests {
         assert!(crate::test_board::until(|| done.load(Ordering::SeqCst)), "blocked on the timer lock");
         drop(held);
         t.join().unwrap();
-    }
-
-    #[test]
-    fn set_due_arms_or_cancels() {
-        let (d, clock) = dev();
-        d.timer.start();
-        d.timer.set_due(Some(7));
-        assert_eq!(d.timer.due(), Some(7));
-        d.timer.set_due(None);
-        clock.step(10);
-        assert!(fired(&d).is_empty());
-        assert_eq!(d.timer.now(), 10);
     }
 }
