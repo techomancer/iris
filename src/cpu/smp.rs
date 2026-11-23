@@ -51,6 +51,10 @@ pub const REQUEST_JIT_REMAP: u32 = 1 << 3;
 pub const REQUEST_JIT_RETIRE: u32 = 1 << 4;
 /// The bits that ask the CPU for something without holding it.
 const REQUESTS: u32 = REQUEST_JIT_REMAP | REQUEST_JIT_RETIRE;
+/// A device asked for a machine reset, which stops every processor at the
+/// request on the board. Released when the machine is at power-on again; a
+/// reset leaves other holds, such as [`HOLD_RENDEZVOUS`], to their owners.
+pub const HOLD_RESET: u32 = 1 << 5;
 
 const NOT_A_CPU: u8 = u8::MAX;
 
@@ -260,6 +264,18 @@ impl World {
     /// Every CPU has left the code [`Self::retire_code`] was called for.
     pub fn code_retired(&self) -> bool {
         self.slots().iter().all(|s| s.answered(REQUEST_JIT_RETIRE))
+    }
+
+    /// A machine reset is due: hold every CPU, the caller's included, until
+    /// [`Self::reset_done`]. Returns at once.
+    pub fn hold_for_reset(&self) {
+        self.slots().iter().for_each(|s| s.hold(HOLD_RESET));
+    }
+
+    pub fn reset_done(&self) {
+        for s in self.slots() {
+            s.release(HOLD_RESET);
+        }
     }
 
     fn slots(&self) -> &[Arc<ParkSlot>] {

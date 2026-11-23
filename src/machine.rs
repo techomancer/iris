@@ -1110,6 +1110,7 @@ impl Machine {
         let (event_tx, event_rx) = MachineEvents::channel(4);
 
         // Give MC and IOC async event senders so they can request hard-reset / power-off.
+        event_tx.set_cpus(world.clone());
         mc.set_event_sender(event_tx.clone());
         ioc.set_event_sender(event_tx.clone());
 
@@ -2780,14 +2781,17 @@ mod controller_lifetime_tests {
         let nv = TempPath::dir("indy-stale-events");
         let mut machine = build_machine(&nv);
         let queue = machine.event_rx.take().unwrap();
+        queue.listen();
         let send = |m: &Machine| {
             m.event_tx.try_send(crate::traits::MachineEvent::HardReset).unwrap();
             queue.recv().unwrap().0
         };
         let sent = send(&machine);
         assert!(queue.is_current(sent));
+        assert_eq!(machine.cpu.park_slot().holds(), crate::cpu::smp::HOLD_RESET, "the CPU stops at the request");
         machine.reset();
         assert!(!queue.is_current(sent), "a reset");
+        assert_eq!(machine.cpu.park_slot().holds(), 0, "and lets the CPU go");
         let sent = send(&machine);
         let live = machine.capture_live_checkpoint();
         machine.restore_live_checkpoint(&live).unwrap();

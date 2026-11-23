@@ -273,6 +273,7 @@ pub(crate) fn machine(
         first_cpu += spec.processors.count();
     }
     let world = Arc::new(World::new());
+    events.set_cpus(world.clone());
     if let [a, b] = &nodes[..] {
         a.chip.connect_peer(&b.chip);
         b.chip.connect_peer(&a.chip);
@@ -352,7 +353,7 @@ pub(crate) fn machine(
         specs[0].module.part.label(),
     );
     let memory = nodes.iter().map(|n| n.chip.decode.physical().clone() as Arc<dyn Device>).collect();
-    Machine::new(cfg, nodes, l1s, node_cpus, io, memory, timers, receiver, |bedrock| {
+    Machine::new(cfg, nodes, l1s, node_cpus, io, memory, timers, (events, receiver), |bedrock| {
         // A timer or the other chip can still reach this one's processor.
         bedrock.clear_cpu_interrupts();
         bedrock.decode.physical().release_devices();

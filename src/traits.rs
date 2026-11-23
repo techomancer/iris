@@ -473,16 +473,37 @@ pub enum MachineEvent {
 
 /// Where devices send [`MachineEvent`]s, stamped with the machine's power-on
 /// count, which every reset and restore bumps (`powered_on`): the event
-/// thread drops a hard reset sent to a machine since replaced.
+/// thread drops a hard reset sent to a machine since replaced. Once that
+/// thread listens, a hard reset also holds every CPU until the next power-on.
 #[derive(Clone)]
 pub struct MachineEvents {
     tx: std::sync::mpsc::SyncSender<(u64, MachineEvent)>,
     power_ons: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    holds: std::sync::Arc<ResetHolds>,
+}
+
+#[derive(Default)]
+struct ResetHolds {
+    cpus: std::sync::OnceLock<std::sync::Arc<crate::cpu::smp::World>>,
+    listening: std::sync::atomic::AtomicBool,
+}
+
+impl ResetHolds {
+    fn set(&self, on: bool) {
+        if let Some(world) = self.cpus.get() {
+            if on {
+                world.hold_for_reset();
+            } else {
+                world.reset_done();
+            }
+        }
+    }
 }
 
 pub struct MachineEventQueue {
     rx: std::sync::mpsc::Receiver<(u64, MachineEvent)>,
     power_ons: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    holds: std::sync::Arc<ResetHolds>,
 }
 
 impl MachineEvents {
@@ -490,11 +511,28 @@ impl MachineEvents {
     pub fn channel(capacity: usize) -> (Self, MachineEventQueue) {
         let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
         let power_ons = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        (Self { tx, power_ons: power_ons.clone() }, MachineEventQueue { rx, power_ons })
+        let holds = std::sync::Arc::new(ResetHolds::default());
+        (Self { tx, power_ons: power_ons.clone(), holds: holds.clone() }, MachineEventQueue { rx, power_ons, holds })
+    }
+
+    /// The CPUs a hard reset stops.
+    pub fn set_cpus(&self, world: std::sync::Arc<crate::cpu::smp::World>) {
+        let _ = self.holds.cpus.set(world);
     }
 
     pub fn try_send(&self, event: MachineEvent) -> Result<(), std::sync::mpsc::TrySendError<(u64, MachineEvent)>> {
-        self.tx.try_send((self.power_ons.load(std::sync::atomic::Ordering::SeqCst), event))
+        use std::sync::mpsc::TrySendError;
+        // Held before it is queued: the reset may run before this returns.
+        let hold = matches!(event, MachineEvent::HardReset) && self.holds.listening.load(std::sync::atomic::Ordering::SeqCst);
+        if hold {
+            self.holds.set(true);
+        }
+        let sent = self.tx.try_send((self.power_ons.load(std::sync::atomic::Ordering::SeqCst), event));
+        // Full: a waiting reset needs the hold. Disconnected: no reset will come.
+        if hold && matches!(sent, Err(TrySendError::Disconnected(_))) {
+            self.holds.set(false);
+        }
+        sent
     }
 
     /// [`Self::try_send`]: a device never waits on the queue.
@@ -504,10 +542,21 @@ impl MachineEvents {
 
     pub fn powered_on(&self) {
         self.power_ons.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.holds.set(false);
     }
 }
 
 impl MachineEventQueue {
+    /// The event thread runs: from now on a hard reset holds the CPUs.
+    pub fn listen(&self) {
+        self.holds.listening.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// No reset will follow: let the CPUs run on.
+    pub fn release_holds(&self) {
+        self.holds.set(false);
+    }
+
     pub fn recv(&self) -> Option<(u64, MachineEvent)> {
         self.rx.recv().ok()
     }
