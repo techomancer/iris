@@ -66,8 +66,13 @@ pub struct CpuStatus {
     /// elsewhere).
     ticks: OnceLock<Arc<AtomicU64>>,
     /// The tick rate the guest programmed, in millihertz; 0 until a timer
-    /// publishes one. Timers write it through [`tick_rate`](Self::tick_rate).
+    /// publishes one. The CPU's own timer (CP0 Compare) writes it through
+    /// [`tick_rate`](Self::tick_rate), a board timer that feeds the same
+    /// counter (the Indy's 8254) through [`board_tick_rate`](Self::board_tick_rate);
+    /// the rate expected is their sum, since a timer the guest does not run
+    /// publishes 0.
     tick_rate: Arc<AtomicU64>,
+    board_tick_rate: Arc<AtomicU64>,
 }
 
 impl CpuStatus {
@@ -77,6 +82,7 @@ impl CpuStatus {
             parked: AtomicPtr::new(std::ptr::null_mut()),
             ticks: OnceLock::new(),
             tick_rate: Arc::new(AtomicU64::new(0)),
+            board_tick_rate: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -98,6 +104,16 @@ impl CpuStatus {
     /// CPU, in millihertz (`hz_to_mhz`). 0 means not known.
     pub fn tick_rate(&self) -> Arc<AtomicU64> {
         self.tick_rate.clone()
+    }
+
+    /// As [`tick_rate`](Self::tick_rate), for a board timer whose interrupts
+    /// the same counter counts.
+    pub fn board_tick_rate(&self) -> Arc<AtomicU64> {
+        self.board_tick_rate.clone()
+    }
+
+    fn programmed_mhz(&self) -> u64 {
+        self.tick_rate.load(Ordering::Relaxed) + self.board_tick_rate.load(Ordering::Relaxed)
     }
 }
 
@@ -249,7 +265,7 @@ impl MachineStatus {
             cpus: std::array::from_fn(|i| {
                 if i < n {
                     let c = &self.cpus[i];
-                    (c.cycles().retired(), c.ticks(), c.tick_rate.load(Ordering::Relaxed))
+                    (c.cycles().retired(), c.ticks(), c.programmed_mhz())
                 } else {
                     (0, 0, 0)
                 }

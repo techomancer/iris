@@ -537,7 +537,7 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).tick_rate());
+        ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).board_tick_rate());
         // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
         // target on a controller (`ScsiDeviceConfig::placement`). The disks
         // recorded here, and the scratch volume's path for the CI socket,
@@ -1003,6 +1003,11 @@ impl Machine {
         // Must happen before hpc3.scsi().start() (called later, from
         // Machine::start) actually spawns the worker thread that reads it.
         status.set_cpu_cycles(cpu.cycles_ptr());
+        // Which timer is the clock depends on the kernel: IRIX on the Indy
+        // takes it on CP0 Compare, on the Indigo2 and IP28 from the 8254.
+        // Both count into the CPU's tick counter; each publishes the rate it
+        // was programmed to, and the bar expects their sum.
+        cpu.publish_tick_rate(status.cpu(0).tick_rate());
         if let Some(td) = &board.testdev { td.attach_core(cpu.core_ptr()); }
         if cheritest_hook {
             if board.testdev.is_none() {
