@@ -4369,7 +4369,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         break 'gate if status & EXEC_IS_EXCEPTION != 0 { self.handle_exception(status) } else { status };
                     }
                     let func = page.func();
-                    debug_assert!(!func.is_null(), "valid bit set with null func");
+                    debug_assert!(!func.is_null());
                     #[cfg(feature = "developer")]
                     { page.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                     let jit_fn: crate::cpu::jitv2::JitFn = unsafe { std::mem::transmute(func) };
@@ -4408,7 +4408,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 if inline_compile {
                     // Sync compiles a page with no code, or one this arrival makes hot,
                     // as the pool would; else every new entry re-emits the page.
-                    if page.func().is_null() || page.note_waiting_arrival() {
+                    if !page.has_code() || page.note_waiting_arrival() {
                         break 'gate self.jitv2_compile_inline(req, trigger);
                     }
                     break 'gate self.step_int();
@@ -9725,7 +9725,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let entry_offset = ((self.core.pc & 0xFFF) >> 2) as usize;
         if page.is_runnable(entry_offset) {
             let func = page.func();
-            debug_assert!(!func.is_null(), "valid bit set with null func");
+            debug_assert!(!func.is_null());
             #[cfg(feature = "developer")]
             { page.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             let jit_fn: crate::cpu::jitv2::JitFn = unsafe { std::mem::transmute(func) };

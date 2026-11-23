@@ -4204,6 +4204,31 @@ mod tests {
             "a store to an unrelated physical page must NOT trip the SMC check");
     }
 
+    /// A held publish landing between `is_runnable` and the `func` load must leave the stub, not
+    /// null (a SIGSEGV booting a 4-CPU Tezro).
+    #[test]
+    fn a_runnable_offset_with_no_code_is_interpreted() {
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let (exec, mem) = seeded_executor([0; 32], pc);
+        let mut exec = Box::new(exec);
+        let addiu = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 1, 5); // addiu r1, r0, 5
+        mem.set_word(pc, addiu);
+        mem.set_word(pc & 0x1FFF_FFFF, addiu);
+        exec.install_jit_hooks();
+        exec.step_jit();
+        assert!(!exec.pcp.is_null(), "the fetch must track the page");
+        // What the racing CPU sees: the offset's bit, the current generation, the stub.
+        let page = unsafe { &*exec.pcp };
+        let mut entries = [0u64; crate::cpu::jitv2::BITMAP_WORDS];
+        entries[0] = 1;
+        assert!(page.publish(&entries, crate::cpu::jitv2::NO_CODE as *const (), page.current_gen(), 0, 0, false));
+        assert!(page.is_runnable(0) && !page.has_code());
+        exec.core.pc = pc;
+        exec.core.gpr[1] = 0;
+        exec.step_jit();
+        assert_eq!(exec.core.gpr[1], 5, "the instruction runs in the interpreter");
+    }
+
     #[test]
     fn self_loop_with_decrement_in_delay_slot_converges_natively() {
         // BGTZ r2,-1 / slot SUBU r2,r2,r3: a tight decrement loop whose

@@ -558,7 +558,7 @@ pub fn write_jitv2_html(
             phys_addr,
             window,
             gen: page_gen,
-            func: format!("{:#014x}", func as usize),
+            func: format!("{:#014x}", if page.has_code() { func as usize } else { 0 }),
             stale,
             fr1: page.is_fr1(),
             entry_count,

@@ -574,6 +574,12 @@ pub const FR_REPIN_FR1: u8 = 2;
 /// boundary.
 pub type JitFn = unsafe extern "C" fn(*mut MipsCore) -> ExecStatus;
 
+/// What `func` holds when a page has no code: callable, and sends the CPU to the interpreter.
+pub unsafe extern "C" fn jit_no_code(_core: *mut MipsCore) -> ExecStatus { crate::cpu::mips_exec::EXEC_FALLBACK }
+
+/// The `func` value that means "no code", as the pointer a page stores.
+pub const NO_CODE: JitFn = jit_no_code;
+
 /// A page-level bitmap over `ENTRIES_PER_PAGE` offsets — one bit per
 /// 4-byte-aligned word (§13.1). `BITMAP_WORDS` (=16) `AtomicU64`s.
 pub type EntryBitmap = [AtomicU64; BITMAP_WORDS];
@@ -928,8 +934,8 @@ pub struct PhysicalCodePage {
     /// Authoritative for dispatch together with `entry_gen` — see
     /// `is_runnable`.
     compiled: EntryBitmap,
-    /// The page's one compiled function, or null if nothing has published
-    /// yet. Validity is owned by `compiled`'s bits together with `entry_gen`
+    /// The page's one compiled function, or `jit_no_code` if nothing has
+    /// published yet. Never null. Validity is owned by `compiled`'s bits together with `entry_gen`
     /// matching `current_gen()` — see `is_runnable`.
     func: std::sync::atomic::AtomicPtr<()>,
     /// The FR mode `func` was compiled for. Distinct from the pin (`fr1`),
@@ -1461,7 +1467,7 @@ impl PhysicalCodePage {
             requested: new_bitmap(),
             denied: new_bitmap_all_set(),
             compiled: new_bitmap(),
-            func: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            func: std::sync::atomic::AtomicPtr::new(NO_CODE as *mut ()),
             func_fr1: std::sync::atomic::AtomicBool::new(false),
             entry_gen: AtomicU64::new(0),
             page_scheduled: std::sync::atomic::AtomicBool::new(false),
@@ -1511,7 +1517,7 @@ impl PhysicalCodePage {
         // (inverted sense: 0 means "still eligible" would make every reset
         // page permanently denylisted everywhere).
         for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
-        self.func.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.func.store(NO_CODE as *mut (), Ordering::Relaxed);
         self.func_fr1.store(false, Ordering::Relaxed);
         // The snapshot describes the `func` just dropped — see
         // `invalidate_compile_snapshot`.
@@ -1596,7 +1602,7 @@ impl PhysicalCodePage {
         debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && !self.is_claimed(),
             "claim() called on a slot that wasn't clean (key={:?}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
             self.key);
-        debug_assert!(self.func.load(Ordering::Relaxed).is_null(),
+        debug_assert!(!self.has_code(),
             "claim() called on a slot with a still-published function — mega_flush must reset_to_unclaimed before this slot can be reused");
         self.key = key;
         self.gen = if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen };
@@ -1884,22 +1890,21 @@ impl PhysicalCodePage {
     /// caller should treat it as unpublished (downgrade to interpreter,
     /// §13.2) rather than dispatch it.
     ///
-    /// The `entry_gen` load is Acquire, not Relaxed: it's the real
-    /// synchronization point for `func` (see `publish`'s doc comment) — the
-    /// `compiled` bit alone doesn't provide fresh ordering across a recompile
-    /// that only adds coverage without moving `entry_gen`, since the bit, once
-    /// set, doesn't change value on that path either. Callers must not read
-    /// `func` after this returns `true` without going through this same
-    /// `entry_gen` load (i.e. don't cache `is_published`'s result and reuse
-    /// it — always call `is_runnable` fresh right before trusting `func`),
-    /// or the ordering guarantee is lost.
+    /// Generation first (Acquire), then the bit, so a bit is never paired with a
+    /// newer generation. A later held publish can still swap in `jit_no_code`.
     #[inline]
     pub fn is_runnable(&self, offset_word: usize) -> bool {
-        self.is_published(offset_word)
-            && self.entry_gen.load(Ordering::Acquire) == self.current_gen()
+        self.entry_gen.load(Ordering::Acquire) == self.current_gen()
+            && bitmap_test(&self.compiled, offset_word, Ordering::Acquire)
     }
 
-    /// The page's compiled function, or null if unpublished. Callers must
+    /// Whether `func` is real code rather than the `jit_no_code` stub.
+    #[inline]
+    pub fn has_code(&self) -> bool {
+        self.func.load(Ordering::Relaxed) != NO_CODE as *mut ()
+    }
+
+    /// The page's compiled function, or `jit_no_code` if unpublished. Callers must
     /// check [`Self::is_runnable`] first (in that order — see its doc
     /// comment on why the `entry_gen` Acquire load must happen-before this
     /// read) before trusting the returned pointer.
@@ -2169,10 +2174,8 @@ impl PhysicalCodePage {
     /// until the bytes change or the arena is flushed. That loop was seen
     /// running thousands of rounds on a kernel page.
     ///
-    /// `func`-then-`compiled`-then-`entry_gen` write order (all Release) means
-    /// a reader that observes a `compiled` bit set (Acquire-paired via
-    /// `is_runnable`'s `entry_gen` load) never observes a stale/null
-    /// `func` for it. `entry_gen` is written unconditionally on every actual
+    /// Stores `func`, `compiled`, then `entry_gen` (Release); `is_runnable` reads
+    /// them back in reverse. `entry_gen` is written unconditionally on every actual
     /// publish, but only **changes** when `snap_gen != entry_gen` (a real
     /// page-bump-triggered recompile, or the first after `GEN_HELD` comes
     /// off, §13.6/§13.3's
@@ -2207,7 +2210,7 @@ impl PhysicalCodePage {
         // skip-as-redundant when entry_gen already matches snap_gen (a pure
         // entry-coverage publish racing another one for the same bytes).
         let same_gen = self.entry_gen.load(Ordering::Relaxed) == snap_gen;
-        let mode_switch = !self.func.load(Ordering::Relaxed).is_null()
+        let mode_switch = self.has_code()
             && self.func_fr1.load(Ordering::Relaxed) != fr1;
         if same_gen && !mode_switch && bitmap_is_subset_of(new_entries, &self.compiled) {
             return false; // some other compile already published everything this one covers, for this same generation and mode
@@ -2432,7 +2435,7 @@ impl PhysicalCodePage {
         // A published `func` is what the snapshot describes; without one
         // there is nothing to re-validate. (Belt and braces — every path
         // that nulls `func` also invalidates the snapshot.)
-        if self.func.load(Ordering::Relaxed).is_null() {
+        if !self.has_code() {
             { self.last_skip_reject.store(2, Ordering::Relaxed); return false; }
         }
         if !bitmap_is_subset_of_plain(wanted_entries, &snap.entries) {
@@ -3028,7 +3031,7 @@ impl Jitv2 {
     /// clanker/build/the-three-builds-we-actually-use.md).
     pub fn code_bytes_used(&self) -> u64 {
         self.pages.iter()
-            .filter(|page| !page.func().is_null())
+            .filter(|page| page.has_code())
             .map(|page| page.code_size.load(Ordering::Relaxed) as u64)
             .sum()
     }
@@ -3045,7 +3048,7 @@ impl Jitv2 {
     pub fn code_size_by_instr_count(&self) -> Vec<Option<CodeSizeBucket>> {
         let mut hist: Vec<Option<CodeSizeBucket>> = Vec::new();
         for page in self.pages.iter() {
-            if page.func().is_null() { continue; }
+            if !page.has_code() { continue; }
             let n = page.instr_count.load(Ordering::Relaxed) as usize;
             let size = page.code_size.load(Ordering::Relaxed);
             if n >= hist.len() { hist.resize(n + 1, None); }
@@ -4556,7 +4559,7 @@ mod tests {
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         assert!(!page.is_runnable(4));
         assert!(!page.is_denylisted(4));
-        assert!(page.func().is_null());
+        assert!(!page.has_code());
     }
 
     /// `try_schedule` must be a genuine test-and-set: the first caller for a
