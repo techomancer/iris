@@ -100,7 +100,7 @@ fn octane() -> Ioc3 {
 }
 
 fn octane_on(tm: &Arc<TimerManager>) -> Ioc3 {
-    Ioc3::new(tm, &IP30, MAC, ByteBus::Ds1685(Ds1685::new(None)))
+    Ioc3::new(tm, &IP30, MAC, ByteBus::Ds1685(Ds1685::new(None, tm.clock().clone())))
 }
 
 struct Rig {
@@ -190,7 +190,7 @@ fn each_board_reads_back_as_its_row_says() {
     for board in [&IP30, &IP29, &BASEIO, &BASEIO6G, &IP34, &IP34_NO_PS2, &MIO] {
         let bus = match board.cells.byte_bus {
             ByteBusPart::None => ByteBus::None,
-            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None)),
+            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None, crate::clock::Clock::stepped())),
             ByteBusPart::M48t35 => {
                 ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at_on(crate::clock::Clock::stepped(), 2026, 1, 1, 0, 0, 0).unwrap()))
             }
@@ -608,7 +608,7 @@ fn each_row_wires_its_pins_as_listed() {
     for (board, straps, bits) in rows {
         let bus = match board.cells.byte_bus {
             ByteBusPart::None => ByteBus::None,
-            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None)),
+            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None, crate::clock::Clock::stepped())),
             ByteBusPart::M48t35 => {
                 ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at_on(crate::clock::Clock::stepped(), 2026, 1, 1, 0, 0, 0).unwrap()))
             }
@@ -2018,7 +2018,7 @@ fn dropping_a_running_chip_ends_its_threads() {
 #[test]
 fn the_clocks_power_off_is_sent_to_the_machine_once() {
     let (tx, rx) = std::sync::mpsc::sync_channel(4);
-    let r = Rig::with(|tm| Ioc3::new(tm, &IP30, MAC, ByteBus::Ds1685(Ds1685::new(Some(tx)))));
+    let r = Rig::with(|tm| Ioc3::new(tm, &IP30, MAC, ByteBus::Ds1685(Ds1685::new(Some(tx), tm.clock().clone()))));
     rtc_w(&r, 0x0a, 0x10); // bank 1
     assert!(rx.try_recv().is_err());
     rtc_w(&r, 0x4a, 0x08);
@@ -2086,8 +2086,7 @@ fn save_load_round_trip() {
 
         let dst = Rig::with(build);
         dst.c.load_state(&v1).expect("load_state");
-        // Seconds may pass between the load and the save, as on a loaded host.
-        dst.c.sh.rtc.as_ref().unwrap().advance_clock(2);
+        dst.clock.step(2_000_000_000);
         let v2 = dst.c.save_state();
         assert_eq!(without_clock(&v1), without_clock(&v2));
         assert_eq!(clock_seconds(&v2), clock_seconds(&v1) + 2, "the restored clock runs on from the saved time");
@@ -2114,8 +2113,6 @@ fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
     let fresh = Rig::new();
     used.c.load_state(&v).unwrap();
     fresh.c.load_state(&v).unwrap();
-    // The loads and saves are not at one instant, so the clock may have moved.
-    used.c.sh.rtc.as_ref().unwrap().advance_clock(1);
     assert_eq!(without_clock(&used.c.save_state()), without_clock(&fresh.c.save_state()));
     assert_eq!(without_clock(&used.c.save_state()), without_clock(&v));
 }

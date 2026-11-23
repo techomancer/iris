@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::clock::{decode, encode};
+use crate::clock::{decode, encode, Clock};
 use crate::dev::battery_clock;
 use crate::dev::ds1687::{image, MaceRtc};
 use crate::snapshot::{field, field_bool, field_u8, field_u8s, StateTable};
@@ -70,9 +70,9 @@ struct Rtc {
 }
 
 impl Rtc {
-    fn new() -> Rtc {
+    fn new(clock: Clock) -> Rtc {
         Rtc {
-            dev: MaceRtc::new(),
+            dev: MaceRtc::new(clock),
             index: 0,
             file: None,
             nv: [0; 64],
@@ -225,9 +225,9 @@ pub struct Ds1685 {
 }
 
 impl Ds1685 {
-    pub fn new(events: Option<SyncSender<MachineEvent>>) -> Arc<Ds1685> {
+    pub fn new(events: Option<SyncSender<MachineEvent>>, clock: Clock) -> Arc<Ds1685> {
         Arc::new(Ds1685 {
-            st: Mutex::new(Rtc::new()),
+            st: Mutex::new(Rtc::new(clock)),
             dirty: AtomicU64::new(0),
             events,
             slot: Arc::default(),
@@ -351,13 +351,6 @@ impl Ds1685 {
         }
     }
 
-    /// Let `secs` of guest time pass at once, as a loaded host lets them
-    /// pass between two statements of a test.
-    #[cfg(test)]
-    pub(crate) fn advance_clock(&self, secs: i64) {
-        self.st.lock().dev.advance_clock(secs);
-    }
-
     /// The clock and its RAM for a snapshot, as the chip's `rtc` key.
     pub fn save_state(&self) -> toml::Value {
         let r = self.st.lock();
@@ -449,7 +442,7 @@ mod tests {
 
     #[test]
     fn dropping_a_started_part_without_stop_ends_its_writer() {
-        let d = Ds1685::new(None);
+        let d = Ds1685::new(None, Clock::stepped());
         d.start();
         // Wait for the writer to park holding its reference.
         let t = Instant::now();

@@ -937,7 +937,7 @@ fn the_register_survives_save_and_load_and_resets() {
 
 #[test]
 fn nvram_survives_and_decodes_maces_spacing() {
-    let r = MaceRtc::new();
+    let r = MaceRtc::new(crate::clock::Clock::stepped());
     // Register 0x3f, byte lane +7.
     r.write8((MACE_RTC + (0x3f << 8) + 7) as u64, 0xa5);
     assert_eq!(r.read8((MACE_RTC + (0x3f << 8) + 7) as u64).data, 0xa5);

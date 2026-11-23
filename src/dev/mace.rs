@@ -62,14 +62,14 @@ impl Mace {
             regs: Stub::new("mace"),
             pci: MacePci::new(pci, crime.clone(), ram.clone()),
             ust,
-            rtc: MaceRtc::new(),
+            rtc: MaceRtc::new(tm.clock().clone()),
             ps2: MacePs2::new(),
             // A locally-administered address; nothing depends on the value yet.
             id: MaceId::new(DEFAULT_MAC),
             com0: MaceUart::named("com0", tm),
             com1: MaceUart::named("com1", tm),
             sdma: MaceSerialDma::new(),
-            audio: MaceAudio::new(),
+            audio: MaceAudio::new(tm.clock().clone()),
             mec: Arc::new(Mec::new(ram.clone())),
             ram,
         };

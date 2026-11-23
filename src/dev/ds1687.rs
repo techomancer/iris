@@ -7,6 +7,7 @@ use std::io::Write;
 use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, load_u8_slice, u8_slice_to_toml};
 use crate::config::{civil_from_days, days_from_civil};
+use crate::clock::Clock;
 use crate::dev::battery_clock;
 
 /// A Dallas-style RTC with battery-backed NVRAM.
@@ -17,11 +18,12 @@ use crate::dev::battery_clock;
 /// trusts it, and why handing back zeros is not neutral.
 pub struct MaceRtc {
     cells: Mutex<Vec<u8>>,
-    /// The clock: guest seconds since 1970 at a host instant, so it runs.
+    /// The clock: guest seconds since 1970 at a machine-clock reading, so it runs with the machine.
     /// A kernel that calibrates its CPU clock against the RTC waits for the
     /// seconds to change, and a stopped clock leaves it waiting for ever
     /// (OpenBSD, straight after autoconfiguration).
-    clock: Mutex<(i64, std::time::Instant)>,
+    clock: Mutex<(i64, u64)>,
+    machine: Clock,
     /// The century while SET is up, as the guest last wrote it (binary).
     /// SET freezes the century with the other time bytes, and clearing SET
     /// commits all of them together: IRIX writes the century between the
@@ -80,7 +82,7 @@ impl MaceRtc {
     pub const NVRAM_FIRST: usize = 0x0e;
     pub const REGS: usize = 0x100;
 
-    pub fn new() -> Self {
+    pub fn new(machine: Clock) -> Self {
         let mut c = vec![0u8; Self::REGS];
         // A plausible stopped-but-valid clock. Register D bit 7 is the
         // valid-RAM-and-time flag: firmware that sees it clear concludes the
@@ -88,13 +90,16 @@ impl MaceRtc {
         c[0x0d] = 0x80;
         // BCD, 24-hour: what SGI firmware leaves the part in.
         c[rtc_reg::B] = rtc_reg::B_24H;
-        Self {
+        let rtc = Self {
             cells: Mutex::new(c),
-            clock: Mutex::new(battery_clock::host_second()),
+            clock: Mutex::new((0, 0)),
+            machine,
             held_century: Mutex::new(None),
             powered_off: std::sync::atomic::AtomicBool::new(false),
             set: std::sync::atomic::AtomicBool::new(false),
-        }
+        };
+        rtc.run_at(0);
+        rtc
     }
 
     /// Run the clock `offset` seconds from host time: where `[rtc_offset]`
@@ -104,7 +109,7 @@ impl MaceRtc {
     }
 
     fn run_at(&self, offset: i64) {
-        let (host, at) = battery_clock::host_second();
+        let (host, at) = battery_clock::host_second(&self.machine);
         *self.clock.lock().unwrap() = (host + offset, at);
     }
 
@@ -189,14 +194,7 @@ impl MaceRtc {
     /// Guest time now, in seconds since 1970.
     fn now(&self) -> i64 {
         let (secs, at) = *self.clock.lock().unwrap();
-        secs + at.elapsed().as_secs() as i64
-    }
-
-    /// Let `secs` of guest time pass at once, as a loaded host lets them
-    /// pass between two statements of a test.
-    #[cfg(test)]
-    pub(crate) fn advance_clock(&self, secs: i64) {
-        self.clock.lock().unwrap().0 += secs;
+        secs + (self.machine.now().saturating_sub(at) / 1_000_000_000) as i64
     }
 
     /// The clock registers' value for `t`, in the mode register B selects.
@@ -257,7 +255,7 @@ impl MaceRtc {
         if battery_clock::sets(self.now(), t) {
             self.set.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        *self.clock.lock().unwrap() = (t, std::time::Instant::now());
+        *self.clock.lock().unwrap() = (t, self.machine.now());
     }
 
     fn reg_of(addr: u32) -> Option<usize> {
@@ -352,17 +350,13 @@ impl Saveable for MaceRtc {
             load_u8_slice(c, &mut self.cells.lock().unwrap());
         }
         if let Some(t) = get_field(v, "time").and_then(|t| t.as_integer()) {
-            *self.clock.lock().unwrap() = (t, std::time::Instant::now());
+            *self.clock.lock().unwrap() = (t, self.machine.now());
         }
         *self.held_century.lock().unwrap() = get_field(v, "held_century").and_then(|c| c.as_integer());
         let off = get_field(v, "powered_off").and_then(|b| b.as_bool()).unwrap_or(false);
         self.powered_off.store(off, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
-}
-
-impl Default for MaceRtc {
-    fn default() -> Self { Self::new() }
 }
 
 impl BusDevice for MaceRtc {
@@ -453,7 +447,7 @@ mod tests {
     /// The RTC runs, from host time, and a guest that sets it with SET moves it.
     #[test]
     fn the_rtc_runs_and_can_be_set() {
-        let r = MaceRtc::new();
+        let r = MaceRtc::new(Clock::stepped());
         let reg = |n: u32| ((n << 8) | 7) as u64;
         // Host time on power-up: some year from 2026 on, in BCD.
         let yy = r.read8(reg(9)).data;
@@ -468,8 +462,7 @@ mod tests {
         assert_eq!(r.read8(reg(6)).data, 6, "a Friday");
         // Three seconds on, it is the year 2000.
         {
-            let mut c = r.clock.lock().unwrap();
-            c.1 -= std::time::Duration::from_secs(3);
+            r.machine.step(3_000_000_000);
         }
         assert_eq!((r.read8(reg(9)).data, r.read8(reg(8)).data, r.read8(reg(7)).data), (0, 1, 1));
         assert_eq!(r.read8(reg(0)).data, 1);
@@ -499,7 +492,7 @@ mod tests {
     /// date written, not from the time SET went up.
     #[test]
     fn a_century_written_under_set_waits_for_set_to_clear() {
-        let r = MaceRtc::new();
+        let r = MaceRtc::new(Clock::stepped());
         let reg = |n: u32| ((n << 8) | 7) as u64;
         r.write8(reg(0x0a), 0x30);
         r.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
@@ -535,18 +528,18 @@ mod tests {
     #[test]
     fn a_snapshot_keeps_a_century_written_under_set() {
         let reg = |n: u32| ((n << 8) | 7) as u64;
-        let src = MaceRtc::new();
+        let src = MaceRtc::new(Clock::stepped());
         src.write8(reg(0x0a), 0x30);
         src.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
         for (n, v) in [(0u32, 0u8), (2, 0), (4, 19), (7, 1), (8, 6), (9, 70), (0x48, 20)] {
             src.write8(reg(n), v);
         }
-        let dst = MaceRtc::new();
+        let dst = MaceRtc::new(Clock::stepped());
         dst.load_state(&src.save_state()).unwrap();
         dst.write8(reg(0x0b), 0x04 | 0x02);
         assert_eq!(dst.now(), 3_168_874_800, "2070-06-01 19:00:00 UTC, not 1970");
         // A save with no write in progress restores none.
-        let after = MaceRtc::new();
+        let after = MaceRtc::new(Clock::stepped());
         after.load_state(&dst.save_state()).unwrap();
         assert_eq!(*after.held_century.lock().unwrap(), None);
     }
@@ -554,9 +547,9 @@ mod tests {
     /// A snapshot after a date set restores the set date, not host time.
     #[test]
     fn a_snapshot_keeps_a_set_date() {
-        let src = MaceRtc::new();
+        let src = MaceRtc::new(Clock::stepped());
         set_2004(&src);
-        let dst = MaceRtc::new();
+        let dst = MaceRtc::new(Clock::stepped());
         dst.load_state(&src.save_state()).unwrap();
         assert!((1_086_116_400..=1_086_116_402).contains(&dst.now()));
         assert_eq!(civil_from_days(dst.now().div_euclid(86400)), (2004, 6, 1));
@@ -568,7 +561,7 @@ mod tests {
     #[test]
     fn a_set_clock_comes_back_from_its_reference() {
         let reg = |n: u32| ((n << 8) | 7) as u64;
-        let src = MaceRtc::new();
+        let src = MaceRtc::new(Clock::stepped());
         assert_eq!(src.clock_reference(), None, "never set");
         src.set_offset(-3600);
         assert_eq!(src.clock_reference(), None, "a seed is not a set");
@@ -581,20 +574,20 @@ mod tests {
         // As if saved an hour ago.
         let saved_at = i64::from_le_bytes(r[8..16].try_into().unwrap()) - 3600;
         r[8..16].copy_from_slice(&saved_at.to_le_bytes());
-        let dst = MaceRtc::new();
+        let dst = MaceRtc::new(Clock::stepped());
         let set = 1_086_116_400;
         let got = dst.restore_clock(&r).expect("a reference");
         assert!((set + 3599..=set + 3601).contains(&got), "2004-06-01 20:00 UTC, got {got}");
         assert!((set + 3599..=set + 3601).contains(&dst.now()));
         assert!(dst.clock_set(), "the restored clock is the guest's and is saved again");
-        assert_eq!(MaceRtc::new().restore_clock(&[0; 24]), None, "zeros are no reference");
+        assert_eq!(MaceRtc::new(Clock::stepped()).restore_clock(&[0; 24]), None, "zeros are no reference");
     }
 
     /// The image carries a calendar QEMU's model accepts, and the reference
     /// is QEMU's: tag, host time, guest time, little-endian.
     #[test]
     fn image_and_reference_follow_the_qemu_layout() {
-        let r = MaceRtc::new();
+        let r = MaceRtc::new(Clock::stepped());
         set_2004(&r);
         // Back to BCD: the image holds the registers in the guest's mode.
         r.write8(((0x0b << 8) | 7) as u64, 0x02);
@@ -609,21 +602,37 @@ mod tests {
         assert!((1_086_116_400..=1_086_116_402).contains(&seconds));
         // A file pair as QEMU writes it opens here.
         let q = crate::dev::battery_clock::encode(b"DS168RF1", crate::dev::battery_clock::unix_now(), Some(1_086_116_400));
-        let o2 = MaceRtc::new();
+        let o2 = MaceRtc::new(Clock::stepped());
         assert!(o2.load_image(&img));
         assert!((1_086_116_400..=1_086_116_401).contains(&o2.restore_clock(&q).unwrap()));
     }
 
+    /// The clock runs on the machine clock: it holds still with the machine and picks up from there.
+    #[test]
+    fn the_clock_stands_still_while_the_machine_is_stopped() {
+        let machine = Clock::stepped();
+        let r = MaceRtc::new(machine.clone());
+        let t0 = r.now();
+        machine.step(3_000_000_000);
+        assert_eq!(r.now(), t0 + 3);
+        machine.stop();
+        machine.step(10_000_000_000);
+        assert_eq!(r.now(), t0 + 3, "a stopped machine keeps its time");
+        machine.start();
+        machine.step(2_000_000_000);
+        assert_eq!(r.now(), t0 + 5);
+    }
+
     #[test]
     fn save_load_round_trip() {
-        let src = MaceRtc::new();
+        let src = MaceRtc::new(Clock::stepped());
         src.poke(0x40, 0xa5);
         src.poke(0xff, 0x5a);
-        *src.clock.lock().unwrap() = (946_684_798, std::time::Instant::now());
+        *src.clock.lock().unwrap() = (946_684_798, src.machine.now());
         src.powered_off.store(true, std::sync::atomic::Ordering::Relaxed);
         let v1 = src.save_state();
 
-        let dst = MaceRtc::new();
+        let dst = MaceRtc::new(Clock::stepped());
         dst.load_state(&v1).expect("load_state");
         assert_eq!(dst.now(), 946_684_798, "the clock resumes from the saved time");
         assert!(dst.powered_off());
