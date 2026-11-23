@@ -116,7 +116,6 @@ impl Rex3 {
     fn invalidate_resident_capture(&self) {
         // A consumer checks availability again while holding this same lock.
         let mut screen = self.head.screen().lock();
-        self.resident_frame.invalidate();
         screen.width = 0;
         screen.height = 0;
     }

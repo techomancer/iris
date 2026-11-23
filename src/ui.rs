@@ -814,7 +814,6 @@ impl Renderer for GlRenderer {
     }
 
     #[cfg(feature = "wgpu")]
-    fn takes_resident_readback_frames(&self) -> bool { true }
 
     // Called from the monitor/CI socket thread — NOT the context-owning refresh
     // thread — so it must not touch GL. Record the request; `present()` applies
@@ -968,7 +967,6 @@ impl Renderer for WgpuRenderer {
         self.board_device
     }
 
-    fn takes_resident_readback_frames(&self) -> bool { true }
 
     fn present_gpu_frame(
         &mut self,
@@ -990,37 +988,6 @@ impl Renderer for WgpuRenderer {
         let sb = bar;
         let r = self.presenter.present(crate::wgpu::Frame::Gpu { buffer: frame, width, height }, ov, sb, crate::disp::FB_STRIDE);
         self.report(r);
-    }
-
-    fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> {
-        Some(self.presenter.gpu())
-    }
-
-    fn present_resident_gpu_frame(
-        &mut self,
-        frame: &wgpu::Buffer,
-        width: u32,
-        height: u32,
-        _screen: &mut Rex3Screen,
-        overlay: &mut DebugOverlay,
-        bar: &[u32],
-    ) -> Result<(), String> {
-        // The debug overlay's pixel inspector expects CPU plane snapshots,
-        // which are intentionally stale in resident mode.
-        if overlay.active() {
-            return Err("resident debug overlays require a raw-plane observation".into());
-        }
-        if let Some((w, h)) = self.window_size.lock().take() {
-            self.presenter.resize(w, h);
-        }
-        *self.display_res.lock() = (width, height);
-        let sb = bar;
-        self.presenter.present(
-            crate::wgpu::Frame::Gpu { buffer: frame, width, height },
-            None,
-            sb,
-            crate::disp::FB_STRIDE,
-        )
     }
 
     #[cfg(test)]

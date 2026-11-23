@@ -54,31 +54,9 @@ pub trait Renderer: Send {
         _bar:     &[u32],
     ) {}
 
-    /// The resident path must verify the presenter's actual device,
-    /// rather than relying on a renderer's claim that it takes GPU frames.
-    #[cfg(feature = "wgpu")]
-    fn resident_gpu_device(&self) -> Option<&Arc<crate::wgpu::Gpu>> { None }
-
-    #[cfg(feature = "wgpu")]
-    #[allow(clippy::too_many_arguments)]
-    fn present_resident_gpu_frame(
-        &mut self,
-        _frame: &wgpu::Buffer,
-        _width: u32,
-        _height: u32,
-        _screen: &mut Rex3Screen,
-        _overlay: &mut crate::debug_overlay::DebugOverlay,
-        _bar: &[u32],
-    ) -> Result<(), String> {
-        Err("renderer does not support resident GPU frames".into())
-    }
-
     #[cfg(all(test, feature = "wgpu"))]
     fn resident_presented_frames(&self) -> Option<u64> { None }
 
     #[cfg(all(test, feature = "wgpu"))]
     fn resident_presented_texture(&self) -> Option<&wgpu::Texture> { None }
-
-    #[cfg(feature = "wgpu")]
-    fn takes_resident_readback_frames(&self) -> bool { false }
 }

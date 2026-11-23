@@ -1,6 +1,11 @@
 # One display refresh thread in the common layer (issue #742)
 
-Status: in progress on branch `display-refresh` (2026-11-14). Phase 1
+Status: in progress on branch `display-refresh` (2026-11-14). 2026-11-22:
+Newport's GPU-authoritative (resident) display is on the common layer too
+(branch `newport-unify`): its own `REX3-Resident-Display` thread,
+`present_resident_gpu_frame` and request tickets are gone; frame and
+screenshot requests are tickets on `HeadHandle` for every board, so a
+request made during a compose waits for the next frame. Phase 1
 (the common layer, `src/display/`, 18 unit tests) is done. Phase 2: GR2,
 IMPACT, VPro and Newport are migrated and checked at the PROM (Indy XZ,
 IP28 High IMPACT, Octane V12, Indy Newport; `--ci`, screenshot through the

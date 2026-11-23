@@ -640,7 +640,7 @@ How each board uses it:
 
 | Board | Producer side (CPU / VDMA) | Consumers |
 |---|---|---|
-| Newport (`src/dev/ng1/`) | REX3 register writes, GO commands, HOSTRW data | CPU raster uses `REX3-Processor` and the shared display refresh; GPU-authoritative raster uses `REX3-Resident-Processor` and a fixed direct-wgpu or readback-compatibility `REX3-Resident-Display` worker |
+| Newport (`src/dev/ng1/`) | REX3 register writes, GO commands, HOSTRW data | CPU raster uses `REX3-Processor` and the shared display refresh; GPU-authoritative raster uses `REX3-Resident-Processor`; its fixed direct-wgpu or readback-compatibility display is composed by the shared display refresh too |
 | GR2 (`src/dev/gr2/`) | HQ2 command FIFO (`hq_fifo`) | `GR2-HQ2` interprets HQ2/GE commands at the GL level and feeds `re3_fifo`; `GR2-RE3` rasterises; the refresh thread scans out |
 | IMPACT (`src/dev/mgras/`) | HQ3 command FIFO and direct raster writes (`hq_fifo`) | `MGRAS-HQ3` runs the command and geometry front end and feeds `rss_fifo`; one RSS thread per raster engine draws (Maximum IMPACT: two, each owning alternate rows, fed by the broadcast FIFO; `IRIS_MGRAS_ENGINES` of 1, 2 or 4 overrides, and a GPU raster unit uses one); the refresh thread scans out |
 | VPro (`src/dev/odyssey/`) | the command FIFO (`fifo.rs`) | `odyssey-work` decodes, transforms and sets primitives up and hands them to the raster queue; `odyssey-raster` and its `odyssey-pool` tile workers rasterise, texture and store; the refresh thread scans out. With `[graphics] raster = "wgpu"` the raster and pool threads do not start: the front end records into batches the host GPU draws (below) |
@@ -1012,10 +1012,19 @@ current. Supported no-op fills advance the stream and REX3 context without
 changing a plane generation. A same-device, read-only binding seam exposes the
 two authoritative planes to direct scanout; display metadata is bound
 separately. The binding is epoch-tagged and does not submit raster work. The
-resident display worker inserts a typed GFIFO frame marker and
-holds the consumer at that cut while it submits the exact resident prefix,
-composes from the resident planes, and queues same-device presentation and
-optional composed-output readback. Later draws cannot overtake the scanout.
+resident display is composed by the shared display refresh thread, through
+the board's `Head`, like every other board's: at the guest's VC2 timing, with
+the same frame and screenshot requests. Its `compose` inserts a typed GFIFO
+frame marker and holds the consumer at that cut while it submits the exact
+resident prefix and composes from the resident planes. It waits a few
+milliseconds for the consumer to reach the cut; if it does not, the head
+answers not ready, the last frame stays up, and the next retrace tries again.
+The direct mode answers `Composed::Gpu` for a presenter on the board's
+device, which presents it without a plane transfer; for a reader, or a
+renderer that composes on the CPU, it reads the composed output back into the
+screen as a finished frame. The compatibility mode copies both observed
+planes into the screen for the renderer's compositor. Later draws cannot
+overtake the scanout.
 Display-state refresh copies VC2, XMAP, palette and cursor state without
 decoding DID or forming CPU plane slices. Changed VC2 state uploads at most
 the 64 KiB VC2 RAM and a 32-byte parameter block; a GPU kernel expands DID
@@ -1031,11 +1040,10 @@ current VC2 state; it does not upload the decoded map. Moving that history
 between devices or back to a CPU renderer is not implemented. A mode-table fence published after the cut defers the frame rather than forcing
 fence progress or presenting stale state. The real common wgpu presenter is
 tested with a winit window and surface on the resident device on both
-backends; it presents the composed buffer without a plane transfer. GL and
-presenters using another
-device are rejected by the direct path. Screenshot, frame request, VNC and
-headless test capture read the composed output only, and publish pixels and
-complete requests only after successful staging. An ignored hardware test
+backends; it presents the composed buffer without a plane transfer. A GL
+presenter gets the read-back frame. Screenshot, frame request, VNC and
+headless test capture read the composed output only, and complete requests
+only after successful staging. An ignored hardware test
 also sends three ordered presentations, including a resize, through the
 common wgpu presenter on a native window using the same device. It compares
 the presenter's unpacked frame texture with the software compositor using an
