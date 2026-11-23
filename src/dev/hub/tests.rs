@@ -665,6 +665,61 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
     assert!(weak_phys.upgrade().is_none(), "the node's decode table is still referenced");
 }
 
+/// NI_PORT_RESET bit 0 stops every processor at the store, as the reset
+/// does on the board: each stops at its next instruction or interrupt check,
+/// and a second store meanwhile is the old machine's.
+#[test]
+fn a_port_reset_stops_every_processor_until_the_machine_is_at_power_on() {
+    use crate::cpu::smp::{ParkSlot, World, HOLD_RESET, HOST_PARK_BIT};
+    let hub = hub(2, 3);
+    let words = [AtomicU64::new(0), AtomicU64::new(0)];
+    let slots: Vec<_> = words.iter().enumerate().map(|(n, w)| Arc::new(ParkSlot::new(n as u8, w))).collect();
+    let world = Arc::new(World::new());
+    world.set_slots(slots.clone());
+    let (tx, rx) = crate::traits::MachineEvents::channel(4);
+    tx.set_cpus(world);
+    rx.listen();
+    hub.set_event_sender(tx.clone());
+    hub.write64(regs::NI_PORT_RESET::OFFSET, 0x81);
+    hub.write64(regs::NI_PORT_RESET::OFFSET, 0x81);
+    for (s, w) in slots.iter().zip(&words) {
+        assert_eq!(s.holds(), HOLD_RESET);
+        assert_ne!(w.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+    }
+    let (first, _) = rx.recv().unwrap();
+    let (second, _) = rx.recv().unwrap();
+    assert!(rx.is_current(first));
+    tx.powered_on();
+    assert!(slots.iter().all(|s| s.holds() == 0), "the reset lets them go");
+    assert!(!rx.is_current(second), "the second store is the old machine's");
+}
+
+/// A reset holds the CPUs only while one can follow: not before the event
+/// thread listens, still when the queue is full of waiting resets, not once
+/// the thread cannot act or has gone.
+#[test]
+fn a_reset_holds_the_processors_only_while_a_reset_can_follow() {
+    use crate::cpu::smp::{ParkSlot, World, HOLD_RESET};
+    let word = AtomicU64::new(0);
+    let slot = Arc::new(ParkSlot::new(0, &word));
+    let world = Arc::new(World::new());
+    world.set_slots(vec![slot.clone()]);
+    let (tx, rx) = crate::traits::MachineEvents::channel(4);
+    tx.set_cpus(world.clone());
+    tx.try_send(MachineEvent::HardReset).unwrap();
+    assert_eq!(slot.holds(), 0, "no thread listens yet");
+    rx.listen();
+    while tx.try_send(MachineEvent::HardReset).is_ok() {}
+    assert_eq!(slot.holds(), HOLD_RESET, "a full queue keeps the hold a waiting reset needs");
+    rx.release_holds();
+    assert_eq!(slot.holds(), 0, "the thread could not reset");
+    while rx.try_recv().is_ok() {}
+    tx.try_send(MachineEvent::HardReset).unwrap();
+    drop(rx);
+    assert!(tx.try_send(MachineEvent::HardReset).is_err());
+    assert_eq!(slot.holds(), 0, "nobody will ever reset");
+}
+
 /// The register window acts on what a 32- or 64-bit store changed.
 #[test]
 fn only_a_wide_register_store_acts_on_what_it_changed() {

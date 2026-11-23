@@ -364,6 +364,26 @@ fn a_modules_config_word_part_and_cache_type_agree() {
     assert!(parts::cpu_module(&parts::R14000_600).is_none());
 }
 
+/// A port reset stops the processor at the store, and the machine reset
+/// releases it and makes the queued request stale, so it runs once.
+#[test]
+fn a_machine_reset_releases_and_ends_a_queued_port_reset() {
+    big_stack(|| {
+        let dir = TempPath::dir("ip27-o200-stale-reset");
+        let mut m = test_support::machine(&config(&dir)).unwrap();
+        let queue = m.events.take().unwrap();
+        queue.listen();
+        assert_eq!(m.nodes[0].chip.write64(hub_regs::NI_PORT_RESET::OFFSET, 0x81), BUS_OK);
+        let (sent, event) = queue.recv().unwrap();
+        assert!(matches!(event, crate::traits::MachineEvent::HardReset) && queue.is_current(sent));
+        let slot = m.node_cpus[0][0].park_slot();
+        assert_eq!(slot.holds(), crate::cpu::smp::HOLD_RESET, "the processor stops at the store");
+        crate::workstation::Workstation::reset(&mut m);
+        assert!(!queue.is_current(sent));
+        assert_eq!(slot.holds(), 0, "the reset lets it go");
+    });
+}
+
 /// The Hub publishes straight into its processor's interrupt word, so the
 /// machine lets go of the word before the processor goes: a cabled Hub, or any
 /// other holder of this one, can still raise an interrupt afterwards.

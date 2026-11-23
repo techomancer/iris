@@ -869,11 +869,12 @@ pub(crate) fn register_system_controller(
     // The event thread goes through the same controller, which stops the
     // machine's threads before it changes machine state.
     if let Some(rx) = events {
+        rx.listen();
         std::thread::Builder::new().name("machine-events".to_string()).spawn(move || {
             while let Some((sent, event)) = rx.recv() {
                 match event {
                     MachineEvent::HardReset => {
-                        let _ = ctrl.with_machine(|machine| {
+                        let done = ctrl.with_machine(|machine| {
                             // A reset or restore since then replaced the machine that asked.
                             if !rx.is_current(sent) {
                                 return Ok(());
@@ -883,6 +884,10 @@ pub(crate) fn register_system_controller(
                             machine.cpu_start();
                             Ok(())
                         });
+                        if let Err(e) = done {
+                            eprintln!("iris: hard reset not done ({e}); the CPUs run on");
+                            rx.release_holds();
+                        }
                     }
                     MachineEvent::PowerOff => {
                         println!("Machine: soft power-off");

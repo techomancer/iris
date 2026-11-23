@@ -225,6 +225,7 @@ pub fn machine(
         b.chip.connect_peer(&a.chip);
     }
     let world = Arc::new(World::new());
+    tx.set_cpus(world.clone());
     for n in &nodes {
         n.chip.decode.set_world(world.clone());
     }
@@ -276,7 +277,7 @@ pub fn machine(
         specs[0].module.part.label(),
     );
     let memory = nodes.iter().map(|n| n.chip.decode.physical().clone() as Arc<dyn Device>).collect();
-    Machine::new(cfg, nodes, Vec::new(), node_cpus, io, memory, timers, rx, |hub| {
+    Machine::new(cfg, nodes, Vec::new(), node_cpus, io, memory, timers, (tx, rx), |hub| {
         // Another Hub can still reach this one's processor.
         hub.pi.clear_cpu_interrupts();
         hub.decode.physical().release_devices();

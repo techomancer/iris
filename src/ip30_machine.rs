@@ -508,6 +508,7 @@ impl OctaneMachine {
         // its far end. Weak, so none of these keeps the bus or the Bridge.
         // The window moves under no running CPU but the one that wrote.
         let world = Arc::new(World::new());
+        events.set_cpus(world.clone());
         let weak = Arc::downgrade(&phys);
         let remap_world = world.clone();
         heart.on_memcfg(Box::new(move |m| {
@@ -2115,12 +2116,15 @@ mod snapshot_tests {
             let mut m = machine(&prom, &dir);
             m.save_snapshot_in(&dir.join("saves"), "s").unwrap();
             let queue = m.event_rx.take().unwrap();
+            queue.listen();
             assert!(m.heart.piu_write(0, 8, 0));
             assert!(m.heart.piu_write(0, 8, 1 << 22));
             let (sent, event) = queue.recv().unwrap();
             assert!(matches!(event, MachineEvent::HardReset) && queue.is_current(sent));
+            assert_ne!(m.cpus[0].park_slot().holds() & crate::cpu::smp::HOLD_RESET, 0, "the CPU stops at the request");
             m.load_snapshot_in(&dir.join("saves"), "s").unwrap();
             assert!(!queue.is_current(sent), "the restore replaced the machine that asked");
+            assert_eq!(m.cpus[0].park_slot().holds() & crate::cpu::smp::HOLD_RESET, 0, "and lets the CPU go");
             m.stop();
         }).unwrap().join().unwrap();
     }
