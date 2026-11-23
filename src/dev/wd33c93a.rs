@@ -2360,27 +2360,18 @@ mod data_out_phase_tests {
     }
 
     /// A channel the driver arms only after the chip has reached its data
-    /// phase, from another thread, the way a driver issues dmago after
-    /// TRANSFER_INFO. It can say when it is armed, as HPC3's channels can.
+    /// phase, the way a driver issues dmago after TRANSFER_INFO. The arming
+    /// lands during the chip's wait, as an HPC3 arming wakes the waiter.
     struct LateDma {
         armed: Mutex<bool>,
-        cv: Condvar,
         feed: Mutex<VecDeque<u8>>,
         taken: Mutex<Vec<u8>>,
         waits: std::sync::atomic::AtomicUsize,
     }
     impl LateDma {
         fn new(feed: &[u8]) -> Arc<Self> {
-            Arc::new(Self { armed: Mutex::new(false), cv: Condvar::new(), feed: Mutex::new(feed.iter().copied().collect()),
+            Arc::new(Self { armed: Mutex::new(false), feed: Mutex::new(feed.iter().copied().collect()),
                 taken: Mutex::new(Vec::new()), waits: Default::default() })
-        }
-        fn arm_after(self: &Arc<Self>, ms: u64) -> thread::JoinHandle<()> {
-            let me = self.clone();
-            thread::spawn(move || {
-                thread::sleep(std::time::Duration::from_millis(ms));
-                *me.armed.lock() = true;
-                me.cv.notify_all();
-            })
         }
     }
     impl DmaClient for LateDma {
@@ -2393,11 +2384,13 @@ mod data_out_phase_tests {
             self.taken.lock().push(val as u8);
             DmaStatus::ok()
         }
+        // The driver arms 1 ms into the chip's wait. Arming here, not from a
+        // timed thread, keeps host scheduling out of the count.
         fn wait_active(&self, timeout: std::time::Duration) -> bool {
             self.waits.fetch_add(1, Ordering::Relaxed);
-            let mut a = self.armed.lock();
-            if !*a { let _ = self.cv.wait_for(&mut a, timeout); }
-            *a
+            if timeout < std::time::Duration::from_millis(1) { return false; }
+            *self.armed.lock() = true;
+            true
         }
     }
 
@@ -2407,9 +2400,7 @@ mod data_out_phase_tests {
     fn data_in_waits_for_a_late_arming_and_is_woken_by_it() {
         let dma = LateDma::new(&[1, 2, 3, 4]);
         let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
-        let arm = dma.arm_after(20);
         let got = dev.state.lock().receive_data_chunked(4, Some(&*dma as &dyn DmaClient));
-        arm.join().unwrap();
         assert_eq!(got, Some(vec![1, 2, 3, 4]));
         assert_eq!(dma.waits.load(Ordering::Relaxed), 1, "the chip polled instead of waiting for the arming");
     }
@@ -2419,9 +2410,7 @@ mod data_out_phase_tests {
     fn data_out_waits_for_a_late_arming_and_is_woken_by_it() {
         let dma = LateDma::new(&[]);
         let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
-        let arm = dma.arm_after(20);
         let done = dev.state.lock().send_data_chunked(vec![5, 6, 7, 8], 0, Some(&*dma as &dyn DmaClient));
-        arm.join().unwrap();
         assert!(done);
         assert_eq!(*dma.taken.lock(), vec![5, 6, 7, 8]);
         assert_eq!(dma.waits.load(Ordering::Relaxed), 1, "the chip polled instead of waiting for the arming");
