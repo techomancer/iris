@@ -30,6 +30,7 @@ impl Fixture {
         let clock = crate::test_board::Stepped::new();
         clock.step(1_000_000);
         let pi = Pi::new(&clock.tm, cpus, 0);
+        pi.start();
         let lines = Arc::new(Lines::default());
         for (slice, word) in lines.0.iter().enumerate() {
             pi.set_cpu_interrupts(slice, word);
@@ -50,20 +51,6 @@ impl Fixture {
     /// Let `ticks` counter ticks pass and run the timers that fell due.
     fn advance(&self, ticks: u64) {
         self.clock.step(ticks * TICK_NS);
-        self.settle();
-    }
-    /// Fire the comparator timers whose deadline has come, as the timer thread would.
-    fn settle(&self) {
-        let now = self.clock.now();
-        for kind in 0..3 {
-            let due = {
-                let s = self.pi.state.lock();
-                [s.due[0], s.due[1], s.prof_due][kind]
-            };
-            if let Some(due) = due.filter(|&d| d <= now) {
-                self.pi.expire(kind, due);
-            }
-        }
     }
     /// Whether slice `slice`'s word carries the soft-reset request.
     fn reset_requested(&self, slice: usize) -> bool {
@@ -345,13 +332,11 @@ fn a_comparator_behind_the_counter_waits_a_whole_revolution() {
 #[test]
 fn a_started_comparator_timer_pends_the_bit_at_the_deadline() {
     let t = Fixture::new(1);
-    t.pi.start();
     t.w(reg::PI_RT_COMPARE_A::OFFSET, t.r(reg::PI_RT_COUNT::OFFSET) + 10);
     t.clock.step(9 * TICK_NS);
-    std::thread::sleep(std::time::Duration::from_millis(20));
     assert_eq!(t.pi.rt_pending[0].load(Ordering::SeqCst), false);
     t.clock.step(TICK_NS);
-    assert!(crate::test_board::until(|| t.pi.rt_pending[0].load(Ordering::SeqCst)));
+    assert!(t.pi.rt_pending[0].load(Ordering::SeqCst));
     t.pi.stop();
 }
 

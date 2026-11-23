@@ -119,6 +119,12 @@ pub struct TimerManager {
     thread_handle: Option<thread::JoinHandle<()>>,
     new_timer_added: Arc<AtomicBool>,
     clock: Clock,
+    /// Every `Timer` built on this manager, for `run_due`.
+    #[cfg(test)]
+    live: Mutex<Vec<Weak<TimerInner>>>,
+    /// Host timers never fire: only `run_due` does, so a test sees one order and no race.
+    #[cfg(test)]
+    pub(crate) manual: AtomicBool,
 }
 
 impl TimerManager {
@@ -160,6 +166,35 @@ impl TimerManager {
             thread_handle: Some(thread_handle),
             new_timer_added,
             clock,
+            #[cfg(test)]
+            live: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            manual: AtomicBool::new(false),
+        }
+    }
+
+    /// Run the callback of every started timer the clock has reached, oldest deadline first and
+    /// on this thread, until none is left: what the host timer does, without waiting for it.
+    #[cfg(test)]
+    pub(crate) fn run_due(&self) {
+        loop {
+            let now = self.clock.now();
+            let mut live = self.live.lock();
+            live.retain(|w| w.strong_count() > 0);
+            let next = live
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter_map(|t| {
+                    let due = {
+                        let st = t.state.lock();
+                        st.due.filter(|d| *d <= now && st.running)?
+                    };
+                    Some((due, t))
+                })
+                .min_by_key(|(due, _)| *due);
+            drop(live);
+            let Some((_, timer)) = next else { return };
+            timer.expire();
         }
     }
 
@@ -304,7 +339,7 @@ impl Timer {
         F: Fn(&S, u64) + Send + Sync + 'static,
     {
         let me = me.clone();
-        Self(Arc::new(TimerInner {
+        let inner = Arc::new(TimerInner {
             tm: Arc::downgrade(tm),
             clock: tm.clock().clone(),
             callback: Box::new(move |due| {
@@ -315,7 +350,10 @@ impl Timer {
             state: parking_lot::Mutex::new(TimerState { due: None, id: None, running: false, firing: false }),
             due_word: AtomicU64::new(crate::clock::encode(None)),
             gate: parking_lot::Mutex::new(()),
-        }))
+        });
+        #[cfg(test)]
+        tm.live.lock().push(Arc::downgrade(&inner));
+        Self(inner)
     }
 
     /// Arm, or re-arm, for absolute machine time `when`.
@@ -386,7 +424,13 @@ impl TimerInner {
         let (Some(due), Some(tm)) = (st.due, self.tm.upgrade()) else { return };
         let delay = Duration::from_nanos(due.saturating_sub(self.clock.now()));
         st.id = Some(tm.add_one_shot(delay, Arc::downgrade(self), move |w: &mut Weak<Self>| {
-            w.upgrade().map_or(TimerReturn::Delete, |t| t.expire())
+            w.upgrade().map_or(TimerReturn::Delete, |t| {
+                #[cfg(test)]
+                if t.tm.upgrade().is_some_and(|tm| tm.manual.load(Ordering::Relaxed)) {
+                    return TimerReturn::Delete;
+                }
+                t.expire()
+            })
         }));
     }
 
@@ -876,10 +920,9 @@ mod timer_tests {
         let (d, clock) = dev();
         d.timer.start();
         d.timer.arm_at(1_000);
-        thread::sleep(Duration::from_millis(20));
         assert!(fired(&d).is_empty(), "the host timer ran ahead of the stepped clock");
         clock.step(1_000);
-        assert!(crate::test_board::until(|| fired(&d) == [1_000]));
+        assert_eq!(fired(&d), [1_000]);
         assert!(!d.timer.is_armed());
     }
 
@@ -890,11 +933,10 @@ mod timer_tests {
         d.timer.arm_at(1_000_000);
         d.timer.arm_at(50);
         clock.step(50);
-        assert!(crate::test_board::until(|| fired(&d) == [50]));
+        assert_eq!(fired(&d), [50]);
         d.timer.arm_at(60);
         d.timer.cancel();
         clock.step(1_000);
-        thread::sleep(Duration::from_millis(20));
         assert_eq!(fired(&d), [50]);
     }
 
@@ -903,18 +945,18 @@ mod timer_tests {
         let (d, clock) = dev();
         d.timer.arm_at(10);
         clock.step(10);
-        thread::sleep(Duration::from_millis(20));
         assert!(fired(&d).is_empty(), "a timer never started stays quiet");
         d.timer.start();
-        assert!(crate::test_board::until(|| fired(&d) == [10]));
+        clock.tm.run_due();
+        assert_eq!(fired(&d), [10]);
         d.timer.arm_at(30);
         d.timer.stop();
         clock.step(100);
-        thread::sleep(Duration::from_millis(20));
         assert_eq!(d.timer.due(), Some(30));
         assert_eq!(fired(&d), [10]);
         d.timer.start();
-        assert!(crate::test_board::until(|| fired(&d) == [10, 30]));
+        clock.tm.run_due();
+        assert_eq!(fired(&d), [10, 30]);
     }
 
     #[test]
@@ -924,7 +966,7 @@ mod timer_tests {
         d.timer.start();
         d.timer.arm_at(5);
         clock.step(100);
-        assert!(crate::test_board::until(|| fired(&d) == [5, 15, 25]));
+        assert_eq!(fired(&d), [5, 15, 25]);
         assert!(!d.timer.is_armed());
     }
 
@@ -950,10 +992,9 @@ mod timer_tests {
         d.timer.arm_at(1_000);
         d.timer.arm_at(5_000);
         clock.step(1_000);
-        thread::sleep(Duration::from_millis(20));
         assert!(fired(&d).is_empty(), "fired at the deadline it moved away from");
         clock.step(4_000);
-        assert!(crate::test_board::until(|| fired(&d) == [5_000]));
+        assert_eq!(fired(&d), [5_000]);
     }
 
     #[test]
@@ -982,7 +1023,6 @@ mod timer_tests {
         assert_eq!(d.timer.due(), Some(7));
         d.timer.set_due(None);
         clock.step(10);
-        thread::sleep(Duration::from_millis(20));
         assert!(fired(&d).is_empty());
         assert_eq!(d.timer.now(), 10);
     }

@@ -54,7 +54,15 @@ pub(crate) struct Stepped {
 impl Stepped {
     pub(crate) fn new() -> Self {
         let clock = Clock::stepped();
-        Self { tm: Arc::new(TimerManager::with_clock(clock.clone())), clock }
+        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+        tm.manual.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self { tm, clock }
+    }
+
+    /// Move the clock on and run every timer it has reached before returning.
+    pub(crate) fn step(&self, ns: u64) {
+        self.clock.step(ns);
+        self.tm.run_due();
     }
 }
 

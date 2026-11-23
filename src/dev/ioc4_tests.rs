@@ -71,7 +71,7 @@ struct Rig {
     mem: Arc<TestMem>,
     wire: [Arc<Wire>; PORTS],
     pin: Arc<LevelProbe>,
-    _tm: Arc<TimerManager>,
+    clock: crate::test_board::Stepped,
 }
 
 impl Rig {
@@ -80,11 +80,11 @@ impl Rig {
     }
 
     fn with(cfg: Ioc4Config) -> Rig {
-        Rig::on(Arc::new(TimerManager::new()), cfg)
+        Rig::on(crate::test_board::Stepped::new(), cfg)
     }
 
-    fn on(tm: Arc<TimerManager>, cfg: Ioc4Config) -> Rig {
-        let c = Ioc4::new(&tm, cfg);
+    fn on(clock: crate::test_board::Stepped, cfg: Ioc4Config) -> Rig {
+        let c = Ioc4::new(&clock.tm, cfg);
         let mem = Arc::new(TestMem(std::sync::Mutex::new(vec![0; MEM_SIZE])));
         c.state().connect_dma(mem.clone());
         let wire: [Arc<Wire>; PORTS] = std::array::from_fn(|_| Arc::new(Wire::default()));
@@ -94,7 +94,7 @@ impl Rig {
         let (pin, line) = LevelProbe::line();
         c.state().connect_irq(line);
         c.attached();
-        Rig { c, mem, wire, pin, _tm: tm }
+        Rig { c, mem, wire, pin, clock }
     }
 
     /// A 32-bit register as the processor sees it through the self-ordered
@@ -160,20 +160,20 @@ impl Rig {
         self.put(ring + 4, &control);
     }
 
-    /// Wait out `ms` of host time, then play the timers.
+    /// Let `ms` of machine time pass, then play the timers.
     fn settle(&self, ms: u64) {
-        std::thread::sleep(Duration::from_millis(ms));
+        self.clock.step(ms * 1_000_000);
         self.c.service();
     }
 
-    /// Play the timers until `done`, a millisecond of host time apart.
+    /// Play the timers until `done`, a millisecond of machine time apart.
     fn until(&self, what: &str, done: impl Fn(&Rig) -> bool) {
         for _ in 0..3000 {
             self.c.service();
             if done(self) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            self.clock.step(1_000_000);
         }
         panic!("timed out waiting for {what}");
     }
@@ -1184,8 +1184,7 @@ fn replacing_the_backend_keeps_the_engine_working() {
 /// register access (PC16550D p. 17, Table IV).
 #[test]
 fn a_uart_receive_timeout_comes_from_a_timer() {
-    let clock = crate::clock::Clock::stepped();
-    let r = Rig::on(Arc::new(TimerManager::with_clock(clock.clone())), Ioc4Config::bare(Ioc4Clock::Mhz33));
+    let r = Rig::on(crate::test_board::Stepped::new(), Ioc4Config::bare(Ioc4Clock::Mhz33));
     r.uw(0, 2, 0xc1);
     r.uw(0, 1, 1);
     r.c.start();
@@ -1194,12 +1193,12 @@ fn a_uart_receive_timeout_comes_from_a_timer() {
     let due = || r.c.sh.st.lock().uart[0].timeout_due();
     assert!(until(&|| due().is_some()), "the receive thread took the character");
     assert_eq!(due(), Some(r.c.sh.st.lock().uart[0].char_time().as_nanos() as u64 * 4));
-    clock.step(due().unwrap() - 1);
+    r.clock.step(due().unwrap() - 1);
     {
         let _idle = r.c.sh.gate.lock();
         assert!(r.c.sh.timers[K_UART].is_armed() && !r.c.sh.st.lock().uart[0].irq());
     }
-    clock.step(1);
+    r.clock.step(1);
     assert!(until(&|| r.c.sh.st.lock().level & int::pass(0) != 0), "the timer raised the pass-through source");
     r.c.stop();
 }
@@ -1298,14 +1297,13 @@ fn a_delay_entry_sets_the_busy_bit() {
 /// A due expiry happens when the timers run, not on a register access.
 #[test]
 fn a_due_receive_timer_expires_when_the_timers_run() {
-    let clock = crate::clock::Clock::stepped();
-    let r = Rig::on(Arc::new(TimerManager::with_clock(clock.clone())), Ioc4Config::bare(Ioc4Clock::Mhz33));
+    let r = Rig::on(crate::test_board::Stepped::new(), Ioc4Config::bare(Ioc4Clock::Mhz33));
     r.pair_base(0, RINGS, 0x1000);
     r.sw(0, sdma_off::CONTROL, ENABLE);
     r.sw(0, sdma_off::RX_TIMER, 2);
     r.sw(0, sdma_off::RX_CONSUME, ARM);
     r.type_in(0, &[0x64]);
-    clock.step(5_000_000);
+    r.clock.step(5_000_000);
     assert_eq!(r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED, 0, "a read does not run it");
     r.c.service();
     assert_eq!(r.r32(reg::SERIAL_PENDING) & TIMER_EXPIRED, TIMER_EXPIRED);
@@ -1319,7 +1317,7 @@ fn the_receive_timer_count_reads_back() {
     r.pair_base(0, RINGS, 0x1000);
     r.sw(0, sdma_off::RX_TIMER, 0xfff);
     assert_eq!(r.sr(0, sdma_off::RX_TIMER) & 0x0fff_0fff, 0x0fff_0fff);
-    std::thread::sleep(Duration::from_millis(2));
+    r.settle(2);
     assert_eq!(r.sr(0, sdma_off::RX_TIMER) & 0x0fff_0fff, 0x0fff_0fff, "idle, it holds");
     r.sw(0, sdma_off::RX_TIMER, 0x140);
     r.sw(0, sdma_off::CONTROL, ENABLE);

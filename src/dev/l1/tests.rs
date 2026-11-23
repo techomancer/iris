@@ -776,6 +776,7 @@ fn the_receive_timeout_runs_on_a_timer_on_the_machine_clock() {
     clock.step(1);
     assert!(!irq.level() && l1.rx_timer.due() == Some(due), "a stopped timer keeps its deadline and does not fire");
     l1.start();
-    assert!(crate::test_board::until(|| irq.level()), "start arms it again");
+    clock.tm.run_due();
+    assert!(irq.level(), "start arms it again");
     l1.stop();
 }

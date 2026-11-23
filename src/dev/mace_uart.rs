@@ -312,7 +312,7 @@ pub(crate) mod tests {
         clock.step(due - 1);
         assert!(!probe.level(), "not before the deadline");
         clock.step(1);
-        assert!(crate::test_board::until(|| probe.level()), "the timer raised the cause");
+        assert!(probe.level(), "the timer raised the cause");
 
         let held = MaceUart::new(&clock.tm);
         let (probe, line) = LevelProbe::line();
@@ -323,7 +323,8 @@ pub(crate) mod tests {
         clock.step(held.timer.due().unwrap() - held.timer.now());
         assert!(!probe.level() && held.timer.due().is_some(), "a stopped timer keeps its deadline and does not fire");
         held.start();
-        assert!(crate::test_board::until(|| probe.level()), "start arms it again");
+        clock.tm.run_due();
+        assert!(probe.level(), "start arms it again");
 
         let (src, dst) = (MaceUart::new(&clock.tm), MaceUart::new(&clock.tm));
         armed(&src);

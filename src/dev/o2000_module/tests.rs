@@ -12,34 +12,6 @@ const INVALID: u8 = 0x7f;
 const SECOND: u64 = 1000;
 const GRANT: u8 = 0xe0;
 
-impl Origin2000Module {
-    /// Expire every timer of the module and its controller due by the test clock, oldest first;
-    /// the module's go before the controller's at the same instant,
-    /// an order production does not promise.
-    fn settle(&self) {
-        loop {
-            let (module, elsc) = (self.shared.due_timer(), self.elsc.due_timer());
-            match (module, elsc) {
-                (None, None) => break,
-                (module, Some((due, kind))) if module.is_none_or(|m| due < m.0) => self.elsc.expire_timer(due, kind),
-                (Some((due, kind)), _) => self.shared.expire(kind, due),
-                (None, Some(_)) => unreachable!(),
-            }
-        }
-    }
-}
-
-impl Shared {
-    fn due_timer(&self) -> Option<(u64, usize)> {
-        let st = self.state.lock();
-        let now = st.clock.now();
-        [(st.message_deadline, K_MESSAGE), (st.pulse_deadline, K_PULSE), (st.service_armed.then_some(st.service_deadline), K_TICK)]
-            .into_iter()
-            .filter_map(|(d, kind)| d.filter(|d| *d <= now).map(|d| (d, kind)))
-            .min()
-    }
-}
-
 struct Rig {
     clock: TestClock,
     module: Arc<Origin2000Module>,
@@ -57,9 +29,8 @@ impl Rig {
         let module = Origin2000Module::new(cfg, nvram, clock.tm());
         let aux = Arc::new(Aux::default());
         module.elsc().set_serial_backend(aux.clone());
-        let timed = module.clone();
-        clock.on_advance(Box::new(move || timed.settle()));
         module.power_on();
+        Device::start(&*module);
         let rig = Self { clock, module, aux };
         rig.init_adapters();
         rig
