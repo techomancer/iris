@@ -891,7 +891,7 @@ if a run from the command line would start, and otherwise exits 1 with one
 `Configuration error:` line per problem on stderr; a missing disk image is one,
 because a command-line run stops on it, and so is a missing `prom` file you named.
 A `Warning:` line is for something a run carries on past, such as a Tezro's audio
-card with `no_audio` set. Other options (`--scsi1`, `--cpu` and so on) apply first,
+card with `no_audio` set. Other options (`--device`, `--cpu` and so on) apply first,
 as they do in a run.
 
 It checks that the file parses and has no unknown keys; that the settings agree
@@ -991,7 +991,7 @@ Automation and debugging
 
 ```bash
 # Use a different PROM and disk image
-iris --prom prom_new.bin --scsi1 irix65.raw
+iris --prom prom_new.bin --device hdd@scsi0/t1,path=irix65.raw
 
 # Boot with 256 MB RAM (two 128 MB banks)
 iris --bank0 128 --bank1 128
@@ -999,8 +999,8 @@ iris --bank0 128 --bank1 128
 # An R5000 Indy
 iris --cpu r5000
 
-# Boot with a CD-ROM changer (three discs, cycle with "scsi eject 4")
-iris --cdrom4 irix65.iso --cdrom4-extra extras.iso --cdrom4-extra patches.iso
+# Boot from a CD-ROM (a changer's extra discs go in the config file's `discs`)
+iris --device cdrom@scsi0/t4,path=irix65.iso
 
 # Point to a config file in another directory
 iris --config /opt/iris/my_machine.toml

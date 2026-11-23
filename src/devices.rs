@@ -119,6 +119,31 @@ impl ConfiguredDevice {
         keys.extend(self.device.options());
         keys
     }
+
+    /// `--device [NAME:]TYPE[@SLOT][,KEY=VALUE]...`. A value is read as TOML
+    /// when it parses as such, else as a string, so `path=a.img` needs no quotes.
+    pub fn from_arg(arg: &str) -> Result<ConfiguredDevice, String> {
+        let mut parts = arg.split(',');
+        let head = parts.next().unwrap_or_default();
+        let (name, rest) = match head.split_once(':') {
+            Some((n, r)) => (Some(n), r),
+            None => (None, head),
+        };
+        let (ty, at) = match rest.split_once('@') {
+            Some((t, a)) => (t, Some(a)),
+            None => (rest, None),
+        };
+        let mut t = toml::Table::new();
+        t.insert("type".into(), ty.into());
+        name.map(|n| t.insert("name".into(), n.into()));
+        at.map(|a| t.insert("at".into(), a.into()));
+        for kv in parts {
+            let (k, v) = kv.split_once('=').ok_or_else(|| format!("--device {arg}: `{kv}` is not KEY=VALUE"))?;
+            let value = toml::from_str::<toml::Table>(&format!("v = {v}")).ok().and_then(|mut t| t.remove("v"));
+            t.insert(k.into(), value.unwrap_or_else(|| v.into()));
+        }
+        ConfiguredDevice::from_table(t).map_err(|e| format!("--device {arg}: {e}"))
+    }
 }
 
 impl Serialize for ConfiguredDevice {
@@ -170,5 +195,15 @@ mod tests {
         assert!(entry("type = \"hdd\"\ncontroller = 1").unwrap_err().contains("no key controller"));
         assert!(entry("type = \"floppy\"").unwrap_err().contains("types: hdd, cdrom, daynaport"));
         assert!(entry("at = \"scsi0/t1\"").unwrap_err().contains("needs a type"));
+    }
+
+    #[test]
+    fn device_arg_takes_a_name_a_slot_and_options() {
+        let e = ConfiguredDevice::from_arg("boot:hdd@scsi0/t2,path=root.img,write_cache=false").unwrap();
+        assert_eq!((e.name.as_deref(), e.at.as_deref()), (Some("boot"), Some("scsi0/t2")));
+        let d = e.device.scsi().unwrap();
+        assert_eq!((d.path.as_str(), d.write_cache), ("root.img", false));
+        assert!(ConfiguredDevice::from_arg("cdrom").unwrap().at.is_none());
+        assert!(ConfiguredDevice::from_arg("hdd@scsi0/t1,path").unwrap_err().contains("not KEY=VALUE"));
     }
 }

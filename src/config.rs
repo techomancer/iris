@@ -4356,6 +4356,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub no_write_cache: bool,
 
+    /// Place a device: `[NAME:]TYPE[@SLOT][,KEY=VALUE]...`, as a
+    /// `[[devices]]` entry. A named one replaces the file's device of that name
+    #[arg(long = "device", value_name = "SPEC")]
+    pub device: Vec<String>,
+
     /// Additional ISO images for CD-ROM ID 4 (can be specified multiple times)
     #[arg(long = "cdrom4-extra", value_name = "ISO")]
     pub cdrom4_extra: Vec<String>,
@@ -4626,6 +4631,18 @@ impl Cli {
                 legacy::shorthand(&mut cfg, id, p.clone(), cdrom, discs.clone());
             }
         }
+        for arg in &self.device {
+            let e = ConfiguredDevice::from_arg(arg).unwrap_or_else(|e| {
+                eprintln!("iris: {e}");
+                std::process::exit(1);
+            });
+            // A named device replaces the file's device of that name.
+            match cfg.devices.iter().position(|d| d.name.is_some() && d.name == e.name) {
+                Some(i) => cfg.devices[i] = e,
+                None => cfg.devices.push(e),
+            }
+        }
+
         if self.no_write_cache {
             for dev in cfg.devices.iter_mut().filter_map(|d| d.device.scsi_mut()).filter(|d| d.kind() == ScsiKind::Disk) {
                 dev.write_cache = false;
@@ -5101,6 +5118,16 @@ mod export_tests {
         let back: MachineConfig = toml::from_str(&s).expect("deserialize");
         assert!(back.disk(1).unwrap().write_cache && !back.disk(2).unwrap().write_cache, "survives export:\n{s}");
         assert!(MachineConfig::from_toml_str("[scsi.1]\nwrite_cache = \"fast\"\n").is_err());
+    }
+
+    /// `--device` adds a device, or replaces the file's device of its name.
+    #[test]
+    fn a_named_command_line_device_replaces_the_files() {
+        use clap::Parser;
+        let file = MachineConfig::from_toml_str("[[devices]]\ntype = \"hdd\"\nname = \"boot\"\nat = \"scsi0/t1\"\npath = \"a.raw\"\n").unwrap();
+        let cfg = Cli::parse_from(["iris", "--device", "boot:hdd@scsi0/t2,path=b.raw", "--device", "cdrom@scsi0/t4"]).apply(file);
+        let got: Vec<_> = cfg.devices.iter().filter_map(|d| Some((d.at.clone()?, d.device.scsi()?.path.clone()))).collect();
+        assert_eq!(got, [("scsi0/t2".to_string(), "b.raw".to_string()), ("scsi0/t4".to_string(), String::new())]);
     }
 
     /// `--no-write-cache` turns the cache off for every disk, whatever the file says.
