@@ -4361,6 +4361,10 @@ pub struct Cli {
     #[arg(long = "device", value_name = "SPEC")]
     pub device: Vec<String>,
 
+    /// Print every slot on the machine, what is in it and what it takes, then exit
+    #[arg(long = "list-slots", default_value_t = false)]
+    pub list_slots: bool,
+
     /// Additional ISO images for CD-ROM ID 4 (can be specified multiple times)
     #[arg(long = "cdrom4-extra", value_name = "ISO")]
     pub cdrom4_extra: Vec<String>,
@@ -4780,6 +4784,10 @@ pub fn load_config() -> (MachineConfig, u32) {
     if let Err(e) = cfg.resolve_slots() {
         eprintln!("Configuration error: {e}");
         std::process::exit(1);
+    }
+    if cli.list_slots {
+        print!("{}", DevicePlacement::new(&cfg).expect("resolve_slots checked every slot").list_slots());
+        std::process::exit(0);
     }
     let scale = cfg.scale;
     if let Err(e) = cfg.validate() {

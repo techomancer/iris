@@ -78,6 +78,14 @@ impl DeviceModel {
         }
     }
 
+    /// What `--list-slots` says is there.
+    pub fn summary(&self) -> String {
+        match self {
+            DeviceModel::Scsi(d) if d.path.is_empty() => self.spec().name.to_string(),
+            DeviceModel::Scsi(d) => format!("{} {}", self.spec().name, d.path),
+        }
+    }
+
     fn options(&self) -> toml::Table {
         let keys = self.spec().keys;
         let (now, default) = match self {
