@@ -2844,7 +2844,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             page.call_count.load(Ordering::Relaxed));
                         #[cfg(not(feature = "developer"))]
                         let dev_cols = String::new();
-                        writeln!(writer, "  func={:#014x}{}", func as usize, dev_cols).unwrap();
+                        writeln!(writer, "  func={:#014x}{}", if page.has_code() { func as usize } else { 0 }, dev_cols).unwrap();
                         // One row per offset that's flagged in ANY of the
                         // three bitmaps (requested/compiled/denylisted) —
                         // R/C/D shown together so a state that shouldn't

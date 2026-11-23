@@ -258,7 +258,7 @@ fn prepare_multi_entry_compile(
             // Publish no code for this generation and deny every offset, so
             // arrivals interpret the page without asking again until the
             // release moves the generation (`step_jit`'s denylist gate).
-            if page.publish(&[0; crate::cpu::jitv2::BITMAP_WORDS], std::ptr::null(), gen, 0, 0, req.compiled_for_fr1) {
+            if page.publish(&[0; crate::cpu::jitv2::BITMAP_WORDS], crate::cpu::jitv2::NO_CODE as *const (), gen, 0, 0, req.compiled_for_fr1) {
                 page.denylist_all();
             }
             page.mark_prepare_bounced();
