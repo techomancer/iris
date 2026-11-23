@@ -522,6 +522,7 @@ impl Gpu {
 
     /// Block until `submission` has finished (or everything, with None).
     pub fn wait(&self, submission: Option<wgpu::SubmissionIndex>) -> Result<(), String> {
+        crate::pf_scope!(crate::perfetto::events::WGPU_WAIT);
         let waited = self.device.poll(wgpu::PollType::Wait { submission_index: submission, timeout: Some(Duration::from_secs(30)) });
         // wgpu cannot wait for a submission it refused (a pipeline that
         // failed to build, a lost device); the error that refused it is

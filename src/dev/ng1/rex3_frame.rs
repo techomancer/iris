@@ -184,6 +184,7 @@ impl Rex3 {
     }
 
     fn resident_frame_cut(&self, timeout: Duration) -> Result<FrameCut<'_>, ResidentError> {
+        crate::pf_scope!(crate::perfetto::events::REX3_GPU_FRAME_CUT);
         let started = Instant::now();
         let control = &self.resident_frame;
         let deadline = Instant::now() + timeout;
@@ -524,7 +525,10 @@ impl ResidentDirectDisplay {
             return Err(ResidentError::InvalidState("resident frame marker stream cut changed"));
         }
         raster.submit_for(FlushReason::FrameCut)?;
-        let frame = self.scanout.compose(&screen.display_state(), raster)?;
+        let frame = {
+            crate::pf_scope!(crate::perfetto::events::REX3_GPU_SCANOUT);
+            self.scanout.compose(&screen.display_state(), raster)?
+        };
         if frame.position != cut.position {
             return Err(ResidentError::InvalidState("resident scanout used the wrong stream cut"));
         }

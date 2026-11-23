@@ -25,6 +25,8 @@ struct RexStateSlot {
 @group(2) @binding(0) var<storage, read_write> rgb: array<u32>;
 @group(2) @binding(1) var<storage, read_write> aux: array<u32>;
 @group(2) @binding(2) var<storage, read> payload: array<u32>;
+// A copy's source plane from before the copy (REX_FLAG_COPY_SNAPSHOT).
+@group(2) @binding(3) var<storage, read> copy_source: array<u32>;
 
 var<private> address: u32;
 var<private> rgb_value: u32;
@@ -1589,6 +1591,89 @@ fn copy_fill(state: RexStateSlot, command: RexCommand) {
     }
 }
 
+// One lane of a parallel copy fill: the destination pixel (px, py) the lane
+// holds. Its walker position is the pixel moved back by XYMOVE; the lane
+// writes when the walk visits that position and does not skip it, with the
+// result the walk would give there (copy_fill and copy_pixel). The source
+// is read in place, or from the snapshot when it overlaps the destination
+// (copy_mode on the CPU guarantees the walk would read it unwritten).
+fn copy_fill_lane(state: RexStateSlot, command: RexCommand, px: i32, py: i32) {
+    let walker = copy_walker_position(state, px, py);
+    let back = copy_physical(state, walker, true);
+    if back.x != px || back.y != py {
+        return;
+    }
+    let mode = state.words[REX_STATE_DRAW_MODE0];
+    let octant = (state.words[34] >> 24u) & 7u;
+    let block = command.kind == REX_COMMAND_COPY_BLOCK;
+    let x_step = select(1, -1, block && (octant & REX_OCTANT_XDEC) != 0u);
+    var y_step = select(1, -1, block && (octant & REX_OCTANT_YDEC) != 0u);
+    if block && ((mode >> 23u) & 1u) != 0u {
+        y_step *= 2;
+    }
+    let y_stride = abs(y_step);
+    let rows = u32(abs(command.src_y1 - command.src_y0)) / u32(y_stride) + 1u;
+    let dy = (walker.y - command.src_y0) * sign(y_step);
+    if dy < 0 || dy % y_stride != 0 {
+        return;
+    }
+    let row = u32(dy / y_stride);
+    if row >= rows {
+        return;
+    }
+    let row_start = select(command.src_x0, bitcast<i32>(command.data[0]), row > 0u);
+    let width = select(command.data[1], command.data[2], row > 0u);
+    let dx = (walker.x - row_start) * x_step;
+    if dx < 0 || u32(dx) >= width {
+        return;
+    }
+    let column = u32(dx);
+    let row_complete = row > 0u
+        || (command.flags & REX_FLAG_FILL_FIRST_ROW_COMPLETE) != 0u;
+    let skip_first = ((mode >> 10u) & 1u) != 0u;
+    let skip_last = ((mode >> 11u) & 1u) != 0u;
+    let lr_skip = block
+        && ((mode >> 19u) & 1u) != 0u
+        && (octant & REX_OCTANT_XDEC) != 0u;
+    let last = column + 1u == width && row_complete;
+    let suppressed = select(
+        (column == 0u && skip_first) || (last && skip_last),
+        skip_first || (last && skip_last) || lr_skip,
+        block,
+    );
+    if suppressed || !in_bounds || !clip_allows(state, px, py) {
+        return;
+    }
+    let cid_mask = (state.words[REX_STATE_CLIP_MODE] >> 9u) & 0xfu;
+    if cid_mask != 0xfu && (cid_mask & (1u << (aux_value & 3u))) == 0u {
+        return;
+    }
+    let source = copy_physical(state, walker, false);
+    var source_word = 0u;
+    if source.x >= 0 && source.y >= 0
+        && u32(source.x) < WRITE_WIDTH
+        && u32(source.y) < PLANE_HEIGHT {
+        let source_address = u32(source.y) * PLANE_STRIDE + u32(source.x);
+        let rgb_source = plane(state) == REX_PLANES_RGB || plane(state) == REX_PLANES_RGBA;
+        if (command.flags & REX_FLAG_COPY_SNAPSHOT) != 0u {
+            source_word = copy_source[source_address];
+        } else {
+            source_word = select(aux[source_address], rgb[source_address], rgb_source);
+        }
+    }
+    let mask = state.words[REX_STATE_WRITE_MASK];
+    if (command.flags & REX_FLAG_WRITE_RGB) != 0u {
+        let result = copy_pixel_result(state, source_word, rgb_value, walker);
+        rgb_value = (rgb_value & ~mask) | (result & mask);
+        rgb_written = true;
+    }
+    if (command.flags & REX_FLAG_WRITE_AUX) != 0u {
+        let result = copy_pixel_result(state, source_word, aux_value, walker);
+        aux_value = (aux_value & ~mask) | (result & mask);
+        aux_written = true;
+    }
+}
+
 fn copy_line(state: RexStateSlot, command: RexCommand) {
     let y_major = (command.flags & REX_FLAG_LINE_Y_MAJOR) != 0u;
     let decreasing = (command.flags & REX_FLAG_LINE_MAJOR_DECREASING) != 0u;
@@ -1647,6 +1732,10 @@ fn arch_prim(p: u32, px: i32, py: i32, lane: u32) {
     let copy_line_command = command.kind == REX_COMMAND_COPY_I_LINE
         || command.kind == REX_COMMAND_COPY_F_LINE
         || command.kind == REX_COMMAND_COPY_A_LINE;
+    if copy_fill_command && (command.flags & REX_FLAG_COPY_PARALLEL) != 0u {
+        copy_fill_lane(states[command.state_slot], command, px, py);
+        return;
+    }
     if copy_fill_command || copy_line_command {
         if lane == 0u {
             let state = states[command.state_slot];

@@ -447,6 +447,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 
 | Note | Kind | Title |
 |---|---|---|
+| [a-by-value-rex3context-costs-every-caller-a-megabyte-frame.md](perf/a-by-value-rex3context-costs-every-caller-a-megabyte-frame.md) | rule | Copying `Rex3Context` (1 MiB HostRW inline) by value gave every inlining caller a 1 MiB stack-probed frame: a third of the GPU raster thread per GO; keep such copies `#[inline(never)]`, with an objdump check |
 | [decode-cache-conflicts-vary-by-boot.md](perf/decode-cache-conflicts-vary-by-boot.md) | measure | The shadow cache's 64-page decode cache conflicts differently on every boot: up to 25% interpreter variance per boot, gone with 256 pages; compare builds over several boots |
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
 | [guest-compiler-changes-the-benchmark.md](perf/guest-compiler-changes-the-benchmark.md) | measure | The guest compiler is part of the benchmark: GCC 14.2 against 16.2.1 changes Dhrystone and rotate90 by 37% in guest instructions, and the pin that fixes it |

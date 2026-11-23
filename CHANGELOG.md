@@ -29,6 +29,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   iris listens on), and `watch <command>` to keep any command's answer
   updating on one line.
 
+### Newport on the GPU raster
+
+- Scrolling and other large screen-to-screen copies no longer stall the
+  display for a tenth of a second or more each (seconds in full-screen
+  demos) with `raster = "wgpu"` on Indy and Indigo2. Drawing-heavy demos
+  also wait far less for the board.
+- A resolution change with the wgpu renderer no longer stops the window
+  presenting ("Failed to wait for GPU to come idle").
+
 ### Newport colour-index shading
 
 - With the REX3 JIT (always on in iris-gui), smooth-shaded colour-index

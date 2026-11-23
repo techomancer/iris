@@ -192,7 +192,7 @@ impl Coverage {
         Self { x0: x, y0: y, x1: x, y1: y }
     }
 
-    fn area(self) -> u64 {
+    pub(crate) fn area(self) -> u64 {
         u64::from(self.x1 - self.x0 + 1) * u64::from(self.y1 - self.y0 + 1)
     }
 
