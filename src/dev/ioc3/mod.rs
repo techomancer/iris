@@ -991,7 +991,7 @@ impl Ioc3 {
         assert_eq!(byte_bus.part(), cells.byte_bus, "{}: the byte bus has {:?}", board.name, cells.byte_bus);
         let core = Arc::new(Core::new());
         let sio = (cells.serial || cells.parallel)
-            .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel)));
+            .then(|| Arc::new(SuperIo::new(core.clone(), [cells.serial; 2], cells.parallel, tm.clock())));
         let serial = if cells.serial {
             Serial::pair(core.clone(), sio.clone().expect("a serial port has a Super I/O"), tm.clock().clone()).map(Some)
         } else {

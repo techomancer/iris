@@ -20,6 +20,7 @@
 //! Ported from hw/misc/sgi-ioc3.c and its serial and parallel siblings in
 //! jamesbraid/qemu-sgi-origami.
 
+use crate::clock::Clock;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -56,8 +57,8 @@ pub(super) struct Uart {
 }
 
 impl Uart {
-    fn new() -> Uart {
-        Uart { core: Ns16550::new(115200), predivider: 0, mcr_afe: 0, lsr_test: 0, msr_test: 0 }
+    fn new(clock: &Clock) -> Uart {
+        Uart { core: Ns16550::new(115200, clock.clone()), predivider: 0, mcr_afe: 0, lsr_test: 0, msr_test: 0 }
     }
 
     fn reset(&mut self) {
@@ -284,8 +285,8 @@ pub(super) struct SuperIo {
 }
 
 impl SuperIo {
-    pub(super) fn new(core: Arc<Core>, uarts: [bool; 2], parallel: bool) -> SuperIo {
-        SuperIo { core, uarts, parallel, st: Mutex::new(Sio { uart: [Uart::new(), Uart::new()], ecp: Ecp::default() }) }
+    pub(super) fn new(core: Arc<Core>, uarts: [bool; 2], parallel: bool, clock: &Clock) -> SuperIo {
+        SuperIo { core, uarts, parallel, st: Mutex::new(Sio { uart: [Uart::new(clock), Uart::new(clock)], ecp: Ecp::default() }) }
     }
 
     pub(super) fn has_uart(&self, p: usize) -> bool {

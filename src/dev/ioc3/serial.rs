@@ -169,7 +169,6 @@ pub(super) struct Serial {
 impl Serial {
     /// Both ports of a chip, over one engine.
     pub(super) fn pair(core: Arc<Core>, sio: Arc<SuperIo>, clock: Clock) -> [Serial; 2] {
-        sio.lock().uart.iter_mut().for_each(|u| u.core.set_clock(clock.clone()));
         let e = Arc::new(Engine {
             core,
             sio,

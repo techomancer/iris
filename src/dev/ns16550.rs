@@ -196,7 +196,7 @@ pub struct Ns16550 {
 impl Ns16550 {
     /// A port in its reset state. `baudbase` is the reference clock over 16
     /// (115200 for a 1.8432 MHz crystal): the divisor divides it.
-    pub fn new(baudbase: u32) -> Self {
+    pub fn new(baudbase: u32, clock: Clock) -> Self {
         let mut s = Self {
             backend: null_serial_backend(),
             baudbase,
@@ -214,7 +214,7 @@ impl Ns16550 {
             recv_fifo_itl: 1,
             thr_ipending: false,
             timeout_ipending: false,
-            clock: Clock::new(),
+            clock,
             timeout_at: None,
             char_transmit_time: RESET_CHAR_TIME,
             typed: VecDeque::new(),
@@ -250,11 +250,6 @@ impl Ns16550 {
 
     pub fn set_backend(&mut self, backend: Arc<dyn SerialBackend>) {
         self.backend = backend;
-    }
-
-    /// The machine clock the receive timeout runs on.
-    pub fn set_clock(&mut self, clock: Clock) {
-        self.clock = clock;
     }
 
     /// Change the reference clock the divisor divides (the IOC3 derives it
@@ -801,8 +796,7 @@ mod tests {
 
     fn uart() -> (Ns16550, Arc<Wire>) {
         let w = Arc::new(Wire::default());
-        let mut u = Ns16550::new(115200);
-        u.set_clock(Clock::stepped());
+        let mut u = Ns16550::new(115200, Clock::stepped());
         u.set_backend(w.clone());
         (u, w)
     }

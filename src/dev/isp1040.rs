@@ -319,7 +319,7 @@ struct Selection {
     /// The request ring consumer position of its entry.
     cons: u32,
     /// When the adapter's clock says the selection times out.
-    due: i64,
+    due: u64,
     /// The completion to post then.
     done: Pending,
     /// The bus it is selecting on: a bus reset retires only that bus's.
@@ -489,7 +489,7 @@ pub struct State {
     pending: VecDeque<Pending>,
     /// Per bus, when the adapter's clock ends the hold-off a bus reset
     /// started. None: no hold.
-    quiet_until: [Option<i64>; BUSES],
+    quiet_until: [Option<u64>; BUSES],
     /// Commands waiting out a hold-off, oldest first.
     parked: VecDeque<Parked>,
     park_seq: u64,
@@ -872,7 +872,7 @@ impl<P: IspPart> Core<P> {
     /// to come, to wake the ring thread when it does. Read under the state lock.
     fn arm(&self, st: &State) {
         let now = self.now_ns();
-        let ahead = |due: Option<i64>| due.filter(|&d| d > now).map(|d| d as u64);
+        let ahead = |due: Option<u64>| due.filter(|&d| d > now);
         let sel = st.ctl.selecting.as_ref().map(|sel| sel.due);
         let hold = st.quiet_until.map(ahead);
         for (t, due) in self.timers.iter().zip([ahead(sel), hold[0], hold[1]]) {
@@ -894,12 +894,12 @@ impl<P: IspPart> Core<P> {
     /// `start` is when the chip begins selecting: now, or for a command that
     /// waited out a hold-off, the moment the hold ended, so the wait is the
     /// hold plus the timeout however late the thread got to it.
-    fn select_absent(&self, st: &mut Locked<'_>, ring: &Ring, cons: u32, start: i64, bus: u8, done: Pending) -> bool {
+    fn select_absent(&self, st: &mut Locked<'_>, ring: &Ring, cons: u32, start: u64, bus: u8, done: Pending) -> bool {
         if !matches!(&st.ctl.selecting, Some(sel) if sel.cons == cons && !sel.orphan) {
             // A programmed zero is no wait: a model choice, the datasheet
             // being silent on zero.
             let wait = SELECTION_TIMEOUT_UNIT * u32::from(st.selection_timeout);
-            let due = start.saturating_add(wait.as_nanos() as i64);
+            let due = start.saturating_add(wait.as_nanos() as u64);
             st.ctl.selecting = Some(Selection { cons, due, done, bus, orphan: false });
         }
         // Whoever waits for the ring to settle may now see it waiting on a
@@ -1289,7 +1289,7 @@ impl<P: IspPart> Core<P> {
                     }
                     self.targets_reset[bus].store(true, Ordering::Release);
                     let delay = BUS_RESET_DELAY_UNIT * u32::from(st.mailbox[1]);
-                    st.quiet_until[bus] = (!delay.is_zero()).then(|| now.saturating_add(delay.as_nanos() as i64));
+                    st.quiet_until[bus] = (!delay.is_zero()).then(|| now.saturating_add(delay.as_nanos() as u64));
                     self.arm(st);
                     self.kick(st);
                 }
@@ -1867,7 +1867,7 @@ impl<P: IspPart> Core<P> {
         mut st: Locked<'a>,
         ring: &Ring,
         prepared: Prepared,
-        start: i64,
+        start: u64,
     ) -> (Locked<'a>, Outcome) {
         let done = match prepared {
             Prepared::Refused => {
@@ -2199,7 +2199,7 @@ impl<P: IspPart> Isp<P> {
         let holds = st.quiet_until.iter().enumerate().filter_map(|(bus, at)| {
             let mut m = toml::map::Map::new();
             m.insert("bus".into(), toml::Value::Integer(bus as i64));
-            m.insert("at_ns".into(), toml::Value::Integer((*at)?));
+            m.insert("at_ns".into(), toml::Value::Integer((*at)? as i64));
             Some(toml::Value::Table(m))
         });
         t.insert("bus_hold".into(), toml::Value::Array(holds.collect()));
@@ -2217,7 +2217,7 @@ impl<P: IspPart> Isp<P> {
         // ends in.
         if let Some(sel) = &st.ctl.selecting {
             let mut m = toml::map::Map::new();
-            m.insert("at_ns".into(), toml::Value::Integer(sel.due));
+            m.insert("at_ns".into(), toml::Value::Integer(sel.due as i64));
             m.insert("cons".into(), toml::Value::Integer(i64::from(sel.cons)));
             m.insert("orphan".into(), toml::Value::Boolean(sel.orphan));
             m.insert("bus".into(), toml::Value::Integer(i64::from(sel.bus)));
@@ -2236,7 +2236,7 @@ impl<P: IspPart> Isp<P> {
 
     /// Unprocessed request entries survive: the ring thread is kicked and
     /// runs them after the load.
-    fn load_locked(&self, st: &mut State, v: &toml::Value, now: i64) -> Result<(), String> {
+    fn load_locked(&self, st: &mut State, v: &toml::Value, now: u64) -> Result<(), String> {
         {
             let ctl = std::mem::take(&mut st.ctl);
             *st = State::new();
@@ -2305,7 +2305,7 @@ impl<P: IspPart> Isp<P> {
             };
             if let Some(toml::Value::Array(a)) = get_field(v, "bus_hold") {
                 for h in a {
-                    let at = int(h, "at_ns").ok_or("bus_hold: missing at_ns")?;
+                    let at = int(h, "at_ns").ok_or("bus_hold: missing at_ns")?.max(0) as u64;
                     if let Some(slot) = int(h, "bus").and_then(|b| usize::try_from(b).ok()).and_then(|b| st.quiet_until.get_mut(b)) {
                         // One that ended while stopped counts from the load.
                         *slot = Some(at.max(now));
@@ -2332,7 +2332,7 @@ impl<P: IspPart> Isp<P> {
                 let Some(toml::Value::Integer(at)) = get_field(sel, "at_ns") else {
                     return Err("selecting: missing at_ns".into());
                 };
-                let at = *at;
+                let at = (*at).max(0) as u64;
                 let cons = match get_field(sel, "cons") {
                     Some(toml::Value::Integer(n)) => *n as u32,
                     _ => 0,

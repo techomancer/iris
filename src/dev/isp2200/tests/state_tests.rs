@@ -31,7 +31,7 @@ fn save_and_load_round_trip() {
     assert_eq!(loaded.rd(mb(0)), mbox::COMPLETE);
     assert_eq!(loaded.rd(reg::SEMAPHORE), SEM_LOCK);
     loaded.ack();
-    loaded.step(BRINGUP_NS_FOR_TEST);
+    loaded.step(super::loop_tests::BRINGUP_NS);
     loaded.expect_events(&[event::LIP_OCCURRED, event::LOOP_UP, event::PORT_DB_CHANGED]);
     loaded.tur(0x52);
 }
@@ -47,8 +47,6 @@ fn a_bringup_without_its_deadline_is_refused() {
     let loaded = Rig::with_disks("save-old-loaded", &[5]);
     assert!(Saveable::load_state(&loaded.isp, &saved).is_err());
 }
-
-const BRINGUP_NS_FOR_TEST: i64 = BRINGUP.as_nanos() as i64;
 
 /// The controller took its own state from the snapshot, so the line is
 /// written again after a load, whatever level it was at.

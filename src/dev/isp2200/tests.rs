@@ -28,10 +28,10 @@ use std::cell::Cell;
 
 /// Set the clock to `ns` and bring the loop up from this thread, so a test can
 /// hold a command on a device and still see it come up.
-pub(crate) fn set_test_clock(isp: &Isp2200, ns: i64) {
+pub(crate) fn set_test_clock(isp: &Isp2200, ns: u64) {
     let mut st = isp.lock();
     crate::dev::isp1040::tests::step_ring_to(&isp.ring, ns);
-    if isp.bringup_left(&st).is_some_and(|left| left <= 0) {
+    if isp.bringup_left(&st) == Some(0) {
         st.bringup_done();
         isp.post_waiting(&mut st);
     }
@@ -64,7 +64,7 @@ pub(crate) struct Rig {
     rq_next: Cell<u16>,
     rs_next: Cell<u16>,
     /// The adapter's clock, which only the test moves.
-    now: Cell<i64>,
+    now: Cell<u64>,
     /// The ring thread is blocked on a device the test holds: writes do not
     /// wait for it to settle.
     busy: Cell<bool>,
