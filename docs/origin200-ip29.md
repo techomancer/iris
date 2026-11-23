@@ -14,7 +14,7 @@ The sample selects `machine.profile = "origin200_ip29"`.
 
 - `machine.cpu` is `r10000_180` (180 MHz, 1 MiB secondary cache, the default
   module; `r10000` names it) or `r12000_270` (270 MHz, 4 MiB; `r12000` names
-  it). One processor is built. The R10000 module runs on the Octane
+  it). `machine.cpus` builds one or two. The R10000 module runs on the Octane
   R10000's cache type (1 MiB, 128-byte lines); the R12000 module has a 4 MiB
   type of its own, the module's size. Both use the Octane part's line size,
   not the module's. Only the 180 MHz
@@ -45,7 +45,7 @@ an existing log unless `serial_log_overwrite` is set.
 
 ## Limits
 
-- One node and one processor. A second module and the GIGAchannel cabinet
+- One node, with one or two processors. A second module and the GIGAchannel cabinet
   are not built. The [Origin 2000](origin2000-ip27.md) and
   [Onyx2](onyx2-ip27.md) desksides are separate profiles.
 - Cached accesses use node-relative addresses, which is right for the node

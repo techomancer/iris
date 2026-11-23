@@ -20,7 +20,7 @@ built in. The sample selects
 - `[machine] io_prom` names the I/O PROM image (`io6prom.img`, beside the
   node PROM on the IRIX 6.5.30 media) to load in the BaseIO's boot flash;
   without it the PROM built into iris is loaded.
-- `machine.cpu` is `r10000` or `r12000`. Each node has one processor.
+- `machine.cpu` is `r10000` or `r12000`. `[machine] cpus` gives each node one or two.
 - `[machine] flash` and `controller_store` keep the boot flash (the second
   node's at the same name with `.1` added) and the module controller's store
   between runs.
@@ -60,9 +60,15 @@ console works without setup. `io_prom` names an image to use instead.
 - Two nodes: the PROM finds both Hubs, numbers them, chooses the first as the
   global master, passes its diagnostics with both processors and 256 MB, and
   IRIX 6.5.30 boots to a root login with both processors.
-- One processor on each node board. A node board has two processor slots;
-  with both filled the PROM does not start, so `[machine] cpus = 2` is
-  refused. Two node boards give two processors.
+- One or two processors on each node board (`[machine] cpus`), so two node
+  boards give up to four; IRIX 6.5.22 and 6.5.30 boot with all four. The
+  PROM's checks that the two slices of a node are alive assume they run at one
+  rate, which host threads do not, so the Hub holds a slice at them until its
+  partner has done its part, or has run 2 billion cycles without. A partner
+  stalled by the host for longer than that still gets the PROM's own verdict.
+  Under heavy host load the PROM can also give up waiting for the second node
+  board and go on with one (3 of 30 boots at two processors, 1 per node board;
+  the same kind of PROM timeout on host time); that is not specific to pairs.
 - The BaseIO is the only board; the second Crossbow has no widgets but its
   node.
 - The module's midplane one-wire part is not fitted.

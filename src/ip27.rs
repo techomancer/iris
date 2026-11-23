@@ -28,7 +28,7 @@
 //! [`NodeSpec`] per node plus a `build_io` function handing back a [`BoardIo`]; the profile picks
 //! both ([`crate::ip29_machine`] for the Origin 200, [`crate::ip27_machine`] for the desksides).
 //!
-//! - Every node holds one processor; each node's memory is mapped by the Hubs' remap.
+//! - A node holds one or two processors, slices A and B; each node's memory is mapped by the Hubs' remap.
 //! - The Hub's per-slice enable and NMI stores only log; their effect on a processor is not established.
 //! - The node flash and uncached Hub-special views carry no JIT page generation (`gen_ptr`), so a
 //!   jitv2 build compiles no code from them and the PROM runs on the interpreter's path.
@@ -304,7 +304,7 @@ fn build_cpu(
         let exec = crate::cpu::build::build_cpu::<C>(bus, cached, memory, module, timers, count_hz, node.first_cpu + slice, smp);
         Arc::new(MipsCpu::new(*exec)) as Arc<dyn CpuDevice>
     });
-    physical.connect_cpu(&*cpu, false)?;
+    physical.connect_cpu(&*cpu, true)?;
     Ok(cpu)
 }
 

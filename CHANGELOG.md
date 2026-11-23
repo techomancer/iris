@@ -42,6 +42,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   at the next hardware interrupt, on every machine. On the Tezro, quake's
   timedemo no longer freezes for up to a second at a time.
 
+### Origin 200, Origin 2000 and Onyx2
+
+- `[machine] cpus = 2` fills both processor slots of each node board, so the
+  Origin 200 runs two processors and a two-board Origin 2000 or Onyx2 four.
+  IRIX 6.5.30 boots with all of them online on each; 6.5.22 also on the
+  Origin 2000.
+
 ### jitv2 flushes
 
 - Under jitv2, a single-processor machine no longer hangs when the CPU runs out

@@ -410,3 +410,95 @@ fn renumbering_a_lone_node_keeps_its_memory_and_lets_a_reference_by_number_compa
         assert_eq!(hub.cpu_view(crate::sn::UncachedSpace::HubSpecial).read64(0x61_c000).data, 0x9c);
     });
 }
+
+/// A Hub node board of two processors, as the deskside's `nodes` node boards carry them.
+fn two_slices(dir: &Path, profile: MachineProfile, nodes: u8) -> MachineConfig {
+    let mut cfg = test_support::config(profile, dir, nodes);
+    cfg.machine.cpus = Some(2);
+    cfg
+}
+
+/// Each slice has its own pending mask and comparator, and each drives only
+/// its own processor's lines: slice B's reach the node's second processor.
+#[test]
+fn slice_b_interrupts_and_comparator_reach_only_the_second_processor() {
+    use std::sync::atomic::Ordering;
+    big_stack(|| {
+        let dir = TempPath::dir("ip27-slice-b-lines");
+        let m = test_support::machine(&two_slices(&dir, MachineProfile::Origin2000Ip27, 2)).unwrap();
+        // Cause IP2..IP5: bank 0, bank 1, the slice's comparator, profiling.
+        let lines = |n: usize, s: usize| (unsafe { &*m.node_cpus[n][s].interrupts_ptr() }.load(Ordering::SeqCst) >> 10) & 0xf;
+        for n in 0..2 {
+            let hub = &m.nodes[n].chip;
+            assert_eq!(m.node_cpus[n].len(), 2, "node {n}");
+            assert_eq!(hub.read64(hub_regs::PI_CPU_PRESENT_B::OFFSET).data, 1, "node {n}");
+            assert_eq!(hub.write64(hub_regs::PI_INT_MASK0_B::OFFSET, 1 << 5), BUS_OK);
+            assert_eq!(hub.write64(hub_regs::PI_INT_PEND_MOD::OFFSET, crate::sn::MODIFY_SET | 5), BUS_OK);
+            assert_eq!((lines(n, 0), lines(n, 1)), (0, 0b0001), "node {n}: bank 0 through B's mask");
+            assert_eq!(hub.write64(hub_regs::PI_RT_EN_B::OFFSET, 1), BUS_OK);
+            // A comparator written equal to the counter matches at once; the counter runs on
+            // the host clock, so a store can land a tick late.
+            for _ in 0..1000 {
+                let now = hub.read64(hub_regs::PI_RT_COUNT::OFFSET).data;
+                assert_eq!(hub.write64(hub_regs::PI_RT_COMPARE_B::OFFSET, now), BUS_OK);
+                if hub.read64(hub_regs::PI_RT_PEND_B::OFFSET).data == 1 {
+                    break;
+                }
+            }
+            assert_eq!(hub.read64(hub_regs::PI_RT_PEND_A::OFFSET).data, 0, "node {n}");
+            assert_eq!((lines(n, 0), lines(n, 1)), (0, 0b0101), "node {n}: B's comparator");
+        }
+    });
+}
+
+/// The PROM keeps its stack in primary data lines it tags itself, at the same
+/// address on both processors of a node. Each processor's lines are its own:
+/// slice B tagging the line after A stored there reads memory, not A's store.
+#[test]
+fn each_slice_keeps_its_own_cache_lines() {
+    use crate::cpu::mips_isa::{CACH_PD, C_IST, OP_CACHE};
+    const SP: u64 = 0x10_3ff0;
+    const OUT: u64 = 0x2000;
+    const TAG: u32 = ((SP >> 12) << 8 | 3 << 6) as u32;
+    let (t0, t1, t2, t4, t5, t6) = (8, 9, 10, 12, 13, 14);
+    let imm = |op: u32, rs: u32, rt: u32, v: u32| op << 26 | rs << 21 | rt << 16 | v;
+    let dsll32 = |r: u32| r << 16 | r << 11 | 0x3c;
+    let mtc0 = |rt: u32, rd: u32| 0x10 << 26 | 4 << 21 | rt << 16 | rd << 11;
+    let words = [
+        imm(0x0d, 0, t0, 0x80), // Status.KX
+        mtc0(t0, 12),
+        imm(0x0f, 0, t1, 0xa800), // t1 = SP in cached xkphys
+        dsll32(t1),
+        imm(0x0f, 0, t2, (SP >> 16) as u32),
+        t1 << 21 | t2 << 16 | t1 << 11 | 0x25,
+        imm(0x0d, t1, t1, (SP & 0xffff) as u32),
+        imm(0x0f, 0, t2, TAG >> 16), // TagLo: the page, DirtyExclusive
+        imm(0x0d, t2, t2, TAG & 0xffff),
+        mtc0(t2, 28),
+        imm(OP_CACHE, t1, C_IST | CACH_PD, 0),
+        imm(0x37, t1, t4, 0), // ld t4, 0(t1)
+        imm(0x0d, 0, t5, 0x5a5a),
+        imm(0x3f, t1, t5, 0), // sd t5, 0(t1)
+        imm(0x0f, 0, t6, 0x9600), // uncached memory
+        dsll32(t6),
+        imm(0x0d, t6, t6, OUT as u32),
+        imm(0x3f, t6, t4, 0), // sd t4, OUT: what the line read
+        0x1000_ffff,
+        0,
+    ];
+    let payload: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
+    big_stack(move || {
+        let dir = TempPath::dir("ip27-slice-lines");
+        let mut cfg = two_slices(&dir, MachineProfile::Origin200Ip29, 1);
+        std::fs::write(dir.join("prom.bin"), &payload).unwrap();
+        cfg.prom = dir.join("prom.bin").to_string_lossy().into_owned();
+        let m = test_support::machine(&cfg).unwrap();
+        let memory = m.nodes[0].chip.decode.physical();
+        assert_eq!(memory.write64(OUT, 0xdead), BUS_OK);
+        let [a, b] = &m.node_cpus[0][..] else { panic!("two processors") };
+        a.step_n_inline(18).unwrap();
+        b.step_n_inline(18).unwrap();
+        assert_eq!(memory.read64(OUT).data, 0, "B's line holds memory, not A's store");
+        assert_eq!(memory.read64(SP).data, 0, "neither store reached memory");
+    });
+}
