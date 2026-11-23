@@ -4448,7 +4448,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         // forever otherwise).
                         if !crate::cpu::jitv2::jitv2::push_compile_request(&self.jitv2_compile_queue_handle, req, &self.jitv2_stats) {
                             crate::pf_level!(crate::perfetto::events::JIT_QUEUE_FULL_LEVEL, crate::perfetto::events::JIT_QUEUE_FULL, true, pc);
-                            page.clear_scheduled();
+                            // A full FIFO must not keep a hot page off the hot lane.
+                            if !page.note_waiting_arrival() {
+                                page.drop_request();
+                            } else {
+                                crate::pf_instant!(crate::perfetto::events::JIT_HOT_REQUEST, pc);
+                                if !crate::cpu::jitv2::jitv2::push_hot_request(&self.jitv2_hot_queue_handle, req) {
+                                    page.clear_scheduled();
+                                }
+                            }
                             #[cfg(feature = "developer")]
                             page.mark_send_dropped_queue_full();
                         } else {
@@ -4459,7 +4467,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         // Already queued, and being executed hard while it
                         // waits: jump the queue (`CompileQueue::hot`).
                         crate::pf_instant!(crate::perfetto::events::JIT_HOT_REQUEST, pc);
-                        crate::cpu::jitv2::jitv2::push_hot_request(&self.jitv2_hot_queue_handle, req);
+                        if !crate::cpu::jitv2::jitv2::push_hot_request(&self.jitv2_hot_queue_handle, req) {
+                            page.rearm_promotion();
+                        }
                     }
                     break 'gate self.step_int();
                 }

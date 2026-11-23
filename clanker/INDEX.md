@@ -105,6 +105,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [read-status-in-registers.md](jitv2/read-status-in-registers.md) | rule | JIT memory hooks return status in registers, never memory |
 | [retry-bail-in-delay-slot-must-arm-the-branch.md](jitv2/retry-bail-in-delay-slot-must-arm-the-branch.md) | rule | A retry bail out of an inlined delay slot must arm the branch |
 | [smc-writes-to-executing-page.md](jitv2/smc-writes-to-executing-page.md) | design | Self-modifying writes onto the page being executed (`jitv2_smc_check`) |
+| [hot-lane-under-a-full-queue.md](jitv2/hot-lane-under-a-full-queue.md) | rule | The hot lane must work while the compile FIFO is full: keep the count across a dropped push, a short lane, a refused promotion re-arms its page |
 | [sync-compile-gates-on-hot.md](jitv2/sync-compile-gates-on-hot.md) | rule | Sync compile gates a page with code on the pool's hot count, and never sets `page_scheduled` |
 | [unsupported-instructions.md](jitv2/unsupported-instructions.md) | design | JIT v2 instruction coverage and interpreter boundaries |
 | [what-actually-blocks-gpr-forwarding.md](jitv2/what-actually-blocks-gpr-forwarding.md) | measure | What actually blocks GPR store-to-load forwarding (and what doesn't) |

@@ -81,6 +81,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   Newport. SideFX PRISMS's "smooth" and "facet" views now draw correctly
   (issue #798).
 
+### jitv2 compile order
+
+- Under jitv2, code that turns hot while the compile workers are behind is
+  compiled first. On a one-CPU Octane a program started just after login ran
+  interpreted for 4 to 12 seconds; it now compiles within half a second.
+
 ### jitv2 interrupts
 
 - Under jitv2, software interrupts are taken as soon as they are enabled, not
