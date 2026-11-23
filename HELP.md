@@ -80,8 +80,11 @@ The monitor gives the same figures as text: `speed` (each CPU's MIPS),
 Which interrupt is the clock tick depends on the machine. IRIX on the Indy,
 Indigo2 and IP28 keeps time with the IOC's 8254: timer 0 is the 100 Hz
 system clock and timer 1 the 1000 Hz fast clock (parked when nothing needs
-it). IRIX on the Octane runs both clocks on CP0 Compare, which fires for
-whichever is due next.
+it), and the light counts both, so `ticks` reads about 1100 Hz while the
+fast clock runs and 100 Hz when it is parked. Every other machine takes its
+clock on CP0 Compare: the O2 and the Origin family at 100 Hz per CPU, the
+Octane at whatever mix of its 100 Hz and 1 kHz clocks is due next. The
+programmed rate comes from what the guest writes to the 8254 or to Compare.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
