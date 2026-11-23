@@ -109,12 +109,18 @@ struct Rig {
     wire: [Arc<Wire>; 2],
     superio: Arc<LevelProbe>,
     clock: crate::clock::Clock,
-    _tm: Arc<TimerManager>,
+    tm: Arc<TimerManager>,
 }
 
 impl Rig {
     fn new() -> Rig {
         Rig::with(octane_on)
+    }
+
+    /// Move the clock on and run the timers it reaches.
+    fn step(&self, ns: u64) {
+        self.clock.step(ns);
+        self.tm.run_due();
     }
 
     fn with(make: impl FnOnce(&Arc<TimerManager>) -> Ioc3) -> Rig {
@@ -132,7 +138,7 @@ impl Rig {
         c.set_serial_backend(1, wire[1].clone());
         let (superio, line) = LevelProbe::line();
         c.connect_superio_interrupt(line);
-        Rig { c, mem, wire, superio, clock, _tm: tm }
+        Rig { c, mem, wire, superio, clock, tm }
     }
 
     fn r32(&self, a: u32) -> u32 {
@@ -444,7 +450,7 @@ fn diagnostic_output_commands_keep_the_running_output() {
 fn a_periodic_output_catches_up_to_the_clock() {
     let r = Rig::new();
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 100);
-    r.clock.step(3_000_000);
+    r.step(3_000_000);
     // Many periods (782 us each) have passed; the timer's pass applies them
     // all and the pulse source is posted.
     r.c.service();
@@ -452,7 +458,7 @@ fn a_periodic_output_catches_up_to_the_clock() {
     r.w32(reg::INT_STATUS, int::RT_OUTPUT_PULSE);
     // A fixed command cancels the periodic one for good.
     r.w32(reg::INT_OUTPUT, IO_LOW);
-    r.clock.step(2_000_000);
+    r.step(2_000_000);
     r.c.service();
     assert_eq!(r.r32(reg::INT_STATUS) & int::RT_OUTPUT_PULSE, 0);
 }
@@ -464,7 +470,7 @@ fn the_output_state_bit_follows_the_clock_while_the_interrupt_is_masked() {
     r.w32(reg::INT_OUTPUT, IO_SQUARE | 100);
     let mut seen = [false; 2];
     for _ in 0..40 {
-        r.clock.step(100_000);
+        r.step(100_000);
         seen[(r.r32(reg::INT_OUTPUT) & IO_STATE != 0) as usize] = true;
     }
     assert_eq!(seen, [true, true]);
@@ -475,7 +481,7 @@ fn reset_cancels_the_interrupt_output() {
     let r = Rig::new();
     r.w32(reg::INT_OUTPUT, IO_SQUARE | 2);
     r.c.reset();
-    r.clock.step(1_000_000);
+    r.step(1_000_000);
     assert_eq!(r.r32(reg::INT_OUTPUT), 0);
     assert_eq!(r.r32(reg::INT_STATUS), 0);
 }
@@ -1047,7 +1053,7 @@ fn host_input_arrives_in_the_receive_ring_after_the_timer() {
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) >> HELD_SHIFT & 7, 2, "two held in the packer");
     assert_eq!(r.r32(A + sdma_off::RX_CONSUME) & ARM_RX_TIMER, ARM_RX_TIMER);
     r.c.sh.serial[0].as_ref().unwrap().set_rx_deadline(Some(due));
-    r.clock.step(wait);
+    r.step(wait);
     r.c.service();
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE), 8, "posted when the timer ran out");
     assert_eq!(&get(&r, 0x3000, 2), b"hi");
@@ -1837,10 +1843,10 @@ fn a_uart_receive_timeout_comes_from_a_timer() {
     assert!(until(|| r.c.sh.deadlines()[K_UART].is_some()), "the receive thread took the character");
     let due = r.c.sh.deadlines()[K_UART].unwrap();
     assert_eq!(due, r.c.sh.sio.as_ref().unwrap().lock().uart[0].core.char_time().as_nanos() as u64 * 4);
-    r.clock.step(due - 1);
+    r.step(due - 1);
     let passthrough = || r.c.int_status() & int::serial(0, int::PASSTHROUGH) != 0;
     assert!(timer_pending(&r, K_UART) && !passthrough());
-    r.clock.step(1);
+    r.step(1);
     assert!(until(passthrough), "the timer raised the source");
     r.c.stop();
 }

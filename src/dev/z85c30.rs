@@ -1139,19 +1139,19 @@ pub(crate) mod tests {
         scc.write_b_control(scc_regs::WR5);
         scc.write_b_control(wr5::TX_ENABLE);
         scc.start();
-        let sent = |n: usize| crate::test_board::until(|| out.drain_guest().len() >= n);
         scc.write_b_data(b'a');
         let due = scc.tx[1].timer.due().expect("the character is on the line");
         clock.step(due - 1);
         assert!(out.drain_guest().is_empty(), "not before its time is up");
         clock.step(1);
-        assert!(sent(1), "the timer sent it");
+        assert_eq!(out.drain_guest().len(), 1, "the timer sent it");
         scc.write_b_data(b'b');
         scc.stop();
         clock.step(due);
         assert!(out.drain_guest().is_empty() && scc.tx[1].timer.due().is_some(), "a stopped timer keeps its deadline");
         scc.start();
-        assert!(sent(1), "start arms it again");
+        clock.tm.run_due();
+        assert_eq!(out.drain_guest().len(), 1, "start arms it again");
         scc.write_b_data(b'c');
         scc.load_state(&scc.save_state()).unwrap();
         assert_eq!(scc.tx[1].timer.due(), None, "a load drops the character in flight");
@@ -1173,7 +1173,7 @@ pub(crate) mod tests {
         let first = scc.tx[1].timer.due().unwrap();
         let char_ns = scc.channel_b.lock().tx_delay * 1000;
         clock.step(first + char_ns / 2 - clock.now());
-        assert!(crate::test_board::until(|| scc.tx[1].timer.due() == Some(first + char_ns)),
+        assert_eq!(scc.tx[1].timer.due(), Some(first + char_ns),
             "the second character ends one character time after the first, not after the late fire");
         scc.stop();
     }

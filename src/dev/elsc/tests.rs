@@ -47,31 +47,23 @@ impl Aux {
     }
 }
 
-/// Virtual time, set by hand: a timer manager on a stepped clock, with hooks that run after each
-/// step and expire whatever came due.
+/// Virtual time: a timer manager on a stepped clock that runs the timers each step reaches.
 #[derive(Clone)]
-pub(crate) struct TestClock(Arc<TimerManager>, Arc<Mutex<Vec<Box<dyn Fn() + Send + Sync>>>>);
+pub(crate) struct TestClock(crate::test_board::Stepped);
 
 impl Default for TestClock {
     fn default() -> Self {
-        Self(crate::test_board::Stepped::new().tm, Default::default())
+        Self(crate::test_board::Stepped::new())
     }
 }
 
 impl TestClock {
     pub(crate) fn now_ns(&self) -> u64 {
-        self.0.clock().now()
-    }
-
-    pub(crate) fn on_advance(&self, hook: Box<dyn Fn() + Send + Sync>) {
-        self.1.lock().push(hook);
+        self.0.now()
     }
 
     pub(crate) fn advance_ns(&self, ns: u64) {
-        self.0.clock().step(ns);
-        for hook in self.1.lock().iter() {
-            hook();
-        }
+        self.0.step(ns);
     }
 
     pub(crate) fn advance_ms(&self, ms: u64) {
@@ -83,28 +75,7 @@ impl TestClock {
     }
 
     pub(crate) fn tm(&self) -> &Arc<TimerManager> {
-        &self.0
-    }
-}
-
-impl Elsc {
-    /// When the oldest timer already due fell, and which it is.
-    pub(crate) fn due_timer(&self) -> Option<(u64, usize)> {
-        let st = self.state.lock();
-        let now = st.clock.now();
-        st.deadlines.iter().enumerate().filter_map(|(kind, d)| d.filter(|d| *d <= now).map(|d| (d, kind))).min()
-    }
-
-    pub(crate) fn expire_timer(&self, due: u64, kind: usize) {
-        self.expire(kind, due);
-    }
-
-    /// Expire every timer due by the test clock, oldest first, each at its own deadline. Production
-    /// promises no order between timers due together.
-    fn settle(&self) {
-        while let Some((due, kind)) = self.due_timer() {
-            self.expire(kind, due);
-        }
+        &self.0.tm
     }
 }
 
@@ -145,10 +116,9 @@ impl Rig {
         let pcf = Pcf8584::new(bus, busy.clone());
         let aux = Arc::new(Aux::default());
         elsc.set_serial_backend(aux.clone());
-        let timed = elsc.clone();
-        clock.on_advance(Box::new(move || timed.settle()));
         pcf.power_on();
         elsc.power_on();
+        Device::start(&*elsc);
         Self { busy, clock, elsc, nvram, pcf, aux }
     }
 
