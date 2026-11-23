@@ -77,12 +77,14 @@ The monitor gives the same figures as text: `speed` (each CPU's MIPS),
 `watch speed` or `watch ticks` to keep them updating on one line (see
 [debug.md](debug.md)).
 
-Which interrupt is the clock tick depends on the machine. IRIX on the Indy,
-Indigo2 and IP28 keeps time with the IOC's 8254: timer 0 is the 100 Hz
-system clock and timer 1 the 1000 Hz fast clock (parked when nothing needs
-it), and the light counts both, so `ticks` reads about 1100 Hz while the
-fast clock runs and 100 Hz when it is parked. Every other machine takes its
-clock on CP0 Compare: the O2 and the Origin family at 100 Hz per CPU, the
+Which interrupt is the clock tick depends on the machine and the kernel.
+IRIX on the Indigo2 and IP28 keeps time with the IOC's 8254: timer 0 is the
+100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
+needs it), and the light counts both, so `ticks` reads about 1100 Hz while
+the fast clock runs and 100 Hz when it is parked. IRIX 6.5 on the Indy has
+been seen to leave the 8254 off and take its clock on CP0 Compare instead,
+at about 1000 Hz; the bar follows whichever the guest programs. Every other
+machine takes its clock on CP0 Compare: the O2 and the Origin family at 100 Hz per CPU, the
 Octane at whatever mix of its 100 Hz and 1 kHz clocks is due next. The
 programmed rate comes from what the guest writes to the 8254 or to Compare.
 
