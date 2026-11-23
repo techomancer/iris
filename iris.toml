@@ -45,8 +45,11 @@ banks = [128, 128, 0, 0]
 # Change this if 192.168.0.x conflicts with your local network.
 #nat_subnet = "192.168.5.0/24"
 
-# SCSI devices.
-# Valid IDs: 1–7 (1–15 on the Octane, the SN0 machines, Fuel and Tezro). The
+# Disks, CD-ROMs and cards are [[devices]] entries. `at` names the slot:
+# scsi0/t1 is target 1 of the first SCSI controller, scsi1/t4 target 4 of the second.
+# Left out, a device takes the first free slot that fits. `iris --list-slots` shows
+# every slot of the machine and its aliases.
+# Valid targets: 1–7 (1–15 on the Octane, the SN0 machines, Fuel and Tezro). The
 # SCSI controller itself occupies ID 0.
 # Typical Indy layout:
 #   t1 — internal hard disk

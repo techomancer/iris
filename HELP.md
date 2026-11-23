@@ -931,9 +931,9 @@ Configuration
   --clock-fixed-mhz <MHZ>     CP0 Count frequency (default: half the part's clock, 75 for an Indy R4400)
 
 Storage
-  --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
-  --cdrom4/5/6 <FILE|URL>     CD-ROM primary disc at that SCSI ID (a file, or an http(s):// URL)
-  --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
+  --device <SPEC>             Place a device: [NAME:]TYPE[@SLOT][,KEY=VALUE]..., as a [[devices]]
+                              entry (hdd@scsi0/t1,path=irix65.raw). A named one replaces the file's
+  --list-slots                Print every slot on the machine, what is in it and what it takes
   --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 

@@ -699,16 +699,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--bank3` | RAM bank 3 size in MB (0/8/16/32/64/128; IP28 also supports 256/512) |
 | `--jitv2-threads` | jitv2 compile-pool threads (default: one per guest CPU, at most 4, capped by the host's usable CPUs; see jitv2.threads) |
 | `--jitv2-compile MODE` | Where jitv2 compiles: `async` on the pool's threads (default) or `sync` on the CPU thread, so a run executes the same host code every time. One CPU only. Sets `jitv2.compile`. |
-| `--scsi1` | SCSI ID 1 image path (HDD) |
-| `--scsi2` | SCSI ID 2 image path (HDD) |
-| `--scsi3` | SCSI ID 3 image path (HDD) |
-| `--cdrom4` | SCSI ID 4 image path (CD-ROM, primary disc) |
-| `--cdrom5` | SCSI ID 5 image path (CD-ROM, primary disc) |
-| `--cdrom6` | SCSI ID 6 image path (CD-ROM, primary disc) |
-| `--scsi7` | SCSI ID 7 image path (HDD) |
-| `--cdrom4-extra` | Additional ISO images for CD-ROM ID 4 (can be specified multiple times) |
-| `--cdrom5-extra` | Additional ISO images for CD-ROM ID 5 (can be specified multiple times) |
-| `--cdrom6-extra` | Additional ISO images for CD-ROM ID 6 (can be specified multiple times) |
+| `--device SPEC` | Place a device: `[NAME:]TYPE[@SLOT][,KEY=VALUE]...`, as a `[[devices]]` entry (`hdd@scsi0/t1,path=irix65.raw`; a value is read as TOML when it parses as one). A named one replaces the file's device of that name. |
+| `--list-slots` | Print every slot on the machine, its aliases, what is in it and what it takes, then exit. |
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
 | `--headless` | Suppress the standalone window (platform-specific graphics/console behavior, as `headless`; audio unaffected) |
 | `--noaudio` | Disable host audio output, as `no_audio`; graphics is unaffected |
