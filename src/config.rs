@@ -960,20 +960,14 @@ impl MachineProfile {
     }
 
     /// The processors one node board holds at most: four on the Tezro and on
-    /// a C-brick (Origin 3200, Onyx 3000), two on the Octane, one elsewhere.
-    /// A Hub node board (Origin 200, Origin 2000, Onyx2) has two slots, but
-    /// the PROM does not start with both filled yet, so it takes one.
+    /// a C-brick (Origin 3200, Onyx 3000), two on the Octane and on a Hub node
+    /// board (Origin 200, Origin 2000, Onyx2), one elsewhere.
     pub fn max_cpus(self) -> u8 {
         match self {
             Self::TezroIp53 | Self::Origin3200Ip35 | Self::Onyx3000Ip35 => 4,
-            Self::OctaneIp30 => 2,
+            Self::OctaneIp30 | Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27 => 2,
             _ => 1,
         }
-    }
-
-    /// A Hub machine: two processor slots on each node board, one modelled.
-    fn hub_node(self) -> bool {
-        matches!(self, Self::Origin200Ip29 | Self::Origin2000Ip27 | Self::Onyx2Ip27)
     }
 
     /// Whether this profile can have `cpus` processors on a node board, and
@@ -981,9 +975,7 @@ impl MachineProfile {
     /// or four.
     pub fn accepts_cpus(self, cpus: u8) -> Result<(), String> {
         let max = self.max_cpus();
-        if cpus == 2 && self.hub_node() {
-            Err(format!("[machine] cpus = 2: the {}'s second processor on a node board is not working yet (the PROM does not start); use two node boards for two processors", self.label()))
-        } else if cpus != 1 && max == 1 {
+        if cpus != 1 && max == 1 {
             Err(format!("[machine] cpus = {cpus}: the {} has one processor", self.label()))
         } else if !(1..=max).contains(&cpus) || cpus == 3 {
             let counts = if max == 4 { "1, 2 or 4" } else { "1 or 2" };
@@ -5861,21 +5853,18 @@ mod export_tests {
         assert!(accepts(MachineProfile::FuelIp34, "r14000") && !accepts(MachineProfile::FuelIp34, "r10000"));
         assert!(accepts(MachineProfile::TezroIp53, "r16000") && !accepts(MachineProfile::TezroIp53, "r14000"));
 
-        // The counts are what the checks in validate() and the Octane
-        // constructor allowed before they moved here: one on every machine
-        // but the Octane, one or two on the Octane.
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::Origin200Ip29, MachineProfile::TezroIp53] {
+        // One processor on the workstations, one or two on the Octane and on
+        // each Hub node board, one, two or four on the Tezro.
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27, MachineProfile::TezroIp53] {
             for cpus in 0..=4u8 {
-                let old_ok = match p {
-                    MachineProfile::OctaneIp30 => (1..=2).contains(&cpus),
+                let ok = match p {
+                    MachineProfile::OctaneIp30 | MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27 => (1..=2).contains(&cpus),
                     MachineProfile::TezroIp53 => [1, 2, 4].contains(&cpus),
                     _ => cpus == 1,
                 };
-                assert_eq!(p.accepts_cpus(cpus).is_ok(), old_ok, "{p:?} with {cpus}");
+                assert_eq!(p.accepts_cpus(cpus).is_ok(), ok, "{p:?} with {cpus}");
             }
-            if p == MachineProfile::Origin200Ip29 {
-                assert!(p.accepts_cpus(2).unwrap_err().contains("second processor on a node board is not working yet"));
-            } else if p.max_cpus() == 1 {
+            if p.max_cpus() == 1 {
                 assert_eq!(p.accepts_cpus(2).unwrap_err(), format!("[machine] cpus = 2: the {} has one processor", p.label()));
             }
         }
@@ -5888,6 +5877,11 @@ mod export_tests {
         octane.validate().expect("two processors");
         octane.machine.cpus = Some(3);
         assert!(octane.validate().unwrap_err().contains("1 or 2"));
+        // Two node boards of two processors each: the deskside's four.
+        let mut deskside = MachineConfig::from_toml_str("[machine]\nprofile = \"origin2000_ip27\"\nnodes = 2\ncpus = 2\n").unwrap();
+        deskside.validate().expect("two node boards of two processors");
+        deskside.machine.cpus = Some(3);
+        assert_eq!(deskside.validate().unwrap_err(), "[machine] cpus = 3: IRIX runs the SGI Origin 2000 (IP27) with 1 or 2 on each node board");
         // Each machine's refusal names that machine.
         assert_eq!(
             MachineProfile::TezroIp53.accepts_cpus(5).unwrap_err(),

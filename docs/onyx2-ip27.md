@@ -35,6 +35,9 @@ A disk installed on an Onyx2 boots; the machine cannot install without a pipe.
 - Two nodes: the PROM finds both Hubs, numbers them, makes the second slot's
   board the global master, passes its diagnostics with both processors and
   256 MB, and IRIX boots to a root login with both processors.
+- One or two processors on each node board (`[machine] cpus`): two boards of
+  two boot IRIX 6.5.30 with four. The [Origin 2000 limits](origin2000-ip27.md#limits)
+  on two processors per node board apply.
 - Either Hub's processor reaches the BaseIO-G through the Crossbow. The Bridge
   delivers DMA and interrupts to the Hub at the widget the guest programs into
   it, and both Hubs are hosts, each behind its Crossbow port's link. With two

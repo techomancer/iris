@@ -724,7 +724,7 @@ cpu     = "r4400"           # unset: the machine's first. Indy, IP22: r4400/r500
                             # Octane: r10000/r12000/r14000; Origin 200/2000, Onyx2: r10000/r12000; Fuel: r14000;
                             # Tezro: r16000 (or a part, "r16000_800"); Origin 3200, Onyx 3000: r12000
 # cpus  = 2                 # per node board. Octane: 1 or 2 (docs/octane-ip30-multiprocessor.md); Tezro: 1, 2 or 4 (default 4);
-                            # Origin 3200, Onyx 3000: 1, 2 or 4 on each C-brick
+                            # Origin 3200, Onyx 3000: 1, 2 or 4 on each C-brick; Origin 200/2000, Onyx2: 1 or 2 on each node board
 
 [graphics]
 board      = "newport"      # Indy, Indigo2: "newport", "xz", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); "extreme" on IP22 only
