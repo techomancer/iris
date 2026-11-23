@@ -181,7 +181,7 @@ mod tests {
     use crate::traits::{BusDevice, BUS_ERR};
 
     fn resets(rig: &Rig) -> usize {
-        rig.events.lock().try_iter().count()
+        std::iter::from_fn(|| rig.events.lock().try_recv().ok()).count()
     }
 
     /// The guest programs route fields and reads the error register to acknowledge faults.

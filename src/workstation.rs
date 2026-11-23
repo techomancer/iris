@@ -32,7 +32,7 @@ use crate::machine::Machine;
 use crate::machine_state::{GuestState, MachineStatus, TransitionAck};
 use crate::monitor::Monitor;
 use crate::net::NatControl;
-use crate::traits::{Device, MachineEvent, MachineFatal};
+use crate::traits::{Device, MachineEvent, MachineEventQueue, MachineFatal};
 
 /// Build the machine `cfg` describes, or say why it cannot be built.
 ///
@@ -856,7 +856,7 @@ pub fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut dyn Workstat
 pub(crate) fn register_system_controller(
     monitor: &Arc<Monitor>,
     slot: MachineSlot,
-    events: Option<std::sync::mpsc::Receiver<MachineEvent>>,
+    events: Option<MachineEventQueue>,
 ) {
     let ctrl = Arc::new(SystemController { machine: slot });
     // SAFETY: called once, before the monitor server thread starts, while the
@@ -870,10 +870,14 @@ pub(crate) fn register_system_controller(
     // machine's threads before it changes machine state.
     if let Some(rx) = events {
         std::thread::Builder::new().name("machine-events".to_string()).spawn(move || {
-            while let Ok(event) = rx.recv() {
+            while let Some((sent, event)) = rx.recv() {
                 match event {
                     MachineEvent::HardReset => {
                         let _ = ctrl.with_machine(|machine| {
+                            // A reset or restore since then replaced the machine that asked.
+                            if !rx.is_current(sent) {
+                                return Ok(());
+                            }
                             println!("Machine: SIN hard reset");
                             machine.reset();
                             machine.cpu_start();

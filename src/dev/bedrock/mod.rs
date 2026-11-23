@@ -57,7 +57,7 @@ use io::Io;
 use md::{Md, View};
 use pi::{Levels, Pi};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use crate::traits::MachineEvents;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -81,7 +81,7 @@ pub struct BedrockConfig<'a> {
     pub nodes: usize,
     /// Where a node reset goes: LB's soft reset and NI's local reset each
     /// send [`MachineEvent::HardReset`].
-    pub events: Option<Sender<MachineEvent>>,
+    pub events: Option<MachineEvents>,
     /// The reset PROM, addressed from zero.
     pub prom: Option<Arc<dyn BusDevice>>,
 }
@@ -161,7 +161,7 @@ pub struct Bedrock {
     /// This node and the chip at the far end of its NI's port, by the numbers they
     /// publish, and the node's memory, which the chip remaps.
     pub(crate) decode: Arc<NodeDecode<Bedrock>>,
-    events: Option<Sender<MachineEvent>>,
+    events: Option<MachineEvents>,
     weak: Weak<Self>,
     /// Held while a control store sets the counters of this node and its peer.
     rt_eval: parking_lot::Mutex<()>,

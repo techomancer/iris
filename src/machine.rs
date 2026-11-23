@@ -8,7 +8,7 @@ use std::thread;
 
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig, ScsiDeviceConfig};
 use crate::machine_state::GuestState;
-use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent, MachineFatal};
+use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEventQueue, MachineEvents, MachineFatal};
 use crate::locks::LockMonitor;
 use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::physical::Physical;
@@ -123,8 +123,8 @@ pub struct Machine {
     /// TCP port the monitor serves on 127.0.0.1 (`cfg.monitor_port`).
     monitor_port: u16,
     /// Sender for async machine events (HardReset, PowerOff) from devices.
-    pub event_tx: mpsc::SyncSender<MachineEvent>,
-    event_rx: Option<mpsc::Receiver<MachineEvent>>,
+    pub event_tx: MachineEvents,
+    event_rx: Option<MachineEventQueue>,
     /// Reliable, unbounded terminal-device-fault path.
     fatal_rx: Option<mpsc::Receiver<MachineFatal>>,
     /// First terminal device failure. A failed machine cannot restart.
@@ -1107,7 +1107,7 @@ impl Machine {
             unsafe { (*monitor_ptr).register_device(Arc::new(LockMonitor)); }
         }
 
-        let (event_tx, event_rx) = mpsc::sync_channel::<MachineEvent>(4);
+        let (event_tx, event_rx) = MachineEvents::channel(4);
 
         // Give MC and IOC async event senders so they can request hard-reset / power-off.
         mc.set_event_sender(event_tx.clone());
@@ -1909,6 +1909,7 @@ impl Machine {
     /// stayed unresponsive after every `jitcheck` for no reason).
     pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
         self.stop();
+        self.event_tx.powered_on();
         #[cfg(feature = "wgpu")]
         self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
         #[cfg(feature = "wgpu")]
@@ -1981,6 +1982,7 @@ impl Machine {
     /// Helper to power-on reset all devices.
     /// Must be called with threads stopped.
     fn power_on_devices(&mut self) {
+        self.event_tx.powered_on();
         self.cpu.power_on();
         self.board.phys.reset_memory();
         self.mc.power_on();
@@ -2769,6 +2771,28 @@ mod controller_lifetime_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// A reset, or a restore of a live checkpoint, replaces the machine that
+    /// asked for the hard resets still queued: the event thread drops them.
+    #[test]
+    fn a_reset_or_restore_makes_a_queued_reset_stale() {
+        let nv = TempPath::dir("indy-stale-events");
+        let mut machine = build_machine(&nv);
+        let queue = machine.event_rx.take().unwrap();
+        let send = |m: &Machine| {
+            m.event_tx.try_send(crate::traits::MachineEvent::HardReset).unwrap();
+            queue.recv().unwrap().0
+        };
+        let sent = send(&machine);
+        assert!(queue.is_current(sent));
+        machine.reset();
+        assert!(!queue.is_current(sent), "a reset");
+        let sent = send(&machine);
+        let live = machine.capture_live_checkpoint();
+        machine.restore_live_checkpoint(&live).unwrap();
+        assert!(!queue.is_current(sent), "a restore");
+        machine.stop();
     }
 
     /// The Indy's console log adds to an existing file, and starts it over

@@ -249,7 +249,7 @@ fn a_node_reset_is_one_event_on_the_boards_channel() {
     let rig = Rig::new();
     rig.w(lb::BASE + lb::SOFT_RESET::OFFSET, 1);
     rig.w(super::regs::ni::BASE + super::regs::ni::PORT_RESET::OFFSET, 4);
-    let events: Vec<_> = rig.events.lock().try_iter().collect();
+    let events: Vec<_> = std::iter::from_fn(|| rig.events.lock().try_recv().ok()).collect();
     assert!(matches!(events[..], [MachineEvent::HardReset, MachineEvent::HardReset]), "{events:?}");
 }
 
@@ -379,7 +379,7 @@ fn both_ends_launching_at_once_complete() {
     }
     // Each end took the other's resets: every fourth round, once.
     for rig in &rigs {
-        assert_eq!(rig.events.lock().try_iter().count() as u64, ROUNDS / 4);
+        assert_eq!(std::iter::from_fn(|| rig.events.lock().try_recv().ok()).count() as u64, ROUNDS / 4);
     }
 }
 
@@ -567,7 +567,7 @@ pub(super) struct Rig {
     pub(super) word: Arc<AtomicU64>,
     pub(super) regs: Arc<dyn BusDevice>,
     /// The node's events.
-    pub(super) events: parking_lot::Mutex<std::sync::mpsc::Receiver<MachineEvent>>,
+    pub(super) events: parking_lot::Mutex<crate::traits::MachineEventQueue>,
 }
 impl Rig {
     /// The Fuel's one processor.
@@ -586,7 +586,7 @@ impl Rig {
     pub(super) fn on(clock: crate::clock::Clock, processors: Population) -> Self {
         // The manager is dropped at the end: the comparator timers never run, and tests deliver them by hand.
         let timers = Arc::new(TimerManager::with_clock(clock.clone()));
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = crate::traits::MachineEvents::channel(1024);
         let chip = Bedrock::new(BedrockConfig { processors, events: Some(events), ..test_config(&timers) }).unwrap();
         let word = Arc::new(AtomicU64::new(0));
         chip.set_cpu_interrupts(0, &*word);

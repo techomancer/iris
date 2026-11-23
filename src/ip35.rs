@@ -49,7 +49,7 @@ use crate::workstation::Workstation;
 use node::{connect_cpus, NodeSpec};
 use serial::SerialPort;
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
+use crate::traits::MachineEvents;
 
 use crate::dev::odyssey::PacketSender;
 use crate::dev::xbridge::XBridge;
@@ -263,7 +263,7 @@ pub(crate) fn machine(
     assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");
     // Any node's reset or power request reaches the machine's main thread: a
     // reset of one node alone is not modelled.
-    let (events, receiver) = channel();
+    let (events, receiver) = MachineEvents::channel(16);
     // The machine numbers its processors once, across its nodes in order.
     let (mut nodes, mut l1s, mut first_cpu) = (Vec::new(), Vec::new(), 0);
     for spec in &specs {

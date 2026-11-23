@@ -193,7 +193,7 @@ fn the_i2c_controller_takes_narrow_accesses_over_the_md_block() {
 fn a_restart_reaches_the_machines_receiver_and_a_soft_reset_the_processor() {
     assert_eq!(hub(1, 3).write64(regs::NI_PORT_RESET::OFFSET, 0x81), BUS_OK, "no listener: only logged");
     let hub = hub(2, 3);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crate::traits::MachineEvents::channel(4);
     hub.set_event_sender(tx);
     let words = [AtomicU64::new(0), AtomicU64::new(0)];
     hub.pi.set_cpu_interrupts(0, &words[0]);
@@ -669,7 +669,7 @@ fn a_wired_hub_with_a_peer_and_attachments_is_freed_when_dropped() {
 #[test]
 fn only_a_wide_register_store_acts_on_what_it_changed() {
     let hub = hub(2, 3);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crate::traits::MachineEvents::channel(4);
     hub.set_event_sender(tx);
     let reset = regs::NI_PORT_RESET::OFFSET;
     assert_eq!((hub.write8(reset + 7, 0x81), hub.write16(reset + 6, 0x81)), (BUS_ERR, BUS_ERR));

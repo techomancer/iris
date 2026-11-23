@@ -53,7 +53,7 @@ use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK,
 };
 use crate::traits::MachineEvent;
-use std::sync::mpsc::Sender;
+use crate::traits::MachineEvents;
 use std::sync::{Arc, OnceLock, Weak};
 
 /// What differs between Hubs: the node's processors, memory, revision fields
@@ -209,7 +209,7 @@ pub struct Hub {
     pub(crate) decode: Arc<NodeDecode<Hub>>,
     /// Where NI_PORT_RESET bit 0 restarts the machine: the receiver goes to
     /// the machine's system controller, as the Indy IOC's does.
-    events: OnceLock<Sender<MachineEvent>>,
+    events: OnceLock<MachineEvents>,
     weak: Weak<Hub>,
 }
 
@@ -251,7 +251,7 @@ impl Hub {
 
     /// Where NI_PORT_RESET bit 0 sends [`MachineEvent::HardReset`]. Wired
     /// once; a Hub with no sender logs the restart and carries on.
-    pub fn set_event_sender(&self, tx: Sender<MachineEvent>) {
+    pub fn set_event_sender(&self, tx: MachineEvents) {
         let _ = self.events.set(tx);
     }
 

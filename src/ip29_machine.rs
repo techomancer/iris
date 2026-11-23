@@ -29,8 +29,7 @@ use crate::hptimer::TimerManager;
 use crate::ip27::{attach_controller, pci_devices, ModuleController, NodeSpec};
 use crate::sn::BoardIo;
 use crate::sn::NodeBoard;
-use crate::traits::{Device, MachineEvent, Resettable};
-use std::sync::mpsc::Sender;
+use crate::traits::{Device, MachineEvents, Resettable};
 use crate::xtalk::Upstream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -121,7 +120,7 @@ pub(crate) fn build_io(
     nodes: &[NodeBoard<Hub, NodeFlash>],
     clock: &Clock,
     timers: &Arc<TimerManager>,
-    events: &Sender<MachineEvent>,
+    events: &MachineEvents,
 ) -> Result<BoardIo, String> {
     let hub = &nodes[0].chip;
     let controller = Origin200Controller::new(hub, timers, cfg.ip27_section().expect("an IP27 profile").controller_store.as_deref().map(Path::new))?;
