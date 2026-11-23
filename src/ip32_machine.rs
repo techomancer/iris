@@ -301,7 +301,7 @@ impl O2Machine {
         crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, bus.phys.clone(), world);
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
-        bus.mace.ust.use_host_clock();
+        bus.mace.ust.use_clock(timer_manager.clock().clone());
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
         // CRIME's rendering engine draws on its own thread, fed through

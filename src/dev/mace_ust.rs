@@ -8,6 +8,7 @@ use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
 use std::io::Write;
 use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, hex_u64, toml_u64};
+use crate::clock::Clock;
 
 /// MACE's UST/MSC counter: unadjusted system time, free-running.
 ///
@@ -20,16 +21,16 @@ use crate::snapshot::{get_field, hex_u64, toml_u64};
 /// count and the rate below fixes the relationship.
 pub struct MaceUst {
     ticks: AtomicU64,
-    /// When set, the clock is the host's: microseconds since this instant,
-    /// read live. The 1-Wire ID chip's slots are tens of microseconds, so a
-    /// clock stepped from another thread cannot time them.
-    host: std::sync::OnceLock<std::time::Instant>,
-    /// Added to the host clock, so a restored machine's time runs on from
+    /// When set, the clock is the machine's: microseconds since the reading it
+    /// had then, read live. The 1-Wire ID chip's slots are tens of microseconds,
+    /// so a clock stepped from another thread cannot time them.
+    clock: std::sync::OnceLock<(Clock, u64)>,
+    /// Added to the machine clock, so a restored machine's time runs on from
     /// where it was saved rather than from when this process started.
     base: std::sync::atomic::AtomicI64,
-    /// The guest's own view of time ([`MaceUst::guest_us`]), in host
-    /// microseconds: the host time at the last guest clock read, the host
-    /// time the guest clock has dropped (stalls during 1-Wire work), and
+    /// The guest's own view of time ([`MaceUst::guest_us`]), in clock
+    /// microseconds: the clock time at the last guest clock read, the time
+    /// the guest clock has dropped (stalls during 1-Wire work), and
     /// until when the 1-Wire bus counts as busy. Outside 1-Wire work a read
     /// is two loads and a store; `onewire` serialises the reads inside it,
     /// which only the PROM makes.
@@ -69,7 +70,7 @@ impl MaceUst {
     pub fn new() -> Self {
         Self {
             ticks: AtomicU64::new(0),
-            host: std::sync::OnceLock::new(),
+            clock: std::sync::OnceLock::new(),
             base: std::sync::atomic::AtomicI64::new(0),
             last: AtomicU64::new(0),
             lost: AtomicU64::new(0),
@@ -78,13 +79,19 @@ impl MaceUst {
         }
     }
 
-    /// Run from the host clock from now on (a machine, not the harness).
-    pub fn use_host_clock(&self) {
-        let _ = self.host.set(std::time::Instant::now());
+    /// Run from the machine clock from now on (a machine, not the harness).
+    pub fn use_clock(&self, clock: Clock) {
+        let t0 = clock.now();
+        let _ = self.clock.set((clock, t0));
+    }
+
+    /// Microseconds on the machine clock since `use_clock`.
+    fn elapsed_us(&self) -> Option<i64> {
+        self.clock.get().map(|(c, t0)| (c.now().saturating_sub(*t0) / 1000) as i64)
     }
 
     /// Set the clock to `us` microseconds, for a machine that keeps time by
-    /// the host clock rather than by instructions run.
+    /// the machine clock rather than by instructions run.
     pub fn set_us(&self, us: u64) {
         self.ticks.store(us, Relaxed);
     }
@@ -102,11 +109,11 @@ impl MaceUst {
         self.guest_us() * 1000 / MACE_UST_PERIOD_NS
     }
 
-    /// The time the guest reads (UST, CRIME's timer): the host's, less what
+    /// The time the guest reads (UST, CRIME's timer): the machine clock's, less what
     /// host stalls cost while the PROM was bit-banging 1-Wire. Then each step
     /// between two guest reads counts at most `GUEST_CLOCK_STEP_CAP_US`,
     /// so after a stall the PROM goes on spinning to its own deadline and
-    /// every slot comes out as wide as it meant. Timed on the host clock, a
+    /// every slot comes out as wide as it meant. Timed on the raw clock, a
     /// stall inside a "1" read as a "0" (or a reset), and on some boots the
     /// PROM reported `ds2502_read_rom failed` and IRIX had no Ethernet
     /// address. Capping a device-side clock alone was not enough: a stall
@@ -117,7 +124,7 @@ impl MaceUst {
         let now = self.now();
         if now >= self.onewire_until.load(Relaxed) {
             self.last.store(now, Relaxed);
-            return now - self.lost.load(Relaxed);
+            return now.saturating_sub(self.lost.load(Relaxed));
         }
         let _one = self.onewire.lock().unwrap();
         let last = self.last.load(Relaxed);
@@ -128,7 +135,7 @@ impl MaceUst {
             }
         }
         self.last.store(now, Relaxed);
-        now - self.lost.load(Relaxed)
+        now.saturating_sub(self.lost.load(Relaxed))
     }
 
     /// The PROM touched the 1-Wire bus: hold stalls out of the guest's clock
@@ -139,9 +146,8 @@ impl MaceUst {
     }
 
     pub fn now(&self) -> u64 {
-        match self.host.get() {
-            Some(t0) => (t0.elapsed().as_micros() as i64
-                + self.base.load(std::sync::atomic::Ordering::Relaxed)) as u64,
+        match self.elapsed_us() {
+            Some(e) => (e + self.base.load(std::sync::atomic::Ordering::Relaxed)) as u64,
             None => self.ticks.load(Relaxed),
         }
     }
@@ -167,8 +173,8 @@ impl Device for MaceUst {
                 let now = self.now();
                 let lost = self.lost.load(Relaxed);
                 writeln!(w, "UST: {} clock, now {now} us, guest {} us ({lost} us held out for 1-Wire), counter {:#x} ({} ns a count)",
-                    if self.host.get().is_some() { "host" } else { "instruction" },
-                    now - lost, (now - lost) * 1000 / MACE_UST_PERIOD_NS, MACE_UST_PERIOD_NS).ok();
+                    if self.clock.get().is_some() { "machine" } else { "instruction" },
+                    now.saturating_sub(lost), now.saturating_sub(lost) * 1000 / MACE_UST_PERIOD_NS, MACE_UST_PERIOD_NS).ok();
                 Ok(())
             }
             _ => Err("Usage: ust status".to_string()),
@@ -194,7 +200,7 @@ impl Saveable for MaceUst {
         let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
         let now = u("now");
         self.ticks.store(now, Relaxed);
-        let elapsed = self.host.get().map_or(0, |t0| t0.elapsed().as_micros() as i64);
+        let elapsed = self.elapsed_us().unwrap_or(0);
         self.base.store(now as i64 - elapsed, std::sync::atomic::Ordering::Relaxed);
         self.last.store(u("last"), Relaxed);
         self.lost.store(u("lost"), Relaxed);
@@ -237,17 +243,32 @@ mod tests {
         assert_eq!(v1, dst.save_state(), "MaceUst save_state mismatch after load_state round-trip");
     }
 
-    /// On the host clock, a restored machine's time carries on from the
-    /// saved value even though this process's clock started later.
+    /// On the machine clock, a restored machine's time carries on from the
+    /// saved value even though the clock started at another reading.
     #[test]
-    fn a_restored_host_clock_runs_on_from_the_saved_time() {
+    fn a_restored_machine_clock_runs_on_from_the_saved_time() {
         let src = MaceUst::new();
         src.set_us(7_000_000_000);
         let v = src.save_state();
         let dst = MaceUst::new();
-        dst.use_host_clock();
+        let clock = Clock::stepped();
+        clock.step(5_000);
+        dst.use_clock(clock.clone());
         dst.load_state(&v).expect("load_state");
-        let t = dst.now();
-        assert!((7_000_000_000..7_001_000_000).contains(&t), "restored clock at {t}");
+        assert_eq!(dst.now(), 7_000_000_000);
+        clock.step(3_000_000);
+        assert_eq!(dst.now(), 7_000_003_000);
+    }
+
+    /// Nothing counts until the machine clock is stepped.
+    #[test]
+    fn the_counter_waits_for_the_machine_clock() {
+        let ust = MaceUst::new();
+        let clock = Clock::stepped();
+        ust.use_clock(clock.clone());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(ust.now(), 0);
+        clock.step(2_000_000);
+        assert_eq!(ust.now(), 2_000);
     }
 }
