@@ -45,7 +45,7 @@ use crate::traits::{BusDevice, CodeKey, Device};
 /// # Safety
 /// `page` must outlive the request — pages live for the lifetime of their
 /// owning device (see [`PhysicalCodePage`]'s Send/Sync safety note).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CompileRequest {
     pub page: *mut PhysicalCodePage,
     /// Live `STATUS_FR` bit at enqueue time, threaded through because the
@@ -316,8 +316,12 @@ pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 /// waits seconds behind that compile's backlog, measured with jitcov on IP28).
 pub const HOT_PROMOTE_ARRIVALS: u32 = 256;
 
-/// Requests the hot lane holds (see `CompileQueue::hot`).
-const HOT_QUEUE_CAPACITY: usize = 256;
+/// Requests the hot lane holds (see `CompileQueue::hot`), shared by every CPU
+/// and worker of the machine. A tunable: few, so a page that turns hot waits
+/// behind few compiles, not pages that were hot a backlog ago; a refused
+/// promotion is retried by its page. Measured on a one-CPU Octane: 8, 16, 32
+/// and 256 left hot user code interpreted 0.1-0.4, 0.7-1.5, 1.2 and 3.7-12 s.
+const HOT_QUEUE_CAPACITY: usize = 8;
 
 /// Wake-up channel between the compile-request producers and the compile
 /// pool's workers.
@@ -436,15 +440,18 @@ impl std::ops::Deref for CompileLane {
     }
 }
 
-/// Put a copy of a request on the hot lane. A full lane just drops it: the
-/// page's FIFO request is still queued, so nothing is lost but the head start.
-/// An accepted push wakes a sleeping worker, which must see the request now,
-/// not after its backstop expires; a dropped one does not, since a full lane
-/// means the workers have work.
-pub fn push_hot_request(hot: &Arc<CompileLane>, req: CompileRequest) {
-    if hot.push(req).is_ok() {
+/// Put a request on the hot lane, saying whether it took it. On a refusal the
+/// caller re-arms the page: its FIFO copy, when it has one, is still queued,
+/// but a page the full FIFO refused has no other request. An accepted push
+/// wakes a sleeping worker, which must see the request now, not after its
+/// backstop expires; a refused one does not, since a full lane means the
+/// workers have work.
+pub fn push_hot_request(hot: &Arc<CompileLane>, req: CompileRequest) -> bool {
+    let accepted = hot.push(req).is_ok();
+    if accepted {
         hot.wake.wake_if_sleeping();
     }
+    accepted
 }
 
 
@@ -965,11 +972,11 @@ pub struct PhysicalCodePage {
     /// of offset-scoped, since one request now serves however many offsets
     /// have accumulated in `requested` by the time it's dequeued.
     page_scheduled: std::sync::atomic::AtomicBool,
-    /// Arrivals at this page while its compile request was already queued
-    /// (`try_schedule_page` lost). Once it crosses [`HOT_PROMOTE_ARRIVALS`]
-    /// the page is hot *now* and gets one extra request on the hot lane
-    /// (`promoted` stops a second). Both reset whenever a compile for the
-    /// page completes (`clear_scheduled`).
+    /// Arrivals at this page while its compile request was queued or refused
+    /// by a full FIFO (`try_schedule_page` lost, or `drop_request`). Once it
+    /// crosses [`HOT_PROMOTE_ARRIVALS`] the page is hot *now* and gets one
+    /// request on the hot lane (`promoted` stops a second). Both reset whenever
+    /// a compile for the page completes (`clear_scheduled`).
     hot_wait: std::sync::atomic::AtomicU32,
     promoted: std::sync::atomic::AtomicBool,
     /// Pinned FR mode for this page, set at page-claim time from live
@@ -2052,6 +2059,19 @@ impl PhysicalCodePage {
         self.page_scheduled.store(false, Ordering::Relaxed);
         self.hot_wait.store(0, Ordering::Relaxed);
         self.promoted.store(false, Ordering::Relaxed);
+    }
+
+    /// The hot lane was full: count afresh, so the page is promoted again if
+    /// it is still hot.
+    pub fn rearm_promotion(&self) {
+        self.hot_wait.store(0, Ordering::Relaxed);
+        self.promoted.store(false, Ordering::Relaxed);
+    }
+
+    /// The FIFO was full: the page asks again at its next arrival, and the
+    /// arrivals it has counted still bring it to the hot lane.
+    pub fn drop_request(&self) {
+        self.page_scheduled.store(false, Ordering::Relaxed);
     }
 
     /// Count one arrival at this page while its request is already queued.
@@ -4594,6 +4614,22 @@ mod tests {
             assert!(!page.note_waiting_arrival());
         }
         assert!(page.note_waiting_arrival(), "re-arms after the compile");
+    }
+
+    #[test]
+    fn a_promotion_the_hot_lane_refused_can_be_made_again() {
+        let page = PhysicalCodePage::new(0, std::ptr::null());
+        assert!(page.try_schedule_page());
+        for _ in 1..HOT_PROMOTE_ARRIVALS {
+            page.note_waiting_arrival();
+        }
+        assert!(page.note_waiting_arrival());
+        page.rearm_promotion();
+        for _ in 1..HOT_PROMOTE_ARRIVALS {
+            assert!(!page.note_waiting_arrival());
+        }
+        assert!(page.note_waiting_arrival(), "promoted again");
+        assert!(page.is_scheduled(), "still queued in the FIFO");
     }
 
     #[test]

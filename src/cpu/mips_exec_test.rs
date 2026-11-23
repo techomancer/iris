@@ -7800,6 +7800,85 @@ mod tests {
         fn code_page(&self, a: u64) -> Option<crate::traits::CodePage> { let (d, a) = self.at(a); d.code_page(a) }
     }
 
+    /// While the compile FIFO is full, a page executed hard enough still gets
+    /// onto the hot lane, and one the full lane refused tries again.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn a_hot_page_reaches_the_hot_lane_while_the_fifo_is_full() {
+        use crate::cpu::jitv2::jitv2::{CompileRequest, PhysicalCodePage, COMPILE_QUEUE_CAPACITY, HOT_PROMOTE_ARRIVALS};
+        let bus = Arc::new(crate::dev::mem::Memory::new(1));
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus.clone() as Arc<dyn BusDevice>, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        exec.install_jit_hooks();
+        for i in 0..4 {
+            bus.write32(0x1000 + 4 * i, make_i(OP_ADDIU, 2, 2, 1));
+        }
+        let mut filler = PhysicalCodePage::new(0, std::ptr::null());
+        let fifo = exec.jitv2_compile_queue_handle.clone();
+        for _ in 0..COMPILE_QUEUE_CAPACITY {
+            fifo.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).unwrap();
+        }
+        let lane = exec.jitv2_hot_queue_handle.clone();
+        while lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).is_ok() {}
+        let mut arrive = |n| {
+            for _ in 0..n {
+                exec.core.pc = 0xffff_ffff_8000_1000;
+                exec.core.in_delay_slot = false;
+                exec.core.jit_trigger = true;
+                exec.step_jit();
+            }
+        };
+        arrive(HOT_PROMOTE_ARRIVALS);
+        lane.pop().unwrap();
+        assert!(lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).is_ok(), "a full lane took nothing");
+        lane.pop().unwrap();
+        arrive(HOT_PROMOTE_ARRIVALS);
+        let page = exec.jitv2_current_page();
+        let hot: Vec<_> = std::iter::from_fn(|| lane.pop()).map(|r| r.page).collect();
+        assert_eq!(hot.last(), Some(&page), "the page jumped the full FIFO once the lane had room");
+        while fifo.pop().is_some() {}
+    }
+
+    /// A queued page the full hot lane refused is promoted again once the lane
+    /// has room and the page is still hot.
+    #[cfg(all(feature = "jitv2", not(feature = "lightning")))]
+    #[test]
+    fn a_queued_page_the_full_hot_lane_refused_is_promoted_again() {
+        use crate::cpu::jitv2::jitv2::{CompileRequest, PhysicalCodePage, HOT_PROMOTE_ARRIVALS};
+        let bus = Arc::new(crate::dev::mem::Memory::new(1));
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus.clone() as Arc<dyn BusDevice>, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        exec.install_jit_hooks();
+        for i in 0..4 {
+            bus.write32(0x1000 + 4 * i, make_i(OP_ADDIU, 2, 2, 1));
+        }
+        let mut filler = PhysicalCodePage::new(0, std::ptr::null());
+        let lane = exec.jitv2_hot_queue_handle.clone();
+        let fifo = exec.jitv2_compile_queue_handle.clone();
+        while lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).is_ok() {}
+        let mut arrive = |n| {
+            for _ in 0..n {
+                exec.core.pc = 0xffff_ffff_8000_1000;
+                exec.core.in_delay_slot = false;
+                exec.core.jit_trigger = true;
+                exec.step_jit();
+            }
+        };
+        // The first arrival queues the page in the FIFO; the rest find it queued.
+        arrive(1 + HOT_PROMOTE_ARRIVALS);
+        assert_eq!(fifo.len(), 1, "queued in the FIFO");
+        lane.pop().unwrap();
+        arrive(HOT_PROMOTE_ARRIVALS);
+        let page = exec.jitv2_current_page();
+        let hot: Vec<_> = std::iter::from_fn(|| lane.pop()).map(|r| r.page).collect();
+        assert_eq!(hot.last(), Some(&page), "promoted again once the lane had room");
+        while fifo.pop().is_some() {}
+    }
+
     /// Compiled code is keyed by the bank it was compiled from: when a remap
     /// puts another bank at its address, the address runs that bank's page,
     /// and the code is found again, not recompiled, where its bank went.
