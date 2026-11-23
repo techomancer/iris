@@ -152,8 +152,9 @@ fn the_safety_net_ends_a_hold_whatever_the_cycles() {
 }
 
 /// A boundary with nothing held and no hold to start takes no lock: before
-/// anyone has posted, once both of a pair have posted, and once both
-/// interfaces have published, a boundary passes while the state is locked.
+/// anyone has posted, once both of a pair have posted, and once the boundary
+/// after both interfaces published has ended the join, a boundary passes while
+/// the state is locked.
 #[test]
 fn a_boundary_with_nothing_to_do_takes_no_lock() {
     let rig = Rig::new(4);
@@ -167,10 +168,11 @@ fn a_boundary_with_nothing_to_do_takes_no_lock() {
     rig.hold.at_batch();
     drop(held);
     rig.publish(0xf0);
+    rig.hold.at_batch();
+    assert!(rig.hold.is_done());
     let held = rig.hold.state.lock();
     rig.hold.at_batch();
     drop(held);
-    assert!(rig.hold.is_done());
 }
 
 /// The first of a pair to post its liveness value after its join is held
@@ -268,4 +270,50 @@ fn a_poster_with_no_boundary_of_its_own_is_held_from_another() {
     rig.post(0);
     rig.hold.at_batch();
     assert!(rig.hold.held().is_empty() && !rig.parked(2));
+}
+
+/// Another processor's boundary can end the join between this one's reads and its lock. A hold
+/// started from the stale reads would outlive the join, and no bound would end it.
+#[test]
+fn a_join_ended_by_another_boundary_starts_no_hold() {
+    let rig = Rig::new(4);
+    let me: Arc<OnceLock<std::sync::Weak<PresenceHold>>> = Arc::default();
+    let (other, window, armed) = (me.clone(), rig.regs.clone(), AtomicBool::new(true));
+    // The first reading of the clock stands for that other boundary: PI0 publishes and the
+    // other processor's check runs.
+    let clock: Clock = Arc::new(move || {
+        if armed.swap(false, Ordering::SeqCst) {
+            assert_eq!(window.write64(regs::io::BASE + 0x150, 0xf0), BUS_OK);
+            other.get().and_then(|w| w.upgrade()).unwrap().at_batch();
+        }
+        0
+    });
+    let hold = PresenceHold::new(Population::populated_cpus(4).unwrap(), clock, &rig.hold.bedrock);
+    hold.set_processors(rig.slots.iter().zip(&rig.cycles).map(|(slot, c)| {
+        let c = c.clone();
+        Cpu { slot: slot.clone(), cycles: Box::new(move || c.load(Ordering::SeqCst)) }
+    }).collect());
+    assert!(me.set(Arc::downgrade(&hold)).is_ok());
+    rig.publish(0xc0);
+    hold.at_batch();
+    rig.cycles.iter().for_each(|c| c.store(HOLD_CYCLES, Ordering::SeqCst));
+    hold.at_batch();
+    assert!(hold.is_done());
+    assert!(hold.held().is_empty() && !rig.parked(1), "CPU 1 held after the join ended");
+}
+
+/// A hold another boundary has started but not yet marked in `holding` keeps
+/// the join open: the publisher is released once the other interface has
+/// published, not left parked under a finished join.
+#[test]
+fn the_join_does_not_end_under_a_hold_another_boundary_is_starting() {
+    let rig = Rig::new(4);
+    rig.publish(0x30);
+    rig.hold.state.lock().held[0] = Some(Held { kind: Kind::Publication, since: 0, progress: 0 });
+    rig.slots[0].hold(HOLD_RENDEZVOUS);
+    rig.publish(0xf0);
+    rig.hold.at_batch();
+    rig.hold.at_batch();
+    assert!(rig.hold.held().is_empty() && !rig.parked(0), "the publisher is released");
+    assert!(rig.hold.is_done());
 }

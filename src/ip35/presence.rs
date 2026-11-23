@@ -204,16 +204,21 @@ impl PresenceHold {
         let presence = self.bedrock.io.scratch0();
         let posted = self.bedrock.lb.rt_posted();
         let count = self.processors.count();
-        // Nothing held and nothing to start: no lock.
+        // Nothing held, nothing to start and the join not over: no lock.
         if !self.holding.load(Ordering::Acquire) && (0..count).all(|cpu| self.due(presence, posted, false, cpu).is_none()) {
             let all = (0..2).filter(|&i| self.populated(i)).all(|i| Self::published(presence, i));
-            if all && !self.done.swap(true, Ordering::Relaxed) {
-                dlog!(LogModule::Bedrock, "presence: the join is over");
+            if !all {
+                return;
             }
-            return;
         }
         let now = (self.clock)();
         let mut s = self.state.lock();
+        // Another boundary may have ended the join or moved the bits since the reads above. The
+        // join ends only under the lock, so no hold starts after it.
+        if self.done.load(Ordering::Relaxed) {
+            return;
+        }
+        let (presence, posted) = (self.bedrock.io.scratch0(), self.bedrock.lb.rt_posted());
         for held in 0..s.held.len() {
             let Some(hold) = s.held[held] else { continue };
             let satisfied = match hold.kind {
