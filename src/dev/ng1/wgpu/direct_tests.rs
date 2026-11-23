@@ -1347,6 +1347,22 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             assert_pixels_eq("first marked prefix", &first_pixels, &to_gpu(&expected_first));
             assert_pixels_eq("later draw", &second_pixels, &to_gpu(&expected_second));
 
+            // A frame with nothing new (a cut that timed out with the GFIFO
+            // full) shows the last GPU frame again, never the screen's
+            // planes, which the resident board does not keep.
+            struct NotReady;
+            impl crate::display::Head for NotReady {
+                fn changed(&self) -> bool { true }
+                fn compose(&self, _: &mut Rex3Screen, _: crate::display::Want) -> crate::display::Composed {
+                    crate::display::Composed::NotReady
+                }
+            }
+            // Past the heartbeat, which presents even with nothing new.
+            std::thread::sleep(std::time::Duration::from_nanos(crate::display::HEARTBEAT_NS + 10_000_000));
+            board.0.head.frame_now_as(&NotReady);
+            let again = outputs.lock().get(2).cloned().expect("the last GPU frame was shown again");
+            assert_pixels_eq("shown again", &read_presented(&mut staging, &again), &to_gpu(&expected_second));
+
             board.0.request_frame();
             let before_fence_race = board.0.head.screen().lock().frame_seq;
             let resize_count = resizes.lock().len();

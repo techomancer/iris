@@ -580,6 +580,11 @@ struct Slot {
     last_present_ns: u64,
     /// The screen holds the current frame (not only the GPU).
     cpu_frame: bool,
+    /// The frame on screen when it is on the board's GPU: shown again when
+    /// there is no new one (a heartbeat, or a capture that timed out). The
+    /// screen's planes are not that frame, and may not be kept at all.
+    #[cfg(feature = "wgpu")]
+    gpu_frame: Option<(wgpu::Buffer, u32, u32)>,
     /// `screen.rgba` holds the current frame.
     rgba_current: bool,
     /// A capture was refused: a change is waiting behind the frame on
@@ -679,6 +684,8 @@ impl Refresh {
             shown: false,
             last_present_ns: 0,
             cpu_frame: false,
+            #[cfg(feature = "wgpu")]
+            gpu_frame: None,
             rgba_current: false,
             waiting: false,
             reader: None,
@@ -1027,12 +1034,17 @@ impl Slot {
         let new_frame = match &composed {
             Composed::Frame => {
                 self.cpu_frame = true;
+                #[cfg(feature = "wgpu")]
+                {
+                    self.gpu_frame = None;
+                }
                 self.rgba_current = false;
                 true
             }
             #[cfg(feature = "wgpu")]
-            Composed::Gpu { .. } => {
+            Composed::Gpu { frame, width, height } => {
                 self.cpu_frame = false;
+                self.gpu_frame = Some((frame.clone(), *width, *height));
                 self.rgba_current = false;
                 true
             }
@@ -1112,6 +1124,13 @@ impl Slot {
                 Composed::Gpu { frame, width, height } => r.present_gpu_frame(
                     &frame, width, height, screen, &mut self.overlay, bar.pixels(),
                 ),
+                // No new frame and the one on screen is on the GPU: show it
+                // again (with a fresh bar), not the screen's planes.
+                #[cfg(feature = "wgpu")]
+                _ if !self.cpu_frame && self.gpu_frame.is_some() => {
+                    let (frame, width, height) = self.gpu_frame.as_ref().expect("checked");
+                    r.present_gpu_frame(frame, *width, *height, screen, &mut self.overlay, bar.pixels());
+                }
                 _ => {
                     let live = head.live_planes();
                     r.present(
