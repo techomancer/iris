@@ -37,6 +37,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   rates, on machines with or without a display), `ports` (every host socket
   iris listens on), and `watch <command>` to keep any command's answer
   updating on one line.
+- `screen hash` prints a blake3 of the composed screen on any machine with a
+  display, so two runs can be compared without a PNG.
 
 ### IMPACT texturing
 

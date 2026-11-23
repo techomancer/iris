@@ -478,6 +478,17 @@ impl HostInput {
     }
 }
 
+/// blake3 of a frame: width and height as little-endian `u32`s, then each
+/// pixel's red, green and blue bytes.
+fn frame_hash(w: usize, h: usize, px: &[u32]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(w as u32).to_le_bytes());
+    hasher.update(&(h as u32).to_le_bytes());
+    let rgb: Vec<u8> = px.iter().flat_map(|p| [*p as u8, (*p >> 8) as u8, (*p >> 16) as u8]).collect();
+    hasher.update(&rgb);
+    hasher.finalize().to_hex().to_string()
+}
+
 /// What a reply adds when its frame is not a fresh one.
 fn stale_note(fresh: bool) -> &'static str {
     if fresh { "" } else { " (an old frame: the display composed no new one in 250 ms)" }
@@ -530,7 +541,7 @@ fn num<T: std::str::FromStr>(args: &[&str], i: usize, what: &str) -> Result<T, S
     args.get(i).ok_or(format!("missing {what}"))?.parse().map_err(|_| format!("bad {what} '{}'", args[i]))
 }
 
-const SCREEN_HELP: &str = "screen info | screen cursor | screen shot <file.png> [x y w h] | screen pix <x> <y> | screen wait [quiet_ms] [timeout_ms]";
+const SCREEN_HELP: &str = "screen info | screen cursor | screen shot <file.png> [x y w h] | screen pix <x> <y> | screen hash | screen wait [quiet_ms] [timeout_ms]";
 const PTR_HELP: &str = "ptr pos | ptr move <x> <y> | ptr click <x> <y> [left|middle|right] [count] | ptr down|up [button] | ptr drag <x1> <y1> <x2> <y2> [button] | ptr rel <dx> <dy> | ptr calibrate";
 const KEY_HELP: &str = "key <name>[+<name>...] [down|up] | key type <text> | key names";
 
@@ -602,6 +613,11 @@ impl crate::traits::Device for HostInput {
                 }
                 let p = px[y * fw + x];
                 out(&mut w, format!("{x},{y} = {:02x}{:02x}{:02x}{}", p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff, stale_note(fresh)));
+                Ok(())
+            }
+            ("screen", "hash") => {
+                let (fw, fh, px, fresh) = self.frame()?;
+                out(&mut w, format!("{} {fw}x{fh}{}", frame_hash(fw, fh, &px), stale_note(fresh)));
                 Ok(())
             }
             ("screen", "wait") => {
@@ -731,6 +747,32 @@ mod tests {
         let display: Arc<dyn GfxDisplay> = Arc::new(crate::gfx_display::testing::FakeDisplay::new(4, 2, false));
         let hi = HostInput::new(Some(display), Arc::new(Ps2Controller::new(None)));
         assert!(hi.wait_still(Duration::from_millis(1), Duration::from_secs(5)).unwrap(), "a composed, unchanging screen is still");
+    }
+
+    /// Equal frames hash equal and one changed pixel changes the hash.
+    #[test]
+    fn screen_hash_follows_the_pixels() {
+        struct Out(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Out {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(b); Ok(b.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+            let display = Arc::new(crate::gfx_display::testing::FakeDisplay::new(4, 2, false));
+            let hi = HostInput::new(Some(display.clone() as Arc<dyn GfxDisplay>), Arc::new(Ps2Controller::new(None)));
+            let hash = || {
+                let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+                crate::traits::Device::execute_command(&hi, "screen", &["hash"], Box::new(Out(buf.clone()))).unwrap();
+                let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+                text.split_whitespace().next().unwrap().to_string()
+            };
+            let first = hash();
+            assert_eq!(first.len(), 64);
+            assert_eq!(hash(), first, "an unchanged screen hashes the same");
+            display.screen().lock().rgba[crate::disp::FB_STRIDE + 1] ^= 0x01;
+            assert_ne!(hash(), first, "one changed pixel changes it");
+            assert_ne!(frame_hash(4, 2, &[0; 8]), frame_hash(2, 4, &[0; 8]), "the size is part of the hash");
+        }).unwrap().join().unwrap();
     }
 
     #[test]
