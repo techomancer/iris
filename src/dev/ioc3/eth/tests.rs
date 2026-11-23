@@ -72,21 +72,16 @@ fn core_for(mem: Option<Arc<Mem>>) -> (Arc<Core>, Arc<Mutex<Vec<bool>>>) {
 
 /// A MAC behind the Octane's transceiver with a negotiation of `delay`.
 fn mac(core: &Arc<Core>, delay: Duration) -> Arc<Ioc3Eth> {
-    mac_on(core, delay, &stepped())
+    mac_on(core, delay, &crate::test_board::Stepped::new().tm)
 }
 
 fn mac_on(core: &Arc<Core>, delay: Duration, tm: &Arc<TimerManager>) -> Arc<Ioc3Eth> {
     Ioc3Eth::with_phy(core.clone(), STATION, Box::new(Ics1890::new(PHY_ADDR, delay)), tm)
 }
 
-/// A timer manager whose clock stands at 0 until a test steps it.
-fn stepped() -> Arc<TimerManager> {
-    Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped()))
-}
-
 /// A MAC with nothing behind it, for tests of its management port.
 fn standalone(phy: Box<dyn MiiPhy>) -> Arc<Ioc3Eth> {
-    Ioc3Eth::with_phy(core_for(None).0, STATION, phy, &stepped())
+    Ioc3Eth::with_phy(core_for(None).0, STATION, phy, &crate::test_board::Stepped::new().tm)
 }
 
 fn rig() -> Rig {
@@ -1032,7 +1027,7 @@ fn save_load_round_trip() {
     }
     let v1 = src.save_state();
     let (core, pin) = core_for(None);
-    let dst = Ioc3Eth::with_phy(core, STATION, Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)), &stepped());
+    let dst = Ioc3Eth::with_phy(core, STATION, Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)), &crate::test_board::Stepped::new().tm);
     dst.load_state(&v1).expect("load_state");
     assert_eq!(v1, dst.save_state());
     assert_eq!(pin.lock().unwrap().last(), Some(&true), "the loaded interrupt level is published");

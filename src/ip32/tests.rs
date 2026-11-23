@@ -429,7 +429,7 @@ fn audio_keeps_the_service_thread_polling_and_a_pass_moves_the_ring() {
     assert!(bus.service(), "a channel playing from a ring asks for the tight poll");
     // 10 ms at 8 kHz is 20 blocks.
     let passes = |bus: &Ip32Bus| { bus.service(); bus.read64(a + 0x48).data >= 0x280 };
-    assert!(crate::test_board::until(std::time::Duration::from_secs(60), || passes(&bus)), "the ring did not move");
+    assert!(crate::test_board::until(|| passes(&bus)), "the ring did not move");
 }
 
 fn sdma_reg(p: u32, reg: u32) -> u64 {

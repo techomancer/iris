@@ -13,6 +13,8 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use crate::clock::Clock;
+use crate::hptimer::TimerManager;
 use crate::traits::Device;
 
 pub(crate) struct TestBoard<T: Device>(Arc<T>);
@@ -41,9 +43,32 @@ impl<T: Device> Drop for TestBoard<T> {
     }
 }
 
-/// Wait up to `limit` for another thread to make `cond` true.
-pub(crate) fn until(limit: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let end = std::time::Instant::now() + limit;
+/// A timer manager on a stepped machine clock. Timers hold their manager
+/// weakly, so a test keeps this alive for as long as its devices run.
+#[derive(Clone)]
+pub(crate) struct Stepped {
+    pub tm: Arc<TimerManager>,
+    pub clock: Clock,
+}
+
+impl Stepped {
+    pub(crate) fn new() -> Self {
+        let clock = Clock::stepped();
+        Self { tm: Arc::new(TimerManager::with_clock(clock.clone())), clock }
+    }
+}
+
+impl Deref for Stepped {
+    type Target = Clock;
+    fn deref(&self) -> &Clock {
+        &self.clock
+    }
+}
+
+/// Wait for another thread to make `cond` true. The minute only catches a
+/// hang; a loaded host can starve a thread for seconds.
+pub(crate) fn until(mut cond: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !cond() {
         if std::time::Instant::now() >= end {
             return false;

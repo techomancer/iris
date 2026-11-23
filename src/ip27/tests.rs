@@ -21,7 +21,7 @@ fn flash(first: &[u8]) -> Arc<NodeFlash> {
 /// `window_nodes` nodes.
 fn board(count: usize, banks: [u32; BANKS], window_nodes: usize, boot: &Arc<NodeFlash>) -> Vec<Arc<Hub>> {
     let config = |n: usize| HubConfig { first_cpu: 2 * n, banks_mb: banks, nodes: window_nodes, ..Default::default() };
-    let hubs: Vec<_> = (0..count).map(|n| Hub::new(config(n), &Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::stepped())), Some(boot.chip())).unwrap()).collect();
+    let hubs: Vec<_> = (0..count).map(|n| Hub::new(config(n), &crate::test_board::Stepped::new().tm, Some(boot.chip())).unwrap()).collect();
     if let [a, b] = &hubs[..] {
         a.connect_peer(b);
         b.connect_peer(a);

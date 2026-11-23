@@ -166,9 +166,8 @@ fn the_pi_timer_wraps_and_pauses() {
     }
     {
         // The machine clock holds the counter and its deadline while the machine is stopped.
-        let clock = crate::clock::Clock::stepped();
-        let tm = Arc::new(crate::hptimer::TimerManager::with_clock(clock.clone()));
-        let chip = super::super::Bedrock::new(super::super::test_config(&tm)).unwrap();
+        let clock = crate::test_board::Stepped::new();
+        let chip = super::super::Bedrock::new(super::super::test_config(&clock.tm)).unwrap();
         let regs = chip.registers();
         let pending = || regs.read64(reg::RT_INT_PEND_A::OFFSET).data;
         chip.start();

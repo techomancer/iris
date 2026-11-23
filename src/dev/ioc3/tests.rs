@@ -21,6 +21,7 @@ use crate::traits::MachineEvent;
 use crate::pci::PciFunction;
 use crate::dev::ng1::rex3::Rex3;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::test_board::until;
 
 const MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 
@@ -95,7 +96,7 @@ impl PciDma for TestMem {
 
 /// The Octane's IOC3, as the machine builds it but for the records.
 fn octane() -> Ioc3 {
-    octane_on(&Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped())))
+    octane_on(&crate::test_board::Stepped::new().tm)
 }
 
 fn octane_on(tm: &Arc<TimerManager>) -> Ioc3 {
@@ -117,7 +118,7 @@ impl Rig {
     }
 
     fn with(make: impl FnOnce(&Arc<TimerManager>) -> Ioc3) -> Rig {
-        Rig::on(Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped())), make)
+        Rig::on(crate::test_board::Stepped::new().tm, make)
     }
 
     fn on(tm: Arc<TimerManager>, make: impl FnOnce(&Arc<TimerManager>) -> Ioc3) -> Rig {
@@ -1789,9 +1790,8 @@ fn rtc_offset_starts_a_clock_with_no_reference() {
 
 /// A running chip with a timer manager, for the tests where nothing touches
 /// a register while the chip works.
-fn running_rig() -> (Rig, Arc<TimerManager>) {
-    let tm = Arc::new(TimerManager::with_clock(crate::clock::Clock::new()));
-    (Rig::on(tm.clone(), octane_on), tm)
+fn running_rig() -> Rig {
+    Rig::on(Arc::new(TimerManager::with_clock(crate::clock::Clock::new())), octane_on)
 }
 
 /// Whether a timer is pending for deadline `kind`, read while no timer
@@ -1808,7 +1808,7 @@ fn timer_pending(r: &Rig, kind: usize) -> bool {
 /// a timer runs the expiry. This guards the removal of the polling thread.
 #[test]
 fn the_receive_timer_fires_with_no_guest_access() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.aim_engines();
     r.w32(reg::SDMA_RING_LO, 0x2000 | 1);
     r.w32(A + sdma_off::RX_TIMER, 0x100);
@@ -1817,7 +1817,7 @@ fn the_receive_timer_fires_with_no_guest_access() {
     r.w32(reg::INT_ENABLE_SET, int::serial(0, int::RX_TIMER));
     r.c.start();
     r.wire[0].inp.lock().unwrap().extend(b"hi");
-    assert!(eventually(|| r.superio.level()), "the expiry raised the line");
+    assert!(until(|| r.superio.level()), "the expiry raised the line");
     // `int_status` is a plain read of the latch: it catches nothing up.
     assert_ne!(r.c.int_status() & int::serial(0, int::RX_TIMER), 0);
     assert_eq!(&get(&r, 0x3000, 2), b"hi");
@@ -1834,14 +1834,14 @@ fn a_uart_receive_timeout_comes_from_a_timer() {
     r.w8(reg::SERIAL_A + 1, 1);
     r.c.start();
     r.wire[0].inp.lock().unwrap().push_back(b'x');
-    assert!(eventually(|| r.c.sh.deadlines()[K_UART].is_some()), "the receive thread took the character");
+    assert!(until(|| r.c.sh.deadlines()[K_UART].is_some()), "the receive thread took the character");
     let due = r.c.sh.deadlines()[K_UART].unwrap();
     assert_eq!(due, r.c.sh.sio.as_ref().unwrap().lock().uart[0].core.char_time().as_nanos() as u64 * 4);
     r.clock.step(due - 1);
     let passthrough = || r.c.int_status() & int::serial(0, int::PASSTHROUGH) != 0;
     assert!(timer_pending(&r, K_UART) && !passthrough());
     r.clock.step(1);
-    assert!(eventually(passthrough), "the timer raised the source");
+    assert!(until(passthrough), "the timer raised the source");
     r.c.stop();
 }
 
@@ -1849,11 +1849,11 @@ fn a_uart_receive_timeout_comes_from_a_timer() {
 /// read.
 #[test]
 fn the_interrupt_output_pulses_with_no_guest_access() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.c.start();
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 100);
-    assert!(eventually(|| r.superio.level()));
+    assert!(until(|| r.superio.level()));
     assert_ne!(r.c.int_status() & int::RT_OUTPUT_PULSE, 0);
     r.c.stop();
 }
@@ -1862,7 +1862,7 @@ fn the_interrupt_output_pulses_with_no_guest_access() {
 /// a timer.
 #[test]
 fn a_transmit_delay_ends_with_no_guest_access() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.aim_engines();
     r.w32(reg::SDMA_RING_LO, 0x2000 | 1);
     r.c.start();
@@ -1877,16 +1877,8 @@ fn a_transmit_delay_ends_with_no_guest_access() {
         r.w32(A + sdma_off::TX_PRODUCE, 8);
         assert!(!r.superio.level(), "the delay has not ended inside the write");
     }
-    assert!(eventually(|| r.superio.level()));
+    assert!(until(|| r.superio.level()));
     r.c.stop();
-}
-
-/// Poll `done` until it holds, giving up after a minute. The timer and the
-/// NVRAM writer run on other threads and the suite runs many tests at once, so
-/// a bound counted in milliseconds gives up on a busy host before either has
-/// had a core; the deadline only has to catch a write that never comes.
-fn eventually(done: impl FnMut() -> bool) -> bool {
-    crate::test_board::until(Duration::from_secs(60), done)
 }
 
 /// A guest write to the clock's RAM leaves the file alone: it only marks the
@@ -1898,7 +1890,7 @@ fn eventually(done: impl FnMut() -> bool) -> bool {
 fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
     let dir = TempPath::dir("ioc3-nvram-perbyte");
     let path = dir.join("nvram");
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.c.rtc().set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
     assert_eq!(std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5], 0, "not written per byte");
@@ -1911,12 +1903,12 @@ fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
 fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
     let dir = TempPath::dir("ioc3-nvram-timer");
     let path = dir.join("nvram");
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.c.rtc().set_nvram_file(&path).unwrap();
     r.c.start();
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).map(|f| f[NVRAM_OFF_NV + 5]).unwrap_or(0);
-    assert!(eventually(|| in_file() == 0x66), "the writer saved the RAM");
+    assert!(until(|| in_file() == 0x66), "the writer saved the RAM");
     r.c.stop();
 }
 
@@ -1924,7 +1916,7 @@ fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
 /// them back, and both can be repeated.
 #[test]
 fn stop_joins_the_threads_and_removes_the_timers() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     assert!(!r.c.is_running());
     r.c.start();
     r.c.start();
@@ -1933,7 +1925,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert!(r.c.rtc().is_running(), "and the clock's NVRAM writer");
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
-    assert!(eventually(|| timer_pending(&r, K_INT_OUT)));
+    assert!(until(|| timer_pending(&r, K_INT_OUT)));
     r.c.stop();
     r.c.stop();
     assert!(!r.c.is_running());
@@ -1946,9 +1938,9 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert_eq!(r.wire[0].inp.lock().unwrap().len(), 1);
     assert!(r.c.rx_pending(0) == 0);
     r.c.start();
-    assert!(eventually(|| r.c.rx_pending(0) != 0));
+    assert!(until(|| r.c.rx_pending(0) != 0));
     // A periodic output shows no timer between its host timer firing and the callback taking `gate`.
-    assert!(eventually(|| timer_pending(&r, K_INT_OUT)), "start arms the deadlines the chip holds");
+    assert!(until(|| timer_pending(&r, K_INT_OUT)), "start arms the deadlines the chip holds");
     r.c.stop();
 }
 
@@ -1956,13 +1948,13 @@ fn stop_joins_the_threads_and_removes_the_timers() {
 /// middle of re-arming it, however often the callbacks run.
 #[test]
 fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.c.start();
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
     for _ in 0..20_000 {
         // The timer shows none between its host timer firing and the callback taking `gate`.
-        assert!(eventually(|| timer_pending(&r, K_INT_OUT)));
+        assert!(until(|| timer_pending(&r, K_INT_OUT)));
     }
     r.c.stop();
 }
@@ -1974,7 +1966,7 @@ fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
 /// deadline back, or a timer for an output the write had just cleared.
 #[test]
 fn a_pass_that_read_the_chip_first_arms_first() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.c.start();
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     let sh = &r.c.sh;
@@ -2009,7 +2001,7 @@ fn a_pass_that_read_the_chip_first_arms_first() {
 /// Dropping a running chip joins its threads; they hold it only weakly.
 #[test]
 fn dropping_a_running_chip_ends_its_threads() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.c.start();
     let weak = Arc::downgrade(&r.c.sh);
     drop(r);
@@ -2232,7 +2224,7 @@ fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
 /// A reset racing the receive thread must not leave the UART's bit latched.
 #[test]
 fn a_reset_racing_the_receive_thread_leaves_no_stale_interrupt() {
-    let (r, _tm) = running_rig();
+    let r = running_rig();
     r.w32(reg::INT_ENABLE_SET, int::SERIAL_A);
     r.c.start();
     let rx: Vec<_> = r.c.threads.lock().iter().map(|t| t.thread().clone()).collect();

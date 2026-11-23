@@ -470,7 +470,7 @@ mod tests {
 
     /// The controller inside a chip of its own, with the views the node hands
     /// out.
-    struct TestMd(Arc<Bedrock>, crate::clock::Clock);
+    struct TestMd(Arc<Bedrock>, crate::test_board::Stepped);
     impl std::ops::Deref for TestMd {
         type Target = Md;
         fn deref(&self) -> &Md {
@@ -486,9 +486,8 @@ mod tests {
         }
         /// A chip whose remap parks the processors of `world`.
         fn with_world(banks: &[u32], world: Arc<crate::cpu::smp::World>) -> Result<Arc<Self>, String> {
-            let clock = crate::clock::Clock::stepped();
-            let timers = Arc::new(crate::hptimer::TimerManager::with_clock(clock.clone()));
-            let chip = Bedrock::new(BedrockConfig { banks_mib: banks, ..super::super::test_config(&timers) })?;
+            let clock = crate::test_board::Stepped::new();
+            let chip = Bedrock::new(BedrockConfig { banks_mib: banks, ..super::super::test_config(&clock.tm) })?;
             chip.decode.set_world(world);
             Ok(Arc::new(Self(chip, clock)))
         }

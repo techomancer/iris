@@ -521,7 +521,7 @@ impl Gate {
 
     fn wait_for(&self, counter: &AtomicU32, n: u32) {
         assert!(
-            crate::test_board::until(Duration::from_secs(10), || counter.load(Ordering::Acquire) >= n),
+            crate::test_board::until(|| counter.load(Ordering::Acquire) >= n),
             "the device did not get there"
         );
     }

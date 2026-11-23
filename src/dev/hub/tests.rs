@@ -67,14 +67,9 @@ impl BusDevice for Bytes {
 
 const RAM_SIZE: usize = 1 << 20;
 
-/// A timer manager on a clock that never moves.
-fn stepped() -> Arc<crate::hptimer::TimerManager> {
-    Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::stepped()))
-}
-
 /// A Hub with one 1 MiB bank, byte `i` of which holds `seed ^ i`.
 fn seeded(cfg: HubConfig, seed: u8) -> Arc<Hub> {
-    let hub = Hub::new(HubConfig { banks_mb: [1, 0, 0, 0], nodes: 2, ..cfg }, &stepped(), None).unwrap();
+    let hub = Hub::new(HubConfig { banks_mb: [1, 0, 0, 0], nodes: 2, ..cfg }, &crate::test_board::Stepped::new().tm, None).unwrap();
     let bank = &hub.decode.physical().banks()[0];
     for i in (0..RAM_SIZE as u64).step_by(8) {
         bank.write64(i, u64::from_be_bytes(std::array::from_fn(|b| seed ^ (i as u8).wrapping_add(b as u8))));
@@ -629,9 +624,8 @@ fn the_interrupt_target_sets_and_clears_pending_bits_by_vector() {
 
 #[test]
 fn the_hub_is_a_device_whose_counter_is_its_clock() {
-    let clock = crate::clock::Clock::stepped();
-    let tm = Arc::new(crate::hptimer::TimerManager::with_clock(clock.clone()));
-    let hub = Hub::new(HubConfig::default(), &tm, None).unwrap();
+    let clock = crate::test_board::Stepped::new();
+    let hub = Hub::new(HubConfig::default(), &clock.tm, None).unwrap();
     assert!(!hub.is_running());
     hub.start();
     assert!(hub.is_running());

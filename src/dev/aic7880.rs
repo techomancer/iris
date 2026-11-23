@@ -2512,18 +2512,6 @@ mod tests {
         assert_eq!(c.execute_on(&[0x03, 0, 0, 0, 14, 0], 1).0.len(), 14);
     }
 
-    /// Wait up to five seconds for the worker to make `done` true.
-    fn eventually(done: impl Fn() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        done()
-    }
-
     /// With its own thread the controller runs what is queued without the
     /// writer waiting for it, and posts results the way it does inline.
     #[test]
@@ -2539,7 +2527,7 @@ mod tests {
         assert!(c.is_running());
         c.write(reg::QINFIFO, 0, 1);
         c.write(reg::QINFIFO, 1, 1);
-        assert!(eventually(|| c.totals().0 == 2 && qout(&ram)[3] == 1), "both commands complete");
+        assert!(crate::test_board::until(|| c.totals().0 == 2 && qout(&ram)[3] == 1), "both commands complete");
         assert_eq!(qout(&ram)[7], 0, "in the order queued");
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
         assert!(irq.level(), "the worker drives the pin");
@@ -2563,7 +2551,7 @@ mod tests {
         assert_eq!(c.read(reg::QINCNT, 1), 1, "still queued");
         assert_eq!(c.totals().0, 0, "nothing ran");
         c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
-        assert!(eventually(|| qout(&ram)[7] == 1), "it runs once unpaused");
+        assert!(crate::test_board::until(|| qout(&ram)[7] == 1), "it runs once unpaused");
         c.stop();
     }
 

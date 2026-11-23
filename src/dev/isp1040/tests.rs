@@ -82,7 +82,7 @@ impl Rig {
 
     /// Like `with_disk`, on a clock the test steps.
     fn stepped(name: &str, id: u8, blocks: usize) -> Rig {
-        let tm = Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped()));
+        let tm = crate::test_board::Stepped::new().tm;
         let r = Rig::on(Isp1040::new_at(0, Isp1040::new_bus(), &tm));
         r.disk(name, id, blocks);
         r
@@ -2826,18 +2826,13 @@ fn a_snapshot_without_its_deadlines_is_refused() {
 }
 
 // ---- the hold-off on the real clock, and thread timing ----
-/// How long a real-clock test waits for a completion it has every reason
-/// to expect. Only a lost wake-up runs it out, and that hangs for good, so
-/// the bound can be long enough for a loaded host.
-const WAIT: Duration = Duration::from_secs(60);
-
 /// Wait for `cond`, and fail the test, not hang it, if it never holds.
 fn spin_until(what: &str, cond: impl Fn() -> bool) {
-    assert!(crate::test_board::until(WAIT, cond), "timed out waiting for {what}");
+    assert!(crate::test_board::until(cond), "timed out waiting for {what}");
 }
 
-fn wait_resp<P: IspPart>(r: &Rig<P>, n: u16, max: Duration) -> bool {
-    crate::test_board::until(max, || r.r(reg::RESPONSE_QUEUE) >= n)
+fn wait_resp<P: IspPart>(r: &Rig<P>, n: u16) -> bool {
+    crate::test_board::until(|| r.r(reg::RESPONSE_QUEUE) >= n)
 }
 
 #[test]
@@ -2856,7 +2851,7 @@ fn a_hold_on_the_real_clock_releases_without_a_poke() {
     if t.elapsed() < Duration::from_millis(1000) {
         assert_eq!(posted, 0, "released early {:?}", t.elapsed());
     }
-    assert!(wait_resp(&r, 1, WAIT), "never released");
+    assert!(wait_resp(&r, 1), "never released");
     assert!(t.elapsed() >= Duration::from_millis(990), "released early {:?}", t.elapsed());
 }
 
@@ -2887,7 +2882,7 @@ fn on_the_real_clock_an_absent_target_waits_hold_plus_timeout_and_a_reset_retire
     let t = std::time::Instant::now();
     bus_reset(&r, 1, 0);
     queue_absent(&r, 0, 0x43);
-    assert!(wait_resp(&r, 1, WAIT));
+    assert!(wait_resp(&r, 1));
     assert!(t.elapsed() >= Duration::from_millis(1240), "{:?}", t.elapsed());
     // a long hold, then a second reset ends it promptly
     bus_reset(&r, 600, 0);
@@ -2895,7 +2890,7 @@ fn on_the_real_clock_an_absent_target_waits_hold_plus_timeout_and_a_reset_retire
     r.doorbell(2);
     std::thread::sleep(Duration::from_millis(100));
     bus_reset(&r, 0, 0);
-    assert!(wait_resp(&r, 2, WAIT));
+    assert!(wait_resp(&r, 2));
     assert_eq!(g16(&r.status(1), 10), IOCB_RESET);
 }
 

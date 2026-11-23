@@ -1132,15 +1132,14 @@ pub(crate) mod tests {
     /// stop keeps the deadline, and a load drops the character in flight.
     #[test]
     fn transmit_is_paced_by_a_timer_on_the_machine_clock() {
-        let clock = crate::clock::Clock::stepped();
-        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
-        let scc = Z85c30::new(None, &tm);
+        let clock = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &clock.tm);
         let out = Arc::new(CiSerialBackend::new());
         scc.set_backend_b(out.clone());
         scc.write_b_control(scc_regs::WR5);
         scc.write_b_control(wr5::TX_ENABLE);
         scc.start();
-        let sent = |n: usize| crate::test_board::until(Duration::from_secs(60), || out.drain_guest().len() >= n);
+        let sent = |n: usize| crate::test_board::until(|| out.drain_guest().len() >= n);
         scc.write_b_data(b'a');
         let due = scc.tx[1].timer.due().expect("the character is on the line");
         clock.step(due - 1);
@@ -1163,9 +1162,8 @@ pub(crate) mod tests {
     /// burst stays on the baud grid.
     #[test]
     fn a_late_timer_does_not_slow_a_burst() {
-        let clock = crate::clock::Clock::stepped();
-        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
-        let scc = Z85c30::new(None, &tm);
+        let clock = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &clock.tm);
         scc.set_backend_b(Arc::new(CiSerialBackend::new()));
         scc.write_b_control(scc_regs::WR5);
         scc.write_b_control(wr5::TX_ENABLE);
@@ -1175,7 +1173,7 @@ pub(crate) mod tests {
         let first = scc.tx[1].timer.due().unwrap();
         let char_ns = scc.channel_b.lock().tx_delay * 1000;
         clock.step(first + char_ns / 2 - clock.now());
-        assert!(crate::test_board::until(Duration::from_secs(60), || scc.tx[1].timer.due() == Some(first + char_ns)),
+        assert!(crate::test_board::until(|| scc.tx[1].timer.due() == Some(first + char_ns)),
             "the second character ends one character time after the first, not after the late fire");
         scc.stop();
     }

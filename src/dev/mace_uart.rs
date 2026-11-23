@@ -296,15 +296,14 @@ pub(crate) mod tests {
     #[test]
     fn the_receive_timeout_runs_on_a_timer_on_the_machine_clock() {
         use crate::clock::Clock;
-        let clock = Clock::stepped();
-        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+        let clock = crate::test_board::Stepped::new();
         let reg = |n: u32| MACE_COM0 as u64 + ((n as u64) << 8) + 7;
         let armed = |u: &MaceUart| {
             u.write8(reg(com_reg::IIR_FCR), 0x81);
             u.write8(reg(com_reg::IER), com_reg::IER_RX);
             u.feed(b"x");
         };
-        let u = MaceUart::new(&tm);
+        let u = MaceUart::new(&clock.tm);
         let (probe, line) = LevelProbe::line();
         u.connect_irq(line);
         armed(&u);
@@ -314,9 +313,9 @@ pub(crate) mod tests {
         clock.step(due - 1);
         assert!(!probe.level(), "not before the deadline");
         clock.step(1);
-        assert!(crate::test_board::until(Duration::from_secs(60), || probe.level()), "the timer raised the cause");
+        assert!(crate::test_board::until(|| probe.level()), "the timer raised the cause");
 
-        let held = MaceUart::new(&tm);
+        let held = MaceUart::new(&clock.tm);
         let (probe, line) = LevelProbe::line();
         held.connect_irq(line);
         armed(&held);
@@ -325,9 +324,9 @@ pub(crate) mod tests {
         clock.step(held.timer.due().unwrap() - held.timer.now());
         assert!(!probe.level() && held.timer.due().is_some(), "a stopped timer keeps its deadline and does not fire");
         held.start();
-        assert!(crate::test_board::until(Duration::from_secs(60), || probe.level()), "start arms it again");
+        assert!(crate::test_board::until(|| probe.level()), "start arms it again");
 
-        let (src, dst) = (MaceUart::new(&tm), MaceUart::new(&tm));
+        let (src, dst) = (MaceUart::new(&clock.tm), MaceUart::new(&clock.tm));
         armed(&src);
         dst.load_state(&src.save_state()).unwrap();
         assert_eq!(dst.timer.due(), dst.core().timeout_due());

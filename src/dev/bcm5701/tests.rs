@@ -2073,7 +2073,7 @@ fn the_receive_thread_delivers_and_publishes_on_its_own() {
     rig.inject.push(frame.clone()).unwrap();
     rig.dev.wake_rx();
     rig.rx_post_std(1);
-    crate::test_board::until(Duration::from_secs(5), || rig.status_rx_prod() == 1);
+    crate::test_board::until(|| rig.status_rx_prod() == 1);
     Device::stop(&*rig.dev);
     assert!(!Device::is_running(&*rig.dev));
     assert_eq!(rig.status_rx_prod(), 1);
@@ -2090,7 +2090,7 @@ fn a_coalescing_update_is_posted_with_no_access() {
     Device::start(&*rig.dev);
     rig.tx_open(64, 8, 50);
     rig.tx_send_one(0, &broadcast(64, 3), 0);
-    crate::test_board::until(Duration::from_secs(5), || rig.status_tag() == 1);
+    crate::test_board::until(|| rig.status_tag() == 1);
     Device::stop(&*rig.dev);
     assert_eq!(rig.status_tag(), 1);
 }

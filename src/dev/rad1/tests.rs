@@ -318,6 +318,7 @@ fn unrecognised_accesses_read_zero_and_store_nothing() {
 use crate::pci::PciDmaStatus;
 
 use crate::pci::testing::FlatMem as Ram;
+use crate::test_board::until;
 
 fn dma_card() -> (Rad1, Arc<Ram>) {
     dma_card_on(stepped())
@@ -646,7 +647,7 @@ fn the_clock_stands_still_while_paused() {
     clock.start();
     r.resume();
     let mut ticks = 0;
-    assert!(eventually(|| {
+    assert!(until(|| {
         ticks = rd(&r, 0x30).wrapping_sub(ust);
         ticks > 0
     }), "the clock runs again after the resume");
@@ -671,17 +672,9 @@ fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
     (r, ram, tm)
 }
 
-/// Poll `done` until it holds, giving up after a minute. Timer callbacks run
-/// on another thread and the suite runs many cards at once, so a wait counted
-/// in sleeps or milliseconds gives up on a busy host before the callback has
-/// had a core; the deadline only has to catch a callback that never comes.
-fn eventually(done: impl FnMut() -> bool) -> bool {
-    crate::test_board::until(Duration::from_secs(60), done)
-}
-
 /// Poll the schedule's own counter, which no guest register read touches.
 fn wait_done(r: &Rad1, n: u64) -> bool {
-    eventually(|| r.state.lock().status_done >= n)
+    until(|| r.state.lock().status_done >= n)
 }
 
 /// A started status schedule delivers completions from the timer with no
@@ -738,7 +731,7 @@ fn the_output_pump_runs_only_while_the_channel_does() {
     wr(&r, 0x58, 0x2000_0001);
     assert!(r.state.lock().audio_timer.is_some());
     // The pump moves frames the guest never asked about.
-    assert!(eventually(|| r.state.lock().chan[CH_OUT].frames > 0), "the pump never ran");
+    assert!(until(|| r.state.lock().chan[CH_OUT].frames > 0), "the pump never ran");
     Device::stop(&r);
     assert!(r.state.lock().audio_timer.is_none(), "stop removes it");
     Device::start(&r);
@@ -1605,7 +1598,7 @@ fn a_tone_reaches_a_file_through_the_real_pump() {
     start_ust(&r);
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
-    assert!(crate::test_board::until(Duration::from_secs(60), || r.state.lock().chan[CH_OUT].frames >= 8820), "the pump never moved the ring");
+    assert!(until(|| r.state.lock().chan[CH_OUT].frames >= 8820), "the pump never moved the ring");
     // The frames played before the DAC mute are counted in the same step.
     let loud = {
         let _tick = r.tick_pass.lock();

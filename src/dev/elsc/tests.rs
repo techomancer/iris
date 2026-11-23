@@ -54,7 +54,7 @@ pub(crate) struct TestClock(Arc<TimerManager>, Arc<Mutex<Vec<Box<dyn Fn() + Send
 
 impl Default for TestClock {
     fn default() -> Self {
-        Self(Arc::new(TimerManager::with_clock(crate::clock::Clock::stepped())), Default::default())
+        Self(crate::test_board::Stepped::new().tm, Default::default())
     }
 }
 
