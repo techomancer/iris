@@ -8,7 +8,7 @@ use crate::dev::bedrock::{self, Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::hub::{self, regs as hub_regs, Hub, HubConfig};
 use crate::dev::node_flash::{FlashValues, NodeFlash};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::l1::{L1, L1Config};
 use crate::ip35::node::NodeSpec;
 use crate::sn::{NodeBoard, IO_REGISTERS_LOCAL, IO_REGISTERS_NAMED};
@@ -28,7 +28,7 @@ fn bench_node_register_paths() {
 
     // IP27: one Hub node with a 128 MiB bank, and two joined as the IP27 machine joins them, the
     // second numbered 1.
-    let clock: Clock = Arc::new(|| 0);
+    let clock = Clock::stepped();
     let tm = Arc::new(crate::hptimer::TimerManager::new());
     let prom = super::tests::prom();
     let hub_spec = |index: usize, nodes| crate::ip27::NodeSpec {

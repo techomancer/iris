@@ -327,7 +327,7 @@ impl OctaneMachine {
         // Memory, and HEART, whose descriptors place it.
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
         let mem = ram.dma_view();
-        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().reader()));
+        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().clone()));
         // HEART's MicroLAN holds the processor module's record.
         let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
         heart.set_microlan(identity.processor.bus());

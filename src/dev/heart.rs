@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::clock::Clock;
 use crate::cpu::smp::{current_cpu, ParkSlot, HOLD_HEART, MAX_CPUS};
 use crate::dev::w1;
 use crate::devlog::LogModule;
@@ -189,10 +190,6 @@ impl HeartConfig {
     }
 }
 
-/// Nanoseconds from some fixed point, for the counter and the MicroLAN slot
-/// timing: the machine clock's [`reader`](crate::clock::Clock::reader).
-pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
-
 pub struct Heart {
     regs: Mutex<Regs>,
     cfg: HeartConfig,
@@ -221,7 +218,7 @@ pub struct Heart {
 
 impl Heart {
     pub fn new(cfg: HeartConfig, clock: Clock) -> Self {
-        let now = clock();
+        let now = clock.now();
         Self {
             regs: Mutex::new(Regs::new(now)),
             cfg,
@@ -396,11 +393,11 @@ impl Heart {
         r.onewire_control = command & !(ONEWIRE_DONE | ONEWIRE_LEVEL);
         r.onewire_level = w1::slot::slot(&mut self.mlan.lock(), pulse, sample);
         r.onewire_busy = true;
-        r.onewire_deadline_ns = (self.clock)() + (pulse + sample) as u64 * 1000;
+        r.onewire_deadline_ns = self.clock.now() + (pulse + sample) as u64 * 1000;
     }
 
     fn onewire_refresh(&self, r: &mut Regs) {
-        if r.onewire_busy && (self.clock)() >= r.onewire_deadline_ns {
+        if r.onewire_busy && self.clock.now() >= r.onewire_deadline_ns {
             r.onewire_busy = false;
             r.onewire_control |= ONEWIRE_DONE;
             if r.onewire_level {
@@ -448,7 +445,7 @@ impl Heart {
                 // The reader's own mask: a CPU services what it enabled.
                 0x10038 => Some(r.pending & r.mask[current_cpu()]),
                 0x10040 => Some(r.ecc_cause),
-                COUNTER => Some(r.counter((self.clock)())),
+                COUNTER => Some(r.counter(self.clock.now())),
                 0x30000 => Some(r.compare as u64),
                 // Who is asking.
                 0x50000 => Some(current_cpu() as u64),
@@ -624,7 +621,7 @@ impl Heart {
 
     /// The counter, for the monitor.
     pub fn counter(&self) -> u64 {
-        self.regs.lock().counter((self.clock)())
+        self.regs.lock().counter(self.clock.now())
     }
 
     /// The register block `addr` (a full physical address) falls in: the
@@ -651,7 +648,7 @@ impl Heart {
                 // The counter is read too often to log every read; one in
                 // COUNTER_SAMPLE, with the host's clock, shows its rate.
                 crate::devlog::devlog().write(LogModule::Heart, format_args!("heart: counter read -> {:#x} at host {} ns (1 in {COUNTER_SAMPLE})",
-                    v.unwrap_or(0), (self.clock)()));
+                    v.unwrap_or(0), self.clock.now()));
             }
         }
         v
@@ -721,7 +718,7 @@ impl BusDevice for Heart {
 /// it is reachable until the PROM (or the machine) sets them again.
 impl crate::traits::Resettable for Heart {
     fn power_on(&self) {
-        let now = (self.clock)();
+        let now = self.clock.now();
         let mut r = self.regs.lock();
         let at = now;
         let out = r.out;
@@ -772,7 +769,7 @@ impl crate::traits::Device for Heart {
                     r.pending,
                     r.mask[0],
                     r.out[0],
-                    r.counter((self.clock)()),
+                    r.counter(self.clock.now()),
                     self.packets.load(Ordering::Relaxed)
                 );
                 let park = self.cpu_park.lock();
@@ -817,7 +814,7 @@ impl crate::traits::Device for Heart {
 // descriptors.
 impl Saveable for Heart {
     fn save_state(&self) -> toml::Value {
-        let now = (self.clock)();
+        let now = self.clock.now();
         let r = self.regs.lock();
         let elapsed = now.saturating_sub(r.epoch_ns);
         StateTable::new()
@@ -846,7 +843,7 @@ impl Saveable for Heart {
         let [widget_control, widget_request_timeout, widget_error_mask] = field_u32s::<3>(v, "widget")?;
         let phase = field_u64(v, "phase")?;
         self.mlan.lock().load_state(field(v, "microlan")?).map_err(|e| format!("MicroLAN: {e}"))?;
-        let now = (self.clock)();
+        let now = self.clock.now();
         let mut r = self.regs.lock();
         let old_mode = r.mode;
         let out = r.out;
@@ -900,7 +897,7 @@ mod tests {
 
     fn heart() -> Fixture {
         let clock = crate::clock::Clock::stepped();
-        let heart = Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), clock.reader());
+        let heart = Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), clock.clone());
         Fixture { heart, clock }
     }
 
@@ -923,7 +920,7 @@ mod tests {
     fn two_cpu_heart() -> TwoCpus {
         let mut cfg = HeartConfig::octane([128 << 20, 0, 0, 0]);
         cfg.cpus = 2;
-        let h = Heart::new(cfg, Arc::new(|| 0));
+        let h = Heart::new(cfg, Clock::stepped());
         let words = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
         let slots = [Arc::new(ParkSlot::new(0, &words[0])), Arc::new(ParkSlot::new(1, &words[1]))];
         for cpu in 0..2 {

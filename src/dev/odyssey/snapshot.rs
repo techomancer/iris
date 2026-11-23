@@ -275,7 +275,7 @@ mod tests {
     fn board(product: &str) -> Arc<Odyssey> {
         let heart = Arc::new(Heart::new(
             HeartConfig::octane([128 << 20, 0, 0, 0]),
-            crate::clock::Clock::new().reader(),
+            crate::clock::Clock::new(),
         ));
         let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
         Odyssey::new(
@@ -509,7 +509,7 @@ mod tests {
     fn gpu_restore_reseeds_authoritative_memory() {
         let heart = Arc::new(Heart::new(
             HeartConfig::octane([128 << 20, 0, 0, 0]),
-            crate::clock::Clock::new().reader(),
+            crate::clock::Clock::new(),
         ));
         let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
         let vpro = match Odyssey::new(

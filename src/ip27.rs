@@ -43,7 +43,7 @@ use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
 use crate::dev::bridge::Bridge;
 use crate::dev::elsc::ModuleOutput;
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::hub::{Hub, HubConfig};
 use crate::sn::{BoardIo, Machine, NodeBoard, UncachedBus, UncachedSpace, RESET_WINDOW};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
@@ -207,7 +207,7 @@ pub fn machine(
         .bytes;
     let specs = node_specs(cfg)?;
     let timers = Arc::new(TimerManager::new());
-    let clock = timers.clock().reader();
+    let clock = timers.clock().clone();
     let mut nodes = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
         let node = NodeBoard::<Hub, NodeFlash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, i, &prom, &timers)?;

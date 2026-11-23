@@ -25,7 +25,7 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::w1::{self, Bus};
 use crate::devlog::LogModule;
 use crate::physical::{BankMapping, Physical, RamBank};
@@ -260,7 +260,7 @@ impl Md {
 
     fn mlan_value(&self, s: &State) -> u64 {
         match s.deadline {
-            Some(at) if (self.clock)() >= at => s.mlan | MLAN_DONE | if s.level { MLAN_RX } else { 0 },
+            Some(at) if self.clock.now() >= at => s.mlan | MLAN_DONE | if s.level { MLAN_RX } else { 0 },
             _ => s.mlan,
         }
     }
@@ -318,7 +318,7 @@ impl Md {
                     Some(bus) => w1::slot::slot(bus, pulse, sample),
                     None => pulse >= w1::slot::RESET_PULSE || pulse < w1::slot::ONE_PULSE,
                 };
-                s.deadline = Some((self.clock)().saturating_add(MLAN_SLOT_NS));
+                s.deadline = Some(self.clock.now().saturating_add(MLAN_SLOT_NS));
             }
             reg::MD_PERF_CNT0::OFFSET => self.state.lock().perf_cnt0 = value & PERF_MASK,
             reg::MD_LED0::OFFSET | reg::MD_LED1::OFFSET | reg::MD_UREG1_0::OFFSET | reg::MD_UREG1_4::OFFSET => {

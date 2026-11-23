@@ -31,7 +31,7 @@ use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::CpuDevice;
 use crate::cpu::smp::{ParkSlot, HOLD_RENDEZVOUS};
 use crate::dev::bedrock::{Bedrock, Population};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::devlog::LogModule;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -211,7 +211,7 @@ impl PresenceHold {
                 return;
             }
         }
-        let now = (self.clock)();
+        let now = self.clock.now();
         let mut s = self.state.lock();
         // Another boundary may have ended the join or moved the bits since the reads above. The
         // join ends only under the lock, so no hold starts after it.

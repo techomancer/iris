@@ -34,7 +34,7 @@
 
 use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::parts;
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::node_flash::NodeFlash;
 use crate::hptimer::TimerManager;
 use crate::sn::NodeBoard;
