@@ -60,7 +60,7 @@ fn bench_node_register_paths() {
         l1: L1Config::default(),
         flash: None,
     };
-    let (events, _) = std::sync::mpsc::channel();
+    let (events, _queue) = crate::traits::MachineEvents::channel(16);
     let build = |first_cpu, nodes| {
         NodeBoard::<Bedrock, Flash>::build(
             "fuel",

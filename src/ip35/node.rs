@@ -21,7 +21,7 @@ use crate::sn::{FetchOp, NodeBoard, UncachedBus, UncachedSpace};
 use crate::traits::{BusDevice, BusRead64, MachineEvent, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use crate::traits::MachineEvents;
 use std::sync::Arc;
 
 /// What a product says about one of its nodes: a C-brick, or a Fuel's or a
@@ -59,7 +59,7 @@ impl NodeBoard<Bedrock, Flash> {
         timers: &Arc<TimerManager>,
         first_cpu: usize,
         nodes: usize,
-        events: &Sender<MachineEvent>,
+        events: &MachineEvents,
         l1: &Arc<L1>,
     ) -> Result<Self, String> {
         let NodeSpec { name, firmware, board_id, processors, .. } = *spec;

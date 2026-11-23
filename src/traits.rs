@@ -471,6 +471,57 @@ pub enum MachineEvent {
     PowerOff,
 }
 
+/// Where devices send [`MachineEvent`]s, stamped with the machine's power-on
+/// count, which every reset and restore bumps (`powered_on`): the event
+/// thread drops a hard reset sent to a machine since replaced.
+#[derive(Clone)]
+pub struct MachineEvents {
+    tx: std::sync::mpsc::SyncSender<(u64, MachineEvent)>,
+    power_ons: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+pub struct MachineEventQueue {
+    rx: std::sync::mpsc::Receiver<(u64, MachineEvent)>,
+    power_ons: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MachineEvents {
+    /// A queue of `capacity` events; a send to a full one is dropped.
+    pub fn channel(capacity: usize) -> (Self, MachineEventQueue) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        let power_ons = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        (Self { tx, power_ons: power_ons.clone() }, MachineEventQueue { rx, power_ons })
+    }
+
+    pub fn try_send(&self, event: MachineEvent) -> Result<(), std::sync::mpsc::TrySendError<(u64, MachineEvent)>> {
+        self.tx.try_send((self.power_ons.load(std::sync::atomic::Ordering::SeqCst), event))
+    }
+
+    /// [`Self::try_send`]: a device never waits on the queue.
+    pub fn send(&self, event: MachineEvent) -> Result<(), std::sync::mpsc::TrySendError<(u64, MachineEvent)>> {
+        self.try_send(event)
+    }
+
+    pub fn powered_on(&self) {
+        self.power_ons.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl MachineEventQueue {
+    pub fn recv(&self) -> Option<(u64, MachineEvent)> {
+        self.rx.recv().ok()
+    }
+
+    pub fn try_recv(&self) -> Result<MachineEvent, std::sync::mpsc::TryRecvError> {
+        self.rx.try_recv().map(|(_, e)| e)
+    }
+
+    /// Ask with the machine locked, so no restore runs in between.
+    pub fn is_current(&self, sent: u64) -> bool {
+        sent == self.power_ons.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Restore hardware to power-on state.
 /// Called with all device threads stopped.
 pub trait Resettable {

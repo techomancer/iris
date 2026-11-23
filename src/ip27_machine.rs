@@ -56,8 +56,7 @@ use crate::dev::xbow::{widget_id, Xbow};
 use crate::pci::DevFn;
 use crate::ip27::{attach_controller, load_io_prom, pci_devices, ModuleController, NodeSpec};
 use crate::sn::BoardIo;
-use crate::traits::MachineEvent;
-use std::sync::mpsc::Sender;
+use crate::traits::MachineEvents;
 use crate::irq::InterruptController;
 use crate::traits::{BusDevice, Device, Resettable, BUS_ERR};
 use crate::xtalk::Upstream;
@@ -316,7 +315,7 @@ pub(crate) fn build_io(
     nodes: &[NodeBoard<Hub, NodeFlash>],
     clock: &Clock,
     timers: &Arc<TimerManager>,
-    events: &Sender<MachineEvent>,
+    events: &MachineEvents,
 ) -> Result<BoardIo, String> {
     let controller = controller(nodes, timers, cfg)?;
     // The status bar's activity bits, shared with the Bridge's devices.

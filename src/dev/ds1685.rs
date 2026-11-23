@@ -18,7 +18,7 @@
 //! Ported from hw/misc/sgi-ioc3.c in jamesbraid/qemu-sgi-origami.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::SyncSender;
+use crate::traits::MachineEvents;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -219,13 +219,13 @@ pub struct Ds1685 {
     dirty: AtomicU64,
     /// Where the guest's power-off goes: one `PowerOff` event when it writes
     /// the bit.
-    events: Option<SyncSender<MachineEvent>>,
+    events: Option<MachineEvents>,
     slot: Arc<WriterSlot>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Ds1685 {
-    pub fn new(events: Option<SyncSender<MachineEvent>>, clock: Clock) -> Arc<Ds1685> {
+    pub fn new(events: Option<MachineEvents>, clock: Clock) -> Arc<Ds1685> {
         Arc::new(Ds1685 {
             st: Mutex::new(Rtc::new(clock)),
             dirty: AtomicU64::new(0),

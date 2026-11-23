@@ -2017,7 +2017,7 @@ fn dropping_a_running_chip_ends_its_threads() {
 /// The clock's power-off bit tells the machine once, through its event sender.
 #[test]
 fn the_clocks_power_off_is_sent_to_the_machine_once() {
-    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let (tx, rx) = crate::traits::MachineEvents::channel(4);
     let r = Rig::with(|tm| Ioc3::new(tm, &IP30, MAC, ByteBus::Ds1685(Ds1685::new(Some(tx), tm.clock().clone()))));
     rtc_w(&r, 0x0a, 0x10); // bank 1
     assert!(rx.try_recv().is_err());

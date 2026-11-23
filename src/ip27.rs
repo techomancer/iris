@@ -64,7 +64,7 @@ pub use crate::dev::hub::{bank_mappings, BANKS, BANK_STRIDE, SLOT_STRIDE};
 use crate::traits::*;
 use crate::workstation::{DiscChanger, Workstation};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use crate::traits::MachineEvents;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -133,7 +133,7 @@ pub trait ModuleController: Send + Sync {
 
 /// Run the module controller as the board's last device, handing its outputs to the machine as
 /// its timers produce them.
-pub(crate) fn attach_controller(io: &mut BoardIo, controller: Arc<dyn ModuleController>, events: &Sender<MachineEvent>) {
+pub(crate) fn attach_controller(io: &mut BoardIo, controller: Arc<dyn ModuleController>, events: &MachineEvents) {
     let (me, events) = (Arc::downgrade(&controller), events.clone());
     controller.set_wake(Box::new(move || {
         for event in me.upgrade().map(|c| c.take_events()).unwrap_or_default() {
@@ -145,7 +145,7 @@ pub(crate) fn attach_controller(io: &mut BoardIo, controller: Arc<dyn ModuleCont
 
 /// What the controller's outputs ask of the machine: power falling is power loss, rising or a
 /// reset pulse a restart. The NMI output has no path to the processor yet and is only logged.
-fn controller_output(event: ModuleOutput, machine: &Sender<MachineEvent>) {
+fn controller_output(event: ModuleOutput, machine: &MachineEvents) {
     let _ = match event {
         ModuleOutput::Power(false) => machine.send(MachineEvent::PowerOff),
         ModuleOutput::Power(true) | ModuleOutput::Reset => machine.send(MachineEvent::HardReset),
@@ -199,7 +199,7 @@ impl NodeBoard<Hub, NodeFlash> {
 pub fn machine(
     cfg: &MachineConfig,
     node_specs: fn(&MachineConfig) -> Result<Vec<NodeSpec>, String>,
-    build_io: fn(&MachineConfig, &[NodeBoard<Hub, NodeFlash>], &Clock, &Arc<TimerManager>, &Sender<MachineEvent>) -> Result<BoardIo, String>,
+    build_io: fn(&MachineConfig, &[NodeBoard<Hub, NodeFlash>], &Clock, &Arc<TimerManager>, &MachineEvents) -> Result<BoardIo, String>,
 ) -> Result<Machine<Hub, NodeFlash>, String> {
     cfg.validate()?;
     let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, node_flash::SIZE)
@@ -213,7 +213,7 @@ pub fn machine(
         let node = NodeBoard::<Hub, NodeFlash>::build(cfg.machine.profile.table_name().unwrap_or_default(), spec, i, &prom, &timers)?;
         nodes.push(node);
     }
-    let (tx, rx) = channel();
+    let (tx, rx) = MachineEvents::channel(16);
     let io = build_io(cfg, &nodes, &clock, &timers, &tx)?;
     let maps: Vec<_> = specs.iter().map(|s| memory_map(s.hub.banks_mb)).collect();
     let memory = Arc::new(crate::sn::machine_memory(&maps, crate::dev::hub::NODE_SHIFT));

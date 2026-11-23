@@ -2,7 +2,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::devlog::LogModule;
-use std::sync::mpsc;
+use crate::traits::MachineEvents;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, toml_u8, hex_u8, toml_u16, hex_u16, toml_u32, hex_u32};
 use crate::dev::z85c30::Z85c30;
@@ -596,7 +596,7 @@ pub struct Ioc {
     ps2: Arc<Ps2Controller>,
     guinness: bool,
     /// Sender for async machine events (power-off).
-    event_tx: Arc<std::sync::OnceLock<mpsc::SyncSender<MachineEvent>>>,
+    event_tx: Arc<std::sync::OnceLock<MachineEvents>>,
     /// Shared heartbeat — IOC sets/clears `crate::status::hb::LED_RED`/`LED_GREEN` directly.
     heartbeat: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
     /// Counter bumped on every 8254 timer 0/1 interrupt (see `set_clock_ticks`).
@@ -683,7 +683,7 @@ impl Ioc {
         }
     }
 
-    pub fn set_event_sender(&self, tx: mpsc::SyncSender<MachineEvent>) {
+    pub fn set_event_sender(&self, tx: MachineEvents) {
         let _ = self.event_tx.set(tx);
     }
 

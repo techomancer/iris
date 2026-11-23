@@ -272,7 +272,8 @@ pub struct OctaneMachine {
     frames: Option<Arc<std::sync::atomic::AtomicU64>>,
     scratch_path: Option<std::path::PathBuf>,
     nvram_path: String,
-    event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
+    events: crate::traits::MachineEvents,
+    event_rx: Option<crate::traits::MachineEventQueue>,
     controller_slot: Option<MachineSlot>,
     lifecycle: crate::machine_state::GuestState,
     /// The disks as a snapshot records them, to refuse one taken on others.
@@ -321,7 +322,8 @@ impl OctaneMachine {
         // (revision 4); there is no separate option for the machine.
         let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12);
         let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
-        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(4);
+        let (event_tx, event_rx) = crate::traits::MachineEvents::channel(4);
+        let events = event_tx.clone();
         let timer_manager = Arc::new(TimerManager::new());
 
         // Memory, and HEART, whose descriptors place it.
@@ -736,6 +738,7 @@ impl OctaneMachine {
             frames,
             scratch_path,
             nvram_path: cfg.nvram.clone(),
+            events,
             event_rx: Some(event_rx),
             controller_slot: None,
             lifecycle: crate::machine_state::GuestState::Idle,
@@ -925,6 +928,7 @@ impl OctaneMachine {
 
     /// Every device as at power-on, with the machine stopped.
     fn power_on_all(&self) {
+        self.events.powered_on();
         for c in &self.cpus {
             Resettable::power_on(&**c);
         }
@@ -2085,6 +2089,26 @@ mod snapshot_tests {
     #[test]
     fn a_fibre_channel_card_is_attached_in_a_cage_slot() {
         fibre_in_a_slot(crate::dev::xio_pci::Kind::Cage, Some(2));
+    }
+
+    /// HEART's software reset asked for before a restore belongs to the
+    /// machine the restore replaced: the event thread must not act on it.
+    #[test]
+    fn a_restore_drops_a_reset_the_guest_asked_for_before_it() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("restore-reset");
+            let prom = empty_prom(&dir);
+            let mut m = machine(&prom, &dir);
+            m.save_snapshot_in(&dir.join("saves"), "s").unwrap();
+            let queue = m.event_rx.take().unwrap();
+            assert!(m.heart.piu_write(0, 8, 0));
+            assert!(m.heart.piu_write(0, 8, 1 << 22));
+            let (sent, event) = queue.recv().unwrap();
+            assert!(matches!(event, MachineEvent::HardReset) && queue.is_current(sent));
+            m.load_snapshot_in(&dir.join("saves"), "s").unwrap();
+            assert!(!queue.is_current(sent), "the restore replaced the machine that asked");
+            m.stop();
+        }).unwrap().join().unwrap();
     }
 
     /// An empty PROM in place of the stock one, so these run anywhere.
