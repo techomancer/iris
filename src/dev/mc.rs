@@ -1375,6 +1375,13 @@ impl Saveable for MemoryController {
             state.eeprom.lock().load_state_mut(e)?;
         }
 
+        // Place the banks as a MEMCFG write does: a machine restored before
+        // its PROM ran still has the reset decode.
+        drop(dma);
+        if let Some(cb) = self.memcfg_callback.get() {
+            let (m0, m1) = (state.regs[(REG_MEMCFG0 / 4) as usize], state.regs[(REG_MEMCFG1 / 4) as usize]);
+            cb(self.parse_memcfg(m0, m1));
+        }
         Ok(())
     }
 }
@@ -1465,6 +1472,28 @@ mod tests {
         st.last_host_ticks = ahead;
         st.update_timers();
         assert_eq!(st.last_host_ticks, ahead);
+    }
+
+    /// A restore into a machine whose PROM never ran must place the saved
+    /// banks, or RAM reads as unmapped after the guest resumes.
+    #[test]
+    fn load_state_places_the_saved_banks() {
+        use crate::ip22_bus::{BANK_SIZE, LOMEM_BASE};
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let src = MemoryController::new(eeprom.clone(), true, [128, 128, 0, 0]);
+        let h0 = MemoryController::encode_memcfg_half(LOMEM_BASE, 128).unwrap();
+        let h1 = MemoryController::encode_memcfg_half(LOMEM_BASE + BANK_SIZE, 128).unwrap();
+        let _ = src.write32((MC_BASE + REG_MEMCFG0) as u64, ((h0 as u32) << 16) | h1 as u32);
+        let saved = src.save_state();
+
+        let dst = MemoryController::new(eeprom, true, [128, 128, 0, 0]);
+        let placed = Arc::new(Mutex::new(None));
+        let sink = placed.clone();
+        dst.set_memcfg_callback(Box::new(move |banks| *sink.lock() = Some(banks)));
+        dst.load_state(&saved).expect("load_state");
+        let banks = placed.lock().expect("load_state did not place the banks");
+        assert_eq!(banks[0].map(|b| b.0), Some(LOMEM_BASE));
+        assert_eq!(banks[1].map(|b| b.0), Some(LOMEM_BASE + BANK_SIZE));
     }
 
     /// Fails at 1.5e9 counts without the re-anchor in `start()`.
