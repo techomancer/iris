@@ -309,7 +309,7 @@ pub trait Workstation: Send {
     fn disc_changer(&self) -> Option<Arc<dyn DiscChanger>> {
         None
     }
-    /// Ask the guest to remount `/CDROM` after a disc change on `scsi_id`.
+    /// Ask the guest to remount `/CDROM` after a disc change on drive `scsi_id`, `16 * controller + id`.
     fn remount_cdrom_guest(&self, _scsi_id: u8) {}
 
     /// Attached CHD disks with changes waiting to be folded into their bases.

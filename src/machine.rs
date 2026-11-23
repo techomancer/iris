@@ -1442,13 +1442,14 @@ impl Machine {
         self.hpc3.ioc().scc().drain_console()
     }
 
-    /// csh one-liner to (re)mount `/CDROM` for SCSI unit `id` (EFS s7, else iso9660 vol).
-    pub fn irix_cdrom_remount_command(scsi_id: u8) -> String {
+    /// csh one-liner to (re)mount `/CDROM` for drive `16 * controller + id`
+    /// (EFS s7, else iso9660 vol).
+    pub fn irix_cdrom_remount_command(drive: u8) -> String {
+        let (c, id) = (drive / 16, drive % 16);
         format!(
             "umount /CDROM >& /dev/null; \
-             mount -t efs -o ro /dev/dsk/dks0d{id}s7 /CDROM || \
-             mount -t iso9660 /dev/rdsk/dks0d{id}vol /CDROM\n",
-            id = scsi_id
+             mount -t efs -o ro /dev/dsk/dks{c}d{id}s7 /CDROM || \
+             mount -t iso9660 /dev/rdsk/dks{c}d{id}vol /CDROM\n"
         )
     }
 
@@ -3127,6 +3128,14 @@ mod stop_order_tests {
         let path = iso.to_string_lossy().into_owned();
         assert_eq!(changer.load_disc(20, path.clone()), Ok(path));
         assert!(changer.load_disc(4, "x.iso".into()).is_err(), "controller 0 has no id 4");
+    }
+
+    /// The second controller is `dks1` to IRIX, so its drive's remount names it.
+    #[test]
+    fn remount_names_the_drives_controller() {
+        let cmd = |drive| Machine::irix_cdrom_remount_command(drive);
+        assert!(cmd(4).contains("dks0d4s7") && cmd(4).contains("dks0d4vol"));
+        assert!(cmd(20).contains("dks1d4s7") && cmd(20).contains("dks1d4vol"));
     }
 }
 
