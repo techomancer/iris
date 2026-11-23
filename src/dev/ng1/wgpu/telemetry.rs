@@ -154,6 +154,19 @@ pub(crate) enum FlushReason {
 
 const FLUSH_REASONS: usize = 14;
 
+/// How a screen-to-screen copy ran on the GPU (`copy::copy_mode`, and copy
+/// lines, which REX3 does not define but the model accepts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum CopyPath {
+    Parallel,
+    Snapshot,
+    Serial,
+    Line,
+}
+
+pub(crate) const COPY_PATHS: usize = 4;
+
 /// Screen-clipped conservative destination bounds. This is not a count of
 /// pixels surviving a per-pixel CID, pattern, alpha, or logic test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +292,18 @@ pub(crate) struct Workload {
     pub(crate) batches: Histogram,
     pub(crate) batch_tile_pairs: Histogram,
     pub(crate) flush: [u64; FLUSH_REASONS],
+    /// Copies and their destination pixels (conservative boxes) by path.
+    pub(crate) copies: [u64; COPY_PATHS],
+    pub(crate) copy_pixels: [u64; COPY_PATHS],
+    /// Bytes copied into the snapshot ahead of snapshot copies.
+    pub(crate) snapshot_bytes: u64,
+    /// State slots, those equal to the slot before, and the words that
+    /// differed from the slot before, in total and per word index
+    /// (`crate::wgpu::SlotChanges`).
+    pub(crate) slots: u64,
+    pub(crate) slots_identical: u64,
+    pub(crate) slot_words_changed: u64,
+    pub(crate) slot_word_changes: Vec<u64>,
     pub(crate) set_waits: u64,
     pub(crate) set_wait_ns: u64,
     pub(crate) command_generation_ns: u64,
@@ -323,6 +348,13 @@ impl Workload {
         Ok(())
     }
 
+    pub(crate) fn record_copy(&mut self, path: CopyPath, pixels: u64, snapshot_bytes: u64) -> Result<(), &'static str> {
+        add!(self.copies[path as usize], 1);
+        add!(self.copy_pixels[path as usize], pixels);
+        add!(self.snapshot_bytes, snapshot_bytes);
+        Ok(())
+    }
+
     pub(crate) fn record_host_read(&mut self, produced: u64, generation_ns: u64) -> Result<(), &'static str> {
         self.host_read_produced_qwords.record(produced)?;
         add!(self.host_read_words, produced.checked_mul(2).ok_or("HostR word count overflow")?);
@@ -352,7 +384,7 @@ impl Workload {
         }
         let mut delta = self.clone();
         subtract!(delta, before, accepted, noops, unsupported, host_write_words, host_read_words,
-            set_waits, set_wait_ns, command_generation_ns, submission_ns, profile_maps,
+            snapshot_bytes, slots, slots_identical, slot_words_changed, set_waits, set_wait_ns, command_generation_ns, submission_ns, profile_maps,
             profile_bytes, profile_samples, profile_busy_tiles, profile_tile_pairs, profile_bin_ns,
             profile_raster_ns);
         for (a, b) in delta.primitive.iter_mut().zip(before.primitive) {
@@ -366,6 +398,15 @@ impl Workload {
         }
         for (a, b) in delta.flush.iter_mut().zip(before.flush) {
             *a = a.checked_sub(b).ok_or("flush count decreased")?;
+        }
+        for (a, &b) in delta.slot_word_changes.iter_mut().zip(&before.slot_word_changes) {
+            *a = a.checked_sub(b).ok_or("slot word change count decreased")?;
+        }
+        for (a, b) in delta.copies.iter_mut().zip(before.copies) {
+            *a = a.checked_sub(b).ok_or("copy count decreased")?;
+        }
+        for (a, b) in delta.copy_pixels.iter_mut().zip(before.copy_pixels) {
+            *a = a.checked_sub(b).ok_or("copy pixel count decreased")?;
         }
         delta.clipped_area = self.clipped_area.delta_since(&before.clipped_area)?;
         delta.clipped_tiles = self.clipped_tiles.delta_since(&before.clipped_tiles)?;
@@ -495,6 +536,8 @@ impl fmt::Display for Snapshot {
              features(blend/shade/z/line/dither/clear/scissor/cid/aux/colorhost/alphahost/packed/double/xy/yflip/compare)={:?} \
              batches={} commands={} batch_p50/p95={:?}/{:?} \
              flush(capacity/host-transition/copy/idle/wait/fence/cut/observe/hostr/explicit/exit/latency/restore/unsupported)={:?} \
+             copies(parallel/snapshot/serial/line)={:?} copy_pixels={:?} snapshot_bytes={} \
+             slots={} slots_identical={} slot_words_changed={} slot_word_changes(word:slots)={} \
              area_p50/p95={:?}/{:?} tiles_p50/p95={:?}/{:?} \
              hostw(qwords/words)={}/{} hostw_qwords_p50/p95={:?}/{:?} \
              hostr(requested/produced_qwords/words)={}/{}/{} hostr_qwords_p50/p95={:?}/{:?} \
@@ -506,6 +549,8 @@ impl fmt::Display for Snapshot {
              profile_bin_ns={} profile_raster_ns={} busy_tiles={} tile_pairs={}",
             self.epoch, w.accepted, w.noops, w.unsupported, w.primitive, w.address, w.features,
             w.batches.samples, w.batches.sum, w.batches.percentile_upper(50), w.batches.percentile_upper(95), w.flush,
+            w.copies, w.copy_pixels, w.snapshot_bytes,
+            w.slots, w.slots_identical, w.slot_words_changed, slot_word_changes(&w.slot_word_changes),
             w.clipped_area.percentile_upper(50), w.clipped_area.percentile_upper(95),
             w.clipped_tiles.percentile_upper(50), w.clipped_tiles.percentile_upper(95),
             w.host_write_qwords.sum, w.host_write_words,
@@ -521,6 +566,13 @@ impl fmt::Display for Snapshot {
             w.profiling, w.profile_maps, w.profile_bytes, w.profile_samples,
             w.profile_bin_ns, w.profile_raster_ns, w.profile_busy_tiles, w.profile_tile_pairs)
     }
+}
+
+/// Nonzero per-word change counts, most changed first: `word:slots ...`.
+fn slot_word_changes(changes: &[u64]) -> String {
+    let mut words: Vec<(usize, u64)> = changes.iter().copied().enumerate().filter(|&(_, n)| n != 0).collect();
+    words.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    words.iter().map(|(i, n)| format!("{i}:{n}")).collect::<Vec<_>>().join(",")
 }
 
 pub(crate) fn duration_ns(duration: std::time::Duration) -> Result<u64, &'static str> {
@@ -584,6 +636,12 @@ mod tests {
             assert_eq!((workload.set_waits, workload.set_wait_ns), (1, 7));
             assert_eq!(workload.flush[FlushReason::Idle as usize], 0);
             assert_eq!(workload.flush[FlushReason::Latency as usize], 1);
+            workload.record_copy(CopyPath::Snapshot, 100, 4096).unwrap();
+            workload.record_copy(CopyPath::Snapshot, 20, 64).unwrap();
+            workload.record_copy(CopyPath::Line, 3, 0).unwrap();
+            assert_eq!(workload.copies, [0, 2, 0, 1]);
+            assert_eq!(workload.copy_pixels, [0, 120, 0, 3]);
+            assert_eq!(workload.snapshot_bytes, 4160);
         }).unwrap().join().unwrap();
     }
 

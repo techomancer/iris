@@ -12,8 +12,10 @@
 //! `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored --nocapture`
 //! (`REX3_REPLAY_OUT=<dir>` saves the final framebuffers there,
 //! `REX3_REPLAY_TRACE=<file>` writes the annotated trace of the replay,
-//! `REX3_REPLAY_ENGINE=interp|jit|gpu` picks the draw path (`gpu` requires the
-//! opt-in `rex-gpu` feature and is replay-only),
+//! `REX3_REPLAY_ENGINE=interp|jit|resident|gpu` picks the draw path
+//! (`resident` is the GPU raster `raster = "wgpu"` runs, with the `wgpu`
+//! feature, and prints its telemetry; `gpu` is the older opt-in `rex-gpu`
+//! path and is replay-only),
 //! `REX3_GPU_BACKEND=auto|vulkan|metal|dx12|gl` selects its wgpu backend,
 //! `REX3_REPLAY_NOCHECK=1` skips the checkpoints, `REX3_REPLAY_LIMIT=<n>`
 //! replays only the first n records, `REX3_REPLAY_STATE=<file>` writes the
@@ -367,7 +369,20 @@ impl Rex3 {
     /// (STATUS: retrace and FIFO interrupt flags; VC2's working cursor Y),
     /// plus `rec_extra`. Call with the board idle.
     pub(crate) fn rec_state_hash(&self) -> [u8; 32] {
-        let mut v = self.save_state();
+        // On the GPU raster the planes live on the GPU: hash what it holds.
+        #[cfg(feature = "wgpu")]
+        if self.resident_active() {
+            let (rgb, aux) = self.observe_resident_checkpoint()
+                .unwrap_or_else(|error| panic!("REX3 resident checkpoint: {error}"));
+            return self.rec_hash_of(self.save_state_fields(), &rgb, &aux);
+        }
+        // SAFETY: idle; the display thread only reads VRAM.
+        let (rgb, aux) = unsafe { (&*self.fb_rgb.get(), &*self.fb_aux.get()) };
+        self.rec_hash_of(self.save_state(), rgb, aux)
+    }
+
+    fn rec_hash_of(&self, state: toml::Value, rgb: &[u32], aux: &[u32]) -> [u8; 32] {
+        let mut v = state;
         if let Some(t) = v.get_mut("config_regs").and_then(|t| t.as_table_mut()) {
             t.remove("status");
         }
@@ -381,9 +396,7 @@ impl Rex3 {
         }
         let mut h = blake3::Hasher::new();
         h.update(toml::to_string(&v).unwrap_or_default().as_bytes());
-        // SAFETY: idle; the display thread only reads VRAM.
-        for fb in unsafe { [&*self.fb_rgb.get(), &*self.fb_aux.get()] } {
-            let words: &[u32] = fb;
+        for words in [rgb, aux] {
             // SAFETY: plain u32 words viewed as bytes.
             h.update(unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) });
         }
@@ -691,6 +704,37 @@ pub(crate) mod tests {
             .map_err(|_| "REX3 replay setup thread panicked".to_string())?
     }
 
+    /// A replay board on the GPU raster: the start state is loaded on the
+    /// CPU planes, which activation then seeds the GPU from.
+    /// `REX3_GPU_BACKEND` picks the wgpu backend.
+    #[cfg(feature = "wgpu")]
+    fn resident_replay_board(state: Option<&[u8]>) -> Result<ReplayBoard, String> {
+        let state = state.map(|s| s.to_vec());
+        let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
+        let gpu = crate::wgpu::Gpu::new(&crate::wgpu::GpuOptions {
+            backend: backend.clone(),
+            ..Default::default()
+        })
+        .map_err(|error| format!("REX3 resident replay on {backend}: {error}"))?;
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut rex = Rex3::new(crate::status::MachineStatus::detached());
+                rex.fb_rgb.get_mut().fill(0);
+                rex.fb_aux.get_mut().fill(0);
+                if let Some(s) = &state {
+                    rex.rec_state_decode(s).map_err(|e| format!("bad state record: {e}"))?;
+                }
+                rex.activate_resident_gpu(gpu).map_err(|error| format!("activate GPU raster: {error}"))?;
+                let board = ReplayBoard(Some(Arc::new(rex)));
+                board.rex().start();
+                Ok(board)
+            })
+            .map_err(|e| format!("cannot start REX3 replay setup: {e}"))?
+            .join()
+            .map_err(|_| "REX3 replay setup thread panicked".to_string())?
+    }
+
     /// What a replay saw.
     #[derive(Debug, Default)]
     pub struct Report {
@@ -711,6 +755,8 @@ pub(crate) mod tests {
     enum ReplayEngine {
         Interp,
         Jit,
+        #[cfg(feature = "wgpu")]
+        Resident,
         Gpu,
     }
 
@@ -719,6 +765,8 @@ pub(crate) mod tests {
             match self {
                 Self::Interp => "interpreter",
                 Self::Jit => "compiled shaders",
+                #[cfg(feature = "wgpu")]
+                Self::Resident => "GPU raster",
                 Self::Gpu => "GPU replay",
             }
         }
@@ -940,6 +988,16 @@ pub(crate) mod tests {
         let engine = match std::env::var("REX3_REPLAY_ENGINE").as_deref() {
             Ok("interp") => ReplayEngine::Interp,
             Ok("jit") | Err(_) => ReplayEngine::Jit,
+            Ok("resident") => {
+                #[cfg(feature = "wgpu")]
+                {
+                    ReplayEngine::Resident
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    return Err("REX3_REPLAY_ENGINE=resident requires cargo --features wgpu".into());
+                }
+            }
             Ok("gpu") => {
                 #[cfg(feature = "rex-gpu")]
                 {
@@ -952,10 +1010,17 @@ pub(crate) mod tests {
             }
             Ok(other) => {
                 return Err(format!(
-                    "REX3_REPLAY_ENGINE={other}: want interp, jit, or gpu"
+                    "REX3_REPLAY_ENGINE={other}: want interp, jit, resident, or gpu"
                 ))
             }
         };
+        #[cfg(feature = "wgpu")]
+        let mut board = if engine == ReplayEngine::Resident {
+            resident_replay_board(start_state(&recs))?
+        } else {
+            make_board(start_state(&recs), engine == ReplayEngine::Jit)?
+        };
+        #[cfg(not(feature = "wgpu"))]
         let mut board = make_board(start_state(&recs), engine == ReplayEngine::Jit)?;
         let result = (|| {
             let rex = board.rex();
@@ -987,6 +1052,13 @@ pub(crate) mod tests {
                     t.insert("rec_extra".into(), rex.rec_extra());
                 }
                 std::fs::write(&f, toml::to_string(&st).unwrap_or_default()).map_err(|e| format!("{f}: {e}"))?;
+            }
+            #[cfg(feature = "wgpu")]
+            if engine == ReplayEngine::Resident {
+                match rex.resident_telemetry_snapshot() {
+                    Ok(telemetry) => eprintln!("{path}: {telemetry}"),
+                    Err(error) => return Err(format!("resident telemetry: {error}")),
+                }
             }
             Ok((rep, took, rex.rec_state_hash(), check))
         })();

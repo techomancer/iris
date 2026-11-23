@@ -254,9 +254,15 @@ pub static REX3_GPU_FLUSH: [EventDef; 14] = [
     gpu_flush("gpu flush: exit"), gpu_flush("gpu flush: latency"),
     gpu_flush("gpu flush: restore"), gpu_flush("gpu flush: unsupported"),
 ];
-/// A screen-to-screen copy going into the batch (arg: destination pixels,
-/// conservative box).
-pub static REX3_GPU_COPY: EventDef = EventDef::new("gpu copy", cat::PRIM).with_arg("pixels");
+const fn gpu_copy(name: &'static str) -> EventDef {
+    EventDef::new(name, cat::PRIM).with_arg("pixels")
+}
+/// A screen-to-screen copy going into the batch, one event per path in
+/// `CopyPath` order (arg: destination pixels, conservative box).
+pub static REX3_GPU_COPY: [EventDef; 4] = [
+    gpu_copy("gpu copy: parallel"), gpu_copy("gpu copy: snapshot"),
+    gpu_copy("gpu copy: serial"), gpu_copy("gpu copy: line"),
+];
 /// A host-data draw going into the batch (arg: destination pixels,
 /// conservative box).
 pub static REX3_GPU_HOST: EventDef = EventDef::new("gpu host draw", cat::PRIM).with_arg("pixels");

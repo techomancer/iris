@@ -411,11 +411,11 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 
 | Command | Description |
 |---|---|
-| `rex status` | All REX3 drawing registers |
+| `rex status` | All REX3 drawing registers; on the GPU raster also a `TELEMETRY` line (batches and flush reasons, copies by path and pixels, snapshot bytes, state-slot words changed per slot, GFIFO pressure, waits) |
 | `rex jit <on\|off\|status\|list>` | REX3 shader JIT (`rex-jit`): switch, counters, compiled and failed shaders |
 | `rex jit <disable\|enable> <dm0> <dm1>` | Take one draw mode out of (or back into) JIT dispatch |
 | `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (also `IRIS_REX3_TRACE=<file>`) |
-| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, or add `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the experimental host-GPU path |
+| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, `REX3_REPLAY_ENGINE=resident` with `--features wgpu` for the GPU raster (`raster = "wgpu"`; prints its telemetry), or `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the older experimental host-GPU path. Recording itself needs the CPU raster |
 | `rex fbdump [DIR]` | Framebuffers as files in `DIR` (default `.`) |
 | `rex cmap <on\|off>` | CMAP access trace |
 | `rex debug <on\|off>` | REX3 register trace **[DEV]** |

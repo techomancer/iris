@@ -310,12 +310,14 @@ fn resident_gpu_age_threshold_and_explicit_busy_tile_profile() {
 
 #[test]
 fn resident_limits_cover_plane_bindings_and_batch_dispatch() {
-    let good = wgpu::Limits::default();
-    validate_limits(&good).expect("default limits cover resident raster");
+    // WebGPU's defaults plus a ninth storage buffer (the copy snapshot);
+    // native backends allow far more.
+    let good = wgpu::Limits { max_storage_buffers_per_shader_stage: 9, ..wgpu::Limits::default() };
+    validate_limits(&good).expect("limits cover resident raster");
     let checks: [(&str, Box<dyn Fn(&mut wgpu::Limits)>); 9] = [
         ("max_buffer_size", Box::new(|l| l.max_buffer_size = READBACK_BYTES - 1)),
         ("max_storage_buffer_binding_size", Box::new(|l| l.max_storage_buffer_binding_size = PLANE_BYTES - 1)),
-        ("max_storage_buffers_per_shader_stage", Box::new(|l| l.max_storage_buffers_per_shader_stage = 7)),
+        ("max_storage_buffers_per_shader_stage", Box::new(|l| l.max_storage_buffers_per_shader_stage = 8)),
         ("max_bind_groups", Box::new(|l| l.max_bind_groups = 2)),
         ("max_bindings_per_bind_group", Box::new(|l| l.max_bindings_per_bind_group = 5)),
         ("max_compute_invocations_per_workgroup", Box::new(|l| l.max_compute_invocations_per_workgroup = 63)),
@@ -1901,6 +1903,35 @@ fn resident_gpu_screen_copies_match_complete_cpu_planes() {
             .bresoctinc1
             .set_octant(crate::dev::ng1::rex3::OCTANT_YDEC);
         cases.push(("down-moving reverse-safe overlap", down_reverse));
+
+        // Snapshot copies whose source box must be found exactly: under
+        // YFLIP (walker rows run against physical rows), and one wide
+        // enough to be snapshotted as a single run.
+        let mut yflip_reverse = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (900, 0x13ff - 600),
+            (931, 0x13ff - 623),
+            (0, 1),
+            0x00ff_ffff,
+        );
+        yflip_reverse.drawmode1.0 |= 1 << 6;
+        yflip_reverse
+            .bresoctinc1
+            .set_octant(crate::dev::ng1::rex3::OCTANT_YDEC);
+        cases.push(("YFLIP reverse-safe overlap", yflip_reverse));
+
+        let wide_scroll = copy(
+            DRAWMODE1_PLANES_RGB,
+            false,
+            false,
+            (4, 900),
+            (1203, 939),
+            (-3, -8),
+            0x00ff_ffff,
+        );
+        cases.push(("wide forward-safe scroll", wide_scroll));
 
         let mut low_to_high = copy(
             DRAWMODE1_PLANES_RGB,
