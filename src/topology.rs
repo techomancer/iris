@@ -157,6 +157,18 @@ fn expand(
     Ok(if rest.is_empty() { base } else { base.extend(&rest.parse()?) })
 }
 
+/// The id the disc changers take for a CD-ROM drive, `16 * controller + id`,
+/// from a slot path, a machine alias such as `scsi1/t4`, or a bare number.
+pub fn drive_id(profile: MachineProfile, spec: &str) -> Result<usize, String> {
+    if let Some(n) = crate::config::legacy::drive_number(spec) {
+        return Ok(n);
+    }
+    let slots = profile.slots();
+    let at = expand(machine_name(profile), &slots, spec, &mut |_| Ok(None))?;
+    let (n, id) = scsi_target(&slots, &at).ok_or_else(|| format!("{at} is not a SCSI target"))?;
+    Ok(usize::from(crate::config::scsi_slot(n, id)))
+}
+
 impl MachineProfile {
     /// The slots of the machine, in the order automatic placement tries them.
     pub fn slots(self) -> Vec<MachineSlot> {
@@ -543,6 +555,25 @@ mod tests {
         let octane = fill(MachineProfile::OctaneIp30);
         assert_eq!(octane.row(&loc("xio15/pci0/2")).map(|r| r.kind), Some(MachineSlotKind::Fixed("ioc3")));
         assert!(matches!(octane.row(&loc("xio15/pci0")).map(|r| r.kind), Some(MachineSlotKind::PciBus(_))));
+    }
+
+    #[test]
+    fn a_drive_is_named_by_slot_alias_or_number() {
+        use MachineProfile as P;
+        for (p, spec, id) in [
+            (P::Indigo2Ip22, "hpc3/c1/t4", 20),
+            (P::Indigo2Ip22, "scsi1/t4", 20),
+            (P::OctaneIp30, "scsi1/t4", 20),
+            (P::OctaneIp30, "xio15/pci0/0/t6", 6),
+            (P::O2Ip32, "scsi1/t2", 18),
+            (P::FuelIp34, "scsi1/t2", 18),
+            (P::IndyIp24, "20", 20),
+        ] {
+            assert_eq!(drive_id(p, spec), Ok(id), "{p:?} {spec}");
+        }
+        assert!(drive_id(P::IndyIp24, "scsi1/t4").is_err(), "no second controller");
+        assert!(drive_id(P::IndyIp24, "scsi0").unwrap_err().contains("not a SCSI target"));
+        assert!(drive_id(P::Origin3200Ip35, "scsi0/t1").is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::dev::kona::KonaProduct;
 use crate::devices::{ConfiguredDevice, DeviceModel};
 use crate::topology::{scsi_target, DevicePlacement};
 
-mod legacy;
+pub(crate) mod legacy;
 
 /// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
 /// which of them a machine takes.

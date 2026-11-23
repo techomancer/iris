@@ -2362,4 +2362,26 @@ mod snapshot_tests {
             m.stop();
         }).unwrap().join().unwrap();
     }
+
+    /// A CD-ROM on the second ISP1040 takes disc changes by its slot.
+    #[test]
+    fn second_controller_cdrom_takes_disc_changes() {
+        use crate::config::{MachineProfile, ScsiDeviceConfig};
+        use crate::workstation::Workstation;
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("octane-disc");
+            let prom = empty_prom(&dir);
+            let mut m = machine_with(&prom, &dir, |cfg| cfg.set_disk(20, ScsiDeviceConfig { cdrom: true, ..Default::default() }));
+            let iso = dir.join("a.iso");
+            std::fs::write(&iso, vec![0u8; 2048]).unwrap();
+            let path = iso.to_string_lossy().into_owned();
+            let changer = m.disc_changer().expect("a disc changer");
+            let id = crate::topology::drive_id(MachineProfile::OctaneIp30, "scsi1/t4").unwrap();
+            assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [id]);
+            assert_eq!(changer.load_disc(id, path.clone()), Ok(path));
+            assert_eq!(changer.eject_to_empty(id), Ok(()));
+            assert!(changer.load_disc(4, "x.iso".into()).is_err(), "controller 0 has no drive at 4");
+            m.stop();
+        }).unwrap().join().unwrap();
+    }
 }

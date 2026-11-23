@@ -5,6 +5,14 @@ use super::*;
 use crate::devices::{ConfiguredDevice, DeviceModel};
 use crate::topology::DevicePlacement;
 
+/// A bare drive id (`16 * controller + id`), the only way older versions
+/// named a drive to load or eject.
+pub(crate) fn drive_number(spec: &str) -> Option<usize> {
+    let n = spec.parse().ok()?;
+    eprintln!("iris: drive id {n} is deprecated; name the drive by slot, such as scsi{}/t{}", n / 16, n % 16);
+    Some(n)
+}
+
 /// The current form of every older key: `[scsi.N]` tables become `[[devices]]` entries at `scsiC/tN`, and the old `[o2]`
 /// spellings move to the shared keys that are still at their defaults.
 pub(super) fn fold(cfg: &mut MachineConfig) -> Result<(), String> {

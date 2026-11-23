@@ -241,11 +241,11 @@ enum Cmd {
         path: Option<String>,
     },
 
-    /// Cycle the CD changer on a SCSI ID to the next disc.
-    CdromEject { id: u64 },
+    /// Cycle the CD changer on a drive, such as scsi1/t4, to the next disc.
+    CdromEject { id: String },
 
-    /// Load an arbitrary CD image into a SCSI ID and make it the active disc.
-    CdromLoad { id: u64, path: String },
+    /// Load an arbitrary CD image into a drive, such as scsi1/t4, and make it the active disc.
+    CdromLoad { id: String, path: String },
 
     /// Fold pending CHD diffs back into their bases (guest must be stopped).
     ChdSync {
