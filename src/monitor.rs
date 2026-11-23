@@ -203,7 +203,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         }
 
         if cmd == "watch" {
-            match watch(&mut reader, &stream, &mut writer, &devices, args) {
+            match watch(&mut reader, &mut writer, &devices, args) {
                 Ok(()) => {}
                 Err(WatchEnd::HungUp) => break,
                 Err(WatchEnd::Usage(e)) => { let _ = write!(writer, "Error: {e}\n"); }
@@ -300,9 +300,8 @@ impl Write for Capture {
 
 /// `watch`: run a command over and over, redrawing its answer on one line,
 /// until the client sends a line (Enter).
-fn watch<R: BufRead>(
-    reader: &mut R,
-    stream: &TcpStream,
+fn watch(
+    reader: &mut BufReader<crate::net::telnet::TelnetReader<TcpStream>>,
     writer: &mut impl Write,
     devices: &Mutex<Vec<Arc<dyn Device>>>,
     args: &[&str],
@@ -340,7 +339,9 @@ fn watch<R: BufRead>(
         if writer.flush().is_err() {
             break Err(WatchEnd::HungUp);
         }
-        let _ = stream.set_read_timeout(Some(every));
+        // Set it on the handle the reader uses: a timeout set on another
+        // clone of the socket does not apply on Windows.
+        let _ = reader.get_ref().get_ref().set_read_timeout(Some(every));
         match reader.fill_buf() {
             Ok([]) => break Err(WatchEnd::HungUp),
             Ok(buf) => {
@@ -353,7 +354,7 @@ fn watch<R: BufRead>(
             Err(_) => break Err(WatchEnd::HungUp),
         }
     };
-    let _ = stream.set_read_timeout(None);
+    let _ = reader.get_ref().get_ref().set_read_timeout(None);
     let _ = write!(writer, "\n");
     result
 }
