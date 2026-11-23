@@ -80,6 +80,7 @@ impl Default for Regs {
         let mut words = BTreeMap::new();
         words.insert(reg::CPU_PERMISSION::OFFSET, !0);
         words.insert(reg::IO_PERMISSION::OFFSET, !0);
+        words.insert(reg::RT_LOCAL_CTRL::OFFSET, reg::RT_LOCAL_CTRL::RESET);
         Self { words, scratch: [0; 5], node: 0, region: 0, deadline: None, sample: true, barrier: Barrier::default() }
     }
 }
@@ -240,6 +241,10 @@ impl Lb {
     pub(super) fn power_on(&self) {
         self.reset(&mut self.regs.lock());
     }
+    /// The real-time clock control.
+    pub(super) fn rt_ctrl(&self) -> u64 {
+        self.regs.lock().words[&reg::RT_LOCAL_CTRL::OFFSET]
+    }
     /// A doubleword read at `a` by processor `requester`, or by none.
     pub(super) fn read(&self, a: u64, clock: &Clock, requester: Option<usize>) -> u64 {
         let mut r = self.regs.lock();
@@ -383,6 +388,7 @@ impl Lb {
                 Effect::NodeNumber(crate::sn::node_id(u64::from(r.node), super::NODE_SHIFT))
             }
             None if reflect => Effect::Reflect,
+            None if a == reg::RT_LOCAL_CTRL::OFFSET => Effect::RtClock,
             None => Effect::None,
         }
     }
