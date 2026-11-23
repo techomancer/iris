@@ -116,6 +116,16 @@ fn narrow_reads_return_part_of_the_32_bit_register() {
     m.stop_engines();
 }
 
+/// A GIO64 board answers the ID at both words of its first doubleword.
+#[test]
+fn the_id_word_also_answers_at_the_second_word() {
+    let m = live_board();
+    assert_eq!(read(&m, 32, 4), 0x0005_0190);
+    assert_eq!(read(&m, 16, 6), 0x0190);
+    assert_eq!(read(&m, 8, 7), 0x90);
+    m.stop_engines();
+}
+
 #[test]
 fn fifo_and_direct_writes_keep_program_order() {
     let m = live_board();

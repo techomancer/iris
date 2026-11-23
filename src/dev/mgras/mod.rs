@@ -231,7 +231,9 @@ impl Front {
 
     fn read(&mut self, off: u32, bits: u32) -> u64 {
         match off {
-            0..=3 => read_subword(GIO_ID, off, bits),
+            // A GIO64 board answers both words of its first doubleword with
+            // the ID (GIO bus spec 4.12).
+            0..=7 => read_subword(GIO_ID, off, bits),
             host::UCODE..=0x45FFF => self.hq.ucode[((off - host::UCODE) / 4) as usize] as u64,
             0x60000..=0x67FFF => {
                 let t = dcb::Txn::decode(off);
