@@ -33,7 +33,7 @@ use super::command::{
     COMMAND_COPY_A_LINE, COMMAND_COPY_BLOCK, COMMAND_COPY_F_LINE, COMMAND_COPY_I_LINE,
     COMMAND_COPY_SPAN, COMMAND_HOST_A_LINE, COMMAND_HOST_BLOCK, COMMAND_HOST_F_LINE,
     COMMAND_HOST_I_LINE, COMMAND_HOST_SPAN, COMMAND_I_LINE, COMMAND_SPAN,
-    FLAG_FAST_CLEAR, FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_LINE_MAJOR_DECREASING,
+    FLAG_FAST_CLEAR, FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_COPY_PARALLEL, FLAG_COPY_SNAPSHOT, CopyMode, FLAG_LINE_MAJOR_DECREASING,
     FLAG_LINE_Y_MAJOR, FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
     MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
     STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
@@ -45,7 +45,7 @@ use super::command::{
     STATE_WRITE_MASK, STATE_XYMOVE, STATE_XYWIN, STATE_Z_PATTERN,
     PayloadRef,
 };
-use super::copy::prepare_copy_fill;
+use super::copy::{copy_mode, prepare_copy_fill};
 use super::host::prepare_host_fill;
 use super::line::{prepare_copy_line, prepare_host_line, prepare_line};
 use super::telemetry::{duration_ns, Coverage, DrawSample, FlushReason, Workload};
@@ -462,9 +462,9 @@ fn validate_limits(limits: &wgpu::Limits) -> Result<(), ResidentError> {
         PLANE_BYTES.max(LIST_CAP as u64 * 4).max(MAX_PAYLOAD_BYTES),
     )?;
     // The raster layout has three storage buffers in group 0, two in group
-    // 1, and both planes plus the current payload set in group 2. The
-    // accept-all bin pipeline does not bind the board resources.
-    check("max_storage_buffers_per_shader_stage", limits.max_storage_buffers_per_shader_stage as u64, 8)?;
+    // 1, and both planes, the current payload set and the copy source in
+    // group 2. The accept-all bin pipeline does not bind the board resources.
+    check("max_storage_buffers_per_shader_stage", limits.max_storage_buffers_per_shader_stage as u64, 9)?;
     check("max_bind_groups", limits.max_bind_groups as u64, 3)?;
     check("max_bindings_per_bind_group", limits.max_bindings_per_bind_group as u64, 6)?;
     check("max_compute_invocations_per_workgroup", limits.max_compute_invocations_per_workgroup as u64, (TILE_W * TILE_H) as u64)?;
@@ -480,6 +480,9 @@ struct Planes {
     gpu: Arc<Gpu>,
     rgb: wgpu::Buffer,
     aux: wgpu::Buffer,
+    /// A copy's source plane as it was before the copy, for a parallel
+    /// copy whose source overlaps its destination (`CopyMode::Snapshot`).
+    copy_source: wgpu::Buffer,
 }
 
 /// A scanout pipeline can only bind the planes through this read-only layout.
@@ -500,6 +503,10 @@ impl Planes {
             gpu: Arc::clone(gpu),
             rgb: gpu.buffer("resident rex3 rgb", PLANE_BYTES, usage),
             aux: gpu.buffer("resident rex3 aux", PLANE_BYTES, usage),
+            copy_source: gpu.buffer(
+                "resident rex3 copy source", PLANE_BYTES,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
         }
     }
 
@@ -542,6 +549,10 @@ impl Planes {
     }
 }
 
+/// Batches submitted and not yet seen complete, for the trace.
+#[cfg(feature = "perfetto")]
+static IN_FLIGHT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 fn record_completion(gpu: &Arc<Gpu>, progress: &Arc<Mutex<ResidentStatus>>, position: Position) {
     let gpu: Weak<Gpu> = Arc::downgrade(gpu);
     let progress = Arc::clone(progress);
@@ -549,6 +560,8 @@ fn record_completion(gpu: &Arc<Gpu>, progress: &Arc<Mutex<ResidentStatus>>, posi
     // Another thread may poll the device as soon as it is installed.
     if let Some(gpu_ref) = gpu.upgrade() {
         gpu_ref.on_done(move || {
+            #[cfg(feature = "perfetto")]
+            crate::pf_counter!(crate::perfetto::events::REX3_GPU_IN_FLIGHT, IN_FLIGHT.fetch_sub(1, Ordering::Relaxed) - 1);
             if gpu.upgrade().is_some_and(|gpu| gpu.check().is_ok()) {
                 progress.lock().confirm(position);
             }
@@ -999,6 +1012,7 @@ impl ResidentGpu {
                 entry(0, false, PLANE_BYTES),
                 entry(1, false, PLANE_BYTES),
                 entry(2, true, MAX_PAYLOAD_BYTES),
+                entry(3, true, PLANE_BYTES),
             ],
         });
         let pipelines = BatchPipelines::new(&gpu, &ArchShaders {
@@ -1035,6 +1049,8 @@ impl ResidentGpu {
                 ("REX_FLAG_FAST_CLEAR", FLAG_FAST_CLEAR),
                 ("REX_FLAG_FILL_FIRST_ROW_COMPLETE", FLAG_FILL_FIRST_ROW_COMPLETE),
                 ("REX_FLAG_FILL_BLOCK", FLAG_FILL_BLOCK),
+                ("REX_FLAG_COPY_PARALLEL", FLAG_COPY_PARALLEL),
+                ("REX_FLAG_COPY_SNAPSHOT", FLAG_COPY_SNAPSHOT),
                 ("REX_OCTANT_XDEC", OCTANT_XDEC),
                 ("REX_OCTANT_YDEC", OCTANT_YDEC),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),
@@ -1096,6 +1112,10 @@ impl ResidentGpu {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: payload.buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: planes.copy_source.as_entire_binding(),
                         },
                     ],
                 });
@@ -1261,6 +1281,7 @@ impl ResidentGpu {
             let line = prepared.line();
             self.current_coverage = line.and_then(|line|
                 Coverage::new(line.min_x, line.min_y, line.max_x, line.max_y));
+            crate::pf_scope!(crate::perfetto::events::REX3_GPU_COPY, self.current_coverage.map_or(0, Coverage::area));
             if line.is_some() && prepared.payload().len() > MAX_PAYLOAD_WORDS {
                 return Err(ResidentError::Unsupported("copy line payload length"));
             }
@@ -1302,17 +1323,32 @@ impl ResidentGpu {
         let fill = prepared.fill();
         self.current_coverage = fill.and_then(|fill|
             Coverage::new(fill.min_x, fill.min_y, fill.max_x, fill.max_y));
+        crate::pf_scope!(crate::perfetto::events::REX3_GPU_COPY, self.current_coverage.map_or(0, Coverage::area));
         self.submit_for(FlushReason::CopyHazard)?;
         let position = self.progress.lock().next_position()?;
         if let Some(fill) = fill {
             let slot = RexStateSlot::for_copy(context);
+            let mode = copy_mode(context, &fill);
+            if mode == CopyMode::Snapshot {
+                // Ordered on the queue before this batch's dispatches.
+                let source = match fill.plane {
+                    FillPlane::Rgb => &self.planes.rgb,
+                    FillPlane::Aux => &self.planes.aux,
+                };
+                let mut encoder = self.gpu.encoder("resident rex3 copy source");
+                encoder.copy_buffer_to_buffer(source, 0, &self.planes.copy_source, 0, PLANE_BYTES);
+                self.gpu.submit(encoder);
+            }
+            // A serial copy is one lane of its first tile; a parallel one
+            // covers its destination, a lane a pixel.
+            let (x1, y1) = if mode == CopyMode::Serial { (fill.min_x, fill.min_y) } else { (fill.max_x, fill.max_y) };
             let result = self.batch.prim_with_slot(
                 slot,
                 fill.min_x,
                 fill.min_y,
-                fill.min_x,
-                fill.min_y,
-                |slot| RexCommand::copy_fill(slot, fill, cid_test(context.clipmode)),
+                x1,
+                y1,
+                |slot| RexCommand::copy_fill(slot, fill, cid_test(context.clipmode), mode),
             );
             match result {
                 Ok(Some(_)) => {}
@@ -1531,6 +1567,7 @@ impl ResidentGpu {
         };
         let fill = prepared.fill();
         self.current_coverage = fill.and_then(|_| prepared.coverage());
+        crate::pf_scope!(crate::perfetto::events::REX3_GPU_HOST, self.current_coverage.map_or(0, Coverage::area));
         if let Some(fill) = fill {
             let fast_clear = prepared.fast_clear();
             let payload_words = prepared
@@ -1770,6 +1807,7 @@ impl ResidentBackend for ResidentGpu {
         }
         let start = Instant::now();
         let commands = self.batch.len();
+        crate::pf_scope!(crate::perfetto::events::REX3_GPU_FLUSH[reason as usize], commands);
         let tile_pairs = self.batch.tile_pair_bound();
         let waits_before = self.batch.wait_stats();
         let profile_before = self.batch.timing.as_ref().map(|timing| (
@@ -1800,6 +1838,8 @@ impl ResidentBackend for ResidentGpu {
             self.gpu.submit(self.gpu.encoder("resident rex3 no-op marker"));
         }
         self.progress.lock().submit(accepted);
+        #[cfg(feature = "perfetto")]
+        crate::pf_counter!(crate::perfetto::events::REX3_GPU_IN_FLIGHT, IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1);
         record_completion(&self.gpu, &self.progress, accepted);
         self.gpu.check().map_err(gpu_error)?;
         let elapsed = duration_ns(start.elapsed()).map_err(ResidentError::InvalidState)?;

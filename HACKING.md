@@ -831,8 +831,8 @@ and a payload word range. The full 1 MiB `Rex3Context` and its HostRW array
 are not uploaded as draw state. A bounded reusable pool (three sets by
 default) owns fixed command, state and 1 MiB payload buffers and stable bind
 groups for its lifetime. The accept-all bin pass omits board bind groups it
-does not read, keeping the raster requirement at eight storage buffers per
-shader stage. Current flat fills have empty payloads but already exercise
+does not read, keeping the raster requirement at nine storage buffers per
+shader stage (the ninth is the copy source snapshot, below). Current flat fills have empty payloads but already exercise
 the shared ordered per-tile command lists and the real Rust/WGSL layouts on
 both hardware backends; shaded fills use the same arena for bounded DDA
 checkpoints.
@@ -897,15 +897,27 @@ zero-write pixels. A complete 1344 x 1024 shaded fill remains below the fixed
 1 MiB arena and one ordered command.
 
 SCR2SCR blocks, spans and all three line families use the same command ABI and
-resident pipeline, but execute as isolated serial commands. REX3 copies are
-ordered feedback walkers, not snapshot or memmove operations: a destination
-write, including logic, blend, amplification and WRMASK effects, can become a
-later source value even across tile boundaries. The backend submits the
+resident pipeline, each copy in a batch of its own: the backend submits the
 accepted prefix before a copy and submits the copy before accepting later
-commands. One shader lane walks the complete primitive and reads and writes
-the selected authoritative RGB or auxiliary plane directly. Packed
-`DBLSRC` slots, unconditional `XYMOVE`, clipping, YFLIP and architectural
-shade/pattern advancement match the CPU walker.
+commands. REX3 copies are ordered feedback walkers, not snapshot or memmove
+operations: a destination write, including logic, blend, amplification and
+WRMASK effects, can become a later source value even across tile boundaries.
+Each pixel's result depends only on its walker position (the source is the
+walker, the destination the walker plus `XYMOVE`, dither and endpoint skips
+come from the walker), so a copy fill whose walk never reads a pixel it wrote
+earlier runs in parallel, binned over its destination tiles with a lane a
+pixel; the lane inverts its pixel to the walker and writes through the
+tile's ordinary per-lane value. `copy::copy_mode` decides on the CPU. When
+the written box and the box moved back by `XYMOVE` do not overlap, lanes read
+the source in place. When they overlap but the walk runs against the move
+(every position's source is overwritten only by a later position, as X
+scrolls), the source plane is first copied into a snapshot buffer on the
+queue and lanes read that. Otherwise (the walk smears pixels along the move)
+and for copy lines, one shader lane walks the complete primitive and reads and
+writes the selected authoritative plane directly, which takes the GPU about
+0.7 µs a pixel. Packed `DBLSRC` slots, unconditional `XYMOVE`, clipping, YFLIP
+and architectural shade/pattern advancement match the CPU walker on every
+path.
 
 DRAW and SCR2SCR fills share a continuation normalizer. The command's three
 metadata words retain `XSAVE` plus first-row and later-row visit counts, so
@@ -1090,7 +1102,13 @@ indirect dispatch. Profiling metadata is separate from raw-plane and composed
 capture traffic.
 
 In addition to capacity and architectural boundaries, a continuously fed
-resident batch is submitted at the next GFIFO command boundary after 4 ms.
+resident batch is submitted at the next GO after 4 ms. An empty GFIFO does
+not submit by itself: the guest pauses between primitives all the time, and a
+submission each time cost the processor thread a fifth of its time in small
+batches. The batch goes when it is 4 ms old, checked after each GO and each
+time the idle processor thread is about to park (a 2 ms park), so a batch
+waits at most about 6 ms; every reader (a frame cut, HostR, a wait for idle)
+submits first.
 This cannot split a command, HostRW transfer or bounded-set wait. A replay of
 66,741 embedded-PROM command-monitor records on Vulkan and D3D12 accepted
 20,987 operations with no unsupported operation or read mismatch. It formed

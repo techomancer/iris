@@ -712,6 +712,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
                 k
             }
             SetChoice::Wait(k) => {
+                crate::pf_scope!(crate::perfetto::events::WGPU_SET_WAIT);
                 let start = Instant::now();
                 self.wait_stats.waits = self.wait_stats.waits.checked_add(1)
                     .ok_or("wgpu bounded set wait counter overflow")?;

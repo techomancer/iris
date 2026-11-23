@@ -3508,12 +3508,23 @@ impl Rex3 {
                     self.gfifo.flush_head();
                     break; 
                 } // GFIFO_EXIT
+                // Only a GO adds work to the batch, so only a GO can age it;
+                // reading the clock after every register write cost the
+                // processor thread a fifth of its time.
                 #[cfg(feature = "wgpu")]
-                self.flush_resident_if_due();
+                if is_go {
+                    self.flush_resident_if_due();
+                }
             } else {
                 if is_busy {
+                    // The guest pauses between primitives all the time; a
+                    // submission each time cost the processor thread a fifth
+                    // of its time in small batches. The batch goes when it is
+                    // 4 ms old, checked here and each time the thread is about
+                    // to park; every reader (frame cut, host read, wait for
+                    // idle) submits first.
                     #[cfg(feature = "wgpu")]
-                    let _ = self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::Idle);
+                    self.flush_resident_if_due();
                     #[cfg(feature = "rex-gpu")]
                     self.flush_gpu_replay(FlushReason::Idle);
                     self.gfxbusy.store(false, Ordering::Release);
@@ -3529,8 +3540,13 @@ impl Rex3 {
                 // CPU at ~100%. Tests leak their Rex3 and its processor thread,
                 // so spinning ones also starve a CI runner.
                 if backoff.is_completed() {
+                    // A batch still young waits through the park below (at
+                    // most 2 ms) and goes on a later pass, once it is due.
                     #[cfg(feature = "wgpu")]
-                    self.poll_resident_device_health();
+                    {
+                        self.flush_resident_if_due();
+                        self.poll_resident_device_health();
+                    }
                     // Set parked BEFORE the final emptiness re-check so a racing
                     // gfifo_push either (a) is seen by the peek below, or (b) sees
                     // parked=true and unparks us — the unpark token makes

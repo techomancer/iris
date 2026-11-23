@@ -237,6 +237,47 @@ pub static REX3_UPLOAD_AUX_RECTS: EventDef =
 pub static REX3_READBACK_BYTES: EventDef =
     EventDef::new("rex3.readback.bytes", cat::GFX).in_group(GFX_GROUP);
 
+// Newport's GPU raster (`raster = "wgpu"`), on the REX3 processor thread
+// unless a track is named.
+
+const fn gpu_flush(name: &'static str) -> EventDef {
+    EventDef::new(name, cat::GFX).with_arg("commands")
+}
+/// A batch submitted to the GPU, one event per flush reason in
+/// `FlushReason` order (arg: commands in the batch).
+pub static REX3_GPU_FLUSH: [EventDef; 14] = [
+    gpu_flush("gpu flush: capacity"), gpu_flush("gpu flush: host transition"),
+    gpu_flush("gpu flush: copy"), gpu_flush("gpu flush: idle"),
+    gpu_flush("gpu flush: wait idle"), gpu_flush("gpu flush: display fence"),
+    gpu_flush("gpu flush: frame cut"), gpu_flush("gpu flush: observation"),
+    gpu_flush("gpu flush: host read"), gpu_flush("gpu flush: explicit"),
+    gpu_flush("gpu flush: exit"), gpu_flush("gpu flush: latency"),
+    gpu_flush("gpu flush: restore"), gpu_flush("gpu flush: unsupported"),
+];
+/// A screen-to-screen copy going into the batch (arg: destination pixels,
+/// conservative box).
+pub static REX3_GPU_COPY: EventDef = EventDef::new("gpu copy", cat::PRIM).with_arg("pixels");
+/// A host-data draw going into the batch (arg: destination pixels,
+/// conservative box).
+pub static REX3_GPU_HOST: EventDef = EventDef::new("gpu host draw", cat::PRIM).with_arg("pixels");
+/// Batches submitted and not yet seen complete (completion is seen at the
+/// next device poll, so the fall can lag the GPU).
+pub static REX3_GPU_IN_FLIGHT: EventDef =
+    EventDef::new("Newport GPU batches in flight", cat::GFX).in_group(GFX_GROUP);
+/// The display thread's frame cut: a marker through the GFIFO, waited for
+/// at the raster thread.
+pub static REX3_GPU_FRAME_CUT: EventDef = EventDef::new("frame cut", cat::GFX);
+/// The display thread composes the scanout from the GPU planes.
+pub static REX3_GPU_SCANOUT: EventDef = EventDef::new("gpu scanout", cat::GFX);
+
+// ── wgpu batches (any board) ─────────────────────────────────────────────────
+
+/// A board's thread waits for the GPU to finish with the oldest batch's
+/// buffers before it can record another: the GPU is behind.
+pub static WGPU_SET_WAIT: EventDef = EventDef::new("wait for GPU (batch set)", cat::GFX);
+/// A blocking wait on a GPU submission (`Gpu::wait`).
+pub static WGPU_WAIT: EventDef = EventDef::new("wait for GPU", cat::GFX);
+
 // ── XZ / Extreme (GR2) ───────────────────────────────────────────────────────
 
 pub static GR2_WAIT: EventDef = EventDef::new("guest read stalled", cat::GFX)

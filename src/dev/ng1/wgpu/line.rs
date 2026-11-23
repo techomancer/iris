@@ -382,6 +382,10 @@ impl PreparedHostLine {
     }
 }
 
+// Never inlined: it copies the whole context (the host buffer is a
+// megabyte), and inlined into the resident enqueue that frame was reserved
+// and stack-probed on every GO, a third of the processor thread's time.
+#[inline(never)]
 pub(super) fn prepare_host_line(
     context: &Rex3Context,
 ) -> Result<PreparedHostLine, &'static str> {

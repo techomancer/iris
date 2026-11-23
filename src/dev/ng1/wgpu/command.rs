@@ -42,6 +42,26 @@ pub(super) const FLAG_SHADED: u32 = 1 << 8;
 pub(super) const FLAG_FILL_FIRST_ROW_COMPLETE: u32 = 1 << 9;
 pub(super) const FLAG_FILL_BLOCK: u32 = 1 << 10;
 pub(super) const FLAG_FAST_CLEAR: u32 = 1 << 11;
+/// A copy fill binned over its destination tiles, a lane a destination
+/// pixel, instead of walked by one lane (`CopyMode`).
+pub(super) const FLAG_COPY_PARALLEL: u32 = 1 << 12;
+/// A parallel copy reads its source from the snapshot taken before the
+/// batch: the source overlaps the destination.
+pub(super) const FLAG_COPY_SNAPSHOT: u32 = 1 << 13;
+
+/// How a copy fill runs on the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CopyMode {
+    /// One lane walks it in the hardware's order: a copy whose walk reads
+    /// pixels it wrote earlier (overlapping, against the move).
+    Serial,
+    /// A lane a destination pixel, reading the source in place: the source
+    /// and destination do not overlap.
+    Parallel,
+    /// A lane a destination pixel, reading the source from a snapshot: they
+    /// overlap, but the walk reads every source pixel before writing it.
+    Snapshot,
+}
 
 pub(super) const STATE_WORDS: usize = 64;
 pub(super) const STATE_DRAW_MODE0: usize = 0;
@@ -214,6 +234,7 @@ impl RexCommand {
         state_slot: u32,
         fill: CopyFill,
         cid_test: bool,
+        mode: CopyMode,
     ) -> Self {
         let kind = match fill.kind {
             CopyKind::Block => COMMAND_COPY_BLOCK,
@@ -233,6 +254,11 @@ impl RexCommand {
         if fill.kind == CopyKind::Block {
             flags |= FLAG_FILL_BLOCK;
         }
+        flags |= match mode {
+            CopyMode::Serial => 0,
+            CopyMode::Parallel => FLAG_COPY_PARALLEL,
+            CopyMode::Snapshot => FLAG_COPY_PARALLEL | FLAG_COPY_SNAPSHOT,
+        };
         Self {
             kind,
             state_slot,
