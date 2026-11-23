@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use spin::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
-use crate::hptimer::{TimerManager, TimerId, TimerReturn};
+use crate::hptimer::{Timer, TimerManager};
 use std::io::Write;
 
 pub trait TimerCallback: Send + Sync {
@@ -30,15 +30,15 @@ struct Channel {
     period_start: Option<u64>,
     period_duration: Option<Duration>,
     input_freq: u32,
-    // Active hptimer ID, if armed. A channel with no interrupt callback has no
-    // hptimer (see `arm_channel`): it is armed but timer-less.
-    timer_id: Option<TimerId>,
+    // The channel interrupts, so a `Timer` restarts its period. One without a
+    // callback has no timer (see `arm_channel`) and free-runs.
+    ticks: bool,
     // The channel is counting (OUT high), with or without an hptimer.
     armed: bool,
 }
 
 impl Channel {
-    fn new() -> Self {
+    fn new(ticks: bool) -> Self {
         Self {
             count: 0,
             reload: 0,
@@ -51,16 +51,47 @@ impl Channel {
             period_start: None,
             period_duration: None,
             input_freq: 0,
-            timer_id: None,
+            ticks,
             armed: false,
+        }
+    }
+}
+
+/// One counter and the deadline that ends its period. Lock order: `chan`, then the timer's state.
+struct Slot {
+    chan: Mutex<Channel>,
+    callback: Option<Arc<dyn TimerCallback>>,
+    debug: Arc<AtomicBool>,
+    timer: Timer,
+}
+
+impl Slot {
+    /// The period that began at `due - period` ended: restart it and interrupt.
+    fn fire(&self, idx: usize, due: u64) {
+        {
+            let mut chan = self.chan.lock();
+            let Some(period) = chan.period_duration else { return };
+            let period = period.as_nanos() as u64;
+            // A period armed since this deadline was set is not this one.
+            if chan.period_start != Some(due.wrapping_sub(period)) {
+                return;
+            }
+            chan.count = 0;
+            chan.period_start = Some(due);
+            self.timer.set_due(Some(due + period));
+        }
+        if self.debug.load(Ordering::Relaxed) && idx != 2 {
+            println!("PIT: Channel {} expired", idx);
+        }
+        if let Some(cb) = &self.callback {
+            cb.callback();
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Pit8254 {
-    channels: [Arc<Mutex<Channel>>; 3],
-    callbacks: [Option<Arc<dyn TimerCallback>>; 3],
+    channels: [Arc<Slot>; 3],
     tm: Arc<TimerManager>,
     debug: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -72,21 +103,25 @@ pub struct Pit8254 {
 
 impl Pit8254 {
     pub fn new(tm: &Arc<TimerManager>, base_frequency: u32, cb0: Option<Arc<dyn TimerCallback>>, cb1: Option<Arc<dyn TimerCallback>>, cb2: Option<Arc<dyn TimerCallback>>) -> Self {
+        let debug = Arc::new(AtomicBool::new(false));
+        let slot = |idx: usize, callback: Option<Arc<dyn TimerCallback>>| {
+            Arc::new_cyclic(|me| Slot {
+                chan: Mutex::new(Channel::new(callback.is_some())),
+                callback,
+                debug: debug.clone(),
+                timer: Timer::new(tm, me, move |s: &Slot, due| s.fire(idx, due)),
+            })
+        };
         let pit = Self {
-            channels: [
-                Arc::new(Mutex::new(Channel::new())),
-                Arc::new(Mutex::new(Channel::new())),
-                Arc::new(Mutex::new(Channel::new())),
-            ],
-            callbacks: [cb0, cb1, cb2],
+            channels: [slot(0, cb0), slot(1, cb1), slot(2, cb2)],
             tm: tm.clone(),
-            debug: Arc::new(AtomicBool::new(false)),
+            debug: debug.clone(),
             running: Arc::new(AtomicBool::new(false)),
             base_frequency,
             rate_sink: Arc::new(std::sync::OnceLock::new()),
         };
         // Channel 2 is driven by the base frequency (1 MHz)
-        pit.channels[2].lock().input_freq = base_frequency;
+        pit.channels[2].chan.lock().input_freq = base_frequency;
         pit
     }
 
@@ -106,7 +141,7 @@ impl Pit8254 {
     pub fn programmed_hz(&self, idx: usize) -> f64 {
         let periodic = |c: &Channel| (c.mode == 2 || c.mode == 3) && c.reload > 0;
         let input = {
-            let c = self.channels[2].lock();
+            let c = self.channels[2].chan.lock();
             if !periodic(&c) {
                 return 0.0;
             }
@@ -115,7 +150,7 @@ impl Pit8254 {
         if idx == 2 {
             return input;
         }
-        let c = self.channels[idx].lock();
+        let c = self.channels[idx].chan.lock();
         if periodic(&c) { input / c.reload as f64 } else { 0.0 }
     }
 
@@ -131,66 +166,34 @@ impl Pit8254 {
     }
 
     fn arm_channel(&self, idx: usize) {
-        let tm = &self.tm;
-
-        // Disarm any existing timer first
         self.disarm_channel(idx);
-
-        let period;
-        {
-            let mut chan = self.channels[idx].lock();
-            if chan.reload == 0 || chan.input_freq == 0 {
-                return;
-            }
-            let ns = 1_000_000_000u64 / chan.input_freq as u64;
-            period = Duration::from_nanos(chan.reload as u64 * ns);
-            chan.period_start = Some(tm.clock().now());
-            chan.period_duration = Some(period);
-            chan.armed = true;
+        let slot = &self.channels[idx];
+        let mut chan = slot.chan.lock();
+        if chan.reload == 0 || chan.input_freq == 0 {
+            return;
         }
-
-        // A channel with no interrupt callback needs no hptimer: its only job
+        let ns = 1_000_000_000u64 / chan.input_freq as u64;
+        let period = Duration::from_nanos(chan.reload as u64 * ns);
+        let now = self.now();
+        chan.period_start = Some(now);
+        chan.period_duration = Some(period);
+        chan.armed = true;
+        // A channel with no interrupt callback needs no timer: its only job
         // would be to restart `period_start` every period so `current_count`
         // can interpolate, and `current_count` can take the phase instead.
         // Channel 2 is such a channel: the guest programs it as the clock
-        // divider for channels 0 and 1, at 5 kHz for IRIX. An hptimer at that
+        // divider for channels 0 and 1, at 5 kHz for IRIX. A timer at that
         // rate sits in the spin branch of the timer thread and burns a host
         // core for nothing.
-        if self.callbacks[idx].is_none() {
-            return;
+        if chan.ticks {
+            slot.timer.set_due(Some(now + period.as_nanos() as u64));
         }
-
-        let chan_arc = self.channels[idx].clone();
-        let callback = self.callbacks[idx].clone();
-        let debug = self.debug.clone();
-        let clock = tm.clock().clone();
-
-        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
-            {
-                let mut chan = chan_arc.lock();
-                chan.count = 0;
-                chan.period_start = Some(clock.now());
-            }
-            if let Some(cb) = &callback {
-                if debug.load(Ordering::Relaxed) && idx != 2 {
-                    println!("PIT: Channel {} expired, triggering callback", idx);
-                }
-                cb.callback();
-            } else if debug.load(Ordering::Relaxed) && idx != 2 {
-                println!("PIT: Channel {} expired (no callback)", idx);
-            }
-            TimerReturn::Continue
-        });
-
-        self.channels[idx].lock().timer_id = Some(id);
     }
 
     fn disarm_channel(&self, idx: usize) {
-        let id = self.channels[idx].lock().timer_id.take();
-        if let Some(id) = id {
-            self.tm.remove(id);
-        }
-        let mut chan = self.channels[idx].lock();
+        let slot = &self.channels[idx];
+        let mut chan = slot.chan.lock();
+        slot.timer.set_due(None);
         chan.period_start = None;
         chan.period_duration = None;
         chan.armed = false;
@@ -208,7 +211,7 @@ impl Pit8254 {
         if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
             if chan.input_freq > 0 {
                 let mut elapsed = Duration::from_nanos(now.saturating_sub(start));
-                if chan.timer_id.is_none() && !duration.is_zero() {
+                if !chan.ticks && !duration.is_zero() {
                     // No hptimer restarts the period: the counter free-runs,
                     // so the count is where in the period we are now.
                     let phase = elapsed.as_nanos() % duration.as_nanos();
@@ -246,7 +249,7 @@ impl Pit8254 {
             if (val & (1 << (idx + 1))) == 0 {
                 continue;
             }
-            let mut chan = self.channels[idx].lock();
+            let mut chan = self.channels[idx].chan.lock();
             if latch_count && chan.latched_count.is_none() {
                 chan.latched_count = Some(Self::current_count(self.now(), &chan));
             }
@@ -257,7 +260,7 @@ impl Pit8254 {
     }
 
     fn read_channel(&self, idx: usize) -> u8 {
-        let mut chan = self.channels[idx].lock();
+        let mut chan = self.channels[idx].chan.lock();
 
         // A status latch is served before the count latch, as on the chip.
         if let Some(status) = chan.latched_status.take() {
@@ -287,7 +290,7 @@ impl Pit8254 {
         let mut update_chain = false;
         let mut do_arm = false;
         {
-            let mut chan = self.channels[idx].lock();
+            let mut chan = self.channels[idx].chan.lock();
 
             match chan.rw_mode {
                 1 => { // LSB
@@ -343,7 +346,7 @@ impl Pit8254 {
         let idx = sc as usize;
         let mut update_chain = false;
         {
-            let mut chan = self.channels[idx].lock();
+            let mut chan = self.channels[idx].chan.lock();
 
             if rw == 0 {
                 // Counter Latch Command
@@ -377,7 +380,7 @@ impl Pit8254 {
         // If Ch2 is in Mode 2 (Rate Generator) or Mode 3 (Square Wave), it generates a clock.
         // Frequency = Input Freq / Reload Value.
         let freq = {
-            let chan = self.channels[2].lock();
+            let chan = self.channels[2].chan.lock();
             let mode_periodic = chan.mode == 2 || chan.mode == 3;
             if mode_periodic && chan.reload > 0 && chan.input_freq > 0 {
                 chan.input_freq / chan.reload as u32
@@ -391,7 +394,7 @@ impl Pit8254 {
 
         for i in 0..2 {
             let changed = {
-                let mut chan = self.channels[i].lock();
+                let mut chan = self.channels[i].chan.lock();
                 if chan.input_freq != freq {
                     if self.debug.load(Ordering::Relaxed) {
                         println!("PIT: Ch{} input freq updated to {} Hz (driven by Ch2)", i, freq);
@@ -443,12 +446,14 @@ impl Device for Pit8254 {
         self.running.store(false, Ordering::Release);
         for i in 0..3 {
             self.disarm_channel(i);
+            self.channels[i].timer.stop();
         }
     }
 
     fn start(&self) {
         self.running.store(true, Ordering::Release);
         for i in 0..3 {
+            self.channels[i].timer.start();
             self.arm_channel(i);
         }
     }
@@ -478,8 +483,8 @@ impl Device for Pit8254 {
                 }
                 "status" => {
                     writeln!(writer, "PIT Status:").unwrap();
-                    for (i, channel_arc) in self.channels.iter().enumerate() {
-                        let chan = channel_arc.lock();
+                    for (i, slot) in self.channels.iter().enumerate() {
+                        let chan = slot.chan.lock();
                         writeln!(writer, "  Channel {}: Mode={} RW={} BCD={} Count={:04x} Reload={:04x} Freq={}Hz Running={}",
                             i, chan.mode, chan.rw_mode, chan.bcd, chan.count, chan.reload, chan.input_freq, chan.period_start.is_some()).unwrap();
                     }
@@ -504,8 +509,8 @@ impl Resettable for Pit8254 {
         for i in 0..3 {
             self.disarm_channel(i);
         }
-        for (i, channel_arc) in self.channels.iter().enumerate() {
-            let mut chan = channel_arc.lock();
+        for (i, slot) in self.channels.iter().enumerate() {
+            let mut chan = slot.chan.lock();
             chan.count = 0;
             chan.reload = 0;
             chan.latched_count = None;
@@ -516,7 +521,6 @@ impl Resettable for Pit8254 {
             chan.rw_state = 0;
             chan.period_start = None;
             chan.period_duration = None;
-            chan.timer_id = None;
             chan.armed = false;
             // Channel 2 is driven by base frequency; channels 0,1 start with 0 until chaining fires.
             chan.input_freq = if i == 2 { self.base_frequency } else { 0 };
@@ -549,7 +553,6 @@ fn chan_from_toml(v: &toml::Value, chan: &mut Channel) {
     chan.rw_state = 0;
     chan.period_start = None;
     chan.period_duration = None;
-    chan.timer_id = None;
     chan.armed = false;
 }
 
@@ -635,8 +638,8 @@ mod tests {
         pit.start();
         program_mode2(&pit, 2, 200); // 200 us period: 5 kHz
         {
-            let chan = pit.channels[2].lock();
-            assert!(chan.timer_id.is_none(), "no hptimer for a callback-less channel");
+            let chan = pit.channels[2].chan.lock();
+            assert!(!chan.ticks && !pit.channels[2].timer.is_armed(), "no timer for a callback-less channel");
             assert!(chan.armed, "the channel is still counting");
         }
         // Status read-back: OUT (bit 7) is high while armed.
@@ -678,6 +681,28 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
         assert_eq!(latch_read16(&pit, 2), 7_000);
         pit.stop();
+    }
+
+    /// An interrupting channel fires once per period of the machine clock,
+    /// and a stopped machine's clock holds it.
+    #[test]
+    fn an_interrupting_channel_follows_the_machine_clock() {
+        let clock = crate::test_board::Stepped::new();
+        let n = Arc::new(AtomicU32::new(0));
+        let pit = Pit8254::new(&clock.tm, 1_000_000, None, None, Some(Arc::new(CountCallback(n.clone()))));
+        pit.start();
+        program_mode2(&pit, 2, 1000); // 1 ms
+        clock.step(999_000);
+        assert_eq!(n.load(AOrdering::SeqCst), 0, "not before the period ends");
+        assert_eq!(latch_read16(&pit, 2), 1, "one tick left");
+        clock.step(1_000);
+        assert_eq!(n.load(AOrdering::SeqCst), 1);
+        clock.step(1_000_000);
+        assert_eq!(n.load(AOrdering::SeqCst), 2, "the next period starts where the last ended");
+        assert_eq!(pit.channels[2].timer.due(), Some(3_000_000));
+        pit.stop();
+        clock.step(5_000_000);
+        assert_eq!(n.load(AOrdering::SeqCst), 2, "a stopped PIT does not fire");
     }
 
     /// The read-back command (control word `11`) latches the selected counter's
@@ -862,16 +887,16 @@ mod tests {
 impl Saveable for Pit8254 {
     fn save_state(&self) -> toml::Value {
         let mut tbl = toml::map::Map::new();
-        for (i, channel_arc) in self.channels.iter().enumerate() {
-            let chan = channel_arc.lock();
+        for (i, slot) in self.channels.iter().enumerate() {
+            let chan = slot.chan.lock();
             tbl.insert(format!("ch{}", i), chan_to_toml(&chan));
         }
         toml::Value::Table(tbl)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        for (i, channel_arc) in self.channels.iter().enumerate() {
-            let mut chan = channel_arc.lock();
+        for (i, slot) in self.channels.iter().enumerate() {
+            let mut chan = slot.chan.lock();
             if let Some(ct) = get_field(v, &format!("ch{}", i)) {
                 chan_from_toml(ct, &mut chan);
             }
