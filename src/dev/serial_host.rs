@@ -1300,7 +1300,7 @@ pub(crate) mod tests {
         let mut got = Vec::new();
         let want = sent.len() - 5000;
         assert!(
-            crate::test_board::until(Duration::from_secs(20), || {
+            crate::test_board::until(|| {
                 f.flush();
                 let mut buf = [0u8; 65536];
                 if let Ok(n) = client.read(&mut buf) {
@@ -1332,7 +1332,7 @@ pub(crate) mod tests {
         assert_eq!(b.dropped(), 1000, "the guest was never held, the oldest went");
         drop(old);
         assert!(
-            crate::test_board::until(Duration::from_secs(10), || {
+            crate::test_board::until(|| {
                 matches!(b.recv_byte(), Err(e) if e.kind() == io::ErrorKind::NotConnected)
             }),
             "the gone client was never let go"
@@ -1345,7 +1345,7 @@ pub(crate) mod tests {
         b.send_byte(b'k');
         let mut got = Vec::new();
         assert!(
-            crate::test_board::until(Duration::from_secs(10), || {
+            crate::test_board::until(|| {
                 b.flush();
                 let mut buf = [0u8; 16];
                 if let Ok(n) = client.read(&mut buf) {
@@ -1368,7 +1368,7 @@ pub(crate) mod tests {
         let b = TcpSocketBackend::new(("127.0.0.1", 0)).unwrap();
         let addr = b.listener.local_addr().unwrap();
         let old = TcpStream::connect(addr).unwrap();
-        assert!(crate::test_board::until(Duration::from_secs(10), || {
+        assert!(crate::test_board::until(|| {
             let _ = b.recv_byte();
             b.conns.lock().len() == 1
         }));
@@ -1379,7 +1379,7 @@ pub(crate) mod tests {
         assert!(held > 0, "the guest was never held, the oldest went");
         drop(old);
         assert!(
-            crate::test_board::until(Duration::from_secs(10), || {
+            crate::test_board::until(|| {
                 b.flush();
                 b.conns.lock().is_empty()
             }),
@@ -1388,7 +1388,7 @@ pub(crate) mod tests {
         assert_eq!(b.dropped(), held, "its count outlives it");
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
-        assert!(crate::test_board::until(Duration::from_secs(10), || {
+        assert!(crate::test_board::until(|| {
             let _ = b.recv_byte();
             b.conns.lock().len() == 1
         }));
@@ -1397,7 +1397,7 @@ pub(crate) mod tests {
         let head = crate::net::telnet::TelnetFilter::initial_handshake().len();
         let mut got = Vec::new();
         assert!(
-            crate::test_board::until(Duration::from_secs(10), || {
+            crate::test_board::until(|| {
                 b.flush();
                 let mut buf = [0u8; 64];
                 if let Ok(n) = client.read(&mut buf) {

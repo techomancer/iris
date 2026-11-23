@@ -13,17 +13,16 @@ struct Rig {
     words: Vec<Arc<AtomicU64>>,
     cycles: Vec<Arc<AtomicU64>>,
     slots: Vec<Arc<ParkSlot>>,
-    clock: crate::clock::Clock,
+    clock: crate::test_board::Stepped,
 }
 
 impl Rig {
     fn new(count: usize) -> Self {
-        let clock = crate::clock::Clock::stepped();
-        let timers = Arc::new(TimerManager::with_clock(clock.clone()));
+        let clock = crate::test_board::Stepped::new();
         let processors = Population::populated_cpus(count).unwrap();
         let bedrock = Bedrock::new(BedrockConfig {
             name: "test",
-            timers: &timers,
+            timers: &clock.tm,
             processors,
             banks_mib: &[64],
             nodes: 1,

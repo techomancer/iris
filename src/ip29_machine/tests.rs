@@ -147,17 +147,16 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
 fn the_origin_200_controller_grants_from_the_start_and_survives_a_reset() {
     use crate::dev::pcf8584::ctl;
     use crate::dev::serial_host::CiSerialBackend;
-    let now = crate::clock::Clock::stepped();
-    let tm = Arc::new(crate::hptimer::TimerManager::with_clock(now.clone()));
-    let hub = Hub::new(HubConfig { cpus: 1, ni_revision: 3, ..Default::default() }, &tm, None).unwrap();
-    let controller = Origin200Controller::new(&hub, &tm, None).unwrap();
+    let now = crate::test_board::Stepped::new();
+    let hub = Hub::new(HubConfig { cpus: 1, ni_revision: 3, ..Default::default() }, &now.tm, None).unwrap();
+    let controller = Origin200Controller::new(&hub, &now.tm, None).unwrap();
     controller.elsc.start();
     let grants = || {
         // The PROM's setup as an I2C observer: a nonzero own address, then the interface on.
         controller.i2c.write_register(8, ctl::PIN);
         controller.i2c.write_register(0, 0x09);
         controller.i2c.write_register(8, ctl::PIN | ctl::ESO);
-        crate::test_board::until(std::time::Duration::from_secs(10), || {
+        crate::test_board::until(|| {
             now.step(1_000_000);
             controller.i2c.read_register(0) == 0xe0
         })

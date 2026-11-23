@@ -196,11 +196,6 @@ mod tests {
         (kona, host, handle)
     }
 
-    /// Wait for `cond`, up to a deadline, not a count of tries.
-    fn wait_for(cond: impl FnMut() -> bool) -> bool {
-        crate::test_board::until(Duration::from_secs(30), cond)
-    }
-
     fn read(kona: &crate::dev::kona::Kona, off: u64) -> u32 {
         kona.bus_read(off, 4).1 as u32
     }
@@ -251,10 +246,10 @@ mod tests {
         let clock = Arc::new(Clock::default());
         let mut t = DisplayThread::spawn(clock.clone(), h.clone(), Duration::from_millis(1), quiet());
         clock.request(h.epoch(), 0x55);
-        assert!(wait_for(|| read(&kona, RETRACE_TAG) == 0x55));
+        assert!(crate::test_board::until(|| read(&kona, RETRACE_TAG) == 0x55));
         assert_eq!(read(&kona, RETRACE_TAG), 0x55);
         // The counters follow the completion within the same frame.
-        assert!(wait_for(|| clock.frames() >= 1));
+        assert!(crate::test_board::until(|| clock.frames() >= 1));
         t.stop();
         let f = clock.frames();
         std::thread::yield_now();
@@ -275,7 +270,7 @@ mod tests {
         }
         assert_eq!(clock.frames(), f);
         clock.resume();
-        assert!(wait_for(|| clock.frames() > f));
+        assert!(crate::test_board::until(|| clock.frames() > f));
         t.stop();
         kona.stop();
     }

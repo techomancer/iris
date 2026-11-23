@@ -106,7 +106,7 @@ impl TestNet {
     /// Pump until a frame matching `pred` arrives; return it (others stay queued).
     pub fn wait_for<F: FnMut(&[u8]) -> bool>(&mut self, what: &str, mut pred: F) -> Vec<u8> {
         let mut found = None;
-        let ok = crate::test_board::until(PATIENCE, || {
+        let ok = crate::test_board::until(|| {
             if let Some(i) = self.inbox.iter().position(|f| pred(f)) {
                 found = self.inbox.remove(i);
                 return true;

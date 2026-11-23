@@ -1832,7 +1832,7 @@ mod tests {
                 };
             ok
         };
-        assert!(wait_for(durable), "the background sync alone made the writes durable");
+        assert!(crate::test_board::until(durable), "the background sync alone made the writes durable");
         fast.finish();
         drop(node);
     }
@@ -2937,11 +2937,6 @@ mod tests {
         (path, file)
     }
 
-    /// Wait for `cond`, up to 5 s.
-    fn wait_for(cond: impl FnMut() -> bool) -> bool {
-        crate::test_board::until(Duration::from_secs(5), cond)
-    }
-
     /// The thread syncs once for a write and then not at all while nothing
     /// is written: it parks. A later write wakes it again.
     #[test]
@@ -2956,14 +2951,14 @@ mod tests {
         assert_eq!(syncs(), 0, "idle: nothing to sync");
 
         bg.mark();
-        assert!(wait_for(|| syncs() == 1), "a write is synced");
+        assert!(crate::test_board::until(|| syncs() == 1), "a write is synced");
         assert!(!bg.is_pending());
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(syncs(), 1, "and then it is idle again");
 
         bg.mark();
         bg.mark();
-        assert!(wait_for(|| syncs() == 2), "a later write wakes it");
+        assert!(crate::test_board::until(|| syncs() == 2), "a later write wakes it");
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(syncs(), 2, "a burst is one sync");
         bg.finish();
@@ -2977,7 +2972,7 @@ mod tests {
         let bg = Background::with_interval(&file, Duration::from_millis(20));
         bg.mark();
         bg.spawn().unwrap();
-        assert!(wait_for(|| bg.syncs() == 1), "synced without another write");
+        assert!(crate::test_board::until(|| bg.syncs() == 1), "synced without another write");
         bg.finish();
     }
 

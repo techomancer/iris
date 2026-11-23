@@ -19,7 +19,7 @@ struct Node {
 }
 fn node(revision: u8) -> Node {
     let config = super::super::HubConfig { ni_revision: revision, ..Default::default() };
-    let hub = super::super::Hub::new(config, &Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::stepped())), None).unwrap();
+    let hub = super::super::Hub::new(config, &crate::test_board::Stepped::new().tm, None).unwrap();
     Node { ni: hub.ni.clone(), hub }
 }
 /// Two Hubs with their NI ports connected, as in an Origin 2000 deskside.

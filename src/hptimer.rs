@@ -851,11 +851,10 @@ mod timer_tests {
         rearm: AtomicUsize,
     }
 
-    fn dev() -> (Arc<Dev>, Clock, Arc<TimerManager>) {
-        let clock = Clock::stepped();
-        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+    fn dev() -> (Arc<Dev>, crate::test_board::Stepped) {
+        let clock = crate::test_board::Stepped::new();
         let d = Arc::new_cyclic(|me| Dev {
-            timer: Timer::new(&tm, me, |d: &Dev, due| {
+            timer: Timer::new(&clock.tm, me, |d: &Dev, due| {
                 d.fired.lock().push(due);
                 if d.rearm.load(Ordering::SeqCst) > 0 {
                     d.rearm.fetch_sub(1, Ordering::SeqCst);
@@ -865,11 +864,7 @@ mod timer_tests {
             fired: Mutex::new(Vec::new()),
             rearm: AtomicUsize::new(0),
         });
-        (d, clock, tm)
-    }
-
-    fn until(f: impl FnMut() -> bool) -> bool {
-        crate::test_board::until(Duration::from_secs(10), f)
+        (d, clock)
     }
 
     fn fired(d: &Dev) -> Vec<u64> {
@@ -878,24 +873,24 @@ mod timer_tests {
 
     #[test]
     fn a_timer_fires_once_when_the_machine_clock_reaches_it() {
-        let (d, clock, _tm) = dev();
+        let (d, clock) = dev();
         d.timer.start();
         d.timer.arm_at(1_000);
         thread::sleep(Duration::from_millis(20));
         assert!(fired(&d).is_empty(), "the host timer ran ahead of the stepped clock");
         clock.step(1_000);
-        assert!(until(|| fired(&d) == [1_000]));
+        assert!(crate::test_board::until(|| fired(&d) == [1_000]));
         assert!(!d.timer.is_armed());
     }
 
     #[test]
     fn a_replaced_or_cancelled_deadline_does_not_fire() {
-        let (d, clock, _tm) = dev();
+        let (d, clock) = dev();
         d.timer.start();
         d.timer.arm_at(1_000_000);
         d.timer.arm_at(50);
         clock.step(50);
-        assert!(until(|| fired(&d) == [50]));
+        assert!(crate::test_board::until(|| fired(&d) == [50]));
         d.timer.arm_at(60);
         d.timer.cancel();
         clock.step(1_000);
@@ -905,13 +900,13 @@ mod timer_tests {
 
     #[test]
     fn stop_keeps_the_deadline_and_start_arms_it() {
-        let (d, clock, _tm) = dev();
+        let (d, clock) = dev();
         d.timer.arm_at(10);
         clock.step(10);
         thread::sleep(Duration::from_millis(20));
         assert!(fired(&d).is_empty(), "a timer never started stays quiet");
         d.timer.start();
-        assert!(until(|| fired(&d) == [10]));
+        assert!(crate::test_board::until(|| fired(&d) == [10]));
         d.timer.arm_at(30);
         d.timer.stop();
         clock.step(100);
@@ -919,23 +914,23 @@ mod timer_tests {
         assert_eq!(d.timer.due(), Some(30));
         assert_eq!(fired(&d), [10]);
         d.timer.start();
-        assert!(until(|| fired(&d) == [10, 30]));
+        assert!(crate::test_board::until(|| fired(&d) == [10, 30]));
     }
 
     #[test]
     fn a_callback_can_arm_the_next_deadline() {
-        let (d, clock, _tm) = dev();
+        let (d, clock) = dev();
         d.rearm.store(2, Ordering::SeqCst);
         d.timer.start();
         d.timer.arm_at(5);
         clock.step(100);
-        assert!(until(|| fired(&d) == [5, 15, 25]));
+        assert!(crate::test_board::until(|| fired(&d) == [5, 15, 25]));
         assert!(!d.timer.is_armed());
     }
 
     #[test]
     fn a_deadline_that_did_not_move_or_moved_later_keeps_its_host_timer() {
-        let (d, _clock, _tm) = dev();
+        let (d, _clock) = dev();
         d.timer.start();
         d.timer.arm_at(1_000);
         let id = d.timer.0.state.lock().id;
@@ -950,7 +945,7 @@ mod timer_tests {
 
     #[test]
     fn a_deadline_moved_later_fires_at_the_later_time_only() {
-        let (d, clock, _tm) = dev();
+        let (d, clock) = dev();
         d.timer.start();
         d.timer.arm_at(1_000);
         d.timer.arm_at(5_000);
@@ -958,12 +953,12 @@ mod timer_tests {
         thread::sleep(Duration::from_millis(20));
         assert!(fired(&d).is_empty(), "fired at the deadline it moved away from");
         clock.step(4_000);
-        assert!(until(|| fired(&d) == [5_000]));
+        assert!(crate::test_board::until(|| fired(&d) == [5_000]));
     }
 
     #[test]
     fn a_repeated_deadline_does_not_take_the_lock() {
-        let (d, _clock, _tm) = dev();
+        let (d, _clock) = dev();
         d.timer.arm_at(1_000);
         let held = d.timer.0.state.lock();
         let done = Arc::new(AtomicBool::new(false));
@@ -974,14 +969,14 @@ mod timer_tests {
                 done.store(true, Ordering::SeqCst);
             })
         };
-        assert!(until(|| done.load(Ordering::SeqCst)), "blocked on the timer lock");
+        assert!(crate::test_board::until(|| done.load(Ordering::SeqCst)), "blocked on the timer lock");
         drop(held);
         t.join().unwrap();
     }
 
     #[test]
     fn set_due_arms_or_cancels() {
-        let (d, clock, _tm) = dev();
+        let (d, clock) = dev();
         d.timer.start();
         d.timer.set_due(Some(7));
         assert_eq!(d.timer.due(), Some(7));

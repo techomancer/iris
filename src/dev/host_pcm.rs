@@ -384,7 +384,7 @@ pub(crate) mod test_time {
     use super::*;
 
     pub(crate) fn stepped() -> Arc<TimerManager> {
-        Arc::new(TimerManager::with_clock(Clock::stepped()))
+        crate::test_board::Stepped::new().tm
     }
 
     pub(crate) trait Stepped {

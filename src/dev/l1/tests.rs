@@ -6,7 +6,7 @@ use super::*;
 use crate::clock::Clock;
 
 fn new_l1(config: L1Config) -> Result<L1, String> {
-    L1::new(&Arc::new(TimerManager::with_clock(Clock::stepped())), config)
+    L1::new(&crate::test_board::Stepped::new().tm, config)
 }
 
 fn send(l1: &L1, bytes: &[u8]) {
@@ -760,9 +760,8 @@ fn has_text(area: &[u8], text: &[u8]) -> bool {
 /// the deadline and a start arms it again.
 #[test]
 fn the_receive_timeout_runs_on_a_timer_on_the_machine_clock() {
-    let clock = Clock::stepped();
-    let tm = Arc::new(TimerManager::with_clock(clock.clone()));
-    let l1 = L1::new(&tm, Default::default()).unwrap();
+    let clock = crate::test_board::Stepped::new();
+    let l1 = L1::new(&clock.tm, Default::default()).unwrap();
     let (irq, line) = crate::irq::LevelProbe::line();
     l1.set_irq(line);
     l1.write64(0x10, 0x81);
@@ -777,6 +776,6 @@ fn the_receive_timeout_runs_on_a_timer_on_the_machine_clock() {
     clock.step(1);
     assert!(!irq.level() && l1.rx_timer.due() == Some(due), "a stopped timer keeps its deadline and does not fire");
     l1.start();
-    assert!(crate::test_board::until(std::time::Duration::from_secs(60), || irq.level()), "start arms it again");
+    assert!(crate::test_board::until(|| irq.level()), "start arms it again");
     l1.stop();
 }

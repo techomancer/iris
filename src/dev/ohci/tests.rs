@@ -412,7 +412,7 @@ fn the_frame_timer_runs_frames_while_the_guest_is_idle_and_only_then() {
     assert!(h.timer.is_armed());
     now.step(3_500_000);
     assert!(
-        crate::test_board::until(std::time::Duration::from_secs(5), || m.bytes.lock()[0x1080] == 4),
+        crate::test_board::until(|| m.bytes.lock()[0x1080] == 4),
         "frames ran with no register access"
     );
     h.stop();
@@ -458,8 +458,7 @@ fn register_access_the_timer_and_stop_do_not_deadlock() {
 
 /// The controller's clock, set to a time by hand; it only moves forward.
 #[derive(Clone)]
-/// The timer manager rides along: the controller's timer holds it weakly.
-pub(super) struct FakeTime(Clock, Arc<TimerManager>);
+pub(super) struct FakeTime(crate::test_board::Stepped);
 
 impl FakeTime {
     pub(super) fn step(&self, ns: u64) {
@@ -472,10 +471,9 @@ impl FakeTime {
 }
 
 pub(super) fn fake_clock_ohci(start_ns: usize) -> (Arc<Ohci>, FakeTime) {
-    let clock = Clock::stepped();
-    let tm = Arc::new(TimerManager::with_clock(clock.clone()));
-    let h = Ohci::new(&tm);
-    let now = FakeTime(clock, tm);
+    let clock = crate::test_board::Stepped::new();
+    let h = Ohci::new(&clock.tm);
+    let now = FakeTime(clock);
     now.store(start_ns, Ordering::Relaxed);
     h.start();
     (h, now)

@@ -12,8 +12,7 @@ use super::*;
 
 struct Fixture {
     pi: Arc<Pi>,
-    clock: crate::clock::Clock,
-    _tm: Arc<TimerManager>,
+    clock: crate::test_board::Stepped,
     lines: Arc<Lines>,
     /// What the writes so far asked the Hub to do, as text.
     effects: Mutex<Vec<String>>,
@@ -28,15 +27,14 @@ impl Lines {
 }
 impl Fixture {
     fn new(cpus: u8) -> Self {
-        let clock = crate::clock::Clock::stepped();
+        let clock = crate::test_board::Stepped::new();
         clock.step(1_000_000);
-        let tm = Arc::new(TimerManager::with_clock(clock.clone()));
-        let pi = Pi::new(&tm, cpus, 0);
+        let pi = Pi::new(&clock.tm, cpus, 0);
         let lines = Arc::new(Lines::default());
         for (slice, word) in lines.0.iter().enumerate() {
             pi.set_cpu_interrupts(slice, word);
         }
-        Self { pi, clock, _tm: tm, lines, effects: Mutex::default() }
+        Self { pi, clock, lines, effects: Mutex::default() }
     }
     fn r(&self, off: u64) -> u64 {
         self.pi.read(off, true)
@@ -353,7 +351,7 @@ fn a_started_comparator_timer_pends_the_bit_at_the_deadline() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert_eq!(t.pi.rt_pending[0].load(Ordering::SeqCst), false);
     t.clock.step(TICK_NS);
-    assert!(crate::test_board::until(std::time::Duration::from_secs(10), || t.pi.rt_pending[0].load(Ordering::SeqCst)));
+    assert!(crate::test_board::until(|| t.pi.rt_pending[0].load(Ordering::SeqCst)));
     t.pi.stop();
 }
 

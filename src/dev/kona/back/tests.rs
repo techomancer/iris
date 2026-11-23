@@ -128,11 +128,6 @@ fn dropped_words_are_counted() {
     assert!(text.contains("dropped words     3"), "{text}");
 }
 
-/// Wait for `cond`, up to a deadline, not a count of tries.
-fn wait_for(cond: impl FnMut() -> bool) -> bool {
-    crate::test_board::until(std::time::Duration::from_secs(30), cond)
-}
-
 fn backend() -> KonaBackend {
     KonaBackend::new(KonaConfig::default())
 }
@@ -298,10 +293,10 @@ fn a_retrace_completes_at_a_frame_boundary_on_a_running_board() {
     for w in [0x1e7u32, 0x77] {
         assert_eq!(kona.bus_write(0xc10000, 4, w as u64), crate::traits::BUS_OK);
     }
-    wait_for(|| kona.bus_read(0x800248, 4).1 == 0x77);
+    crate::test_board::until(|| kona.bus_read(0x800248, 4).1 == 0x77);
     assert_eq!(kona.bus_read(0x800248, 4).1, 0x77);
     // The counter follows the completion within the same frame.
-    wait_for(|| monitor(&kona, &["status"]).1.contains("1 retraces completed"));
+    crate::test_board::until(|| monitor(&kona, &["status"]).1.contains("1 retraces completed"));
     let text = monitor(&kona, &["status"]).1;
     assert!(text.contains("thread running"), "{text}");
     kona.stop();
