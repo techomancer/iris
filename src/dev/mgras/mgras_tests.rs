@@ -97,6 +97,26 @@ fn fifo_fast_fill_lands_top_down() {
 }
 
 #[test]
+fn narrow_reads_return_part_of_the_32_bit_register() {
+    // OpenBSD's GIO probe takes the ID word only if reads at +2 (16-bit) and
+    // +3 (8-bit) agree with it.
+    let m = live_board();
+    assert_eq!(read(&m, 32, 0), 0x0005_0190);
+    assert_eq!(read(&m, 16, 0), 0x0005);
+    assert_eq!(read(&m, 16, 2), 0x0190);
+    assert_eq!(read(&m, 8, 1), 0x05);
+    assert_eq!(read(&m, 8, 2), 0x01);
+    assert_eq!(read(&m, 8, 3), 0x90);
+    // The same parts of a plain register.
+    write(&m, 32, crate::dev::mgras::hq3::host::CFIFO_HIGH_MARK, 0x1122_3344);
+    assert_eq!(read(&m, 16, crate::dev::mgras::hq3::host::CFIFO_HIGH_MARK), 0x1122);
+    assert_eq!(read(&m, 16, crate::dev::mgras::hq3::host::CFIFO_HIGH_MARK + 2), 0x3344);
+    assert_eq!(read(&m, 8, crate::dev::mgras::hq3::host::CFIFO_HIGH_MARK + 1), 0x22);
+    assert_eq!(read(&m, 8, crate::dev::mgras::hq3::host::CFIFO_HIGH_MARK + 3), 0x44);
+    m.stop_engines();
+}
+
+#[test]
 fn fifo_and_direct_writes_keep_program_order() {
     let m = live_board();
     x_server(&m);
