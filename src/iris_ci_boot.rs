@@ -193,17 +193,16 @@ fn ci_socket() -> String {
     }
 }
 
-/// The iris config of every run: the machine (it runs its built-in PROM), the disk on SCSI 1
+/// The iris config of every run: the machine (it runs its built-in PROM), the disk at scsi0/t1
 /// with an overlay, the NVRAM (the PROM's flash on an O2) and the serial mirror
 /// in the working directory.
 fn config(disk: &Path, socket: &str, machine: &str) -> String {
-    let mut scsi1 = toml::Table::new();
+    let mut hdd = toml::Table::new();
+    hdd.insert("type".into(), "hdd".into());
+    hdd.insert("at".into(), "scsi0/t1".into());
     // Forward slashes in TOML work on every host, Windows included.
-    scsi1.insert("path".into(), disk.to_string_lossy().replace('\\', "/").into());
-    scsi1.insert("cdrom".into(), false.into());
-    scsi1.insert("overlay".into(), true.into());
-    let mut scsi = toml::Table::new();
-    scsi.insert("1".into(), scsi1.into());
+    hdd.insert("path".into(), disk.to_string_lossy().replace('\\', "/").into());
+    hdd.insert("overlay".into(), true.into());
     let mut m = toml::Table::new();
     m.insert("profile".into(), machine.into());
     let mut t = toml::Table::new();
@@ -217,7 +216,7 @@ fn config(disk: &Path, socket: &str, machine: &str) -> String {
     t.insert("serial_log_overwrite".into(), true.into());
     t.insert("ci".into(), true.into());
     t.insert("ci_socket".into(), socket.into());
-    t.insert("scsi".into(), scsi.into());
+    t.insert("devices".into(), vec![toml::Value::from(hdd)].into());
     format!("# Written by iris-ci boot-test.\n{}", toml::to_string(&t).expect("a table of plain values"))
 }
 
@@ -734,7 +733,7 @@ mod tests {
     fn the_config_names_the_disk_whatever_its_path_holds() {
         let disk = Path::new("C:\\a \"b\"\\irix.chd");
         let t: toml::Table = toml::from_str(&config(disk, "127.0.0.1:19851", "indy_ip24")).unwrap();
-        let scsi1 = &t["scsi"]["1"];
+        let scsi1 = &t["devices"][0];
         assert_eq!(scsi1["path"].as_str(), Some("C:/a \"b\"/irix.chd"));
         assert_eq!((scsi1["overlay"].as_bool(), t["ci"].as_bool()), (Some(true), Some(true)));
         assert_eq!(t["ci_socket"].as_str(), Some("127.0.0.1:19851"));

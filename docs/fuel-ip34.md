@@ -29,7 +29,7 @@ lists its keys.
 
 `[machine] audio_card = true` fits an audio card: the IC Ensemble ICE1724 with
 the DMediaPro DM8's converters, the same model as the
-[Tezro's](tezro-ip53.md). It sits at device 2 of head F, beside the base I/O;
+[Tezro's](tezro-ip53.md). It takes the first free PCI slot (device 1 of head E) unless `at` names another, such as device 2 of head F beside the base I/O;
 which device a real Fuel's option slots are is not established, so the slot is
 the model's choice. IRIX 6.5.30 lists it as `Iris Audio Processor: version MAD
 revision 1` and plays through it. It plays to the host as `[audio]` sets, or

@@ -4,6 +4,10 @@ use std::net::Ipv4Addr;
 
 use crate::cpu::parts::{self, Part};
 use crate::dev::kona::KonaProduct;
+use crate::devices::{ConfiguredDevice, DeviceModel};
+use crate::topology::{scsi_target, DevicePlacement};
+
+mod legacy;
 
 /// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
 /// which of them a machine takes.
@@ -98,18 +102,11 @@ pub struct ScsiDeviceConfig {
     /// already exists or `scratch=false`.
     #[serde(default)]
     pub size_mb: Option<u32>,
-    /// Which SCSI controller this target lives on: 0 (default) or 1. Indigo2
-    /// (IP22 fullhouse) has two independent WD33C93A controllers and the O2
-    /// two Adaptec 7880s (0 the internal bus, 1 the external connector);
-    /// Indy (IP24 guinness) only has controller 0, so `controller = 1` is
-    /// rejected there — see `MachineConfig::validate`.
-    #[serde(default)]
-    pub controller: u8,
 }
 
-/// The `[scsi.N]` key, and the snapshot manifest's disk number, that names
-/// `id` on `controller`: the id itself on controller 0, 16 + id on
-/// controller 1. Sixteen slots per controller, as SCSI ids go.
+/// The snapshot manifest's disk number for `id` on `controller`: the id
+/// itself on controller 0, 16 + id on controller 1. Sixteen slots per
+/// controller, as SCSI ids go.
 pub fn scsi_slot(controller: u8, id: u8) -> u8 {
     controller * 16 + id
 }
@@ -137,7 +134,6 @@ impl Default for ScsiDeviceConfig {
             overlay: false,
             scratch: false,
             size_mb: None,
-            controller: 0,
         }
     }
 }
@@ -154,15 +150,6 @@ impl ScsiDeviceConfig {
 
     pub fn is_cdrom(&self) -> bool { self.kind() == ScsiKind::Cdrom }
     pub fn is_daynaport(&self) -> bool { self.kind() == ScsiKind::Daynaport }
-
-    /// Where the `[scsi.KEY]` table puts this target, as (controller, id).
-    /// Keys 1–15 are ids on `controller` (default 0). The profile's
-    /// `max_scsi_id()` restricts narrow buses to IDs 1–7;
-    /// a key of 16 + id names controller 1 directly, so the same id can be
-    /// used on both controllers. See [`scsi_slot`].
-    pub fn placement(&self, key: u8) -> (u8, u8) {
-        if key >= 16 { (key / 16, key % 16) } else { (self.controller, key) }
-    }
 
     /// The media this target starts with: the active image and, for a
     /// CD-ROM, the changer list built from `path` and `discs` with empty
@@ -894,6 +881,11 @@ impl MachineProfile {
         matches!(self, Self::Origin3200Ip35 | Self::Onyx3000Ip35)
     }
 
+    /// Whether a DaynaPort goes on the machine's SCSI bus: not where Ethernet is built in.
+    pub fn takes_daynaport(self) -> bool {
+        !(matches!(self, Self::O2Ip32 | Self::FuelIp34 | Self::TezroIp53) || self.is_ip27())
+    }
+
     /// The name `[machine] profile` and `--machine` give this profile.
     pub fn name(self) -> &'static str {
         match self {
@@ -1021,22 +1013,6 @@ impl MachineProfile {
             Self::Origin3200Ip35 => "SGI Origin 3200 (IP35)",
             Self::Onyx3000Ip35 => "SGI Onyx 3000 (IP35)",
         }
-    }
-
-    /// The number of SCSI controllers accepted by configuration validation.
-    /// Indy has one; IP22, O2, Octane, SN0, Fuel and Tezro accept two.
-    /// IP35 brick machines use their Fibre Channel disk tables instead.
-    pub fn scsi_controllers(self) -> u8 {
-        if self.is_ip27() || matches!(self, Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 | Self::FuelIp34 | Self::TezroIp53) { 2 } else { 1 }
-    }
-
-    /// The highest SCSI id a `[scsi.N]` table can name. The Octane's ISP1040
-    /// buses are wide, with ids 0 to 15 and the controller on 0. The Indy's
-    /// and Indigo2's WD33C93A chips are narrow, with ids 0 to 7. The O2's
-    /// Adaptec buses are wide too, but stay at 7 until they are widened on
-    /// purpose. The Fuel's and the Tezro's ISP12160 buses are wide.
-    pub fn max_scsi_id(self) -> u8 {
-        if self.is_ip27() || matches!(self, Self::OctaneIp30 | Self::FuelIp34 | Self::TezroIp53) { 15 } else { 7 }
     }
 
     /// How many memory banks the machine has: four on the MC, HEART and O2
@@ -2286,37 +2262,6 @@ pub struct VinoConfig {
     pub camera_index: u32,
 }
 
-/// (De)serialize the `scsi` map through string keys. TOML (and the `toml`
-/// crate's serializer) requires map keys to be strings, but the map is keyed
-/// by `u8`, so `toml::to_string` would fail with "map key was not a string".
-/// JSON is unaffected (it already stringifies map keys); this just makes the
-/// representation explicit and symmetric so iris.toml export round-trips.
-mod scsi_keys {
-    use super::ScsiDeviceConfig;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::collections::{BTreeMap, HashMap};
-
-    pub fn serialize<S: Serializer>(
-        map: &HashMap<u8, ScsiDeviceConfig>,
-        ser: S,
-    ) -> Result<S::Ok, S::Error> {
-        // BTreeMap → stable, ID-sorted output.
-        map.iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect::<BTreeMap<String, &ScsiDeviceConfig>>()
-            .serialize(ser)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        de: D,
-    ) -> Result<HashMap<u8, ScsiDeviceConfig>, D::Error> {
-        HashMap::<String, ScsiDeviceConfig>::deserialize(de)?
-            .into_iter()
-            .map(|(k, v)| k.parse::<u8>().map(|id| (id, v)).map_err(serde::de::Error::custom))
-            .collect()
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FuelSection {
@@ -2764,9 +2709,17 @@ pub struct MachineConfig {
 
     // --- table / array-of-table fields: must be emitted after all scalars ---
 
-    /// SCSI devices keyed by ID 1–7 (1–15 on the Octane). Missing IDs are not attached.
-    #[serde(default = "default_scsi", with = "scsi_keys")]
-    pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
+    /// The placed devices, `[[devices]]`. Written even when empty, so a
+    /// machine with no disks reads back without the default ones.
+    #[serde(default)]
+    pub devices: Vec<ConfiguredDevice>,
+
+    /// The older `[scsi.N]` tables, until `legacy` turns them into devices.
+    #[serde(default, rename = "scsi", skip_serializing)]
+    pub legacy_scsi: Option<toml::Table>,
+    /// `--scsiN` and `--cdromN`, until `legacy` merges them into the devices.
+    #[serde(skip)]
+    pub legacy_shorthands: Vec<ConfiguredDevice>,
 
     /// NFS share configuration. If present, the NAT's in-process NFS server
     /// (`src/net/nfsudp.rs`) exports `shared_dir` to the guest.
@@ -3008,18 +2961,11 @@ mod banks_serde {
 
 fn default_scale() -> u32 { 1 }
 
-fn default_scsi() -> std::collections::HashMap<u8, ScsiDeviceConfig> {
-    let mut map = std::collections::HashMap::new();
-    map.insert(1, ScsiDeviceConfig {
-        path: "scsi1.raw".to_string(),
-        ..Default::default()
-    });
-    map.insert(4, ScsiDeviceConfig {
-        path: "cdrom4.iso".to_string(),
-        cdrom: true,
-        ..Default::default()
-    });
-    map
+/// The disks of a config that names none: `scsi1.raw` and `cdrom4.iso`.
+fn default_disks() -> Vec<ConfiguredDevice> {
+    let disk = ScsiDeviceConfig { path: "scsi1.raw".to_string(), ..Default::default() };
+    let cd = ScsiDeviceConfig { path: "cdrom4.iso".to_string(), cdrom: true, kind_field: ScsiKind::Cdrom, ..Default::default() };
+    [("scsi0/t1", disk), ("scsi0/t4", cd)].map(|(at, d)| ConfiguredDevice { default: true, ..ConfiguredDevice::new(at, DeviceModel::Scsi(d)) }).into()
 }
 
 impl Default for MachineConfig {
@@ -3032,7 +2978,9 @@ impl Default for MachineConfig {
             banks_set: false,
             jitv2_threads_set: false,
             jitv2_threads_reason: String::new(),
-            scsi: default_scsi(),
+            devices: default_disks(),
+            legacy_scsi: None,
+            legacy_shorthands: Vec::new(),
             scale: default_scale(),
             nfs: None,
             port_forward: vec![],
@@ -3372,7 +3320,12 @@ impl MachineConfig {
         let table = toml::from_str::<toml::Table>(text)?;
         cfg.banks_set = table.contains_key("banks");
         cfg.jitv2_threads_set = table.get("jitv2").and_then(|j| j.get("threads")).is_some();
-        cfg.fold_deprecated();
+        cfg.fold_deprecated().map_err(<toml::de::Error as serde::de::Error>::custom)?;
+        // A written `devices = []` is a machine with no disks.
+        let none = matches!(table.get("devices"), Some(toml::Value::Array(a)) if a.is_empty());
+        if !table.contains_key("scsi") && !none && !cfg.devices.iter().any(|d| d.device.scsi().is_some()) {
+            cfg.devices.splice(0..0, default_disks());
+        }
         cfg.fold_machine_keys().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         cfg.settle_jitv2_threads();
         Ok(cfg)
@@ -3677,96 +3630,9 @@ impl MachineConfig {
         }
     }
 
-    /// Translate keys an older iris wrote into their current form, saying so
-    /// once. The old `[o2]` spellings move to the shared keys they stand for
-    /// when those are still at their defaults (a shared key that is set wins);
-    /// `o2.disks` becomes `[scsi.N]` entries with `controller` = bus and
-    /// replaces the `scsi` map, since a config that has it never meant the
-    /// Indy's default disks.
-    pub fn fold_deprecated(&mut self) {
-        let mut moved: Vec<&str> = Vec::new();
-        if let Some(prom) = self.o2.prom.take() {
-            if self.prom == DEFAULT_PROM { self.prom = prom; }
-            moved.push("o2.prom -> prom");
-        }
-        if let Some(flash) = self.o2.flash.take() {
-            if self.nvram == DEFAULT_NVRAM { self.nvram = flash; }
-            moved.push("o2.flash -> nvram");
-        }
-        if let Some(mb) = self.o2.ram_mb.take() {
-            match crate::dev::crime_mem::kits_for(mb) {
-                Ok(kits) if self.banks == default_banks() => {
-                    self.banks = [0; MAX_BANKS];
-                    self.banks[..kits.len()].copy_from_slice(&kits);
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("iris: o2.ram_mb = {mb}: {e}; ignored"),
-            }
-            moved.push("o2.ram_mb -> banks");
-        }
-        if let Some(kits) = self.o2.dimms.take() {
-            if self.banks == default_banks() && !kits.is_empty() && kits.len() <= MAX_BANKS {
-                self.banks = [0; MAX_BANKS];
-                self.banks[..kits.len()].copy_from_slice(&kits);
-            }
-            moved.push("o2.dimms -> banks");
-        }
-        if !self.o2.disks.is_empty() {
-            self.scsi.clear();
-            for d in std::mem::take(&mut self.o2.disks) {
-                self.scsi.insert(d.id, ScsiDeviceConfig {
-                    path: d.path,
-                    cdrom: d.cdrom,
-                    overlay: d.overlay,
-                    controller: d.bus,
-                    ..Default::default()
-                });
-            }
-            moved.push("o2.disks -> [scsi.N] (controller = bus)");
-        }
-        if let Some(port) = self.o2.serial_port.take() {
-            if self.serial_port_a.is_none() { self.serial_port_a = Some(port); }
-            moved.push("o2.serial_port -> serial_port_a");
-        }
-        if let Some(log) = self.o2.serial_log.take() {
-            if self.serial_log.is_none() { self.serial_log = Some(log); }
-            moved.push("o2.serial_log -> serial_log");
-        }
-        if let Some(graphics) = self.o2.graphics.take() {
-            if !graphics { self.headless = true; }
-            moved.push("o2.graphics -> headless (inverted)");
-        }
-        if let Some(mhz) = self.o2.cpu_mhz.take() {
-            if self.clock.fixed_mhz.is_none() { self.clock.fixed_mhz = Some(mhz as f64 / 2.0); }
-            moved.push("o2.cpu_mhz -> [clock] fixed_mhz (half: CP0 Count)");
-        }
-        if let Some(net) = self.o2.net.take() {
-            if !net { self.network.mode = NetMode::Off; }
-            moved.push("o2.net -> [network] mode = \"off\"");
-        }
-        if !self.o2.forwards.is_empty() {
-            let forwards = std::mem::take(&mut self.o2.forwards);
-            self.port_forward.extend(forwards);
-            moved.push("o2.forwards -> [[port_forward]]");
-        }
-        if let Some(impact) = self.impact.take() {
-            let board = match impact.gfx.as_deref().map(str::to_ascii_lowercase).as_deref() {
-                Some("solid") => Some(GraphicsBoard::SolidImpact),
-                Some("high") => Some(GraphicsBoard::HighImpact),
-                Some("max") => Some(GraphicsBoard::MaxImpact),
-                _ => None,
-            };
-            if let Some(board) = board {
-                if self.graphics.board.is_none() { self.graphics.board = Some(board); }
-                eprintln!("iris: deprecated [impact] gfx folded into [graphics] board = \"{}\"; move it in the config to silence this", board.as_str());
-            }
-        }
-        if !moved.is_empty() {
-            eprintln!(
-                "iris: deprecated [o2] keys folded into the shared settings ({}); move them in the config to silence this",
-                moved.join(", ")
-            );
-        }
+    /// Read the keys an older iris wrote, saying so (see `legacy`).
+    pub fn fold_deprecated(&mut self) -> Result<(), String> {
+        legacy::fold(self)
     }
 
     /// The O2's memory as the kit in each DIMM pair from pair A: `banks` with
@@ -3946,6 +3812,49 @@ impl MachineConfig {
         Ok(())
     }
 
+    /// The SCSI devices this machine has a slot for, as (`scsi_slot(controller, id)`, index into `devices`); the first at a slot wins.
+    pub fn disks(&self) -> Vec<(u8, usize)> {
+        let placement = DevicePlacement::lenient(self, &self.devices);
+        let mut out: Vec<(u8, usize)> = Vec::new();
+        for (i, d) in self.devices.iter().enumerate() {
+            let slot = placement.at(i).and_then(|at| scsi_target(&placement.slots, at)).map(|(c, id)| scsi_slot(c, id));
+            if let Some(slot) = slot.filter(|s| d.device.scsi().is_some() && !out.iter().any(|o| o.0 == *s)) {
+                out.push((slot, i));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    pub fn disk(&self, slot: u8) -> Option<&ScsiDeviceConfig> {
+        let i = self.disks().into_iter().find(|d| d.0 == slot)?.1;
+        self.devices[i].device.scsi()
+    }
+
+    pub fn disk_mut(&mut self, slot: u8) -> Option<&mut ScsiDeviceConfig> {
+        let i = self.disks().into_iter().find(|d| d.0 == slot)?.1;
+        self.devices[i].device.scsi_mut()
+    }
+
+    /// Put `dev` at `slot`, replacing what is there.
+    pub fn set_disk(&mut self, slot: u8, dev: ScsiDeviceConfig) {
+        self.remove_disk(slot);
+        self.devices.push(ConfiguredDevice::new(&format!("scsi{}/t{}", slot / 16, slot % 16), DeviceModel::Scsi(dev)));
+    }
+
+    pub fn remove_disk(&mut self, slot: u8) {
+        if let Some((_, i)) = self.disks().into_iter().find(|d| d.0 == slot) {
+            self.devices.remove(i);
+        }
+    }
+
+    /// Settle where each device goes once the command line has picked the machine; `--scsiN` and `--cdromN` images replace
+    /// what is at their slot.
+    pub fn resolve_slots(&mut self) -> Result<(), String> {
+        legacy::merge_shorthands(self);
+        DevicePlacement::new(self).map(drop)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.validate_virtio_serial()?;
         self.validate_ip27_sections()?;
@@ -3996,60 +3905,18 @@ impl MachineConfig {
                 return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
             }
         }
-        // The Origin 3200's disks hang off the I-brick's Fibre Channel adapter
-        // (`[fibre_channel.disk.N]`): the default tables the other machines
-        // attach are left alone, and any table a config adds is refused.
-        if self.machine.profile.is_ip35_bricks() {
-            let defaults = default_scsi();
-            let own = |(key, dev): (&u8, &ScsiDeviceConfig)| defaults.get(key).is_some_and(|d| d.path == dev.path && d.cdrom == dev.cdrom);
-            if self.scsi.len() != defaults.len() || !self.scsi.iter().all(own) {
-                return Err("scsi: the Origin 3200's disks hang off the I-brick's Fibre Channel adapter: use [fibre_channel.disk.N]".into());
-            }
-        }
-        let mut placed: std::collections::HashMap<(u8, u8), u8> = std::collections::HashMap::new();
-        let mut keys: Vec<u8> = self.scsi.keys().copied().collect();
-        keys.sort();
-        for key in keys {
-            let dev = &self.scsi[&key];
-            let (controller, id) = dev.placement(key);
-            let max_id = self.machine.profile.max_scsi_id();
-            if id == 0 || id > max_id {
-                return Err(format!("scsi.{}: SCSI ID {} is out of range (1–{}; the controller itself is 0)", key, id, max_id));
-            }
-            if key >= 16 && dev.controller != 0 && dev.controller != controller {
-                return Err(format!(
-                    "scsi.{}: the key already puts the target on controller {}; controller = {} contradicts it",
-                    key, controller, dev.controller
-                ));
-            }
-            if controller > 1 {
-                return Err(format!("scsi.{}: controller {} is invalid (valid: 0, 1)", key, controller));
-            }
-            if controller != 0 && self.machine.profile.scsi_controllers() < 2 {
-                let two: Vec<_> = MachineProfile::EVERY.iter().filter(|p| p.scsi_controllers() > 1).map(|p| p.name()).collect();
-                return Err(format!(
-                    "scsi.{}: controller {} is only valid on the machines with two SCSI controllers (machine.profile = {}) — this machine has one (0)",
-                    key, controller, two.join(", ")
-                ));
-            }
-            if let Some(other) = placed.insert((controller, id), key) {
-                return Err(format!(
-                    "scsi.{} and scsi.{} both name {}", other, key, scsi_label(controller, id)
-                ));
-            }
-            if dev.is_daynaport() && (matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::FuelIp34 | MachineProfile::TezroIp53) || self.machine.profile.is_ip27()) {
-                let on = match self.machine.profile.product_name().filter(|_| self.machine.profile.is_ip27()) {
+        let p = self.machine.profile;
+        for d in self.devices.iter().filter(|d| d.device.scsi().is_some_and(ScsiDeviceConfig::is_daynaport)) {
+            let at = d.at.as_deref().unwrap_or_default();
+            if !p.takes_daynaport() {
+                let on = match p.product_name().filter(|_| p.is_ip27()) {
                     Some(p) => format!("the {p}"),
-                    None => self.machine.profile.label().to_string(),
+                    None => p.label().to_string(),
                 };
-                return Err(format!(
-                    "scsi.{}: kind = \"daynaport\" is not available on {on} (its Ethernet is built in)", key
-                ));
+                return Err(format!("[[devices]] daynaport at \"{at}\": not available on {on} (its Ethernet is built in)"));
             }
-            if dev.is_daynaport() && self.network.mode == NetMode::Stream {
-                return Err(format!(
-                    "scsi.{}: kind = \"daynaport\" cannot join a stream segment: [network] stream names the onboard Ethernet's peer", key
-                ));
+            if self.network.mode == NetMode::Stream {
+                return Err(format!("[[devices]] daynaport at \"{at}\": cannot join a stream segment: [network] stream names the onboard Ethernet's peer"));
             }
         }
         self.validate_serial_sockets()?;
@@ -4238,7 +4105,10 @@ impl MachineConfig {
         if emu_id != 0 && !matches!(self.machine.profile, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
             return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
-        for (id, dev) in &self.scsi {
+        let placement = DevicePlacement::new(self)?;
+        let slots = (0..self.devices.len()).map(|i| placement.at(i).and_then(|p| scsi_target(&placement.slots, p)).map(|(c, id)| scsi_slot(c, id)));
+        for (dev, id) in self.devices.iter().zip(slots).filter_map(|(d, s)| Some((d.device.scsi()?, s?))) {
+            let id = &id;
             // A CD-ROM may legitimately start with an empty tray (no path, no
             // discs) and have media loaded at runtime; any discs list is valid
             // as a changer queue. So there is nothing CD-ROM-specific to check.
@@ -4747,36 +4617,23 @@ impl Cli {
         cfg.settle_jitv2_threads();
         if let Some(m) = self.jitv2_compile { cfg.jitv2.compile = m; }
 
-        // Helper: insert or update a SCSI device entry.
-        let apply_scsi = |map: &mut std::collections::HashMap<u8, ScsiDeviceConfig>,
-                          id: u8, path: String, cdrom: bool, extra: Vec<String>| {
-            let entry = map.entry(id).or_insert_with(|| ScsiDeviceConfig {
-                cdrom,
-                ..Default::default()
-            });
-            entry.path = path;
-            entry.cdrom = cdrom;
-            if !extra.is_empty() {
-                entry.discs = extra;
+        for (id, p, cdrom, discs) in [
+            (1, &self.scsi1, false, &vec![]), (2, &self.scsi2, false, &vec![]), (3, &self.scsi3, false, &vec![]),
+            (4, &self.cdrom4, true, &self.cdrom4_extra), (5, &self.cdrom5, true, &self.cdrom5_extra),
+            (6, &self.cdrom6, true, &self.cdrom6_extra), (7, &self.scsi7, false, &vec![]),
+        ] {
+            if let Some(p) = p {
+                legacy::shorthand(&mut cfg, id, p.clone(), cdrom, discs.clone());
             }
-        };
-
-        if let Some(p) = self.scsi1.clone()  { apply_scsi(&mut cfg.scsi, 1, p, false, vec![]); }
-        if let Some(p) = self.scsi2.clone()  { apply_scsi(&mut cfg.scsi, 2, p, false, vec![]); }
-        if let Some(p) = self.scsi3.clone()  { apply_scsi(&mut cfg.scsi, 3, p, false, vec![]); }
-        if let Some(p) = self.cdrom4.clone() { apply_scsi(&mut cfg.scsi, 4, p, true, self.cdrom4_extra.clone()); }
-        if let Some(p) = self.cdrom5.clone() { apply_scsi(&mut cfg.scsi, 5, p, true, self.cdrom5_extra.clone()); }
-        if let Some(p) = self.cdrom6.clone() { apply_scsi(&mut cfg.scsi, 6, p, true, self.cdrom6_extra.clone()); }
-        if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
-
+        }
         if self.no_write_cache {
-            for dev in cfg.scsi.values_mut().filter(|d| !d.cdrom && d.kind() == ScsiKind::Disk) {
+            for dev in cfg.devices.iter_mut().filter_map(|d| d.device.scsi_mut()).filter(|d| d.kind() == ScsiKind::Disk) {
                 dev.write_cache = false;
             }
             cfg.nvme.write_cache = false;
         }
 
-        // Resolved by `MachineConfig::cpu_part` once the profile is final.
+        // DevicePlacement by `MachineConfig::cpu_part` once the profile is final.
         if let Some(cpu) = &self.cpu { cfg.machine.cpu = Some(cpu.clone()); }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
@@ -4895,12 +4752,18 @@ pub fn load_config() -> (MachineConfig, u32) {
             eprintln!("Configuration error: {e}");
             std::process::exit(1);
         });
-        let cfg = cli.apply(toml_cfg);
+        let mut cfg = cli.apply(toml_cfg);
+        // A placement error is reported by the check below.
+        let _ = cfg.resolve_slots();
         std::process::exit(crate::validate_config::report(&cli.config, &cfg));
     }
 
     let toml_cfg = MachineConfig::load_toml(&cli.config);
-    let cfg = cli.apply(toml_cfg);
+    let mut cfg = cli.apply(toml_cfg);
+    if let Err(e) = cfg.resolve_slots() {
+        eprintln!("Configuration error: {e}");
+        std::process::exit(1);
+    }
     let scale = cfg.scale;
     if let Err(e) = cfg.validate() {
         eprintln!("Configuration error: {}", e);
@@ -4941,14 +4804,14 @@ mod export_tests {
     #[test]
     fn toml_export_roundtrips() {
         let mut cfg = MachineConfig::default();
-        cfg.scsi.insert(4, ScsiDeviceConfig {
+        cfg.set_disk(4, ScsiDeviceConfig {
             path: "/abs/cd.chd".into(), cdrom: true, ..Default::default()
         });
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         let back: MachineConfig = toml::from_str(&s).expect("deserialize");
-        assert_eq!(back.scsi.len(), cfg.scsi.len());
-        assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
-        assert_eq!(back.scsi[&4].cdrom, true);
+        assert_eq!(back.devices.len(), cfg.devices.len());
+        assert_eq!(back.disk(1).unwrap().path, cfg.disk(1).unwrap().path);
+        assert_eq!(back.disk(4).unwrap().cdrom, true);
         println!("--- exported toml ---\n{s}");
     }
 
@@ -5041,26 +4904,20 @@ mod export_tests {
         }
     }
 
-    /// IDs 1 to 15 are valid on the Octane's wide buses, and 1 to 7 on the
-    /// narrow Indy; the controller's own ID 0 is refused everywhere.
+    /// IDs 1 to 15 are slots on the Octane's wide buses, and 1 to 7 on the
+    /// narrow Indy; the controller's own ID 0 is no slot anywhere.
     #[test]
     fn scsi_id_limit_is_15_on_the_octane_and_7_elsewhere() {
-        let octane = |key: u8| -> MachineConfig {
-            toml::from_str(&format!(
-                "banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[scsi.{key}]\npath = \"wide.raw\"\n"
+        let disk = |profile: &str, at: &str| -> MachineConfig {
+            MachineConfig::from_toml_str(&format!(
+                "banks = [128, 0, 0, 0]\n[machine]\nprofile = \"{profile}\"\n[[devices]]\ntype = \"hdd\"\nat = \"{at}\"\npath = \"d.raw\"\n"
             )).expect("parse")
         };
-        octane(15).validate().expect("id 15 on controller 0");
-        octane(31).validate().expect("id 15 on controller 1");
-        let err = octane(16).validate().unwrap_err();
-        assert!(err.contains("SCSI ID 0"), "key 16 names controller 1's ID 0: {err}");
-        let indy = |key: u8| -> MachineConfig {
-            toml::from_str(&format!("[scsi.{key}]\npath = \"narrow.raw\"\n")).expect("parse")
-        };
-        indy(7).validate().expect("id 7 on the Indy");
-        let err = indy(8).validate().unwrap_err();
-        assert!(err.contains("SCSI ID 8") && err.contains("1–7"), "{err}");
-        assert!(indy(0).validate().is_err(), "the controller is ID 0");
+        disk("octane_ip30", "scsi0/t15").validate().expect("id 15 on controller 0");
+        disk("octane_ip30", "scsi1/t15").validate().expect("id 15 on controller 1");
+        assert!(disk("octane_ip30", "scsi1/t0").validate().unwrap_err().contains("no slot scsi1/t0"));
+        disk("indy_ip24", "scsi0/t7").validate().expect("id 7 on the Indy");
+        assert!(disk("indy_ip24", "scsi0/t8").validate().unwrap_err().contains("no slot scsi0/t8"));
     }
 
     #[test]
@@ -5069,7 +4926,7 @@ mod export_tests {
             let mut c: MachineConfig =
                 toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
                     .expect("parse");
-            c.scsi.clear();
+            c.devices.clear();
             c
         };
         let shoehorn = "[[xio_board]]\nkind = \"pci-shoehorn\"\n";
@@ -5101,7 +4958,7 @@ mod export_tests {
             let mut c: MachineConfig =
                 toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
                     .expect("parse");
-            c.scsi.clear();
+            c.devices.clear();
             c
         };
         let cage = "[[xio_board]]\nkind = \"pci-cage\"\n";
@@ -5146,7 +5003,7 @@ mod export_tests {
             let mut c: MachineConfig =
                 toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
                     .expect("parse");
-            c.scsi.clear();
+            c.devices.clear();
             c
         };
         let nvme = |extra: &str| format!("[nvme]\npath = \"d.img\"\n{extra}");
@@ -5178,7 +5035,7 @@ mod export_tests {
             let mut c: MachineConfig =
                 toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n{t}"))
                     .expect("parse");
-            c.scsi.clear();
+            c.devices.clear();
             c
         };
         let cfg = octane("");
@@ -5230,20 +5087,20 @@ mod export_tests {
 
     #[test]
     fn write_cache_defaults_on_and_round_trips() {
-        let cfg: MachineConfig = toml::from_str(r#"
+        let cfg = MachineConfig::from_toml_str(r#"
             [scsi.1]
             path = "a.raw"
             [scsi.2]
             path = "b.raw"
             write_cache = false
         "#).expect("parse");
-        assert!(cfg.scsi[&1].write_cache, "the default");
-        assert!(!cfg.scsi[&2].write_cache);
+        assert!(cfg.disk(1).unwrap().write_cache, "the default");
+        assert!(!cfg.disk(2).unwrap().write_cache);
         assert!(ScsiDeviceConfig::default().write_cache, "the default in code");
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         let back: MachineConfig = toml::from_str(&s).expect("deserialize");
-        assert!(back.scsi[&1].write_cache && !back.scsi[&2].write_cache, "survives export:\n{s}");
-        assert!(toml::from_str::<MachineConfig>("[scsi.1]\nwrite_cache = \"fast\"\n").is_err());
+        assert!(back.disk(1).unwrap().write_cache && !back.disk(2).unwrap().write_cache, "survives export:\n{s}");
+        assert!(MachineConfig::from_toml_str("[scsi.1]\nwrite_cache = \"fast\"\n").is_err());
     }
 
     /// `--no-write-cache` turns the cache off for every disk, whatever the file says.
@@ -5251,12 +5108,12 @@ mod export_tests {
     fn no_write_cache_flag_turns_the_cache_off_for_every_disk() {
         use clap::Parser;
         let mut cfg = MachineConfig::default();
-        cfg.scsi.insert(1, ScsiDeviceConfig { path: "a.raw".into(), ..Default::default() });
-        cfg.scsi.insert(2, ScsiDeviceConfig { path: "b.raw".into(), write_cache: true, ..Default::default() });
+        cfg.set_disk(1, ScsiDeviceConfig { path: "a.raw".into(), ..Default::default() });
+        cfg.set_disk(2, ScsiDeviceConfig { path: "b.raw".into(), write_cache: true, ..Default::default() });
         let on = Cli::parse_from(["iris"]).apply(cfg.clone());
-        assert!(on.scsi[&1].write_cache && on.scsi[&2].write_cache, "no flag, no change");
+        assert!(on.disk(1).unwrap().write_cache && on.disk(2).unwrap().write_cache, "no flag, no change");
         let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
-        assert!(!off.scsi[&1].write_cache && !off.scsi[&2].write_cache);
+        assert!(!off.disk(1).unwrap().write_cache && !off.disk(2).unwrap().write_cache);
         assert!(on.nvme.write_cache, "the NVMe default");
         assert!(!off.nvme.write_cache, "NVMe too");
     }
@@ -5276,13 +5133,13 @@ mod export_tests {
 
     #[test]
     fn scsi_kind_daynaport_parses_and_round_trips() {
-        let cfg: MachineConfig = toml::from_str(r#"
+        let cfg = MachineConfig::from_toml_str(r#"
             [scsi.3]
             kind = "daynaport"
             mac = "00:80:19:aa:bb:cc"
             subnet = "192.168.7.0/24"
         "#).expect("parse");
-        let dev = &cfg.scsi[&3];
+        let dev = &cfg.disk(3).unwrap();
         assert!(dev.is_daynaport());
         assert!(!dev.is_cdrom());
         cfg.validate().expect("validate");
@@ -5294,31 +5151,31 @@ mod export_tests {
 
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         let back: MachineConfig = toml::from_str(&s).expect("deserialize");
-        assert!(back.scsi[&3].is_daynaport(), "kind must survive export:\n{s}");
+        assert!(back.disk(3).unwrap().is_daynaport(), "kind must survive export:\n{s}");
     }
 
     /// `cdrom = true` predates `kind`; it must keep working, and a plain disk
     /// must not start serializing a redundant `kind = "disk"`.
     #[test]
     fn cdrom_bool_still_selects_a_cdrom() {
-        let cfg: MachineConfig = toml::from_str(r#"
+        let cfg = MachineConfig::from_toml_str(r#"
             [scsi.4]
             path = "cd.iso"
             cdrom = true
             [scsi.1]
             path = "disk.raw"
         "#).expect("parse");
-        assert!(cfg.scsi[&4].is_cdrom());
-        assert_eq!(cfg.scsi[&1].kind(), ScsiKind::Disk);
+        assert!(cfg.disk(4).unwrap().is_cdrom());
+        assert_eq!(cfg.disk(1).unwrap().kind(), ScsiKind::Disk);
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         assert!(!s.contains("kind"), "default kind should not be emitted:\n{s}");
     }
 
     #[test]
     fn daynaport_defaults_to_its_own_subnet_and_a_derived_mac() {
-        let cfg: MachineConfig = toml::from_str("[scsi.5]\nkind = \"daynaport\"\n").expect("parse");
+        let cfg = MachineConfig::from_toml_str("[scsi.5]\nkind = \"daynaport\"\n").expect("parse");
         cfg.validate().expect("validate");
-        let p = cfg.scsi[&5].daynaport_params(5).expect("params");
+        let p = cfg.disk(5).unwrap().daynaport_params(5).expect("params");
         assert_eq!(p.mac, [0x00, 0x80, 0x19, 0x44, 0x50, 5]);
         // Not the driver's own 00:80:19:00:00:NN placeholder, or the acceptance
         // test can't tell a real MAC read from a made-up one.
@@ -5329,7 +5186,7 @@ mod export_tests {
 
     #[test]
     fn daynaport_rejects_a_subnet_that_collides_with_ec0() {
-        let cfg: MachineConfig = toml::from_str(r#"
+        let cfg = MachineConfig::from_toml_str(r#"
             nat_subnet = "192.168.10.0/24"
             [scsi.3]
             kind = "daynaport"
@@ -5340,7 +5197,7 @@ mod export_tests {
 
     #[test]
     fn daynaport_rejects_disk_only_options() {
-        let cfg: MachineConfig = toml::from_str(
+        let cfg = MachineConfig::from_toml_str(
             "[scsi.3]\nkind = \"daynaport\"\noverlay = true\n").expect("parse");
         assert!(cfg.validate().is_err());
     }
@@ -5448,7 +5305,7 @@ mod export_tests {
         // An explicit 0 is not silently clamped away: `validate` still
         // refuses it.
         let mut zero = MachineConfig::default();
-        zero.scsi.clear();
+        zero.devices.clear();
         zero.jitv2.threads = 0;
         zero.jitv2_threads_set = true;
         assert_eq!(zero.jitv2_pool_size().0, 0, "an explicit 0 must not be clamped");
@@ -5525,22 +5382,21 @@ mod export_tests {
         }
     }
 
-    /// The O2 reads the same `[scsi.N]` tables as the other machines, with
-    /// `controller` as the bus; like the Indigo2 it has two. Its Ethernet is
-    /// built in, so a DaynaPort target is refused.
+    /// The O2 has two SCSI controllers like the Indigo2, scsi0 internal and
+    /// scsi1 external. Its Ethernet is built in, so a DaynaPort is refused.
     #[test]
-    fn o2_takes_scsi_tables_with_controller_as_bus() {
+    fn o2_has_two_scsi_controllers_and_no_daynaport() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::O2Ip32;
         cfg.machine.cpu = Some("r10000".into());
-        cfg.scsi.insert(2, ScsiDeviceConfig { path: "external.raw".into(), controller: 1, ..Default::default() });
+        cfg.set_disk(scsi_slot(1, 2), ScsiDeviceConfig { path: "external.raw".into(), ..Default::default() });
         cfg.validate().expect("the O2 has two SCSI controllers");
         cfg.machine.profile = MachineProfile::IndyIp24;
         cfg.machine.cpu = None;
-        assert!(cfg.validate().unwrap_err().contains("controller 1"), "the Indy has one");
+        assert!(cfg.validate().unwrap_err().contains("has no slot scsi1/t2"), "the Indy has one");
         cfg.machine.profile = MachineProfile::O2Ip32;
         cfg.machine.cpu = Some("r10000".into());
-        cfg.scsi.insert(3, ScsiDeviceConfig { kind_field: ScsiKind::Daynaport, ..Default::default() });
+        cfg.set_disk(3, ScsiDeviceConfig { kind_field: ScsiKind::Daynaport, ..Default::default() });
         assert!(cfg.validate().unwrap_err().contains("daynaport"));
     }
 
@@ -5560,9 +5416,9 @@ mod export_tests {
             cfg.network.stream = Some("tcp:127.0.0.1:7000".into());
             cfg.validate().unwrap_or_else(|e| panic!("{profile:?}: {e}"));
         }
-        let mut cfg: MachineConfig = toml::from_str("[network]\nmode = \"stream\"\nstream = \"unix:/run/x\"\n[scsi.4]\nkind = \"daynaport\"").unwrap();
+        let mut cfg = MachineConfig::from_toml_str("[network]\nmode = \"stream\"\nstream = \"unix:/run/x\"\n[scsi.4]\nkind = \"daynaport\"").unwrap();
         assert!(cfg.validate().unwrap_err().contains("cannot join a stream segment"));
-        cfg.scsi.clear();
+        cfg.devices.clear();
         assert_eq!(cfg.network().stream.as_deref(), Some("unix:/run/x"));
     }
 
@@ -5658,7 +5514,7 @@ mod export_tests {
     }
 
     fn ip27_config(profile: &str, tables: &str) -> MachineConfig {
-        toml::from_str(&format!("[machine]\nprofile = \"{profile}\"\n{tables}")).unwrap()
+        MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"{profile}\"\n{tables}")).unwrap()
     }
 
     /// `[machine]` holds what a machine has beyond the shared keys; `c_bricks` is `nodes`. A file
@@ -5799,16 +5655,14 @@ mod export_tests {
     }
 
     #[test]
-    fn network_off_and_a_second_scsi_controller_name_the_machines_that_take_them() {
+    fn network_off_names_the_machines_that_take_it_and_a_second_controller_the_machine() {
         let mut cfg = ip27_config("indy_ip24", "");
         cfg.network.mode = NetMode::Off;
         let e = cfg.validate().unwrap_err();
         assert!(e.contains("the Origin 200, the Origin 2000 and the Onyx2"), "{e}");
         ip27_config("onyx2_ip27", "[network]\nmode = \"off\"\n").validate().unwrap();
         let e = ip27_config("indy_ip24", "[scsi.17]\npath = \"d.raw\"\n").validate().unwrap_err();
-        for p in MachineProfile::EVERY.into_iter().filter(|p| p.scsi_controllers() > 1) {
-            assert!(e.contains(p.name()), "{e}");
-        }
+        assert!(e.contains("has no slot scsi1/t1"), "{e}");
     }
 
     #[test]
@@ -5949,7 +5803,7 @@ mod export_tests {
             mouse = false
             forwards = [ { proto = "tcp", host_port = 2292, guest_port = 22 } ]
         "#).expect("parse");
-        cfg.fold_deprecated();
+        cfg.fold_deprecated().unwrap();
         assert_eq!(cfg.prom, "o2prom.bin");
         assert_eq!(cfg.nvram, "o2flash.bin");
         assert_eq!(cfg.banks, banks_from4([256, 128, 0, 0]), "384 MB, largest kits first");
@@ -5975,7 +5829,7 @@ mod export_tests {
             [o2]
             prom = "old.bin"
         "#).expect("parse");
-        cfg.fold_deprecated();
+        cfg.fold_deprecated().unwrap();
         assert_eq!(cfg.prom, "mine.bin");
     }
 
@@ -5990,7 +5844,7 @@ mod export_tests {
             exp0 = "none"
             exp1 = "none"
         "#).expect("parse");
-        cfg.fold_deprecated();
+        cfg.fold_deprecated().unwrap();
         assert!(cfg.impact.is_none());
         assert_eq!(cfg.graphics.board, None);
 
@@ -6000,84 +5854,13 @@ mod export_tests {
             [impact]
             gfx = "high"
         "#).expect("parse");
-        cfg.fold_deprecated();
+        cfg.fold_deprecated().unwrap();
         assert_eq!(cfg.graphics.board, Some(GraphicsBoard::HighImpact));
         assert!(!toml::to_string(&cfg).unwrap().contains("[impact]"));
 
         // The GUI's settings file holds the same struct as JSON.
         let json = r#"{"impact":{"gfx":"none","exp0":"none","exp1":"none"}}"#;
         assert!(serde_json::from_str::<MachineConfig>(json).is_ok());
-    }
-
-    /// `[scsi.17]` is id 1 on controller 1, so one id can be on both
-    /// controllers; `controller = 1` on a low key still works; a key that
-    /// names a controller cannot be contradicted, two tables cannot name the
-    /// same target, and id 0 and controller 2 do not exist.
-    #[test]
-    fn slot_keys_place_targets_on_either_controller() {
-        let mut cfg: MachineConfig = toml::from_str(r#"
-            [machine]
-            profile = "indigo2_ip22"
-            [scsi.1]
-            path = "internal.raw"
-            [scsi.17]
-            path = "external.raw"
-            [scsi.4]
-            path = "cd.iso"
-            cdrom = true
-            controller = 1
-        "#).expect("parse");
-        cfg.validate().expect("two controllers, no collision");
-        assert_eq!(cfg.scsi[&1].placement(1), (0, 1));
-        assert_eq!(cfg.scsi[&17].placement(17), (1, 1));
-        assert_eq!(cfg.scsi[&4].placement(4), (1, 4));
-        assert_eq!(scsi_slot(1, 1), 17);
-        assert_eq!(scsi_label(0, 1), "SCSI ID 1");
-        assert_eq!(scsi_label(1, 1), "SCSI 1:1");
-
-        cfg.scsi.insert(20, ScsiDeviceConfig { path: "twice.iso".into(), cdrom: true, ..Default::default() });
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("scsi.4 and scsi.20 both name SCSI 1:4"), "{err}");
-        cfg.scsi.remove(&20);
-
-        cfg.scsi.insert(18, ScsiDeviceConfig { path: "x.raw".into(), controller: 0, ..Default::default() });
-        cfg.validate().expect("controller 0 on a slot key is just the default");
-        cfg.scsi.get_mut(&18).unwrap().controller = 2;
-        assert!(cfg.validate().unwrap_err().contains("contradicts"));
-        cfg.scsi.remove(&18);
-
-        cfg.scsi.insert(16, ScsiDeviceConfig { path: "x.raw".into(), ..Default::default() });
-        assert!(cfg.validate().unwrap_err().contains("out of range"));
-        cfg.scsi.remove(&16);
-        cfg.scsi.insert(33, ScsiDeviceConfig { path: "x.raw".into(), ..Default::default() });
-        assert!(cfg.validate().unwrap_err().contains("controller 2 is invalid"));
-        cfg.scsi.remove(&33);
-
-        cfg.machine.profile = MachineProfile::IndyIp24;
-        assert!(cfg.validate().unwrap_err().contains("this machine has one"));
-    }
-
-    /// An older O2 config's `o2.disks` becomes `[scsi.N]` entries, replacing
-    /// the default disks, and is gone from the section afterwards.
-    #[test]
-    fn deprecated_o2_disks_fold_into_scsi() {
-        let mut cfg: MachineConfig = toml::from_str(r#"
-            [machine]
-            profile = "o2_ip32"
-            [o2]
-            disks = [ { id = 1, path = "sys.raw", overlay = true },
-                      { id = 4, path = "cd.iso", cdrom = true, bus = 1 } ]
-        "#).expect("parse");
-        cfg.fold_deprecated();
-        assert!(cfg.o2.disks.is_empty());
-        assert_eq!(cfg.scsi.len(), 2, "the list replaces the default map");
-        assert_eq!(cfg.scsi[&1].path, "sys.raw");
-        assert!(cfg.scsi[&1].overlay);
-        assert_eq!(cfg.scsi[&1].controller, 0);
-        assert!(cfg.scsi[&4].is_cdrom());
-        assert_eq!(cfg.scsi[&4].controller, 1);
-        let s = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(!s.contains("disks"), "the deprecated key is never written back:\n{s}");
     }
 }
 
@@ -6453,7 +6236,7 @@ mod fuel_input_tests {
         cfg.banks.fill(0);
         cfg.banks[0] = 256;
         cfg.banks[1] = 256;
-        cfg.scsi.clear();
+        cfg.devices.clear();
         // Leaving `cpu` out takes the Fuel's own part.
         cfg.machine.cpu = None;
         cfg.validate().unwrap();
@@ -6476,7 +6259,7 @@ mod fuel_input_tests {
         cfg.banks.fill(0);
         cfg.banks[0] = 256;
         cfg.banks[1] = 256;
-        cfg.scsi.clear();
+        cfg.devices.clear();
         assert_eq!(cfg.graphics_board(), GraphicsBoard::None);
         cfg.network.mode = NetMode::Off;
         cfg.validate().unwrap();
@@ -6498,12 +6281,14 @@ mod fuel_input_tests {
     #[test]
     fn fuel_accepts_wide_scsi_ids_on_both_channels_without_changing_narrow_profiles() {
         let text = "banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\ncpu = \"r14000\"\n[scsi.15]\npath = \"disk.raw\"\n[scsi.31]\npath = \"disk1.raw\"\n";
-        let mut cfg: MachineConfig = toml::from_str(text).unwrap();
+        let mut cfg = MachineConfig::from_toml_str(text).unwrap();
         cfg.validate().unwrap();
         // The Octane's buses are wide as well; the Indy's WD33C93A is narrow.
         cfg.machine.profile = MachineProfile::IndyIp24;
         cfg.machine.cpu = Some("r4400".into());
-        assert!(cfg.validate().unwrap_err().contains("out of range"));
+        cfg.banks = default_banks();
+        let e = cfg.validate().unwrap_err();
+        assert!(e.contains("has no slot scsi0/t15"), "{e}");
     }
 }
 
@@ -6515,7 +6300,7 @@ mod tezro_config_tests {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::TezroIp53;
         cfg.set_cpu(&parts::R16000_700_EARLY);
-        cfg.scsi.clear();
+        cfg.devices.clear();
         cfg
     }
 

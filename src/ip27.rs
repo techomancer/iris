@@ -37,7 +37,7 @@
 
 #![warn(dead_code)]
 
-use crate::config::MachineConfig;
+use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::parts::CpuModule;
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
@@ -331,6 +331,22 @@ pub(crate) fn load_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), S
     Ok(())
 }
 
+/// The two ISP1040s behind the I/O board's Bridge.
+const SCSI_DEVICES: [u8; 2] = [0, 1];
+
+/// The BaseIO Bridge's widget: 8 on the Origin 200 and 2000, 15 on the Onyx2's BaseIO-G.
+fn scsi_at(profile: MachineProfile) -> [String; 2] {
+    let widget = if profile == MachineProfile::Onyx2Ip27 { 15 } else { 8 };
+    SCSI_DEVICES.map(|d| format!("xio{widget}/pci0/{d}"))
+}
+
+/// The slots of the Origin 200, Origin 2000 and Onyx2.
+pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>, profile: MachineProfile) {
+    for at in scsi_at(profile) {
+        crate::topology::scsi_bus_slots(s, &at, "isp1040", 15);
+    }
+}
+
 /// The PCI devices both IP27 I/O boards carry behind their Bridge: two ISP1040s and an IOC3.
 /// `ioc3_board` gives its identification, ports and SuperIO interrupt input; the devices set the
 /// status bar's activity bits in `heartbeat`.
@@ -344,19 +360,16 @@ pub(crate) fn pci_devices(
 ) -> Result<BoardIo, String> {
     let (scsi_name, name) = (cfg.machine.profile.table_name().unwrap_or_default(), cfg.machine.profile.product_name().unwrap_or_default());
     let (bus_a, bus_b) = (Isp1040::new_bus(), Isp1040::new_bus());
-    let scratch = crate::scsi::attach_without_daynaport(cfg, scsi_name, name, &|c| match c {
-        0 => Ok(&bus_a),
-        1 => Ok(&bus_b),
-        _ => Err(format!("controller {c} ({name} has controllers 0 and 1)")),
-    })?;
+    let resolved = crate::topology::DevicePlacement::new(cfg)?;
+    let scratch = crate::scsi::attach_without_daynaport(cfg, scsi_name, name, &resolved, &[&bus_a, &bus_b])?;
     let scsi = vec![Arc::new(Isp1040::new_at(0, bus_a, timers)), Arc::new(Isp1040::new_at(1, bus_b, timers))];
     for s in &scsi {
         s.set_heartbeat(heartbeat.clone());
     }
     let pci = bridge.bus();
     let slot = |device| crate::pci::DevFn { device, function: 0 };
-    pci.attach(slot(0), scsi[0].clone());
-    pci.attach(slot(1), scsi[1].clone());
+    pci.attach(slot(SCSI_DEVICES[0]), scsi[0].clone());
+    pci.attach(slot(SCSI_DEVICES[1]), scsi[1].clone());
     // The Fuel's M48T35 Timekeeper is the same part.
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
     let ioc3 = Arc::new(Ioc3::new(timers, ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));

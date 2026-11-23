@@ -1,6 +1,7 @@
 //! Less common machine settings and a validated editor for the complete config.
 use egui::{ComboBox, DragValue, TextEdit, Ui};
 use iris::config::*;
+use iris::topology::{scsi_target_slot, scsi_target, DevicePlacement};
 
 /// The Indy and Indigo2 family: the machines built around the MC memory
 /// controller, with Newport resolution presets, a DS1386 NVRAM and (on the
@@ -36,17 +37,10 @@ pub fn builtin_prom(cfg: &MachineConfig) -> bool {
             && !cfg.machine.profile.release_prom_file().is_some_and(exists))
 }
 
-/// The `[scsi.KEY]` key of the target at (`controller`, `id`), whichever
-/// spelling the config used: the bare id with `controller = 1`, or `16 + id`.
-pub fn scsi_key(cfg: &MachineConfig, controller: u8, id: u8) -> Option<u8> {
-    cfg.scsi.iter().find(|(k, d)| d.placement(**k) == (controller, id)).map(|(k, _)| *k)
-}
-
-/// How a `[scsi.KEY]` target is named to the user: its id on controller 0,
-/// `controller:id` on another (so key 19 reads "1:3", not "19").
-pub fn scsi_name(cfg: &MachineConfig, key: u8) -> String {
-    let (controller, id) = cfg.scsi.get(&key).map_or((0, key), |d| d.placement(key));
-    if controller == 0 { id.to_string() } else { format!("{controller}:{id}") }
+/// How the target at slot `key` (`scsi_slot(controller, id)`) is named to
+/// the user: its id on controller 0, `controller:id` on another.
+pub fn scsi_name(key: u8) -> String {
+    if key < 16 { key.to_string() } else { format!("{}:{}", key / 16, key % 16) }
 }
 
 /// Choices reflect the boards actually fitted by machine constructors. The O2
@@ -59,7 +53,7 @@ pub fn board_supported(board: GraphicsBoard, profile: MachineProfile) -> bool {
 
 /// Refit hardware when the user explicitly changes profiles. Do not run this
 /// each frame: it would erase intentional edits and imported configurations.
-pub fn switch_profile(cfg: &mut MachineConfig) {
+pub fn switch_profile(cfg: &mut MachineConfig, from: MachineProfile) {
     let p = cfg.machine.profile;
     cfg.machine.cpu = None;
     cfg.machine.cpus = None;
@@ -82,21 +76,7 @@ pub fn switch_profile(cfg: &mut MachineConfig) {
     cfg.origin200 = Default::default();
     cfg.origin2000 = Default::default();
     cfg.onyx2 = Default::default();
-    if p.is_ip35_bricks() {
-        // These machines use the I-brick's Fibre Channel adapter. The core
-        // expects its historical default SCSI map to remain untouched.
-        cfg.scsi = MachineConfig::default().scsi;
-    } else {
-        // Targets the new machine's buses cannot hold, which the Disks tab
-        // would no longer show: a second controller, wide ids, DaynaPort.
-        let (controllers, max_id) = (p.scsi_controllers(), p.max_scsi_id());
-        let daynaport = matches!(p, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22
-            | MachineProfile::Indigo2Ip28 | MachineProfile::OctaneIp30);
-        cfg.scsi.retain(|k, d| {
-            let (c, id) = d.placement(*k);
-            c < controllers && id <= max_id && (daynaport || !d.is_daynaport())
-        });
-    }
+    rehome_disks(cfg, from);
     // What `MachineConfig::validate` refuses on the new machine, and the
     // Advanced tab no longer shows for it.
     if !matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
@@ -139,6 +119,27 @@ pub fn switch_profile(cfg: &mut MachineConfig) {
     }
     if mc_machine(p) {
         cfg.serial_log_b = None;
+    }
+}
+
+/// Keep each SCSI device through a profile switch at the same controller and target, dropping it where the new machine has
+/// no such slot. Other devices keep their slot where they can, else take any, else go.
+fn rehome_disks(cfg: &mut MachineConfig, from: MachineProfile) {
+    let p = cfg.machine.profile;
+    let (old, new) = (from.slots(), p.slots());
+    let mut old_cfg = cfg.clone();
+    old_cfg.machine.profile = from;
+    let was = DevicePlacement::lenient(&old_cfg, &cfg.devices);
+    let places: Vec<_> = (0..cfg.devices.len()).map(|i| was.at(i).cloned()).collect();
+    let devices = std::mem::take(&mut cfg.devices);
+    for (mut d, at) in devices.into_iter().zip(places) {
+        let target = at.and_then(|at| scsi_target(&old, &at)).and_then(|(c, id)| scsi_target_slot(&new, c, id));
+        let Some(target) = target.filter(|_| p.takes_daynaport() || !d.device.scsi().is_some_and(|s| s.is_daynaport())) else { continue };
+        // An alias that names the same slot on the new machine is kept as written.
+        if DevicePlacement::lenient(cfg, std::slice::from_ref(&d)).at(0) != Some(&target) {
+            d.at = Some(target.to_string());
+        }
+        cfg.devices.push(d);
     }
 }
 
@@ -714,21 +715,28 @@ fn parse_complete(text: &str) -> Result<MachineConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iris::devices::{ConfiguredDevice, DeviceModel};
+    use iris::topology::scsi_buses;
+
+    fn switch(cfg: &mut MachineConfig, to: MachineProfile) {
+        let from = cfg.machine.profile;
+        cfg.machine.profile = to;
+        switch_profile(cfg, from);
+    }
 
     #[test]
     fn every_profile_can_be_created_saved_and_switched_to() {
         assert_eq!(MachineProfile::ALL, MachineProfile::EVERY);
         for p in MachineProfile::ALL {
             let mut cfg = MachineConfig::default();
-            cfg.machine.profile = p;
-            switch_profile(&mut cfg);
+            switch(&mut cfg, p);
             cfg.validate().unwrap_or_else(|e| panic!("{p:?}: {e}"));
             let loaded = parse_complete(&toml::to_string(&cfg).unwrap()).unwrap();
             assert_eq!(loaded.machine.profile, p);
             assert_eq!(loaded.banks, cfg.banks);
             // Changing away from an SN0 table must not leave a foreign table.
             cfg.origin200.flash = Some("other-flash.bin".into());
-            switch_profile(&mut cfg);
+            switch(&mut cfg, p);
             cfg.validate()
                 .unwrap_or_else(|e| panic!("switch to {p:?}: {e}"));
         }
@@ -741,14 +749,13 @@ mod tests {
         for from in [MachineProfile::OctaneIp30, MachineProfile::TezroIp53, MachineProfile::O2Ip32] {
             for to in MachineProfile::ALL {
                 let mut cfg = MachineConfig::default();
-                cfg.machine.profile = from;
-                switch_profile(&mut cfg);
+                switch(&mut cfg, from);
                 match from {
                     MachineProfile::OctaneIp30 => {
                         cfg.xio_board.push(XioBoardConfig { kind: iris::dev::xio_pci::Kind::Shoehorn, widget: None });
                         cfg.nvme.path = "nvme.raw".into();
                         cfg.serial_log_b = Some("b.log".into());
-                        cfg.scsi.insert(iris::config::scsi_slot(1, 12), ScsiDeviceConfig { path: "w.raw".into(), ..Default::default() });
+                        cfg.set_disk(iris::config::scsi_slot(1, 12), ScsiDeviceConfig { path: "w.raw".into(), ..Default::default() });
                     }
                     MachineProfile::TezroIp53 => {
                         cfg.machine.emu_id = 7;
@@ -762,26 +769,37 @@ mod tests {
                     }
                 }
                 cfg.validate().unwrap_or_else(|e| panic!("populated {from:?}: {e}"));
-                cfg.machine.profile = to;
-                switch_profile(&mut cfg);
+                switch(&mut cfg, to);
                 cfg.validate().unwrap_or_else(|e| panic!("{from:?} -> {to:?}: {e}"));
             }
         }
     }
 
-    /// An older `[scsi.3] controller = 1` table is found at (1, 3) only, and
-    /// is named 1:3; key 19 says the same.
+    /// Every disk keeps its controller and target through a switch, or is dropped where the new machine has no such slot.
     #[test]
-    fn scsi_targets_are_found_by_placement() {
+    fn disks_follow_their_controller_and_target_through_a_switch() {
+        let disk = |at: &str| ConfiguredDevice::new(at, DeviceModel::Scsi(ScsiDeviceConfig { path: format!("{at}.raw"), ..Default::default() }));
+        for from in MachineProfile::ALL {
+            for to in MachineProfile::ALL {
+                let mut cfg = MachineConfig::default();
+                switch(&mut cfg, from);
+                cfg.devices = scsi_buses(&from.slots()).iter().flat_map(|(_, at, ids)| [1, *ids.last().unwrap()].map(|id| disk(&format!("{at}/t{id}")))).collect();
+                let before: Vec<u8> = cfg.disks().iter().map(|d| d.0).collect();
+                switch(&mut cfg, to);
+                cfg.validate().unwrap_or_else(|e| panic!("{from:?} -> {to:?}: {e}"));
+                let after: Vec<u8> = cfg.disks().iter().map(|d| d.0).collect();
+                let new = to.slots();
+                let fits: Vec<u8> = before.iter().copied().filter(|&s| scsi_target_slot(&new, s / 16, s % 16).is_some()).collect();
+                assert_eq!(after, fits, "{from:?} -> {to:?}");
+                assert_eq!(cfg.devices.iter().filter(|d| d.device.scsi().is_some()).count(), after.len(), "{from:?} -> {to:?}: nothing without a slot is kept");
+            }
+        }
+        // An alias stays as written; a full slot is rewritten for the new machine.
         let mut cfg = MachineConfig::default();
-        cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.scsi.clear();
-        cfg.scsi.insert(3, ScsiDeviceConfig { controller: 1, ..Default::default() });
-        cfg.scsi.insert(iris::config::scsi_slot(1, 5), ScsiDeviceConfig::default());
-        assert_eq!(scsi_key(&cfg, 0, 3), None);
-        assert_eq!(scsi_key(&cfg, 1, 3), Some(3));
-        assert_eq!(scsi_key(&cfg, 1, 5), Some(21));
-        assert_eq!((scsi_name(&cfg, 3), scsi_name(&cfg, 21)), ("1:3".to_string(), "1:5".to_string()));
+        cfg.devices = vec![disk("scsi0/t2"), disk("hpc3/c0/t3")];
+        switch(&mut cfg, MachineProfile::OctaneIp30);
+        let at: Vec<_> = cfg.devices.iter().filter(|d| d.device.scsi().is_some()).map(|d| d.at.clone().unwrap()).collect();
+        assert_eq!(at, ["scsi0/t2", "xio15/pci0/0/t3"]);
     }
 
     #[test]
@@ -789,8 +807,7 @@ mod tests {
         for p in MachineProfile::ALL {
             for &mb in crate::ram::ram_presets(p) {
                 let mut cfg = MachineConfig::default();
-                cfg.machine.profile = p;
-                switch_profile(&mut cfg);
+                switch(&mut cfg, p);
                 cfg.banks = crate::dialogs::new_machine::distribute_ram(mb, p);
                 assert_eq!(cfg.banks.iter().sum::<u32>(), mb, "{p:?}: {mb}");
                 cfg.validate()
@@ -811,8 +828,7 @@ mod tests {
         let ctx = egui::Context::default();
         for p in MachineProfile::ALL {
             let mut cfg = MachineConfig::default();
-            cfg.machine.profile = p;
-            switch_profile(&mut cfg);
+            switch(&mut cfg, p);
             ctx.run_ui(Default::default(), |ui| show(ui, &mut cfg, false))
                 .drop_without_applying_deltas();
         }

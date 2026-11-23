@@ -548,9 +548,8 @@ impl Machine {
         ioc.scc().set_backend_a(channel_a);
         ioc.set_heartbeat(heartbeat.clone());
         ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).board_tick_rate());
-        // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
-        // target on a controller (`ScsiDeviceConfig::placement`). The disks
-        // recorded here, and the scratch volume's path for the CI socket,
+        // Attach SCSI devices from config, each at its slot in the slot
+        // list. The disks recorded here, and the scratch volume's path for the CI socket,
         // come back with it. Disk provenance for snapshot manifests is
         // captured while the MachineConfig `cfg` is still in scope (it is
         // shadowed by the CPU config below): the slot (controller * 16 + id,
@@ -558,7 +557,8 @@ impl Machine {
         // size.
         // The buses are filled before the controllers exist and handed to them.
         let scsi_buses = Hpc3::new_scsi_buses(guinness);
-        let attached = match crate::scsi::attach_from_config(&cfg, None, &|c| Hpc3::route_scsi(&scsi_buses, c)) {
+        let resolved = crate::topology::DevicePlacement::new(&cfg)?;
+        let attached = match crate::scsi::attach_from_config(&cfg, None, &resolved, &scsi_buses.iter().collect::<Vec<_>>()) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("iris: fatal: {e}");
@@ -2903,7 +2903,7 @@ mod controller_lifetime_tests {
             .spawn(move || {
                 let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
                 nvram_in(&mut cfg, &nv_dir);
-                cfg.scsi.insert(1, crate::config::ScsiDeviceConfig { path: path_str, overlay: true, ..Default::default() });
+                cfg.set_disk(1, crate::config::ScsiDeviceConfig { path: path_str, overlay: true, ..Default::default() });
                 Box::new(Machine::new(cfg))
             })
             .unwrap()
@@ -3002,7 +3002,7 @@ mod production_newport_wgpu_tests {
     fn production_config(nv_dir: &std::path::Path) -> MachineConfig {
         let mut cfg = MachineConfig::default();
         nvram_in(&mut cfg, nv_dir);
-        cfg.scsi.clear();
+        cfg.devices.clear();
         cfg.no_audio = true;
         cfg.ci = true;
         cfg.monitor_port = Some(0);
@@ -3110,7 +3110,7 @@ mod stop_order_tests {
             let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
             crate::test_temp::nvram_in(&mut cfg, &nv);
             cfg.machine.profile = MachineProfile::Indigo2Ip22;
-            cfg.scsi.insert(20, ScsiDeviceConfig { cdrom: true, controller: 1, ..Default::default() });
+            cfg.set_disk(20, ScsiDeviceConfig { cdrom: true, ..Default::default() });
             Box::new(Machine::new(cfg))
         });
         let changer = Workstation::disc_changer(&*machine).expect("a disc changer");
@@ -3279,7 +3279,7 @@ mod virtio_tests {
             .spawn(move || {
                 let mut cfg = MachineConfig::default();
                 crate::test_temp::nvram_in(&mut cfg, &nv_dir);
-                cfg.scsi.clear();
+                cfg.devices.clear();
                 cfg.headless = true;
                 cfg.machine.profile = profile;
                 if profile == MachineProfile::Indigo2Ip28 {
@@ -3315,7 +3315,7 @@ mod virtio_tests {
             .spawn(move || {
                 let mut cfg = MachineConfig::default();
                 crate::test_temp::nvram_in(&mut cfg, &nv_dir);
-                cfg.scsi.clear();
+                cfg.devices.clear();
                 cfg.machine.profile = MachineProfile::IndyIp24;
                 cfg.graphics.heads = 2;
                 cfg.ultra64.enabled = true;
@@ -3373,7 +3373,7 @@ mod virtio_tests {
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
                 let mut cfg = MachineConfig::default();
-                cfg.scsi.clear();
+                cfg.devices.clear();
                 cfg.headless = true;
                 cfg.machine.profile = MachineProfile::Indigo2Ip28;
                 cfg.machine.cpu = Some("r10000".into());

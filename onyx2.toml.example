@@ -32,7 +32,9 @@ controller_store = "ignore/onyx2/controller.raw"
 # Disconnected cable. For NAT, use mode = "nat".
 mode = "off"
 
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path = "ignore/onyx2/irix.raw"
 cdrom = false
 # Keep the base disk unchanged. Guest writes go to irix.raw.overlay.

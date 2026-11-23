@@ -90,6 +90,22 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     Ok(io)
 }
 
+/// The ISP12160 on head F.
+const SCSI_DEVICE: u8 = 1;
+
+/// The ISP12160's two channels.
+fn scsi_at() -> [String; 2] {
+    [0, 1].map(|c| format!("xio{HEAD_F}/pci0/{SCSI_DEVICE}/c{c}"))
+}
+
+/// The Fuel's slots.
+pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
+    crate::topology::fixed_slot(s, &format!("xio{HEAD_F}/pci0/{SCSI_DEVICE}"), "isp12160", &[]);
+    for at in scsi_at() {
+        crate::topology::scsi_bus_slots(s, &at, "isp12160 channel", 15);
+    }
+}
+
 /// The Fuel's base I/O on its XBridge's head F: the ISP12160, the IOC3 and the OHCI controller. A
 /// link reset of head F resets them, and of the graphics port the `vpro` behind it.
 fn build_baseio(
@@ -109,7 +125,7 @@ fn build_baseio(
     let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus(), timers));
     scsi.set_heartbeat(heartbeat.clone());
     ioc3.set_heartbeat(heartbeat);
-    pci.attach(DevFn { device: 1, function: 0 }, scsi.clone());
+    pci.attach(DevFn { device: SCSI_DEVICE, function: 0 }, scsi.clone());
     let usb = attach_usb(pci, &ioc3, timers, cfg.fuel.usb_input)?;
     let (reset_ioc3, reset_scsi, reset_usb) = (ioc3.clone(), scsi.clone(), usb.clone());
     let reset_vpro = vpro.as_ref().map(Arc::downgrade);
@@ -127,9 +143,9 @@ fn build_baseio(
         }
     }));
     let (table, product) = (cfg.machine.profile.table_name().unwrap_or_default(), cfg.machine.profile.product_name().unwrap_or_default());
-    let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &|channel| {
-        scsi.bus_for_channel(channel).ok_or_else(|| format!("controller {channel} (a {product} has channels 0 and 1)"))
-    })?;
+    let buses = [0, 1].map(|c| scsi.bus_for_channel(c).expect("the ISP12160 has two channels"));
+    let resolved = crate::topology::DevicePlacement::new(cfg)?;
+    let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &resolved, &buses)?;
     let console_index = cfg.fuel.console.index();
     connect_serial_ports(cfg, "Fuel", &serial, console_index)?;
     let console = cfg.ci.then(|| serial[console_index].ci.clone());

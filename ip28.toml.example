@@ -14,9 +14,10 @@ cpu     = "r10000"
 board = "solidimpact"
 heads = 1
 resolution = "guest"
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path    = "ip28/blank.raw"
-cdrom   = false
 overlay = true
 
 # Optional: a virtio-serial port for a guest that has a driver for it

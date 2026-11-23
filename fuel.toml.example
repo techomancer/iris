@@ -46,8 +46,9 @@ board = "none"
 # Initial defaults: guest 192.168.0.2/24, gateway 192.168.0.1.
 mode = "off"
 
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path = "ignore/fuel/irix.raw"
-cdrom = false
 # Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
 overlay = true

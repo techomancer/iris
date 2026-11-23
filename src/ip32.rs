@@ -122,13 +122,15 @@ pub use crate::dev::mace_uart::*;
 pub use crate::dev::ns16550::*;
 pub use crate::dev::mace_id::*;
 
-use crate::pci::{DevFn, IntxRouting};
+use crate::pci::{DevFn, IntxRouting, PCI_INTA};
+use crate::topology::MachineSlotKind;
 
 /// MACE's PCI bus 0; the outputs are CRIME inputs. Source: the MACE
 /// specification (Tables 85 and 87, pp. 164 and 166; Table 90, p. 179), which
 /// gives the routing the software uses. No published document shows how the
-/// board connects INTB-D of the option slot.
-pub static PCI0: IntxRouting = IntxRouting {
+/// board connects INTB-D of the option slot. The Adaptec buses are wide, but
+/// stay at ids 1-7 until they are widened on purpose.
+pub static PCI0_ROUTING: IntxRouting = IntxRouting {
     devices: 32,
     irqs: 16,
     intx: &[
@@ -143,6 +145,12 @@ pub static PCI0: IntxRouting = IntxRouting {
     board_irqs: &[],
 };
 
+/// The O2 system board's PCI devices.
+pub(crate) const PCI0_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
+    (IP32_SCSI_SLOT, MachineSlotKind::ScsiBus { part: "aic7880", ids: 7 }, None),
+    (IP32_SCSI_SLOT_B, MachineSlotKind::ScsiBus { part: "aic7880", ids: 7 }, None),
+    (IP32_OPTION_SLOT, MachineSlotKind::PCI_SLOT, Some("pci_slot")),
+];
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 /// CRIME's no-ECC alias of the memory window: the same memory as
@@ -516,7 +524,19 @@ impl Ip32Bus {
                 gbe.tr = crime.tr.clone();
                 gbe
             },
-            mace: Mace::new(ram.clone(), crime, ust, &PCI0, timers),
+            mace: Mace::new(ram.clone(), crime, ust, &IntxRouting {
+        devices: 32,
+        irqs: 16,
+        intx: &[
+            (1, [Some(8), None, None, None]),                // internal SCSI
+            (2, [Some(9), None, None, None]),                // external SCSI
+            (3, [Some(10), Some(13), Some(14), Some(15)]),   // INTB-D shared
+            // The specification routes device 4; no O2 board populates it. Using
+            // it for virtio is iris's choice of a spare number, not hardware use.
+            (4, [Some(11), None, None, None]),
+        ],
+        board_irqs: &[],
+    }, timers),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
             nvme: std::sync::OnceLock::new(),

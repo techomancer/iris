@@ -23,7 +23,7 @@ pub(crate) fn fuel_config(dir: &Path) -> MachineConfig {
     cfg.banks = crate::config::banks_from4([256, 256, 0, 0]);
     cfg.banks_set = true;
     cfg.fuel.l1_port = Some(0);
-    cfg.scsi.clear();
+    cfg.devices.clear();
     cfg
 }
 /// A Tezro of `cpus` processors, its listening ports left to any free one. It has the 1 GiB four
@@ -36,7 +36,7 @@ pub(crate) fn tezro_config(dir: &Path, cpus: u8) -> MachineConfig {
     cfg.machine.cpus = Some(cpus);
     cfg.tezro.l1_port = Some(0);
     (cfg.tezro.serial_port_c, cfg.tezro.serial_port_d) = (Some(0), Some(0));
-    cfg.scsi.clear();
+    cfg.devices.clear();
     cfg
 }
 /// A PCI head as a processor reaches it through PIO: configuration cycles at the head's

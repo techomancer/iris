@@ -745,7 +745,7 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # days    = -2              # days/hours/minutes/seconds add as plain time
 # hours   = +3
 
-# ── SCSI ─────────────────────────────────────────────────────────────────────
+# ── Disks, CD-ROMs and cards ─────────────────────────────────────────────────
 
 # Valid IDs: 1–7 (1–15 on the Octane). For a hard disk, set cdrom = false. On a machine with two
 # controllers (Indigo2, O2) [scsi.N] is id N on controller 0 and [scsi.16+N]
@@ -753,29 +753,31 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # in a [scsi.N] table does the same for that one device.
 [scsi.1]
 path    = "scsi1.raw"       # raw or .chd image
-cdrom   = false
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
 # write_cache = true        # the disk's write cache (default true). true: a write completes once the host has it and a sync follows within ~5 s, so a host crash or
                             # power cut can lose the last ~5 s of writes. false: every write is stored on the host's disk before it completes, as on SGI's drives (slower). See STORAGE.md.
-# controller = 0            # Indigo2 and O2 have two: 0 or 1 (the O2's 1 is its external bus); or write [scsi.17]
 
 # A CD-ROM. path may be empty to start with an empty tray, or an http:// or
 # https:// URL (read-only, fetched in pieces; see STORAGE.md).
-[scsi.4]
+[[devices]]
+type  = "cdrom"
+at    = "scsi0/t4"
 path  = "cdrom4.iso"
-cdrom = true
 # discs = ["irix65.iso", "extras.iso", "patches.iso"]   # changer; "scsi eject 4" cycles
 
 # Scratch volume for file injection without networking (see STORAGE.md).
-# [scsi.2]
+# [[devices]]
+# type    = "hdd"
+# at      = "scsi0/t2"
 # path    = "scratch.raw"
 # scratch = true
 # size_mb = 64
 
 # DaynaPort SCSI/Link — Ethernet over the SCSI bus. Needs a guest driver
 # (IRIX: irixdayna -> dp0). See docs/dev/daynaport.md.
-# [scsi.3]
-# kind   = "daynaport"      # "disk" (default) | "cdrom" | "daynaport"
+# [[devices]]
+# type   = "daynaport"
+# at     = "scsi0/t3"
 # mac    = "00:80:19:12:34:56"
 # subnet = "192.168.10.0/24"
 
@@ -856,23 +858,22 @@ IRIX, while EFS and pure ISO9660 discs do. Mounting by hand works:
 `mount -t iso9660 /dev/rdsk/dks0d4vol /CDROM`. It looks like `mediad` and the
 kernel step on each other's block size setting.
 
-### SCSI ID conventions
+### SCSI target conventions
 
-| ID | Typical use |
-|----|-------------|
-| 1  | Internal hard disk (primary) |
-| 2  | Second hard disk (or scratch volume) |
-| 3  | Tape, additional disk, or DaynaPort |
-| 4  | Internal CD-ROM |
-| 5  | Additional CD-ROM |
-| 6  | Additional disk or tape |
-| 7  | Additional disk |
+| Target | Typical use |
+|--------|-------------|
+| t1 | Internal hard disk (primary) |
+| t2 | Second hard disk (or scratch volume) |
+| t3 | Tape, additional disk, or DaynaPort |
+| t4 | Internal CD-ROM |
+| t5 | Additional CD-ROM |
+| t6 | Additional disk or tape |
+| t7 | Additional disk |
 
-The controller itself is ID 0. On the Indigo2 and the O2, which have two
-controllers, `[scsi.N]` keys 1–7 are ids on controller 0 and keys 17–23 are
-ids 1–7 on controller 1 (16 slots per controller); `controller = 1` in a low
-key's table is the older spelling and still works. The monitor's `scsi1`
-addresses the second controller.
+The controller itself is target 0. The Indigo2 and the O2 have two controllers,
+`scsi0` and `scsi1`, and each has its own targets 1–7, so `scsi0/t1` and
+`scsi1/t1` are different disks. The monitor's `scsi1` addresses the second
+controller.
 
 On the Octane the internal bus (controller 0) has three drive bays, and the
 PROM and IRIX look for devices on it only at ids 1–3. Put a CD-ROM, and any
@@ -1070,7 +1071,7 @@ development board IPC bridge.  The IRIS-compatible fork lives at:
    enabled = true
    ```
 
-   The board is built into every IRIS binary; without `enabled = true` no
+   The board is built into every IRIS binary; without the device no
    board appears in GIO slot 0.
 
 2. Build and run the N64 emulator (it can be started at any time — it will

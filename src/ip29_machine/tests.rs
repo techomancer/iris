@@ -132,8 +132,8 @@ fn a_scratch_volume_is_the_machines_scratch_path() {
         let dir = TempPath::dir("ip27-o200-scratch");
         let mut cfg = config(&dir);
         let disk = dir.join("scratch.raw");
-        cfg.scsi.clear();
-        cfg.scsi.insert(2, toml::from_str(&format!("path = {:?}\nscratch = true\nsize_mb = 4", disk.to_string_lossy())).unwrap());
+        cfg.devices.clear();
+        cfg.set_disk(2, toml::from_str(&format!("path = {:?}\nscratch = true\nsize_mb = 4", disk.to_string_lossy())).unwrap());
         let m = test_support::machine(&cfg).unwrap();
         assert_eq!(m.scratch_path(), Some(disk.as_path()));
     });

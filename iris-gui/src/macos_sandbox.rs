@@ -192,7 +192,7 @@ mod tests {
     fn config_paths_harvest_restore() {
         let path = temp_file(".raw");
         let mut cfg = MachineConfig::default();
-        cfg.scsi.get_mut(&1).unwrap().path = path.clone();
+        cfg.disk_mut(1).unwrap().path = path.clone();
         cfg.prom = "prom.bin".into(); // relative, and missing → skipped
 
         let paths = config_paths(&cfg, Path::new("/tmp/iris-machine"));

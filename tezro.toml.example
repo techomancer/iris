@@ -40,9 +40,10 @@ board = "none"
 # Disconnected cable. For NAT, use mode = "nat".
 mode = "off"
 
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path = "ignore/tezro/irix.raw"
-cdrom = false
 # Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
 overlay = true
 # write_cache = false  # default true. false stores every write before it completes, like SGI's drives (slower); true can lose ~5 s of writes in a host crash. See STORAGE.md

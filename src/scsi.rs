@@ -9,7 +9,7 @@
 //! [`crate::block_node`]. Which chip carries the commands, and what each
 //! machine says its drives are ([`ScsiIdentity`]), belong to the
 //! controllers. [`ScsiBus`] (`bus.rs`) is the id-to-target table each
-//! controller owns; `attach.rs` puts the `[scsi.N]` tables on it.
+//! controller owns; `attach.rs` puts the config's SCSI devices on it.
 
 use std::io;
 
@@ -21,15 +21,16 @@ pub use bus::{DiskActivity, DiskCounts, ScsiBus, ScsiIdentities, ScsiTarget, Tar
 
 use crate::block_node::{Background, ChangerNode, Removable, BlockNode};
 
-/// Attach the tables of a machine whose Ethernet is built in, and return its scratch
+/// Attach the SCSI devices of a machine whose Ethernet is built in, and return its scratch
 /// image. A `daynaport` entry is refused, naming `machine`.
-pub fn attach_without_daynaport<'a>(
+pub fn attach_without_daynaport(
     cfg: &crate::config::MachineConfig,
     table: &str,
     machine: &str,
-    route: &dyn Fn(u8) -> Result<&'a ScsiBus, String>,
+    resolved: &crate::topology::DevicePlacement,
+    buses: &[&ScsiBus],
 ) -> Result<Option<std::path::PathBuf>, String> {
-    let attached = attach_from_config(cfg, Some(table), route)?;
+    let attached = attach_from_config(cfg, Some(table), resolved, buses)?;
     match attached.daynaports.first() {
         Some(d) => Err(format!("{}: kind = \"daynaport\" is not available on the {machine}", crate::config::scsi_label(d.controller, d.id))),
         None => Ok(attached.scratch),

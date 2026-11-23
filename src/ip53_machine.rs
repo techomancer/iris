@@ -74,6 +74,20 @@ const SECOND_PIC_WIDGET: u8 = 11;
 const HOST_WIDGET: u8 = 10;
 /// The device the V12's packets name at Bedrock IO's inbound permission check.
 const INBOUND_DEVICE: u8 = 0;
+
+/// The ISP12160's two channels.
+fn scsi_at() -> [String; 2] {
+    [0, 1].map(|c| format!("xio{IO9_WIDGET}/pci0/{SCSI_DEVICE}/c{c}"))
+}
+
+/// The Tezro's slots.
+pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
+    crate::topology::fixed_slot(s, &format!("xio{IO9_WIDGET}/pci0/{SCSI_DEVICE}"), "isp12160", &[]);
+    for at in scsi_at() {
+        crate::topology::scsi_bus_slots(s, &at, "isp12160 channel", 15);
+    }
+}
+
 /// IO9's PCI functions: configuration device on head 0.
 const IOC4_DEVICE: u8 = 1;
 const SCSI_DEVICE: u8 = 3;
@@ -386,9 +400,9 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     io9.attach(0, ETH_DEVICE, eth.clone(), Function { self_ordered_pio: false, req64: true });
 
     let (table, product) = (cfg.machine.profile.table_name().unwrap_or_default(), cfg.machine.profile.product_name().unwrap_or_default());
-    let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &|channel| {
-        scsi.bus_for_channel(channel).ok_or_else(|| format!("controller {channel} (a {product} has channels 0 and 1)"))
-    })?;
+    let buses = [0, 1].map(|c| scsi.bus_for_channel(c).expect("the ISP12160 has two channels"));
+    let resolved = crate::topology::DevicePlacement::new(cfg)?;
+    let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &resolved, &buses)?;
     let virtio = Arc::new(attach_virtio(cfg, &io9));
     eprintln!("iris: {}", if vpro.is_some() { cfg.graphics_board().label() } else { "no graphics" });
     let console_index = cfg.tezro.console.index();

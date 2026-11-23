@@ -182,6 +182,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [vdma-gio-side-is-always-whole-qwords.md](devices/vdma-gio-side-is-always-whole-qwords.md) | rule | The GIO side of a VDMA transfer is always whole qwords — only memory is ragged |
 | [vdma-transfers-are-always-translated.md](devices/vdma-transfers-are-always-translated.md) | rule | VDMA image transfers are always address-translated |
 | [serial-clients-never-hold-the-guest.md](devices/serial-clients-never-hold-the-guest.md) | rule | A slow serial client never holds the guest: per-client 1 MiB queue, oldest dropped in whole telnet units and counted; log and CI first |
+| [machine-slots.md](devices/machine-slots.md) | design | A machine is a list of slots and `[[devices]]` are placed into it: the four types, the placement order, how a machine declares its slots, how `[scsi.N]` is translated, what `--list-slots` prints |
 
 ## scsi/
 

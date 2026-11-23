@@ -375,8 +375,8 @@ On the O2 the controllers are Adaptec 7880s: `scsi regs` shows that chip's
 interrupt status, queues and command totals, whether its worker thread is
 running (commands run on it, off the CPU's thread), any completions held
 for a paused sequencer and NetBSD's doorbell, and `wdt`, `defer` and `debug`
-are not there. Ids are per controller, as in the `[scsi.N]` tables
-(`[scsi.17]` is id 1 on controller 1, so `scsi1 eject 1`).
+are not there. Ids are per controller, as in the slots of the `[[devices]]` entries
+(`scsi1/t1` is id 1 on controller 1, so `scsi1 eject 1`).
 
 On the Octane the controllers are ISP1040s: `scsi notes` (`scsi1 notes`)
 shows the command total and anything odd the driver did; `regs`, `wdt`,
@@ -390,7 +390,7 @@ nothing is mapped at, with the PC; a device's own refusal is not listed). The
 
 On the Fuel the one controller is a two-channel ISP12160: `scsi` (or
 `scsi0`) and `cow` act on channel 0, `scsi1` and `cow1` on channel 1, and
-ids run 0 to 15 on each (`[scsi.17]` is id 1 on channel 1). `scsi notes`
+ids run 0 to 15 on each (`scsi1/t1` is id 1 on channel 1). `scsi notes`
 shows the whole chip's command total and anything odd the driver did, and
 has no `scsi1` form; `regs`, `wdt`, `defer` and `debug` are not there. The
 Tezro's ISP12160 answers the same way.

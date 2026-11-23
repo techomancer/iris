@@ -1,18 +1,18 @@
-//! Putting the `[scsi.N]` config tables on a machine's buses.
+//! Putting the config's SCSI devices on a machine's buses.
 //!
-//! Every machine walks the same list: place each table on a controller and
-//! id, make a scratch volume, send a CI run's overlay to the temporary
+//! Every machine walks the same list: find each device's bus in the slot
+//! list, make a scratch volume, send a CI run's overlay to the temporary
 //! directory, attach the target, and decide what a target that will not
-//! attach means. Only two
-//! things are the machine's: which bus a controller number names, and, on
-//! the machines that have one, how a DaynaPort is built.
+//! attach means. Only two things are the machine's: the buses it binds to
+//! the slot list, and, on the machines that have one, how a DaynaPort is built.
 
 use std::path::PathBuf;
 
 use super::ScsiBus;
 use crate::config::{DaynaportParams, MachineConfig, ScsiDeviceConfig};
+use crate::topology::{scsi_buses, scsi_target, DevicePlacement};
 
-/// One `[scsi.N]` image table, for a snapshot manifest to record.
+/// One disk or CD-ROM, for a snapshot manifest to record.
 pub struct TableRef {
     /// The slot, controller * 16 + id (`config::scsi_slot`).
     pub slot: u8,
@@ -22,8 +22,8 @@ pub struct TableRef {
     pub size_bytes: u64,
 }
 
-/// A `kind = "daynaport"` table. The controller that can hold one builds it,
-/// since it needs the machine's network.
+/// A `daynaport`. The controller that can hold one builds it, since it
+/// needs the machine's network.
 pub struct DaynaportRef {
     pub controller: u8,
     pub id: u8,
@@ -36,9 +36,9 @@ pub struct Attached {
     /// The `scratch = true` volume the CI socket reads and writes: the
     /// lowest-id one, if several are configured.
     pub scratch: Option<PathBuf>,
-    /// Every disk and CD-ROM table, by slot, whether or not it attached.
+    /// Every disk and CD-ROM, by slot, whether or not it attached.
     pub tables: Vec<TableRef>,
-    /// The DaynaPort tables, not attached.
+    /// The DaynaPorts, not attached.
     pub daynaports: Vec<DaynaportRef>,
 }
 
@@ -91,30 +91,29 @@ pub fn attach_table(
     }
 }
 
-/// Attach every disk and CD-ROM table of `cfg`, logging each as
-/// `{log_prefix}: SCSI ID n: ...` unless the prefix is `None`. `route` names
-/// the bus a controller number is on, or says why there is none ("an O2 has
-/// controllers 0 and 1"). The error is the message to end the run with.
-pub fn attach_from_config<'a>(
-    cfg: &MachineConfig,
-    log_prefix: Option<&str>,
-    route: &dyn Fn(u8) -> Result<&'a ScsiBus, String>,
-) -> Result<Attached, String> {
+/// Attach every SCSI device of `cfg` to the bus of its slot; `buses` are the machine's, in slot-list order. Logs each device as
+/// `{log_prefix}: SLOT: ...` unless the prefix is `None`. The error ends the run.
+pub fn attach_from_config(cfg: &MachineConfig, log_prefix: Option<&str>, resolved: &DevicePlacement, buses: &[&ScsiBus]) -> Result<Attached, String> {
+    let declared = scsi_buses(&resolved.slots).len();
+    if buses.len() != declared {
+        return Err(format!("the {}'s slot list declares {declared} SCSI buses, which the machine built {}", resolved.machine(), buses.len()));
+    }
+    let mut targets: Vec<_> = resolved.placed().filter_map(|(d, at)| {
+        let (controller, id) = scsi_target(&resolved.slots, at)?;
+        Some((crate::config::scsi_slot(controller, id), controller, id, d.device.scsi()?, at.clone()))
+    }).collect();
+    targets.sort_by_key(|t| t.0);
     let mut out = Attached::default();
-    let mut keys: Vec<u8> = cfg.scsi.keys().copied().collect();
-    keys.sort();
-    for key in keys {
-        let dev = &cfg.scsi[&key];
-        let (controller, id) = dev.placement(key);
-        let at = crate::config::scsi_label(controller, id);
+    for (key, controller, id, dev, at) in targets {
+        let bus = buses[usize::from(controller)];
+        let label = at.to_string();
         if dev.is_daynaport() {
-            let params = dev.daynaport_params(key).map_err(|e| format!("{at}: {e}"))?;
-            route(controller).map_err(|e| format!("{at}: {e}"))?;
+            let params = dev.daynaport_params(key).map_err(|e| format!("{label}: {e}"))?;
             out.daynaports.push(DaynaportRef { controller, id, params });
             continue;
         }
         out.tables.push(TableRef {
-            slot: crate::config::scsi_slot(controller, id),
+            slot: key,
             is_cdrom: dev.is_cdrom(),
             path: dev.path.clone(),
             size_bytes: std::fs::metadata(&dev.path).map(|m| m.len()).unwrap_or(0),
@@ -128,12 +127,11 @@ pub fn attach_from_config<'a>(
                 out.scratch = Some(path);
             }
         }
-        let bus = route(controller).map_err(|e| format!("{at}: {e}"))?;
         // CI mode isolates each copy-on-write overlay in the temporary
         // directory, so an interactive iris holding one and any number of CI
         // runs can share the image.
         let ci_overlay = (cfg.ci && dev.overlay && !dev.is_cdrom()).then(|| ScsiDeviceConfig::ci_overlay_path(key));
-        attach_table(bus, id, &at, dev, ci_overlay.as_deref(), log_prefix)?;
+        attach_table(bus, id, &label, dev, ci_overlay.as_deref(), log_prefix)?;
     }
     out.tables.sort_by_key(|t| t.slot);
     Ok(out)
@@ -142,8 +140,11 @@ pub fn attach_from_config<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MachineProfile;
+    use crate::devices::{DeviceModel, ConfiguredDevice};
     use crate::scsi::{ScsiIdentities, ScsiIdentity};
     use crate::test_temp::TempPath;
+    use crate::topology::DevicePlacement;
 
     const ID: ScsiIdentity = ScsiIdentity::new(b"TEST    ", b"ATTACH          ", b"1.0 ");
 
@@ -151,51 +152,61 @@ mod tests {
         std::array::from_fn(|_| ScsiBus::new(16, ScsiIdentities { disk: ID, cdrom: ID }))
     }
 
-    fn route<'a>(b: &'a [ScsiBus; 2]) -> impl Fn(u8) -> Result<&'a ScsiBus, String> {
-        move |c| b.get(c as usize).ok_or_else(|| format!("controller {c} (two buses here)"))
-    }
-
     fn image(tag: &str) -> TempPath {
         TempPath::file(&format!("attach-{tag}"), &[0u8; 4096])
     }
 
-    fn table(path: &TempPath, cdrom: bool, controller: u8) -> ScsiDeviceConfig {
-        ScsiDeviceConfig { path: path.to_string_lossy().into_owned(), cdrom, controller, ..Default::default() }
+    fn indigo2(devices: Vec<ConfiguredDevice>) -> MachineConfig {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::Indigo2Ip22;
+        cfg.devices = devices;
+        cfg
+    }
+
+    fn at(at: &str, dev: ScsiDeviceConfig) -> ConfiguredDevice {
+        ConfiguredDevice::new(at, DeviceModel::Scsi(dev))
+    }
+
+    fn disk(path: &TempPath) -> ScsiDeviceConfig {
+        ScsiDeviceConfig { path: path.to_string_lossy().into_owned(), ..Default::default() }
+    }
+
+    fn attach(cfg: &MachineConfig, buses: &[ScsiBus; 2]) -> Result<Attached, String> {
+        attach_from_config(cfg, None, &DevicePlacement::new(cfg)?, &buses.iter().collect::<Vec<_>>())
     }
 
     #[test]
-    fn tables_land_on_their_controller_and_id() {
+    fn devices_land_on_the_bus_bound_at_their_slot() {
         let (a, b) = (image("a"), image("b"));
-        let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
-        cfg.scsi.insert(1, table(&a, false, 0));
-        cfg.scsi.insert(2, table(&b, false, 1)); // controller field
-        cfg.scsi.insert(16 + 5, table(&b, false, 0)); // key names controller 1
+        let cfg = indigo2(vec![at("scsi0/t1", disk(&a)), at("hpc3/c1/t2", disk(&b)), at("scsi1/t5", disk(&b))]);
         let buses = buses();
-        attach_from_config(&cfg, None, &route(&buses)).unwrap();
+        attach(&cfg, &buses).unwrap();
         let ids = |b: &ScsiBus| (0..16).filter(|&i| b.has_target(i)).collect::<Vec<u8>>();
         assert_eq!(ids(&buses[0]), vec![1]);
         assert_eq!(ids(&buses[1]), vec![2, 5]);
     }
 
     #[test]
-    fn a_bus_the_machine_lacks_is_an_error() {
+    fn a_slot_the_machine_lacks_is_an_error() {
         let a = image("lack");
-        let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
-        cfg.scsi.insert(1, table(&a, false, 2));
         let buses = buses();
-        let e = attach_from_config(&cfg, None, &route(&buses)).err().unwrap();
-        assert!(e.starts_with("SCSI 2:1: controller 2"), "{e}");
+        let e = attach(&indigo2(vec![at("scsi2/t1", disk(&a))]), &buses).err().unwrap();
+        assert!(e.contains("has no slot scsi2/t1"), "{e}");
+    }
+
+    #[test]
+    fn a_bus_the_map_declares_must_be_built() {
+        let cfg = indigo2(vec![]);
+        let buses = buses();
+        let e = attach_from_config(&cfg, None, &DevicePlacement::new(&cfg).unwrap(), &[&buses[0]]).err().unwrap();
+        assert!(e.contains("declares 2 SCSI buses, which the machine built 1"), "{e}");
     }
 
     #[test]
     fn daynaports_are_returned_for_the_machine_to_attach() {
-        let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
-        cfg.scsi.insert(3, ScsiDeviceConfig { kind_field: crate::config::ScsiKind::Daynaport, ..Default::default() });
+        let dayna = ScsiDeviceConfig { kind_field: crate::config::ScsiKind::Daynaport, ..Default::default() };
         let buses = buses();
-        let got = attach_from_config(&cfg, None, &route(&buses)).unwrap();
+        let got = attach(&indigo2(vec![at("scsi0/t3", dayna)]), &buses).unwrap();
         assert_eq!((got.daynaports[0].controller, got.daynaports[0].id), (0, 3));
         assert!(got.tables.is_empty(), "no image behind a DaynaPort");
         assert!(!buses[0].has_target(3), "and nothing attached");
@@ -204,14 +215,11 @@ mod tests {
     #[test]
     fn tables_come_back_by_slot_with_their_kind() {
         let (a, iso) = (image("prov"), image("iso"));
-        let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
-        cfg.scsi.insert(4, table(&iso, true, 0));
-        cfg.scsi.insert(1, table(&a, false, 0));
+        let cd = ScsiDeviceConfig { cdrom: true, ..disk(&iso) };
         let buses = buses();
-        let got = attach_from_config(&cfg, None, &route(&buses)).unwrap();
+        let got = attach(&indigo2(vec![at("scsi1/t4", cd), at("scsi0/t1", disk(&a))]), &buses).unwrap();
         let kinds: Vec<_> = got.tables.iter().map(|t| (t.slot, t.is_cdrom)).collect();
-        assert_eq!(kinds, vec![(1, false), (4, true)]);
+        assert_eq!(kinds, vec![(1, false), (20, true)]);
         assert_eq!(got.tables[0].size_bytes, 4096);
     }
 }

@@ -397,7 +397,7 @@ mod tests {
     }
 
     fn bridge_with(crime: &Arc<Crime>) -> Arc<MacePci> {
-        MacePci::new(&PCI0, crime.clone(), test_ram())
+        MacePci::new(&PCI0_ROUTING, crime.clone(), test_ram())
     }
 
     fn at(device: u8) -> DevFn {
@@ -656,7 +656,7 @@ mod tests {
     fn nvme_in_the_option_slot(bridge: bool) {
         let crime = Arc::new(Crime(Mutex::new(Vec::new())));
         let ram = test_ram();
-        let pci = MacePci::new(&PCI0, crime.clone(), ram.clone());
+        let pci = MacePci::new(&PCI0_ROUTING, crime.clone(), ram.clone());
         let img = crate::dev::nvme::tests::temp_image(if bridge { "mace-ppb" } else { "mace" });
         let card = crate::dev::nvme::Card::open(&crate::config::NvmeConfig {
             path: img.to_string_lossy().into_owned(),

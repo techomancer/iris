@@ -49,45 +49,37 @@ banks = [128, 128, 0, 0]
 # Valid IDs: 1–7 (1–15 on the Octane, the SN0 machines, Fuel and Tezro). The
 # SCSI controller itself occupies ID 0.
 # Typical Indy layout:
-#   ID 1 — internal hard disk
-#   ID 4 — internal CD-ROM (removable, 512-byte block mode)
-#   ID 6 — optional second hard disk or tape
+#   t1 — internal hard disk
+#   t4 — internal CD-ROM (removable, 512-byte block mode)
+#   t6 — optional second hard disk or tape
 
 # Internal hard disk
-[scsi.1]
-path   = "scsi1.raw"
-cdrom  = false
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
+path = "scsi1.raw"
 #overlay = true
 #write_cache = false  # default true. false stores every write before it completes, like SGI's drives (slower); true can lose ~5 s of writes in a host crash. See STORAGE.md.
-#controller = 0   # Indigo2 and O2 have a second controller (1); on the O2 it is the external bus.
-                  # [scsi.17] is id 1 on controller 1 without this key, so an id can be on both.
 
-# Internal hard disk
-#[scsi.2]
-#path   = "scsi2.raw"
-#cdrom  = false
+# Second hard disk. The Indigo2 and O2 have a second controller, scsi1 (on the O2 the external bus);
+# the same target can be used on both.
+#[[devices]]
+#type = "hdd"
+#at   = "scsi0/t2"
+#path = "scsi2.raw"
 
 # Scratch volume for host<->guest file injection without networking.
-# iris auto-creates the file at `path` if missing — first 4 KB hold a minimal
-# SGI Volume Header (so IRIX recognises the device); the rest (size_mb MB
-# minus 4 KB) is the host-controlled payload area. The CI socket exposes
-# scratch-write/scratch-read/scratch-clear/scratch-info; offsets passed to
-# those commands are relative to the payload start, so the VH is never
-# touched. The guest reads the same bytes at offset 0 of /dev/rdsk/dks0dNvol.
-# No higher-level format is imposed — typical use is a tar stream:
-#   host:  iris CI: scratch-write {host_path: "bundle.tar"}
-#   guest: dd if=/dev/rdsk/dks0d2s0 bs=512 | tar xf -
 #          tar cf - /var/log/foo | dd of=/dev/rdsk/dks0d2s0 bs=512 conv=notrunc
 #   host:  iris CI: scratch-read {to_path: "log.tar"}
 # IRIX raw block-device reads must be sector-aligned (bs must be a multiple
 # of 512); bs=64 etc returns "Read error: I/O error".
-# Implies cdrom=false, overlay=false (the volume must be host-writable, and
+# Implies overlay=false (the volume must be host-writable, and
 # scratch contents intentionally survive snapshot rollback so a freshly
 # injected bundle isn't reverted).
-#[scsi.2]
+#[[devices]]
+#type    = "hdd"
+#at      = "scsi0/t2"
 #path    = "scratch.raw"
-#cdrom   = false
-#overlay = false
 #scratch = true
 #size_mb = 64
 
@@ -99,8 +91,9 @@ cdrom  = false
 #   subnet — optional; this target's own NAT subnet (gateway .1, guest .2).
 #            Must differ from nat_subnet (ec0's). Default 192.168.10.0/24.
 # See docs/dev/daynaport.md.
-#[scsi.3]
-#kind   = "daynaport"
+#[[devices]]
+#type   = "daynaport"
+#at     = "scsi0/t3"
 #mac    = "00:80:19:12:34:56"
 #subnet = "192.168.10.0/24"
 
@@ -143,9 +136,10 @@ bind       = "localhost"
 # http:// or https:// URL; the server must answer Range requests (STORAGE.md).
 # For a changer (cycled with "scsi eject 4" in the monitor), list all
 # ISO images in `discs`; the first entry is mounted at startup.
-#[scsi.4]
-#path   = "cdrom4.iso"
-#cdrom  = true
+#[[devices]]
+#type  = "cdrom"
+#at    = "scsi0/t4"
+#path  = "cdrom4.iso"
 #discs = ["second.iso", "cdrom4.iso", "patches.iso"]
 
 # Runtime disc switching (no extra config needed).
@@ -157,9 +151,10 @@ bind       = "localhost"
 #   - two+ discs: ejecting cycles through them; a single disc ejects to empty
 # `path` is optional: omit it (or comment it out) to boot with an empty tray and
 # insert media later.
-#[scsi.4]
-#cdrom = true
-#path  = "cdrom4.iso"   # optional — omit to start with an empty tray
+#[[devices]]
+#type = "cdrom"
+#at   = "scsi0/t4"
+#path = "cdrom4.iso"   # optional — omit to start with an empty tray
 
 # VINO video-in (IndyCam). Off by default.
 # source:   "off" | "test_pattern" | "black" | "camera"

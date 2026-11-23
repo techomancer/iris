@@ -125,7 +125,7 @@ fn each_slot_answers(kind: Kind, widget: u8) {
     for device in 0..8u8 {
         assert_eq!(rig.config(device, 0), None, "device {device} is empty");
     }
-    for &device in kind.slots() {
+    for device in kind.slots() {
         rig.card(device, PCI_INTA);
         // Vendor in the low half, device in the high half, as the CPU reads
         // the big-endian window.
@@ -176,7 +176,7 @@ fn a_function_goes_only_in_a_free_slot_the_board_has() {
 /// vector the guest wrote for the pin.
 fn interrupts(kind: Kind, widget: u8) {
     let rig = Rig::new(kind, widget);
-    for (n, &device) in kind.slots().iter().enumerate() {
+    for (n, device) in kind.slots().into_iter().enumerate() {
         let a = rig.card(device, PCI_INTA);
         let vector = 20 + n as u32;
         rig.route(device as u32, vector);

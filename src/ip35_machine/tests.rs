@@ -67,7 +67,7 @@ fn refused(cfg: &MachineConfig) -> String {
     cfg.validate().unwrap_err()
 }
 /// The row's limits: one or two C-bricks, banks a C-brick takes in matched
-/// pairs, disks on the loop and not on `[scsi.N]`, no option board keys, no graphics.
+/// pairs, disks on the loop and not on a SCSI bus, no option board keys, no graphics.
 #[test]
 fn the_configuration_refuses_what_the_row_does_not_hold() {
     let dir = TempPath::dir("o3k-config");
@@ -96,8 +96,8 @@ fn the_configuration_refuses_what_the_row_does_not_hold() {
     }
     assert!(refused(&fc("[disk.126]\npath = \"d.img\"")).contains("loop ID"));
     let mut cfg = config(&dir, 1);
-    cfg.scsi.insert(2, toml::from_str("path = \"d.raw\"").unwrap());
-    assert!(refused(&cfg).contains("Fibre Channel"));
+    cfg.set_disk(2, toml::from_str("path = \"d.raw\"").unwrap());
+    assert!(refused(&cfg).contains("has no slot scsi0/t2"), "{}", refused(&cfg));
     let mut cfg = config(&dir, 1);
     cfg.graphics.board = Some(crate::config::GraphicsBoard::V12);
     assert!(refused(&cfg).contains("Origin 3200"));

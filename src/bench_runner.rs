@@ -338,7 +338,7 @@ pub fn bench_config(banks: [u32; 4], cpu: &Part) -> MachineConfig {
     // `MachineConfig::default` attaches scsi1.raw, which makes startup fatal
     // when the file is absent — and here it always is. Same reason
     // bench/run/bare.toml carries a present-but-empty `[scsi]`.
-    cfg.scsi.clear();
+    cfg.devices.clear();
     cfg.set_cpu(cpu);
     cfg
 }
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn the_bench_machine_has_no_disks() {
         let cfg = bench_config(BENCH_BANKS, &parts::R4400_150);
-        assert!(cfg.scsi.is_empty(), "a bench machine must not try to open a disk image");
+        assert!(cfg.devices.is_empty(), "a bench machine must not try to open a disk image");
         assert!(cfg.headless && cfg.no_audio);
     }
 
