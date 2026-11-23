@@ -22,21 +22,16 @@ pub enum ScsiAction {
 ///
 /// The menu covers ids 1-7 on controller 0, the ones a disc can be loaded
 /// into at run time; every target, on every controller, is in the Disks tab.
-/// Actions carry that controller-0 id; [`apply`] finds its `[scsi.KEY]`.
+/// Actions carry that controller-0 id.
 pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
     let mut action = ScsiAction::None;
     ui.set_min_width(280.0);
     for id in 1u8..=7 {
-        let dev = crate::extra_ui::scsi_key(cfg, 0, id).map(|k| &cfg.scsi[&k]);
-        // An older `controller = 1` table keyed by this id leaves it no key.
-        let key_taken = dev.is_none() && cfg.scsi.contains_key(&id);
+        let dev = cfg.disk(id);
         let label = render_label(id, dev);
         ui.menu_button(label, |ui| {
             ui.set_min_width(220.0);
             match dev {
-                None if key_taken => {
-                    ui.label(t!("config-scsi-key-taken", key = id));
-                }
                 None => {
                     if ui.button(t!("scsi-attach-hdd")).clicked() {
                         if let Some(p) = pick_disk(&t!("scsi-attach-hdd-picker"), "") {
@@ -185,37 +180,34 @@ pub fn pick_iso(title: &str, cur: &str) -> Option<String> {
         .map(|p| crate::picked_path(&p))
 }
 
-/// Apply an action to the config. `id` is a controller-0 SCSI id; a target
-/// already there is found by its placement, a new one takes the key `id`.
+/// Apply an action to the config. `id` is a controller-0 SCSI id.
 pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
-    let key = |cfg: &MachineConfig, id: u8| crate::extra_ui::scsi_key(cfg, 0, id).unwrap_or(id);
     match action {
         ScsiAction::None => None,
         ScsiAction::AttachHdd { id, path } => {
-            cfg.scsi.insert(id, ScsiDeviceConfig { path, ..Default::default() });
+            cfg.set_disk(id, ScsiDeviceConfig { path, ..Default::default() });
             Some(t!("scsi-attached-hdd", id = id))
         }
         ScsiAction::AttachEmptyCdrom { id } => {
-            cfg.scsi.insert(id, ScsiDeviceConfig { cdrom: true, ..Default::default() });
+            cfg.set_disk(id, ScsiDeviceConfig { cdrom: true, ..Default::default() });
             Some(t!("scsi-attached-cdrom-empty", id = id))
         }
         ScsiAction::AttachCdromWithDisc { id, path } => {
-            cfg.scsi.insert(id, ScsiDeviceConfig {
+            cfg.set_disk(id, ScsiDeviceConfig {
                 path: path.clone(), cdrom: true, ..Default::default()
             });
             Some(t!("scsi-attached-cdrom-disc", id = id))
         }
         ScsiAction::InsertDisc { id, path } => {
-            if let Some(d) = cfg.scsi.get_mut(&key(cfg, id)) { d.path = path; }
+            if let Some(d) = cfg.disk_mut(id) { d.path = path; }
             Some(t!("scsi-disc-inserted", id = id))
         }
         ScsiAction::Eject { id } => {
-            if let Some(d) = cfg.scsi.get_mut(&key(cfg, id)) { d.path = String::new(); }
+            if let Some(d) = cfg.disk_mut(id) { d.path = String::new(); }
             Some(t!("scsi-disc-ejected", id = id))
         }
         ScsiAction::Detach { id } => {
-            let k = key(cfg, id);
-            cfg.scsi.remove(&k);
+            cfg.remove_disk(id);
             Some(t!("scsi-detached", id = id))
         }
         ScsiAction::CreateBlank { .. } => {
@@ -224,7 +216,7 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
         }
         ScsiAction::ToggleOverlay { id } => {
             let mut on = false;
-            if let Some(d) = cfg.scsi.get_mut(&key(cfg, id)) { d.overlay = !d.overlay; on = d.overlay; }
+            if let Some(d) = cfg.disk_mut(id) { d.overlay = !d.overlay; on = d.overlay; }
             Some(if on { t!("scsi-overlay-on", id = id) } else { t!("scsi-overlay-off", id = id) })
         }
         ScsiAction::RemountInIrix { .. } => None,

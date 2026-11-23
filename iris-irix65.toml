@@ -12,16 +12,18 @@ serial_log  = "irix-install-console.log"
 
 # Empty 20 GB CHD created with:
 #   chdman createhd -o irix65.chd -s 21474836480 -ss 512 -c none
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path  = "irix65.chd"
-cdrom = false
 
 # CD changer at SCSI 4. Overlay 1 mounted first; the rest cycle in load order.
 # Filenames match what's actually in irix/ (the doc's irix/6.5.22/ layout
 # doesn't exist; these are the same ISOs under different release-kit names).
-[scsi.4]
+[[devices]]
+type = "cdrom"
+at   = "scsi0/t4"
 path  = "irix/IRIX 6.5.22 Installation Tools and Overlays (1 of 3).iso"
-cdrom = true
 discs = [
   "irix/IRIX 6.5.22 Installation Tools and Overlays (1 of 3).iso",
   "irix/IRIX 6.5.22 Overlays (2 of 3).iso",

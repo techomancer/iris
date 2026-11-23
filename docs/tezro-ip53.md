@@ -277,8 +277,8 @@ Tezro. On them the IOC4 serial ports appear as `tty3` and `tty4`, as on
 real single-node IP59 inventories.
 
 Boot from any IRIX 6.5.x disk installed on an IP35 machine (an Origin 300
-class install): attach it as `[scsi.1]`. A second data disk goes on another
-`[scsi.N]` with `overlay = true` when its filesystem needs recovery.
+class install): attach it as an `hdd` at `scsi0/t1`. A second data disk goes on another
+target with `overlay = true` when its filesystem needs recovery.
 
 A disk installed for another machine family, for example an Octane install,
 does not boot a Tezro: the PROM loads that disk's `/unix` and stops with

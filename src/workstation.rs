@@ -1073,3 +1073,33 @@ mod exit_file_tests {
         assert!(kept.exists());
     }
 }
+
+#[cfg(test)]
+mod placement_tests {
+    use crate::config::{GraphicsBoard, MachineProfile as P, ScsiDeviceConfig};
+    use crate::devices::{DeviceModel, ConfiguredDevice};
+
+    /// Every machine builds with a disk on each SCSI bus its slot list declares, and a bus bound to every PCI bus slot.
+    #[test]
+    fn each_machine_builds_with_a_disk_on_every_bus_its_map_declares() {
+        for p in P::EVERY.into_iter().filter(|p| !p.is_ip35_bricks()) {
+            let dir = crate::display_stop_tests::scratch(&format!("map-{}", p.name()));
+            let mut cfg = match p {
+                P::Origin200Ip29 | P::Origin2000Ip27 | P::Onyx2Ip27 => crate::ip27::test_support::config(p, &dir, 1),
+                P::FuelIp34 => crate::ip35::test_support::fuel_config(&dir),
+                P::TezroIp53 => crate::ip35::test_support::tezro_config(&dir, 1),
+                _ => crate::display_stop_tests::config(&dir, p, if p.ip28() { GraphicsBoard::SolidImpact } else { GraphicsBoard::default_for(p) }),
+            };
+            cfg.headless = true;
+            let disk = dir.join("disk.raw");
+            std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
+            let buses = crate::topology::scsi_buses(&p.slots());
+            let dev = ScsiDeviceConfig { path: disk.to_string_lossy().into_owned(), overlay: true, ..Default::default() };
+            cfg.devices = buses.iter().map(|b| ConfiguredDevice::new(&format!("{}/t1", b.1), DeviceModel::Scsi(dev.clone()))).collect();
+            assert_eq!(cfg.disks().len(), buses.len(), "{p:?}");
+            let built = crate::display_stop_tests::big_stack(move || super::build(cfg).map(|m| m.disk_activity().len()));
+            let n = built.unwrap_or_else(|e| panic!("{p:?}: {e}"));
+            assert!(n >= buses.len(), "{p:?}: {n} disk buses for {} in the map", buses.len());
+        }
+    }
+}

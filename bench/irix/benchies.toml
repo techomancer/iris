@@ -4,7 +4,7 @@
 # names other files.
 #
 # Copy the binaries into the guest first. One way is `iris-ci put`, which needs
-# a scratch volume in iris.toml (a `[scsi.2]` entry with `scratch = true`, see
+# a scratch volume in iris.toml (an `hdd` device at `scsi0/t2` with `scratch = true`, see
 # STORAGE.md). From the repo root:
 #
 #   iris-ci run "mkdir -p /usr/bench"

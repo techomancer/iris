@@ -23,8 +23,8 @@ pub(crate) fn config(profile: MachineProfile, dir: &Path, nodes: u8) -> MachineC
     cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
     let disk = dir.join("disk.raw");
     std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
-    cfg.scsi.clear();
-    cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
+    cfg.devices.clear();
+    cfg.set_disk(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
     cfg
 }
 

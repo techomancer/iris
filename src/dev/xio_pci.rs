@@ -56,6 +56,7 @@ use crate::dev::bridge::{Bridge, RawFlash, PIN_WIRING};
 use crate::dev::w1;
 use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use crate::pci::{DevFn, PciBus, PciFunction};
+use crate::topology::MachineSlotKind;
 use crate::xtalk::Upstream;
 
 /// Which product, as `[[xio_board]] kind` names it.
@@ -77,6 +78,12 @@ const BLANK_FLASH_SIZE: u32 = 2 << 20;
 /// for the same adapter.
 const SHOEHORN_BRIDGE_REVISION: u32 = 4;
 
+/// A shoehorn's bus: one slot, device 1.
+pub(crate) const SHOEHORN_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::PCI_SLOT, None)];
+/// The PCI module's bus: slots 1 to 3, PCI device numbers 1 to 3.
+pub(crate) const CAGE_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] =
+    &[(1, MachineSlotKind::PCI_SLOT, None), (2, MachineSlotKind::PCI_SLOT, None), (3, MachineSlotKind::PCI_SLOT, None)];
+
 impl Kind {
     /// The name `[[xio_board]] kind` uses.
     pub fn name(self) -> &'static str {
@@ -93,13 +100,17 @@ impl Kind {
         }
     }
 
+    fn table(self) -> &'static [(u8, MachineSlotKind, Option<&'static str>)] {
+        match self {
+            Kind::Shoehorn => SHOEHORN_SLOTS,
+            Kind::Cage => CAGE_SLOTS,
+        }
+    }
+
     /// The PCI device numbers of the board's slots, in the order a card with
     /// no slot named fills them.
-    pub fn slots(self) -> &'static [u8] {
-        match self {
-            Kind::Shoehorn => &[1],
-            Kind::Cage => &[1, 2, 3],
-        }
+    pub fn slots(self) -> Vec<u8> {
+        self.table().iter().filter(|d| d.1 == MachineSlotKind::PCI_SLOT).map(|d| d.0).collect()
     }
 }
 
@@ -174,7 +185,7 @@ impl XioPciBoard {
 
     /// The first slot with nothing in it.
     pub fn free_slot(&self) -> Option<u8> {
-        self.kind.slots().iter().copied().find(|&d| !self.bus().occupied(d))
+        self.kind.slots().into_iter().find(|&d| !self.bus().occupied(d))
     }
 
     /// Put `f` (function 0) in slot `device`.

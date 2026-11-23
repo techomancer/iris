@@ -19,8 +19,9 @@ checked against the bundled Mozilla roots. A failed request is retried twice.
 Hard disks cannot be served this way, and CHD files must be local.
 
 ```toml
-[scsi.4]
-cdrom = true
+[[devices]]
+type = "cdrom"
+at   = "scsi0/t4"
 path = "https://example.org/irix-6.5.30-overlays-1.iso"
 discs = ["https://example.org/irix-6.5.30-overlays-2.iso"]
 ```
@@ -42,7 +43,7 @@ are BSD-3-Clause licensed, so IRIS stays fully BSD-3-Clause (see
 
 ## Disk write cache
 
-Each hard disk has a `write_cache` setting in its `[scsi.N]` table. It is the
+Each hard disk has a `write_cache` setting in its `hdd` device. It is the
 WCE bit of the SCSI caching page: whether the disk may tell the guest a write
 is done before the write is on the host's disk. The NVMe card (`[nvme]`, as
 the volatile write cache feature) and Fibre Channel disks
@@ -51,7 +52,9 @@ the volatile write cache feature) and Fibre Channel disks
 Channel disk's table.
 
 ```toml
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path = "irix.img"
 write_cache = false   # default true
 ```
@@ -181,9 +184,10 @@ overlay that a newer iris left that way with a newer iris first.
 
 Enable in `iris.toml`:
 ```toml
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path = "scsi1.raw"
-cdrom = false
 overlay = true
 ```
 
@@ -360,9 +364,10 @@ SGI Volume Header on first run, and exposes it inside IRIX as
 
 Enable in `iris.toml`:
 ```toml
-[scsi.2]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t2"
 path    = "scratch.raw"
-cdrom   = false
 overlay = false
 scratch = true
 size_mb = 64

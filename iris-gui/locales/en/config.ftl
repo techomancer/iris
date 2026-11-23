@@ -183,7 +183,6 @@ config-scsi-id = SCSI ID { $id }
 config-scsi-controller = Controller { $controller }
 config-scsi-controller-id = SCSI { $controller }:{ $id }
 # $key is the number of the [scsi.N] table.
-config-scsi-key-taken = The [scsi.{ $key }] table holds a target on another controller. Remove it there, or give it the key 16 + id in the configuration.
 config-scsi-attach = Add device
 config-scsi-type = Type
 config-scsi-type-disk = Hard disk

@@ -230,7 +230,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
     let o2 = cfg.machine.profile == MachineProfile::O2Ip32;
     if cfg.machine.profile != profile_before {
-        crate::extra_ui::switch_profile(cfg);
+        crate::extra_ui::switch_profile(cfg, profile_before);
     }
     subtitle(ui, t!("config-platform-subtitle"));
     subtitle(ui, t!("config-viewport-subtitle"));
@@ -827,26 +827,18 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
         subtitle(ui, t!("config-scsi-subtitle"));
     });
     let mut to_delete: Option<u8> = None;
-    // Every (controller, id) the profile has: two controllers on the
-    // Indigo2, O2, Octane, SN0, Fuel and Tezro; ids up to 15 on wide buses.
-    // A target's `[scsi.KEY]` is found through its placement, so an older
-    // `controller = 1` table keyed by the bare id still shows where it is.
-    let profile = cfg.machine.profile;
-    let controllers = profile.scsi_controllers();
-    let max_id = profile.max_scsi_id();
-    for controller in 0..controllers {
-        if controllers > 1 {
+    // Every SCSI target the machine's slot list has, by controller.
+    let buses = iris::topology::scsi_buses(&cfg.machine.profile.slots());
+    for (controller, _, ids) in &buses {
+        let controller = *controller;
+        if buses.len() > 1 {
             ui.separator();
             ui.heading(t!("config-scsi-controller", controller = controller));
         }
-        for id in 1u8..=max_id {
+        for &id in ids {
             ui.separator();
-            let found = crate::extra_ui::scsi_key(cfg, controller, id);
-            let exists = found.is_some();
-            let key = found.unwrap_or(iris::config::scsi_slot(controller, id));
-            // An older `[scsi.N] controller = 1` table holds key N, so the
-            // controller-0 target with that id has no key left to take.
-            let key_taken = !exists && cfg.scsi.contains_key(&key);
+            let key = iris::config::scsi_slot(controller, id);
+            let exists = cfg.disk(key).is_some();
             ui.horizontal(|ui| {
                 if controller == 0 {
                     ui.strong(t!("config-scsi-id", id = id));
@@ -857,16 +849,14 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     if ui.button(t!("config-remove")).clicked() {
                         to_delete = Some(key);
                     }
-                } else if key_taken {
-                    ui.label(RichText::new(t!("config-scsi-key-taken", key = key)).weak());
                 } else if ui.button(t!("config-scsi-attach")).clicked() {
-                    cfg.scsi.insert(key, ScsiDeviceConfig {
+                    cfg.set_disk(key, ScsiDeviceConfig {
                         path: crate::settings::GuiSettings::default_disk_path(key),
                         ..Default::default()
                     });
                 }
             });
-            if let Some(dev) = cfg.scsi.get_mut(&key).filter(|_| exists) {
+            if let Some(dev) = cfg.disk_mut(key).filter(|_| exists) {
                 // A DaynaPort has no image, no media and no overlay — it is an
                 // Ethernet adapter on the SCSI bus. Show its own short form
                 // instead of the storage rows below.
@@ -1003,7 +993,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
             }
         }
     }
-    if let Some(key) = to_delete { cfg.scsi.remove(&key); }
+    if let Some(key) = to_delete { cfg.remove_disk(key); }
     (edit, action)
 }
 

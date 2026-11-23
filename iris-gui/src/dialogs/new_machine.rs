@@ -377,20 +377,20 @@ impl NewMachineDialog {
                         }
                         // SCSI defaults: drop the built-in entries unless the
                         // user explicitly opted in.
-                        if !self.profile.is_ip35_bricks() { cfg.scsi.clear(); }
+                        cfg.devices.clear();
                         if self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
                             let mut fc = iris::config::FibreChannelConfig::default();
                             fc.disks.insert(1, ScsiDeviceConfig { path: self.scsi1_path.clone(), ..Default::default() });
                             cfg.fibre_channel = Some(fc);
                         }
                         if !self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
-                            cfg.scsi.insert(1, ScsiDeviceConfig {
+                            cfg.set_disk(1, ScsiDeviceConfig {
                                 path: self.scsi1_path.clone(),
                                 ..Default::default()
                             });
                         }
                         if !self.profile.is_ip35_bricks() && self.attach_cdrom && !self.cdrom4_path.is_empty() {
-                            cfg.scsi.insert(4, ScsiDeviceConfig {
+                            cfg.set_disk(4, ScsiDeviceConfig {
                                 path: self.cdrom4_path.clone(),
                                 cdrom: true,
                                 ..Default::default()

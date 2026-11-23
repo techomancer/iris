@@ -21,7 +21,7 @@ mod tests {
 
     fn minimal_cfg() -> MachineConfig {
         let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
+        cfg.devices.clear();
         cfg
     }
 

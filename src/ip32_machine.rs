@@ -164,6 +164,12 @@ pub const O2_PROM_FILE: &str = "ip32prom.rev4.18.bin";
 /// The processors an O2 shipped with, the default first.
 pub const CPUS: &[&Part] = &[&parts::R5000_180, &parts::R10000_250, &parts::R12000_400];
 
+/// The O2's slots.
+pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
+    crate::topology::pci_bus_slots(s, "pci0", "O2 system board", crate::ip32::PCI0_SLOTS);
+}
+
+
 impl O2Machine {
     pub fn new(cfg: &MachineConfig) -> Result<Self, String> {
         let part = MachineProfile::O2Ip32.part(cfg.machine.cpu.as_deref())?;
@@ -193,14 +199,11 @@ impl O2Machine {
             Some(mac) => Some(crate::config::parse_mac(mac).map_err(|e| format!("network.mac: {e}"))?),
             None => None,
         };
-        // The SCSI devices, from the same `[scsi.N]` tables as the other
-        // machines; `controller` is the bus (0 internal, 1 external). The
-        // buses are filled before the controllers exist.
+        // The SCSI devices: scsi0 is the internal bus, scsi1 the external
+        // one. The buses are filled before the controllers exist.
         let scsi = [crate::dev::aic7880::Aic7880::new_bus(), crate::dev::aic7880::Aic7880::new_bus()];
-        let attached = crate::scsi::attach_from_config(cfg, Some("ip32"), &|c| {
-            scsi.get(c as usize)
-                .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1)"))
-        })?;
+        let resolved = crate::topology::DevicePlacement::new(cfg)?;
+        let attached = crate::scsi::attach_from_config(cfg, Some("ip32"), &resolved, &[&scsi[0], &scsi[1]])?;
         let opts = Ip32Options {
             scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
@@ -1449,7 +1452,7 @@ mod drop_tests {
         let disk = dir.join("disk.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
         let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
-        cfg.scsi.insert(1, crate::config::ScsiDeviceConfig {
+        cfg.set_disk(1, crate::config::ScsiDeviceConfig {
             path: disk.to_string_lossy().into_owned(), overlay: true, ..Default::default()
         });
         let mut machine = big_stack(move || Box::new(O2Machine::new(&cfg).expect("O2")));

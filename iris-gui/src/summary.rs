@@ -3,7 +3,7 @@
 //! and the tests need no window.
 //!
 //! Disks sit in different places per machine: `[scsi.N]` on every machine but
-//! the IP35 bricks (where that map is unused), `[nvme]` on the O2 and in an
+//! the IP35 bricks (where that slot list is unused), `[nvme]` on the O2 and in an
 //! Octane option board, `[fibre_channel]` on the machines with a PCI slot for
 //! it. The SCSI targets are named by their (controller, id) placement, so the
 //! O2's external bus reads `1:3`, not the `[scsi.19]` key.
@@ -24,20 +24,16 @@ pub enum Drive {
 /// id) order, then the NVMe card, then the Fibre Channel loop.
 pub fn drives(cfg: &MachineConfig) -> Vec<Drive> {
     let mut out = Vec::new();
-    if !cfg.machine.profile.is_ip35_bricks() {
-        let mut keys: Vec<u8> = cfg.scsi.keys().copied().collect();
-        keys.sort_by_key(|k| cfg.scsi[k].placement(*k));
-        for key in keys {
-            let d = &cfg.scsi[&key];
-            let id = crate::extra_ui::scsi_name(cfg, key);
-            out.push(if d.is_daynaport() {
-                Drive::Daynaport { id }
-            } else if d.is_cdrom() {
-                Drive::Cdrom { id, path: d.path.clone() }
-            } else {
-                Drive::Disk { id, path: d.path.clone() }
-            });
-        }
+    for (key, i) in cfg.disks() {
+        let d = cfg.devices[i].device.scsi().expect("listed by disks");
+        let id = crate::extra_ui::scsi_name(key);
+        out.push(if d.is_daynaport() {
+            Drive::Daynaport { id }
+        } else if d.is_cdrom() {
+            Drive::Cdrom { id, path: d.path.clone() }
+        } else {
+            Drive::Disk { id, path: d.path.clone() }
+        });
     }
     if !cfg.nvme.path.is_empty() {
         out.push(Drive::Nvme { path: cfg.nvme.path.clone() });
@@ -100,18 +96,12 @@ pub struct MissingDisk {
 /// The SCSI targets whose image `readable` refuses. Scratch volumes (iris
 /// creates them), DaynaPorts (no image) and empty CD-ROM drives (tray empty)
 /// are never missing, and a CD-ROM is present if any disc in its changer
-/// list is. The IP35 bricks take no `[scsi]` disks, so nothing there is
-/// missing. NVMe and Fibre Channel images are checked separately
+/// list is. NVMe and Fibre Channel images are checked separately
 /// ([`expansion_paths`]): they cannot be detached from this list.
 pub fn missing_disks(cfg: &MachineConfig, readable: impl Fn(&str) -> bool) -> Vec<MissingDisk> {
     let mut out = Vec::new();
-    if cfg.machine.profile.is_ip35_bricks() {
-        return out;
-    }
-    let mut keys: Vec<u8> = cfg.scsi.keys().copied().collect();
-    keys.sort_by_key(|k| cfg.scsi[k].placement(*k));
-    for key in keys {
-        let dev = &cfg.scsi[&key];
+    for (key, i) in cfg.disks() {
+        let dev = cfg.devices[i].device.scsi().expect("listed by disks");
         if dev.scratch || dev.is_daynaport() {
             continue;
         }
@@ -123,7 +113,7 @@ pub fn missing_disks(cfg: &MachineConfig, readable: impl Fn(&str) -> bool) -> Ve
         if !present {
             out.push(MissingDisk {
                 key,
-                name: crate::extra_ui::scsi_name(cfg, key),
+                name: crate::extra_ui::scsi_name(key),
                 path: dev.path.clone(),
                 cdrom: dev.is_cdrom(),
             });
@@ -175,7 +165,7 @@ mod tests {
     #[test]
     fn deprecated_o2_disks_reach_the_summary_and_the_disk_check() {
         // The spelling issue #304 was filed against: disks in `[o2]`, not in
-        // `[scsi.N]`. The core folds them into `[scsi.N]` on load.
+        // `[scsi.N]`. The core folds them into `[[devices]]` on load.
         let cfg = parse(r#"
             [machine]
             profile = "o2_ip32"
@@ -192,7 +182,7 @@ mod tests {
                    vec![("2", "o2-root.img", false), ("1:4", "o2-cd.iso", true)]);
         // Every name maps back to a key that detaching removes.
         for m in &missing {
-            assert!(cfg.scsi.contains_key(&m.key));
+            assert!(cfg.disk(m.key).is_some());
         }
     }
 

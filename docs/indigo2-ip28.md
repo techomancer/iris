@@ -30,7 +30,9 @@ board = "highimpact"       # also solidimpact or maximpact
 heads = 1
 resolution = "guest"
 
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path = "irix65.chd"
 ```
 

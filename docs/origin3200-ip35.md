@@ -43,7 +43,7 @@ port holds which is inferred. Port B (widget 11) is
 declared and empty. The Fibre Channel adapter is always fitted, with or without
 disks, and its slot runs 64-bit data phases (inferred from the PROM's behaviour:
 the control block and rings it builds are right only if the bridge reverses
-each doubleword of the adapter's DMA). A `[scsi.N]` table is refused.
+each doubleword of the adapter's DMA). A disk at a SCSI slot is refused.
 
 `[machine] audio_card = true` fits an audio card at device 2 of head F: the IC
 Ensemble ICE1724 with the DMediaPro DM8's converters, the same model as the

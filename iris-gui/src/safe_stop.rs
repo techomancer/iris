@@ -39,19 +39,12 @@ pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
     }
 
     let mut r = UnsafeReasons::default();
-    if !cfg.machine.profile.is_ip35_bricks() {
-        let mut keys: Vec<u8> = cfg.scsi.iter()
-            .filter(|(_, dev)| {
-                !dev.is_cdrom()
-                    && !dev.scratch
-                    && !dev.is_daynaport() // no image behind a network adapter
-                    && persists_to_base(&dev.path, dev.overlay)
-            })
-            .map(|(k, dev)| (dev.placement(*k), *k))
-            .collect::<std::collections::BTreeMap<_, _>>()
-            .into_values()
-            .collect();
-        r.writable_disks.extend(keys.drain(..).map(|k| t!("safestop-scsi-disk", id = crate::extra_ui::scsi_name(cfg, k))));
+    for (k, i) in cfg.disks() {
+        let dev = cfg.devices[i].device.scsi().expect("listed by disks");
+        // A DaynaPort has no image behind it.
+        if !dev.is_cdrom() && !dev.scratch && !dev.is_daynaport() && persists_to_base(&dev.path, dev.overlay) {
+            r.writable_disks.push(t!("safestop-scsi-disk", id = crate::extra_ui::scsi_name(k)));
+        }
     }
     if let Some(fc) = &cfg.fibre_channel {
         for (id, disk) in &fc.disks {
@@ -110,8 +103,9 @@ mod tests {
     #[test]
     fn second_controller_disk_is_named_controller_and_id() {
         let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
-        cfg.scsi.insert(19, iris::config::ScsiDeviceConfig { path: "d.raw".into(), ..Default::default() });
+        cfg.machine.profile = iris::config::MachineProfile::Indigo2Ip22;
+        cfg.devices.clear();
+        cfg.set_disk(19, iris::config::ScsiDeviceConfig { path: "d.raw".into(), ..Default::default() });
         let r = evaluate(&running(false), &cfg);
         assert_eq!(r.writable_disks.len(), 1);
         assert!(r.writable_disks[0].contains("1:3"), "{:?}", r.writable_disks);

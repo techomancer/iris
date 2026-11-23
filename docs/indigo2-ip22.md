@@ -21,10 +21,9 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
   (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
   `nveeprom save` or automatically on normal Stop. `[network] mac` is
   injected into a blank slot before boot; an existing MAC is retained.
-- **SCSI:** two WD33C93A controllers. A device goes on the second one as
-  `[scsi.16+N]` (so `[scsi.17]` is id 1 there, and id 1 can be on both), or
-  with `controller = 1` in its `[scsi.N]` section; `scsi0` / `scsi1` in the
-  monitor address each controller.
+- **SCSI:** two WD33C93A controllers. A device goes on the second one at
+  `scsi1/tN` (so `scsi1/t1` is id 1 there, and id 1 can be on both);
+  `scsi0` / `scsi1` in the monitor address each controller.
 - **Interrupts:** INT2 and the fullhouse cascade are modelled; the IRIX kernel
   never hooks GIO interrupt 2, so vertical retrace is delivered the way the
   table below describes.

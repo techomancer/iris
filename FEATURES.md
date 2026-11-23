@@ -238,10 +238,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `serial_socket_a` | `unset` | Also serve serial channel A on this Unix socket (raw bytes, one client at a time). |
 | `serial_socket_b` | `unset` | Likewise for channel B. With `ci` the console stays readable through `serial-read` and `wait-serial` as well. |
 | `load_elf` | `unset` | Load a static big-endian MIPS ELF32 binary before starting the CPU. |
-| `test_device` | `false` | Map the bare-metal test device in GIO slot 0. |
-| `test_device_dump` | `iris-testdev-dump.json when unset` | Test-device machine-state JSON output. |
-| `test_device_run_config` | `unset` | What the test device's run-configuration register publishes, as `time_pct=N,repeats=N,groups=MASK` (any of them); the benchmark suite reads it to shorten its run. Needs `test_device`. |
-| `cheritest_dump_hook` | `false` | CP0 register 26 dump convention; needs test_device, unsafe for normal PROM boot. |
+| `cheritest_dump_hook` | `false` | CP0 register 26 dump convention; needs a `test_device` device, unsafe for normal PROM boot. |
 | `nat_subnet` | `192.168.0.0/24 when unset` | CIDR; NAT gateway network+1 and guest network+2. |
 | `ci` | `false` | CI server/serial backend; hides host window unless ci_display, keeps offscreen graphics. |
 | `ci_socket` | `iris.sock` in `$TMPDIR` (else `/tmp`) on Unix; `127.0.0.1:19851` on Windows | Unix path, host:port, or tcp:host:port. |
@@ -383,9 +380,9 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 | `graphics.newport_mode` | `direct` when Newport uses wgpu | `direct` shares the resident GPU with the wgpu window presenter and fails startup rather than falling back to GL/CPU; `readback` explicitly selects the slow compatibility/validation compositor, synchronizing both complete planes for each newly composed frame. It applies only to Newport with `raster = "wgpu"`. |
 | `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. `WGPU_BACKEND` overrides it. Experimental production Newport initially accepts only Vulkan or D3D12; `auto` must resolve to one of them. |
 
-<a id="scsiid"></a>
+<a id="devices"></a>
 
-### `[scsi.<ID>]`
+### [[devices]]
 
 | Key | Default | Values and behavior |
 |---|---|---|
@@ -609,8 +606,8 @@ Octane's 512-byte image, and its clock in `<nvram>.rtc.clock`), `banks`
 `headless` (serial console instead of the graphics console and keyboard),
 `[clock] fixed_mhz` (CP0 Count; the CPU runs at twice it, so 90 MHz is a
 180 MHz O2), `[network]` including `mac` and `mode = "off"` for an unplugged
-Ethernet, `[[port_forward]]`, `nat_subnet`, `[nfs]` and `[scsi.N]`
-(`controller` is the bus). See [the O2 guide](docs/o2-ip32.md). The old
+Ethernet, `[[port_forward]]`, `nat_subnet`, `[nfs]` and `[[devices]]`
+(`scsi0` and `scsi1` are its buses). See [the O2 guide](docs/o2-ip32.md). The old
 O2-only spellings (`o2.prom`, `o2.flash`, `o2.ram_mb`, `o2.dimms`,
 `o2.disks`, `o2.serial_port`, `o2.serial_log`, `o2.graphics`, `o2.cpu_mhz`,
 `o2.net`, `o2.forwards`) are deprecated: they are folded into those keys when

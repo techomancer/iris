@@ -54,7 +54,9 @@ proto = "tcp"
 host_port = 2323
 guest_port = 23
 
-[scsi.1]
+[[devices]]
+type = "hdd"
+at   = "scsi0/t1"
 path = "irix6530.raw"
 overlay = true
 ```
@@ -99,10 +101,10 @@ console.
 
 ## Disks
 
-The `[scsi.N]` tables list the devices on the two ISP1040s: `N` 1-15 is the
-id on the internal bus (controller 0), `N` = 16 + id that id on the external
-bus (controller 1), or use `controller = 1`. IRIX expects its system disk at
-id 1 on controller 0. Raw images and `overlay = true` work as on the other
+The `[[devices]]` entries list the devices on the two ISP1040s: `scsi0/t1` to `scsi0/t15` are the
+ids on the internal bus (controller 0), `scsi1/t1` to `scsi1/t15` those on the external
+bus (controller 1). IRIX expects its system disk at
+`scsi0/t1`. Raw images and `overlay = true` work as on the other
 machines ([STORAGE.md](../STORAGE.md)). The controller's own firmware is
 stored and never run; SCSI commands go to iris's shared target model. The
 monitor's `scsi` and `cow` commands reach controller 0 (`scsi1`, `cow1` the

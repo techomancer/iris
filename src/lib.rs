@@ -161,7 +161,9 @@ pub mod build_features {
 
 pub mod validate_config;
 pub mod config;
+pub mod devices;
 pub mod slot_path;
+pub mod topology;
 pub mod identity;
 pub mod traits;
 #[macro_use]

@@ -63,11 +63,10 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
         missing_file("prom", &cfg.prom, &mut problems);
     }
 
-    let mut keys: Vec<_> = cfg.scsi.keys().copied().collect();
-    keys.sort();
-    for key in keys {
-        let dev = &cfg.scsi[&key];
-        let what = format!("scsi.{key}");
+    let placement = crate::topology::DevicePlacement::lenient(cfg, &cfg.devices);
+    for (i, d) in cfg.devices.iter().enumerate() {
+        let (Some(dev), Some(at)) = (d.device.scsi(), placement.at(i)) else { continue };
+        let what = format!("{} at {at}", d.device.spec().name);
         match dev.kind() {
             ScsiKind::Daynaport => {}
             ScsiKind::Cdrom => {
@@ -205,9 +204,9 @@ mod tests {
         let cfg = MachineConfig::try_load(d.join("absent.toml").to_str().unwrap()).unwrap();
         let wanted = problems(&cfg);
         // (Both are there if the test is run beside such files.)
-        assert!(wanted.iter().all(|p| p.starts_with("scsi.1 scsi1.raw") || p.starts_with("scsi.4 cdrom4.iso")), "{wanted:?}");
+        assert!(wanted.iter().all(|p| p.starts_with("hdd at hpc3/c0/t1 scsi1.raw") || p.starts_with("cdrom at hpc3/c0/t4 cdrom4.iso")), "{wanted:?}");
         let mut cfg = cfg;
-        cfg.scsi.clear();
+        cfg.devices.clear();
         assert!(problems(&cfg).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -235,17 +234,17 @@ mod tests {
         cfg.machine.cpu = Some("r4400".into());
         cfg.banks = banks_from4([128, 0, 0, 0]);
         cfg.prom = d.join("no-prom").to_string_lossy().into_owned();
-        cfg.scsi.clear();
-        cfg.scsi.insert(1, toml::from_str(&format!("path = {:?}", d.join("no-disk").to_str().unwrap())).unwrap());
-        cfg.scsi.insert(2, toml::from_str("path = \"\"").unwrap());
+        cfg.devices.clear();
+        cfg.set_disk(1, toml::from_str(&format!("path = {:?}", d.join("no-disk").to_str().unwrap())).unwrap());
+        cfg.set_disk(2, toml::from_str("path = \"\"").unwrap());
         cfg.serial_log = Some(d.join("nowhere").join("log").to_string_lossy().into_owned());
         cfg.monitor_port = Some(8880);
         let all = problems(&cfg).join("\n");
         for want in [
             "SGI Octane (IP30) takes [machine] cpu = ",
             "prom ",
-            "scsi.1 ",
-            "scsi.2: a disk needs a path",
+            "hdd at xio15/pci0/0/t1 ",
+            "hdd at xio15/pci0/0/t2: a disk needs a path",
             "serial_log ",
             "directory ",
             "monitor_port and serial_port_a both use port 8880",
@@ -260,7 +259,7 @@ mod tests {
     #[test]
     fn the_board_ports_join_the_clash_check() {
         let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
+        cfg.devices.clear();
         cfg.machine.profile = MachineProfile::FuelIp34;
         cfg.fuel.l1_port = Some(8880);
         assert!(problems(&cfg).iter().any(|p| p == "machine.l1_port and serial_port_a both use port 8880"), "{:?}", problems(&cfg));
@@ -284,7 +283,7 @@ mod tests {
     #[test]
     fn a_named_prom_must_exist() {
         let mut cfg = MachineConfig::default();
-        cfg.scsi.clear();
+        cfg.devices.clear();
         cfg.prom = "no-such-prom.bin".into();
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")), "{:?}", problems(&cfg));
         assert_eq!(report("indy.toml", &cfg), 1);
@@ -329,9 +328,9 @@ mod tests {
         cfg.banks = banks_from4([128, 0, 0, 0]);
         cfg.prom = d.join("absent-prom").to_string_lossy().into_owned();
         assert!(problems(&cfg).iter().any(|p| p.starts_with("prom ")), "{:?}", problems(&cfg));
-        cfg.scsi.clear();
-        cfg.scsi.insert(1, toml::from_str(&format!("scratch = true\npath = {:?}", d.join("scratch.img").to_str().unwrap())).unwrap());
-        cfg.scsi.insert(4, toml::from_str("cdrom = true").unwrap());
+        cfg.devices.clear();
+        cfg.set_disk(1, toml::from_str(&format!("scratch = true\npath = {:?}", d.join("scratch.img").to_str().unwrap())).unwrap());
+        cfg.set_disk(4, toml::from_str("cdrom = true").unwrap());
         cfg.prom = file(&d, "prom");
         assert_eq!(problems(&cfg), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&d);

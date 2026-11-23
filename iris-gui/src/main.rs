@@ -912,7 +912,7 @@ impl App {
 
     /// Detach the given SCSI IDs from the live config and (optionally) try Start again.
     fn detach_and_start(&mut self, ids: &[u8]) {
-        for id in ids { self.cfg.scsi.remove(id); }
+        for &id in ids { self.cfg.remove_disk(id); }
         self.mark_dirty();
         self.start_emulator();
     }
@@ -961,8 +961,8 @@ impl App {
             return Vec::new();
         }
         let mut out = Vec::new();
-        if self.cfg.machine.profile.is_ip35_bricks() { return out; }
-        for (&id, dev) in &self.cfg.scsi {
+        for (id, i) in self.cfg.disks() {
+            let dev = self.cfg.devices[i].device.scsi().expect("listed by disks");
             // CD-ROM CHDs are read-only (no diff); scratch disks live in the
             // writable container. Only writable HDD CHDs ever get folded.
             if dev.scratch || dev.is_cdrom() { continue; }
@@ -999,7 +999,8 @@ impl App {
         // Snapshot disks that currently have an overlay on disk (cloned so we
         // don't hold a `cfg` borrow while sending worker commands below).
         let mut entries: Vec<(u8, String, bool)> = Vec::new(); // (id, base, is_chd)
-        for (&id, dev) in &self.cfg.scsi {
+        for (id, i) in self.cfg.disks() {
+            let dev = self.cfg.devices[i].device.scsi().expect("listed by disks");
             if dev.is_cdrom() || dev.scratch || dev.path.trim().is_empty() {
                 continue;
             }
@@ -1026,7 +1027,7 @@ impl App {
         }
         for (id, base, is_chd) in entries {
             let name = std::path::Path::new(&base).file_name().and_then(|n| n.to_str()).unwrap_or(&base);
-            let label = crate::extra_ui::scsi_name(&self.cfg, id);
+            let label = crate::extra_ui::scsi_name(id);
             ui.label(RichText::new(t!("menu-cow-disk", id = &label, name = name)).weak());
             if ui.button(t!("menu-cow-commit"))
                 .tip(t!("menu-cow-commit-tip"))
@@ -3031,7 +3032,7 @@ impl App {
         let Some(job) = &self.cow_discard_confirm else { return };
         let name = std::path::Path::new(&job.base).file_name().and_then(|n| n.to_str()).unwrap_or(&job.base).to_string();
         let (id, base, chd) = (job.id, job.base.clone(), job.chd);
-        let label = crate::extra_ui::scsi_name(&self.cfg, id);
+        let label = crate::extra_ui::scsi_name(id);
         let mut decision: Option<bool> = None; // Some(true) = discard, Some(false) = cancel
         egui::Window::new(t!("modal-discard-title"))
             .collapsible(false)
@@ -3288,12 +3289,10 @@ impl eframe::App for App {
             if self.emu.is_running() {
                 // The first CD-ROM drive on controller 0: a disc loads by
                 // that controller's SCSI id.
-                let cdrom = (1u8..=15)
-                    .filter_map(|id| crate::extra_ui::scsi_key(&self.cfg, 0, id).map(|k| (id, k)))
-                    .find(|(_, k)| self.cfg.scsi[k].is_cdrom());
+                let cdrom = (1u8..=15).find(|&id| self.cfg.disk(id).is_some_and(|d| d.is_cdrom()));
 
-                if let Some((id, key)) = cdrom {
-                    let cur = self.cfg.scsi.get(&key).map(|d| d.path.clone()).unwrap_or_default();
+                if let Some(id) = cdrom {
+                    let cur = self.cfg.disk(id).map(|d| d.path.clone()).unwrap_or_default();
                     if let Some(path) = scsi_menu::pick_iso(&t!("main-load-disc-title"), &cur) {
                         self.emu.send(Cmd::LoadDisc { id, path, remount: true });
                     }
@@ -3435,7 +3434,7 @@ impl eframe::App for App {
         self.create_disk.show(ctx);
         if let Some(result) = self.create_disk.take_result() {
             let path_str = result.path.to_string_lossy().into_owned();
-            self.cfg.scsi.insert(result.scsi_id, iris::config::ScsiDeviceConfig {
+            self.cfg.set_disk(result.scsi_id, iris::config::ScsiDeviceConfig {
                 path: path_str.clone(), ..Default::default()
             });
             self.mark_dirty();
@@ -3955,7 +3954,7 @@ mod machine_storage_integration {
         let mut prefs = GuiSettings::load_in(root.clone(), launch_dir());
         let mut cfg = MachineConfig::default();
         cfg.banks = iris::config::banks_from4([8, 8, 0, 0]);
-        cfg.scsi.clear();
+        cfg.devices.clear();
         cfg.headless = true;
         cfg.monitor_port = Some(0);
         cfg.serial_port_a = Some(0);
