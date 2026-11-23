@@ -98,6 +98,17 @@ const MAP_SIZE: u32 = 0x10_0000;
 /// GIO ID: product 0x10, 32-bit ID, revision 1, GIO64, no ROM, manufacturer 1.
 pub const GIO_ID: u32 = 0x0005_0190;
 
+/// An 8- or 16-bit read of a 32-bit register returns the part of the word at
+/// that address, high byte first (big-endian).
+fn read_subword(word: u32, off: u32, bits: u32) -> u64 {
+    if bits >= 32 {
+        return word as u64;
+    }
+    let n = bits / 8;
+    let at = (off & 3) & !(n - 1);
+    (word >> (8 * (4 - at - n))) as u64 & ((1 << bits) - 1)
+}
+
 const HQ_FIFO_DEPTH: usize = 65536;
 /// Deep enough for most of a frame's texture loads (Quake 3 on High IMPACT
 /// moves ~13 MB a frame, 1.6 M entries), so the HQ finishes a DMA, and the
@@ -220,7 +231,7 @@ impl Front {
 
     fn read(&mut self, off: u32, bits: u32) -> u64 {
         match off {
-            0 => GIO_ID as u64,
+            0..=3 => read_subword(GIO_ID, off, bits),
             host::UCODE..=0x45FFF => self.hq.ucode[((off - host::UCODE) / 4) as usize] as u64,
             0x60000..=0x67FFF => {
                 let t = dcb::Txn::decode(off);
@@ -240,7 +251,7 @@ impl Front {
             host::GE_DIAG_READ => self.ge.out.pop().unwrap_or(0) as u64,
             host::GE_READBACK_HI => self.hq.ge_readback[0] as u64,
             host::GE_READBACK_LO => self.hq.ge_readback[1] as u64,
-            _ => self.hq.regs.get(off) as u64,
+            _ => read_subword(self.hq.regs.get(off & !3), off, bits),
         }
     }
 
