@@ -547,23 +547,33 @@ impl Default for SlotChanges {
 
 impl SlotChanges {
     fn note(&mut self, bytes: &[u8]) {
-        let mut changed = 0;
-        let mut n = 0;
-        for (i, w) in bytes.chunks_exact(4).take(64).enumerate() {
-            let w = u32::from_ne_bytes(w.try_into().expect("four bytes"));
-            if i >= self.last_len || self.last[i] != w {
-                changed += 1;
-                self.per_word[i] += 1;
-            }
-            self.last[i] = w;
-            n = i + 1;
+        // One pass building a mask of the words that changed (it
+        // vectorises), then the counters for those words only: this runs
+        // for every primitive.
+        let mut words = [0u32; 64];
+        let n = (bytes.len() / 4).min(64);
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *word = u32::from_ne_bytes(chunk.try_into().expect("four bytes"));
         }
+        let mut mask = 0u64;
+        for i in 0..64 {
+            mask |= u64::from(words[i] != self.last[i]) << i;
+        }
+        if self.last_len != n {
+            mask |= if n == 64 { !0 } else { (1u64 << n) - 1 };
+        }
+        mask &= if n == 64 { !0 } else { (1u64 << n) - 1 };
+        self.last = words;
         self.last_len = n;
         self.slots += 1;
-        if changed == 0 {
+        if mask == 0 {
             self.identical += 1;
         }
-        self.words += changed;
+        self.words += u64::from(mask.count_ones());
+        while mask != 0 {
+            self.per_word[mask.trailing_zeros() as usize] += 1;
+            mask &= mask - 1;
+        }
     }
 }
 
@@ -590,8 +600,10 @@ pub struct Batch<R: Pod, S: Pod> {
     pub flushes: u64,
     /// Primitives drawn so far.
     pub prims_total: u64,
-    /// How each slot differs from the one before it (`prim_with_slot`).
+    /// How each slot differs from the one before it (`prim_with_slot`),
+    /// counted only with `track_slot_changes`: it costs every primitive.
     pub slot_changes: SlotChanges,
+    pub track_slot_changes: bool,
     /// GPU times, with WGPU_BATCH_TIMING.
     pub timing: Option<Timing>,
     wait_stats: BatchWaitStats,
@@ -672,6 +684,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
             flushes: 0,
             prims_total: 0,
             slot_changes: SlotChanges::default(),
+            track_slot_changes: false,
             timing: if environment_timing { Timing::new(gpu) } else { None },
             wait_stats: BatchWaitStats::default(),
             #[cfg(test)]
@@ -881,7 +894,7 @@ impl<R: Pod, S: Pod> Batch<R, S> {
         record: impl FnOnce(u32) -> R,
     ) -> Result<Option<(u32, u32)>, Full> {
         let result = self.recording.prim_with_slot(slot, self.grid.tile_box(x0, y0, x1, y1), record);
-        if let Ok(Some(_)) = result {
+        if self.track_slot_changes && matches!(result, Ok(Some(_))) {
             self.slot_changes.note(bytemuck::bytes_of(&slot));
         }
         result

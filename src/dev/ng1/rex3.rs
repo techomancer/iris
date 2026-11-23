@@ -1420,6 +1420,10 @@ pub struct Rex3 {
     fatal_sender: Mutex<Option<std::sync::mpsc::Sender<crate::traits::MachineFatal>>>,
     #[cfg(feature = "wgpu")]
     resident_fatal_notified: AtomicBool,
+    /// Whether the resident raster has a fault: `ResidentRaster` keeps it,
+    /// and `resident_ready` reads it on every GO without the raster's lock.
+    #[cfg(feature = "wgpu")]
+    resident_faulted: Arc<AtomicBool>,
     #[cfg(feature = "wgpu")]
     resident_frame: frame::ResidentFrameControl,
     #[cfg(feature = "wgpu")]
@@ -1641,6 +1645,8 @@ impl Rex3 {
             #[cfg(feature = "wgpu")]
             resident_fatal_notified: AtomicBool::new(false),
             #[cfg(feature = "wgpu")]
+            resident_faulted: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "wgpu")]
             resident_frame: frame::ResidentFrameControl::default(),
             #[cfg(feature = "wgpu")]
             resident_display_mode: Mutex::new(None),
@@ -1843,8 +1849,9 @@ impl Rex3 {
             return Err("REX3 live resident scanout is not implemented".into());
         }
         self.processor_unparker.take();
-        *self.raster.get_mut() =
-            RasterMode::Resident(crate::dev::ng1::wgpu::resident::ResidentRaster::new(backend));
+        let mut raster = crate::dev::ng1::wgpu::resident::ResidentRaster::new(backend);
+        raster.share_fault_flag(Arc::clone(&self.resident_faulted));
+        *self.raster.get_mut() = RasterMode::Resident(raster);
         self.resident_frame.activate();
         Ok(())
     }
@@ -1894,7 +1901,9 @@ impl Rex3 {
             backend.enable_profiling()?;
         }
         self.processor_unparker.take();
-        *self.raster.get_mut() = RasterMode::Resident(ResidentRaster::new(backend));
+        let mut raster = ResidentRaster::new(backend);
+        raster.share_fault_flag(Arc::clone(&self.resident_faulted));
+        *self.raster.get_mut() = RasterMode::Resident(raster);
         self.resident_frame.activate();
         Ok(())
     }
@@ -1946,10 +1955,8 @@ impl Rex3 {
 
     #[cfg(feature = "wgpu")]
     fn resident_ready(&self) -> bool {
-        if let RasterMode::Resident(raster) = &*self.raster.lock() {
-            return raster.fault().is_none();
-        }
-        true
+        // Not the raster's lock: this runs on every GO.
+        !(self.resident_frame.is_active() && self.resident_faulted.load(Ordering::Acquire))
     }
 
     #[cfg(feature = "wgpu")]
@@ -3451,6 +3458,9 @@ impl Rex3 {
         let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
+        // Entries since the batch's age was last checked here.
+        #[cfg(feature = "wgpu")]
+        let mut since_age_check = 0u32;
         loop {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
@@ -3508,12 +3518,19 @@ impl Rex3 {
                     self.gfifo.flush_head();
                     break; 
                 } // GFIFO_EXIT
-                // Only a GO adds work to the batch, so only a GO can age it;
-                // reading the clock after every register write cost the
-                // processor thread a fifth of its time.
+                // The batch's age is checked as each GO starts
+                // (`ResidentGpu::enqueue_at`), when the GFIFO empties, before
+                // the thread parks, and every 256 entries here, so a stream
+                // of register writes without GOs cannot hold a batch back.
+                // Not after every GO: that cost a clock read and a raster
+                // lock each.
                 #[cfg(feature = "wgpu")]
-                if is_go {
-                    self.flush_resident_if_due();
+                {
+                    since_age_check += 1;
+                    if since_age_check >= 256 {
+                        since_age_check = 0;
+                        self.flush_resident_if_due();
+                    }
                 }
             } else {
                 if is_busy {

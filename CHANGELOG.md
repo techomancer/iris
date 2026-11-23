@@ -35,6 +35,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   display for a tenth of a second or more each (seconds in full-screen
   demos) with `raster = "wgpu"` on Indy and Indigo2. Drawing-heavy demos
   also wait far less for the board.
+- The GPU raster handles about half again as many primitives a second on
+  GL demos (Ideas in Motion, powerflip, solidview).
 - A resolution change with the wgpu renderer no longer stops the window
   presenting ("Failed to wait for GPU to come idle").
 
