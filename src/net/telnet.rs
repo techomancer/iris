@@ -220,6 +220,10 @@ impl<S: Read + Write> TelnetReader<S> {
     pub fn new_passive(inner: S) -> Self {
         Self { inner, filter: TelnetFilter::new_passive(), handshake: None }
     }
+
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
 }
 
 impl<S: Read + Write> Read for TelnetReader<S> {
