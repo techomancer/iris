@@ -54,7 +54,7 @@ pub fn set_emulator_profile(profile: MachineProfile) {
     EMULATOR_PROFILE.store(profile as u8, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn emulator_profile() -> Option<MachineProfile> {
+pub fn emulator_profile() -> Option<MachineProfile> {
     let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
     MachineProfile::EVERY.into_iter().find(|p| *p as u8 == raw)
 }
@@ -3106,8 +3106,7 @@ mod stop_order_tests {
         assert!(!overlap.load(SeqCst), "HPC3 was still running when the graphics stopped");
     }
 
-    /// A CD-ROM on the Indigo2's second controller is `[scsi.20]`; disc
-    /// changes must reach it by that key.
+    /// A CD-ROM on the Indigo2's second controller takes disc changes by its slot.
     #[test]
     fn second_controller_cdrom_takes_disc_changes() {
         use crate::config::{MachineProfile, ScsiDeviceConfig};
@@ -3122,11 +3121,12 @@ mod stop_order_tests {
             Box::new(Machine::new(cfg))
         });
         let changer = Workstation::disc_changer(&*machine).expect("a disc changer");
-        assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [20]);
+        let id = crate::topology::drive_id(MachineProfile::Indigo2Ip22, "hpc3/c1/t4").unwrap();
+        assert_eq!(changer.disc_status().iter().map(|d| d.0).collect::<Vec<_>>(), [id]);
         let iso = dir.join("a.iso");
         std::fs::write(&iso, vec![0u8; 2048]).unwrap();
         let path = iso.to_string_lossy().into_owned();
-        assert_eq!(changer.load_disc(20, path.clone()), Ok(path));
+        assert_eq!(changer.load_disc(id, path.clone()), Ok(path));
         assert!(changer.load_disc(4, "x.iso".into()).is_err(), "controller 0 has no id 4");
     }
 

@@ -353,10 +353,21 @@ fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
     }
 }
 
+/// The `id` arg as a drive: a slot such as `scsi1/t4`, or the older number.
+fn drive_arg(args: &Value) -> Result<usize, String> {
+    let spec = match args.get("id") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => return Err("missing 'id' arg".into()),
+    };
+    let profile = crate::machine::emulator_profile().ok_or("no machine")?;
+    crate::topology::drive_id(profile, &spec)
+}
+
 fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
-    let id = match args.get("id").and_then(|v| v.as_u64()) {
-        Some(n) => n as usize,
-        None => return Response::err("cdrom-eject: missing 'id' arg"),
+    let id = match drive_arg(args) {
+        Ok(id) => id,
+        Err(e) => return Response::err(format!("cdrom-eject: {e}")),
     };
     let result = server.with_machine_result(|m| {
         m.disc_changer().ok_or("no CD-ROM controller")?.eject_disc(id)
@@ -368,9 +379,9 @@ fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
 }
 
 fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
-    let id = match args.get("id").and_then(|v| v.as_u64()) {
-        Some(n) => n as usize,
-        None => return Response::err("cdrom-load: missing 'id' arg"),
+    let id = match drive_arg(args) {
+        Ok(id) => id,
+        Err(e) => return Response::err(format!("cdrom-load: {e}")),
     };
     let path = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),

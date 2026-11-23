@@ -898,9 +898,9 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     // the running machine (equivalent to Ctrl+F12). The core's
                     // count-driven queue decides whether this replaces the current
                     // disc or joins the changer cycle.
-                    if controller == 0 && dev.is_cdrom() && e.picked && !dev.path.is_empty() {
+                    if dev.is_cdrom() && e.picked && !dev.path.is_empty() {
                         action = ConfigAction::LoadDisc {
-                            id, path: dev.path.clone(), remount: true,
+                            id: key, path: dev.path.clone(), remount: true,
                         };
                     }
                     ui.end_row();

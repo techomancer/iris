@@ -71,7 +71,7 @@ with the corrections and shortcuts we found running it through iris.
     (`sgilabel` header, not ISO9660) installed from the booted system
     via `inst`, *after* the base 5.3 install reboots. List all four
     discs in the `[scsi.4]` changer so they can be cycled in with
-    `iris-ci cdrom-eject 4` — see the config and section 11 below.
+    `iris-ci cdrom-eject scsi0/t4` — see the config and section 11 below.
 
 ## Install config
 
@@ -137,7 +137,7 @@ proto = "tcp"; host_port = 2323; guest_port = 23; bind = "localhost"
 
 **5.3:** the base install only needs the single 5.3 CD, but list the
 three Developer's Toolbox 6.0 discs in the `[scsi.4]` changer too (if
-you have them) so they can be cycled in with `iris-ci cdrom-eject 4`
+you have them) so they can be cycled in with `iris-ci cdrom-eject scsi0/t4`
 for the section 11 add-on install. The 5.3 CD stays first/active, so
 the base install (sections 3-7) is unaffected by the extra discs. The
 [scsi.2] scratch volume gives the host an out-of-band channel for
@@ -932,7 +932,7 @@ loses these optionals:
 - **fx defaults** are correct on iris; `label/create/all` writes a
   standard SGI volume header with a root partition that mkfs will
   later format as XFS.
-- **`scsi eject 4`** vs `iris-ci cdrom-eject 4` are the same thing.
+- **`scsi eject 4`** vs `iris-ci cdrom-eject scsi0/t4` are the same thing.
   Use the iris-ci form so it's scriptable.
 
 ## Driving the installer reliably

@@ -322,7 +322,7 @@ debugging the wrapper itself.
 ./target/release/iris-ci diff base mutated   # per-device + chunk + cow-sector deltas
 ./target/release/iris-ci tree
 ./target/release/iris-ci script tests/scenario.iris   # batch-run a sequence of cmds
-./target/release/iris-ci cdrom-load 4 disc2.iso       # swap a CD at runtime
+./target/release/iris-ci cdrom-load scsi0/t4 disc2.iso # swap a CD at runtime
 ./target/release/iris-ci rtc-save                     # persist NVRAM
 ./target/release/iris-ci quit --sync-chd              # fold CHD diffs, then exit
 ```
