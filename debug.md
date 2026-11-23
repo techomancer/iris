@@ -557,6 +557,7 @@ to learn the cursor's hotspot exactly.
 | `screen info` | Size, hardware cursor, pointer position, whether the guest has enabled the mouse, buttons held |
 | `screen shot <file.png> [x y w h]` | The composed screen as PNG (no host status bar), optionally cropped |
 | `screen pix <x> <y>` | One pixel, `rrggbb` |
+| `screen hash` | blake3 of the composed screen on any machine with a display: its width and height as little-endian 32-bit numbers, then each pixel's red, green and blue bytes. Equal screens hash equal, so two runs can be compared without a PNG |
 | `screen wait [quiet_ms] [timeout_ms]` | Wait until the screen has not changed for `quiet_ms` (default 500, at most 10000 ms) |
 | `screen cursor` | The cursor glyph as text, with its hotspot |
 | `ptr pos` | Where the pointer is |
