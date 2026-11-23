@@ -533,6 +533,7 @@ The host-GPU raster path (`src/wgpu`, `src/dev/<board>/wgpu`): what the kernels 
 | [cpu-written-buffers-live-in-host-memory.md](wgpu/cpu-written-buffers-live-in-host-memory.md) | rule | No Queue::write_buffer; CPU-written GPU buffers are HostBuffers (Vulkan host memory, mapped once) in per-batch sets; one static upload ring; small memory blocks; nothing in the 256 MiB BAR window; run GPU tests with few threads |
 | [2d-fills-are-one-record-not-pixels.md](wgpu/2d-fills-are-one-record-not-pixels.md) | rule | X/PROM fills, id writes and pattern spans go through Board::fill_box: one constant-word blit record per buffer on the GPU unit, row spans on the CPU; the slot is cached; PROM power-on 4.2 s to 0.16 s drawing on the GPU unit |
 | [drop-the-surface-texture-before-configure.md](wgpu/drop-the-surface-texture-before-configure.md) | rule | Never `Surface::configure` while a `SurfaceTexture` is held: on Suboptimal drop it, configure, acquire again; the window stayed broken after a border drag otherwise (fixed 5b9c80b2) |
+| [configure-the-surface-with-submitters-held-out.md](wgpu/configure-the-surface-with-submitters-held-out.md) | rule | `Surface::configure` fails ("GPU to come idle") if another thread submits during its wait, and the uncaptured error poisoned `Gpu::check` for every board; use `Gpu::configure_surface` (uploads lock + error scope) |
 
 
 ## build/
