@@ -148,9 +148,8 @@ impl L1 {
             guest_tx: guest_tx.clone(),
             protocol_rx,
         });
-        let mut uart = Ns16550::new(UART_BAUDBASE);
+        let mut uart = Ns16550::new(UART_BAUDBASE, tm.clock().clone());
         uart.set_backend(protocol_backend);
-        uart.set_clock(tm.clock().clone());
 
         let shared = Arc::new_cyclic(|me| Shared {
             state,

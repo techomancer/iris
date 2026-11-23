@@ -115,8 +115,8 @@ impl<S: RingState + IrqLevel> RingThread<S> {
         (self.gen.load(Ordering::Acquire) == gen).then(store)
     }
 
-    pub fn now_ns(&self) -> i64 {
-        self.clock.now() as i64
+    pub fn now_ns(&self) -> u64 {
+        self.clock.now()
     }
 
     /// Start the ring thread (idempotent), running `run` on `core`, and let

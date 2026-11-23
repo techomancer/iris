@@ -15,15 +15,15 @@ use crate::traits::{Device, Saveable};
 use std::sync::Mutex;
 
 /// Put the ring's clock at `ns`, stopped so that it moves only here.
-pub(crate) fn step_ring_to<S: RingState + IrqLevel>(ring: &RingThread<S>, ns: i64) {
+pub(crate) fn step_ring_to<S: RingState + IrqLevel>(ring: &RingThread<S>, ns: u64) {
     let clock = ring.clock();
     clock.stop();
-    clock.restore(ns as u64);
+    clock.restore(ns);
 }
 
 /// Set the clock to `ns`. Made with `st` held, as the ring thread reads the clock
 /// under it and then waits with no timeout.
-pub(crate) fn set_test_clock<P: IspPart>(isp: &Isp<P>, ns: i64) {
+pub(crate) fn set_test_clock<P: IspPart>(isp: &Isp<P>, ns: u64) {
     let _st = isp.lock();
     step_ring_to(&isp.ring, ns);
     isp.wake.notify_all();
@@ -96,7 +96,7 @@ impl Rig {
 impl<P: IspPart> Rig<P> {
     /// Take the adapter's clock off the host's and set it to `ns`; the
     /// ring thread has seen the new time when this returns.
-    fn clock(&self, ns: i64) {
+    fn clock(&self, ns: u64) {
         set_test_clock(&self.isp, ns);
         self.isp.wait_idle();
     }
@@ -885,14 +885,14 @@ fn an_absent_target_is_incomplete_with_a_timeout() {
     r.clock(0);
     r.put_entry(0, &request(0x55, 3, &[0, 0, 0, 0, 0, 0], &[]));
     r.doorbell(1);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * 1_000_000);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * 1_000_000);
     let s = r.status(0);
     assert_eq!(g16(&s, 10), IOCB_INCOMPLETE);
     assert_eq!(g16(&s, 12), STATE_GOT_BUS);
     assert_eq!(g16(&s, 14), STATUS_FLAG_TIMEOUT);
 }
 
-const MS: i64 = 1_000_000;
+const MS: u64 = 1_000_000;
 
 /// Whether the response ring holds a completion for `handle` in slot 0.
 fn posted<P: IspPart>(r: &Rig<P>, handle: u32) -> bool {
@@ -906,10 +906,10 @@ fn an_absent_target_times_out_after_the_default_selection_timeout() {
     r.clock(0);
     r.put_entry(0, &request(0x55, 3, &[0, 0, 0, 0, 0, 0], &[]));
     r.doorbell(1);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert!(!posted(&r, 0x55), "not before the timeout");
     assert_eq!(r.r(reg::BUS_STATUS) & STATUS_RISC_INT_REQ, 0, "and no interrupt");
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(posted(&r, 0x55), "at the timeout");
 }
 
@@ -921,7 +921,7 @@ fn the_programmed_selection_timeout_sets_the_delay() {
     assert_eq!(r.cmd(&[mbox::SET_SELECTION_TIMEOUT, 1000]), mbox::COMPLETE);
     r.put_entry(0, &request(0x61, 3, &[0, 0, 0, 0, 0, 0], &[]));
     r.doorbell(1);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(!posted(&r, 0x61), "the default no longer applies");
     r.clock(999 * MS);
     assert!(!posted(&r, 0x61));
@@ -947,7 +947,7 @@ fn a_reset_takes_the_selection_timeout_back_to_the_default() {
     r.clock(0);
     r.put_entry(0, &request(0x63, 3, &[0, 0, 0, 0, 0, 0], &[]));
     r.doorbell(1);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(posted(&r, 0x63));
 }
 
@@ -959,7 +959,7 @@ fn a_reset_cancels_a_selection_in_progress() {
     r.put_entry(0, &request(0x64, 3, &[0, 0, 0, 0, 0, 0], &[]));
     r.doorbell(1);
     r.w(reg::BUS_CTRL, CTRL_SOFT_RESET);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(!posted(&r, 0x64), "no completion after the reset");
 }
 
@@ -981,7 +981,7 @@ fn every_move_of_the_test_clock_reaches_a_waiting_selection() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let r = hold_rig("clock-race");
-        let due = DEFAULT_SELECTION_TIMEOUT as i64 * MS;
+        let due = DEFAULT_SELECTION_TIMEOUT as u64 * MS;
         let mut t = 0;
         for i in 0..2000u32 {
             let slot = i % 8;
@@ -1043,7 +1043,7 @@ fn a_bus_reset_retires_a_waiting_selection_with_a_reset_completion() {
     let s = r.status(0);
     assert_eq!((g16(&s, 10), g16(&s, 12), g16(&s, 14)), (IOCB_RESET, 0, 0));
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     r.clock(10_000 * MS);
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1, "the timeout posts nothing more");
     assert_eq!(r.r(reg::REQUEST_QUEUE), 1, "and the entry was consumed once");
@@ -1059,16 +1059,16 @@ fn a_reset_leaves_no_late_completion_for_a_waiting_selection() {
     r.w(reg::BUS_CTRL, CTRL_SOFT_RESET);
     // The driver starts over on the same rings before the old wait was up.
     r.init_rings(4, 4);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     r.clock(10_000 * MS);
     assert!(!posted(&r, 0x68), "nothing for the cancelled command, then or later");
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 0);
     assert_eq!(r.r(reg::REQUEST_QUEUE), 0, "the new ring's consumer is untouched");
     // The next absent target waits its own full timeout from when it starts.
     queue_absent(&r, 0, 0x69);
-    r.clock(10_000 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(10_000 * MS + DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert!(!posted(&r, 0x69));
-    r.clock(10_000 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(10_000 * MS + DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(posted(&r, 0x69));
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1);
 }
@@ -1083,7 +1083,7 @@ fn a_response_queue_initialisation_does_not_cancel_a_waiting_selection() {
     queue_absent(&r, 0, 0x6a);
     r.clock(100 * MS);
     assert_eq!(r.init_queue(mbox::INIT_RSP_QUEUE, 4, RESP + 0x100), mbox::COMPLETE);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     let s: [u8; ENTRY_SIZE] = r.mem.get(RESP + 0x100, ENTRY_SIZE).try_into().unwrap();
     assert_eq!(g32(&s, 4), 0x6a, "posted into the ring in place when the wait ended");
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1);
@@ -1099,9 +1099,9 @@ fn a_request_queue_initialisation_does_not_cancel_a_waiting_selection() {
     queue_absent(&r, 0, 0x6b);
     r.clock(100 * MS);
     assert_eq!(r.init_queue(mbox::INIT_REQ_QUEUE, 4, RQST + 0x400), mbox::COMPLETE);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert!(!posted(&r, 0x6b), "not before its timeout");
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(posted(&r, 0x6b), "the command ran once; its completion is not lost");
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1);
     assert_eq!(r.r(reg::REQUEST_QUEUE), 0, "the new ring's consumer is untouched");
@@ -1117,7 +1117,7 @@ fn a_paused_adapter_posts_a_selection_that_ran_out_meanwhile_when_it_resumes() {
     queue_absent(&r, 0, 0x6c);
     r.clock(100 * MS);
     r.isp.pause();
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS + 50 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS + 50 * MS);
     assert!(!posted(&r, 0x6c), "a stopped machine posts nothing, however the clock reads");
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 0);
     assert_eq!(r.r(reg::REQUEST_QUEUE), 0, "the entry is still the adapter's to take");
@@ -1162,9 +1162,9 @@ fn a_snapshot_taken_during_a_selection_resumes_at_the_time_it_ends() {
     let saved = src.isp.save_state();
 
     // The source goes on as if nothing had happened.
-    src.clock(100 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    src.clock(100 * MS + DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert!(!posted(&src, 0x6e));
-    src.clock(100 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    src.clock(100 * MS + DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(posted(&src, 0x6e));
 
     // The machine puts the clock back to its saved reading, then loads.
@@ -2172,7 +2172,7 @@ fn a_missing_target_times_out_on_each_channel() {
         r.put_entry(slot as u32, &request(handle, target, &TUR, &[]));
         r.doorbell(slot as u16 + 1);
         assert_ne!(g32(&r.status(slot as u32), 4), handle, "nothing before the selection timeout");
-        now += DEFAULT_SELECTION_TIMEOUT as i64 * MS;
+        now += DEFAULT_SELECTION_TIMEOUT as u64 * MS;
         r.clock(now);
         let s = r.status(slot as u32);
         assert_eq!(g32(&s, 4), handle);
@@ -2315,7 +2315,7 @@ fn a_bus_reset_leaves_a_unit_attention_on_the_reset_channel_only() {
 // clamped, a second reset retires what the first parked, and request-out stays
 // at the oldest parked entry.
 
-const S: i64 = 1_000_000_000;
+const S: u64 = 1_000_000_000;
 
 /// A bus reset of `bus` with `secs` seconds of hold-off.
 fn bus_reset<P: IspPart>(r: &Rig<P>, secs: u16, bus: u16) {
@@ -2540,9 +2540,9 @@ fn an_absent_target_waits_out_the_hold_and_then_its_timeout() {
     queue_absent(&r, 0, 0x71);
     r.clock(S);
     assert!(!posted(&r, 0x71), "selection starts when the hold ends");
-    r.clock(S + DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(S + DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert!(!posted(&r, 0x71), "not at 1.25 s minus a nanosecond");
-    r.clock(S + DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(S + DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     let s = r.status(0);
     assert_eq!(g32(&s, 4), 0x71);
     assert_eq!((g16(&s, 10), g16(&s, 14)), (IOCB_INCOMPLETE, STATUS_FLAG_TIMEOUT));
@@ -2559,9 +2559,9 @@ fn parked_commands_start_oldest_first() {
     r.clock(S);
     assert_eq!(handles(&r, 1), [0x71]);
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1, "the absent target is selecting, the one behind it waits its turn");
-    r.clock(S + DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(S + DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1);
-    r.clock(S + DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(S + DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert_eq!(handles(&r, 3), [0x71, 0x72, 0x73]);
     assert_eq!(r.r(reg::REQUEST_QUEUE), 3);
 }
@@ -2672,9 +2672,9 @@ fn a_second_reset_retires_the_parked_commands_and_replaces_the_hold() {
     assert_eq!((handles(&r, 1), g16(&r.status(0), 10)), (vec![0x77], IOCB_RESET));
     assert_eq!(r.r(reg::REQUEST_QUEUE), 1);
     queue_absent(&r, 1, 0x78);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert_ne!(g32(&r.status(1), 4), 0x78);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert_eq!(g32(&r.status(1), 4), 0x78, "no hold left: the timeout alone");
 }
 
@@ -2688,7 +2688,7 @@ fn a_guest_reset_clears_the_hold_and_drops_the_parked_commands() {
     r.init_rings(8, 8);
     r.clock(0);
     queue_absent(&r, 0, 0x7a);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert_eq!(handles(&r, 1), [0x7a], "answered at 250 ms, not 5.25 s");
     r.clock(20 * S);
     assert_eq!(r.r(reg::RESPONSE_QUEUE), 1, "the old command never appears");
@@ -2764,7 +2764,7 @@ fn a_snapshot_taken_during_a_hold_resumes_at_the_time_it_ends() {
     // A second command joins the hold.
     dst.put_entry(1, &request(0x6f, 3, &[0, 0, 0, 0, 0, 0], &[]));
     dst.doorbell(2);
-    let ends = 2_000 * MS + DEFAULT_SELECTION_TIMEOUT as i64 * MS;
+    let ends = 2_000 * MS + DEFAULT_SELECTION_TIMEOUT as u64 * MS;
     dst.clock(ends - 1);
     assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0, "the hold ends at 2 s and the timeout follows");
     dst.clock(ends);
@@ -2785,15 +2785,15 @@ fn a_hold_that_ended_unfired_still_crosses_a_snapshot() {
     let hold = get_field(&saved, "bus_hold").expect("bus_hold");
     let toml::Value::Array(hold) = hold else { panic!("bus_hold is not an array") };
     assert_eq!(hold.len(), 1, "the ended hold is carried");
-    assert_eq!(get_field(&hold[0], "at_ns"), Some(&toml::Value::Integer(S)));
+    assert_eq!(get_field(&hold[0], "at_ns"), Some(&toml::Value::Integer(S as i64)));
 
     let dst = Rig::with_disk("hold-expired-dst", 1, 64);
     dst.put_entry(0, &request(0x6c, 3, &[0, 0, 0, 0, 0, 0], &[]));
     dst.clock(9 * S);
     dst.isp.load_state(&saved).expect("load_state");
-    dst.clock(9 * S + DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    dst.clock(9 * S + DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert_eq!(dst.r(reg::RESPONSE_QUEUE), 0);
-    dst.clock(9 * S + DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    dst.clock(9 * S + DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert_eq!(handles(&dst, 1), [0x6c], "it starts at the load");
 }
 
@@ -2932,9 +2932,9 @@ fn a_reset_naming_a_missing_bus_leaves_a_waiting_selection_and_is_noted() {
     queue_absent(&r, 0, 0x52);
     r.clock(100 * MS);
     bus_reset(&r, 0, 1);
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert!(!posted(&r, 0x52));
-    r.clock(DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert_eq!(g16(&r.status(0), 10), IOCB_INCOMPLETE);
     assert!(r.isp.notes().iter().any(|n| n.contains("does not have")), "noted: {:?}", r.isp.notes());
 }
@@ -2960,9 +2960,9 @@ fn a_late_thread_still_counts_the_timeout_from_the_hold_end() {
     bus_reset(&r, 1, 0);
     queue_absent(&r, 0, 0x54);
     r.clock(S + 100 * MS);
-    r.clock(S + DEFAULT_SELECTION_TIMEOUT as i64 * MS - 1);
+    r.clock(S + DEFAULT_SELECTION_TIMEOUT as u64 * MS - 1);
     assert!(!posted(&r, 0x54));
-    r.clock(S + DEFAULT_SELECTION_TIMEOUT as i64 * MS);
+    r.clock(S + DEFAULT_SELECTION_TIMEOUT as u64 * MS);
     assert!(posted(&r, 0x54));
 }
 

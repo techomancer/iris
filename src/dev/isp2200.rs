@@ -493,7 +493,7 @@ pub struct State {
     /// The running bring-up came from a LIP reset.
     bringup_lip_reset: bool,
     /// When the adapter's clock says the loop is up.
-    bringup_due: Option<i64>,
+    bringup_due: Option<u64>,
     ports: Ports,
     /// The command running on the loop; at most one, the ring is walked in
     /// order.
@@ -731,7 +731,7 @@ impl State {
     /// bring-up queued and has not posted, so the queue holds at most one
     /// bring-up's events and each bring-up posts a whole set. An event
     /// already posted stays until the host releases it.
-    fn bringup(&mut self, lip_reset: bool, due: i64) {
+    fn bringup(&mut self, lip_reset: bool, due: u64) {
         if !self.loop_active {
             return;
         }
@@ -1426,7 +1426,7 @@ impl Core {
     }
 
     fn start_bringup(&self, st: &mut State, lip_reset: bool) {
-        let due = self.now_ns() + BRINGUP.as_nanos() as i64;
+        let due = self.now_ns() + BRINGUP.as_nanos() as u64;
         st.bringup(lip_reset, due);
         self.arm(st);
         self.kick(st);
@@ -1589,13 +1589,13 @@ impl Core {
     // ---- the ring thread ---------------------------------------------
 
     /// How long until the loop is up, if it is coming up.
-    fn bringup_left(&self, st: &State) -> Option<i64> {
-        st.bringup_due.map(|due| due - self.now_ns())
+    fn bringup_left(&self, st: &State) -> Option<u64> {
+        st.bringup_due.map(|due| due.saturating_sub(self.now_ns()))
     }
 
     /// Time the loop's coming up, read under the state lock.
     fn arm(&self, st: &State) {
-        self.bringup.set_due(st.bringup_due.map(|d| d as u64));
+        self.bringup.set_due(st.bringup_due);
     }
 
     /// The loop's bring-up time has passed: wake the ring thread to post it.
@@ -1608,7 +1608,7 @@ impl Core {
     /// waiting for more.
     pub fn wait_idle(&self) {
         let mut st = self.lock();
-        while (st.ctl.hold == 0 && !st.ctl.paused && (st.ctl.work || self.bringup_left(&st).is_some_and(|left| left <= 0)))
+        while (st.ctl.hold == 0 && !st.ctl.paused && (st.ctl.work || self.bringup_left(&st) == Some(0)))
             || st.ctl.walking
         {
             st.wait(&self.wake);
@@ -1623,7 +1623,7 @@ impl Core {
                     return;
                 }
                 let runnable = st.ctl.hold == 0 && !st.ctl.paused;
-                if runnable && (st.ctl.work || self.bringup_left(&st).is_some_and(|left| left <= 0)) {
+                if runnable && (st.ctl.work || self.bringup_left(&st) == Some(0)) {
                     break;
                 }
                 st.wait(&self.wake);
@@ -1649,7 +1649,7 @@ impl Core {
                 st.unlocked(|| self.reset_devices(target));
                 continue;
             }
-            if self.bringup_left(&st).is_some_and(|left| left <= 0) {
+            if self.bringup_left(&st) == Some(0) {
                 st.bringup_done();
                 continue;
             }
@@ -2481,7 +2481,7 @@ impl Core {
         t.insert("held".into(), toml::Value::Array(st.held.iter().map(|entry| u8_slice_to_toml(entry)).collect()));
         // The machine clock is restored with the board: a machine time.
         if let Some(due) = st.bringup_due {
-            t.insert("bringup_at_ns".into(), toml::Value::Integer(due));
+            t.insert("bringup_at_ns".into(), toml::Value::Integer(due as i64));
         }
         toml::Value::Table(t)
     }
@@ -2583,7 +2583,7 @@ impl Core {
                 st.held.push_back(entry);
             }
         }
-        st.bringup_due = int("bringup_at_ns");
+        st.bringup_due = int("bringup_at_ns").map(|n| n.max(0) as u64);
         if st.loop_active && st.loop_state == FW_STATE_WAIT_AL_PA && st.bringup_due.is_none() {
             return Err("bring-up in progress: missing bringup_at_ns".into());
         }

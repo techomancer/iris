@@ -37,8 +37,7 @@ impl MaceUart {
     /// A UART answering monitor commands as `name`.
     pub fn named(name: &'static str, tm: &Arc<TimerManager>) -> Arc<Self> {
         Arc::new_cyclic(|me| {
-            let mut core = Ns16550::new(BAUDBASE);
-            core.set_clock(tm.clock().clone());
+            let core = Ns16550::new(BAUDBASE, tm.clock().clone());
             Self { core: Mutex::new(core), name, irq: OnceLock::new(), timer: Timer::new(tm, me, |u: &Self, _| u.pump()) }
         })
     }

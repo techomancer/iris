@@ -9,7 +9,7 @@ use crate::scsi::{ScsiResponse, ScsiTarget};
 use std::io;
 
 /// The model's loop bring-up time.
-pub(super) const BRINGUP_NS: i64 = BRINGUP.as_nanos() as i64;
+pub(super) const BRINGUP_NS: u64 = BRINGUP.as_nanos() as u64;
 
 const ICB_OPT_HARD: u16 = ICB_OPT_HARD_ADDR;
 const ICB_OPT_PORT_DB: u16 = ICB_OPT_PORT_DB_EVENTS;
@@ -18,7 +18,7 @@ const BRINGUP_EVENTS: [u16; 3] = [event::LIP_OCCURRED, event::LOOP_UP, event::PO
 
 impl Rig {
     /// Move the adapter's clock on and let the ring thread see it.
-    pub(super) fn step(&self, ns: i64) {
+    pub(super) fn step(&self, ns: u64) {
         self.now.set(self.now.get() + ns);
         super::set_test_clock(&self.isp, self.now.get());
         self.settle();

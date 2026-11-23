@@ -297,9 +297,7 @@ impl St {
             error_high: 0,
             ata_readback: 0,
             uart: std::array::from_fn(|_| {
-                let mut u = Ns16550::new(cfg.clock.hz() / 16);
-                u.set_clock(clock.clone());
-                u
+                Ns16550::new(cfg.clock.hz() / 16, clock.clone())
             }),
             sdma: SerialDma::new(PORTS, IOC4_SDMA_PARAMS),
             // Every IO9 brings the keyboard and mouse out.
