@@ -9,10 +9,9 @@ use crate::dev::w1::sgi::{board_record_part, BoardRecord};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-fn md(signals: SlotSignals) -> (Md, Arc<AtomicU64>) {
-    let now = Arc::new(AtomicU64::new(0));
-    let clock = now.clone();
-    (Md::new(Arc::new(move || clock.load(Ordering::SeqCst)), signals, [64, 0, 0, 0]), now)
+fn md(signals: SlotSignals) -> (Md, crate::clock::Clock) {
+    let now = crate::clock::Clock::stepped();
+    (Md::new(now.clone(), signals, [64, 0, 0, 0]), now)
 }
 fn r(md: &Md, off: u64) -> u64 {
     md.read(off)
@@ -45,7 +44,7 @@ fn the_error_cluster_reads_zero_and_the_performance_counter_never_counts() {
     }
     assert_eq!(r(&md, reg::MD_PERF_CNT0::OFFSET), 0);
     md.write(reg::MD_PERF_CNT0::OFFSET, !0);
-    now.store(1_000_000, Ordering::SeqCst);
+    now.restore(1_000_000);
     assert_eq!(r(&md, reg::MD_PERF_CNT0::OFFSET), 0xf_ffff);
     md.power_on();
     assert_eq!(r(&md, reg::MD_PERF_CNT0::OFFSET), 0);
@@ -85,17 +84,17 @@ fn the_one_wire_master_keeps_its_wide_field_and_resets_to_its_timing() {
     md.write(reg::MD_MLAN_CTL::OFFSET, (0x66 << 27) | (60 << 10) | (0x41 << 2) | 3);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET), (0x66 << 27) | (60 << 10) | (0x41 << 2));
     // Done and the sampled level arrive a microsecond later.
-    now.store(999, Ordering::SeqCst);
+    now.restore(999);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET) & 3, 0);
-    now.store(1000, Ordering::SeqCst);
+    now.restore(1000);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET) & 3, 2);
     md.write(reg::MD_MLAN_CTL::OFFSET, 8 << 10);
-    now.store(2000, Ordering::SeqCst);
+    now.restore(2000);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET) & 3, 3);
     // A reset cancels a slot in progress.
     md.write(reg::MD_MLAN_CTL::OFFSET, 8 << 10);
     md.power_on();
-    now.store(10_000, Ordering::SeqCst);
+    now.restore(10_000);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET), 0x1_8b10_0000);
 }
 
@@ -105,7 +104,7 @@ fn starting_a_slot_is_not_finishing_it() {
     let (md, now) = md(SlotSignals::default());
     md.write(reg::MD_MLAN_CTL::OFFSET, 8 << 10);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET) & 3, 0);
-    now.fetch_add(1000, Ordering::SeqCst);
+    now.step(1000);
     md.write(reg::MD_MLAN_CTL::OFFSET, 8 << 10);
     assert_eq!(r(&md, reg::MD_MLAN_CTL::OFFSET) & 3, 0, "the restart clears done");
 }
@@ -120,7 +119,7 @@ fn the_master_reads_the_nodes_board_record() {
     md.set_onewire(bus);
     let slot = |pulse: u64| {
         md.write(reg::MD_MLAN_CTL::OFFSET, pulse << 10);
-        now.fetch_add(MLAN_SLOT_NS, Ordering::SeqCst);
+        now.step(MLAN_SLOT_NS);
         r(&md, reg::MD_MLAN_CTL::OFFSET)
     };
     // The part answers the reset slot with a presence pulse: the wire reads low.

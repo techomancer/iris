@@ -18,7 +18,7 @@ use crate::cpu::parts;
 use crate::dev::bridge::{Bridge, PIN_WIRING};
 use crate::dev::elsc::{Elsc, ElscConfig, ModuleOutput};
 use crate::dev::elsc_nvram::ElscNvram;
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::hub::{Hub, HubConfig};
 use crate::dev::i2c::{BusBusy, I2cBus};
 use crate::dev::node_flash::{FlashValues, NodeFlash};

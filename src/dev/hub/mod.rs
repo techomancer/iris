@@ -225,7 +225,7 @@ impl Hub {
             let node = Node::new(weak.clone(), memory, runs, boot, false);
             let regs = Arc::new(Regs {
                 pi: Pi::new(tm, cfg.cpus, cfg.first_cpu),
-                md: Md::new(tm.clock().reader(), cfg.slot, cfg.banks_mb),
+                md: Md::new(tm.clock().clone(), cfg.slot, cfg.banks_mb),
                 io: Io::new(cfg.widget_revision, cfg.manufacturer),
                 ni: Arc::new(Ni::new(cfg.ni_revision)),
                 i2c: OnceLock::new(),

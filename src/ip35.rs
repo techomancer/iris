@@ -25,7 +25,7 @@
 #![warn(dead_code)]
 
 use crate::dev::bedrock::{Bedrock, RamExtent};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::ioc3::{ByteBus, Ioc3, Ioc3Board};
 use crate::dev::odyssey::Odyssey;
@@ -258,7 +258,7 @@ pub(crate) fn machine(
         .map_err(|e| format!("{name} {e}"))?
         .bytes;
     let timers = Arc::new(TimerManager::new());
-    let clock = timers.clock().reader();
+    let clock = timers.clock().clone();
     let specs = node_specs(cfg)?;
     assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");
     // Any node's reset or power request reaches the machine's main thread: a

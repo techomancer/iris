@@ -17,7 +17,7 @@ use crate::config::{GraphicsBoard, MachineConfig};
 use crate::cpu::parts::{self, Part};
 use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::ioc3::{IP34, IP34_NO_PS2};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1Config, L1};

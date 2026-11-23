@@ -55,11 +55,6 @@ impl Clock {
         self.source().wrapping_sub(self.0.shift.load(Relaxed))
     }
 
-    pub fn reader(&self) -> Arc<dyn Fn() -> u64 + Send + Sync> {
-        let c = self.clone();
-        Arc::new(move || c.now())
-    }
-
     /// `stop`, `start` and `restore` are called from one thread at a time. A reader racing one can
     /// see a spike or a small step back; machine stops are rare, so neither is guarded.
     pub fn stop(&self) {
@@ -122,6 +117,6 @@ mod tests {
         c.restore(40);
         c.start();
         c.step(2);
-        assert_eq!((c.reader())(), 42);
+        assert_eq!(c.now(), 42);
     }
 }

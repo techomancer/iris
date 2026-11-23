@@ -50,7 +50,7 @@ use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::parts::{self, Part};
 use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash, Header};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::ioc3::IO7;
 use crate::dev::isp2200::card::Card;
 use crate::dev::kona::{Kona, KonaConfig};

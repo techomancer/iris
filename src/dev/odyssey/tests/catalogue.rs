@@ -55,7 +55,7 @@ mod widget {
     const VECTOR: u32 = 18;
 
     fn board() -> (Arc<Heart>, Arc<Odyssey>) {
-        let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::clock::Clock::new().reader()));
+        let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), crate::clock::Clock::new()));
         let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
         let v = Odyssey::new(WIDGET, "v12", heart.clone(), ram.dma_view(), crate::status::MachineStatus::detached(), (2, 32), (crate::config::RasterUnit::Cpu, "auto")).expect("board");
         (heart, v)

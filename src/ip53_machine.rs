@@ -44,7 +44,7 @@ use crate::dev::bcm5701::{Bcm5701, Bcm5701Config};
 use crate::dev::bedrock::{Bedrock, Population, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::ds1744::{Ds1744, YearBase};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};

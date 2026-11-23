@@ -31,7 +31,7 @@ use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::CpuDevice;
 use crate::cpu::smp::{ParkSlot, HOLD_RENDEZVOUS};
 use crate::dev::bedrock::{Bedrock, Population};
-use crate::dev::heart::Clock;
+use crate::clock::Clock;
 use crate::devlog::LogModule;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -212,7 +212,7 @@ impl PresenceHold {
             }
             return;
         }
-        let now = (self.clock)();
+        let now = self.clock.now();
         let mut s = self.state.lock();
         for held in 0..s.held.len() {
             let Some(hold) = s.held[held] else { continue };
