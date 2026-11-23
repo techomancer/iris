@@ -648,7 +648,7 @@ const K_UART: usize = 3 * PORTS;
 const KINDS: usize = 4 * PORTS;
 type Deadlines = [Option<u64>; KINDS];
 
-/// Lock order: `gate`, then `line_order`, then `st`; `line` is a
+/// Lock order: `line_order`, then `st`; `line` is a
 /// leaf. A timer is set under `st`. The engines move their rings with `st` held:
 /// the DMA goes down through the bridge, which never calls back into the chip.
 struct Shared {
@@ -666,8 +666,6 @@ struct Shared {
     kbc_dirty: AtomicBool,
     /// Between `start` and `stop`.
     running: AtomicBool,
-    /// Held by a timer callback while it runs, so `stop` can wait one out.
-    gate: Mutex<()>,
 }
 
 impl KbcOwner for Shared {
@@ -738,7 +736,6 @@ impl Shared {
     /// A deadline passed with no guest access to notice it. Runs on the timer
     /// thread: short, no waiting beyond the chip's own locks.
     fn fire(&self) {
-        let _gate = self.gate.lock();
         self.with_st(|st| {
             st.sdma_catch_up();
             st.uart_timeouts();
@@ -815,7 +812,6 @@ impl Ioc4 {
                 me: weak.clone(),
                 timers: std::array::from_fn(|_| Timer::new(tm, weak, |sh: &Shared, _| sh.fire())),
                 running: AtomicBool::new(false),
-                gate: Mutex::new(()),
             }
         });
         Ioc4 { sh, clock: OnceLock::new(), threads: Mutex::new(Vec::new()) }
@@ -904,7 +900,6 @@ impl Device for Ioc4 {
             return;
         }
         self.sh.timers.iter().for_each(Timer::stop);
-        drop(self.sh.gate.lock());
         let mut threads = self.threads.lock();
         for t in threads.iter() {
             t.thread().unpark();

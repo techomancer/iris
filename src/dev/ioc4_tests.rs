@@ -1194,12 +1194,9 @@ fn a_uart_receive_timeout_comes_from_a_timer() {
     assert!(until(&|| due().is_some()), "the receive thread took the character");
     assert_eq!(due(), Some(r.c.sh.st.lock().uart[0].char_time().as_nanos() as u64 * 4));
     r.clock.step(due().unwrap() - 1);
-    {
-        let _idle = r.c.sh.gate.lock();
-        assert!(r.c.sh.timers[K_UART].is_armed() && !r.c.sh.st.lock().uart[0].irq());
-    }
+    assert!(r.c.sh.timers[K_UART].is_armed() && !r.c.sh.st.lock().uart[0].irq());
     r.clock.step(1);
-    assert!(until(&|| r.c.sh.st.lock().level & int::pass(0) != 0), "the timer raised the pass-through source");
+    assert!(r.c.sh.st.lock().level & int::pass(0) != 0, "the timer raised the pass-through source");
     r.c.stop();
 }
 
