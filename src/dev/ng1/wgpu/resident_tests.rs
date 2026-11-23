@@ -848,7 +848,7 @@ fn resident_gpu_failed_observation_is_counted_and_latched() {
         use crate::gfx_display::GfxDisplay;
         board.0.start();
         let mut display = ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::ReadbackCompatibility).unwrap();
-        display.suppress_screenshot_files();
+        board.0.head.set_screenshot_files(false);
         board.0.request_frame();
         board.0.request_screenshot();
         assert_eq!(
@@ -856,7 +856,6 @@ fn resident_gpu_failed_observation_is_counted_and_latched() {
             Err(failure.clone()),
         );
         assert!(board.0.frame_pending() && board.0.screenshot_pending());
-        assert!(!board.0.frame_available());
         {
             let screen = board.0.head.screen().lock();
             assert_eq!((screen.frame_seq, screen.rgba[0]), (7, 0xff12_3456));

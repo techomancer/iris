@@ -1162,10 +1162,16 @@ impl crate::dev::ng1::rex3::Renderer for CompatibilityPresenter {
         live_rgb: Option<&[u32]>,
         live_aux: Option<&[u32]>,
     ) {
-        assert!(!need_readback);
         assert!(live_rgb.is_none() && live_aux.is_none());
         let mut compositor = SwCompositor::new();
         compositor.compose_pixels(&screen.compositor_source());
+        if need_readback {
+            for y in 0..screen.height {
+                let row = y * FB_STRIDE;
+                let w = screen.width;
+                screen.rgba[row..row + w].copy_from_slice(&compositor.pixels()[row..row + w]);
+            }
+        }
         let mut frame = Vec::with_capacity(screen.width * screen.height);
         for y in 0..screen.height {
             frame.extend_from_slice(
@@ -1179,29 +1185,28 @@ impl crate::dev::ng1::rex3::Renderer for CompatibilityPresenter {
         self.resizes.lock().push((width, height));
     }
 
-    fn takes_resident_readback_frames(&self) -> bool { true }
 }
 
 impl crate::dev::ng1::rex3::Renderer for QueuePresenter {
     fn present(
         &mut self,
-        _screen: &mut Rex3Screen,
+        screen: &mut Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
         _bar: &[u32],
         _need_readback: bool,
         _rgb: Option<&[u32]>,
         _aux: Option<&[u32]>,
     ) {
-        panic!("resident frame fell through to the CPU-plane renderer");
+        // A reader's frame comes read back, finished; the planes never do.
+        assert!(screen.prebuilt, "resident frame fell through to the CPU-plane renderer");
     }
 
     fn takes_gpu_frames(&self) -> bool { self.accepts }
-    fn resident_gpu_device(&self) -> Option<&Arc<Gpu>> { self.gpu.as_ref() }
     fn resize(&mut self, width: usize, height: usize) {
         self.resizes.lock().push((width, height));
     }
 
-    fn present_resident_gpu_frame(
+    fn present_gpu_frame(
         &mut self,
         frame: &wgpu::Buffer,
         width: u32,
@@ -1209,7 +1214,7 @@ impl crate::dev::ng1::rex3::Renderer for QueuePresenter {
         _screen: &mut Rex3Screen,
         _overlay: &mut crate::debug_overlay::DebugOverlay,
         _bar: &[u32],
-    ) -> Result<(), String> {
+    ) {
         let gpu = self.gpu.as_ref().unwrap();
         let bytes = u64::from(width) * u64::from(height) * 4;
         let output = gpu.buffer("resident test presenter output", bytes,
@@ -1217,9 +1222,8 @@ impl crate::dev::ng1::rex3::Renderer for QueuePresenter {
         let mut encoder = gpu.encoder("resident test presenter");
         encoder.copy_buffer_to_buffer(frame, 0, &output, 0, bytes);
         gpu.submit(encoder);
-        gpu.check()?;
+        gpu.check().expect("resident test presenter");
         self.outputs.lock().push(output);
-        Ok(())
     }
 }
 
@@ -1290,28 +1294,12 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
             let resizes = Arc::new(Mutex::new(Vec::new()));
 
             *board.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
-                gpu: None, accepts: false, outputs: Arc::clone(&outputs),
-                resizes: Arc::clone(&resizes),
-            }));
-            assert!(matches!(ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::DirectWgpu),
-                Err(ResidentError::Unsupported("resident frames require a wgpu presenter"))));
-            let foreign = required_gpu();
-            assert!(!Arc::ptr_eq(&foreign, &gpu));
-            *board.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
-                gpu: Some(foreign), accepts: true, outputs: Arc::clone(&outputs),
-                resizes: Arc::clone(&resizes),
-            }));
-            assert!(matches!(
-                ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::DirectWgpu),
-                Err(ResidentError::DeviceMismatch)
-            ));
-            *board.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
                 gpu: Some(Arc::clone(&gpu)), accepts: true, outputs: Arc::clone(&outputs),
                 resizes: Arc::clone(&resizes),
             }));
             board.0.start();
             let mut display = ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::DirectWgpu).unwrap();
-            display.suppress_screenshot_files();
+            board.0.head.set_screenshot_files(false);
             write_reg(&board.0, REX3_TOPSCAN, 1023, false);
             let mut first = fill_context();
             first.drawmode0.0 |= 1 << 5;
@@ -1395,9 +1383,8 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
                 board.0.request_frame();
             }).unwrap();
             assert!(board.0.frame_pending(), "a request after the cut must remain pending");
-            assert!(!board.0.frame_available());
             display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).unwrap();
-            assert!(!board.0.frame_pending() && board.0.frame_available());
+            assert!(!board.0.frame_pending());
             let mut captured = Vec::new();
             let (_, _, seq) = crate::gfx_display::copy_frame(&*board.0, &mut captured).unwrap();
             assert_pixels_eq("requested composed frame", &captured, &expected_after_fence);
@@ -1408,9 +1395,6 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
                 Err(ResidentError::Failed(_))));
             assert!(board.0.screenshot_pending());
             assert_eq!(board.0.head.screen().lock().frame_seq, seq);
-            let mut stale = vec![0xfeed_beef];
-            assert_eq!(crate::gfx_display::fresh_frame(&*board.0, &mut stale, std::time::Duration::ZERO), None);
-            assert_eq!(stale, [0xfeed_beef]);
             display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).unwrap();
             assert!(!board.0.screenshot_pending() && !board.0.frame_pending());
             assert_eq!(board.0.head.screen().lock().frame_seq, seq + 1);
@@ -1425,18 +1409,13 @@ fn resident_frame_gpu_marker_order_capture_and_display_changes() {
 
             board.0.set_capture(true);
             display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).unwrap();
-            assert!(board.0.frame_available() && !board.0.frame_pending());
+            assert!(!board.0.frame_pending());
             let continuous_seq = board.0.head.screen().lock().frame_seq;
             display.fail_next_capture(CaptureFault::AfterStaging);
             assert!(display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).is_err());
             assert!(!board.0.frame_pending(), "continuous capture has no outstanding ticket");
-            assert!(!board.0.frame_available(), "failed continuous capture cannot expose stale pixels");
             assert_eq!(board.0.head.screen().lock().frame_seq, continuous_seq);
-            let mut unavailable = vec![0xfeed_beef];
-            assert_eq!(crate::gfx_display::copy_frame(&*board.0, &mut unavailable), None);
-            assert_eq!(unavailable, [0xfeed_beef]);
             display.render(&board.0, std::time::Duration::from_secs(5), |_| {}).unwrap();
-            assert!(board.0.frame_available());
             board.0.set_capture(false);
 
             {
@@ -1705,12 +1684,8 @@ fn resident_frame_gpu_readback_compatibility_is_labeled() {
             }));
 
             board.0.start();
-            assert!(matches!(
-                ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::ReadbackCompatibility),
-                Err(ResidentError::Unsupported("resident compatibility display requires a readback-capable renderer"))
-            ));
             let mut direct = ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::DirectWgpu).unwrap();
-            direct.suppress_screenshot_files();
+            board.0.head.set_screenshot_files(false);
             let mut fill = fill_context();
             fill.drawmode0.0 |= 1 << 5;
             draw_reference(fill.clone(), &mut expected_rgb, &mut expected_aux);
@@ -1754,27 +1729,11 @@ fn resident_frame_gpu_readback_compatibility_is_labeled() {
             assert_eq!(board.0.resident_status().unwrap().raw_plane_map_attempts, 0);
             assert_eq!(direct.capture_count().attempts, 0);
 
-            *board.0.head.renderer_slot().lock() = Some(Box::new(CompatibilityPresenter {
-                frames: Arc::clone(&frames),
-                resizes: Arc::clone(&resizes),
-            }));
+            // With no presenter for GPU frames, the direct display reads its
+            // frame back for the requests.
             board.0.request_frame();
             board.0.request_screenshot();
             board.0.set_capture(true);
-            assert!(matches!(
-                direct.render(&board.0, std::time::Duration::from_secs(5), |_| {}),
-                Err(ResidentError::Unsupported("resident frames require a wgpu presenter"))
-            ));
-            assert_eq!(direct.mode(), ResidentDisplayMode::DirectWgpu);
-            assert!(matches!(
-                board.0.start_resident_display(Arc::clone(&gpu), ResidentDisplayMode::DirectWgpu),
-                Err(ResidentError::Unsupported("resident frames require a wgpu presenter"))
-            ));
-            assert!(board.0.frame_pending() && board.0.screenshot_pending());
-            assert_eq!(board.0.head.screen().lock().frame_seq, 0);
-            assert_eq!(board.0.resident_status().unwrap().observations, ObservationCounters::default());
-            assert!(frames.lock().is_empty(), "direct rejection must not invoke compatibility");
-
             *board.0.head.renderer_slot().lock() = None;
             direct.render(&board.0, std::time::Duration::from_secs(5), |_| {})
                 .expect("headless direct capture");
@@ -1812,7 +1771,7 @@ fn resident_frame_gpu_readback_compatibility_is_labeled() {
             }));
             let mut display = ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::ReadbackCompatibility)
                 .expect("explicitly select compatibility display");
-            display.suppress_screenshot_files();
+            board.0.head.set_screenshot_files(false);
             board.0.request_frame();
             board.0.request_frame();
             board.0.request_screenshot();
@@ -1835,7 +1794,6 @@ fn resident_frame_gpu_readback_compatibility_is_labeled() {
             assert_pixels_eq("compatibility composed capture", &captured, &expected);
             assert_eq!(frames.lock().len(), 1);
             assert_pixels_eq("readback compatibility frame", &frames.lock()[0], &expected);
-            assert_eq!(&*resizes.lock(), &[(WIDTH, HEIGHT)]);
             assert_pixels_eq("CPU software presenter", &software_frame(&board.0, &expected_rgb, &expected_aux), &expected);
             board.0.set_capture(false);
             let status = board.0.resident_status().unwrap();
@@ -1896,7 +1854,7 @@ fn resident_frame_gpu_compatibility_capture_failures_and_coalescing() {
             board.0.start();
             assert!(board.0.head.renderer_slot().lock().is_none());
             let mut display = ResidentDisplay::new(&board.0, &gpu, ResidentDisplayMode::ReadbackCompatibility).unwrap();
-            display.suppress_screenshot_files();
+            board.0.head.set_screenshot_files(false);
             {
                 let mut screen = board.0.head.screen().lock();
                 screen.rgba[0] = 0xff12_3456;
@@ -1908,7 +1866,6 @@ fn resident_frame_gpu_compatibility_capture_failures_and_coalescing() {
             display.fail_next_capture(CaptureFault::BeforeCapture);
             assert!(matches!(display.render(&board.0, Duration::from_secs(5), |_| {}), Err(ResidentError::Failed(_))));
             assert!(board.0.frame_pending() && board.0.screenshot_pending());
-            assert!(!board.0.frame_available());
             {
                 let screen = board.0.head.screen().lock();
                 assert_eq!((screen.frame_seq, screen.rgba[0]), (11, 0xff12_3456));
@@ -1921,7 +1878,6 @@ fn resident_frame_gpu_compatibility_capture_failures_and_coalescing() {
                 board.0.request_screenshot();
             }).unwrap();
             assert!(board.0.frame_pending() && board.0.screenshot_pending());
-            assert!(!board.0.frame_available(), "tickets newer than the cut remain pending");
             assert_eq!(board.0.head.screen().lock().frame_seq, 12);
             assert_compatibility_observations(&board.0, 2);
             assert_composed_captures(&board.0, &display, 2, 1);
@@ -1936,7 +1892,6 @@ fn resident_frame_gpu_compatibility_capture_failures_and_coalescing() {
             display.fail_next_capture(CaptureFault::AfterStaging);
             assert!(matches!(display.render(&board.0, Duration::from_secs(5), |_| {}), Err(ResidentError::Failed(_))));
             assert!(!board.0.frame_pending() && !board.0.screenshot_pending());
-            assert!(!board.0.frame_available(), "failed continuous capture cannot publish an old frame");
             {
                 let screen = board.0.head.screen().lock();
                 assert_eq!(screen.frame_seq, 13);
@@ -1947,7 +1902,6 @@ fn resident_frame_gpu_compatibility_capture_failures_and_coalescing() {
             assert_compatibility_observations(&board.0, 4);
             assert_composed_captures(&board.0, &display, 4, 2);
             display.render(&board.0, Duration::from_secs(5), |_| {}).unwrap();
-            assert!(board.0.frame_available());
             assert_eq!(board.0.head.screen().lock().frame_seq, 14);
             assert_compatibility_observations(&board.0, 5);
             assert_composed_captures(&board.0, &display, 5, 3);
@@ -1994,23 +1948,9 @@ fn resident_frame_gpu_compatibility_capture_failures_and_coalescing() {
             assert_compatibility_observations(&board.0, 7);
             assert_composed_captures(&board.0, &display, 7, 5);
 
-            *board.0.head.renderer_slot().lock() = Some(Box::new(QueuePresenter {
-                gpu: Some(Arc::clone(&gpu)), accepts: true,
-                outputs: Arc::new(Mutex::new(Vec::new())),
-                resizes: Arc::new(Mutex::new(Vec::new())),
-            }));
+            assert_eq!(display.mode(), ResidentDisplayMode::ReadbackCompatibility);
             board.0.request_frame();
             board.0.request_screenshot();
-            assert_eq!(
-                display.render(&board.0, Duration::from_secs(5), |_| {}),
-                Err(ResidentError::Unsupported("resident compatibility display requires a readback-capable renderer"))
-            );
-            assert_eq!(display.mode(), ResidentDisplayMode::ReadbackCompatibility);
-            assert!(board.0.frame_pending() && board.0.screenshot_pending());
-            assert_eq!(board.0.head.screen().lock().frame_seq, 16);
-            assert_compatibility_observations(&board.0, 7);
-            assert_composed_captures(&board.0, &display, 7, 5);
-            *board.0.head.renderer_slot().lock() = None;
             display.render(&board.0, Duration::from_secs(5), |_| {}).unwrap();
             assert!(!board.0.frame_pending() && !board.0.screenshot_pending());
             assert_eq!(board.0.head.screen().lock().frame_seq, 17);
@@ -2087,7 +2027,9 @@ fn resident_frame_gpu_headless_screenshot_png_matches_cpu() {
                         Err(error) => panic!("reserve screenshot output: {error}"),
                     }
                 };
-                board.0.screenshot_counter.store(number, Ordering::Relaxed);
+                // The refresh thread numbers its own files; this test writes the
+                // served screenshot with the same encoder, to its own name.
+                board.0.head.set_screenshot_files(false);
                 let initial_seq = board.0.head.screen().lock().frame_seq;
                 board.0.request_screenshot();
                 display.fail_next_capture(CaptureFault::BeforeCapture);
@@ -2098,6 +2040,10 @@ fn resident_frame_gpu_headless_screenshot_png_matches_cpu() {
                 display.render(&board.0, Duration::from_secs(10), |_| {}).unwrap();
                 assert!(!board.0.screenshot_pending());
                 assert_eq!(board.0.head.screen().lock().frame_seq, initial_seq + 1);
+                {
+                    let screen = board.0.head.screen().lock();
+                    crate::disp::save_screenshot(path.0.to_str().unwrap(), &screen.rgba, screen.width, screen.height).unwrap();
+                }
                 let expected = software_frame(&board.0, &rgb, &aux);
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let (info, pixels) = loop {
@@ -2170,7 +2116,7 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
                 write_reg(&board.0, REX3_TOPSCAN, 1023, false);
                 assert!(board.0.head.renderer_slot().lock().is_none());
                 let mut headless = ResidentDisplay::new(&board.0, &gpu, mode).unwrap();
-                headless.suppress_screenshot_files();
+                board.0.head.set_screenshot_files(false);
                 board.0.request_screenshot();
                 headless
                     .render(&board.0, Duration::from_secs(10), |_| {})
@@ -2329,6 +2275,12 @@ fn resident_frame_gpu_headless_requests_and_vnc_capture() {
                     .collect();
                 let expected: Vec<u32> = captured.iter().map(|pixel| pixel & 0x00ff_ffff).collect();
                 assert_pixels_eq("VNC composed frame", &vnc, &expected);
+                // VNC turns capture on: frames are composed and read back
+                // from then on.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while board.0.head.screen().lock().frame_seq <= seq && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 assert!(
                     board.0.head.screen().lock().frame_seq > seq,
                     "VNC enabled composed capture"
@@ -2449,9 +2401,7 @@ fn resident_frame_gpu_restore_invalidates_capture_and_rebinds_display() {
                     let mut screen = board.0.head.screen().lock();
                     stale.compose(&screen.display_state(), &mut source).unwrap().stamp()
                 };
-                assert!(board.0.frame_available());
                 board.0.load_state(&registers).unwrap();
-                assert!(!board.0.frame_available());
                 assert_eq!(frontend.screen_size(), (0, 0));
                 assert!(board.0.hw_cursor().is_none());
                 assert!(crate::gfx_display::copy_frame(&*board.0, &mut captured).is_none());

@@ -261,6 +261,34 @@ struct Phase {
     epoch_ns: u64,
 }
 
+/// Requests counted in, and how many a frame has served.
+#[derive(Default)]
+struct Tickets {
+    requested: AtomicU64,
+    served: AtomicU64,
+}
+
+impl Tickets {
+    fn request(&self) {
+        self.requested.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn pending(&self) -> bool {
+        self.requested.load(Ordering::Acquire) != self.served.load(Ordering::Acquire)
+    }
+
+    /// The requests a frame beginning now serves.
+    fn taken(&self) -> u64 {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    /// A frame served the requests up to `ticket`; returns whether it
+    /// served any.
+    fn serve(&self, ticket: u64) -> bool {
+        self.served.swap(ticket, Ordering::AcqRel) != ticket
+    }
+}
+
 /// What the rest of the emulator holds of a head: the screen, the renderer
 /// slot, and the requests. The refresh thread serves all of them.
 pub struct HeadHandle {
@@ -285,8 +313,13 @@ pub struct HeadHandle {
     stopping: Mutex<bool>,
     stopped: Condvar,
     damage: AtomicBool,
-    screenshot: AtomicBool,
-    frame_request: AtomicBool,
+    /// Screenshot and frame requests, as tickets: a frame serves the ones
+    /// made before it began, so a request that comes while a frame is being
+    /// composed waits for the next.
+    screenshot: Tickets,
+    /// Whether a screenshot is also saved as a PNG file (tests turn it off).
+    screenshot_files: AtomicBool,
+    frame_request: Tickets,
     capture: AtomicU32,
     /// Retraces delivered, for tests and the monitor.
     retraces: AtomicU64,
@@ -432,22 +465,50 @@ impl HeadHandle {
 
     /// Ask for the next frame in `screen().rgba` and a PNG of it.
     pub fn request_screenshot(&self) {
-        self.screenshot.store(true, Ordering::Release);
+        self.screenshot.request();
         self.kick();
     }
 
     pub fn screenshot_pending(&self) -> bool {
-        self.screenshot.load(Ordering::Acquire)
+        self.screenshot.pending()
+    }
+
+    /// Whether a screenshot is also saved as `screenshot_NNNN.png`.
+    pub(crate) fn set_screenshot_files(&self, on: bool) {
+        self.screenshot_files.store(on, Ordering::Relaxed);
+    }
+
+    /// Run one frame of this head now, on the calling thread, as the refresh
+    /// thread does at a retrace: capture, compose, present, and serve the
+    /// frame and screenshot requests. For tests of a head that is not
+    /// started.
+    #[cfg(test)]
+    pub(crate) fn frame_now(&self) {
+        if let Some(head) = self.board() {
+            self.frame_now_as(&*head);
+        }
+    }
+
+    /// As [`frame_now`](Self::frame_now), with `head` standing in for the
+    /// board (a test that composes with its own display object).
+    #[cfg(test)]
+    pub(crate) fn frame_now_as(&self, head: &dyn Head) {
+        let Some(shared) = self.refresh.upgrade() else { return };
+        let mut slots = shared.slots.lock();
+        slots.append(&mut shared.incoming.lock());
+        if let Some(slot) = slots.iter_mut().find(|s| std::ptr::eq(s.handle.as_ptr(), self)) {
+            slot.frame(&shared, self, head);
+        }
     }
 
     /// Ask for the next frame in `screen().rgba`.
     pub fn request_frame(&self) {
-        self.frame_request.store(true, Ordering::Release);
+        self.frame_request.request();
         self.kick();
     }
 
     pub fn frame_pending(&self) -> bool {
-        self.frame_request.load(Ordering::Acquire)
+        self.frame_request.pending()
     }
 
     /// Keep `screen().rgba` current with every frame while a consumer has
@@ -598,8 +659,9 @@ impl Refresh {
             stopping: Mutex::new(false),
             stopped: Condvar::new(),
             damage: AtomicBool::new(true),
-            screenshot: AtomicBool::new(false),
-            frame_request: AtomicBool::new(false),
+            screenshot: Tickets::default(),
+            screenshot_files: AtomicBool::new(true),
+            frame_request: Tickets::default(),
             capture: AtomicU32::new(0),
             retraces: AtomicU64::new(0),
         });
@@ -913,12 +975,13 @@ impl Slot {
     }
 
     fn readback_wanted(h: &HeadHandle) -> bool {
-        h.screenshot.load(Ordering::Acquire) || h.frame_request.load(Ordering::Acquire) || h.capture.load(Ordering::Acquire) > 0
+        h.screenshot.pending() || h.frame_request.pending() || h.capture.load(Ordering::Acquire) > 0
     }
 
     fn frame(&mut self, shared: &Shared, h: &HeadHandle, head: &dyn Head) {
         let now = (shared.clock)();
-        let shot = h.screenshot.load(Ordering::Acquire);
+        // The requests this frame serves: those made before it began.
+        let (shot, frame_ticket) = (h.screenshot.taken(), h.frame_request.taken());
         let readback = Self::readback_wanted(h);
         let said = h.damage.swap(false, Ordering::AcqRel) | head.changed();
         // Checking the verdicts: compose a frame the board would leave.
@@ -990,7 +1053,7 @@ impl Slot {
         let size = (screen.width, screen.height);
         if size.0 == 0 || size.1 == 0 {
             // No video mode: nothing to show, and nothing for a reader.
-            h.frame_request.store(false, Ordering::Release);
+            h.frame_request.serve(frame_ticket);
             return;
         }
         if size != self.size {
@@ -1066,7 +1129,7 @@ impl Slot {
         self.last_present_ns = now;
 
         if self.rgba_current && !waiting {
-            if shot && h.screenshot.swap(false, Ordering::AcqRel) {
+            if h.screenshot.serve(shot) && h.screenshot_files.load(Ordering::Relaxed) {
                 let pixels = screen.rgba.clone();
                 let (w, hgt) = size;
                 let n = shared.screenshots.fetch_add(1, Ordering::Relaxed);
@@ -1076,7 +1139,7 @@ impl Slot {
                     Err(e) => println!("iris: screenshot failed: {}", e),
                 });
             }
-            h.frame_request.store(false, Ordering::Release);
+            h.frame_request.serve(frame_ticket);
         }
     }
 }

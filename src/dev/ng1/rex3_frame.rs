@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
-use super::{RasterMode, Rex3, Renderer, GFIFO_RESIDENT_FRAME, STATUS_VRINT};
-use crate::compositor::SwCompositor;
+use super::{RasterMode, Rex3, GFIFO_RESIDENT_FRAME};
+use crate::display::{Composed, Want};
 use crate::dev::ng1::wgpu::direct::{
     CaptureCount, Ng1ResidentScanout, ResidentFrameStamp, ResidentScanoutTraffic,
 };
@@ -23,6 +23,10 @@ use crate::debug_overlay::DebugOverlay;
 use crate::wgpu::Gpu;
 
 const FRAME_WAIT: Duration = Duration::from_millis(50);
+
+/// How long the refresh thread waits for the GFIFO to reach a frame cut
+/// before it shows the last frame again and tries at the next retrace.
+const CUT_WAIT: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResidentDisplayMode {
@@ -65,84 +69,28 @@ impl CaptureTotals {
 
 /// One marker at a time. The processor acknowledges the marker and then
 /// waits without holding the raster lock until the display releases it.
+///
+/// Frame and screenshot requests are the display head's own (`HeadHandle`):
+/// the refresh thread asks for a readback frame through [`Want`].
 #[derive(Default)]
 pub(super) struct ResidentFrameControl {
     active: AtomicBool,
     serial: Mutex<()>,
     marker: Mutex<MarkerState>,
     changed: Condvar,
-    requested: AtomicU64,
-    completed: AtomicU64,
-    screenshots: AtomicU64,
-    screenshots_completed: AtomicU64,
-    captured: AtomicBool,
     // Like raw observations, composed-capture totals survive resident resets.
     captures: Mutex<CaptureTotals>,
     error: Mutex<Option<ResidentError>>,
 }
 
-#[derive(Clone, Copy)]
-struct Requests {
-    frame: u64,
-    screenshot: u64,
-    needs_frame: bool,
-    needs_screenshot: bool,
-}
-
 impl ResidentFrameControl {
     pub(super) fn activate(&self) {
-        self.requested.store(0, Ordering::Relaxed);
-        self.completed.store(0, Ordering::Relaxed);
-        self.screenshots.store(0, Ordering::Relaxed);
-        self.screenshots_completed.store(0, Ordering::Relaxed);
-        self.captured.store(false, Ordering::Relaxed);
         *self.error.lock() = None;
         self.active.store(true, Ordering::Release);
     }
 
     pub(super) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
-    }
-
-    pub(super) fn request_frame(&self) {
-        self.requested.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(super) fn request_screenshot(&self) {
-        self.screenshots.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(super) fn frame_pending(&self) -> bool {
-        self.requested.load(Ordering::Acquire) != self.completed.load(Ordering::Acquire)
-    }
-
-    pub(super) fn screenshot_pending(&self) -> bool {
-        self.screenshots.load(Ordering::Acquire) != self.screenshots_completed.load(Ordering::Acquire)
-    }
-
-    pub(super) fn frame_available(&self) -> bool {
-        self.captured.load(Ordering::Acquire) && !self.frame_pending() && !self.screenshot_pending()
-    }
-
-    fn requests(&self) -> Requests {
-        let frame = self.requested.load(Ordering::Acquire);
-        let screenshot = self.screenshots.load(Ordering::Acquire);
-        Requests {
-            frame,
-            screenshot,
-            needs_frame: frame != self.completed.load(Ordering::Acquire),
-            needs_screenshot: screenshot != self.screenshots_completed.load(Ordering::Acquire),
-        }
-    }
-
-    fn complete(&self, requests: Requests) {
-        self.completed.store(requests.frame, Ordering::Release);
-        self.screenshots_completed.store(requests.screenshot, Ordering::Release);
-        self.captured.store(true, Ordering::Release);
-    }
-
-    pub(super) fn invalidate(&self) {
-        self.captured.store(false, Ordering::Release);
     }
 
     pub(super) fn quiescent(&self) -> bool {
@@ -192,7 +140,6 @@ struct FrameCut<'a> {
     id: u64,
     position: Position,
     topscan: usize,
-    requests: Requests,
     _serial: MutexGuard<'a, ()>,
 }
 
@@ -245,7 +192,6 @@ impl Rex3 {
         if !self.running.load(Ordering::Acquire) {
             return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
         }
-        let requests = control.requests();
         let id = {
             let mut state = control.marker.lock();
             state.next = state.next.checked_add(1)
@@ -278,7 +224,7 @@ impl Rex3 {
                 match result {
                     Ok((position, topscan)) => {
                         drop(state);
-                        let cut = FrameCut { control, id, position, topscan, requests, _serial: serial };
+                        let cut = FrameCut { control, id, position, topscan, _serial: serial };
                         let elapsed = duration_ns(started.elapsed()).map_err(ResidentError::InvalidState)?;
                         self.resident_telemetry.lock().cut(elapsed);
                         return Ok(cut);
@@ -331,7 +277,8 @@ impl Rex3 {
         }
     }
 
-    /// Start the fixed resident display mode after the GFIFO processor.
+    /// Install the fixed resident display mode, after the GFIFO processor:
+    /// the shared refresh thread composes it from now on (`Rex3Head`).
     pub(crate) fn start_resident_display(
         &self,
         gpu: Arc<Gpu>,
@@ -342,11 +289,11 @@ impl Rex3 {
             return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
         }
         self.check_resident_health(false)?;
-        let mut thread_slot = self.refresh_thread.lock();
-        if thread_slot.is_some() {
+        let mut slot = self.resident_display.lock();
+        if slot.is_some() {
             return Err(ResidentError::InvalidState("resident display already started"));
         }
-        let mut display = match ResidentDisplay::new(self, &gpu, mode) {
+        let display = match ResidentDisplay::new(self, &gpu, mode) {
             Ok(display) => display,
             Err(error) => {
                 if matches!(error, ResidentError::DeviceLost(_) | ResidentError::Failed(_)) {
@@ -355,78 +302,59 @@ impl Rex3 {
                 return Err(error);
             }
         };
-        if !self.running.load(Ordering::Acquire) {
-            return Err(ResidentError::InvalidState("resident GFIFO is stopped"));
-        }
-        let rex = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
-        let handle = std::thread::Builder::new().name("REX3-Resident-Display".into())
-            .spawn(move || {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| display.run(rex))).is_err() {
-                    rex.fail_resident(ResidentError::Failed("resident display worker panicked".into()));
-                }
-            });
-        let handle = match handle {
-            Ok(handle) => handle,
-            Err(error) => {
-                let error = ResidentError::Failed(format!("start resident display: {error}"));
-                self.fail_resident(error.clone());
-                return Err(error);
-            }
-        };
-        *thread_slot = Some(handle);
+        *slot = Some(display);
+        drop(slot);
+        // The shared refresh thread drives the head, as for the CPU raster:
+        // the guest's timing, and frames composed on the GPU
+        // (`Rex3Head::compose`).
+        let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
+        let shim = self.head_shim.get_or_init(|| Arc::new(super::Rex3Head(rex3)));
+        let head: Arc<dyn crate::display::Head> = shim.clone();
+        self.head.attach(Arc::downgrade(&head));
+        self.head.start();
         Ok(())
     }
 
-    fn resident_vblank(&self) {
-        self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
-        {
-            let mut vc2 = self.vc2.lock();
-            let working = crate::dev::ng1::vc2::VC2_REG_WORKING_CURSOR_Y as usize;
-            let y = vc2.regs[crate::dev::ng1::vc2::VC2_REG_CURSOR_Y_LOC as usize];
-            if vc2.regs[working] != y {
-                vc2.regs[working] = y;
-                vc2.dirty = true;
+    /// Take the resident display down (`stop`).
+    pub(crate) fn stop_resident_display(&self) {
+        *self.resident_display.lock() = None;
+    }
+
+    /// One frame of the resident display, for the refresh thread.
+    pub(super) fn resident_compose(&self, screen: &mut Rex3Screen, want: Want) -> Composed {
+        let mut slot = self.resident_display.lock();
+        let Some(display) = slot.as_mut() else { return Composed::NotReady };
+        match display.compose(self, screen, want, CUT_WAIT, |_| {}) {
+            Ok(composed) => composed,
+            Err(error) => {
+                self.resident_display_failed(&display.gpu, error);
+                Composed::NotReady
             }
         }
-        if let Some(irq) = self.vblank_cb.lock().clone() {
-            irq.set(true);
+    }
+
+    /// A frame that could not be composed: a timeout waits for the next
+    /// retrace; a lost or failed device stops the board.
+    fn resident_display_failed(&self, gpu: &Gpu, error: ResidentError) {
+        *self.resident_frame.error.lock() = Some(error.clone());
+        let fatal = self.resident_fault().or_else(|| {
+            gpu.check().err().map(|message| {
+                if message.starts_with("wgpu device lost (") {
+                    ResidentError::DeviceLost(message)
+                } else {
+                    ResidentError::Failed(message)
+                }
+            })
+        }).or_else(|| matches!(error, ResidentError::DeviceLost(_)).then_some(error));
+        if let Some(fatal) = fatal {
+            self.fail_resident(fatal);
         }
     }
-}
 
-pub(super) fn validate_presenter(renderer: &dyn Renderer, gpu: &Arc<Gpu>) -> Result<(), ResidentError> {
-    if !renderer.takes_gpu_frames() {
-        return Err(ResidentError::Unsupported("resident frames require a wgpu presenter"));
-    }
-    let device = renderer.resident_gpu_device()
-        .ok_or(ResidentError::Unsupported("presenter did not identify its GPU"))?;
-    if !Arc::ptr_eq(device, gpu) {
-        return Err(ResidentError::DeviceMismatch);
-    }
-    Ok(())
-}
-
-fn validate_compatibility_presenter(renderer: &dyn Renderer) -> Result<(), ResidentError> {
-    if !renderer.takes_resident_readback_frames() {
-        return Err(ResidentError::Unsupported("resident compatibility display requires a readback-capable renderer"));
-    }
-    Ok(())
-}
-
-fn publish_capture(rex: &Rex3, screen: &mut Rex3Screen, requests: Requests, save_screenshots: bool) {
-    screen.frame_seq = screen.frame_seq.wrapping_add(1);
-    rex.resident_frame.complete(requests);
-    if requests.needs_screenshot && save_screenshots {
-        let (width, height) = (screen.width, screen.height);
-        let pixels = screen.rgba.clone();
-        let n = rex.screenshot_counter.fetch_add(1, Ordering::Relaxed);
-        let path = format!("screenshot_{n:04}.png");
-        std::thread::spawn(move || {
-            match crate::disp::save_screenshot(&path, &pixels, width, height) {
-                Ok(()) => println!("iris: screenshot saved to {path}"),
-                Err(error) => println!("iris: screenshot failed: {error}"),
-            }
-        });
+    /// Whether the direct mode shows the frame: its debug overlays need CPU
+    /// planes it does not keep.
+    pub(super) fn resident_direct(&self) -> bool {
+        self.resident_display.lock().as_ref().is_some_and(|d| d.mode() == ResidentDisplayMode::DirectWgpu)
     }
 }
 
@@ -445,80 +373,39 @@ fn observed_words(observation: &Observation, rgb: bool) -> Result<Vec<u32>, Resi
 }
 
 /// Explicitly slow validation/compatibility path: read both authoritative
-/// planes, then hand the CPU snapshots to the ordinary renderer.
+/// planes into the screen, for the renderer's compositor to compose as it
+/// does the CPU planes.
 struct ResidentCompatibilityDisplay {
-    overlay: DebugOverlay,
-    compositor: Option<SwCompositor>,
     capture: CaptureCount,
     #[cfg(test)]
     capture_fault: Option<CaptureFault>,
-    save_screenshots: bool,
-    resize_pending: bool,
 }
 
 impl ResidentCompatibilityDisplay {
-    fn new(rex: &Rex3) -> Result<Self, ResidentError> {
-        if let Some(renderer) = rex.head.renderer_slot().lock().as_deref() {
-            validate_compatibility_presenter(renderer)?;
-        }
-        Ok(Self {
-            overlay: DebugOverlay::new(),
-            compositor: None,
+    fn new() -> Self {
+        Self {
             capture: CaptureCount::default(),
             #[cfg(test)]
             capture_fault: None,
-            save_screenshots: true,
-            resize_pending: true,
-        })
+        }
     }
 
-    fn render(
+    fn compose(
         &mut self,
         rex: &Rex3,
+        screen: &mut Rex3Screen,
+        want: Want,
         timeout: Duration,
         at_marker: impl FnOnce(Position),
-    ) -> Result<ResidentDisplayFrame, ResidentError> {
+    ) -> Result<Composed, ResidentError> {
         rex.wait_resident_display_fence(timeout)?;
         let cut = rex.resident_frame_cut(timeout)?;
-        let requests = cut.requests;
-        let capture = requests.needs_frame || requests.needs_screenshot
-            || rex.head.capturing();
-        if capture {
-            rex.resident_frame.invalidate();
-        }
         at_marker(cut.position);
-
-        let mut screen = rex.head.screen().lock();
         screen.topscan = cut.topscan;
-        screen.status_bar_only = false;
-        let resized = screen.refresh_display_state(
-            &rex.vc2,
-            &rex.xmap0,
-            &rex.cmap0,
-            &rex.bt445,
-            &rex.diag,
-        );
-        if resized {
-            rex.resident_frame.invalidate();
-        }
-        self.resize_pending |= resized;
+        screen.prebuilt = false;
         if !rex.resident_display_fence_complete() {
             return Err(ResidentError::Timeout("display fence after frame marker"));
         }
-        if screen.width == 0 || screen.width > FB_STRIDE || screen.height == 0
-            || screen.height > super::REX3_SCREEN_HEIGHT as usize
-        {
-            return Err(ResidentError::InvalidState("resident scanout dimensions exceed the Newport planes"));
-        }
-        self.overlay.show_cmap = rex.show_cmap.load(Ordering::Relaxed);
-        self.overlay.show_disp_debug = rex.show_disp_debug.load(Ordering::Relaxed);
-        self.overlay.show_draw_debug = rex.draw_debug_active();
-        let mut renderer = rex.head.renderer_slot().lock();
-        if let Some(renderer) = renderer.as_deref() {
-            validate_compatibility_presenter(renderer)?;
-        }
-        // Screen, renderer, bar: the refresh thread's lock order.
-        let bar = rex.head.status_bar(rex.gfifo.len(), screen.width);
         let mut mode = rex.raster.lock();
         let RasterMode::Resident(raster) = &mut *mode else {
             return Err(ResidentError::InvalidState("resident raster is not active"));
@@ -531,6 +418,7 @@ impl ResidentCompatibilityDisplay {
         if observation.position() != cut.position {
             return Err(ResidentError::InvalidState("compatibility observation used the wrong stream cut"));
         }
+        drop(mode);
         let rgb = observed_words(&observation, true)?;
         let aux = observed_words(&observation, false)?;
         screen.fb_rgb.resize(rgb.len(), 0);
@@ -543,7 +431,7 @@ impl ResidentCompatibilityDisplay {
             damage.mark_full(DamagePlane::Aux);
             damage
         };
-        let resized = screen.refresh(
+        screen.refresh(
             &rgb,
             &aux,
             #[cfg(feature = "rex-dirty-upload")]
@@ -556,139 +444,74 @@ impl ResidentCompatibilityDisplay {
             &rex.bt445,
             &rex.diag,
         );
-        if resized {
-            rex.resident_frame.invalidate();
-        }
-        self.resize_pending |= resized;
         if !rex.resident_display_fence_complete() {
             return Err(ResidentError::Timeout("display fence after compatibility observation"));
         }
-        if let Some(renderer) = renderer.as_deref_mut() {
-            if self.resize_pending {
-                renderer.resize(screen.width, screen.height);
-                self.resize_pending = false;
-            }
-            renderer.present(
-                &mut screen,
-                &mut self.overlay,
-                bar.pixels(),
-                false,
-                None,
-                None,
-            );
-        } else {
-            self.resize_pending = true;
+        if screen.width == 0 || screen.width > FB_STRIDE || screen.height == 0
+            || screen.height > super::REX3_SCREEN_HEIGHT as usize
+        {
+            return Err(ResidentError::InvalidState("resident scanout dimensions exceed the Newport planes"));
         }
-        let (width, height) = (screen.width, screen.height);
-        if capture {
-            let bytes = (width * height * size_of::<u32>()) as u64;
+        if want.readback {
+            // The refresh thread composes the planes into `rgba` for the
+            // reader; this counts the frames read back for one.
+            let bytes = (screen.width * screen.height * size_of::<u32>()) as u64;
             self.capture.attempt(bytes)?;
             rex.resident_frame.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, bytes)?;
             #[cfg(test)]
-            let fault = self.capture_fault.take();
-            #[cfg(test)]
-            if matches!(fault, Some(CaptureFault::BeforeCapture)) {
-                return Err(ResidentError::Failed("injected composed capture failure before capture".into()));
-            }
-            let compositor = self.compositor.get_or_insert_with(SwCompositor::new);
-            compositor.compose_pixels(&screen.compositor_source());
-            #[cfg(test)]
-            if matches!(fault, Some(CaptureFault::AfterStaging)) {
-                return Err(ResidentError::Failed("injected composed capture failure after staging".into()));
-            }
-            for y in 0..height {
-                let row = y * FB_STRIDE;
-                screen.rgba[row..row + width]
-                    .copy_from_slice(&compositor.pixels()[row..row + width]);
+            if self.capture_fault.take().is_some() {
+                return Err(ResidentError::Failed("injected composed capture failure".into()));
             }
             self.capture.success(bytes)?;
             rex.resident_frame.capture_success(ResidentDisplayMode::ReadbackCompatibility, bytes)?;
-            publish_capture(rex, &mut screen, requests, self.save_screenshots);
         }
-        Ok(ResidentDisplayFrame { position: cut.position, width: width as u32, height: height as u32 })
+        Ok(Composed::Frame)
     }
 }
 
 /// Owns the composed output and its staging buffer across refreshes.
 struct ResidentDirectDisplay {
     scanout: Ng1ResidentScanout,
-    overlay: DebugOverlay,
     capture: Vec<u32>,
-    save_screenshots: bool,
-    resize_pending: bool,
 }
 
 impl ResidentDirectDisplay {
     fn new(rex: &Rex3, gpu: &Arc<Gpu>) -> Result<Self, ResidentError> {
-        if let Some(renderer) = rex.head.renderer_slot().lock().as_deref() {
-            validate_presenter(renderer, gpu)?;
-        }
         let scanout = Ng1Scanout::new_resident(gpu, &rex)?;
-        Ok(Self {
-            scanout,
-            overlay: DebugOverlay::new(),
-            capture: Vec::new(),
-            save_screenshots: true,
-            resize_pending: true,
-        })
+        Ok(Self { scanout, capture: Vec::new() })
     }
 
     /// The hook runs at the FIFO cut, before the raster lock is taken. It is
     /// used to deterministically queue later draws in the ordering tests.
-    fn render(
+    ///
+    /// The frame stays on the GPU for a presenter on the board's device
+    /// ([`Want::gpu`]); a reader, or a renderer that composes on the CPU,
+    /// gets it read back into the screen as finished pixels.
+    fn compose(
         &mut self,
         rex: &Rex3,
+        screen: &mut Rex3Screen,
+        want: Want,
         timeout: Duration,
         at_marker: impl FnOnce(Position),
-    ) -> Result<ResidentFrameStamp, ResidentError> {
+    ) -> Result<(Composed, ResidentFrameStamp), ResidentError> {
         rex.wait_resident_display_fence(timeout)?;
         let cut = rex.resident_frame_cut(timeout)?;
-        let requests = cut.requests;
-        let capture = requests.needs_frame || requests.needs_screenshot
-            || rex.head.capturing();
-        if capture {
-            rex.resident_frame.invalidate();
-        }
         at_marker(cut.position);
-
-        let mut screen = rex.head.screen().lock();
         screen.topscan = cut.topscan;
-        screen.status_bar_only = false;
-        let resized = screen.refresh_resident_display_state(
+        screen.refresh_resident_display_state(
             &rex.vc2,
             &rex.xmap0,
             &rex.cmap0,
             &rex.bt445,
             &rex.diag,
         );
-        if resized {
-            rex.resident_frame.invalidate();
-        }
-        self.resize_pending |= resized;
         // A mode write after the initial wait may have published a later
         // fence. Its GFIFO entry cannot pass this marker, so defer rather
         // than wait here or compose state not ordered by the cut.
         if !rex.resident_display_fence_complete() {
             return Err(ResidentError::Timeout("display fence after frame marker"));
         }
-        self.overlay.show_cmap = rex.show_cmap.load(Ordering::Relaxed);
-        self.overlay.show_disp_debug = rex.show_disp_debug.load(Ordering::Relaxed);
-        self.overlay.show_draw_debug = rex.draw_debug_active();
-        if self.overlay.active() {
-            return Err(ResidentError::Unsupported("resident debug overlays require CPU planes"));
-        }
-        let mut renderer = rex.head.renderer_slot().lock();
-        if let Some(renderer) = renderer.as_deref_mut() {
-            validate_presenter(renderer, self.scanout.gpu())?;
-            if self.resize_pending {
-                renderer.resize(screen.width, screen.height);
-                self.resize_pending = false;
-            }
-        } else {
-            self.resize_pending = true;
-        }
-
-        let bar = rex.head.status_bar(rex.gfifo.len(), screen.width);
 
         // The cut keeps the consumer from accepting later draws; the raster
         // lock also excludes every other submitter until both consumers have
@@ -700,40 +523,40 @@ impl ResidentDirectDisplay {
         if raster.status()?.accepted != cut.position {
             return Err(ResidentError::InvalidState("resident frame marker stream cut changed"));
         }
-
         raster.submit_for(FlushReason::FrameCut)?;
         let frame = self.scanout.compose(&screen.display_state(), raster)?;
         if frame.position != cut.position {
             return Err(ResidentError::InvalidState("resident scanout used the wrong stream cut"));
         }
         let stamp = frame.stamp();
-        let buffer = frame.buffer.clone();
-        let gpu = Arc::clone(frame.gpu);
-        if let Some(renderer) = renderer.as_deref_mut() {
-            validate_presenter(renderer, &gpu)?;
-            renderer.present_resident_gpu_frame(
-                &buffer, stamp.width, stamp.height, &mut screen, &mut self.overlay, bar.pixels(),
-            ).map_err(ResidentError::Failed)?;
+        if want.gpu {
+            screen.prebuilt = false;
+            let buffer = frame.buffer.clone();
+            return Ok((Composed::Gpu { frame: buffer, width: stamp.width, height: stamp.height }, stamp));
         }
-        if capture {
-            let (width, height) = (stamp.width as usize, stamp.height as usize);
-            self.capture.resize(width * height, 0);
-            let before = self.scanout.traffic().composed_readbacks;
-            let result = self.scanout.capture(stamp, raster, &mut self.capture);
-            let after = self.scanout.traffic().composed_readbacks;
-            rex.resident_frame.capture_delta(ResidentDisplayMode::DirectWgpu, before, after)?;
-            result?;
-            for y in 0..height {
-                let row = y * FB_STRIDE;
-                for (dst, &src) in screen.rgba[row..row + width]
-                    .iter_mut().zip(&self.capture[y * width..(y + 1) * width])
-                {
-                    *dst = 0xff00_0000 | src.swap_bytes() >> 8;
-                }
+        let (width, height) = (stamp.width as usize, stamp.height as usize);
+        self.capture.resize(width * height, 0);
+        let before = self.scanout.traffic().composed_readbacks;
+        let result = self.scanout.capture(stamp, raster, &mut self.capture);
+        let after = self.scanout.traffic().composed_readbacks;
+        rex.resident_frame.capture_delta(ResidentDisplayMode::DirectWgpu, before, after)?;
+        result?;
+        // A finished frame, as a board that composes on the CPU leaves it.
+        screen.width = width;
+        screen.height = height;
+        screen.prebuilt = true;
+        if screen.fb_rgb.len() < FB_STRIDE * height {
+            screen.fb_rgb.resize(FB_STRIDE * height, 0);
+        }
+        for y in 0..height {
+            let row = y * FB_STRIDE;
+            for (dst, &src) in screen.fb_rgb[row..row + width]
+                .iter_mut().zip(&self.capture[y * width..(y + 1) * width])
+            {
+                *dst = 0xff00_0000 | src.swap_bytes() >> 8;
             }
-            publish_capture(rex, &mut screen, requests, self.save_screenshots);
         }
-        Ok(stamp)
+        Ok((Composed::Frame, stamp))
     }
 }
 
@@ -764,7 +587,7 @@ impl ResidentDisplay {
         let driver = match mode {
             ResidentDisplayMode::DirectWgpu => ResidentDisplayDriver::Direct(ResidentDirectDisplay::new(rex, gpu)?),
             ResidentDisplayMode::ReadbackCompatibility => {
-                ResidentDisplayDriver::Compatibility(ResidentCompatibilityDisplay::new(rex)?)
+                ResidentDisplayDriver::Compatibility(ResidentCompatibilityDisplay::new())
             }
         };
         Ok(Self { gpu: Arc::clone(gpu), driver })
@@ -799,71 +622,86 @@ impl ResidentDisplay {
         }
     }
 
-    pub(crate) fn suppress_screenshot_files(&mut self) {
-        match &mut self.driver {
-            ResidentDisplayDriver::Direct(display) => display.save_screenshots = false,
-            ResidentDisplayDriver::Compatibility(display) => display.save_screenshots = false,
-        }
+    /// Compose the frame at a new GFIFO cut into `screen`, as `want` asks:
+    /// what `Rex3Head::compose` answers the refresh thread with.
+    pub(crate) fn compose(
+        &mut self,
+        rex: &Rex3,
+        screen: &mut Rex3Screen,
+        want: Want,
+        timeout: Duration,
+        at_marker: impl FnOnce(Position),
+    ) -> Result<Composed, ResidentError> {
+        let started = Instant::now();
+        let kept = (screen.width, screen.height, screen.topscan, screen.prebuilt);
+        let composed = match &mut self.driver {
+            ResidentDisplayDriver::Direct(display) => display.compose(rex, screen, want, timeout, at_marker).map(|c| c.0),
+            ResidentDisplayDriver::Compatibility(display) => display.compose(rex, screen, want, timeout, at_marker),
+        };
+        // A frame that was not composed leaves the screen as the last one
+        // left it: the thread shows that again, at its size.
+        let composed = composed.inspect_err(|_| {
+            (screen.width, screen.height, screen.topscan, screen.prebuilt) = kept;
+        })?;
+        let elapsed = duration_ns(started.elapsed()).map_err(ResidentError::InvalidState)?;
+        rex.resident_telemetry.lock().presentation(elapsed);
+        Ok(composed)
     }
 
+    /// One frame as the refresh thread makes it, for the tests: the
+    /// thread's own frame for the board's head (requests, screenshots,
+    /// presenting, readback), with this display composing it. The hook runs
+    /// at the cut, as in [`compose`](Self::compose).
+    #[cfg(test)]
     pub(crate) fn render(
         &mut self,
         rex: &Rex3,
         timeout: Duration,
-        at_marker: impl FnOnce(Position),
+        at_marker: impl FnOnce(Position) + Send,
     ) -> Result<ResidentDisplayFrame, ResidentError> {
-        let started = Instant::now();
-        let requests = rex.resident_frame.requests();
-        // Retain a completed capture across uncaptured presentations; otherwise
-        // a CI consumer can miss it before it acquires the screen lock.
-        if requests.needs_frame || requests.needs_screenshot || rex.head.capturing() {
-            rex.resident_frame.invalidate();
+        struct Standin<'a> {
+            rex: &'a Rex3,
+            display: Mutex<&'a mut ResidentDisplay>,
+            at_marker: Mutex<Option<Box<dyn FnOnce(Position) + Send + 'a>>>,
+            timeout: Duration,
+            result: Mutex<Option<Result<(Position, u32, u32), ResidentError>>>,
         }
-        let frame = match &mut self.driver {
-            ResidentDisplayDriver::Direct(display) => {
-                let stamp = display.render(rex, timeout, at_marker)?;
-                Ok(ResidentDisplayFrame { position: stamp.position, width: stamp.width, height: stamp.height })
-            }
-            ResidentDisplayDriver::Compatibility(display) => display.render(rex, timeout, at_marker),
-        }?;
-        let elapsed = duration_ns(started.elapsed()).map_err(ResidentError::InvalidState)?;
-        rex.resident_telemetry.lock().presentation(elapsed);
-        Ok(frame)
-    }
-
-    fn run(&mut self, rex: &Rex3) {
-        let period = Duration::from_micros(16667);
-        while rex.running.load(Ordering::Acquire) {
-            let start = Instant::now();
-            let requests = rex.resident_frame.requests();
-            let needs_frame = requests.needs_frame || requests.needs_screenshot
-                || rex.head.capturing();
-            if needs_frame || rex.head.renderer_slot().lock().is_some() {
-                let result = self.render(rex, FRAME_WAIT, |_| {});
-                *rex.resident_frame.error.lock() = result.as_ref().err().cloned();
-                if let Err(error) = result {
-                    let fatal = rex.resident_fault().or_else(|| {
-                        self.gpu.check().err().map(|message| {
-                            if message.starts_with("wgpu device lost (") {
-                                ResidentError::DeviceLost(message)
-                            } else {
-                                ResidentError::Failed(message)
-                            }
-                        })
-                    }).or_else(|| matches!(error, ResidentError::DeviceLost(_)).then_some(error));
-                    if let Some(fatal) = fatal {
-                        rex.fail_resident(fatal);
-                        break;
+        impl crate::display::Head for Standin<'_> {
+            fn changed(&self) -> bool { true }
+            fn compose(&self, screen: &mut Rex3Screen, want: Want) -> Composed {
+                let hook = self.at_marker.lock().take();
+                let mut cut = None;
+                let result = ResidentDisplay::compose(&mut self.display.lock(), self.rex, screen, want, self.timeout, |p| {
+                    cut = Some(p);
+                    if let Some(hook) = hook { hook(p) }
+                });
+                let (composed, result) = match result {
+                    Ok(composed) => {
+                        let (w, h) = match &composed {
+                            Composed::Gpu { width, height, .. } => (*width, *height),
+                            _ => (screen.width as u32, screen.height as u32),
+                        };
+                        (composed, Ok((cut.expect("a compose reaches its cut"), w, h)))
                     }
-                }
+                    Err(error) => (Composed::NotReady, Err(error)),
+                };
+                *self.result.lock() = Some(result);
+                composed
             }
-            rex.resident_vblank();
-            let elapsed = start.elapsed();
-            if elapsed < period {
-                std::thread::sleep(period - elapsed);
-            }
+            fn gfifo_pending(&self) -> usize { self.rex.gfifo.len() }
         }
-        rex.head.display_stop().finish(rex.head.renderer_slot());
+        let standin = Standin {
+            rex,
+            display: Mutex::new(self),
+            at_marker: Mutex::new(Some(Box::new(at_marker))),
+            timeout,
+            result: Mutex::new(None),
+        };
+        rex.head.frame_now_as(&standin);
+        let result = standin.result.lock().take()
+            .ok_or(ResidentError::InvalidState("the refresh frame did not compose"))?;
+        let (position, width, height) = result?;
+        Ok(ResidentDisplayFrame { position, width, height })
     }
 }
 
@@ -883,28 +721,12 @@ mod tests {
         fn status(&mut self) -> Result<ResidentStatus, ResidentError> { Ok(ResidentStatus::for_test()) }
     }
 
+    /// Composed-capture totals are counted per mode and survive a resident
+    /// reset; a counter that would overflow or run backwards is an error.
     #[test]
-    fn resident_frame_requests_keep_newer_tickets_pending() {
+    fn resident_capture_totals_survive_resets() {
         let control = ResidentFrameControl::default();
         control.activate();
-        assert!(!control.frame_available());
-        control.request_frame();
-        control.request_screenshot();
-        let first = control.requests();
-        control.request_frame();
-        control.request_screenshot();
-        control.complete(first);
-        assert!(control.frame_pending());
-        assert!(control.screenshot_pending());
-        assert!(!control.frame_available());
-        let second = control.requests();
-        control.complete(second);
-        assert!(!control.frame_pending());
-        assert!(!control.screenshot_pending());
-        assert!(control.frame_available());
-        control.invalidate();
-        assert!(!control.frame_available(), "an unpublished display state is not a captured frame");
-
         control.capture_attempt(ResidentDisplayMode::DirectWgpu, 64).unwrap();
         control.capture_success(ResidentDisplayMode::DirectWgpu, 64).unwrap();
         control.capture_attempt(ResidentDisplayMode::ReadbackCompatibility, 32).unwrap();
@@ -927,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_frame_timeouts_never_publish_fences_or_stale_pixels() {
+    fn resident_frame_timeouts_never_publish_fences_or_frames() {
         std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
             let mut rex = Box::new(Rex3::new(crate::status::MachineStatus::detached()));
             rex.attach_resident_raster(Probe).unwrap();
@@ -946,10 +768,7 @@ mod tests {
             assert_eq!(rex.wait_resident_display_fence(Duration::ZERO), Err(ResidentError::Timeout("display fence")));
             assert_eq!(rex.gfifo_fence.load(Ordering::Acquire), 8);
             assert!(rex.frame_pending() && rex.screenshot_pending());
-            let mut pixels = vec![0xfeed_beef];
-            assert_eq!(fresh_frame(&*rex, &mut pixels, Duration::ZERO), None);
-            assert_eq!(pixels, [0xfeed_beef]);
-            assert_eq!(rex.head.screen().lock().frame_seq, 7);
+            assert_eq!(rex.head.screen().lock().frame_seq, 7, "a timed-out frame publishes nothing");
 
             rex.gfifo_fence.store(9, Ordering::Release);
             assert!(matches!(rex.resident_frame_cut(Duration::from_millis(10)),

@@ -1424,6 +1424,10 @@ pub struct Rex3 {
     resident_frame: frame::ResidentFrameControl,
     #[cfg(feature = "wgpu")]
     resident_display_mode: Mutex<Option<frame::ResidentDisplayMode>>,
+    /// The resident display the refresh thread composes (`Rex3Head`), while
+    /// the board runs.
+    #[cfg(feature = "wgpu")]
+    resident_display: Mutex<Option<frame::ResidentDisplay>>,
     #[cfg(feature = "wgpu")]
     resident_lifecycle: RwLock<lifecycle::ResidentLifecycle>,
     #[cfg(feature = "wgpu")]
@@ -1568,9 +1572,6 @@ pub struct Rex3 {
     pub show_cmap: AtomicBool,
     /// When true, overlay decoded DID/XMAP mode info near the bottom of the screen.
     pub show_disp_debug: AtomicBool,
-    /// Screenshot counter of the resident display test thread.
-    #[cfg_attr(not(all(test, feature = "wgpu")), allow(dead_code))]
-    pub screenshot_counter: AtomicU32,
 }
 
 unsafe impl Sync for Rex3 {}
@@ -1643,6 +1644,8 @@ impl Rex3 {
             resident_frame: frame::ResidentFrameControl::default(),
             #[cfg(feature = "wgpu")]
             resident_display_mode: Mutex::new(None),
+            #[cfg(feature = "wgpu")]
+            resident_display: Mutex::new(None),
             #[cfg(feature = "wgpu")]
             resident_lifecycle: RwLock::new(lifecycle::ResidentLifecycle::default()),
             #[cfg(feature = "wgpu")]
@@ -1740,7 +1743,6 @@ impl Rex3 {
             trace: Mutex::new(trace::Rex3Trace::new()),
             show_cmap: AtomicBool::new(false),
             show_disp_debug: AtomicBool::new(false),
-            screenshot_counter: AtomicU32::new(0),
         }
     }
 
@@ -1801,7 +1803,7 @@ impl Rex3 {
         if self.running.load(Ordering::Acquire)
             || self.gfxbusy.load(Ordering::Acquire)
             || self.processor_thread.lock().is_some()
-            || self.refresh_thread.lock().is_some()
+            || self.resident_display.lock().is_some()
             || !self.gfifo.publish_tail()
             || !self.gfifo.is_empty()
         {
@@ -4481,13 +4483,9 @@ impl Device for Rex3 {
             self.head.display_stop().request();
             self.running.store(false, Ordering::SeqCst);
             self.resident_frame.wake();
-            if let Some(handle) = self.refresh_thread.lock().take() {
-                if handle.join().is_err() {
-                    self.fail_resident(crate::dev::ng1::wgpu::resident::ResidentError::Failed(
-                        "resident display worker panicked".into(),
-                    ));
-                }
-            }
+            // No compose runs, or will, once the head has stopped.
+            self.head.stop();
+            self.stop_resident_display();
             let mut processor = self.processor_thread.lock();
             if let Some(handle) = processor.take() {
                 let mut sent_exit = false;
@@ -4579,7 +4577,7 @@ impl Device for Rex3 {
         if self.raster.lock().kind() == RasterModeKind::Resident {
             self.start_resident_processor().unwrap_or_else(|error| panic!("REX3 {error}"));
             if let Some(mode) = *self.resident_display_mode.lock() {
-                if self.refresh_thread.lock().is_none() {
+                if self.resident_display.lock().is_none() {
                     let gpu = match &*self.raster.lock() {
                         RasterMode::Resident(raster) => raster.gpu(),
                         _ => None,
@@ -6037,15 +6035,48 @@ struct Rex3Head(&'static Rex3);
 
 impl crate::display::Head for Rex3Head {
     fn vblank_start(&self, _field: u32, _t_ns: u64) { self.0.head_vblank_start() }
-    fn changed(&self) -> bool { self.0.head_changed() }
-    fn capture(&self, screen: &mut Rex3Screen, _want: crate::display::Want) -> bool { self.0.head_capture(screen) }
-    /// The screen holds display state; the renderer's compositor makes the
-    /// picture from it.
-    fn compose(&self, _screen: &mut Rex3Screen, _want: crate::display::Want) -> crate::display::Composed {
+    fn changed(&self) -> bool {
+        // On the GPU raster nothing marks the planes changed: compose every
+        // retrace while there is a window to show it or a reader waiting.
+        #[cfg(feature = "wgpu")]
+        if self.0.resident_frame.is_active() {
+            let h = &self.0.head;
+            return h.frame_pending() || h.screenshot_pending() || h.capturing()
+                || h.renderer_slot().lock().is_some();
+        }
+        self.0.head_changed()
+    }
+    fn capture(&self, screen: &mut Rex3Screen, _want: crate::display::Want) -> bool {
+        // The GPU raster's frame is taken at a GFIFO cut, in `compose`.
+        #[cfg(feature = "wgpu")]
+        if self.0.resident_frame.is_active() {
+            return true;
+        }
+        self.0.head_capture(screen)
+    }
+    /// The CPU raster: the screen holds display state, and the renderer's
+    /// compositor makes the picture from it. The GPU raster composes at a
+    /// GFIFO cut (`Rex3::resident_compose`).
+    fn compose(&self, screen: &mut Rex3Screen, want: crate::display::Want) -> crate::display::Composed {
+        #[cfg(feature = "wgpu")]
+        if self.0.resident_frame.is_active() {
+            return self.0.resident_compose(screen, want);
+        }
+        let _ = (screen, want);
         crate::display::Composed::Frame
     }
     fn gfifo_pending(&self) -> usize { self.0.gfifo.len() }
-    fn overlay(&self, overlay: &mut crate::debug_overlay::DebugOverlay) { self.0.head_overlay(overlay) }
+    fn overlay(&self, overlay: &mut crate::debug_overlay::DebugOverlay) {
+        // The direct GPU display keeps no CPU planes for the overlays to read.
+        #[cfg(feature = "wgpu")]
+        if self.0.resident_direct() {
+            overlay.show_cmap = false;
+            overlay.show_disp_debug = false;
+            overlay.show_draw_debug = false;
+            return;
+        }
+        self.0.head_overlay(overlay)
+    }
 }
 
 impl Drop for Rex3 {
@@ -6059,37 +6090,11 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { self.head.renderer_slot() }
     fn display_stop(&self) -> &crate::gfx_display::DisplayStop { self.head.display_stop() }
     fn screen(&self) -> &Mutex<Rex3Screen> { self.head.screen() }
-    fn request_screenshot(&self) {
-        #[cfg(feature = "wgpu")]
-        if self.resident_frame.is_active() {
-            self.resident_frame.request_screenshot();
-            return;
-        }
-        self.head.request_screenshot();
-    }
-    fn screenshot_pending(&self) -> bool {
-        #[cfg(feature = "wgpu")]
-        if self.resident_frame.is_active() {
-            return self.resident_frame.screenshot_pending();
-        }
-        self.head.screenshot_pending()
-    }
+    fn request_screenshot(&self) { self.head.request_screenshot() }
+    fn screenshot_pending(&self) -> bool { self.head.screenshot_pending() }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.status.cycles() }
-    fn request_frame(&self) {
-        #[cfg(feature = "wgpu")]
-        if self.resident_frame.is_active() {
-            self.resident_frame.request_frame();
-            return;
-        }
-        self.head.request_frame();
-    }
-    fn frame_pending(&self) -> bool {
-        #[cfg(feature = "wgpu")]
-        if self.resident_frame.is_active() {
-            return self.resident_frame.frame_pending();
-        }
-        self.head.frame_pending()
-    }
+    fn request_frame(&self) { self.head.request_frame() }
+    fn frame_pending(&self) -> bool { self.head.frame_pending() }
     fn minimum_frame_request_timeout(&self) -> std::time::Duration {
         #[cfg(feature = "wgpu")]
         if self.resident_frame.is_active()
@@ -6103,18 +6108,12 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn frame_available(&self) -> bool {
         #[cfg(feature = "wgpu")]
         if self.resident_frame.is_active() {
-            return !self.resident_fatal_notified.load(Ordering::Acquire)
-                && self.resident_frame.frame_available();
+            return !self.resident_fatal_notified.load(Ordering::Acquire);
         }
         true
     }
     fn set_capture(&self, on: bool) {
         self.head.set_capture(on);
-        // Repaint at once so the new consumer gets a frame.
-        #[cfg(feature = "wgpu")]
-        if on && self.resident_frame.is_active() {
-            self.resident_frame.request_frame();
-        }
     }
     #[cfg(feature = "wgpu")]
     fn gpu(&self) -> Option<std::sync::Arc<crate::wgpu::Gpu>> {
