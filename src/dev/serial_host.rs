@@ -203,21 +203,6 @@ impl SerialBackend for TeeBackend {
     }
 }
 
-/// A serial line on a Unix socket at `path`: raw bytes, no telnet, one client
-/// at a time (the next waits in the listen queue until the first hangs up).
-/// What a script wants from a console: it can connect without a free TCP
-/// port, and the socket's directory permissions say who may.
-#[cfg(unix)]
-pub(crate) struct UnixSocketBackend {
-    /// The socket's entry in `ports`.
-    _port: crate::ports::PortGuard,
-    path: std::path::PathBuf,
-    listener: UnixListener,
-    stream: Mutex<Option<(UnixStream, ClientQueue)>>,
-    /// Bytes dropped for clients that have since gone.
-    dropped: AtomicU64,
-}
-
 /// Bind a Unix socket at `path`. A socket file left by an earlier iris is
 /// replaced; one that something still answers on, or any other kind of
 /// file, is an error and left alone.
@@ -238,99 +223,90 @@ pub(crate) fn bind_unix_socket(path: &Path) -> io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
+
+/// A listening socket and what its clients are.
+pub(crate) trait Listen: Send + Sync {
+    type Stream: Read + Write + Send;
+    /// Whether clients speak telnet (offered character mode, output escaped)
+    /// or raw bytes.
+    const TELNET: bool;
+    /// Clients served at once; others wait in the listen queue.
+    const MAX: usize;
+    /// Take one waiting client, non-blocking.
+    fn accept(&self) -> io::Result<Self::Stream>;
+}
+
+impl Listen for TcpListener {
+    type Stream = TcpStream;
+    const TELNET: bool = true;
+    const MAX: usize = usize::MAX;
+
+    fn accept(&self) -> io::Result<TcpStream> {
+        let (socket, _) = TcpListener::accept(self)?;
+        socket.set_nonblocking(true)?;
+        // The console is latency-sensitive: without TCP_NODELAY, Nagle
+        // holds a keystroke or a log line back until the previous
+        // segment is acked, which shows up as a stutter on every
+        // interaction. Set it on accept, before any byte is written.
+        let _ = socket.set_nodelay(true);
+        Ok(socket)
+    }
+}
+
+/// A Unix socket's listener and the file it removes when it goes.
 #[cfg(unix)]
-impl UnixSocketBackend {
-    /// Bind `path`, as `bind_unix_socket` does.
-    pub(crate) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let listener = bind_unix_socket(&path)?;
-        listener.set_nonblocking(true)?;
-        crate::workstation::remove_at_exit(&path);
-        let _port = crate::ports::register("unix", path.display(), "serial port");
-        Ok(Self { _port, path, listener, stream: Mutex::new(None), dropped: AtomicU64::new(0) })
-    }
+pub(crate) struct UnixLine {
+    path: std::path::PathBuf,
+    listener: UnixListener,
+}
 
-    /// Write out what the client has queued; one that has gone is let go.
-    fn flush_client(&self, guard: &mut Option<(UnixStream, ClientQueue)>) {
-        if let Some((stream, q)) = guard {
-            if q.flush(stream).is_err() {
-                self.let_go(guard);
-            }
-        }
-    }
+#[cfg(unix)]
+impl Listen for UnixLine {
+    type Stream = UnixStream;
+    const TELNET: bool = false;
+    const MAX: usize = 1;
 
-    fn let_go(&self, guard: &mut Option<(UnixStream, ClientQueue)>) {
-        if let Some((_, q)) = guard.take() {
-            self.dropped.fetch_add(q.dropped(), Ordering::Relaxed);
-        }
+    fn accept(&self) -> io::Result<UnixStream> {
+        let (socket, _) = self.listener.accept()?;
+        socket.set_nonblocking(true)?;
+        Ok(socket)
     }
 }
 
 #[cfg(unix)]
-impl Drop for UnixSocketBackend {
+impl Drop for UnixLine {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
         crate::workstation::keep_at_exit(&self.path);
     }
 }
 
-#[cfg(unix)]
-impl SerialBackend for UnixSocketBackend {
-    /// With no client the byte goes nowhere: nobody waits for it.
-    fn send_byte(&self, byte: u8) {
-        if let Some((_, q)) = self.stream.lock().as_mut() {
-            q.push(&[byte]);
-        }
-    }
-
-    fn flush(&self) {
-        self.flush_client(&mut self.stream.lock());
-    }
-
-    fn queued(&self) -> bool {
-        self.stream.lock().as_ref().is_some_and(|(_, q)| q.queued())
-    }
-
-    fn dropped(&self) -> u64 {
-        let live = self.stream.lock().as_ref().map_or(0, |(_, q)| q.dropped());
-        self.dropped.load(Ordering::Relaxed) + live
-    }
-
-    fn recv_byte(&self) -> io::Result<u8> {
-        let mut guard = self.stream.lock();
-
-        if guard.is_none() {
-            match self.listener.accept() {
-                Ok((socket, _)) => {
-                    socket.set_nonblocking(true)?;
-                    *guard = Some((socket, ClientQueue::new(false)));
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        if let Some((stream, _)) = guard.as_mut() {
-            let mut buf = [0u8; 1];
-            match stream.read(&mut buf) {
-                Ok(1) => Ok(buf[0]),
-                Ok(_) => { // EOF
-                    self.let_go(&mut guard);
-                    Err(io::Error::new(io::ErrorKind::NotConnected, "EOF"))
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock")),
-                Err(e) => {
-                    self.let_go(&mut guard);
-                    Err(e)
-                }
-            }
-        } else {
-            Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"))
-        }
-    }
+/// One socket client.
+struct Conn<S> {
+    stream: S,
+    /// Set for a telnet client.
+    telnet: Option<crate::net::telnet::TelnetFilter>,
+    /// Output and telnet replies, in order, that the socket has not taken.
+    queue: ClientQueue,
 }
+
+/// A serial line served on a listening socket. Every connected client (up to
+/// `L::MAX`) sees all the output and may type, so a person at the console and
+/// a script can share it.
+pub(crate) struct SocketBackend<L: Listen> {
+    /// The socket's entry in `ports`.
+    _port: Option<crate::ports::PortGuard>,
+    pub(crate) listener: L,
+    conns: Mutex<Vec<Conn<L::Stream>>>,
+    /// Bytes dropped for clients that have since gone.
+    dropped: AtomicU64,
+}
+
+pub(crate) type TcpSocketBackend = SocketBackend<TcpListener>;
+/// A Unix socket line: raw bytes, no telnet, one client at a time (the next
+/// waits in the listen queue until the first hangs up), for scripts.
+#[cfg(unix)]
+pub(crate) type UnixSocketBackend = SocketBackend<UnixLine>;
 
 /// Several host ends of one serial line (a TCP port and a Unix socket):
 /// the guest's output goes to all of them and its input comes from
@@ -364,25 +340,41 @@ impl SerialBackend for FanoutBackend {
     }
 }
 
-struct TcpConn {
-    stream: TcpStream,
-    telnet: crate::net::telnet::TelnetFilter,
-    /// Output and telnet replies, in order, that the socket has not taken.
-    queue: ClientQueue,
+impl<L: Listen> SocketBackend<L> {
+    fn with(listener: L, port: Option<crate::ports::PortGuard>) -> Self {
+        Self { _port: port, listener, conns: Mutex::new(Vec::new()), dropped: AtomicU64::new(0) }
+    }
+
+    /// Take any clients waiting to connect, offering telnet ones character
+    /// mode. One whose handshake cannot be written is dropped; it can
+    /// reconnect.
+    fn accept_waiting(&self, conns: &mut Vec<Conn<L::Stream>>) {
+        while conns.len() < L::MAX {
+            let Ok(stream) = self.listener.accept() else { break };
+            let mut c = Conn {
+                stream,
+                telnet: L::TELNET.then(crate::net::telnet::TelnetFilter::new),
+                queue: ClientQueue::new(L::TELNET),
+            };
+            if !L::TELNET || c.stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_ok() {
+                conns.push(c);
+            }
+        }
+    }
+
+    /// Write out what every client has queued; one that has gone is dropped.
+    fn flush_all(&self, conns: &mut Vec<Conn<L::Stream>>) {
+        conns.retain_mut(|c| {
+            let kept = c.queue.flush(&mut c.stream).is_ok();
+            if !kept {
+                self.dropped.fetch_add(c.queue.dropped(), Ordering::Relaxed);
+            }
+            kept
+        });
+    }
 }
 
-pub(crate) struct TcpSocketBackend {
-    /// The socket's entry in `ports`.
-    _port: Option<crate::ports::PortGuard>,
-    pub(crate) listener: TcpListener,
-    /// Every connected client: each sees all the output and may type, so a
-    /// person at the console and a script can share it.
-    conns: Mutex<Vec<TcpConn>>,
-    /// Bytes dropped for clients that have since gone.
-    dropped: AtomicU64,
-}
-
-impl TcpSocketBackend {
+impl SocketBackend<TcpListener> {
     /// Bind a TCP serial backend. Returns `None` (rather than panicking) if the
     /// port can't be bound — most commonly because a stale emulator process from
     /// an earlier crash is still holding it. Callers fall back to a NullBackend
@@ -400,53 +392,32 @@ impl TcpSocketBackend {
             log::warn!("serial TCP backend disabled: failed to set nonblocking: {e}");
             return None;
         }
-        let _port = listener.local_addr().map(|a| crate::ports::register("tcp", a, "serial port")).ok();
-        Some(Self {
-            _port,
-            listener,
-            conns: Mutex::new(Vec::new()),
-            dropped: AtomicU64::new(0),
-        })
-    }
-
-    /// Take any clients waiting to connect, offering each telnet character
-    /// mode. One whose handshake cannot be written is dropped; it can
-    /// reconnect.
-    fn accept_waiting(&self, conns: &mut Vec<TcpConn>) {
-        while let Ok((socket, _)) = self.listener.accept() {
-            if socket.set_nonblocking(true).is_err() {
-                continue;
-            }
-            // The console is latency-sensitive: without TCP_NODELAY, Nagle
-            // holds a keystroke or a log line back until the previous
-            // segment is acked, which shows up as a stutter on every
-            // interaction. Set it on accept, before any byte is written.
-            let _ = socket.set_nodelay(true);
-            let mut c = TcpConn { stream: socket, telnet: crate::net::telnet::TelnetFilter::new(), queue: ClientQueue::new(true) };
-            if c.stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_ok() {
-                conns.push(c);
-            }
-        }
-    }
-
-    /// Write out what every client has queued; one that has gone is dropped.
-    fn flush_all(&self, conns: &mut Vec<TcpConn>) {
-        conns.retain_mut(|c| {
-            let kept = c.queue.flush(&mut c.stream).is_ok();
-            if !kept {
-                self.dropped.fetch_add(c.queue.dropped(), Ordering::Relaxed);
-            }
-            kept
-        });
+        let port = listener.local_addr().map(|a| crate::ports::register("tcp", a, "serial port")).ok();
+        Some(Self::with(listener, port))
     }
 }
 
-impl SerialBackend for TcpSocketBackend {
+#[cfg(unix)]
+impl SocketBackend<UnixLine> {
+    /// Bind `path`, as `bind_unix_socket` does.
+    pub(crate) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let listener = bind_unix_socket(&path)?;
+        listener.set_nonblocking(true)?;
+        crate::workstation::remove_at_exit(&path);
+        let port = crate::ports::register("unix", path.display(), "serial port");
+        Ok(Self::with(UnixLine { path, listener }, Some(port)))
+    }
+}
+
+impl<L: Listen> SerialBackend for SocketBackend<L> {
+    /// With no client the byte goes nowhere: nobody waits for it.
     fn send_byte(&self, byte: u8) {
-        let mut buf = Vec::with_capacity(2);
-        crate::net::telnet::escape_byte(byte, &mut buf);
+        // A telnet client gets 0xff doubled.
+        let pair = [IAC, byte];
+        let unit = if L::TELNET && byte == IAC { &pair[..] } else { &pair[1..] };
         for c in self.conns.lock().iter_mut() {
-            c.queue.push(&buf);
+            c.queue.push(unit);
         }
     }
 
@@ -466,9 +437,7 @@ impl SerialBackend for TcpSocketBackend {
     fn recv_byte(&self) -> io::Result<u8> {
         let mut conns = self.conns.lock();
         self.accept_waiting(&mut conns);
-        if conns.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
-        }
+        let mut lost = false;
         // Each client in turn: pull bytes through its telnet filter until a
         // real data byte falls out or it has nothing more to give. A client
         // that has gone away is dropped.
@@ -480,15 +449,21 @@ impl SerialBackend for TcpSocketBackend {
                 let mut buf = [0u8; 1];
                 match c.stream.read(&mut buf) {
                     Ok(1) => {
-                        let mut reply = Vec::new();
-                        let data = c.telnet.feed(buf[0], &mut reply);
-                        // Behind queued output, so a reply never lands
-                        // inside an escaped data byte.
-                        if !reply.is_empty() {
-                            c.queue.push(&reply);
-                            // Nothing else flushes it while the guest is idle.
-                            let _ = c.queue.flush(&mut c.stream);
-                        }
+                        let data = match c.telnet.as_mut() {
+                            Some(t) => {
+                                let mut reply = Vec::new();
+                                let data = t.feed(buf[0], &mut reply);
+                                // Behind queued output, so a reply never lands
+                                // inside an escaped data byte.
+                                if !reply.is_empty() {
+                                    c.queue.push(&reply);
+                                    // Nothing else flushes it while the guest is idle.
+                                    let _ = c.queue.flush(&mut c.stream);
+                                }
+                                data
+                            }
+                            None => Some(buf[0]),
+                        };
                         if let Some(d) = data {
                             return Ok(d);
                         }
@@ -508,11 +483,13 @@ impl SerialBackend for TcpSocketBackend {
             if gone {
                 let c = conns.remove(i);
                 self.dropped.fetch_add(c.queue.dropped(), Ordering::Relaxed);
+                lost = true;
             } else {
                 i += 1;
             }
         }
-        Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock"))
+        let kind = if lost { io::ErrorKind::NotConnected } else { io::ErrorKind::WouldBlock };
+        Err(kind.into())
     }
 }
 
@@ -1359,6 +1336,33 @@ pub(crate) mod tests {
         assert_eq!(b.dropped(), 1000);
         drop(b);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TCP client that leaves is reported once as `NotConnected`, as a Unix
+    /// one is, and the next one gets only what comes after it connects.
+    #[test]
+    fn a_tcp_client_that_leaves_reads_as_not_connected() {
+        let b = TcpSocketBackend::new(("127.0.0.1", 0)).unwrap();
+        let addr = b.listener.local_addr().unwrap();
+        let old = TcpStream::connect(addr).unwrap();
+        assert!(crate::test_board::until(|| {
+            let _ = b.recv_byte();
+            b.conns.lock().len() == 1
+        }));
+        drop(old);
+        assert!(
+            crate::test_board::until(|| {
+                matches!(b.recv_byte(), Err(e) if e.kind() == io::ErrorKind::NotConnected)
+            }),
+            "the gone client was never reported"
+        );
+        assert!(b.conns.lock().is_empty());
+        let _new = TcpStream::connect(addr).unwrap();
+        assert!(crate::test_board::until(|| {
+            let _ = b.recv_byte();
+            b.conns.lock().len() == 1
+        }));
+        assert!(matches!(b.recv_byte(), Err(e) if e.kind() == io::ErrorKind::WouldBlock), "a live client reads as idle");
     }
 
     /// The TCP counterpart: `flush_all` removing a gone client keeps its
