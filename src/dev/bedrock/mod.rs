@@ -107,6 +107,8 @@ enum Effect {
     None,
     /// A bit of the chip's levels changed: both PIs publish.
     Reflect,
+    /// The real-time clock control changed: the counters run or hold.
+    RtClock,
     /// LB's region write gave the node this number (seven bits).
     NodeNumber(NodeId),
     /// PI `.0`'s cached-alias store: the alias now spans `.1` bytes.
@@ -161,6 +163,8 @@ pub struct Bedrock {
     pub(crate) decode: Arc<NodeDecode<Bedrock>>,
     events: Option<Sender<MachineEvent>>,
     weak: Weak<Self>,
+    /// Held while a control store sets the counters of this node and its peer.
+    rt_eval: parking_lot::Mutex<()>,
 }
 
 /// Where an XIO address's I/O view names the node.
@@ -190,6 +194,7 @@ impl Bedrock {
                 clock,
                 processors,
                 weak: weak.clone(),
+                rt_eval: parking_lot::Mutex::new(()),
             }
         });
         Ok(chip)
@@ -374,6 +379,26 @@ impl Bedrock {
     pub fn uart_irq(self: &Arc<Self>) -> IrqLine {
         IrqLine::new(Arc::new(Uart(self.weak.clone())), 0)
     }
+    /// A node's counters run while its control uses the internal clock, or while the other node
+    /// drives the global clock (internal clock and global-clock enable both set); else they hold.
+    /// A two-node view: a third node would need "any other node drives".
+    fn set_rt_clocks(&self) {
+        use regs::lb::RT_LOCAL_CTRL as c;
+        let peer = self.decode.peer();
+        // Both ends take the two locks in address order, so concurrent stores serialise.
+        let mut ends = [Some(self), peer.as_deref()];
+        ends.sort_by_key(|b| b.map_or(0, |b| b as *const Self as usize));
+        let _held = ends.map(|b| b.map(|b| b.rt_eval.lock()));
+        let ctrl = [Some(self), peer.as_deref()].map(|b| b.map_or(0, |b| b.lb.rt_ctrl()));
+        let own = |v: u64| v & c::USE_INTERNAL::MASK != 0;
+        let drives = |v: u64| own(v) && v & c::GCLK_ENABLE::MASK != 0;
+        let runs = |me: usize| own(ctrl[me]) || drives(ctrl[1 - me]);
+        let now = self.clock.now();
+        self.pi.iter().for_each(|pi| pi.set_clock(runs(0), now, &self.levels));
+        if let Some(peer) = &peer {
+            peer.pi.iter().for_each(|pi| pi.set_clock(runs(1), now, &peer.levels));
+        }
+    }
     fn publish_all(&self) {
         for pi in &self.pi {
             pi.publish(&self.levels);
@@ -383,6 +408,7 @@ impl Bedrock {
         match effect {
             Effect::None => {}
             Effect::Reflect => self.publish_all(),
+            Effect::RtClock => self.set_rt_clocks(),
             Effect::Bte(n) => {
                 if let Some(done) = self.io.run_bte(n, &*self.decode) {
                     if !self.deliver(done.node, done.pi, done.value) {
@@ -566,6 +592,8 @@ impl Resettable for Bedrock {
         let _ = self.ni.power_on(&self.levels);
         let _ = self.xb.power_on(&self.levels);
         self.publish_all();
+        // The reset control runs this node's counters, and a peer that followed it may now hold.
+        self.set_rt_clocks();
         // LB resets to node zero and MD to its reset configuration, read inside the stop as
         // in `apply`; each PI keeps its cached-alias register.
         let alias = self.pi.each_ref().map(|pi| calias_bytes(pi.cached_alias()));

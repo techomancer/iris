@@ -3,7 +3,7 @@
 // cpu-number-fallback, cpu-enable-lines, nmi and sn1-cpu-identity-test's
 // four-processors-know-their-slots.
 
-use super::super::regs::PI1_BASE;
+use super::super::regs::{lb, PI1_BASE};
 use super::super::Rig;
 use super::*;
 use crate::sn::IO_REGISTERS_LOCAL;
@@ -394,4 +394,54 @@ fn stores_to_the_stored_words_leave_the_interrupts_alone() {
         stored += 1;
     }
     assert!(stored > 0);
+}
+
+const CTRL: u64 = lb::BASE + lb::RT_LOCAL_CTRL::OFFSET;
+
+/// A lone node's counters stop on the control IRIX writes and resume from the held count; the
+/// control reads what the model acts on, and a reset runs the counters again.
+#[test]
+fn a_lone_nodes_counters_hold_while_its_control_stops_them() {
+    let rig = Rig::new();
+    assert_eq!(rig.r(CTRL), 0x1_0000_0640, "the reset control uses the internal clock");
+    at(&rig, 8000);
+    rig.w(CTRL, 0x4f0);
+    at(&rig, 16000);
+    assert_eq!(rig.r(reg::RT_COUNTER::OFFSET), 10);
+    rig.w(CTRL, 0x1_0000_04f1);
+    at(&rig, 24000);
+    assert_eq!(rig.r(reg::RT_COUNTER::OFFSET), 20);
+    rig.w(CTRL, 0x4f0);
+    rig.set_time(32000);
+    crate::traits::Resettable::power_on(&*rig.chip);
+    assert_eq!(rig.r(CTRL), 0x1_0000_0640);
+    rig.set_time(40000);
+    assert_eq!(rig.r(reg::RT_COUNTER::OFFSET), 10, "a reset runs the counter from zero");
+}
+
+/// A match that came due before the stop is latched; a held counter matches nothing, a compare
+/// stored equal to its count does not latch, and a restart re-arms both comparators.
+#[test]
+fn a_held_counter_latches_what_was_due_and_matches_nothing_more() {
+    {
+        let rig = Rig::new();
+        rig.w(reg::RT_COMPARE_A::OFFSET, 2);
+        rig.set_time(2400);
+        rig.w(CTRL, 0x4f0);
+        assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 1, "the timer had not delivered it yet");
+    }
+    let rig = Rig::new();
+    rig.set_time(8000);
+    rig.w(CTRL, 0x4f0);
+    rig.w(reg::RT_COMPARE_A::OFFSET, 10);
+    assert_eq!(rig.r(reg::RT_INT_PEND_A::OFFSET), 0, "no tick passes in a stopped counter");
+    rig.w(reg::RT_COMPARE_A::OFFSET, 12);
+    rig.w(reg::PROFILE_COMPARE::OFFSET, 12);
+    at(&rig, 1_000_000);
+    assert_eq!((rig.r(reg::RT_INT_PEND_A::OFFSET), rig.r(reg::PROF_INT_PEND_A::OFFSET)), (0, 0));
+    rig.w(CTRL, 0x1_0000_04f1);
+    at(&rig, 1_001_599);
+    assert_eq!((rig.r(reg::RT_INT_PEND_A::OFFSET), rig.r(reg::PROF_INT_PEND_A::OFFSET)), (0, 0));
+    at(&rig, 1_001_600);
+    assert_eq!((rig.r(reg::RT_INT_PEND_A::OFFSET), rig.r(reg::PROF_INT_PEND_A::OFFSET)), (1, 1));
 }

@@ -32,6 +32,8 @@ pub(super) const MEMORY_ERROR: u64 = reg::ERR_INT_PEND::MEM_UNC::MASK;
 pub(super) const REFLECT: u64 = field_masks!(reg::INT_PEND1; XB_ERROR, LB_ERROR, NI_ERROR, SYSTEM_SHUTDOWN);
 /// Nanoseconds per real-time counter tick: the counter runs at 1.25 MHz.
 pub(super) const TICK: u64 = 800;
+/// The `held` value of a counter whose clock runs.
+const RUNNING: u64 = u64::MAX;
 /// Length of a PI's register aperture.
 pub(super) const SIZE: u64 = reg::RT_COUNTER::OFFSET + reg::RT_COUNTER::WIDTH as u64 / 8;
 /// IP2 is Cause bit 10.
@@ -174,6 +176,8 @@ pub(super) struct Pi {
     /// The latest clock reading `count` has used: processors on different sockets read the host
     /// clock a few hundred ns apart, but the counter never goes back.
     seen: AtomicU64,
+    /// The count while the counter's clock is stopped, else `RUNNING`.
+    held: AtomicU64,
     timer: Mutex<Comparators>,
     /// The two real-time comparators, then the profile one.
     timers: [Timer; 3],
@@ -207,6 +211,7 @@ impl Pi {
             out: Mutex::new([0; 2]),
             origin: AtomicU64::new(now / TICK),
             seen: AtomicU64::new(0),
+            held: AtomicU64::new(RUNNING),
             timer: Mutex::new(Comparators { rt_compare: [0; 2], profile_compare: 0, due: [0; 3] }),
             timers: [0, 1, 2].map(|kind| {
                 Timer::new(tm, chip, move |c: &Bedrock, due| c.pi[usize::from(interface)].expire(kind, due, c.clock.now(), &c.levels))
@@ -355,11 +360,18 @@ impl Pi {
     }
 
     fn since(&self, now: u64) -> u64 {
-        (now / TICK).wrapping_sub(self.origin.load(Relaxed))
+        match self.held.load(Acquire) {
+            RUNNING => (now / TICK).wrapping_sub(self.origin.load(Relaxed)),
+            held => held,
+        }
     }
 
     /// The origin is read before the clock, so a store that moves it is never read against a stale clock.
     pub(super) fn count(&self, clock: &Clock) -> u64 {
+        let held = self.held.load(Acquire);
+        if held != RUNNING {
+            return held;
+        }
         let origin = self.origin.load(Acquire);
         let now = clock.now();
         let now = self.seen.fetch_max(now, Relaxed).max(now);
@@ -367,10 +379,18 @@ impl Pi {
     }
 
     fn arm_rt(&self, t: &mut Comparators, slot: usize, now: u64) {
+        if self.held.load(Acquire) != RUNNING {
+            t.due[slot] = u64::MAX;
+            return;
+        }
         let ticks = (t.rt_compare[slot].wrapping_sub(self.since(now)).wrapping_sub(1) & RT_MASK) + 1;
         t.due[slot] = (now / TICK).saturating_add(ticks).saturating_mul(TICK);
     }
     fn arm_profile(&self, t: &mut Comparators, now: u64) {
+        if self.held.load(Acquire) != RUNNING {
+            t.due[2] = u64::MAX;
+            return;
+        }
         let ticks = (t.profile_compare as u32).wrapping_sub(self.since(now) as u32);
         let ticks = if ticks == 0 { 1u64 << 32 } else { u64::from(ticks) };
         t.due[2] = (now / TICK).saturating_add(ticks).saturating_mul(TICK);
@@ -409,6 +429,35 @@ impl Pi {
             return;
         }
         self.matched(&mut t, kind, now);
+        self.schedule(&t);
+        drop(t);
+        self.drive(&mut out, levels);
+    }
+
+    /// Run the counter's clock or stop it, as of `now` so that every counter stopped or restarted
+    /// together changes on the same tick. A stopped counter holds its count and matches nothing.
+    pub(super) fn set_clock(&self, runs: bool, now: u64, levels: &Levels) {
+        let mut out = self.out.lock();
+        let mut t = self.timer.lock();
+        let held = self.held.load(Acquire);
+        if !runs && held == RUNNING {
+            // A match already due still happened; the count never steps back below a reading given.
+            for kind in 0..3 {
+                if t.due[kind] <= now {
+                    self.matched(&mut t, kind, now);
+                }
+            }
+            let at = now.max(self.seen.load(Relaxed));
+            self.held.store((at / TICK).wrapping_sub(self.origin.load(Acquire)) & RT_MASK, Release);
+            t.due = [u64::MAX; 3];
+        } else if runs && held != RUNNING {
+            self.origin.store((now / TICK).wrapping_sub(held), Release);
+            self.seen.store(0, Relaxed);
+            self.held.store(RUNNING, Release);
+            self.arm_all(&mut t, now);
+        } else {
+            return;
+        }
         self.schedule(&t);
         drop(t);
         self.drive(&mut out, levels);
@@ -573,7 +622,7 @@ impl Pi {
                         t.rt_compare[slot] = value & RT_MASK;
                         self.arm_rt(&mut t, slot, now);
                         // The match is on equality, so a store of the counter's own value matches now.
-                        if t.rt_compare[slot] == self.since(now) & RT_MASK {
+                        if self.held.load(Acquire) == RUNNING && t.rt_compare[slot] == self.since(now) & RT_MASK {
                             self.matched(&mut t, slot, now);
                         }
                     }
@@ -585,6 +634,9 @@ impl Pi {
                         let count = value & RT_MASK;
                         self.origin.store((now / TICK).wrapping_sub(count), Release);
                         self.seen.store(0, Relaxed);
+                        if self.held.load(Acquire) != RUNNING {
+                            self.held.store(count, Release);
+                        }
                         self.arm_all(&mut t, now);
                     }
                 }
@@ -707,6 +759,7 @@ impl Pi {
         t.profile_compare = 0;
         self.origin.store(now / TICK, Release);
         self.seen.store(0, Relaxed);
+        self.held.store(RUNNING, Release);
         self.arm_all(&mut t, now);
         self.schedule(&t);
         self.drive(&mut out, levels);

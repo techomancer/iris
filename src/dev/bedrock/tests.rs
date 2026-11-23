@@ -157,6 +157,54 @@ fn the_pi_hot_reads_take_no_lock() {
     });
 }
 
+/// A node's counters hold while neither its own nor a driven global clock runs them, and a counter
+/// stored then takes effect only when the clock restarts.
+#[test]
+fn counters_loaded_while_their_clock_is_stopped_count_together() {
+    let clock = crate::clock::Clock::stepped();
+    let nodes: Vec<Rig> = (0..2).map(|n| Rig::on(clock.clone(), Population::SINGLE.with_first_cpu(n))).collect();
+    nodes[0].chip.connect_peer(&nodes[1].chip);
+    nodes[1].chip.connect_peer(&nodes[0].chip);
+    let ctrl = lb::BASE + lb::RT_LOCAL_CTRL::OFFSET;
+    let count = |n: usize| nodes[n].r(pi::RT_COUNTER::OFFSET);
+    nodes[0].set_time(8_000);
+    // The reset control uses the internal clock; node 0 now drives the global clock, node 1 follows it.
+    nodes[0].w(ctrl, 0x1_0000_04f1);
+    nodes[1].w(ctrl, 0x4f0);
+    nodes[0].set_time(16_000);
+    assert_eq!((count(0), count(1)), (20, 20), "a follower counts the driven clock");
+    nodes[0].w(ctrl, 0x4f0);
+    nodes[0].set_time(24_000);
+    assert_eq!((count(0), count(1)), (20, 20), "with no clock driven both hold");
+    nodes[0].w(pi::RT_COUNTER::OFFSET, 100);
+    nodes[0].set_time(40_000);
+    nodes[1].w(pi::RT_COUNTER::OFFSET, 100);
+    nodes[0].set_time(48_000);
+    assert_eq!((count(0), count(1)), (100, 100), "a store to a held counter does not move it");
+    nodes[0].w(ctrl, 0x1_0000_04f1);
+    nodes[0].set_time(56_000);
+    assert_eq!((count(0), count(1)), (110, 110));
+}
+
+/// A node that stops driving the global clock stops the node following it, though only the
+/// first node reset.
+#[test]
+fn a_reset_node_that_drove_the_global_clock_stops_its_follower() {
+    let clock = crate::clock::Clock::stepped();
+    let nodes: Vec<Rig> = (0..2).map(|n| Rig::on(clock.clone(), Population::SINGLE.with_first_cpu(n))).collect();
+    nodes[0].chip.connect_peer(&nodes[1].chip);
+    nodes[1].chip.connect_peer(&nodes[0].chip);
+    let ctrl = lb::BASE + lb::RT_LOCAL_CTRL::OFFSET;
+    nodes[0].w(ctrl, 0x1_0000_04f1);
+    nodes[1].w(ctrl, 0x4f0);
+    nodes[0].set_time(16_000);
+    assert_eq!(nodes[1].r(pi::RT_COUNTER::OFFSET), 20);
+    Resettable::power_on(&*nodes[0].chip);
+    nodes[0].set_time(24_000);
+    assert_eq!(nodes[1].r(pi::RT_COUNTER::OFFSET), 20, "the follower holds");
+    assert_eq!(nodes[0].r(pi::RT_COUNTER::OFFSET), 10, "the reset node counts from zero");
+}
+
 /// With MD's cell register bit 0 clear the window refuses every access; padding and past-window
 /// accesses are bus errors.
 #[test]
@@ -532,7 +580,10 @@ impl Rig {
         Self::with(Population::populated_cpus(4).unwrap())
     }
     pub(super) fn with(processors: Population) -> Self {
-        let clock = crate::clock::Clock::stepped();
+        Self::on(crate::clock::Clock::stepped(), processors)
+    }
+    /// A node on `clock`, which other nodes may share.
+    pub(super) fn on(clock: crate::clock::Clock, processors: Population) -> Self {
         // The manager is dropped at the end: the comparator timers never run, and tests deliver them by hand.
         let timers = Arc::new(TimerManager::with_clock(clock.clone()));
         let (events, receiver) = std::sync::mpsc::channel();
