@@ -1340,7 +1340,7 @@ impl Hpc3 {
         let seeq_irq = irqs.line(HPC3_INTSTAT_ENET_DEV);
         let net_base = gateway_cfg.clone();
         let link = Link::with_gateway(gateway_cfg.clone());
-        let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
+        let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()).with_clock(tm.clock().clone()));
         match link {
             Ok(Some(link)) => seeq.attach(link),
             Ok(None) => {}

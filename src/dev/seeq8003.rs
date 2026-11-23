@@ -209,6 +209,8 @@ pub struct Seeq8003 {
     /// How long a hold lasts before the frame goes in (`RX_HOLD_LAST_MAX`;
     /// tests shorten it).
     hold_last_max: Duration,
+    /// Times the hold.
+    clock: crate::clock::Clock,
     config:   GatewayConfig,
     running:  Arc<AtomicBool>,
     /// The network backend: see [`Net`].
@@ -305,11 +307,18 @@ impl Seeq8003 {
             in_reset: Arc::new(AtomicBool::new(false)),
             rx_holding: Arc::new(AtomicBool::new(false)),
             hold_last_max: RX_HOLD_LAST_MAX,
+            clock: crate::clock::Clock::new(),
             config,
             running:  Arc::new(AtomicBool::new(false)),
             net:      Mutex::new(Net { session: Default::default(), rx_wake: None, reporter: None, frames: None, nat: NatControl::new() }),
             heartbeat,
         }
+    }
+
+    /// Time receive holds on the machine clock.
+    pub fn with_clock(mut self, clock: crate::clock::Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Connect to the backend `[network]` selected. It runs from `start` to
@@ -737,7 +746,8 @@ impl Device for Seeq8003 {
         let heartbeat_enet = self.heartbeat.clone();
         let rx_holding    = self.rx_holding.clone();
         let hold          = self.config.rx_hold;
-        let hold_last_max = self.hold_last_max;
+        let hold_last_max = self.hold_last_max.as_nanos() as u64;
+        let clock = self.clock.clone();
         thread::Builder::new().name("seeq-enet".into()).spawn(move || {
             let mut tx_prod = tx_prod;
             let mut rx_cons = rx_cons;
@@ -760,7 +770,7 @@ impl Device for Seeq8003 {
             const ENET_POLL_MAX: Duration = Duration::from_millis(50);
             let mut poll = Duration::from_millis(1);
             // When the frame now held on the last descriptor was first held.
-            let mut held_last_since: Option<std::time::Instant> = None;
+            let mut held_last_since: Option<u64> = None;
             while running_enet.load(Ordering::Relaxed) {
                 let mut notified = false;
                 // Wait for an RX frame from NAT (or a TX kick), or the poll
@@ -793,7 +803,7 @@ impl Device for Seeq8003 {
                 let rx_result = if let Some(ref dma) = rx_dma {
                     let mut r = RxPumpResult::Nothing;
                     for _ in 0..RX_DRAIN_CAP {
-                        let hold_last = held_last_since.map_or(true, |t| t.elapsed() < hold_last_max);
+                        let hold_last = held_last_since.map_or(true, |t| clock.now().saturating_sub(t) < hold_last_max);
                         match Self::pump_rx(dma, &mut rx_cons, rx_cmd_snap, station_addr_snap, &in_reset_enet, hold, hold_last) {
                             RxPumpResult::Filtered => { filtered += 1; continue }   // chatter discarded; keep draining
                             other => { r = other; break; }        // Delivered / Lost / Held / Nothing
@@ -830,7 +840,7 @@ impl Device for Seeq8003 {
                 let held = matches!(rx_result, RxPumpResult::Held);
                 if !held {
                     if let Some(t) = held_last_since.take() {
-                        st.rx_hold_timeouts += (t.elapsed() >= hold_last_max) as u64;
+                        st.rx_hold_timeouts += (clock.now().saturating_sub(t) >= hold_last_max) as u64;
                     }
                 }
                 if held && !rx_holding.swap(true, Ordering::Relaxed) {
@@ -857,7 +867,7 @@ impl Device for Seeq8003 {
                         Self::load_rx_overflow(&mut st);
                     }
                     RxPumpResult::Held => {
-                        held_last_since.get_or_insert_with(std::time::Instant::now);
+                        held_last_since.get_or_insert_with(|| clock.now());
                     }
                     RxPumpResult::Lost => {
                         st.rx_lost += 1;
@@ -1353,6 +1363,28 @@ mod tests {
         seeq.write(SEEQ_RX_REG, rx_cmd::MATCH_STA_BCAST | rx_cmd::INTOVERFLOW);
         seeq.rx_overflow();
         assert_eq!(seeq.get_rx_status(), rx_stat::OVERFLOW);
+    }
+
+    /// The hold is timed on the machine clock: it outlasts any amount of host time.
+    #[test]
+    fn a_hold_waits_for_the_machine_clock() {
+        let ring = Arc::new(Ring::default());
+        *ring.room.lock() = RxRoom::Last;
+        let board = crate::test_board::Stepped::new();
+        let seeq = Arc::new(Seeq8003::new(None, Some(ring.clone()), None, Arc::new(AtomicU64::new(0))).with_clock(board.clock.clone()));
+        seeq.write(SEEQ_RX_REG, rx_cmd::MATCH_STA_BCAST);
+        let (link, _sent, mut inject) = Link::loopback();
+        let wake = link.rx_wake();
+        seeq.attach(link);
+        inject.push(vec![0xff; 60]).unwrap();
+        seeq.start();
+        wake.notify();
+        wait_for("the hold", || seeq.state.lock().rx_holds == 1);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(*ring.filled.lock(), 0, "the host clock must not time out the hold");
+        board.step(RX_HOLD_LAST_MAX.as_nanos() as u64);
+        wait_for("the held frame to go", || *ring.filled.lock() == 1);
+        seeq.stop();
     }
 
     /// A hold gives up after `hold_last_max`, so a driver that leaves the
