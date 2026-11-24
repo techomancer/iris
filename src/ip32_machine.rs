@@ -1026,10 +1026,11 @@ impl O2Display {
 
 impl crate::display::Head for O2Display {
     /// GBE scans RAM the CPU and the rendering engine write with no mark
-    /// the display could test, so every frame is looked at: the scan-out
-    /// finds what changed (`compose` answers `Unchanged` when nothing did).
+    /// the display could test, so every frame is looked at while someone
+    /// watches: the scan-out finds what changed (`compose` answers
+    /// `Unchanged` when nothing did). Headless, nothing would see it.
     fn changed(&self) -> bool {
-        true
+        self.head.watched()
     }
 
     /// The frame rate is the guest's: GBE's frame size at its dot clock.

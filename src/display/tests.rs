@@ -578,3 +578,14 @@ fn the_thread_runs_and_stops() {
     assert!(handle.retraces() > n);
     handle.stop();
 }
+
+#[test]
+fn a_head_is_watched_by_a_window_or_a_reader() {
+    let rig = Rig::new();
+    let (_head, handle) = rig.head("a");
+    assert!(handle.watched());
+    *handle.renderer_slot().lock() = None;
+    assert!(!handle.watched());
+    handle.request_frame();
+    assert!(handle.watched());
+}

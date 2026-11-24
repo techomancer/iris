@@ -383,6 +383,11 @@ impl HeadHandle {
         }
     }
 
+    /// A window shows the frames, or a reader waits for one.
+    pub fn watched(&self) -> bool {
+        Slot::readback_wanted(self) || self.renderer.lock().is_some()
+    }
+
     /// What a compose would be asked for now.
     pub fn want(&self) -> Want {
         let readback = Slot::readback_wanted(self);
