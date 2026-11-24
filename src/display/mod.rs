@@ -517,7 +517,7 @@ impl HeadHandle {
         if on {
             self.capture.fetch_add(1, Ordering::AcqRel);
         } else {
-            let _ = self.capture.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+            let _ = self.capture.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
         }
     }
 

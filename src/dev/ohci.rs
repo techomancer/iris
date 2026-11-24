@@ -210,7 +210,7 @@ impl Ohci {
     pub fn sync_clock(&self) {
         let now = self.timer.now();
         let mut elapsed = 0;
-        let _ = self.anchor.fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+        let _ = self.anchor.try_update(Ordering::AcqRel, Ordering::Acquire, |at| {
             elapsed = now.saturating_sub(at) / 1_000_000;
             (elapsed != 0).then(|| at + elapsed * 1_000_000)
         });

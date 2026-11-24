@@ -26,9 +26,13 @@ pub(crate) fn fuel_config(dir: &Path) -> MachineConfig {
     cfg.scsi.clear();
     cfg
 }
-/// A Tezro of `cpus` processors, its listening ports left to any free one.
+/// A Tezro of `cpus` processors, its listening ports left to any free one. It has the 1 GiB four
+/// processors need, not the 4 GiB default: Windows commits a machine's RAM when it is built, and
+/// tests running side by side with 4 GiB each fill a CI runner's page file.
 pub(crate) fn tezro_config(dir: &Path, cpus: u8) -> MachineConfig {
     let mut cfg = headless(dir, MachineProfile::TezroIp53);
+    cfg.banks = crate::config::banks_from4([512, 512, 0, 0]);
+    cfg.banks_set = true;
     cfg.machine.cpus = Some(cpus);
     cfg.tezro.l1_port = Some(0);
     (cfg.tezro.serial_port_c, cfg.tezro.serial_port_d) = (Some(0), Some(0));

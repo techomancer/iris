@@ -933,13 +933,11 @@ fn a_slice_polling_the_others_comparator_is_held_until_both_have_seen_the_code()
         assert_eq!(poll(pi, 0), reg::PI_RT_COMPARE_A::RESET);
     });
     assert!(held(1));
+    // Each step runs the hold's check when its timer comes due.
     t.clock.step(POLL_CHECK_NS);
-    let due = t.pi.state.lock().hold_due.unwrap();
-    t.pi.expire(3, due);
     assert!(held(1), "the other slice has retired nothing and little time has passed");
+    assert!(t.pi.state.lock().hold_due.is_some(), "the check looks again later");
     t.clock.step(SAFETY_NS);
-    let due = t.pi.state.lock().hold_due.unwrap();
-    t.pi.expire(3, due);
     assert!(!held(1), "the PROM's own bound decides");
 }
 

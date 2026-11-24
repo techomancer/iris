@@ -1061,7 +1061,7 @@ impl<
             let p = unsafe { base.add((phys_addr & !7) as usize) as *mut u64 };
             let (v, m) = (val.rotate_left(32), mask.rotate_left(32));
             let word = unsafe { std::sync::atomic::AtomicU64::from_ptr(p) };
-            let _ = word.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed, |cur| {
+            let _ = word.try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed, |cur| {
                 Some((cur & !m) | (v & m))
             });
             self.bump_gen(phys_addr);

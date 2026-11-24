@@ -722,7 +722,9 @@ fn the_l1_names_an_attached_vpro_in_component_2() {
 #[test]
 fn the_cached_view_swaps_ram_above_4_gib() {
     let dir = TempPath::dir("tezro-cas");
-    with_machine(tezro_config(&dir, 4), |m| {
+    let mut cfg = tezro_config(&dir, 4);
+    cfg.banks = [1024, 1024, 512, 512, 512, 512, 0, 0];
+    with_machine(cfg, |m| {
         let chip = &m.nodes[0].chip;
         // Banks 0 to 5: two 1 GiB banks and four of 512 MiB, as MD's tests set them.
         assert_eq!(chip.registers().write64(crate::dev::bedrock::regs::md::BASE + 8, 0x53 | (0x43 << 8) | (0x43 << 16)), BUS_OK);

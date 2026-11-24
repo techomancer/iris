@@ -581,7 +581,7 @@ impl BusDevice for PpMemory {
             let m = mask.rotate_left(32);
             // Compare-exchange: another CPU or a DMA engine may store to the
             // rest of this doubleword meanwhile.
-            let _ = AtomicU64::from_ptr(p).fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+            let _ = AtomicU64::from_ptr(p).try_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
                 Some((old & !m) | (v & m))
             });
         }

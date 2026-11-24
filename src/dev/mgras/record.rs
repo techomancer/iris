@@ -504,6 +504,7 @@ pub(super) mod tests {
         let mut scan_bad: Vec<String> = Vec::new();
         // MGRAS_REPLAY_NOSCAN=1: no scan-out comparisons (timing).
         let scan = std::env::var("MGRAS_REPLAY_NOSCAN").is_err();
+        #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
         let mut compare = |m: &Mgras| {
             #[cfg(feature = "wgpu")]
             if let Some((n, first)) = if scan { m.compare_scanouts() } else { None } {

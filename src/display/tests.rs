@@ -44,7 +44,7 @@ impl Head for TestHead {
         self.say(&format!("line{line}.{field}"));
     }
     fn capture(&self, _screen: &mut Rex3Screen, _want: Want) -> bool {
-        if self.not_ready.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        if self.not_ready.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
             self.say("notready");
             return false;
         }
