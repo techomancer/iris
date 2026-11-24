@@ -499,10 +499,7 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). The SCC's channels start wired to
         // nothing; each gets its host end below.
-        #[cfg(feature = "ci_clock")]
-        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
-        #[cfg(not(feature = "ci_clock"))]
-        let timer_manager = Arc::new(TimerManager::new());
+        let timer_manager = Arc::new(TimerManager::with_clock(cfg.machine_clock()));
         mc.set_clock(timer_manager.clock().clone());
         let ioc = Ioc::new_for_profile(&timer_manager, guinness, cfg.machine.profile.ip28());
         ioc.ps2().set_layout(cfg.keyboard);
@@ -1036,7 +1033,6 @@ impl Machine {
             }
         }
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
-        #[cfg(feature = "ci_clock")]
         timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
 
         // Inject the CPU/self handles jitv2's compile-thread worker needs to

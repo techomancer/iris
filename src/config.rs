@@ -2024,6 +2024,31 @@ pub struct ClockConfig {
     /// is independent of this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_mhz: Option<f64>,
+    /// What guest time follows. `host` runs the guest's clocks on the host's,
+    /// so a loop the JIT has compiled takes less guest time than the
+    /// interpreted loop IRIX timed to calibrate its delays. `instructions`
+    /// counts retired instructions, `insn_ns` each, which keeps that
+    /// calibration right at any speed. One processor only, on the Indy and
+    /// Indigo2. Unset is `host`, except in a `ci_clock` build, where the Indy
+    /// and Indigo2 run on instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<ClockTime>,
+    /// Instruction time: guest nanoseconds per retired instruction, a whole
+    /// number. 10 is 100 MIPS.
+    #[serde(default = "default_insn_ns")]
+    pub insn_ns: u64,
+}
+
+/// What guest time follows ([`ClockConfig::time`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClockTime {
+    Host,
+    Instructions,
+}
+
+fn default_insn_ns() -> u64 {
+    crate::cpu::mips_core::NS_PER_GUEST_CYCLE
 }
 
 impl ClockConfig {
@@ -2035,7 +2060,7 @@ impl ClockConfig {
 
 impl Default for ClockConfig {
     fn default() -> Self {
-        Self { fixed_mhz: None }
+        Self { fixed_mhz: None, time: None, insn_ns: default_insn_ns() }
     }
 }
 
@@ -3634,6 +3659,25 @@ impl MachineConfig {
         self.node_boards() * usize::from(self.machine.cpus())
     }
 
+    /// Guest nanoseconds per retired instruction, 0 while guest time follows the host.
+    /// A `ci_clock` build runs the Indy and Indigo2 on instructions unless `[clock] time` says otherwise.
+    pub fn insn_ns(&self) -> u64 {
+        let on = self.clock.time.map_or(
+            cfg!(feature = "ci_clock")
+                && matches!(self.machine.profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28),
+            |t| t == ClockTime::Instructions,
+        );
+        if on { self.clock.insn_ns } else { 0 }
+    }
+
+    /// The machine clock `[clock]` asks for.
+    pub fn machine_clock(&self) -> crate::clock::Clock {
+        match self.insn_ns() {
+            0 => crate::clock::Clock::new(),
+            ns => crate::clock::Clock::counting(ns),
+        }
+    }
+
     /// Load from `iris.toml` if it exists, otherwise return defaults.
     ///
     /// A *missing* file is fine (defaults are used). A file that exists but
@@ -4276,6 +4320,16 @@ impl MachineConfig {
         if let Some(mhz) = self.clock.fixed_mhz {
             if !(mhz > 0.0) || !mhz.is_finite() {
                 return Err(format!("clock.fixed_mhz {} is invalid (must be a positive number)", mhz));
+            }
+        }
+        if self.clock.time == Some(ClockTime::Instructions) {
+            if self.clock.insn_ns == 0 {
+                return Err("clock.insn_ns must be at least 1".into());
+            }
+            let supported = matches!(self.machine.profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22
+                | MachineProfile::Indigo2Ip28);
+            if !supported || self.total_cpus() != 1 {
+                return Err("clock.time = \"instructions\" is for one processor, on the Indy and Indigo2".into());
             }
         }
         if self.graphics.threads == 0 {
@@ -6504,6 +6558,34 @@ mod fuel_input_tests {
         cfg.machine.profile = MachineProfile::IndyIp24;
         cfg.machine.cpu = Some("r4400".into());
         assert!(cfg.validate().unwrap_err().contains("out of range"));
+    }
+}
+
+#[cfg(test)]
+mod instruction_clock_config_tests {
+    use super::*;
+
+    fn parse(toml: &str) -> MachineConfig {
+        toml::from_str(toml).expect("parse")
+    }
+
+    /// Instruction time is opt in: left alone, guest time follows the host.
+    /// Asked for, it takes a whole `insn_ns` and refuses what has no clock
+    /// wired to it.
+    #[test]
+    fn instruction_time_is_opt_in_and_only_on_the_machines_that_have_it() {
+        let cfg = parse("");
+        assert_eq!(cfg.insn_ns(), if cfg!(feature = "ci_clock") { 10 } else { 0 });
+        assert_eq!(parse("[machine]\nprofile = \"origin2000_ip27\"\n").insn_ns(), 0, "only the machines that have it follow a ci_clock default");
+        assert_eq!(parse("[clock]\ntime = \"host\"\n").insn_ns(), 0, "an explicit setting beats the ci_clock default");
+        let on = parse("[clock]\ntime = \"instructions\"\ninsn_ns = 4\n");
+        on.validate().unwrap();
+        assert_eq!(on.insn_ns(), 4);
+        assert!(parse("[clock]\ntime = \"instructions\"\ninsn_ns = 0\n").validate().unwrap_err().contains("insn_ns"));
+        let octane = parse("[clock]\ntime = \"instructions\"\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n");
+        assert!(octane.validate().unwrap_err().contains("one processor"));
+        let origin = parse("[clock]\ntime = \"instructions\"\n[machine]\nprofile = \"origin200_ip29\"\ncpu = \"r10000\"\n");
+        assert!(origin.validate().unwrap_err().contains("one processor"));
     }
 }
 

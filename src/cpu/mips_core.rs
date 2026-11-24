@@ -82,10 +82,9 @@ pub const CAUSE_IP7: u32 = 1 << 15;            // Timer interrupt (IP7)
 pub const DEFAULT_COUNT_HZ: u64 = 33_000_000;
 
 
-/// ci_clock: synthetic nanoseconds per retired instruction (~100 MIPS R4400).
-/// Virtual time is derived from `hot.cycles` instead of the wall clock so the
-/// snapshot determinism validator stays reproducible at any host speed.
-#[cfg(feature = "ci_clock")]
+/// Instruction clock: default nanoseconds per retired instruction (~100 MIPS R4400).
+/// Guest time is derived from `hot.cycles` instead of the host clock, so it
+/// is reproducible at any host speed (`[clock] time = "instructions"`).
 pub const NS_PER_GUEST_CYCLE: u64 = 10;
 
 /// Claim the right to deliver IP7 for the armed deadline `ticket`.
@@ -655,9 +654,9 @@ pub struct MipsCore {
     /// bug this class of mistake already caused once in this same file.
     #[cfg(feature = "jitv2")]
     pub kill_entry_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
-    /// ci_clock: `fire_compare_if_due`, called by compiled code at a cycle
-    /// flush once `hot.cycles` has reached the Compare deadline.
-    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    /// Instruction clock: `fire_compare_if_due`, called by compiled code at a
+    /// cycle flush once `hot.cycles` has reached the Compare deadline.
+    #[cfg(feature = "jitv2")]
     pub ci_compare_fn: unsafe extern "C" fn(*mut core::ffi::c_void),
     /// Developer-only per-instruction hook, called by compiled code at the top
     /// of every instruction's block (right where the interrupt preamble runs —
@@ -968,24 +967,24 @@ pub struct MipsCore {
     /// count is latched at `cp0_count` (reads don't advance it) and the
     /// compare timer is silenced, so monitor `cpu stop` / debugger stepping
     /// sees a frozen Count and no IP7 firing underneath it. Cleared by
-    /// `on_cpu_start`, which re-anchors and re-arms. Ignored under ci_clock
+    /// `on_cpu_start`, which re-anchors and re-arms. Ignored on instruction time
     /// (count follows `hot.cycles` there — debug steps advancing it is the
     /// deterministic behavior CI wants).
     pub(crate) count_paused: bool,
     /// hptimer that delivers the Count==Compare interrupt: its callback sets
     /// IP7 in `hot.interrupts` and bumps `fasttick_count`. Re-armed
     /// (remove + add_one_shot) on every Compare or Count write. None until
-    /// `set_timer_manager` is wired (unit tests, ci_clock builds).
+    /// `set_timer_manager` is wired (unit tests).
     pub(crate) timer_mgr: Option<Arc<crate::hptimer::TimerManager>>,
     pub(crate) timer_id: Option<crate::hptimer::TimerId>,
-    /// ci_clock: `hot.cycles` value the virtual count is anchored at
-    /// (synthetic 10 ns per instruction instead of wall clock, so CI runs
-    /// stay deterministic).
-    #[cfg(feature = "ci_clock")]
+    /// Nanoseconds one retired instruction adds to guest time; 0 keeps guest
+    /// time on the host clock. Set before the CPU runs (`set_instruction_clock`).
+    pub insn_ns: u64,
+    /// Instruction clock: `hot.cycles` value the virtual count is anchored at.
     pub(crate) count_anchor_cycle: u64,
-    /// ci_clock: `hot.cycles` value at which IP7 fires (checked in step()'s
-    /// preamble instead of an hptimer). u64::MAX = disarmed.
-    #[cfg(feature = "ci_clock")]
+    /// Instruction clock: `hot.cycles` value at which IP7 fires, checked at
+    /// each batch and at compiled code's cycle flushes instead of an hptimer.
+    /// u64::MAX = disarmed.
     pub count_fire_cycle: u64,
     /// developer_ip7: total CP0 Compare writes seen, and how many of those
     /// landed behind Count (which arms a full-wrap ~2^32 wait).
@@ -1307,7 +1306,7 @@ unsafe extern "C" fn jit_hooks_not_installed_fetch_verify(_ctx: *mut core::ffi::
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_step(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _bd: u32) {}
 #[cfg(feature = "jitv2_lockstep")]
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_compare(_ctx: *mut core::ffi::c_void) -> u32 { crate::cpu::mips_exec::EXEC_COMPLETE }
-#[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+#[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_ci_compare(_ctx: *mut core::ffi::c_void) {
     panic!("jitv2: ci_compare hook called before MipsExecutor::install_jit_hooks");
 }
@@ -1422,7 +1421,7 @@ impl MipsCore {
             interp_fallback_fn: jit_hooks_not_installed_interp_fallback,
             #[cfg(feature = "jitv2")]
             kill_entry_fn: jit_hooks_not_installed_kill_entry,
-            #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+            #[cfg(feature = "jitv2")]
             ci_compare_fn: jit_hooks_not_installed_ci_compare,
             #[cfg(all(feature = "jitv2", feature = "developer"))]
             dev_trace_bp_fn: jit_hooks_not_installed_dev_trace_bp,
@@ -1502,9 +1501,8 @@ impl MipsCore {
             count_paused: false,
             timer_mgr: None,
             timer_id: None,
-            #[cfg(feature = "ci_clock")]
+            insn_ns: 0,
             count_anchor_cycle: 0,
-            #[cfg(feature = "ci_clock")]
             count_fire_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
             ip7_writes: 0,
@@ -1553,17 +1551,17 @@ impl MipsCore {
             self.cp0_count = 0;
             self.cp0_entryhi = 0;
             self.cp0_compare = 0;
-            self.hot.cycles = 0;
-            // Parked time is part of `cycles`; keep it so, or `retired()`
-            // reads 0 until the new run's cycles pass the old run's parks.
-            self.hot.parked_cycles = 0;
-            self.count_read_cycle = 0;
-            self.count_anchor_instant = std::time::Instant::now();
-            #[cfg(feature = "ci_clock")]
-            {
-                self.count_anchor_cycle = 0;
-                self.count_fire_cycle = u64::MAX;
+            // The instruction clock is guest time, which a reset does not rewind.
+            if self.insn_ns == 0 {
+                self.hot.cycles = 0;
+                // Parked time is part of `cycles`; keep it so, or `retired()`
+                // reads 0 until the new run's cycles pass the old run's parks.
+                self.hot.parked_cycles = 0;
             }
+            self.count_read_cycle = self.hot.cycles;
+            self.count_anchor_instant = std::time::Instant::now();
+            self.count_anchor_cycle = self.hot.cycles;
+            self.count_fire_cycle = u64::MAX;
             self.disarm_compare_timer();
             self.tick_rate.reset(0);
             self.cp0_random = self.tlb_entries - 1;
@@ -1807,25 +1805,26 @@ impl MipsCore {
     /// ends the timer. An overrun deadline is already the write's own case 2
     /// below, which delivers after the ack with a live ticket.
     fn materialize_count(&mut self, deliver_crossing: bool) -> u32 {
-        #[cfg(not(feature = "ci_clock"))]
-        if self.count_paused {
+        if self.insn_ns == 0 && self.count_paused {
             return self.cp0_count as u32;
         }
         let cycles = self.hot.cycles;
         if cycles == self.count_read_cycle {
             return self.cp0_count as u32;
         }
-        #[cfg(feature = "ci_clock")]
-        let elapsed_ns = cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
-        #[cfg(not(feature = "ci_clock"))]
-        let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
+        let elapsed_ns = if self.insn_ns != 0 {
+            cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(self.insn_ns)
+        } else {
+            self.count_anchor_instant.elapsed().as_nanos() as u64
+        };
         let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
         if ticks != 0 {
             let consumed_ns = ((ticks as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
-            #[cfg(feature = "ci_clock")]
-            { self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / NS_PER_GUEST_CYCLE); }
-            #[cfg(not(feature = "ci_clock"))]
-            { self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns); }
+            if self.insn_ns != 0 {
+                self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / self.insn_ns);
+            } else {
+                self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns);
+            }
             let before = self.cp0_count as u32;
             let after = before.wrapping_add(ticks as u32);
             self.cp0_count = after as u64;
@@ -1894,16 +1893,28 @@ impl MipsCore {
     /// Non-mutating variant of `count_now` for debugger/monitor reads: same
     /// computation, but neither the anchor nor the memo state moves.
     pub fn count_peek(&self) -> u32 {
-        #[cfg(not(feature = "ci_clock"))]
-        if self.count_paused {
+        if self.insn_ns == 0 && self.count_paused {
             return self.cp0_count as u32;
         }
-        #[cfg(feature = "ci_clock")]
-        let elapsed_ns = self.hot.cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
-        #[cfg(not(feature = "ci_clock"))]
-        let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
+        let elapsed_ns = if self.insn_ns != 0 {
+            self.hot.cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(self.insn_ns)
+        } else {
+            self.count_anchor_instant.elapsed().as_nanos() as u64
+        };
         let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
         (self.cp0_count as u32).wrapping_add(ticks as u32)
+    }
+
+    /// Put guest time on the instruction clock, `ns` per retired instruction
+    /// (0 is the host clock). Like `set_count_hz`, before the core runs.
+    pub fn set_instruction_clock(&mut self, ns: u64) {
+        self.insn_ns = ns;
+    }
+
+    /// Host nanoseconds a stalled CPU (WAIT, an idle park) takes to retire one
+    /// cycle: the instruction clock's rate, else the 10 ns the host clock assumes.
+    pub fn stall_ns_per_cycle(&self) -> u64 {
+        if self.insn_ns != 0 { self.insn_ns } else { NS_PER_GUEST_CYCLE }
     }
 
     /// Set the CP0 Count frequency. There is no runtime inference: Count
@@ -1954,9 +1965,9 @@ impl MipsCore {
     /// Real-time builds: removes the previous hptimer one-shot and arms a
     /// fresh one whose callback claims this arm's IP7 ticket (see
     /// `claim_ip7`) — so a one-shot the guest has already superseded cannot
-    /// re-raise the interrupt. ci_clock builds: computes the deterministic
-    /// `hot.cycles` value the interrupt fires at instead — step()'s preamble
-    /// checks it.
+    /// re-raise the interrupt. On the instruction clock it computes the
+    /// `hot.cycles` value the interrupt fires at instead, which the run loop
+    /// and compiled code check.
     fn schedule_compare_timer(&mut self) {
         // Real MIPS Count==Compare semantics: IP7 fires when the free-running
         // 32-bit Count becomes numerically equal to Compare. If Count is
@@ -1967,11 +1978,10 @@ impl MipsCore {
         // a deadline we overran) and delivers IP7 itself when warranted; this
         // function only schedules the next architectural match.
         let ns = compare_delay_ns(self.cp0_compare as u32, self.cp0_count as u32, self.count_hz);
-        #[cfg(feature = "ci_clock")]
-        {
-            self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
+        if self.insn_ns != 0 {
+            self.count_fire_cycle = self.hot.cycles.saturating_add(ns / self.insn_ns);
+            return;
         }
-        #[cfg(not(feature = "ci_clock"))]
         {
             if self.count_paused {
                 // CPU is stopped: stay disarmed; on_cpu_start re-arms from
@@ -2036,17 +2046,16 @@ impl MipsCore {
         }
     }
 
-    /// ci_clock: raise IP7 once `hot.cycles` has reached the Compare
+    /// Instruction clock: raise IP7 once `hot.cycles` has reached the Compare
     /// deadline. A threshold, not an edge, so a caller that looks late still
     /// delivers it, once.
-    #[cfg(feature = "ci_clock")]
     #[inline(always)]
     pub(crate) fn fire_compare_if_due(&mut self) {
         if self.hot.cycles >= self.count_fire_cycle {
             // Next architectural match is a full 32-bit Count wrap away;
             // normally a Compare write re-arms much sooner.
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
-            self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
+            self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / self.insn_ns.max(1));
             self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
             crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], true);
             self.fasttick_count.fetch_add(1, Ordering::Relaxed);
@@ -2055,8 +2064,7 @@ impl MipsCore {
 
     /// Cancel any armed Count==Compare interrupt source.
     fn disarm_compare_timer(&mut self) {
-        #[cfg(feature = "ci_clock")]
-        { self.count_fire_cycle = u64::MAX; }
+        self.count_fire_cycle = u64::MAX;
         if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
             tm.remove(id);
         }
@@ -2066,6 +2074,11 @@ impl MipsCore {
     /// has reached its final address (inside the executor's `Arc<Mutex<..>>`)
     /// — the armed timer callback keeps a raw pointer to `hot.interrupts`.
     pub fn set_timer_manager(&mut self, tm: Arc<crate::hptimer::TimerManager>) {
+        // A machine clock that counts instructions puts the core's Count on them too.
+        let ns = tm.clock().insn_ns();
+        if ns != 0 {
+            self.insn_ns = ns;
+        }
         self.timer_mgr = Some(tm);
     }
 
@@ -2076,10 +2089,8 @@ impl MipsCore {
     /// itself refuses to arm — and `on_cpu_start` re-arms.
     pub fn reanchor_count_and_reschedule(&mut self) {
         self.count_read_cycle = self.hot.cycles;
-        #[cfg(feature = "ci_clock")]
-        { self.count_anchor_cycle = self.hot.cycles; }
-        #[cfg(not(feature = "ci_clock"))]
-        { self.count_anchor_instant = std::time::Instant::now(); }
+        self.count_anchor_cycle = self.hot.cycles;
+        self.count_anchor_instant = std::time::Instant::now();
         self.schedule_compare_timer();
     }
 
@@ -2919,6 +2930,7 @@ mod ip7_ticket_tests {
         }
         #[cfg(feature = "ci_clock")]
         {
+            core.set_instruction_clock(NS_PER_GUEST_CYCLE);
             core.hot.cycles = 100_000;
         }
         core
@@ -2936,6 +2948,7 @@ mod ip7_ticket_tests {
         }
         #[cfg(feature = "ci_clock")]
         {
+            core.set_instruction_clock(NS_PER_GUEST_CYCLE);
             let ns = (count_ticks as u128 * 1_000_000_000) / core.count_hz as u128;
             core.hot.cycles = core
                 .hot
@@ -3102,19 +3115,62 @@ mod ip7_ticket_tests {
         assert_ne!(core.cause_for_snapshot() & CAUSE_IP7, 0);
     }
 
-    /// ci_clock Count follows retired cycles, so a stop/start pair must not
-    /// cost the cycles retired since Count was last read: start re-anchors at
-    /// the current cycle, and those ticks were never added to `cp0_count`.
-    #[cfg(feature = "ci_clock")]
+    /// On the instruction clock Count follows retired cycles, so a stop/start
+    /// pair must not cost the cycles retired since Count was last read: start
+    /// re-anchors at the current cycle, and those ticks were never added to
+    /// `cp0_count`.
     #[test]
-    fn ci_clock_stop_and_start_keeps_the_count_the_cycles_earned() {
+    fn instruction_clock_stop_and_start_keeps_the_count_the_cycles_earned() {
         let mut core = MipsCore::default();
+        core.set_instruction_clock(10);
         core.hot.cycles = 100_000;
         let expected = core.count_peek();
         assert_ne!(expected, 0, "the cycles should have earned some ticks");
         core.on_cpu_stop();
         core.on_cpu_start();
         assert_eq!(core.count_peek(), expected, "Count lost the ticks counted before the stop");
+    }
+
+    /// Count on the instruction clock is the retired cycles at `insn_ns` each,
+    /// whatever the host does, and a hard reset does not take guest time back.
+    #[test]
+    fn instruction_clock_count_follows_cycles_and_survives_a_reset() {
+        let mut core = MipsCore::default();
+        core.set_instruction_clock(4);
+        core.hot.cycles = 1_000_000; // 4 ms: 132,000 ticks at 33 MHz
+        assert_eq!(core.count_peek(), 132_000);
+        core.reset(false);
+        assert_eq!(core.hot.cycles, 1_000_000);
+        assert_eq!(core.count_peek(), 0, "Count restarts from the reset");
+        core.hot.cycles += 250_000;
+        assert_eq!(core.count_peek(), 33_000);
+    }
+
+    /// A core's time is the one its machine clock keeps, in every build: a host-clock manager
+    /// leaves it on the host, whatever features the build has.
+    #[test]
+    fn a_core_on_a_host_clock_manager_keeps_host_time() {
+        let mut core = MipsCore::default();
+        assert_eq!(core.insn_ns, 0);
+        core.set_timer_manager(Arc::new(crate::hptimer::TimerManager::new()));
+        assert_eq!(core.insn_ns, 0);
+        core.set_timer_manager(Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting(4))));
+        assert_eq!(core.insn_ns, 4);
+    }
+
+    /// A Compare deadline the cycles have reached raises IP7, once.
+    #[test]
+    fn instruction_clock_deadline_raises_ip7_once() {
+        let mut core = MipsCore::default();
+        core.set_instruction_clock(10);
+        core.count_fire_cycle = 100;
+        core.hot.cycles = 99;
+        core.fire_compare_if_due();
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst) & CAUSE_IP7 as u64, 0);
+        core.hot.cycles = 150;
+        core.fire_compare_if_due();
+        assert_ne!(core.hot.interrupts.load(Ordering::SeqCst) & CAUSE_IP7 as u64, 0);
+        assert!(core.count_fire_cycle > 150, "the next match is a Count wrap away");
     }
 
     /// The overrun case still delivers -- suppressing the crossing must not

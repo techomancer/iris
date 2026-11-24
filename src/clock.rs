@@ -9,9 +9,9 @@ struct Inner {
     /// The reading while stopped.
     held: AtomicU64,
     stopped: AtomicBool,
-    /// ci_clock, the Indy's clock only: the source is the first CPU's retired instructions.
-    #[cfg(feature = "ci_clock")]
+    /// The instruction clock: the source is the first CPU's retired instructions, `insn_ns` each.
     cycles: Option<std::sync::OnceLock<crate::cpu::mips_core::CyclesPtr>>,
+    insn_ns: u64,
     #[cfg(test)]
     stepped: Option<AtomicU64>,
     /// Runs before every reading, so a test can act at the moment the clock is read.
@@ -37,22 +37,24 @@ impl Clock {
         if let Some(s) = &self.0.stepped {
             return s.load(Relaxed);
         }
-        #[cfg(feature = "ci_clock")]
         if let Some(c) = &self.0.cycles {
-            return c.get().map_or(0, |c| c.get()).wrapping_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+            return c.get().map_or(0, |c| c.get()).wrapping_mul(self.0.insn_ns);
         }
         crate::platform::get_host_ticks()
     }
 
-    /// A clock that counts the CPU's instructions once `set_cpu_cycles` gives it the counter.
-    #[cfg(feature = "ci_clock")]
-    pub fn counting() -> Self {
-        Clock(Arc::new(Inner { cycles: Some(Default::default()), ..Default::default() }))
+    /// A clock that counts the CPU's instructions, `insn_ns` each, once `set_cpu_cycles` gives it the counter.
+    pub fn counting(insn_ns: u64) -> Self {
+        Clock(Arc::new(Inner { cycles: Some(Default::default()), insn_ns, ..Default::default() }))
     }
 
-    #[cfg(feature = "ci_clock")]
     pub fn set_cpu_cycles(&self, cycles: crate::cpu::mips_core::CyclesPtr) {
         let _ = self.0.cycles.as_ref().map(|o| o.set(cycles));
+    }
+
+    /// Nanoseconds each retired instruction adds, or 0 if this clock follows the host.
+    pub fn insn_ns(&self) -> u64 {
+        if self.0.cycles.is_some() { self.0.insn_ns } else { 0 }
     }
 
     pub fn now(&self) -> u64 {
@@ -123,6 +125,20 @@ mod tests {
             assert_eq!(decode(encode(Some(t))), Some(t));
         }
         assert_eq!(decode(0), None);
+    }
+
+    #[test]
+    fn a_counting_clock_follows_the_cycles_and_not_the_host() {
+        let cycles = std::cell::UnsafeCell::new(0u64);
+        let c = Clock::counting(4);
+        c.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
+        assert_eq!(c.insn_ns(), 4);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(c.now(), 0);
+        // SAFETY: only this thread writes it; the clock reads it here, between.
+        unsafe { *cycles.get() = 1_000 };
+        assert_eq!(c.now(), 4_000);
+        assert_eq!(Clock::new().insn_ns(), 0);
     }
 
     #[test]

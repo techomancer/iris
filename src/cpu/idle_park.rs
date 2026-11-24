@@ -94,18 +94,14 @@ const PEER_SLICE_DEFAULT_NS: u64 = 100_000;
 /// `PEER_SLICE_NS << PEER_BACKOFF_MAX`: hand-offs stay quick while the guest
 /// is busy and a settled idle guest wakes about once a millisecond.
 const PEER_BACKOFF_MAX: u32 = 3;
-/// Host-pacing rate for `hot.cycles` while the CPU is parked: one guest cycle
-/// per 10 ns of real time, the rate `NS_PER_GUEST_CYCLE` names under
-/// `ci_clock`. In every build this keeps cross-thread cycle readers
-/// (WD33C93A's deferred-interrupt spin, CP0 Random) moving during a park.
-const STALL_NS_PER_CYCLE: u64 = 10;
-/// Move `hot.cycles` on by a park's host time, and record that those cycles
-/// were not instructions. Guest-visible timing (Count under `ci_clock`,
-/// CP0 Random, the cycle-reading device spins) follows `hot.cycles` exactly
-/// as before; only the status bars' MIPS reads `CyclesPtr::retired`, which
-/// leaves them out.
+/// Move `hot.cycles` on by a park's host time, one guest cycle per
+/// `stall_ns_per_cycle`, and record that those cycles were not instructions.
+/// This keeps cross-thread cycle readers (WD33C93A's deferred-interrupt spin,
+/// CP0 Random) moving during a park. Guest-visible timing (Count on the
+/// instruction clock, the cycle-reading device spins) follows `hot.cycles`;
+/// only the status bars' MIPS reads `CyclesPtr::retired`, which leaves them out.
 fn advance_parked(core: &mut MipsCore, elapsed_ns: u64) {
-    let cycles = elapsed_ns / STALL_NS_PER_CYCLE;
+    let cycles = elapsed_ns / core.stall_ns_per_cycle();
     core.hot.cycles = core.hot.cycles.wrapping_add(cycles);
     core.hot.parked_cycles = core.hot.parked_cycles.wrapping_add(cycles);
 }
@@ -915,10 +911,9 @@ impl IdleParkState {
                 PARK_WAKE_KICK.fetch_add(1, Ordering::Relaxed);
                 break;
             }
-            // ci_clock has no hptimer — the fire point is a cycles threshold
-            // checked in step()'s preamble, so stop parking once we cross it.
-            #[cfg(feature = "ci_clock")]
-            if core.hot.cycles >= core.count_fire_cycle {
+            // The instruction clock has no hptimer: the fire point is a cycles
+            // threshold the run loop checks, so stop parking once we cross it.
+            if core.insn_ns != 0 && core.hot.cycles >= core.count_fire_cycle {
                 break;
             }
 
@@ -997,7 +992,7 @@ impl IdleParkState {
     /// Unlike [`IdleParkState::park`], this never waits indefinitely: it
     /// sleeps at most one slice per call, so there is no deadlock risk when
     /// nothing can wake the CPU. `hot.cycles` advances during the sleep at the host-pacing
-    /// rate (`STALL_NS_PER_CYCLE`), so cross-thread cycle readers keep seeing
+    /// rate (`stall_ns_per_cycle`), so cross-thread cycle readers keep seeing
     /// progress and, under `ci_clock`, the Compare threshold still arrives.
     /// The sleep ends at once when `running` is cleared (monitor command /
     /// soft reset), when an interrupt becomes deliverable, when the guest
@@ -1030,10 +1025,9 @@ impl IdleParkState {
             if ie && im != 0 {
                 break;
             }
-            // ci_clock: stop once the compare deadline is reached, so the run
-            // loop can deliver IP7.
-            #[cfg(feature = "ci_clock")]
-            if core.hot.cycles >= core.count_fire_cycle {
+            // Instruction clock: stop once the compare deadline is reached, so
+            // the run loop can deliver IP7.
+            if core.insn_ns != 0 && core.hot.cycles >= core.count_fire_cycle {
                 break;
             }
             let t0 = Instant::now();
@@ -1754,11 +1748,11 @@ mod wake_tests {
     /// raising a line: the callback sets IP7 in `hot.interrupts`, and `park`
     /// exits on any pending line. The Compare deadline is the hptimer
     /// one-shot armed by `schedule_compare_timer`.
-    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn an_armed_compare_timer_ends_the_park() {
         let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
+        core.set_instruction_clock(0);
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
         core.set_timer_manager(Arc::new(crate::hptimer::TimerManager::new()));
         // Arm Compare a few Count ticks ahead: about 1 us at 33 MHz. park's
@@ -1781,14 +1775,14 @@ mod wake_tests {
         );
     }
 
-    /// Under `ci_clock` there is no host timer: the Compare deadline is a
-    /// `hot.cycles` threshold, and the park must stop once the advancing cycle
-    /// counter crosses it so the run loop can deliver IP7.
-    #[cfg(feature = "ci_clock")]
+    /// On the instruction clock there is no host timer: the Compare deadline
+    /// is a `hot.cycles` threshold, and the park must stop once the advancing
+    /// cycle counter crosses it so the run loop can deliver IP7.
     #[test]
-    fn ci_clock_cycle_compare_threshold_ends_the_park() {
+    fn instruction_clock_cycle_compare_threshold_ends_the_park() {
         let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
+        core.set_instruction_clock(10);
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
         core.cp0_compare = 1;
         core.count_fire_cycle = core.hot.cycles + 300_000; // 3 ms at 10 ns/cycle
@@ -1923,7 +1917,7 @@ mod retired_tests {
         let p = ptr(&core);
         assert_eq!(p.retired(), 1_000);
         advance_parked(&mut core, 1_000_000);
-        assert_eq!(core.hot.cycles, 1_000 + 1_000_000 / STALL_NS_PER_CYCLE);
+        assert_eq!(core.hot.cycles, 1_000 + 1_000_000 / core.stall_ns_per_cycle());
         assert_eq!(p.get(), core.hot.cycles, "timing readers still see the park");
         assert_eq!(p.retired(), 1_000, "a park retires nothing");
         core.hot.cycles += 50;
@@ -1951,12 +1945,13 @@ mod retired_tests {
         assert_eq!(p.retired(), 7);
     }
 
-    /// A hard reset starts the cycle counter again from 0; the parked part
+    /// On the host clock a hard reset starts the cycle counter again from 0; the parked part
     /// must go with it, or the bars read 0 MIPS after a reboot for as long
     /// as the previous run spent parked.
     #[test]
     fn a_reset_starts_the_retired_count_again() {
         let mut core = MipsCore::default();
+        core.set_instruction_clock(0);
         core.hot.cycles = 1_000;
         advance_parked(&mut core, 1_000_000);
         let p = ptr(&core);

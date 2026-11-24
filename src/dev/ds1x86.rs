@@ -620,13 +620,12 @@ mod tests {
         rtc.regs_to_centiseconds(&d.regs, 0) as i64 / 100
     }
 
-    /// Under `ci_clock` the clock runs on the cycle count, as CP0 Count does,
-    /// so it reads the same however long the host took.
-    #[cfg(feature = "ci_clock")]
+    /// On the instruction clock the clock runs on the cycle count, as CP0
+    /// Count does, so it reads the same however long the host took.
     #[test]
-    fn ci_clock_time_follows_the_cycle_count() {
+    fn instruction_clock_time_follows_the_cycle_count() {
         let path = std::env::temp_dir().join(format!("ds1x86-ci-clock-{}", std::process::id()));
-        let rtc = Ds1x86::new(8192, path.to_str().unwrap().to_string(), RtcOffset::default(), Clock::counting());
+        let rtc = Ds1x86::new(8192, path.to_str().unwrap().to_string(), RtcOffset::default(), Clock::counting(10));
         let cycles = std::cell::UnsafeCell::new(0u64);
         rtc.clock.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
         set_2004(&rtc);

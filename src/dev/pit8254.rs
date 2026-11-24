@@ -654,14 +654,13 @@ mod tests {
         pit.stop();
     }
 
-    /// Under `ci_clock` channel 2 counts on the cycle count, so it holds the
-    /// same count however long the host took.
-    #[cfg(feature = "ci_clock")]
+    /// On the instruction clock channel 2 counts on the cycle count, so it
+    /// holds the same count however long the host took.
     #[test]
-    fn ci_clock_counts_follow_the_cycle_count() {
+    fn instruction_clock_counts_follow_the_cycle_count() {
         let _lock = SERIAL.lock().unwrap();
         let cycles = std::cell::UnsafeCell::new(0u64);
-        let tm = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
+        let tm = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting(10)));
         let pit = Pit8254::new(&tm, 1_000_000, None, None, None);
         tm.clock().set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
         pit.start();

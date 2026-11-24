@@ -1014,6 +1014,9 @@ impl Codegen {
         if self.jit_consts.single_clears_upper {
             s.push_str(" single_zx=1");
         }
+        if self.jit_consts.instruction_clock {
+            s.push_str(" icount=1");
+        }
         let _ = write!(s, " cvt_l={} cvt_from_l={}", self.jit_consts.cvt_l_range_bits, self.jit_consts.cvt_from_l_range_bits);
         s.push_str(" ops=");
         s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
@@ -3115,10 +3118,9 @@ fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset, stat
     ctx.builder.ins().jump(exit_block, &[ir::BlockArg::Value(ctx.core_ptr), ir::BlockArg::Value(word_offset_val), ir::BlockArg::Value(status_val)]);
 }
 
-/// `ci_clock` has no timer thread: the Compare deadline is a `hot.cycles`
-/// threshold, tested at each cycle flush. Once due, `ci_compare_fn` raises
-/// IP7 in `hot.interrupts`.
-#[cfg(feature = "ci_clock")]
+/// On the instruction clock there is no timer thread: the Compare deadline is
+/// a `hot.cycles` threshold, tested at each cycle flush. Once due,
+/// `ci_compare_fn` raises IP7 in `hot.interrupts`.
 fn emit_ci_clock_deadline(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
@@ -3854,12 +3856,10 @@ fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_P
 /// flush half of `emit_account_for_cycles`, for a point that must flush
 /// without retiring a word of its own.
 fn emit_flush_cycles(ctx: &mut EmitCtx) {
-    #[cfg(feature = "ci_clock")]
     let advanced = *ctx.cycles_pending != 0;
     emit_store_pending_cycles(ctx);
     *ctx.cycles_pending = 0;
-    #[cfg(feature = "ci_clock")]
-    if advanced {
+    if advanced && ctx.jit_consts.instruction_clock {
         emit_ci_clock_deadline(ctx);
     }
 }
@@ -4711,6 +4711,9 @@ pub struct JitConsts {
     /// this N, where 63 is every long (`CpuModel::CVT_FROM_L_RANGE_BITS`);
     /// the rest take the callout, which raises Unimplemented Operation.
     pub cvt_from_l_range_bits: u8,
+    /// Guest time is retired instructions: each cycle flush tests the Compare
+    /// deadline. Published and fingerprinted like `lwr_keeps_upper`.
+    pub instruction_clock: bool,
 }
 
 /// Nothing published yet, and the R4400's model choices: the `CpuModel`
@@ -4722,6 +4725,7 @@ impl Default for JitConsts {
             core: None,
             lwr_keeps_upper: false,
             single_clears_upper: false,
+            instruction_clock: false,
             cvt_l_range_bits: 53,
             cvt_from_l_range_bits: 52,
         }

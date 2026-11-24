@@ -2286,13 +2286,13 @@ mod tests {
         assert_eq!(exec.core.read_gpr(2), 7, "released, the instruction runs");
     }
 
-    /// Under `ci_clock` a WAIT stall runs no steps, so the stall must raise
-    /// IP7 when it passes the Compare deadline. A soft reset after 1 s stops
-    /// a regression instead of hanging.
-    #[cfg(feature = "ci_clock")]
+    /// On the instruction clock a WAIT stall runs no steps, so the stall must
+    /// raise IP7 when it passes the Compare deadline. A soft reset after 1 s
+    /// stops a regression instead of hanging.
     #[test]
-    fn ci_clock_wait_wakes_on_the_compare_deadline() {
+    fn instruction_clock_wait_wakes_on_the_compare_deadline() {
         let (mut exec, _) = create_executor();
+        exec.core.set_instruction_clock(10);
         exec.core.pc = 0xFFFF_FFFF_8000_1000;
         exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE
             | (1 << (crate::cpu::mips_core::STATUS_IM_SHIFT + 7));
@@ -8158,11 +8158,11 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(5)).expect("second stop did not return");
     }
 
-    /// Under `ci_clock` no timer thread raises IP7, and a spin on one `beq`
-    /// never leaves compiled code, so compiled code must test the deadline.
-    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    /// On the instruction clock no timer thread raises IP7, and a spin on one
+    /// `beq` never leaves compiled code, so compiled code must test the deadline.
+    #[cfg(feature = "jitv2")]
     #[test]
-    fn ci_clock_a_compiled_spin_takes_the_compare_deadline() {
+    fn instruction_clock_a_compiled_spin_takes_the_compare_deadline() {
         use crate::cpu::mips_core::{STATUS_EXL, STATUS_IE, STATUS_IM_SHIFT};
         use crate::cpu::smp::HOST_PARK_BIT;
         use std::sync::atomic::Ordering;
@@ -8172,6 +8172,7 @@ mod tests {
             MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
         exec.jitv2_inline_compile = true;
         // Compiled code calls the Compare hook at a cycle flush.
+        exec.core.set_instruction_clock(10);
         exec.install_jit_hooks();
         #[cfg(feature = "fetchverify")]
         { exec.core.fetch_verify_on = false; }

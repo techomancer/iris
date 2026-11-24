@@ -1888,9 +1888,9 @@ unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::
     EXEC_COMPLETE
 }
 
-/// ci_clock: compiled code reached a cycle flush at or past the Compare
-/// deadline.
-#[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+/// Instruction clock: compiled code reached a cycle flush at or past the
+/// Compare deadline.
+#[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_ci_compare(ctx: *mut core::ffi::c_void) {
     unsafe { (*core_from_arg(ctx)).fire_compare_if_due() }
 }
@@ -2587,24 +2587,13 @@ fn cvt_s_to_d_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
 /// guarantees the compiler can't elide/hoist the write out of an unbounded
 /// loop, even though this isn't a synchronizing atomic RMW (readers only
 /// need eventual visibility of the count, not ordering against other
-/// memory). Also runs `ci_clock`'s timer-fire check, immediately after, on
-/// the freshly-bumped value — `ci_clock`'s "fire when hot.cycles >=
-/// count_fire_cycle" is a threshold test, not an edge trigger, so it stays
-/// correct (just coarser-grained, still deterministic) even when the caller
-/// only calls this once per N instructions instead of every single one —
-/// see `step_int_0cycles`'s doc comment.
+/// memory).
 macro_rules! step_cycles {
     ($self:ident) => {{
         unsafe {
             let p = &mut $self.core.hot.cycles as *mut u64;
             std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(1));
         }
-
-        // ci_clock: the compare "timer" is a deterministic hot.cycles
-        // threshold instead of an hptimer thread — check it here, before the
-        // pending load below, so the fire is delivered within this same step.
-        #[cfg(feature = "ci_clock")]
-        $self.core.fire_compare_if_due();
     }};
 }
 
@@ -3292,6 +3281,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 single_clears_upper: C::SINGLE_CLEARS_UPPER,
                 cvt_l_range_bits: C::CVT_L_RANGE_BITS as u8,
                 cvt_from_l_range_bits: C::CVT_FROM_L_RANGE_BITS as u8,
+                instruction_clock: self.core.insn_ns != 0,
             };
             *j.compile_queue.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -3369,8 +3359,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         { self.core.dev_trace_bp_fn = jit_dev_trace_bp::<T, C>; }
         #[cfg(feature = "fetchverify")]
         { self.core.fetch_verify_fn = jit_fetch_verify::<T, C>; }
-        #[cfg(feature = "ci_clock")]
-        { self.core.ci_compare_fn = jit_ci_compare; }
+        self.core.ci_compare_fn = jit_ci_compare;
         self.core.fpu_set_mode_fn = jit_fpu_set_mode;
         self.core.fpu_cvt_to_int_fn = jit_cvt_to_int::<T, C>;
         self.core.fpu_cvt_int_to_float_fn = jit_cvt_int_to_float::<T, C>;
@@ -8150,9 +8139,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let stall_start = std::time::Instant::now();
         let mut issued: u64 = 0;
         loop {
-            // ci_clock has no timer thread and no step runs while this stalls.
-            #[cfg(feature = "ci_clock")]
-            self.core.fire_compare_if_due();
+            // The instruction clock has no timer thread and no step runs while this stalls.
+            if self.core.insn_ns != 0 {
+                self.core.fire_compare_if_due();
+            }
             let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
             if pending & (SOFT_RESET_BIT | crate::cpu::smp::HOST_PARK_BIT) != 0 {
                 break;
@@ -8184,11 +8174,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // then tracks wall time the same way a running one does.
             let now = std::time::Instant::now();
             let elapsed_ns = now.duration_since(stall_start).as_nanos() as u64;
-            // 10ns/cycle — the same rate `mips_core::NS_PER_GUEST_CYCLE`
-            // defines, restated here because that constant is `ci_clock`-only
-            // while this pacing must hold in every build.
-            const STALL_NS_PER_CYCLE: u64 = 10;
-            let want = elapsed_ns / STALL_NS_PER_CYCLE;
+            let want = elapsed_ns / self.core.stall_ns_per_cycle();
             if want > issued {
                 let delta = want - issued;
                 issued = want;
@@ -11568,6 +11554,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // (`IdleParkState::wants_probe`).
             #[cfg(all(feature = "idle-pause", feature = "jitv2"))]
             let mut probe_next = false;
+            // Instruction clock: the batch's end is where a due Compare is delivered.
+            let icount = guard.core.insn_ns != 0;
 
             while running.load(Ordering::Relaxed) {
                 // Another thread is holding this CPU: stop here, between
@@ -11677,6 +11665,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 if let Some(mut hook) = guard.batch_hook.take() {
                     hook(&mut guard);
                     guard.batch_hook = Some(hook);
+                }
+                if icount {
+                    guard.core.fire_compare_if_due();
                 }
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() {
