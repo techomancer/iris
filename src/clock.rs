@@ -14,6 +14,9 @@ struct Inner {
     cycles: Option<std::sync::OnceLock<crate::cpu::mips_core::CyclesPtr>>,
     #[cfg(test)]
     stepped: Option<AtomicU64>,
+    /// Runs on every reading, so a test can act at the instant a device reads the time.
+    #[cfg(test)]
+    on_read: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// Machine nanoseconds. Clones share one clock.
@@ -26,6 +29,10 @@ impl Clock {
     }
 
     fn source(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(f) = &self.0.on_read {
+            f();
+        }
         #[cfg(test)]
         if let Some(s) = &self.0.stepped {
             return s.load(Relaxed);
@@ -77,6 +84,12 @@ impl Clock {
     #[cfg(test)]
     pub fn stepped() -> Self {
         Clock(Arc::new(Inner { stepped: Some(AtomicU64::new(0)), ..Default::default() }))
+    }
+
+    /// A stepped clock that runs `f` on every reading.
+    #[cfg(test)]
+    pub fn stepped_on_read(f: impl Fn() + Send + Sync + 'static) -> Self {
+        Clock(Arc::new(Inner { stepped: Some(AtomicU64::new(0)), on_read: Some(Box::new(f)), ..Default::default() }))
     }
 
     #[cfg(test)]

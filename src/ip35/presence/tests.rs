@@ -280,12 +280,11 @@ fn a_join_ended_by_another_boundary_starts_no_hold() {
     let (other, window, armed) = (me.clone(), rig.regs.clone(), AtomicBool::new(true));
     // The first reading of the clock stands for that other boundary: PI0 publishes and the
     // other processor's check runs.
-    let clock: Clock = Arc::new(move || {
+    let clock = Clock::stepped_on_read(move || {
         if armed.swap(false, Ordering::SeqCst) {
             assert_eq!(window.write64(regs::io::BASE + 0x150, 0xf0), BUS_OK);
             other.get().and_then(|w| w.upgrade()).unwrap().at_batch();
         }
-        0
     });
     let hold = PresenceHold::new(Population::populated_cpus(4).unwrap(), clock, &rig.hold.bedrock);
     hold.set_processors(rig.slots.iter().zip(&rig.cycles).map(|(slot, c)| {
