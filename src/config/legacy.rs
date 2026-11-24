@@ -2,8 +2,85 @@
 //! `--cdromN` and the bare drive number live only here; the card flags keep their fields in `config.rs`.
 
 use super::*;
-use crate::devices::{ConfiguredDevice, DeviceModel};
-use crate::topology::DevicePlacement;
+use crate::devices::{ConfiguredDevice, DeviceModel, TestDeviceConfig};
+use crate::topology::{slots_take, DeviceFamily, DevicePlacement};
+
+/// The older `[ultra64]` section.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Ultra64Config {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// The older `slot` of `[virtio_serial]` and `[virtio_9p]`: a GIO expansion slot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtioGioSlot {
+    Exp0,
+    Exp1,
+}
+
+/// The older GIO flags (`[ultra64]`, `graphics.heads`, `test_device`) as
+/// `[[devices]]` entries in the slot they named, once the machine is known.
+pub(super) fn gio_cards(cfg: &mut MachineConfig) -> Result<(), String> {
+    if cfg.graphics.heads != 1 && cfg.graphics.heads != 2 {
+        return Err(format!("graphics.heads {} is invalid (valid: 1, 2)", cfg.graphics.heads));
+    }
+    if cfg.test_device_run_config.is_some() && !cfg.test_device {
+        return Err("test_device_run_config needs test_device".into());
+    }
+    let slots = cfg.machine.profile.slots();
+    if !slots_take(&slots, DeviceFamily::Gio) {
+        return match cfg.graphics.heads == 2 {
+            true => Err(format!("graphics.heads = 2: the {} has no GIO slot for a second head", cfg.machine.profile.product_name().unwrap_or(cfg.machine.profile.label()))),
+            false => Ok(()),
+        };
+    }
+    let mut cards: Vec<(&str, DeviceModel)> = Vec::new();
+    let mut moved: Vec<&str> = Vec::new();
+    if cfg.graphics.heads == 2 && !cfg.headless {
+        cards.push(("gio0", DeviceModel::Newport));
+        moved.push("graphics.heads = 2 -> newport");
+    }
+    if cfg.ultra64.enabled {
+        cards.push(("gio0", DeviceModel::Ultra64));
+        moved.push("[ultra64] -> ultra64");
+    }
+    if cfg.test_device {
+        let run = TestDeviceConfig { dump: cfg.test_device_dump.clone(), run_config: cfg.test_device_run_config.clone() };
+        run.run()?;
+        cards.push(("gio0", DeviceModel::TestDevice(run)));
+    }
+    cfg.graphics.heads = 1;
+    cfg.ultra64.enabled = false;
+    (cfg.test_device, cfg.test_device_dump, cfg.test_device_run_config) = (false, None, None);
+    cfg.devices.extend(cards.into_iter().map(|(at, d)| ConfiguredDevice::new(at, d)));
+    if !moved.is_empty() {
+        eprintln!("iris: deprecated keys folded into [[devices]] ({}); move them in the config to silence this", moved.join(", "));
+    }
+    Ok(())
+}
+
+/// An enabled `[virtio_serial]` or `[virtio_9p]` as a `[[devices]]` entry, in the GIO slot it named,
+/// else wherever the machine has a slot for it.
+pub(super) fn virtio_cards(cfg: &mut MachineConfig) {
+    let gio = slots_take(&cfg.machine.profile.slots(), DeviceFamily::Gio);
+    let at = |slot: Option<VirtioGioSlot>| gio.then(|| if slot == Some(VirtioGioSlot::Exp0) { "gio0" } else { "gio1" }.to_string());
+    let mut moved: Vec<&str> = Vec::new();
+    if cfg.virtio_serial.enabled {
+        let serial = std::mem::take(&mut cfg.virtio_serial);
+        cfg.devices.push(ConfiguredDevice { at: at(serial.slot), ..ConfiguredDevice::new("", DeviceModel::VirtioSerial(serial)) });
+        moved.push("[virtio_serial] -> virtio_serial");
+    }
+    if cfg.virtio_9p.enabled {
+        let p9 = std::mem::take(&mut cfg.virtio_9p);
+        cfg.devices.push(ConfiguredDevice { at: at(p9.slot), ..ConfiguredDevice::new("", DeviceModel::Virtio9p(p9)) });
+        moved.push("[virtio_9p] -> virtio_9p");
+    }
+    if !moved.is_empty() {
+        eprintln!("iris: deprecated keys folded into [[devices]] ({}); move them in the config to silence this", moved.join(", "));
+    }
+}
 
 /// A bare drive id (`16 * controller + id`), the only way older versions
 /// named a drive to load or eject.
@@ -254,6 +331,24 @@ mod tests {
         assert_eq!(places(&cfg), ["hpc3/c0/t2"]);
     }
 
+    /// The keys that placement replaced are no longer read.
+    #[test]
+    fn the_dropped_keys_are_unknown_fields() {
+        for (text, key) in [
+            ("[[xio_board]]\nkind = \"pci-cage\"\n", "xio_board"),
+            ("[nvme]\npath = \"d.img\"\n", "nvme"),
+            ("[fibre_channel]\n", "fibre_channel"),
+            ("[graphics]\nnode = 1\n", "node"),
+            ("[graphics]\nwidget = 9\n", "widget"),
+            ("[machine]\naudio_card = true\n", "audio_card"),
+            ("[machine]\nprofile = \"tezro_ip53\"\n[tezro]\naudio = true\n", "audio"),
+            ("[virtio_serial]\nenabled = true\nbridge_slot = 5\n", "bridge_slot"),
+        ] {
+            let e = MachineConfig::from_toml_str(text).err().map(|e| e.to_string()).unwrap_or_else(|| format!("{key} parsed"));
+            assert!(e.contains("unknown field") && e.contains(key), "{key}: {e}");
+        }
+    }
+
     /// A file with no disks gets the two defaults; one that names a disk gets
     /// exactly that one.
     #[test]
@@ -266,5 +361,52 @@ mod tests {
         assert!(MachineConfig::from_toml_str("[scsi]\n").unwrap().devices.iter().all(|d| d.device.scsi().is_none()), "an empty [scsi] is no disks");
         let text = toml::to_string(&MachineConfig { devices: vec![], ..MachineConfig::default() }).unwrap();
         assert!(MachineConfig::from_toml_str(&text).unwrap().devices.iter().all(|d| d.device.scsi().is_none()), "a machine saved with none reads back with none");
+    }
+
+    fn slots(cfg: &MachineConfig) -> Vec<(String, &'static str)> {
+        let p = DevicePlacement::new(cfg).unwrap();
+        p.placed().filter(|(_, at)| at.gio_slot().is_some()).map(|(d, at)| (at.to_string(), d.device.spec().name)).collect()
+    }
+
+    /// The older flags put a card in the slot they named, on the Indy and on
+    /// the Indigo2, and leave nothing behind to be written back.
+    #[test]
+    fn gio_flags_become_cards_in_their_slots() {
+        for profile in ["indy_ip24", "indigo2_ip22"] {
+            let cfg = MachineConfig::from_toml_str(&format!(
+                "[machine]\nprofile = \"{profile}\"\n[ultra64]\nenabled = true\n[virtio_serial]\nenabled = true\n[[virtio_serial.port]]\nname = \"a\"\n"
+            )).unwrap();
+            let mut cfg = cfg;
+            cfg.resolve_slots().unwrap();
+            assert_eq!(slots(&cfg), [("gio0".into(), "ultra64"), ("gio1".into(), "virtio_serial")], "{profile}");
+            assert!(!cfg.ultra64.enabled && cfg.virtio_serial.is_default());
+            let Some(DeviceModel::VirtioSerial(v)) = cfg.devices.iter().map(|d| &d.device).find(|d| matches!(d, DeviceModel::VirtioSerial(_))) else { panic!("not virtio") };
+            assert_eq!(v.ports[0].name.as_deref(), Some("a"), "the ports move with the card");
+        }
+        let mut cfg = MachineConfig::from_toml_str("[virtio_9p]\nenabled = true\nslot = \"exp0\"\npath = \"/x\"\n").unwrap();
+        cfg.resolve_slots().unwrap();
+        assert_eq!(slots(&cfg), [("gio0".into(), "virtio_9p")]);
+    }
+
+    #[test]
+    fn two_flags_for_one_slot_are_a_slot_clash() {
+        let mut cfg = MachineConfig::from_toml_str("test_device = true\n[ultra64]\nenabled = true\n").unwrap();
+        let e = cfg.resolve_slots().unwrap_err();
+        assert!(e.contains("test_device at \"gio0\": gio0 is taken by the ultra64"), "{e}");
+        assert_eq!(cfg.validate().unwrap_err(), e);
+        let mut cfg = MachineConfig::from_toml_str("test_device = true\n[graphics]\nheads = 2\n").unwrap();
+        assert!(cfg.resolve_slots().unwrap_err().contains("gio0 is taken by the newport"));
+        // Without a window there is no second head to take the slot.
+        let mut cfg = MachineConfig::from_toml_str("test_device = true\nheadless = true\n[graphics]\nheads = 2\n").unwrap();
+        cfg.resolve_slots().unwrap();
+    }
+
+    #[test]
+    fn a_machine_without_gio_slots_refuses_a_second_head() {
+        let octane = "[machine]\nprofile = \"octane_ip30\"\n";
+        let mut cfg = MachineConfig::from_toml_str(&format!("{octane}[graphics]\nheads = 2\n")).unwrap();
+        assert!(cfg.resolve_slots().unwrap_err().contains("no GIO slot"));
+        let mut three = MachineConfig::from_toml_str("[graphics]\nheads = 3\n").unwrap();
+        assert!(three.resolve_slots().unwrap_err().contains("heads 3 is invalid"));
     }
 }

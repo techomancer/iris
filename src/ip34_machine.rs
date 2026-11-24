@@ -23,13 +23,14 @@ use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1Config, L1};
 use crate::dev::odyssey::Odyssey;
 use crate::dev::timekeeper::Timekeeper;
-use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F};
+use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, PCI_ROUTING};
 use crate::hptimer::TimerManager;
-use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, fit_audio_card, xbridge_on};
+use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
 use crate::ip35::node::NodeSpec;
 use crate::ip35::serial::connect_serial_ports;
 use crate::sn::BoardIo;
-use crate::pci::DevFn;
+use crate::pci::{DevFn, PCI_INTA};
+use crate::topology::MachineSlotKind;
 use crate::sn::NodeBoard;
 use crate::traits::Resettable;
 use std::path::{Path, PathBuf};
@@ -76,7 +77,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, timers, heartbeat, vpro.clone())?;
     io.status = Some(status);
     io.fasttick = Some(fasttick);
-    fit_audio_card(cfg, xbridge.bus(HEAD_F), timers, &mut io);
     if let Some(vpro) = vpro {
         io.display = Some(vpro.display());
         io.monitor.push(vpro.clone());
@@ -93,16 +93,30 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
 /// The ISP12160 on head F.
 const SCSI_DEVICE: u8 = 1;
 
-/// The ISP12160's two channels.
-fn scsi_at() -> [String; 2] {
-    [0, 1].map(|c| format!("xio{HEAD_F}/pci0/{SCSI_DEVICE}/c{c}"))
-}
+/// Head E's bus: the two slots of the 66 MHz bus. Which device numbers they
+/// are is inferred: one owner-installed card was seen at device 2.
+pub(crate) const HEAD_E_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::PCI_SLOT, None), (2, MachineSlotKind::PCI_SLOT, None)];
+
+/// Head F's bus: the base I/O (ISP12160 at 1, IOC3 at 4, USB at 5), the two
+/// slots of the 33 MHz bus at 2 and 3 (inferred, as head E's) and two extra slots.
+pub(crate) const HEAD_F_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
+        (SCSI_DEVICE, MachineSlotKind::Fixed("isp12160"), None),
+        (2, MachineSlotKind::PCI_SLOT, None),
+        (3, MachineSlotKind::PCI_SLOT, None),
+        (4, MachineSlotKind::Fixed("ioc3"), None),
+        (5, MachineSlotKind::Fixed("ohci"), None),
+        (6, MachineSlotKind::Extra { pin: PCI_INTA }, None),
+        (7, MachineSlotKind::Extra { pin: PCI_INTA }, None),
+    ];
 
 /// The Fuel's slots.
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
-    crate::topology::fixed_slot(s, &format!("xio{HEAD_F}/pci0/{SCSI_DEVICE}"), "isp12160", &[]);
-    for at in scsi_at() {
-        crate::topology::scsi_bus_slots(s, &at, "isp12160 channel", 15);
+    crate::topology::open_slot(s, &format!("xio{WIDGET_VPRO}"), &[crate::topology::DeviceFamily::Gfx], &[]);
+    crate::topology::pci_bus_slots(s, &format!("xio{HEAD_E}/pci0"), "Fuel XBridge head E", HEAD_E_SLOTS);
+    crate::topology::pci_bus_slots(s, &format!("xio{HEAD_F}/pci0"), "Fuel XBridge head F", HEAD_F_SLOTS);
+    // The ISP12160's two channels.
+    for c in [0, 1] {
+        crate::topology::scsi_bus_slots(s, &format!("xio{HEAD_F}/pci0/{SCSI_DEVICE}/c{c}"), "isp12160 channel", 15);
     }
 }
 
@@ -144,8 +158,12 @@ fn build_baseio(
     }));
     let (table, product) = (cfg.machine.profile.table_name().unwrap_or_default(), cfg.machine.profile.product_name().unwrap_or_default());
     let buses = [0, 1].map(|c| scsi.bus_for_channel(c).expect("the ISP12160 has two channels"));
-    let resolved = crate::topology::DevicePlacement::new(cfg)?;
+    let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
+    for head in [HEAD_E, HEAD_F] {
+        resolved.bind_pci(&format!("xio{head}/pci0"), xbridge.bus(head).clone())?;
+    }
     let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &resolved, &buses)?;
+    let cards = Arc::new(resolved.build_cards(cfg, timers)?);
     let console_index = cfg.fuel.console.index();
     connect_serial_ports(cfg, "Fuel", &serial, console_index)?;
     let console = cfg.ci.then(|| serial[console_index].ci.clone());
@@ -154,8 +172,10 @@ fn build_baseio(
     xbridge.register_locks();
     let (reset_xbridge, reset_ioc3, reset_scsi, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), scsi.clone(), usb.clone(), timekeeper.clone());
     let disks = scsi.clone();
+    let monitor: Vec<Arc<dyn crate::traits::Device>> = vec![scsi.clone(), ioc3.ps2(), crate::pci::pci_host_commands("XBridge", &[xbridge.bus(HEAD_E), pci], None)];
+    let devices: Vec<Arc<dyn crate::traits::Device>> = vec![ioc3.clone(), scsi.clone(), usb];
     Ok(BoardIo {
-        devices: vec![ioc3.clone(), scsi.clone(), usb],
+        devices,
         reset: Box::new(move || {
             reset_xbridge.power_on();
             reset_ioc3.power_on();
@@ -164,7 +184,7 @@ fn build_baseio(
             reset_clock.power_on();
         }),
         at_batch: None,
-        monitor: vec![scsi.clone(), ioc3.ps2(), crate::pci::pci_host_commands("XBridge", &[xbridge.bus(HEAD_E), pci], None)],
+        monitor,
         ps2: ioc3.ps2(),
         flush_nvram: Box::new(move || timekeeper.flush_nvram()),
         console,
@@ -176,7 +196,8 @@ fn build_baseio(
         status: None,
         fasttick: None,
         cpus: None,
-    })
+    }
+    .with_cards(&cards))
 }
 
 /// The processors a Fuel can be built with, the default first: the R14000A

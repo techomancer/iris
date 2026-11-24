@@ -55,7 +55,7 @@ impl Rig {
     /// A card with a memory BAR and INT`pin` in `device`.
     fn card(&self, device: u8, pin: u8) -> Arc<TestCard> {
         let card = TestCard::new([Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], pin);
-        self.board.attach(device, card.clone()).unwrap();
+        self.board.bus().attach(DevFn { device, function: 0 }, card.clone());
         card
     }
 
@@ -156,21 +156,6 @@ fn the_flash_aperture_reads_all_ones_and_ignores_writes() {
     assert_ne!(rig.bridge().write16(0xc0_0000, 0x1234), BUS_OK);
 }
 
-#[test]
-fn a_function_goes_only_in_a_free_slot_the_board_has() {
-    let rig = Rig::new(Kind::Cage, 13);
-    let card = TestCard::new([Bar::Unused; 6], 0);
-    assert!(rig.board.attach(0, card.clone()).is_err(), "device 0 is not a slot");
-    assert!(rig.board.attach(4, card.clone()).is_err(), "nor is device 4");
-    assert_eq!(rig.board.free_slot(), Some(1));
-    rig.board.attach(1, card.clone()).unwrap();
-    assert!(rig.board.attach(1, card.clone()).is_err(), "slot 1 is taken");
-    assert_eq!(rig.board.free_slot(), Some(2));
-    rig.board.attach(2, TestCard::new([Bar::Unused; 6], 0)).unwrap();
-    rig.board.attach(3, TestCard::new([Bar::Unused; 6], 0)).unwrap();
-    assert_eq!(rig.board.free_slot(), None);
-}
-
 /// INTA of a slot reaches the Bridge pin numbered as the device, INTB that
 /// number with bit two flipped, and each is a packet to HEART naming the
 /// vector the guest wrote for the pin.
@@ -246,8 +231,8 @@ fn two_boards_keep_their_own_interrupt_state() {
     let two = XioPciBoard::new(Kind::Cage, 13, up(), 3);
     let a = TestCard::new([Bar::Unused; 6], PCI_INTA);
     let b = TestCard::new([Bar::Unused; 6], PCI_INTA);
-    one.attach(1, a.clone()).unwrap();
-    two.attach(1, b.clone()).unwrap();
+    one.bus().attach(DevFn { device: 1, function: 0 }, a.clone());
+    two.bus().attach(DevFn { device: 1, function: 0 }, b.clone());
     for (bridge, vector) in [(one.bridge(), 30u32), (two.bridge(), 31)] {
         let set = |off: u32, v: u32| assert_eq!(bridge.write32(u64::from(off + 4), v), BUS_OK);
         set(reg::INT_DEST_UPPER, HEART_WIDGET << 16);
@@ -296,12 +281,10 @@ fn nvme_in_slot(kind: Kind, widget: u8, slot: u8, behind_bridge: bool) {
     let img = crate::dev::nvme::tests::temp_image(&format!("xio-{}-{slot}-{behind_bridge}", kind.name()));
     let card = crate::dev::nvme::Card::open(&crate::config::NvmeConfig {
         path: img.to_string_lossy().into_owned(),
-        bridge: behind_bridge,
         ..Default::default()
     })
     .unwrap();
-    rig.board.check_slot(slot).unwrap();
-    card.attach(rig.board.bus(), slot);
+    crate::dev::nvme::tests::attach(&card, rig.board.bus(), slot, behind_bridge);
     let cfg_write = |off: u32, size: u32, v: u32| {
         let (a, w) = (u64::from(CFG0_BASE + u32::from(slot) * 0x1000 + ((off & !3) | ((off & 3) ^ (4 - size)))), size);
         let s = match w {
@@ -462,10 +445,8 @@ fn a_fibre_channel_card_in_the_pci_module_masters_ram_and_raises_its_pin() {
     use crate::dev::isp2200::card::Card;
     let rig = Rig::new(kind, widget);
     let img = crate::dev::nvme::tests::temp_image(&format!("fc-{}-{slot}", kind.name()));
-    let mut cfg = crate::config::FibreChannelConfig::default();
-    cfg.disks.insert(5, crate::config::ScsiDeviceConfig { path: img.to_string_lossy().into_owned(), ..Default::default() });
-    let card = Card::open(&cfg, false, &Arc::new(crate::hptimer::TimerManager::new())).unwrap();
-    rig.board.check_slot(slot).unwrap();
+    let disk = crate::config::ScsiDeviceConfig { path: img.to_string_lossy().into_owned(), ..Default::default() };
+    let card = Card::open(&[(5, &disk)].into(), false, &Arc::new(crate::hptimer::TimerManager::new())).unwrap();
     card.attach(rig.board.bus(), slot);
     let cfg_write = |off: u32, size: u32, v: u32| {
         let (a, w) = (u64::from(CFG0_BASE + u32::from(slot) * 0x1000 + ((off & !3) | ((off & 3) ^ (4 - size)))), size);

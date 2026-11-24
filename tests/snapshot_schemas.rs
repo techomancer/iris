@@ -1,7 +1,7 @@
-//! Snapshots saved by older builds still load.
+//! A snapshot of the schema this build writes loads, and an older one is refused.
 //!
 //! Each directory under `tests/snapshots/` is the `saves/` directory of an
-//! older iris build (named in the directory, `<machine>-v<schema>`) that ran
+//! iris build (named in the directory, `<machine>-v<schema>`) that ran
 //! the machine on an all-zero PROM and saved it once, as `fixture`.
 //! `tests/snapshots/generate.sh` makes them. The test copies one into a fresh
 //! working directory, points its provenance at this build, starts the real
@@ -10,10 +10,9 @@
 //!
 //! A snapshot whose schema this build reads must load; the fixtures hold no
 //! PROM or guest data, so what they exercise is the format of each machine's
-//! tables and of `chunks.bin`. Three are kept: the Indy at schema 6 (the
-//! oldest schema it still reads, which also covers `chunks.bin` before the
-//! KONA lists), the O2 at schema 7 and the Octane at schema 10, the ones with a PCI
-//! layer whose saved table can change. They are 19.5 KiB as packed git objects.
+//! tables and of `chunks.bin`. One per machine family is kept, at the schema
+//! this build writes; a schema change makes them again with `generate.sh`, and
+//! every older snapshot is refused (the same fixture with its schema lowered).
 
 #![cfg(unix)]
 
@@ -112,8 +111,10 @@ fn command(s: &mut TcpStream, cmd: &str) -> String {
 }
 
 /// Load `tests/snapshots/<fixture>` into `profile` and check that the load
-/// reported success and the machine saved again at this build's schema.
-fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str) {
+/// reported success and the machine saved again at this build's schema. With
+/// `older`, the fixture's manifest says that schema instead, and the load must
+/// be refused with the schemas this build reads named.
+fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str, older: Option<u32>) {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots").join(fixture);
     assert!(src.is_dir(), "fixture {} is missing", src.display());
     let dir: PathBuf = std::env::temp_dir().join(format!("iris-snapshot-schemas-{fixture}-{}", std::process::id()));
@@ -121,6 +122,12 @@ fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str) {
     copy_dir(&src, &dir.join("saves"));
     let manifest = dir.join("saves/fixture/snapshot.toml");
     retarget(&manifest);
+    if let Some(older) = older {
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        let now = format!("schema_version = {}", iris::snapshot::SCHEMA_VERSION);
+        assert!(text.contains(&now), "the fixture is of this build's schema");
+        std::fs::write(&manifest, text.replace(&now, &format!("schema_version = {older}"))).unwrap();
+    }
     // The cache model is a build default (a build with the translation cache
     // runs the Indy's cache as a shadow), and a snapshot refuses a different
     // one, so ask for the one the fixture was saved with.
@@ -161,6 +168,13 @@ fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str) {
     let reply = command(&mut s, "load fixture");
     let out = std::fs::read_to_string(&stdout).unwrap();
     let err = std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
+    if let Some(older) = older {
+        let want = format!("snapshot fixture is schema {older}; this build reads schema {}", iris::snapshot::SCHEMA_VERSION);
+        assert!(reply.contains(&want) || out.contains(&want) || err.contains(&want), "{fixture} at schema {older} was not refused\nreply: {reply}\nstdout: {out}\nstderr: {err}");
+        assert!(!out.contains("Snapshot loaded from"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
     assert!(out.contains("Snapshot loaded from"), "{fixture} did not load\nreply: {reply}\nstdout: {out}\nstderr: {err}");
 
     command(&mut s, "save again");
@@ -174,14 +188,29 @@ const O2: (&str, usize, &str) = ("o2_ip32", 512 << 10, "[32, 0, 0, 0]");
 const OCTANE: (&str, usize, &str) = ("octane_ip30", 1 << 20, "[64, 0, 0, 0]");
 
 #[test]
-fn indy_loads_schema_6() {
-    loads("indy-v6", INDY.0, INDY.1, INDY.2);
+fn indy_loads_schema_11() {
+    loads("indy-v11", INDY.0, INDY.1, INDY.2, None);
 }
 #[test]
-fn o2_loads_schema_7() {
-    loads("o2-v7", O2.0, O2.1, O2.2);
+fn o2_loads_schema_11() {
+    loads("o2-v11", O2.0, O2.1, O2.2, None);
 }
 #[test]
-fn octane_loads_schema_10() {
-    loads("octane-v10", OCTANE.0, OCTANE.1, OCTANE.2);
+fn octane_loads_schema_11() {
+    loads("octane-v11", OCTANE.0, OCTANE.1, OCTANE.2, None);
+}
+
+/// Schema 10 numbered disks by controller and target; nothing maps them to slots, so
+/// each machine refuses it.
+#[test]
+fn indy_refuses_schema_10() {
+    loads("indy-v11", INDY.0, INDY.1, INDY.2, Some(10));
+}
+#[test]
+fn o2_refuses_schema_10() {
+    loads("o2-v11", O2.0, O2.1, O2.2, Some(10));
+}
+#[test]
+fn octane_refuses_schema_10() {
+    loads("octane-v11", OCTANE.0, OCTANE.1, OCTANE.2, Some(10));
 }

@@ -33,7 +33,7 @@ fn die(msg: &str) -> ! {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let shm = ShmemConf::new().os_id(SHM_OS_ID).open()
-        .unwrap_or_else(|e| die(&format!("cannot open the bridge ({e}); is iris running with [ultra64] enabled?")));
+        .unwrap_or_else(|e| die(&format!("cannot open the bridge ({e}); is iris running with an ultra64 device?")));
     let base = shm.as_ptr();
     // iris lays out the h2n event first and the n2h event right after it.
     let (_h2n, used) = unsafe { Event::from_existing(base) }

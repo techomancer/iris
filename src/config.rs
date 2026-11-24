@@ -512,26 +512,6 @@ impl Default for VinoStandard {
     fn default() -> Self { VinoStandard::Ntsc }
 }
 
-/// N64 development board (Ultra64) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Ultra64Config {
-    /// Enable the N64 development board GIO device and POSIX shm IPC bridge.
-    #[serde(default)]
-    pub enabled: bool,
-}
-
-/// Which GIO expansion slot a virtio device sits in (machines without PCI).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum VirtioGioSlot {
-    /// 0x1F400000; shared with `--test-device`, the Ultra64 board and the
-    /// second Newport head (`graphics.heads = 2`).
-    Exp0,
-    /// 0x1F600000.
-    #[default]
-    Exp1,
-}
-
 /// One virtio-serial port and the host end it is connected to.
 ///
 /// With neither `tcp_port` nor `socket` the port is wired to nothing: output
@@ -556,16 +536,13 @@ pub struct VirtioSerialPort {
 /// virtio-serial (virtio-console) device for the guest, `[virtio_serial]`.
 /// See `src/dev/virtio` and `docs/dev/virtio-serial.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct VirtioSerialConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// GIO expansion slot, on the Indy and Indigo2 (IP24/IP22/IP28). The
-    /// machines with PCI (O2, Octane) put it on the PCI bus and ignore this.
-    #[serde(default)]
-    pub slot: VirtioGioSlot,
-    /// The Octane's onboard Bridge slot, 4 to 7. Unset: 4.
+    /// The older GIO slot key, read by `legacy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bridge_slot: Option<u8>,
+    pub slot: Option<legacy::VirtioGioSlot>,
     /// The ports, in order; port 0 is the first. Empty means one console
     /// port on TCP 127.0.0.1:8890.
     #[serde(default, rename = "port", skip_serializing_if = "Vec::is_empty")]
@@ -576,48 +553,37 @@ impl VirtioSerialConfig {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The ports it lists.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        // Two queues per port and the control pair, in a 64-bit notify mask.
+        if self.ports.len() > 31 {
+            return Err(format!("[virtio_serial] has {} ports (at most 31)", self.ports.len()));
+        }
+        for (i, p) in self.ports.iter().enumerate() {
+            if p.tcp_port.is_some() && p.socket.is_some() {
+                return Err(format!("[virtio_serial] port {i}: tcp_port and socket are exclusive"));
+            }
+            if p.name.as_deref().is_some_and(|n| n.is_empty() || n.len() > 200) {
+                return Err(format!("[virtio_serial] port {i}: name must be 1 to 200 bytes"));
+            }
+            if self.ports[..i].iter().any(|q| q.name.is_some() && q.name == p.name) {
+                return Err(format!("[virtio_serial] port {i}: name {:?} is used twice", p.name.as_deref().unwrap_or("")));
+            }
+        }
+        Ok(())
+    }
 }
 
-/// `[[xio_board]]`: an option board in one of the Octane's XIO slots. See
-/// `docs/pci.md`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct XioBoardConfig {
-    pub kind: crate::dev::xio_pci::Kind,
-    /// The XIO slot: a Crossbow port from 9 to 12 for a shoehorn, 13 for the
-    /// PCI module. Unset: the module is in 13 and a shoehorn in the first of
-    /// 10, 12, 9 and 11 that nothing else holds (10 is where real Octanes have
-    /// one).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub widget: Option<u8>,
-}
-
-/// The Octane's four XIO slots, Crossbow ports 9 to 12, in the order a
-/// shoehorn with no slot named takes them. Port 13 is the PCI module's own.
-pub const OCTANE_XIO_SLOTS: [u8; 4] = [10, 12, 9, 11];
-
-/// `[nvme]`: an NVM Express card in the O2's PCI option slot or in a slot of
-/// an Octane's `[[xio_board]]`. See `docs/nvme.md`.
+/// An `nvme` device's options: an NVM Express card. See `docs/nvme.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NvmeConfig {
     /// The namespace's disk image (raw or CHD). Empty: no card.
     #[serde(default)]
     pub path: String,
-    /// Copy-on-write: writes go to `{path}.overlay`, as `[scsi.N] overlay`.
+    /// Copy-on-write: writes go to `{path}.overlay`, as an `hdd`'s `overlay`.
     #[serde(default)]
     pub overlay: bool,
-    /// Put the card behind a PCI-to-PCI bridge in the slot, as a card on an
-    /// expansion cage sits, instead of in the slot itself.
-    #[serde(default)]
-    pub bridge: bool,
-    /// Octane: which `[[xio_board]]` holds the card, counting from 0. Unset:
-    /// the first. The O2 has one slot and takes neither this nor `slot`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub board: Option<usize>,
-    /// Octane: the slot on that board, its PCI device number. Unset: the
-    /// first free one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slot: Option<u8>,
     /// The namespace's volatile write cache, as `[scsi.N] write_cache`: `true`
     /// (the default) reports one, so a plain write completes once the host
     /// has it, Flush and a write with FUA store what came before them, and a
@@ -631,41 +597,8 @@ pub struct NvmeConfig {
 
 impl Default for NvmeConfig {
     fn default() -> Self {
-        Self { path: String::new(), overlay: false, bridge: false, board: None, slot: None, write_cache: true }
+        Self { path: String::new(), overlay: false, write_cache: true }
     }
-}
-
-impl NvmeConfig {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-/// `[fibre_channel]`: a QLogic ISP2200 Fibre Channel adapter in a slot of an
-/// Octane's `[[xio_board]]`, with the disks on its private loop. See
-/// `docs/fibre-channel.md`.
-///
-/// An unknown key is an error: a misspelt `slot` would otherwise put the card
-/// in a different slot without a word. The disk tables are `[scsi.N]` tables
-/// and drop unknown keys as those do.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct FibreChannelConfig {
-    /// The loop's disks, `[fibre_channel.disk.N]`, N the disk's loop ID (0 to
-    /// 125). Each is a `[scsi.N]` disk table in every respect (image,
-    /// overlay, write cache). The adapter takes the lowest loop ID no disk
-    /// has, unless the guest asks for a hard address.
-    #[serde(default, rename = "disk")]
-    pub disks: std::collections::BTreeMap<u8, ScsiDeviceConfig>,
-    /// Put the card behind a PCI-to-PCI bridge in the slot, as `[nvme] bridge`.
-    #[serde(default)]
-    pub bridge: bool,
-    /// Which `[[xio_board]]` holds the card, counting from 0. Unset: the first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub board: Option<usize>,
-    /// The slot on that board, its PCI device number. Unset: the first free one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slot: Option<u8>,
 }
 
 /// Whose files the guest sees in a `[virtio_9p]` share.
@@ -684,16 +617,13 @@ pub enum Virtio9pOwners {
 /// virtio-9p: a host directory the guest mounts, `[virtio_9p]`. See
 /// `src/dev/virtio/p9.rs` and `docs/dev/virtio-9p.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Virtio9pConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// GIO expansion slot, on the Indy and Indigo2 (IP24/IP22/IP28). The
-    /// Octane puts it on the PCI bus and ignores this.
-    #[serde(default)]
-    pub slot: VirtioGioSlot,
-    /// The Octane's onboard Bridge slot, 4 to 7. Unset: 5.
+    /// The older GIO slot key, read by `legacy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bridge_slot: Option<u8>,
+    pub slot: Option<legacy::VirtioGioSlot>,
     /// Host directory to share.
     #[serde(default)]
     pub path: String,
@@ -730,8 +660,7 @@ impl Default for Virtio9pConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            slot: VirtioGioSlot::default(),
-            bridge_slot: None,
+            slot: None,
             path: String::new(),
             tag: default_9p_tag(),
             readonly: false,
@@ -747,6 +676,29 @@ impl Default for Virtio9pConfig {
 impl Virtio9pConfig {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// What it shares.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if cfg!(not(unix)) {
+            return Err("[virtio_9p] needs a Unix host".into());
+        }
+        if self.path.is_empty() {
+            return Err("[virtio_9p] needs a path to share".into());
+        }
+        if self.tag.is_empty() || self.tag.len() > 64 {
+            return Err("[virtio_9p] tag must be 1 to 64 bytes".into());
+        }
+        if self.owners == Virtio9pOwners::Squash && !(self.uid_map.is_empty() && self.gid_map.is_empty()) {
+            return Err("[virtio_9p] uid_map and gid_map need owners = \"passthrough\"".into());
+        }
+        // The id maps are parsed by the Unix-only device; a non-Unix host was refused above.
+        #[cfg(unix)]
+        {
+            crate::dev::virtio::p9::IdMap::parse(&self.uid_map).map_err(|e| format!("[virtio_9p] uid_map: {e}"))?;
+            crate::dev::virtio::p9::IdMap::parse(&self.gid_map).map_err(|e| format!("[virtio_9p] gid_map: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -879,6 +831,15 @@ impl MachineProfile {
     /// or two with an I-brick, configured by `[origin3200]` or `[onyx3000]`.
     pub fn is_ip35_bricks(self) -> bool {
         matches!(self, Self::Origin3200Ip35 | Self::Onyx3000Ip35)
+    }
+
+    /// Refuse an NVMe card on a machine with nowhere to report its disk yet: the Fuel, the Tezro
+    /// and the Origin 3200 and Onyx 3000. Config validation and the constructors both ask.
+    pub fn refuse_nvme(self) -> Result<(), String> {
+        match matches!(self, Self::FuelIp34 | Self::TezroIp53) || self.is_ip35_bricks() {
+            true => Err(format!("[[devices]] nvme: the {} takes no NVMe card yet", self.product_name().unwrap_or_default())),
+            false => Ok(()),
+        }
     }
 
     /// Whether a DaynaPort goes on the machine's SCSI bus: not where Ethernet is built in.
@@ -1327,17 +1288,7 @@ pub struct GraphicsSection {
     /// and Guest resolution. See [`MachineConfig::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<GraphicsBoard>,
-    /// Where the board plugs in, for a machine with a choice: the node board
-    /// (C-brick, from 0) whose XIO link reaches it. Unset: the machine's
-    /// own placement. Onyx 3000 only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<u8>,
-    /// The Crosstalk widget (port) the board answers at. Unset: the
-    /// machine's own. Onyx 3000 and Tezro.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub widget: Option<u8>,
-    /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 in GIO
-    /// expansion slot 0, which the Ultra64 board then cannot have.
+    /// The older second-head key, read by `legacy`.
     #[serde(default = "default_graphics_heads")]
     pub heads: u8,
     /// Host-forced Newport video mode at VM start (`guest` = IRIX/setmon controls VC2).
@@ -1430,8 +1381,6 @@ impl Default for GraphicsSection {
             newport_mode: None,
             gpu_backend: default_gpu_backend(),
             flash: None,
-            node: None,
-            widget: None,
         }
     }
 }
@@ -1567,9 +1516,6 @@ pub struct MachineSection {
     pub serial_port_c: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_port_d: Option<u16>,
-    /// Tezro, Fuel, Origin 3200, Onyx 3000: fit the ICE1724 audio card.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audio_card: Option<bool>,
     /// Fuel: which keyboard and mouse the host's reach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ps2_input: Option<bool>,
@@ -2294,9 +2240,6 @@ pub struct FuelSection {
     /// the marked synthetic `EMUN00`.
     #[serde(default)]
     pub brick_serial: Option<String>,
-    /// Fit the audio card (IC Ensemble ICE1724) in a PCI slot. Off by default.
-    #[serde(default)]
-    pub audio: bool,
 }
 
 fn default_fuel_input() -> bool { true }
@@ -2312,7 +2255,6 @@ impl Default for FuelSection {
             usb_input: false,
             l1_revision: None,
             brick_serial: None,
-            audio: false,
         }
     }
 }
@@ -2328,7 +2270,6 @@ impl FuelSection {
             && !self.usb_input
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
-            && !self.audio
     }
 }
 
@@ -2381,10 +2322,6 @@ pub struct Ip35Section {
     /// bytes. Unset: the marked synthetic `EMUN00`.
     #[serde(default)]
     pub brick_serial: Option<String>,
-    /// Fit the audio card (IC Ensemble ICE1724) in an I-brick PCI slot. Off
-    /// by default.
-    #[serde(default)]
-    pub audio: bool,
 }
 
 impl Default for Ip35Section {
@@ -2397,7 +2334,6 @@ impl Default for Ip35Section {
             l1_log: None,
             l1_revision: None,
             brick_serial: None,
-            audio: false,
         }
     }
 }
@@ -2412,7 +2348,6 @@ impl Ip35Section {
             && self.l1_log.is_none()
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
-            && !self.audio
     }
 }
 
@@ -2459,11 +2394,6 @@ pub struct TezroSection {
     pub serial_port_c: Option<u16>,
     #[serde(default)]
     pub serial_port_d: Option<u16>,
-    /// Add the audio controller (IC Ensemble ICE1724) behind the IO9's PCI
-    /// bridge. Off by default: the bridge's bus is then empty. `no_audio`
-    /// keeps the controller but gives it no host output.
-    #[serde(default)]
-    pub audio: bool,
 }
 
 impl TezroSection {
@@ -2475,7 +2405,6 @@ impl TezroSection {
             && self.l1_log.is_none()
             && self.serial_port_c.is_none()
             && self.serial_port_d.is_none()
-            && !self.audio
     }
 }
 
@@ -2609,19 +2538,12 @@ pub struct MachineConfig {
     #[serde(skip)]
     pub perfetto_clock: Option<String>,
 
-    /// Map the bare-metal test device (guest console, machine-state dump, exit
-    /// code) into GIO expansion slot 0. Off by default; see src/dev/testdev.rs.
+    /// The older test-device keys and `--test-device`, read by `legacy`; see
+    /// src/dev/testdev.rs for the device.
     #[serde(default)]
     pub test_device: bool,
-
-    /// Where the test device's DUMP register writes its JSON. Defaults to
-    /// `iris-testdev-dump.json` in the working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_device_dump: Option<String>,
-
-    /// What the test device publishes at its run-configuration register, as
-    /// `time_pct=10,repeats=3` (see `RunConfig`). Unset publishes 0, which the
-    /// bare-metal benchmark suite reads as "every kernel, full length".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_device_run_config: Option<String>,
 
@@ -2817,25 +2739,14 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "RtcOffset::is_zero")]
     pub rtc_offset: RtcOffset,
 
-    /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
+    /// The older `[ultra64]` section, read by `legacy`.
     #[serde(default)]
-    pub ultra64: Ultra64Config,
+    pub ultra64: legacy::Ultra64Config,
 
     /// virtio-serial guest device (`[virtio_serial]`, `[[virtio_serial.port]]`).
     #[serde(default, skip_serializing_if = "VirtioSerialConfig::is_default")]
     pub virtio_serial: VirtioSerialConfig,
 
-    /// Option boards in the Octane's XIO slots (`[[xio_board]]`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub xio_board: Vec<XioBoardConfig>,
-
-    /// NVM Express card (`[nvme]`).
-    #[serde(default, skip_serializing_if = "NvmeConfig::is_default")]
-    pub nvme: NvmeConfig,
-
-    /// Fibre Channel adapter and its loop (`[fibre_channel]`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fibre_channel: Option<FibreChannelConfig>,
     /// virtio-9p shared directory (`[virtio_9p]`).
     #[serde(default, skip_serializing_if = "Virtio9pConfig::is_default")]
     pub virtio_9p: Virtio9pConfig,
@@ -3036,11 +2947,8 @@ impl Default for MachineConfig {
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
-            ultra64: Ultra64Config::default(),
+            ultra64: Default::default(),
             virtio_serial: VirtioSerialConfig::default(),
-            xio_board: Vec::new(),
-            nvme: NvmeConfig::default(),
-            fibre_channel: None,
             virtio_9p: Virtio9pConfig::default(),
         }
     }
@@ -3050,255 +2958,6 @@ impl Default for MachineConfig {
 fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::default() }
 
 impl MachineConfig {
-    /// `[[xio_board]]`: the Octane's XIO slots, each holding at most one board,
-    /// and not the one the graphics board is in. Returns each board's slot.
-    pub fn xio_widgets(&self) -> Result<Vec<u8>, String> {
-        use crate::dev::xio_pci::{Kind, CAGE_WIDGET};
-        if self.xio_board.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.machine.profile != MachineProfile::OctaneIp30 {
-            return Err("[[xio_board]] needs an Octane: it is the machine with XIO slots".into());
-        }
-        let graphics = (self.graphics_board() != GraphicsBoard::None).then_some(crate::ip30_machine::WIDGET_GFX);
-        let mut taken: Vec<u8> = Vec::new();
-        let mut out = vec![0u8; self.xio_board.len()];
-        // Named slots first, so a board with no slot takes one nothing names.
-        let named = |b: &XioBoardConfig| b.widget.or((b.kind == Kind::Cage).then_some(CAGE_WIDGET));
-        for (i, w) in self.xio_board.iter().enumerate().filter_map(|(i, b)| named(b).map(|w| (i, w))) {
-            if self.xio_board[i].kind == Kind::Cage && w != CAGE_WIDGET {
-                return Err(format!("[[xio_board]] the PCI module goes in port {CAGE_WIDGET}, not {w}"));
-            }
-            if self.xio_board[i].kind == Kind::Shoehorn && !OCTANE_XIO_SLOTS.contains(&w) {
-                return Err(format!("[[xio_board]] widget {w} is not an Octane XIO slot (9 to 12)"));
-            }
-            if graphics == Some(w) {
-                return Err(format!("[[xio_board]] widget {w} holds the graphics board"));
-            }
-            if taken.contains(&w) {
-                return Err(format!("[[xio_board]] widget {w} is named twice"));
-            }
-            taken.push(w);
-            out[i] = w;
-        }
-        for (i, b) in self.xio_board.iter().enumerate().filter(|(_, b)| named(b).is_none()) {
-            let w = OCTANE_XIO_SLOTS.into_iter().find(|w| !taken.contains(w) && graphics != Some(*w))
-                .ok_or_else(|| format!("[[xio_board]] a {} has no free XIO slot", b.kind.label()))?;
-            taken.push(w);
-            out[i] = w;
-        }
-        Ok(out)
-    }
-
-    /// `[virtio_serial]`: the ports it lists, and whether this machine has
-    /// somewhere to put it.
-    fn validate_virtio_serial(&self) -> Result<(), String> {
-        let v = &self.virtio_serial;
-        if !v.enabled {
-            return Ok(());
-        }
-        // Two queues per port and the control pair, in a 64-bit notify mask.
-        if v.ports.len() > 31 {
-            return Err(format!("[virtio_serial] has {} ports (at most 31)", v.ports.len()));
-        }
-        for (i, p) in v.ports.iter().enumerate() {
-            if p.tcp_port.is_some() && p.socket.is_some() {
-                return Err(format!("[virtio_serial] port {i}: tcp_port and socket are exclusive"));
-            }
-            if p.name.as_deref().is_some_and(|n| n.is_empty() || n.len() > 200) {
-                return Err(format!("[virtio_serial] port {i}: name must be 1 to 200 bytes"));
-            }
-            if v.ports[..i].iter().any(|q| q.name.is_some() && q.name == p.name) {
-                return Err(format!("[virtio_serial] port {i}: name {:?} is used twice", p.name.as_deref().unwrap_or("")));
-            }
-        }
-        match self.machine.profile {
-            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
-                match v.slot {
-                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device
-                        || (self.graphics.heads == 2 && !self.headless) => Err(
-                        "[virtio_serial] slot = \"exp0\" is taken by the ultra64 board, test_device or the second graphics head; use \"exp1\"".into(),
-                    ),
-                    _ => Ok(()),
-                }
-            }
-            // The Octane has a PCI bridge with free slots.
-            MachineProfile::OctaneIp30 => self.octane_virtio_slots().map(|_| ()),
-            p @ (MachineProfile::Origin200Ip29 | MachineProfile::Origin2000Ip27 | MachineProfile::Onyx2Ip27) => {
-                Err(format!("[virtio_serial] is not wired on the {}", p.product_name().expect("an IP27 product")))
-            }
-            MachineProfile::FuelIp34 => Err(
-                "[virtio_serial] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
-            ),
-            // The Tezro's IO9 PIC has an empty bus.
-            MachineProfile::TezroIp53 => Ok(()),
-            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => Err(
-                "[virtio_serial] is not wired on the Origin 3200 or the Onyx 3000: their XBridge has no virtio-pci attachment".into(),
-            ),
-            MachineProfile::O2Ip32 => Err(
-                "[virtio_serial] is not wired on the O2 yet: the virtio-pci transport exists, but the \
-                 MACE PCI bridge has no interrupt route for a third slot (see docs/dev/virtio-serial.md)"
-                    .into(),
-            ),
-        }
-    }
-
-    /// `[nvme]`: only machines with PCI slots have somewhere to put it.
-    fn validate_nvme(&self) -> Result<(), String> {
-        if self.nvme.is_default() {
-            return Ok(());
-        }
-        if self.nvme.path.is_empty() {
-            return Err("[nvme] needs a path".into());
-        }
-        match self.machine.profile {
-            MachineProfile::O2Ip32 if self.nvme.board.is_some() || self.nvme.slot.is_some() => {
-                Err("[nvme] board and slot place a card on an Octane's [[xio_board]]; the O2 has one slot".into())
-            }
-            MachineProfile::O2Ip32 => Ok(()),
-            // The Octane's own Bridge keeps its built-in devices; a card
-            // goes on an option board.
-            MachineProfile::OctaneIp30 => {
-                let board = self.nvme.board.unwrap_or(0);
-                let Some(b) = self.xio_board.get(board) else {
-                    return Err(if self.xio_board.is_empty() {
-                        "[nvme] on the Octane needs a [[xio_board]] to sit in: a pci-cage or a pci-shoehorn".into()
-                    } else {
-                        format!("[nvme] board {board}: there are {} [[xio_board]] tables", self.xio_board.len())
-                    });
-                };
-                match self.nvme.slot {
-                    Some(s) if !b.kind.slots().contains(&s) => {
-                        Err(format!("[nvme] slot {s}: the {} has slots {:?}", b.kind.label(), b.kind.slots()))
-                    }
-                    _ => Ok(()),
-                }
-            }
-            _ => Err("[nvme] needs a machine with PCI slots: the O2 or the Octane".into()),
-        }
-    }
-
-    /// `[fibre_channel]`: the Octane's option boards are the only slots for
-    /// the card, and each disk must be a plain disk on a loop ID.
-    fn validate_fibre_channel(&self) -> Result<(), String> {
-        let Some(fc) = &self.fibre_channel else { return Ok(()) };
-        let on_board = self.machine.profile.is_ip35_bricks();
-        if self.machine.profile != MachineProfile::OctaneIp30 && !on_board {
-            return Err("[fibre_channel] needs an Octane or an Origin 3200: the machines with a slot or an I-brick for it".into());
-        }
-        if on_board {
-            // The I-brick's adapter is on its base I/O board, at a place the
-            // row fixes.
-            if fc.board.is_some() || fc.slot.is_some() || fc.bridge {
-                return Err("[fibre_channel] board, slot and bridge name an Octane's option board: the Origin 3200's adapter is on the I-brick".into());
-            }
-        }
-        if !on_board {
-            let board = fc.board.unwrap_or(0);
-            let Some(b) = self.xio_board.get(board) else {
-                return Err(if self.xio_board.is_empty() {
-                    "[fibre_channel] needs a [[xio_board]] to sit in: a pci-cage or a pci-shoehorn".into()
-                } else {
-                    format!("[fibre_channel] board {board}: there are {} [[xio_board]] tables", self.xio_board.len())
-                });
-            };
-            if let Some(s) = fc.slot.filter(|s| !b.kind.slots().contains(s)) {
-                return Err(format!("[fibre_channel] slot {s}: the {} has slots {:?}", b.kind.label(), b.kind.slots()));
-            }
-        }
-        for (&id, d) in &fc.disks {
-            let at = format!("[fibre_channel.disk.{id}]");
-            if id > crate::dev::isp2200::LOOP_ID_MAX {
-                return Err(format!("{at}: loop ID {id} is out of range (0 to {})", crate::dev::isp2200::LOOP_ID_MAX));
-            }
-            if d.path.is_empty() {
-                return Err(format!("{at} needs a path"));
-            }
-            if d.kind() != ScsiKind::Disk || d.scratch {
-                return Err(format!("{at}: only a plain disk goes on the loop"));
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn validate_virtio_9p_for_test(&self) -> Result<(), String> {
-        self.validate_virtio_9p()
-    }
-
-    /// `[virtio_9p]`: what it shares, and whether this machine has somewhere
-    /// to put it.
-    fn validate_virtio_9p(&self) -> Result<(), String> {
-        let v = &self.virtio_9p;
-        if !v.enabled {
-            return Ok(());
-        }
-        if cfg!(not(unix)) {
-            return Err("[virtio_9p] needs a Unix host".into());
-        }
-        if v.path.is_empty() {
-            return Err("[virtio_9p] needs a path to share".into());
-        }
-        if v.tag.is_empty() || v.tag.len() > 64 {
-            return Err("[virtio_9p] tag must be 1 to 64 bytes".into());
-        }
-        if v.owners == Virtio9pOwners::Squash && !(v.uid_map.is_empty() && v.gid_map.is_empty()) {
-            return Err("[virtio_9p] uid_map and gid_map need owners = \"passthrough\"".into());
-        }
-        // The id maps are parsed by the Unix-only device; a non-Unix host was refused above.
-        #[cfg(unix)]
-        {
-            crate::dev::virtio::p9::IdMap::parse(&v.uid_map).map_err(|e| format!("[virtio_9p] uid_map: {e}"))?;
-            crate::dev::virtio::p9::IdMap::parse(&v.gid_map).map_err(|e| format!("[virtio_9p] gid_map: {e}"))?;
-        }
-        match self.machine.profile {
-            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => {
-                if self.virtio_serial.enabled && self.virtio_serial.slot == v.slot {
-                    return Err(format!(
-                        "[virtio_9p] and [virtio_serial] are both in slot {:?}; a GIO slot holds one device",
-                        v.slot
-                    ));
-                }
-                match v.slot {
-                    VirtioGioSlot::Exp0 if self.ultra64.enabled || self.test_device
-                        || (self.graphics.heads == 2 && !self.headless) => Err(
-                        "[virtio_9p] slot = \"exp0\" is taken by the ultra64 board, test_device or the second graphics head; use \"exp1\"".into(),
-                    ),
-                    _ => Ok(()),
-                }
-            }
-            MachineProfile::OctaneIp30 => self.octane_virtio_slots().map(|_| ()),
-            MachineProfile::O2Ip32 => Err(
-                "[virtio_9p] is not wired on the O2: the MACE PCI bridge has no interrupt route for a third slot".into(),
-            ),
-            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => Err("[virtio_9p] is not wired on the Origin 3200 or the Onyx 3000".into()),
-            MachineProfile::Origin200Ip29 => Err("[virtio_9p] is not wired on the Origin 200".into()),
-            MachineProfile::Origin2000Ip27 => Err("[virtio_9p] is not wired on the Origin 2000".into()),
-            MachineProfile::Onyx2Ip27 => Err("[virtio_9p] is not wired on the Onyx2".into()),
-            MachineProfile::FuelIp34 => Err(
-                "[virtio_9p] is not wired on the Fuel: its XBridge has no virtio-pci attachment".into(),
-            ),
-            MachineProfile::TezroIp53 => Ok(()),
-        }
-    }
-
-    /// The Octane's onboard Bridge slots for virtio-serial and virtio-9p, as
-    /// `bridge_slot` names them or by default 4 and 5. Slots 0 to 3 hold the
-    /// board's own devices; two enabled devices cannot share a slot.
-    pub fn octane_virtio_slots(&self) -> Result<(u8, u8), String> {
-        let serial = self.virtio_serial.bridge_slot.unwrap_or(7);
-        let p9 = self.virtio_9p.bridge_slot.unwrap_or(5);
-        for (name, slot, enabled) in [("virtio_serial", serial, self.virtio_serial.enabled), ("virtio_9p", p9, self.virtio_9p.enabled)] {
-            if enabled && !(4..=7).contains(&slot) {
-                return Err(format!("[{name}] bridge_slot = {slot}: the Octane's Bridge has slots 4 to 7 free"));
-            }
-        }
-        if self.virtio_serial.enabled && self.virtio_9p.enabled && serial == p9 {
-            return Err(format!("[virtio_serial] and [virtio_9p] are both in Bridge slot {serial}"));
-        }
-        Ok((serial, p9))
-    }
-
     /// The serial channels' TCP ports (A, B), defaults filled in.
     pub fn serial_ports(&self) -> [u16; 2] {
         let [a, b] = crate::dev::z85c30::DEFAULT_PORTS;
@@ -3420,16 +3079,6 @@ impl MachineConfig {
             if !tezro { return Err(not_here("serial_port_d")); }
             self.tezro.serial_port_d = Some(port);
         }
-        if let Some(card) = self.machine.audio_card.take() {
-            let slot = match p {
-                P::TezroIp53 => &mut self.tezro.audio,
-                P::FuelIp34 => &mut self.fuel.audio,
-                P::Origin3200Ip35 => &mut self.origin3200.audio,
-                P::Onyx3000Ip35 => &mut self.onyx3000.audio,
-                _ => return Err(not_here("audio_card")),
-            };
-            *slot = card;
-        }
         let fuel = p == P::FuelIp34;
         if let Some(on) = self.machine.ps2_input.take() {
             if !fuel { return Err(not_here("ps2_input")); }
@@ -3506,7 +3155,6 @@ impl MachineConfig {
                 m.usb_input = fuel.usb_input.then_some(true);
                 m.l1_revision = fuel.l1_revision;
                 m.brick_serial = fuel.brick_serial;
-                m.audio_card = fuel.audio.then_some(true);
             }
             P::TezroIp53 => {
                 let tezro = std::mem::take(&mut out.tezro);
@@ -3516,7 +3164,6 @@ impl MachineConfig {
                 m.l1_log = tezro.l1_log;
                 m.serial_port_c = tezro.serial_port_c;
                 m.serial_port_d = tezro.serial_port_d;
-                m.audio_card = tezro.audio.then_some(true);
             }
             P::Origin3200Ip35 | P::Onyx3000Ip35 => {
                 let section = std::mem::take(if self.machine.profile == P::Onyx3000Ip35 { &mut out.onyx3000 } else { &mut out.origin3200 });
@@ -3527,7 +3174,6 @@ impl MachineConfig {
                 m.l1_log = section.l1_log;
                 m.l1_revision = section.l1_revision;
                 m.brick_serial = section.brick_serial;
-                m.audio_card = section.audio.then_some(true);
             }
             _ => {}
         }
@@ -3659,17 +3305,6 @@ impl MachineConfig {
     }
 
     /// The section that configures an IP35 brick machine: `[origin3200]` or `[onyx3000]`.
-    /// Whether the ICE1724 audio card is fitted (`[machine] audio_card`), on
-    /// the machines that take one.
-    pub fn audio_card(&self) -> bool {
-        match self.machine.profile {
-            MachineProfile::TezroIp53 => self.tezro.audio,
-            MachineProfile::FuelIp34 => self.fuel.audio,
-            MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => self.ip35_section().audio,
-            _ => false,
-        }
-    }
-
     pub fn ip35_section(&self) -> &Ip35Section {
         if self.machine.profile == MachineProfile::Onyx3000Ip35 { &self.onyx3000 } else { &self.origin3200 }
     }
@@ -3745,7 +3380,7 @@ impl MachineConfig {
     pub fn cpu_part(&self) -> Result<&'static Part, String> {
         let named = self.machine.cpu.as_deref();
         match self.machine.profile.part(named) {
-            Err(_) if self.test_device => named.and_then(|n| parts::find(parts::ALL, n))
+            Err(_) if self.test_device || self.has_device("test_device") => named.and_then(|n| parts::find(parts::ALL, n))
                 .ok_or_else(|| format!("unknown cpu {:?}", named.unwrap_or_default())),
             part => part,
         }
@@ -3799,19 +3434,6 @@ impl MachineConfig {
         Ok(())
     }
 
-    /// `[graphics] node` and `widget` only where the machine has a choice of where the board
-    /// plugs in: the Onyx 3000 (both) and the Tezro (the widget). Each checks its own values.
-    fn validate_graphics_placement(&self) -> Result<(), String> {
-        let p = self.machine.profile;
-        if self.graphics.node.is_some_and(|node| node != 0) && p != MachineProfile::Onyx3000Ip35 {
-            return Err(format!("graphics.node: machine.profile {} has one place for its graphics board", p.name()));
-        }
-        if self.graphics.widget.is_some() && !matches!(p, MachineProfile::Onyx3000Ip35 | MachineProfile::TezroIp53) {
-            return Err(format!("graphics.widget: machine.profile {} has one place for its graphics board", p.name()));
-        }
-        Ok(())
-    }
-
     /// The SCSI devices this machine has a slot for, as (`scsi_slot(controller, id)`, index into `devices`); the first at a slot wins.
     pub fn disks(&self) -> Vec<(u8, usize)> {
         let placement = DevicePlacement::lenient(self, &self.devices);
@@ -3826,6 +3448,19 @@ impl MachineConfig {
         out
     }
 
+    /// The disks on Fibre Channel loops: each one's loop ID and its entry in `devices`.
+    pub fn loop_disks(&self) -> Vec<(u8, usize)> {
+        DevicePlacement::lenient(self, &self.devices).loop_disks(None)
+    }
+
+    /// The NVMe card's options, if the machine has one.
+    pub fn nvme(&self) -> Option<&NvmeConfig> {
+        self.devices.iter().find_map(|d| match &d.device {
+            DeviceModel::Nvme(n) => Some(n),
+            _ => None,
+        })
+    }
+
     pub fn disk(&self, slot: u8) -> Option<&ScsiDeviceConfig> {
         let i = self.disks().into_iter().find(|d| d.0 == slot)?.1;
         self.devices[i].device.scsi()
@@ -3834,6 +3469,21 @@ impl MachineConfig {
     pub fn disk_mut(&mut self, slot: u8) -> Option<&mut ScsiDeviceConfig> {
         let i = self.disks().into_iter().find(|d| d.0 == slot)?.1;
         self.devices[i].device.scsi_mut()
+    }
+
+    /// Whether a device of type `ty` is configured.
+    pub fn has_device(&self, ty: &str) -> bool {
+        self.devices.iter().any(|d| d.device.spec().name == ty)
+    }
+
+    /// Add an unplaced device of type `ty` with default options, or remove
+    /// every one.
+    pub fn set_device(&mut self, ty: &str, on: bool) {
+        self.devices.retain(|d| d.device.spec().name != ty);
+        if on {
+            let table = toml::Table::from_iter([("type".to_string(), ty.into())]);
+            self.devices.push(ConfiguredDevice::from_table(table).expect("a device type with no required options"));
+        }
     }
 
     /// Put `dev` at `slot`, replacing what is there.
@@ -3851,26 +3501,23 @@ impl MachineConfig {
     /// Settle where each device goes once the command line has picked the machine; `--scsiN` and `--cdromN` images replace
     /// what is at their slot.
     pub fn resolve_slots(&mut self) -> Result<(), String> {
+        legacy::gio_cards(self)?;
+        legacy::virtio_cards(self);
         legacy::merge_shorthands(self);
         DevicePlacement::new(self).map(drop)
     }
 
+    /// The config with every slot settled, as the command line settles it: what a front end
+    /// that never ran `load_config` builds from.
+    pub fn resolved(mut self) -> Result<MachineConfig, String> {
+        self.resolve_slots()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        self.validate_virtio_serial()?;
         self.validate_ip27_sections()?;
-        self.xio_widgets()?;
-        self.validate_graphics_placement()?;
-        self.validate_nvme()?;
-        self.validate_fibre_channel()?;
         self.cpu_part()?;
         self.machine.profile.accepts_cpus(self.machine.cpus())?;
-        self.validate_virtio_9p()?;
-        if self.graphics.heads != 1 && self.graphics.heads != 2 {
-            return Err(format!(
-                "graphics.heads {} is invalid (valid: 1, 2)",
-                self.graphics.heads
-            ));
-        }
         let board = self.graphics_board();
         if board != GraphicsBoard::Newport {
             let name = board.as_str();
@@ -3898,8 +3545,8 @@ impl MachineConfig {
                     format!("graphics.board \"{name}\" is only valid on the Octane")
                 });
             }
-            if self.graphics.heads != 1 {
-                return Err(format!("graphics.board \"{name}\" does not support dual-head (graphics.heads must be 1)"));
+            if self.has_device("newport") {
+                return Err(format!("graphics.board \"{name}\" does not support a second Newport head"));
             }
             if !self.graphics.resolution.is_guest() {
                 return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
@@ -3920,20 +3567,13 @@ impl MachineConfig {
             }
         }
         self.validate_serial_sockets()?;
-        // The test device decodes GIO expansion slot 0, as do the Ultra64 board and the second Newport head.
-        if self.test_device && matches!(self.machine.profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28) {
-            if self.ultra64.enabled {
-                return Err("test_device and [ultra64] both claim GIO expansion slot 0; enable one".into());
+        for d in &self.devices {
+            match &d.device {
+                DeviceModel::TestDevice(t) => t.run().map(|_| ())?,
+                DeviceModel::VirtioSerial(v) => v.check()?,
+                DeviceModel::Virtio9p(v) => v.check()?,
+                _ => {}
             }
-            if self.graphics.heads == 2 && !self.headless {
-                return Err("test_device and the second graphics head (graphics.heads = 2) both claim GIO expansion slot 0".into());
-            }
-        }
-        if self.test_device_run_config.is_some() {
-            if !self.test_device {
-                return Err("test_device_run_config needs test_device".into());
-            }
-            self.test_device_run_config()?;
         }
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
@@ -4004,7 +3644,7 @@ impl MachineConfig {
                 return Err(format!("machine.nodes {count} is invalid (valid: 1, 2)"));
             }
             if onyx {
-                crate::ip35_machine::check_placement(self)?;
+                crate::ip35_machine::graphics_port(self)?;
                 if let Some((product, _)) = board.kona() {
                     product.spec().check_host(crate::dev::kona::KonaHost::Onyx3000)?;
                 }
@@ -4031,9 +3671,6 @@ impl MachineConfig {
             crate::ip53_machine::check_banks_for_cpus(&self.tezro_memory()?, usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
             if !board.supports(MachineProfile::TezroIp53) {
                 return Err(format!("graphics.board \"{}\" is not a Tezro board (valid: v12, none)", board.as_str()));
-            }
-            if let Some(widget) = self.graphics.widget {
-                crate::ip53_machine::check_vpro_widget(widget)?;
             }
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
             // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
@@ -4106,6 +3743,20 @@ impl MachineConfig {
             return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
         let placement = DevicePlacement::new(self)?;
+        let written = self.devices.iter().filter(|d| matches!(d.device, DeviceModel::Graphics)).count();
+        if written > 1 {
+            // Octane dual head, Onyx2 and Onyx 3000 pipes and the Indy's dual-head board are real; iris builds one board.
+            return Err(format!("[[devices]] graphics: iris builds one graphics board on the {}", placement.machine()));
+        }
+        if written == 1 && board == GraphicsBoard::None {
+            return Err("[[devices]] graphics: the board `[graphics] board` names is none".into());
+        }
+        if self.has_device("nvme") {
+            self.machine.profile.refuse_nvme()?;
+        }
+        if self.has_device("qla2200") && matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35) {
+            return Err(format!("[[devices]] qla2200: the {} cannot take a Fibre Channel adapter", placement.machine()));
+        }
         let slots = (0..self.devices.len()).map(|i| placement.at(i).and_then(|p| scsi_target(&placement.slots, p)).map(|(c, id)| scsi_slot(c, id)));
         for (dev, id) in self.devices.iter().zip(slots).filter_map(|(d, s)| Some((d.device.scsi()?, s?))) {
             let id = &id;
@@ -4224,13 +3875,6 @@ impl MachineConfig {
     }
 
     /// Extract network-related settings into a `NetworkConfig`.
-    /// The test device's run configuration; all zero when unset.
-    pub fn test_device_run_config(&self) -> Result<crate::dev::testdev::RunConfig, String> {
-        self.test_device_run_config.as_deref().map_or(Ok(crate::dev::testdev::RunConfig::ALL), |s| {
-            s.parse().map_err(|e| format!("test_device_run_config {s:?}: {e}"))
-        })
-    }
-
     /// Parses `nat_subnet` from CIDR — safe to unwrap because `validate()` already accepted it.
     pub fn network(&self) -> NetworkConfig {
         let nat_subnet = self.nat_subnet.as_deref().map(|cidr| {
@@ -4349,7 +3993,7 @@ pub struct Cli {
     pub scsi7: Option<String>,
 
     /// Report every hard disk's write cache off (`write_cache = false` in each
-    /// `[scsi.N]` and in `[nvme]`): every write is stored on the host's disk before the guest
+    /// `hdd` and `nvme` device): every write is stored on the host's disk before the guest
     /// is told it is done, as on the drives SGI shipped. Slower. The default
     /// is a write cache, which can lose about 5 s of writes in a host crash
     /// (see STORAGE.md)
@@ -4651,7 +4295,7 @@ impl Cli {
             for dev in cfg.devices.iter_mut().filter_map(|d| d.device.scsi_mut()).filter(|d| d.kind() == ScsiKind::Disk) {
                 dev.write_cache = false;
             }
-            cfg.nvme.write_cache = false;
+            cfg.devices.iter_mut().filter_map(|d| d.device.nvme_mut()).for_each(|n| n.write_cache = false);
         }
 
         // DevicePlacement by `MachineConfig::cpu_part` once the profile is final.
@@ -4946,115 +4590,6 @@ mod export_tests {
     }
 
     #[test]
-    fn xio_boards_take_distinct_octane_slots() {
-        let octane = |t: &str| -> MachineConfig {
-            let mut c: MachineConfig =
-                toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
-                    .expect("parse");
-            c.devices.clear();
-            c
-        };
-        let shoehorn = "[[xio_board]]\nkind = \"pci-shoehorn\"\n";
-        let cage = "[[xio_board]]\nkind = \"pci-cage\"\n";
-        assert_eq!(octane("").xio_widgets().unwrap(), Vec::<u8>::new());
-        assert_eq!(octane(cage).xio_widgets().unwrap(), [13], "the module is in port 13");
-        assert_eq!(octane(&format!("{shoehorn}{cage}{shoehorn}")).xio_widgets().unwrap(), [10, 13, 12]);
-        assert!(octane(&format!("{cage}widget = 12\n")).validate().unwrap_err().contains("goes in port 13"));
-        assert!(octane(&cage.repeat(2)).validate().unwrap_err().contains("named twice"));
-        assert_eq!(octane(&shoehorn.repeat(5)).validate().unwrap_err(), "[[xio_board]] a PCI shoehorn has no free XIO slot");
-        assert_eq!(octane(&shoehorn.repeat(4)).xio_widgets().unwrap(), [10, 12, 9, 11]);
-        assert_eq!(octane(&format!("{shoehorn}{shoehorn}widget = 10\n")).xio_widgets().unwrap(), [12, 10]);
-        assert!(octane(&format!("{shoehorn}widget = 13\n")).validate().unwrap_err().contains("not an Octane XIO slot"), "13 is the module's");
-        assert!(octane(&format!("{shoehorn}widget = 9\n{shoehorn}widget = 9\n")).validate().unwrap_err().contains("named twice"));
-        // The graphics board's slot is its own; with none attached it is free.
-        let mut with_graphics = octane(&format!("{shoehorn}widget = 11\n"));
-        with_graphics.validate().expect("no graphics board in 11");
-        with_graphics.graphics.board = Some(GraphicsBoard::SolidImpact);
-        assert!(with_graphics.validate().unwrap_err().contains("holds the graphics board"));
-        // Only the Octane has XIO slots.
-        let mut o2 = octane(shoehorn);
-        o2.machine.profile = MachineProfile::O2Ip32;
-        assert!(o2.xio_widgets().unwrap_err().contains("needs an Octane"));
-    }
-
-    #[test]
-    fn a_fibre_channel_card_needs_a_board_and_disks_on_loop_ids() {
-        let octane = |t: &str| -> MachineConfig {
-            let mut c: MachineConfig =
-                toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
-                    .expect("parse");
-            c.devices.clear();
-            c
-        };
-        let cage = "[[xio_board]]\nkind = \"pci-cage\"\n";
-        let shoehorn = "[[xio_board]]\nkind = \"pci-shoehorn\"\n";
-        let fc = |extra: &str| format!("[fibre_channel]\n{extra}");
-        let err = octane(&fc("")).validate().unwrap_err();
-        assert!(err.contains("needs a [[xio_board]]"), "{err}");
-        octane(&format!("{cage}{}", fc(""))).validate().expect("a card with no disks");
-        octane(&format!("{cage}{}", fc("slot = 3\nbridge = true"))).validate().expect("the module's third slot");
-        let err = octane(&format!("{cage}{}", fc("slot = 4"))).validate().unwrap_err();
-        assert!(err.contains("slot 4") && err.contains("PCI module"), "{err}");
-        let err = octane(&format!("{shoehorn}{}", fc("board = 1"))).validate().unwrap_err();
-        assert!(err.contains("board 1"), "{err}");
-        let mut o2 = octane(&format!("{shoehorn}{}", fc("")));
-        o2.machine.profile = MachineProfile::O2Ip32;
-        assert!(o2.validate_fibre_channel().unwrap_err().contains("needs an Octane"));
-
-        let disk = |id: u32, extra: &str| format!("[fibre_channel.disk.{id}]\npath = \"d.img\"\n{extra}");
-        let ok = octane(&format!("{cage}{}{}", disk(5, "overlay = true\n"), disk(125, "")));
-        ok.validate().expect("loop IDs 5 and 125");
-        let fcc = ok.fibre_channel.as_ref().unwrap();
-        assert!(fcc.disks[&5].overlay && fcc.disks.keys().copied().collect::<Vec<_>>() == [5, 125]);
-        let err = octane(&format!("{cage}{}", disk(126, ""))).validate().unwrap_err();
-        assert!(err.contains("loop ID 126"), "{err}");
-        let err = octane(&format!("{cage}[fibre_channel.disk.5]\n")).validate().unwrap_err();
-        assert!(err.contains("needs a path"), "{err}");
-        let err = octane(&format!("{cage}{}", disk(5, "cdrom = true\n"))).validate().unwrap_err();
-        assert!(err.contains("plain disk"), "{err}");
-    }
-
-    #[test]
-    fn a_misspelt_fibre_channel_key_is_an_error() {
-        for key in ["slott = 3", "bridg = true", "borad = 0"] {
-            let err = toml::from_str::<MachineConfig>(&format!("[fibre_channel]\n{key}\n")).unwrap_err().to_string();
-            assert!(err.contains("unknown field"), "{key}: {err}");
-        }
-    }
-
-    #[test]
-    fn an_octane_nvme_card_needs_a_board_and_one_of_its_slots() {
-        let octane = |t: &str| -> MachineConfig {
-            let mut c: MachineConfig =
-                toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[graphics]\nboard = \"none\"\n{t}"))
-                    .expect("parse");
-            c.devices.clear();
-            c
-        };
-        let nvme = |extra: &str| format!("[nvme]\npath = \"d.img\"\n{extra}");
-        let err = octane(&nvme("")).validate().unwrap_err();
-        assert!(err.contains("needs a [[xio_board]]"), "the onboard Bridge has no slot for it: {err}");
-        let cage = "[[xio_board]]\nkind = \"pci-cage\"\n";
-        let shoehorn = "[[xio_board]]\nkind = \"pci-shoehorn\"\n";
-        // [nvme] is a table, so the arrays go first.
-        octane(&format!("{cage}{}", nvme(""))).validate().expect("the first board, its first free slot");
-        octane(&format!("{cage}{}", nvme("slot = 3\nbridge = true"))).validate().expect("the module's third slot");
-        let err = octane(&format!("{cage}{}", nvme("slot = 4"))).validate().unwrap_err();
-        assert!(err.contains("slot 4") && err.contains("[1, 2, 3]"), "{err}");
-        let err = octane(&format!("{shoehorn}{}", nvme("slot = 2"))).validate().unwrap_err();
-        assert!(err.contains("slot 2") && err.contains("[1]"), "{err}");
-        octane(&format!("{cage}{shoehorn}{}", nvme("board = 1"))).validate().expect("the shoehorn");
-        let err = octane(&format!("{cage}{}", nvme("board = 1"))).validate().unwrap_err();
-        assert!(err.contains("board 1") && err.contains("1 [[xio_board]]"), "{err}");
-        // The O2 has the one slot.
-        let mut o2 = octane(&nvme("slot = 1"));
-        o2.machine.profile = MachineProfile::O2Ip32;
-        assert!(o2.validate_nvme().unwrap_err().contains("the O2 has one slot"));
-        o2.nvme.slot = None;
-        o2.validate_nvme().expect("the O2's option slot");
-    }
-
-    #[test]
     fn octane_graphics_defaults_to_solid_impact() {
         let octane = |t: &str| -> MachineConfig {
             let mut c: MachineConfig =
@@ -5145,25 +4680,25 @@ mod export_tests {
         let mut cfg = MachineConfig::default();
         cfg.set_disk(1, ScsiDeviceConfig { path: "a.raw".into(), ..Default::default() });
         cfg.set_disk(2, ScsiDeviceConfig { path: "b.raw".into(), write_cache: true, ..Default::default() });
+        cfg.devices.push(ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::Nvme(NvmeConfig { path: "n.raw".into(), ..Default::default() })) });
         let on = Cli::parse_from(["iris"]).apply(cfg.clone());
         assert!(on.disk(1).unwrap().write_cache && on.disk(2).unwrap().write_cache, "no flag, no change");
         let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
         assert!(!off.disk(1).unwrap().write_cache && !off.disk(2).unwrap().write_cache);
-        assert!(on.nvme.write_cache, "the NVMe default");
-        assert!(!off.nvme.write_cache, "NVMe too");
+        assert!(on.nvme().unwrap().write_cache, "the NVMe default");
+        assert!(!off.nvme().unwrap().write_cache, "NVMe too");
     }
 
     #[test]
     fn nvme_write_cache_defaults_on_and_round_trips() {
-        let cfg: MachineConfig = toml::from_str("[nvme]\npath = \"a.raw\"\n").expect("parse");
-        assert!(cfg.nvme.write_cache, "the default");
+        let nvme = |extra: &str| MachineConfig::from_toml_str(&format!("[[devices]]\ntype = \"nvme\"\npath = \"a.raw\"\n{extra}")).expect("parse");
+        assert!(nvme("").nvme().unwrap().write_cache, "the default");
         assert!(NvmeConfig::default().write_cache, "the default in code");
-        let off: MachineConfig = toml::from_str("[nvme]\npath = \"a.raw\"\nwrite_cache = false\n").expect("parse");
-        assert!(!off.nvme.write_cache);
+        let off = nvme("write_cache = false\n");
+        assert!(!off.nvme().unwrap().write_cache);
         let s = toml::to_string_pretty(&off).expect("serialize");
-        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
-        assert!(!back.nvme.write_cache, "survives export:\n{s}");
-        assert!(NvmeConfig::default().is_default());
+        let back = MachineConfig::from_toml_str(&s).expect("deserialize");
+        assert!(!back.nvme().unwrap().write_cache, "survives export:\n{s}");
     }
 
     #[test]
@@ -5240,26 +4775,22 @@ mod export_tests {
     #[test]
     fn the_test_device_run_config_comes_from_the_command_line_and_is_checked() {
         use crate::dev::testdev::RunConfig;
-        let cli = |a: &[&str]| Cli::parse_from(["iris"].iter().chain(a)).apply(MachineConfig::default());
-        let cfg = cli(&["--test-device", "--test-device-run-config", "time_pct=10,repeats=3"]);
+        let cli = |a: &[&str]| {
+            let mut cfg = Cli::parse_from(["iris"].iter().chain(a)).apply(MachineConfig::default());
+            cfg.resolve_slots().map(|_| cfg)
+        };
+        let run = |cfg: &MachineConfig| match &cfg.devices.iter().find(|d| d.device.spec().name == "test_device").unwrap().device {
+            DeviceModel::TestDevice(t) => t.run(),
+            _ => unreachable!(),
+        };
+        let cfg = cli(&["--test-device", "--test-device-run-config", "time_pct=10,repeats=3"]).unwrap();
         cfg.validate().expect("a valid run config");
-        assert_eq!(cfg.test_device_run_config(), Ok(RunConfig { groups: 0, time_pct: 10, repeats: 3 }));
-        assert_eq!(cli(&["--test-device"]).test_device_run_config(), Ok(RunConfig::ALL));
-        let bad = cli(&["--test-device", "--test-device-run-config", "repeats=16"]).validate().unwrap_err();
-        assert!(bad.contains("test_device_run_config"), "{bad}");
-        let alone = cli(&["--test-device-run-config", "time_pct=10"]).validate().unwrap_err();
+        assert_eq!(run(&cfg), Ok(RunConfig { groups: 0, time_pct: 10, repeats: 3 }));
+        assert_eq!(run(&cli(&["--test-device"]).unwrap()), Ok(RunConfig::ALL));
+        let bad = cli(&["--test-device", "--test-device-run-config", "repeats=16"]).unwrap_err();
+        assert!(bad.contains("run_config"), "{bad}");
+        let alone = cli(&["--test-device-run-config", "time_pct=10"]).unwrap_err();
         assert!(alone.contains("needs test_device"), "{alone}");
-    }
-
-    #[test]
-    fn the_test_device_refuses_another_card_in_gio_slot_0() {
-        let cli = |a: &[&str]| Cli::parse_from(["iris"].iter().chain(a)).apply(MachineConfig::default());
-        let mut cfg = cli(&["--test-device"]);
-        cfg.ultra64.enabled = true;
-        assert!(cfg.validate().unwrap_err().contains("[ultra64]"));
-        let mut cfg = cli(&["--test-device"]);
-        cfg.graphics.heads = 2;
-        assert!(cfg.validate().unwrap_err().contains("second graphics head"));
     }
 
     #[test]
@@ -5566,19 +5097,8 @@ mod export_tests {
         let back = load(&text).unwrap();
         assert_eq!((back.c_bricks(), back.onyx3000.brick_serial.as_deref()), (2, Some("S")));
 
-        let tezro = load("[machine]\nprofile = \"tezro_ip53\"\nconsole = \"ioc4_c\"\nserial_port_c = 9003\naudio_card = true\n").unwrap();
-        assert_eq!((tezro.tezro.console, tezro.tezro.serial_port_c, tezro.tezro.audio), (TezroConsole::Ioc4C, Some(9003), true));
-        let text = toml::to_string_pretty(&tezro.for_writing()).unwrap();
-        assert!(text.contains("audio_card = true") && !text.contains("[tezro]"), "{text}");
-        // The Fuel, Origin 3200 and Onyx 3000 take the same card; no other machine does.
-        for (profile, cpu) in [("fuel_ip34", "r14000"), ("origin3200_ip35", "r12000"), ("onyx3000_ip35", "r12000")] {
-            let cfg = load(&format!("[machine]\nprofile = \"{profile}\"\ncpu = \"{cpu}\"\naudio_card = true\n")).unwrap();
-            assert!(cfg.audio_card(), "{profile}");
-            let text = toml::to_string_pretty(&cfg.for_writing()).unwrap();
-            assert!(text.contains("audio_card = true"), "{profile}: {text}");
-            assert!(MachineConfig::parse_toml(&text).unwrap().audio_card(), "{profile}");
-        }
-        assert!(load("[machine]\nprofile = \"octane_ip30\"\naudio_card = true\n").unwrap_err().contains("machine.audio_card is not a key"));
+        let tezro = load("[machine]\nprofile = \"tezro_ip53\"\nconsole = \"ioc4_c\"\nserial_port_c = 9003\n").unwrap();
+        assert_eq!((tezro.tezro.console, tezro.tezro.serial_port_c), (TezroConsole::Ioc4C, Some(9003)));
 
         let onyx2 = load("[machine]\nprofile = \"onyx2_ip27\"\nnodes = 2\nio_prom = \"io6prom.img\"\n").unwrap();
         assert_eq!((onyx2.node_boards(), onyx2.onyx2.io_prom.as_deref()), (2, Some("io6prom.img")));
@@ -5603,22 +5123,72 @@ mod export_tests {
         assert!(load("[machine]\nprofile = \"fuel_ip34\"\nconsole = \"ioc4_a\"\n").unwrap_err().contains("is not a console"));
     }
 
-    /// `[graphics] node` and `widget` say where the board plugs in, on the machines with a choice.
+    /// A `graphics` device says where the board plugs in, on the machines with a choice.
     #[test]
-    fn the_graphics_section_places_the_board() {
-        let onyx = |keys: &str| MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"onyx3000_ip35\"\n{keys}")).unwrap().validate();
-        onyx("nodes = 2\n[graphics]\nboard = \"v12\"\nnode = 0\n").unwrap();
-        onyx("nodes = 2\n[graphics]\nboard = \"v12\"\nnode = 1\nwidget = 12\n").unwrap();
-        onyx("nodes = 2\n[graphics]\nboard = \"ir3\"\nnode = 1\n").unwrap();
-        assert!(onyx("nodes = 1\n[graphics]\nboard = \"ir3\"\nnode = 1\n").unwrap_err().contains("graphics.node 1"));
-        assert!(onyx("nodes = 1\n[graphics]\nboard = \"v12\"\nwidget = 8\n").unwrap_err().contains("port B"));
-        assert!(onyx("nodes = 2\n[graphics]\nboard = \"v12\"\nwidget = 10\n").unwrap_err().contains("graphics.widget 10"));
-        let tezro = |keys: &str| MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"tezro_ip53\"\n[graphics]\nboard = \"v12\"\n{keys}")).unwrap().validate();
-        tezro("widget = 13\n").unwrap();
-        assert!(tezro("widget = 11\n").unwrap_err().contains("graphics.widget 11"));
-        assert!(tezro("node = 1\n").unwrap_err().contains("graphics.node"));
-        let octane = MachineConfig::from_toml_str("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\n[graphics]\nwidget = 9\n").unwrap();
-        assert!(octane.validate().unwrap_err().contains("graphics.widget"));
+    fn a_graphics_device_places_the_board() {
+        let load = |profile: &str, machine: &str, rest: &str| {
+            let mut cfg = MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"{profile}\"\n{machine}\n{rest}")).unwrap();
+            cfg.resolve_slots().and_then(|_| cfg.validate()).map(|_| cfg)
+        };
+        let gfx = |board: &str, at: &str| format!("[graphics]\nboard = \"{board}\"\n[[devices]]\ntype = \"graphics\"\nat = \"{at}\"\n");
+        let onyx = |nodes: u8, rest: String| load("onyx3000_ip35", &format!("nodes = {nodes}"), &rest);
+        onyx(2, gfx("v12", "node1/xio12")).unwrap();
+        onyx(2, gfx("v12", "xio11")).unwrap();
+        onyx(2, gfx("ir3", "node1/xio8")).unwrap();
+        assert!(onyx(1, gfx("ir3", "node1/xio11")).unwrap_err().contains("the machine has 1 C-brick"));
+        assert!(onyx(1, gfx("v12", "xio8")).unwrap_err().contains("has no slot xio8"), "the I-brick's pipe port is B");
+        assert!(onyx(2, gfx("v12", "node1/xio10")).unwrap_err().contains("has no slot node1/xio10"), "10 is the host");
+        let v12 = onyx(2, "[graphics]\nboard = \"v12\"\n".into()).unwrap();
+        assert_eq!(DevicePlacement::new(&v12).unwrap().graphics().unwrap().to_string(), "node1/xio8", "a V12 with no slot takes the V-brick");
+        let tezro = |rest: String| load("tezro_ip53", "", &rest);
+        tezro(gfx("v12", "xio13")).unwrap();
+        assert!(tezro(gfx("v12", "xio11")).unwrap_err().contains("has no slot xio11"), "11 is the second PIC");
+        assert_eq!(DevicePlacement::new(&tezro(gfx("v12", "xio13")).unwrap()).unwrap().graphics().unwrap().to_string(), "xio13");
+        assert_eq!(DevicePlacement::new(&tezro("[graphics]\nboard = \"v12\"\n".into()).unwrap()).unwrap().graphics().unwrap().to_string(), "xio12");
+        // One device, for a board that is fitted.
+        let two = format!("{}[[devices]]\ntype = \"graphics\"\n", gfx("v12", "xio13"));
+        assert!(tezro(two).unwrap_err().contains("builds one graphics board"));
+        assert!(tezro("[[devices]]\ntype = \"graphics\"\n".into()).unwrap_err().contains("is none"), "the Tezro has no board by default");
+        assert!(load("o2_ip32", "", "[[devices]]\ntype = \"graphics\"\n").unwrap_err().contains("no free slot for a graphics board"));
+    }
+
+    /// The graphics board is a placed device, so it holds its port: an Octane's default
+    /// board is at xio11 and a machine with no board, or no slot for one, lists none.
+    /// `workstation::build` settles the legacy card flags, as the GUI never runs `load_config`: two flags for
+    /// one GIO slot clash only if the build resolved them.
+    #[test]
+    fn a_built_machine_resolves_the_legacy_card_flags() {
+        let cfg = MachineConfig::from_toml_str("test_device = true\n[machine]\nprofile = \"indy_ip24\"\n[ultra64]\nenabled = true\n").unwrap();
+        let e = crate::workstation::build(cfg).err().expect("the flags clash in gio0");
+        assert!(e.contains("gio0 is taken by the ultra64"), "{e}");
+    }
+
+    /// The machines that cannot build a Fibre Channel adapter refuse one in `validate`.
+    #[test]
+    fn a_fibre_channel_card_is_refused_where_the_machine_cannot_build_it() {
+        for profile in ["o2_ip32", "origin3200_ip35", "onyx3000_ip35"] {
+            let mut cfg = MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"{profile}\"\n[[devices]]\ntype = \"qla2200\"\n")).unwrap();
+            let e = cfg.resolve_slots().and_then(|_| cfg.validate()).err().unwrap_or_default();
+            assert!(e.contains("Fibre Channel"), "{profile}: {e}");
+        }
+    }
+
+    #[test]
+    fn the_graphics_board_is_a_placed_device() {
+        let at = |profile: &str, rest: &str| -> Vec<String> {
+            let cfg = MachineConfig::from_toml_str(&format!("devices = []\n[machine]\nprofile = \"{profile}\"\n{rest}")).unwrap();
+            DevicePlacement::new(&cfg).unwrap().graphics().map(|at| at.to_string()).into_iter().collect()
+        };
+        assert_eq!(at("octane_ip30", ""), ["xio11"]);
+        assert_eq!(at("indy_ip24", ""), ["gfx"]);
+        assert_eq!(at("onyx2_ip27", "[graphics]\nboard = \"ir2\"\n"), ["xio8"]);
+        assert_eq!(at("fuel_ip34", "[graphics]\nboard = \"v12\"\n"), ["xio13"]);
+        for none in [at("octane_ip30", "[graphics]\nboard = \"none\"\n"), at("fuel_ip34", ""), at("o2_ip32", "")] {
+            assert!(none.is_empty());
+        }
+        let cfg = MachineConfig::from_toml_str("devices = []\n[machine]\nprofile = \"octane_ip30\"\n").unwrap();
+        let listing = DevicePlacement::new(&cfg).unwrap().list_slots();
+        assert!(listing.lines().any(|l| l.starts_with("xio11 ") && l.contains("graphics")), "{listing}");
     }
 
     /// Each IP27 product reads the table named for it, and only that one.
@@ -5684,8 +5254,8 @@ mod export_tests {
             assert!(e.contains(&format!("not available on the {product} ")), "{e}");
             let e = ip27_config(profile, "[graphics]\nboard = \"v12\"\n").validate().unwrap_err();
             assert!(e.contains(&format!("not modelled on the {product} ")), "{e}");
-            let e = ip27_config(profile, "[virtio_serial]\nenabled = true\n").validate().unwrap_err();
-            assert!(e.contains(&format!("not wired on the {product}")), "{e}");
+            let e = ip27_config(profile, "[virtio_serial]\nenabled = true\n").resolve_slots().unwrap_err();
+            assert!(e.contains(&format!("no free slot for virtio devices on the {product}")), "{e}");
         }
     }
 
@@ -6339,16 +5909,14 @@ mod tezro_config_tests {
         cfg
     }
 
-    /// The audio controller is off unless `[tezro] audio` adds it, and a
-    /// config that adds it is written back.
+    /// The audio controller is off unless an `ice1724` entry adds it, and survives a save.
     #[test]
     fn tezro_audio_is_opt_in_and_survives_a_save() {
-        assert!(!tezro().tezro.audio);
-        let on = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\n[tezro]\naudio = true\n").unwrap();
-        assert!(on.tezro.audio && !on.tezro.is_default());
-        assert!(TezroSection::default().is_default());
+        assert!(!tezro().has_device("ice1724"));
+        let mut on = tezro();
+        on.set_device("ice1724", true);
         let text = toml::to_string(&on).unwrap();
-        assert!(MachineConfig::parse_toml(&text).unwrap().tezro.audio, "{text}");
+        assert!(MachineConfig::parse_toml(&text).unwrap().has_device("ice1724"), "{text}");
     }
 
     /// Left at the generic default, `banks` gives the Tezro its 4 GiB layout;

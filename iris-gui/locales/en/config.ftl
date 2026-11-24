@@ -70,7 +70,7 @@ config-jit-cache-tip =
 config-jit-cache-dir = JIT cache folder
 config-jit-cache-dir-hint = Default location
 
-config-newport-heads = Newport heads
+config-newport-heads = Second Newport head
 config-newport-dual-subtitle =
 
 config-prom = PROM image
@@ -489,7 +489,7 @@ extra-console = Guest console
 extra-tcp-port = TCP port (0 = unset)
 extra-socket = Unix socket path
 extra-add-port = Add virtio port
-extra-widget = Widget (0 = automatic)
+extra-slot = Slot
 extra-add-xio = Add XIO PCI board
 extra-nvme-fit = Fit an NVMe disk
 extra-nvme = NVMe disk image
@@ -498,8 +498,6 @@ extra-bridge = Use PCI bridge
 extra-fc = Fit Fibre Channel adapter
 extra-write-cache = Write cache
 extra-add-disk = Add Fibre Channel disk
-extra-board = Board index
-extra-slot = PCI slot
 extra-complete = Complete configuration (TOML)
 extra-complete-help = Edit any supported configuration key, including optional tables and diagnostic settings. Apply validates the draft before saving it. See FEATURES.md for keys and supported hardware.
 extra-stale = Settings changed since this draft was opened. Reload the current settings before applying.
@@ -519,7 +517,6 @@ extra-log-timestamps = Log timestamps
 extra-network-mode = Network backend
 extra-jit-compile = JIT compile mode
 extra-console-select = Console
-extra-gio-slot = GIO slot
 extra-xio-kind = Board
 extra-usb-input = Use a USB keyboard and mouse instead of PS/2
 extra-tezro-audio = Fit the audio card (ICE1724)

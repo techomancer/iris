@@ -56,13 +56,15 @@ use crate::dev::isp2200::card::Card;
 use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::l1::{AttachedBrick, BoardIdentity, ComputeNode, L1Config, L1};
 use crate::dev::timekeeper::Timekeeper;
-use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET};
+use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET, PCI_ROUTING};
+use crate::pci::{PCI_INTA};
 use crate::hptimer::TimerManager;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::presence::PresenceHold;
 use crate::ip35::serial::connect_serial_ports;
-use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, fit_audio_card, xbridge_on};
+use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
 use crate::sn::BoardIo;
+use crate::topology::{DeviceFamily, MachineSlotKind};
 use crate::sn::NodeBoard;
 use crate::traits::{Device, Resettable};
 use std::path::Path;
@@ -177,6 +179,38 @@ fn pimm_mask(processors: Population) -> u8 {
     (0..2u8).filter(|&interface| (0..2).any(|slot| processors.populated(interface, slot))).fold(0, |mask, interface| mask | 1 << interface)
 }
 
+/// Head E's bus, "Bus 2": two slots at 1 and 2, the device numbers inferred.
+pub(crate) const HEAD_E_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::PCI_SLOT, Some("bus2-slot1")), (2, MachineSlotKind::PCI_SLOT, Some("bus2-slot2"))];
+
+/// Head F's bus, "Bus 1": the Fibre Channel adapter at 1, the IOC3 at 4, USB at 5, slots at 2 and 3 (inferred) and one extra slot.
+/// Device 0 is none: its INTA is the IOC3's SuperIO interrupt.
+pub(crate) const HEAD_F_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
+        (1, MachineSlotKind::Fixed("qla2200"), None),
+        (2, MachineSlotKind::PCI_SLOT, Some("bus1-slot2")),
+        (3, MachineSlotKind::PCI_SLOT, Some("bus1-slot3")),
+        (4, MachineSlotKind::Fixed("ioc3"), None),
+        (5, MachineSlotKind::Fixed("ohci"), None),
+        (6, MachineSlotKind::Fixed("ieee1394"), None),
+        (7, MachineSlotKind::Extra { pin: PCI_INTA }, None),
+    ];
+
+/// The I-brick's Fibre Channel adapter, device 1 of head F.
+const FIBRE_DEVICE: u8 = 1;
+
+fn fibre_at() -> crate::slot_path::MachineSlotPath {
+    format!("xio{HEAD_F}/pci0/{FIBRE_DEVICE}").parse().expect("a slot path")
+}
+
+/// The Origin 3200's and Onyx 3000's slots on the I-brick.
+pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>, onyx: bool) {
+    crate::topology::pci_bus_slots(s, &format!("xio{HEAD_E}/pci0"), "I-brick XBridge head E", HEAD_E_SLOTS);
+    crate::topology::pci_bus_slots(s, &format!("xio{HEAD_F}/pci0"), "I-brick XBridge head F", HEAD_F_SLOTS);
+    crate::topology::loop_slots(s, &fibre_at());
+    if onyx {
+        graphics_slots(s);
+    }
+}
+
 /// The I-brick's base I/O on `xbridge` (the first C-brick's crossbar): a Fibre Channel adapter at
 /// device 1 of head F, the IOC3 and USB. Head F's link reset resets the IOC3 and USB, and any
 /// other port's goes to `link_reset`, for a product with a board at the I-brick's other port.
@@ -191,17 +225,27 @@ fn build_baseio(
 ) -> Result<BoardIo, String> {
     let l1 = &l1s[0];
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
+    let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
+    for head in [HEAD_E, HEAD_F] {
+        resolved.bind_pci(&format!("xio{head}/pci0"), xbridge.bus(head).clone())?;
+    }
+    let cards = resolved.build_cards(cfg, timers)?;
+    if !cards.fibre.is_empty() {
+        return Err("[[devices]] qla2200: the I-brick has its Fibre Channel adapter built in".into());
+    }
+    let cards = Arc::new(cards);
     // The I-brick's head F bus, from published `hinv -mv` of an Origin 3200, an Onyx 3000 and an
     // Origin 3400: QLogic 2200 at slot 1, IOC3 at 4, USB at 5 (1394 at 6 unmodelled). Head F as
     // widget 15 and E as 14 is inferred from the port letters; head E's bus is empty.
     let pci = xbridge.bus(HEAD_F);
-    // The on-board Fibre Channel adapter, with the disks of `[fibre_channel]`.
-    let card = Card::open(&cfg.fibre_channel.clone().unwrap_or_default(), cfg.ci, timers)?;
-    card.attach(pci, 1);
+    // The on-board Fibre Channel adapter, with the disks placed on its loop.
+    let disks = resolved.card_loop(&fibre_at());
+    let card = Card::open(&disks, cfg.ci, timers)?;
+    card.attach(pci, FIBRE_DEVICE);
     // The slot runs 64-bit data phases, inferred from the PROM: its rings are right only if the
     // bridge reverses each adapter DMA doubleword as it does on such a slot.
-    xbridge.set_dma_64bit(HEAD_F, 1, true);
-    eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", cfg.fibre_channel.as_ref().map_or(0, |f| f.disks.len()));
+    xbridge.set_dma_64bit(HEAD_F, FIBRE_DEVICE, true);
+    eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", disks.len());
     let fibre = card.fc;
     fibre.set_heartbeat(heartbeat.clone());
     let section = cfg.ip35_section();
@@ -238,8 +282,9 @@ fn build_baseio(
     // `scsi2` and `cow2`: the Fibre Channel loop's disks.
     let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone(), crate::pci::pci_host_commands("XBridge", &[xbridge.bus(HEAD_E), pci], None)];
     let scsi_fibre = fibre.clone();
-    let mut io = BoardIo {
-        devices: vec![ioc3.clone(), usb, fibre],
+    let devices: Vec<Arc<dyn Device>> = vec![ioc3.clone(), usb, fibre];
+    Ok(BoardIo {
+        devices,
         reset: Box::new(move || {
             reset_xbridge.power_on();
             reset_ioc3.power_on();
@@ -262,14 +307,13 @@ fn build_baseio(
         status: None,
         fasttick: None,
         cpus: None,
-    };
-    fit_audio_card(cfg, pci, timers, &mut io);
-    Ok(io)
+    }
+    .with_cards(&cards))
 }
 
 /// Where an InfiniteReality pipe sits: widget 11 of the I-brick's XBridge,
 /// its port B.
-const PIPE_WIDGET: u8 = SPARE_PORT;
+pub(crate) const PIPE_WIDGET: u8 = SPARE_PORT;
 
 /// The rack bay the I-brick's controller reports for the G-brick: a choice, as no inventory places
 /// one (the C-brick is at bay 4, the I-brick at 14).
@@ -277,48 +321,47 @@ const G_BRICK_BAY: u32 = 24;
 
 /// The V-brick's V12 at widget 8 of its XBridge. Approximation: no V-brick widget listing is
 /// captured; 8 and 12 are equal candidates from the X-brick's slot table.
-const VPRO_WIDGET: u8 = 8;
+pub(crate) const VPRO_WIDGET: u8 = 8;
 
 /// The V-brick as its C-brick's controller reports it. Approximation: the L1 firmware names none;
 /// it runs the X-brick's personality, so the type letter is `X`, the bay a choice and the rest the
 /// C-brick's.
 const V_BRICK: AttachedBrick = AttachedBrick { bay: 11, type_code: b'X' as u32, graphics_bay: None };
 
-/// Where the Onyx 3000's graphics board sits: the C-brick whose XIO link reaches it and its widget
-/// there. `[graphics] node` and `widget` choose; unset, a pipe is on the first C-brick and a V12 on
-/// the last, at widget 11 of the I-brick's XBridge on the first and, for a V12 in a V-brick of its
-/// own on another, widget 8.
+/// Where the Onyx 3000's graphics board can go: the I-brick's port B on the first C-brick, or a
+/// free port of a graphics brick's XBridge on the second.
+fn graphics_slots(s: &mut Vec<crate::topology::MachineSlot>) {
+    crate::topology::open_slot(s, &format!("xio{PIPE_WIDGET}"), &[DeviceFamily::Gfx], &[]);
+    for widget in (8..HEAD_E).filter(|&w| w != HOST_WIDGET) {
+        crate::topology::open_slot(s, &format!("node1/xio{widget}"), &[DeviceFamily::Gfx], &[]);
+    }
+}
+
+/// The C-brick whose XIO link reaches the graphics board and its widget there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Placement {
+pub(crate) struct GraphicsPort {
     pub node: usize,
     pub widget: u8,
 }
 
-pub(crate) fn placement(cfg: &MachineConfig) -> Placement {
-    let vpro = cfg.graphics_board().is_vpro();
-    let node = cfg.graphics.node.map_or(if vpro { cfg.c_bricks() - 1 } else { 0 }, usize::from);
-    let widget = cfg.graphics.widget.unwrap_or(if node > 0 && vpro { VPRO_WIDGET } else { PIPE_WIDGET });
-    Placement { node, widget }
+/// Where the board is placed, on a C-brick the machine has.
+pub(crate) fn graphics_port(cfg: &MachineConfig) -> Result<GraphicsPort, String> {
+    let at = crate::topology::DevicePlacement::new(cfg)?.graphics().cloned();
+    let (node, widget) = at.and_then(|at| at.xio_port()).unwrap_or((0, PIPE_WIDGET));
+    match usize::from(node) < cfg.c_bricks() {
+        true => Ok(GraphicsPort { node: node.into(), widget }),
+        false => Err(format!("graphics at node{node}: the machine has {} C-brick(s), numbered from 0", cfg.c_bricks())),
+    }
 }
 
-/// Refuse a placement the bricks do not have: a C-brick the machine lacks, a widget other than the
-/// I-brick's port B on the first C-brick, or a port an XBridge cannot give a board on another.
-pub(crate) fn check_placement(cfg: &MachineConfig) -> Result<(), String> {
-    let Placement { node, widget } = placement(cfg);
-    if node >= cfg.c_bricks() {
-        return Err(format!("graphics.node {node}: the machine has {} C-brick(s), numbered from 0", cfg.c_bricks()));
-    }
-    if node == 0 && widget != PIPE_WIDGET {
-        return Err(format!("graphics.widget {widget}: on the first C-brick the board is at the I-brick's port B, widget {PIPE_WIDGET}"));
-    }
-    if !(8..HEAD_E).contains(&widget) || widget == HOST_WIDGET {
-        return Err(format!("graphics.widget {widget} is not a port of the graphics brick's XBridge (valid: 8, 9, 11, 12, 13)"));
-    }
-    Ok(())
+/// Where a V12 goes when none is named: a V-brick of its own on the last C-brick, when there is a
+/// second.
+pub(crate) fn default_at(cfg: &MachineConfig) -> Option<String> {
+    (cfg.graphics_board().is_vpro() && cfg.c_bricks() > 1).then(|| format!("node{}/xio{VPRO_WIDGET}", cfg.c_bricks() - 1))
 }
 
 /// The machine's one or two C-bricks. The first has the I-brick. On the Onyx 3000 the C-brick the
-/// graphics is on ([`placement`]) names it: the first lists a brick on the I-brick's port B, another
+/// graphics is on ([`graphics_port`]) names it: the first lists a brick on the I-brick's port B, another
 /// has a brick of its own on its XIO connector, answering as an X-brick, with a pipe on its port B.
 pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let count = cfg.c_bricks();
@@ -326,7 +369,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
         return c_bricks(cfg, count, I_BRICK, None);
     }
     let graphics = AttachedBrick { graphics_bay: Some(G_BRICK_BAY), ..I_BRICK };
-    if placement(cfg).node == 0 {
+    if graphics_port(cfg)?.node == 0 {
         c_bricks(cfg, count, graphics, None)
     } else if cfg.graphics_board().is_vpro() {
         c_bricks(cfg, count, I_BRICK, Some(V_BRICK))
@@ -377,8 +420,7 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
         io.status = Some(status);
         return Ok(io);
     }
-    check_placement(cfg)?;
-    let Placement { node, widget } = placement(cfg);
+    let GraphicsPort { node, widget } = graphics_port(cfg)?;
     let on_ibrick = node == 0;
     let bedrock = &nodes[node].chip;
     let bridge = if on_ibrick { xbridge.clone() } else { xbridge_on(bedrock) };

@@ -358,7 +358,7 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
     on_large_stack(|| {
         let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &crate::cpu::parts::R4400_150);
         cfg.headless = false;
-        cfg.graphics.heads = 2;
+        cfg.set_device("newport", true);
         cfg.nvram.clear();
         cfg.nveeprom.clear();
         cfg.monitor_port = Some(0);

@@ -222,7 +222,7 @@ pub struct EmulatorHandle {
     /// Shared latest-framebuffer slot, written by the CaptureRenderer
     /// inside the worker and read by the GUI each egui frame.
     pub frame_sink: FrameSink,
-    /// Second Newport head (`graphics.heads == 2`); inactive when seq stays 0.
+    /// Second Newport head (a `newport` device); inactive when seq stays 0.
     pub frame_sink_head1: FrameSink,
     /// Handle to the live machine's PS/2 controller (when running), so
     /// the GUI thread can push keyboard / mouse events at it directly.
@@ -496,7 +496,7 @@ fn worker_loop(
                 let cfg_owned = *cfg;
                 let sink_for_machine = frame_sink.clone();
                 let sink_for_head1 = frame_sink_head1.clone();
-                let heads = cfg_owned.graphics.heads;
+                let dual = cfg_owned.has_device("newport");
                 // Read before the closure moves the config into it.
                 let vnc_listen = cfg_owned.vnc.listen.clone();
                 let vnc_max_fps = cfg_owned.vnc.max_fps;
@@ -512,7 +512,7 @@ fn worker_loop(
                         *display.renderer_slot().lock() =
                             Some(new_capture_renderer(sink_for_machine));
                     }
-                    if heads >= 2 {
+                    if dual {
                         if let Some(display) = m.get_display_head1() {
                             *display.renderer_slot().lock() =
                                 Some(new_capture_renderer(sink_for_head1));

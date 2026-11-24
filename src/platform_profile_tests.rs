@@ -43,32 +43,39 @@ mod tests {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = profile;
         cfg.virtio_serial.enabled = true;
+        cfg.resolve_slots().expect("a slot for the card");
         cfg
+    }
+
+    fn serial_options(c: &mut MachineConfig) -> &mut crate::config::VirtioSerialConfig {
+        c.devices.iter_mut().find_map(|d| match &mut d.device {
+            crate::devices::DeviceModel::VirtioSerial(v) => Some(v),
+            _ => None,
+        }).expect("a virtio_serial entry")
     }
 
     #[test]
     fn virtio_serial_validates_where_it_has_a_home() {
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::OctaneIp30] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
             virtio_cfg(p).validate().unwrap_or_else(|e| panic!("{p:?}: {e}"));
         }
-        assert!(virtio_cfg(MachineProfile::O2Ip32).validate().is_err(), "not wired on the O2");
     }
 
     #[test]
     fn virtio_serial_refuses_a_taken_slot_and_bad_ports() {
-        use crate::config::{VirtioGioSlot, VirtioSerialPort};
-        let mut c = virtio_cfg(MachineProfile::Indigo2Ip28);
-        c.virtio_serial.slot = VirtioGioSlot::Exp0;
-        c.test_device = true;
-        assert!(c.validate().is_err());
+        use crate::config::VirtioSerialPort;
+        let mut c = MachineConfig::from_toml_str(
+            "test_device = true\n[machine]\nprofile = \"indigo2_ip28\"\n[virtio_serial]\nenabled = true\nslot = \"exp0\"",
+        ).unwrap();
+        assert!(c.resolve_slots().unwrap_err().contains("gio0 is taken by the test_device"));
 
         let mut c = virtio_cfg(MachineProfile::IndyIp24);
         let port = |n: &str| VirtioSerialPort { name: Some(n.into()), ..Default::default() };
-        c.virtio_serial.ports = vec![port("a"), port("a")];
+        serial_options(&mut c).ports = vec![port("a"), port("a")];
         assert!(c.validate().unwrap_err().contains("used twice"));
-        c.virtio_serial.ports = (0..32).map(|i| port(&format!("p{i}"))).collect();
+        serial_options(&mut c).ports = (0..32).map(|i| port(&format!("p{i}"))).collect();
         assert!(c.validate().unwrap_err().contains("at most 31"));
-        c.virtio_serial.ports = vec![VirtioSerialPort { tcp_port: Some(1), socket: Some("/x".into()), ..Default::default() }];
+        serial_options(&mut c).ports = vec![VirtioSerialPort { tcp_port: Some(1), socket: Some("/x".into()), ..Default::default() }];
         assert!(c.validate().unwrap_err().contains("exclusive"));
     }
 
@@ -153,7 +160,6 @@ mod tests {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
         cfg.graphics.board = Some(GraphicsBoard::Xz);
-        cfg.graphics.heads = 1;
         cfg.validate().expect("XZ board on Indy");
     }
 
@@ -178,7 +184,7 @@ mod tests {
     fn dual_head_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.graphics.heads = 2;
+        cfg.set_device("newport", true);
         cfg.validate().expect("dual-head Indigo2");
     }
 

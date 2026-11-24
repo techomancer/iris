@@ -334,7 +334,7 @@ impl State {
 /// device number behind a PCI-to-PCI bridge, whose INTA the bridge's rotation
 /// carries to the bridge's INTC, has a line; no function on the IO9 uses it
 /// otherwise, and INTB and INTD are unknown.
-static PIC_ROUTING: IntxRouting = IntxRouting {
+pub static PIC_ROUTING: IntxRouting = IntxRouting {
     devices: DEVICES + 1,
     irqs: PINS as u8,
     intx: &[

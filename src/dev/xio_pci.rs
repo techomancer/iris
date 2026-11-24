@@ -59,14 +59,14 @@ use crate::pci::{DevFn, PciBus, PciFunction};
 use crate::topology::MachineSlotKind;
 use crate::xtalk::Upstream;
 
-/// Which product, as `[[xio_board]] kind` names it.
+/// Which product: the `pci_shoehorn` or `pci_cage` device type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     /// The single-slot XIO-to-PCI adapter.
-    #[serde(rename = "pci-shoehorn")]
+    #[serde(rename = "pci_shoehorn", alias = "pci-shoehorn")]
     Shoehorn,
     /// The Octane's three-slot PCI module.
-    #[serde(rename = "pci-cage")]
+    #[serde(rename = "pci_cage", alias = "pci-cage")]
     Cage,
 }
 
@@ -81,15 +81,14 @@ const SHOEHORN_BRIDGE_REVISION: u32 = 4;
 /// A shoehorn's bus: one slot, device 1.
 pub(crate) const SHOEHORN_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::PCI_SLOT, None)];
 /// The PCI module's bus: slots 1 to 3, PCI device numbers 1 to 3.
-pub(crate) const CAGE_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] =
-    &[(1, MachineSlotKind::PCI_SLOT, None), (2, MachineSlotKind::PCI_SLOT, None), (3, MachineSlotKind::PCI_SLOT, None)];
+pub(crate) const CAGE_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::PCI_SLOT, None), (2, MachineSlotKind::PCI_SLOT, None), (3, MachineSlotKind::PCI_SLOT, None)];
 
 impl Kind {
-    /// The name `[[xio_board]] kind` uses.
+    /// Its device type's name.
     pub fn name(self) -> &'static str {
         match self {
-            Kind::Shoehorn => "pci-shoehorn",
-            Kind::Cage => "pci-cage",
+            Kind::Shoehorn => "pci_shoehorn",
+            Kind::Cage => "pci_cage",
         }
     }
 
@@ -170,29 +169,6 @@ impl XioPciBoard {
 
     pub fn bus(&self) -> &PciBus {
         self.bridge.bus()
-    }
-
-    /// `device` as the board's slot, free to take a function.
-    pub fn check_slot(&self, device: u8) -> Result<(), String> {
-        if !self.kind.slots().contains(&device) {
-            return Err(format!("the {} has no slot {device} (slots {:?})", self.kind.label(), self.kind.slots()));
-        }
-        if self.bus().occupied(device) {
-            return Err(format!("the {}'s slot {device} is taken", self.kind.label()));
-        }
-        Ok(())
-    }
-
-    /// The first slot with nothing in it.
-    pub fn free_slot(&self) -> Option<u8> {
-        self.kind.slots().into_iter().find(|&d| !self.bus().occupied(d))
-    }
-
-    /// Put `f` (function 0) in slot `device`.
-    pub fn attach(&self, device: u8, f: Arc<dyn PciFunction>) -> Result<(), String> {
-        self.check_slot(device)?;
-        self.bus().attach(DevFn { device, function: 0 }, f);
-        Ok(())
     }
 }
 

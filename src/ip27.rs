@@ -334,16 +334,38 @@ pub(crate) fn load_io_prom(bridge: &Bridge, cfg: &MachineConfig) -> Result<(), S
 /// The two ISP1040s behind the I/O board's Bridge.
 const SCSI_DEVICES: [u8; 2] = [0, 1];
 
-/// The BaseIO Bridge's widget: 8 on the Origin 200 and 2000, 15 on the Onyx2's BaseIO-G.
-fn scsi_at(profile: MachineProfile) -> [String; 2] {
-    let widget = if profile == MachineProfile::Onyx2Ip27 { 15 } else { 8 };
-    SCSI_DEVICES.map(|d| format!("xio{widget}/pci0/{d}"))
-}
+/// The Origin 2000's XIO slots IO1 to IO12: ports of the first node's Crossbow (IO1 is the BaseIO),
+/// then the second node's (Origin 2000 quick-reference HMQ-380-C, p. 250).
+const ORIGIN2000_SLOTS: [&str; 12] = [
+    "xio8", "xio12", "xio15", "xio11", "xio14", "xio13",
+    "node1/xio14", "node1/xio11", "node1/xio15", "node1/xio12", "node1/xio8", "node1/xio13",
+];
+
+/// The Onyx2 deskside's slots IO1 to IO6 on its one Crossbow: the BaseIO-G, three option slots and
+/// the graphics slot.
+const ONYX2_SLOTS: [&str; 6] = ["xio15", "xio11", "xio14", "xio8", "xio13", "xio12"];
 
 /// The slots of the Origin 200, Origin 2000 and Onyx2.
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>, profile: MachineProfile) {
-    for at in scsi_at(profile) {
-        crate::topology::scsi_bus_slots(s, &at, "isp1040", 15);
+    use crate::topology::DeviceFamily;
+    let slots: &[&str] = match profile {
+        MachineProfile::Origin2000Ip27 => &ORIGIN2000_SLOTS,
+        MachineProfile::Onyx2Ip27 => &ONYX2_SLOTS,
+        _ => &[],
+    };
+    for (n, at) in slots.iter().enumerate() {
+        let alias = format!("io{}", n + 1);
+        match n {
+            0 if profile == MachineProfile::Origin2000Ip27 => crate::topology::fixed_slot(s, at, "BaseIO", &[&alias]),
+            0 => crate::topology::fixed_slot(s, at, "BaseIO-G", &[&alias]),
+            // The Onyx2's graphics slot, the only one of its board classes modelled.
+            _ => crate::topology::open_slot(s, at, if *at == "xio8" { &[DeviceFamily::Gfx] } else { &[] }, &[&alias]),
+        }
+    }
+    // The BaseIO Bridge's widget: 8 on the Origin 200 and 2000, 15 on the Onyx2's BaseIO-G.
+    let widget = if profile == MachineProfile::Onyx2Ip27 { 15 } else { 8 };
+    for d in SCSI_DEVICES {
+        crate::topology::scsi_bus_slots(s, &format!("xio{widget}/pci0/{d}"), "isp1040", 15);
     }
 }
 

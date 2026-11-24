@@ -46,6 +46,12 @@ impl PciToPciBridge {
         })
     }
 
+    /// The generic bridge iris puts a card behind: DEC 1011:0026 (the 21154), which drivers know, with the 21154's 32-bit I/O
+    /// window. Only its type 1 header is modelled.
+    pub fn dec_21154(parent: &PciBus, at: DevFn) -> Arc<Self> {
+        Self::with_io32_windows(parent, at, 0x1011, 0x0026, 0)
+    }
+
     /// As [`Self::with_revision`], with the windows of the TI PCI2050: 32-bit
     /// I/O addressing and stored upper halves of the prefetchable window (see
     /// [`PciConfig::type1_wide`]). Other bridges keep the plain 16-bit I/O

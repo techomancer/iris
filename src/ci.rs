@@ -1062,8 +1062,8 @@ fn cmd_diff(args: &Value) -> Response {
     let mut devices_changed: Vec<&'static str> = Vec::new();
     let mut devices_unchanged: Vec<&'static str> = Vec::new();
     for &base in &device_bases {
-        let va = snap_a.read_state(base, sv_a).ok();
-        let vb = snap_b.read_state(base, sv_b).ok();
+        let va = snap_a.read_state(base).ok();
+        let vb = snap_b.read_state(base).ok();
         match (va, vb) {
             (Some(va), Some(vb)) => {
                 if va == vb { devices_unchanged.push(base); }
@@ -1073,8 +1073,8 @@ fn cmd_diff(args: &Value) -> Response {
         }
     }
     // REX3 separately because it's optional.
-    let rex_a = snap_a.read_state("rex3", sv_a).ok();
-    let rex_b = snap_b.read_state("rex3", sv_b).ok();
+    let rex_a = snap_a.read_state("rex3").ok();
+    let rex_b = snap_b.read_state("rex3").ok();
     let rex3_changed = match (rex_a, rex_b) {
         (Some(va), Some(vb)) => Some(va != vb),
         (None, None)         => None,

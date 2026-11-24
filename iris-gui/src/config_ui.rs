@@ -335,13 +335,13 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         show_board_picker(ui, cfg, mem_ctx.running);
     }
     if !o2 && !octane && cfg.graphics_board() == GraphicsBoard::Newport {
-        ui.horizontal(|ui| {
-            ui.label(t!("config-newport-heads"));
-            ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
-            if cfg.graphics.heads == 2 {
-                subtitle(ui, t!("config-newport-dual-subtitle"));
-            }
-        });
+        let mut dual = cfg.has_device("newport");
+        if ui.checkbox(&mut dual, t!("config-newport-heads")).changed() {
+            cfg.set_device("newport", dual);
+        }
+        if dual {
+            subtitle(ui, t!("config-newport-dual-subtitle"));
+        }
     }
     if !octane {
         show_resolution_picker(ui, cfg, false);
@@ -434,8 +434,12 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     #[cfg(not(feature = "appstore"))]
     {
         ui.separator();
-        ui.checkbox(&mut cfg.ultra64.enabled, t!("config-ultra64"))
-            .tip(t!("config-ultra64-tip"));
+        let mut on = cfg.has_device("ultra64");
+        if crate::extra_ui::mc_machine(cfg.machine.profile)
+            && ui.checkbox(&mut on, t!("config-ultra64")).tip(t!("config-ultra64-tip")).changed()
+        {
+            cfg.set_device("ultra64", on);
+        }
         subtitle(ui, t!("config-autosave-subtitle"));
     }
 
@@ -585,7 +589,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     if choice != before {
         cfg.graphics.board = Some(choice);
         if choice != GraphicsBoard::Newport {
-            cfg.graphics.heads = 1;
+            cfg.set_device("newport", false);
             cfg.graphics.resolution = NewportResolution::Guest;
         }
     }

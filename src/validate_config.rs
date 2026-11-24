@@ -39,12 +39,12 @@ fn missing_parent(what: &str, path: &str, problems: &mut Vec<String>) {
     }
 }
 
-/// What the machine would warn about and carry on: the audio card added
+/// What the machine would warn about and carry on: an audio card placed
 /// with `no_audio` set.
 pub fn warnings(cfg: &MachineConfig) -> Vec<String> {
     let mut warnings = Vec::new();
-    if cfg.audio_card() && cfg.no_audio {
-        warnings.push(crate::ip35::AUDIO_WITH_NO_AUDIO.to_string());
+    if cfg.has_device("ice1724") && cfg.no_audio {
+        warnings.push(crate::devices::AUDIO_WITH_NO_AUDIO.to_string());
     }
     warnings
 }
@@ -123,7 +123,10 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
         MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => ports.push(l1(cfg.ip35_section().l1_port)),
         _ => {}
     }
-    let virtio = &cfg.virtio_serial;
+    let virtio = cfg.devices.iter().find_map(|d| match &d.device {
+        crate::devices::DeviceModel::VirtioSerial(v) => Some(v),
+        _ => None,
+    }).unwrap_or(&cfg.virtio_serial);
     if virtio.enabled {
         let default = [crate::dev::virtio::console::DEFAULT_TCP_PORT];
         let tcp = virtio.ports.iter().filter_map(|p| p.tcp_port);
@@ -296,20 +299,12 @@ mod tests {
     fn the_tezro_audio_card_with_no_audio_is_a_warning() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::TezroIp53;
-        cfg.tezro.audio = true;
+        cfg.set_device("ice1724", true);
         assert!(warnings(&cfg).is_empty());
         cfg.no_audio = true;
         assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")), "{:?}", warnings(&cfg));
-        cfg.tezro.audio = false;
+        cfg.set_device("ice1724", false);
         assert!(warnings(&cfg).is_empty());
-        // The same card on the other machines that take it.
-        cfg.machine.profile = MachineProfile::FuelIp34;
-        cfg.fuel.audio = true;
-        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")));
-        cfg.machine.profile = MachineProfile::Onyx3000Ip35;
-        assert!(warnings(&cfg).is_empty());
-        cfg.onyx3000.audio = true;
-        assert!(warnings(&cfg).iter().any(|w| w.contains("plays to nowhere")));
     }
 
     /// A scratch volume only needs its directory and an empty CD-ROM tray is

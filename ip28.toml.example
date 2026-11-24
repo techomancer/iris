@@ -21,17 +21,18 @@ path    = "ip28/blank.raw"
 overlay = true
 
 # Optional: a virtio-serial port for a guest that has a driver for it
-# (see docs/dev/virtio-serial.md). GIO expansion slot 1 by default.
-# [virtio_serial]
-# enabled = true
-# [[virtio_serial.port]]
+# (see docs/dev/virtio-serial.md), in GIO slot gio1 or gio0.
+# [[devices]]
+# type = "virtio_serial"
+# at   = "gio1"
+# [[devices.port]]
 # console  = true
 # tcp_port = 8890
 
 # Optional: a host directory the guest mounts (see docs/dev/virtio-9p.md). If
 # virtio-serial is on too, give each its own slot.
-# [virtio_9p]
-# enabled = true
-# slot    = "exp0"
-# path    = "/path/on/the/host"
-# tag     = "share"
+# [[devices]]
+# type = "virtio_9p"
+# at   = "gio0"
+# path = "/path/on/the/host"
+# tag  = "share"

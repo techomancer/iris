@@ -2,9 +2,9 @@
 //! out from the config alone so every machine profile gets the same answer
 //! and the tests need no window.
 //!
-//! Disks sit in different places per machine: `[scsi.N]` on every machine but
-//! the IP35 bricks (where that slot list is unused), `[nvme]` on the O2 and in an
-//! Octane option board, `[fibre_channel]` on the machines with a PCI slot for
+//! Disks sit in different slots per machine: SCSI targets on every machine but
+//! the IP35 bricks (where that slot list is unused), an `nvme` card on the O2 and in an
+//! Octane option board, a `qla2200` loop on the machines with a PCI slot for
 //! it. The SCSI targets are named by their (controller, id) placement, so the
 //! O2's external bus reads `1:3`, not the `[scsi.19]` key.
 
@@ -35,13 +35,11 @@ pub fn drives(cfg: &MachineConfig) -> Vec<Drive> {
             Drive::Disk { id, path: d.path.clone() }
         });
     }
-    if !cfg.nvme.path.is_empty() {
-        out.push(Drive::Nvme { path: cfg.nvme.path.clone() });
+    if let Some(n) = cfg.nvme() {
+        out.push(Drive::Nvme { path: n.path.clone() });
     }
-    if let Some(fc) = &cfg.fibre_channel {
-        for (&id, d) in &fc.disks {
-            out.push(Drive::FibreChannel { id, path: d.path.clone() });
-        }
+    for (id, i) in cfg.loop_disks() {
+        out.push(Drive::FibreChannel { id, path: cfg.devices[i].device.scsi().map_or_else(String::new, |d| d.path.clone()) });
     }
     out
 }
@@ -124,9 +122,8 @@ pub fn missing_disks(cfg: &MachineConfig, readable: impl Fn(&str) -> bool) -> Ve
 
 /// The NVMe and Fibre Channel images the machine will open.
 pub fn expansion_paths(cfg: &MachineConfig) -> Vec<&str> {
-    cfg.fibre_channel.iter()
-        .flat_map(|fc| fc.disks.values().map(|d| d.path.as_str()))
-        .chain((!cfg.nvme.path.is_empty()).then_some(cfg.nvme.path.as_str()))
+    cfg.loop_disks().into_iter().filter_map(|(_, i)| cfg.devices[i].device.scsi().map(|d| d.path.as_str()))
+        .chain(cfg.nvme().map(|n| n.path.as_str()))
         .collect()
 }
 
@@ -151,7 +148,8 @@ mod tests {
             [scsi.19]
             path = "cd.iso"
             cdrom = true
-            [nvme]
+            [[devices]]
+            type = "nvme"
             path = "nvme.img"
         "#);
         assert_eq!(cfg.machine.profile, MachineProfile::O2Ip32);
@@ -227,7 +225,9 @@ mod tests {
             profile = "origin3200_ip35"
             [scsi.1]
             path = "unused.img"
-            [fibre_channel.disk.0]
+            [[devices]]
+            type = "hdd"
+            at = "xio15/pci0/1/l0"
             path = "fc0.img"
         "#);
         assert!(missing_disks(&cfg, none_readable).is_empty());

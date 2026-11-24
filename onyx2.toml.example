@@ -36,6 +36,5 @@ mode = "off"
 type = "hdd"
 at   = "scsi0/t1"
 path = "ignore/onyx2/irix.raw"
-cdrom = false
 # Keep the base disk unchanged. Guest writes go to irix.raw.overlay.
 overlay = true

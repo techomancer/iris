@@ -1,7 +1,9 @@
 //! Less common machine settings and a validated editor for the complete config.
 use egui::{ComboBox, DragValue, TextEdit, Ui};
 use iris::config::*;
-use iris::topology::{scsi_target_slot, scsi_target, DevicePlacement};
+use iris::dev::xio_pci::Kind;
+use iris::topology::{scsi_target_slot, scsi_target, slots_take, DeviceFamily, DevicePlacement, MachineSlotKind};
+use iris::devices::{DeviceModel, ConfiguredDevice};
 
 /// The Indy and Indigo2 family: the machines built around the MC memory
 /// controller, with Newport resolution presets, a DS1386 NVRAM and (on the
@@ -65,7 +67,6 @@ pub fn switch_profile(cfg: &mut MachineConfig, from: MachineProfile) {
     } else {
         GraphicsBoard::default_for(p)
     });
-    cfg.graphics.heads = 1;
     // `compile = "sync"` needs one CPU; the new machine may start with more.
     if cfg.machine.cpus() > 1 {
         cfg.jitv2.compile = JitCompile::Async;
@@ -77,38 +78,14 @@ pub fn switch_profile(cfg: &mut MachineConfig, from: MachineProfile) {
     cfg.origin2000 = Default::default();
     cfg.onyx2 = Default::default();
     rehome_disks(cfg, from);
+    // Cards need a GIO slot; a second head also needs a Newport board.
+    if !mc_machine(p) || cfg.graphics_board() != GraphicsBoard::Newport {
+        cfg.set_device("newport", false);
+    }
     // What `MachineConfig::validate` refuses on the new machine, and the
     // Advanced tab no longer shows for it.
     if !matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
         cfg.machine.emu_id = 0;
-    }
-    let octane = p == MachineProfile::OctaneIp30;
-    if !octane {
-        cfg.xio_board.clear();
-    }
-    if !(octane || p == MachineProfile::O2Ip32) {
-        cfg.nvme = Default::default();
-    } else if !octane {
-        // The O2 has one slot: no option board to name.
-        cfg.nvme.board = None;
-        cfg.nvme.slot = None;
-    }
-    if !(octane || p.is_ip35_bricks()) {
-        cfg.fibre_channel = None;
-    } else if let (false, Some(fc)) = (octane, &mut cfg.fibre_channel) {
-        fc.board = None;
-        fc.slot = None;
-        fc.bridge = false;
-    }
-    // On the Octane both cards sit on an `[[xio_board]]`; with none left
-    // (an O2's NVMe, an IP35 loop) there is no slot for them.
-    if octane && cfg.xio_board.is_empty() {
-        cfg.nvme = Default::default();
-        cfg.fibre_channel = None;
-    }
-    if !(mc_machine(p) || octane || p == MachineProfile::TezroIp53) {
-        cfg.virtio_serial.enabled = false;
-        cfg.virtio_9p.enabled = false;
     }
     if mc_machine(p) && cfg.network.mode == NetMode::Off {
         cfg.network.mode = NetMode::Nat;
@@ -122,17 +99,42 @@ pub fn switch_profile(cfg: &mut MachineConfig, from: MachineProfile) {
     }
 }
 
+/// Whether a Fibre Channel adapter goes in one of the machine's PCI slots: not on the O2, and
+/// not on the I-brick, whose adapter is built in.
+fn takes_fibre_card(p: MachineProfile) -> bool {
+    iris::topology::slots_take(&p.slots(), DeviceFamily::Pci) && p != MachineProfile::O2Ip32 && !p.is_ip35_bricks()
+}
+
 /// Keep each SCSI device through a profile switch at the same controller and target, dropping it where the new machine has
 /// no such slot. Other devices keep their slot where they can, else take any, else go.
 fn rehome_disks(cfg: &mut MachineConfig, from: MachineProfile) {
     let p = cfg.machine.profile;
     let (old, new) = (from.slots(), p.slots());
+    let brick = new.iter().find(|s| s.kind == MachineSlotKind::Fixed("qla2200")).map(|s| s.path.clone());
     let mut old_cfg = cfg.clone();
     old_cfg.machine.profile = from;
     let was = DevicePlacement::lenient(&old_cfg, &cfg.devices);
     let places: Vec<_> = (0..cfg.devices.len()).map(|i| was.at(i).cloned()).collect();
     let devices = std::mem::take(&mut cfg.devices);
+    let mut others = Vec::new();
     for (mut d, at) in devices.into_iter().zip(places) {
+        if matches!(d.device, DeviceModel::Qla2200) && !takes_fibre_card(p) {
+            continue;
+        }
+        if matches!(d.device, DeviceModel::Nvme(_)) && p.refuse_nvme().is_err() {
+            continue;
+        }
+        if d.device.scsi().is_none() {
+            others.push(d);
+            continue;
+        }
+        if let Some(id) = at.as_ref().and_then(|a| a.loop_number()) {
+            if let Some(b) = &brick {
+                d.at = Some(b.loop_id(id).to_string());
+                cfg.devices.push(d);
+            }
+            continue;
+        }
         let target = at.and_then(|at| scsi_target(&old, &at)).and_then(|(c, id)| scsi_target_slot(&new, c, id));
         let Some(target) = target.filter(|_| p.takes_daynaport() || !d.device.scsi().is_some_and(|s| s.is_daynaport())) else { continue };
         // An alias that names the same slot on the new machine is kept as written.
@@ -140,6 +142,15 @@ fn rehome_disks(cfg: &mut MachineConfig, from: MachineProfile) {
             d.at = Some(target.to_string());
         }
         cfg.devices.push(d);
+    }
+    for d in others {
+        cfg.devices.push(d);
+        if DevicePlacement::new(cfg).is_err() {
+            cfg.devices.last_mut().expect("just pushed").at = None;
+            if DevicePlacement::new(cfg).is_err() {
+                cfg.devices.pop();
+            }
+        }
     }
 }
 
@@ -282,13 +293,16 @@ pub fn show(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 &mut cfg.jitv2.compile,
                 &[JitCompile::Async, JitCompile::Sync],
             );
-            ui.checkbox(&mut cfg.test_device, t!("extra-test-device"));
+            if mc_machine(cfg.machine.profile) {
+                let mut on = cfg.has_device("test_device");
+                if ui.checkbox(&mut on, t!("extra-test-device")).changed() {
+                    cfg.set_device("test_device", on);
+                }
+                if let Some(DeviceModel::TestDevice(t)) = cfg.devices.iter_mut().map(|d| &mut d.device).find(|d| matches!(d, DeviceModel::TestDevice(_))) {
+                    text(ui, &t!("extra-test-config"), &mut t.run_config);
+                }
+            }
             ui.checkbox(&mut cfg.cheritest_dump_hook, t!("extra-cheritest"));
-            text(
-                ui,
-                &t!("extra-test-config"),
-                &mut cfg.test_device_run_config,
-            );
         });
     });
     complete_editor(ui, cfg, running);
@@ -332,7 +346,6 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
-                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
                 ui.checkbox(&mut s.ps2_input, t!("extra-ps2"));
                 ui.checkbox(&mut s.usb_input, t!("extra-usb-input"));
             }
@@ -356,7 +369,6 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 port(ui, &t!("extra-port-c"), &mut s.serial_port_c);
                 port(ui, &t!("extra-port-d"), &mut s.serial_port_d);
-                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
             }
             MachineProfile::Origin3200Ip35 => {
                 let s = &mut cfg.origin3200;
@@ -383,7 +395,6 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
-                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
             }
             MachineProfile::Onyx3000Ip35 => {
                 let mut count = cfg.c_bricks() as u8;
@@ -410,9 +421,14 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
                 text(ui, &t!("extra-brick-serial"), &mut s.brick_serial);
-                ui.checkbox(&mut s.audio, t!("extra-tezro-audio"));
             }
             _ => (),
+        }
+        if matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) || p.is_ip35_bricks() {
+            let mut on = cfg.has_device("ice1724");
+            if ui.checkbox(&mut on, t!("extra-tezro-audio")).changed() {
+                cfg.set_device("ice1724", on);
+            }
         }
         // Only the Fuel and the Tezro take an identity (`validate`).
         if matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
@@ -424,182 +440,193 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
     });
 }
 
+/// The virtio-serial options being edited, if it is on.
+fn virtio_serial(cfg: &mut MachineConfig) -> Option<&mut VirtioSerialConfig> {
+    cfg.devices.iter_mut().find_map(|d| match &mut d.device {
+        DeviceModel::VirtioSerial(v) => Some(v),
+        _ => None,
+    })
+}
+
+fn virtio_9p(cfg: &mut MachineConfig) -> Option<&mut Virtio9pConfig> {
+    cfg.devices.iter_mut().find_map(|d| match &mut d.device {
+        DeviceModel::Virtio9p(v) => Some(v),
+        _ => None,
+    })
+}
+
+fn virtio_serial_ui(ui: &mut Ui, v: &mut VirtioSerialConfig) {
+    let mut remove = None;
+    for (i, p) in v.ports.iter_mut().enumerate() {
+        ui.push_id(i, |ui| {
+            ui.group(|ui| {
+                text(ui, &t!("extra-name"), &mut p.name);
+                ui.checkbox(&mut p.console, t!("extra-console"));
+                port(ui, &t!("extra-tcp-port"), &mut p.tcp_port);
+                text(ui, &t!("extra-socket"), &mut p.socket);
+                if ui.button(t!("extra-remove")).clicked() {
+                    remove = Some(i);
+                }
+            });
+        });
+    }
+    if let Some(i) = remove {
+        v.ports.remove(i);
+    }
+    if ui.button(t!("extra-add-port")).clicked() {
+        v.ports.push(Default::default());
+    }
+}
+
+/// virtio-9p shares a host directory; the device needs a Unix host.
+fn virtio_9p_ui(ui: &mut Ui, v: &mut Virtio9pConfig) {
+    ui.horizontal(|ui| {
+        ui.label(t!("extra-9p-path"));
+        crate::config_ui::path_row(ui, "virtio_9p_path", &mut v.path, crate::config_ui::Pick::Dir, &[]);
+    });
+    ui.horizontal(|ui| {
+        ui.label(t!("extra-9p-tag"));
+        ui.text_edit_singleline(&mut v.tag);
+    });
+    ui.checkbox(&mut v.readonly, t!("extra-9p-readonly"));
+    choice(
+        ui,
+        &t!("extra-9p-owners"),
+        "virtio_9p_owners",
+        &mut v.owners,
+        &[Virtio9pOwners::Squash, Virtio9pOwners::Passthrough],
+    );
+    ui.horizontal(|ui| {
+        ui.label(t!("extra-9p-uid"));
+        ui.add(DragValue::new(&mut v.uid));
+        ui.label(t!("extra-9p-gid"));
+        ui.add(DragValue::new(&mut v.gid));
+    });
+    if v.owners == Virtio9pOwners::Passthrough {
+        ui.horizontal(|ui| {
+            ui.label(t!("extra-9p-uid-map"));
+            ui.add(TextEdit::singleline(&mut v.uid_map).hint_text("0:1000,1000:1001:5"));
+        });
+        ui.horizontal(|ui| {
+            ui.label(t!("extra-9p-gid-map"));
+            ui.add(TextEdit::singleline(&mut v.gid_map).hint_text("0:1000"));
+        });
+    }
+}
+
 pub fn expansion(ui: &mut Ui, cfg: &mut MachineConfig) {
     let p = cfg.machine.profile;
-    // What each machine has room for, as `MachineConfig::validate` decides:
-    // virtio on a GIO slot of the Indy and Indigo2 or on the Octane's and
-    // Tezro's PCI; XIO option boards on the Octane; NVMe on the O2 or an
-    // Octane option board; Fibre Channel on an Octane option board or the
-    // IP35 I-brick.
-    let gio = mc_machine(p);
-    let octane = p == MachineProfile::OctaneIp30;
-    let virtio = gio || octane || p == MachineProfile::TezroIp53;
-    let nvme = octane || p == MachineProfile::O2Ip32;
-    let fibre = octane || p.is_ip35_bricks();
+    // What the machine has room for, from its slot list and what `validate` refuses.
+    let slots = p.slots();
+    let takes = |f| slots_take(&slots, f);
+    let (virtio, xio) = (takes(DeviceFamily::Virtio), takes(DeviceFamily::Xio));
+    let nvme = takes(DeviceFamily::Pci) && p.refuse_nvme().is_ok();
+    let fibre_card = takes_fibre_card(p);
+    let fibre = fibre_card || slots.iter().any(|s| s.kind == MachineSlotKind::Fixed("qla2200"));
     if !(virtio || nvme || fibre) {
         return;
     }
     ui.collapsing(t!("extra-expansion"), |ui| {
         if virtio {
-            ui.checkbox(&mut cfg.virtio_serial.enabled, t!("extra-virtio"));
-            if cfg.virtio_serial.enabled {
-                if gio {
-                    choice(
-                        ui,
-                        &t!("extra-gio-slot"),
-                        "virtio_slot",
-                        &mut cfg.virtio_serial.slot,
-                        &[VirtioGioSlot::Exp0, VirtioGioSlot::Exp1],
-                    );
-                }
-                let mut remove = None;
-                for (i, p) in cfg.virtio_serial.ports.iter_mut().enumerate() {
-                    ui.push_id(i, |ui| {
-                        ui.group(|ui| {
-                            text(ui, &t!("extra-name"), &mut p.name);
-                            ui.checkbox(&mut p.console, t!("extra-console"));
-                            port(ui, &t!("extra-tcp-port"), &mut p.tcp_port);
-                            text(ui, &t!("extra-socket"), &mut p.socket);
-                            if ui.button(t!("extra-remove")).clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    });
-                }
-                if let Some(i) = remove {
-                    cfg.virtio_serial.ports.remove(i);
-                }
-                if ui.button(t!("extra-add-port")).clicked() {
-                    cfg.virtio_serial.ports.push(Default::default());
-                }
+            let mut on = virtio_serial(cfg).is_some();
+            if ui.checkbox(&mut on, t!("extra-virtio")).changed() {
+                cfg.set_device("virtio_serial", on);
             }
-            // virtio-9p shares a host directory; the device needs a Unix host.
+            if let Some(v) = virtio_serial(cfg) {
+                virtio_serial_ui(ui, v);
+            }
             if cfg!(unix) {
                 ui.separator();
-                let mut on = cfg.virtio_9p.enabled;
+                let mut on = virtio_9p(cfg).is_some();
                 if ui.checkbox(&mut on, t!("extra-9p")).changed() {
-                    cfg.virtio_9p.enabled = on;
+                    cfg.set_device("virtio_9p", on);
                 }
-                if cfg.virtio_9p.enabled {
-                    let v = &mut cfg.virtio_9p;
-                    if gio {
-                        choice(
-                            ui,
-                            &t!("extra-gio-slot"),
-                            "virtio_9p_slot",
-                            &mut v.slot,
-                            &[VirtioGioSlot::Exp0, VirtioGioSlot::Exp1],
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(t!("extra-9p-path"));
-                        crate::config_ui::path_row(ui, "virtio_9p_path", &mut v.path, crate::config_ui::Pick::Dir, &[]);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(t!("extra-9p-tag"));
-                        ui.text_edit_singleline(&mut v.tag);
-                    });
-                    ui.checkbox(&mut v.readonly, t!("extra-9p-readonly"));
-                    choice(
-                        ui,
-                        &t!("extra-9p-owners"),
-                        "virtio_9p_owners",
-                        &mut v.owners,
-                        &[Virtio9pOwners::Squash, Virtio9pOwners::Passthrough],
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label(t!("extra-9p-uid"));
-                        ui.add(DragValue::new(&mut v.uid));
-                        ui.label(t!("extra-9p-gid"));
-                        ui.add(DragValue::new(&mut v.gid));
-                    });
-                    if v.owners == Virtio9pOwners::Passthrough {
-                        ui.horizontal(|ui| {
-                            ui.label(t!("extra-9p-uid-map"));
-                            ui.add(TextEdit::singleline(&mut v.uid_map).hint_text("0:1000,1000:1001:5"));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(t!("extra-9p-gid-map"));
-                            ui.add(TextEdit::singleline(&mut v.gid_map).hint_text("0:1000"));
-                        });
-                    }
+                if let Some(v) = virtio_9p(cfg) {
+                    virtio_9p_ui(ui, v);
                 }
             }
         }
-        if octane {
+        if xio {
             ui.separator();
             let mut remove = None;
-            for (i, b) in cfg.xio_board.iter_mut().enumerate() {
+            for i in 0..cfg.devices.len() {
+                let DeviceModel::XioBoard(mut kind) = cfg.devices[i].device else { continue };
                 ui.push_id(("xio", i), |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("XIO {i}"));
-                        choice(
-                            ui,
-                            &t!("extra-xio-kind"),
-                            "kind",
-                            &mut b.kind,
-                            &[
-                                iris::dev::xio_pci::Kind::Cage,
-                                iris::dev::xio_pci::Kind::Shoehorn,
-                            ],
-                        );
+                        choice(ui, &t!("extra-xio-kind"), "kind", &mut kind, &[Kind::Cage, Kind::Shoehorn]);
+                        cfg.devices[i].device = DeviceModel::XioBoard(kind);
+                        slot_choice(ui, cfg, i);
                         if ui.button(t!("extra-remove")).clicked() {
                             remove = Some(i);
-                        }
-                    });
-                    let mut widget = b.widget.unwrap_or(0);
-                    ui.horizontal(|ui| {
-                        ui.label(t!("extra-widget"));
-                        if ui.add(DragValue::new(&mut widget).range(0..=15)).changed() {
-                            b.widget = (widget != 0).then_some(widget);
                         }
                     });
                 });
             }
             if let Some(i) = remove {
-                cfg.xio_board.remove(i);
+                cfg.devices.remove(i);
             }
             if ui.button(t!("extra-add-xio")).clicked() {
-                cfg.xio_board.push(XioBoardConfig {
-                    kind: iris::dev::xio_pci::Kind::Shoehorn,
-                    widget: None,
-                });
+                cfg.devices.push(ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::XioBoard(Kind::Shoehorn)) });
             }
         }
         if nvme {
             ui.separator();
-            // `[nvme]` is fitted when it differs from the default; unticking
-            // removes the whole table, so no half-set card is left behind.
-            let mut fitted = !cfg.nvme.is_default();
+            let card = |cfg: &MachineConfig| cfg.devices.iter().position(|d| matches!(d.device, DeviceModel::Nvme(_)));
+            let mut fitted = card(cfg).is_some();
             if ui.checkbox(&mut fitted, t!("extra-nvme-fit")).changed() {
-                cfg.nvme = Default::default();
-                if fitted {
-                    cfg.nvme.path = "disks/nvme.raw".into();
+                match card(cfg) {
+                    Some(i) => {
+                        let mut gone: Vec<usize> = behind(cfg, i).into_iter().chain([i]).collect();
+                        gone.sort_unstable();
+                        gone.into_iter().rev().for_each(|g| drop(cfg.devices.remove(g)));
+                    }
+                    None => cfg.devices.push(ConfiguredDevice {
+                        at: None,
+                        ..ConfiguredDevice::new("", DeviceModel::Nvme(NvmeConfig { path: "disks/nvme.raw".into(), ..Default::default() }))
+                    }),
                 }
             }
-            if fitted {
+            if let Some(i) = card(cfg) {
                 ui.label(t!("extra-nvme"));
-                crate::config_ui::path_row_disk(ui, "nvme_path", &mut cfg.nvme.path, crate::config_ui::Pick::OpenFile, &crate::config_ui::disk_filters());
-                ui.checkbox(&mut cfg.nvme.overlay, t!("extra-overlay"));
-                ui.checkbox(&mut cfg.nvme.bridge, t!("extra-bridge"));
-                if octane {
-                    placement(ui, &mut cfg.nvme.board, &mut cfg.nvme.slot);
+                let n = cfg.devices[i].device.nvme_mut().expect("an nvme entry");
+                crate::config_ui::path_row_disk(ui, "nvme_path", &mut n.path, crate::config_ui::Pick::OpenFile, &crate::config_ui::disk_filters());
+                ui.checkbox(&mut n.overlay, t!("extra-overlay"));
+                let mut bridged = behind(cfg, i).is_some();
+                if ui.checkbox(&mut bridged, t!("extra-bridge")).changed() {
+                    set_bridge(cfg, i, bridged);
                 }
+                let i = card(cfg).expect("still there");
+                // A card behind a bridge moves with it.
+                slot_choice(ui, cfg, behind(cfg, i).unwrap_or(i));
             }
         }
         if fibre {
             ui.separator();
-            let mut enabled = cfg.fibre_channel.is_some();
-            if ui.checkbox(&mut enabled, t!("extra-fc")).changed() {
-                cfg.fibre_channel = enabled.then(Default::default);
-            }
-            if let Some(fc) = &mut cfg.fibre_channel {
-                if octane {
-                    ui.checkbox(&mut fc.bridge, t!("extra-bridge"));
-                    placement(ui, &mut fc.board, &mut fc.slot);
+            let card = |cfg: &MachineConfig| cfg.devices.iter().position(|d| matches!(d.device, DeviceModel::Qla2200));
+            if fibre_card {
+                let mut fitted = card(cfg).is_some();
+                if ui.checkbox(&mut fitted, t!("extra-fc")).changed() {
+                    match card(cfg) {
+                        Some(i) => {
+                            let name = cfg.devices.remove(i).name;
+                            cfg.devices.retain(|d| name.is_none() || d.at.as_deref().and_then(|a| a.split('/').next()) != name.as_deref());
+                        }
+                        None => cfg.devices.push(ConfiguredDevice { at: None, name: Some(LOOP_CARD.into()), ..ConfiguredDevice::new("", DeviceModel::Qla2200) }),
+                    }
                 }
+                if let Some(i) = card(cfg) {
+                    slot_choice(ui, cfg, i);
+                }
+            }
+            // The loop's slot: the Octane card's name, or the I-brick's fixed adapter.
+            let base = match card(cfg) {
+                Some(i) => cfg.devices[i].name.clone(),
+                None => p.slots().iter().find(|s| s.kind == MachineSlotKind::Fixed("qla2200")).map(|s| s.path.to_string()),
+            };
+            if let Some(base) = base {
                 let mut remove = None;
-                for (&id, disk) in &mut fc.disks {
+                for (id, i) in cfg.loop_disks() {
+                    let disk = cfg.devices[i].device.scsi_mut().expect("listed by loop_disks");
                     ui.push_id(("fc", id), |ui| {
                         ui.horizontal(|ui| {
                             ui.label(format!("ID {id}"));
@@ -607,38 +634,73 @@ pub fn expansion(ui: &mut Ui, cfg: &mut MachineConfig) {
                             ui.checkbox(&mut disk.overlay, t!("extra-overlay"));
                             ui.checkbox(&mut disk.write_cache, t!("extra-write-cache"));
                             if ui.button(t!("extra-remove")).clicked() {
-                                remove = Some(id);
+                                remove = Some(i);
                             }
                         });
                     });
                 }
-                if let Some(id) = remove {
-                    fc.disks.remove(&id);
+                if let Some(i) = remove {
+                    cfg.devices.remove(i);
                 }
                 if ui.button(t!("extra-add-disk")).clicked() {
-                    if let Some(id) = (0..=iris::dev::isp2200::LOOP_ID_MAX).find(|id| !fc.disks.contains_key(id)) {
-                        fc.disks.insert(id, Default::default());
+                    let used: Vec<u8> = cfg.loop_disks().into_iter().map(|d| d.0).collect();
+                    if let Some(id) = (0..=iris::dev::isp2200::LOOP_ID_MAX).find(|id| !used.contains(id)) {
+                        cfg.devices.push(ConfiguredDevice::new(&format!("{base}/l{id}"), DeviceModel::Scsi(Default::default())));
                     }
                 }
             }
         }
     });
 }
-fn placement(ui: &mut Ui, board: &mut Option<usize>, slot: &mut Option<u8>) {
-    ui.horizontal(|ui| {
-        ui.label(t!("extra-board"));
-        let mut n = board.unwrap_or(0);
-        if ui.add(DragValue::new(&mut n).range(0..=3)).changed() {
-            *board = Some(n);
+
+/// The local name the GUI gives the Fibre Channel card, so its loop's disks can name it.
+const LOOP_CARD: &str = "fibre_channel";
+
+/// The bridge the GUI puts a card behind.
+const CARD_BRIDGE: &str = "nvme_bridge";
+
+/// The `pci_bridge` entry card `i` sits behind, if it is behind the GUI's one.
+fn behind(cfg: &MachineConfig, i: usize) -> Option<usize> {
+    let first = cfg.devices[i].at.as_deref()?.strip_suffix("/pci0/0").filter(|n| *n == CARD_BRIDGE)?;
+    cfg.devices.iter().position(|d| d.name.as_deref() == Some(first))
+}
+
+/// Put card `i` behind a bridge in its slot, or back in the bridge's slot.
+fn set_bridge(cfg: &mut MachineConfig, i: usize, on: bool) {
+    match behind(cfg, i) {
+        Some(b) if !on => {
+            let bridge = cfg.devices.remove(b);
+            cfg.devices[if b < i { i - 1 } else { i }].at = bridge.at;
         }
-        ui.label(t!("extra-slot"));
-        let mut s = slot.unwrap_or(0);
-        if ui.add(DragValue::new(&mut s).range(0..=31)).changed() {
-            *slot = Some(s);
+        None if on => {
+            let at = cfg.devices[i].at.replace(format!("{CARD_BRIDGE}/pci0/0"));
+            let bridge = ConfiguredDevice { name: Some(CARD_BRIDGE.into()), at, ..ConfiguredDevice::new("", DeviceModel::PciBridge) };
+            cfg.devices.insert(i, bridge);
         }
-        if ui.button(t!("common-auto")).clicked() {
-            *board = None;
-            *slot = None;
+        _ => {}
+    }
+}
+
+/// Where entry `i` goes: automatic, or a free slot of its family.
+fn slot_choice(ui: &mut Ui, cfg: &mut MachineConfig, i: usize) {
+    // What sits at or below this entry goes with it, so its own slot is not in the way.
+    let name = cfg.devices[i].name.clone();
+    let others: Vec<ConfiguredDevice> = cfg.devices.iter().enumerate()
+        .filter(|(j, d)| *j != i && (name.is_none() || d.at.as_deref().and_then(|a| a.split('/').next()) != name.as_deref()))
+        .map(|(_, d)| d.clone()).collect();
+    let others = DevicePlacement::lenient(cfg, &others);
+    let family = cfg.devices[i].device.spec().family;
+    let free: Vec<String> = others.slots.iter()
+        .filter(|s| s.kind.takes(family, false) && !others.placed().any(|(_, at)| *at == s.path))
+        .map(|s| s.path.to_string())
+        .collect();
+    let auto = t!("common-auto").to_string();
+    let at = &mut cfg.devices[i].at;
+    ui.label(t!("extra-slot"));
+    ComboBox::from_id_salt(("slot", i)).selected_text(at.clone().unwrap_or_else(|| auto.clone())).show_ui(ui, |ui| {
+        ui.selectable_value(at, None, auto);
+        for p in free {
+            ui.selectable_value(at, Some(p.clone()), p);
         }
     });
 }
@@ -715,8 +777,8 @@ fn parse_complete(text: &str) -> Result<MachineConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iris::devices::{ConfiguredDevice, DeviceModel};
     use iris::topology::scsi_buses;
+    use iris::devices::ConfiguredDevice;
 
     fn switch(cfg: &mut MachineConfig, to: MachineProfile) {
         let from = cfg.machine.profile;
@@ -746,14 +808,17 @@ mod tests {
     /// identity leaves nothing the new machine refuses.
     #[test]
     fn switching_from_a_populated_machine_leaves_a_valid_config() {
+        let nvme = || ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::Nvme(NvmeConfig { path: "nvme.raw".into(), ..Default::default() })) };
         for from in [MachineProfile::OctaneIp30, MachineProfile::TezroIp53, MachineProfile::O2Ip32] {
             for to in MachineProfile::ALL {
                 let mut cfg = MachineConfig::default();
                 switch(&mut cfg, from);
                 match from {
                     MachineProfile::OctaneIp30 => {
-                        cfg.xio_board.push(XioBoardConfig { kind: iris::dev::xio_pci::Kind::Shoehorn, widget: None });
-                        cfg.nvme.path = "nvme.raw".into();
+                        cfg.devices.push(ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::XioBoard(Kind::Shoehorn)) });
+                        cfg.devices.push(ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::XioBoard(Kind::Cage)) });
+                        cfg.devices.push(nvme());
+                        cfg.devices.push(ConfiguredDevice { name: Some("fibre_channel".into()), at: None, ..ConfiguredDevice::new("", DeviceModel::Qla2200) });
                         cfg.serial_log_b = Some("b.log".into());
                         cfg.set_disk(iris::config::scsi_slot(1, 12), ScsiDeviceConfig { path: "w.raw".into(), ..Default::default() });
                     }
@@ -764,7 +829,7 @@ mod tests {
                         cfg.network.mode = NetMode::Off;
                     }
                     _ => {
-                        cfg.nvme.path = "nvme.raw".into();
+                        cfg.devices.push(nvme());
                         cfg.serial_log_b = Some("b.log".into());
                     }
                 }
@@ -800,6 +865,27 @@ mod tests {
         switch(&mut cfg, MachineProfile::OctaneIp30);
         let at: Vec<_> = cfg.devices.iter().filter(|d| d.device.scsi().is_some()).map(|d| d.at.clone().unwrap()).collect();
         assert_eq!(at, ["scsi0/t2", "xio15/pci0/0/t3"]);
+    }
+
+    /// A loop disk moves to the I-brick's loop, and nowhere else keeps it or the card.
+    #[test]
+    fn a_loop_disk_moves_to_the_ibricks_loop() {
+        let mut cfg = MachineConfig::default();
+        switch(&mut cfg, MachineProfile::OctaneIp30);
+        cfg.devices.push(ConfiguredDevice { name: Some("cage".into()), ..ConfiguredDevice::new("shoebox", DeviceModel::XioBoard(Kind::Cage)) });
+        cfg.devices.push(ConfiguredDevice { name: Some("fibre_channel".into()), ..ConfiguredDevice::new("cage/pci0", DeviceModel::Qla2200) });
+        cfg.devices.push(ConfiguredDevice::new("fibre_channel/l7", DeviceModel::Scsi(ScsiDeviceConfig { path: "fc.raw".into(), ..Default::default() })));
+        assert_eq!(cfg.loop_disks().iter().map(|d| d.0).collect::<Vec<_>>(), [7]);
+        for to in [MachineProfile::Origin3200Ip35, MachineProfile::Onyx3000Ip35] {
+            let mut moved = cfg.clone();
+            switch(&mut moved, to);
+            moved.validate().unwrap();
+            let kept = moved.devices.iter().filter(|d| d.device.scsi().is_some());
+            assert_eq!(kept.map(|d| d.at.clone()).collect::<Vec<_>>(), [Some("xio15/pci0/1/l7".to_string())]);
+            assert!(!moved.has_device("qla2200"));
+        }
+        switch(&mut cfg, MachineProfile::IndyIp24);
+        assert!(cfg.loop_disks().is_empty() && !cfg.has_device("qla2200"));
     }
 
     #[test]
