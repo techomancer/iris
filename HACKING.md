@@ -344,13 +344,24 @@ in [docs/interrupt_map.md](docs/interrupt_map.md).
 
 ### Time
 
-CP0 Count is derived from host wall-clock time at a fixed rate (half the part's
-clock, `Part::count_hz`: 75 MHz on the Indy R4400, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). The Compare
-interrupt and other periodic device events come from host timers
-(`src/hptimer.rs`), not from counting instructions. A guest that runs faster
-or slower than real hardware sees the same time passing. `--features
-ci_clock` instead derives Count from retired instructions, for deterministic
-replays.
+By default CP0 Count is derived from host wall-clock time at a fixed rate (half
+the part's clock, `Part::count_hz`: 75 MHz on the Indy R4400, 97.5 MHz on IP28;
+`[clock] fixed_mhz` overrides). The Compare interrupt and other periodic device
+events come from host timers (`src/hptimer.rs`). A guest that runs faster or
+slower than real hardware sees the same time passing.
+
+`[clock] time = "instructions"` runs one processor's guest on retired
+instructions instead, `insn_ns` each. The machine `Clock` (`src/clock.rs`) counts
+the CPU's cycles at that rate, and a core takes its rate from its machine clock
+(`MipsCore::set_timer_manager`), so Count, HEART, the RTC and every `Timer`
+move together. Count and Compare are checked at the end of each batch and, in
+compiled code built for the mode, at cycle flushes against one threshold
+(`check_cycle`, the earlier of the Compare deadline and the pacing budget).
+With `pace` on, the CPU thread sleeps at the end of a batch while guest time is
+more than a millisecond ahead of the host's, and the budget brings compiled code
+back for it; a guest that cannot keep the rate lags and is not sped up. Nothing
+of this runs per instruction with the setting off. `--features ci_clock` only
+chooses the defaults (instructions, unpaced, on the Indy, Indigo2 and O2).
 
 ## 4. Threads
 

@@ -739,6 +739,9 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 [clock]
 # fixed_mhz = 33            # Count MHz: default half the part's clock: 75 on the Indy and Indigo2 R4400, 97.5 on IP28
+# time = "host"             # or "instructions": guest time counts retired instructions (one processor); fixes delay-loop calibration
+# insn_ns = 10              # instruction time: guest ns per instruction (10 is 100 MIPS); a slow guest lags, a larger value evens it out
+# pace = true               # instruction time: sleep while the guest is ahead of the host
 
 # [rtc_offset]              # guest clock start, relative to host time (all signed)
 # years   = -18             # years/months step the calendar (Mar 31 -1 month = Feb 28/29)
@@ -809,6 +812,7 @@ camera_index = 0            # host camera, source = "camera" only
 [audio]
 # host = "default"          # or "pulse", "wasapi", "coreaudio", "null" (discard)
 prebuf_ms = 20              # sound held before playing: the margin against a late guest, and the latency added
+# max_latency_ms = 100      # most sound queued before it skips ahead; unset: 3 x prebuf_ms, 2000 on instruction time
 # latency_ms = 20           # what the host's device buffers; unset: its low-latency default
 # channels = 2              # speakers for the Tezro's multichannel card: 2, 4, 6 or 8
 # file = "out.wav"          # play into a WAV file instead of a sound card

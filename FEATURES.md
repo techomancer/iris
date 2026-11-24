@@ -25,7 +25,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `perfetto` | Perfetto trace recording (`--perfetto FILE`, monitor `perfetto`); see [docs/perfetto.md](docs/perfetto.md). Lightning-compatible. | — |
 | `rexdiag` | REX3 per-GO activity and dispatch counters. Default on; removable in a core build. | — |
 | `fetchverify` | Compare executed instruction bytes with memory in interpreter/JIT; expensive stale-code detector. | — |
-| `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. Also times the Indy's DS1386 and 8254 on the cycle count. | — |
+| `ci_clock` | Makes the Indy, Indigo2 and O2 run on instructions without pacing (`[clock] time = "instructions"`, `pace = false`) unless `[clock]` says otherwise: a deterministic clock for CI and snapshot validation. Also makes the test device's clock count retired instructions. | — |
 | `opcodefusion` | Interpreter instruction fusion; breakpoints on a fused second instruction cannot fire. | — |
 | `lightning` | Strip breakpoints/traceback for speed; hides GUI Debug controls. | `opcodefusion` |
 | `tlbvmap` | Compatibility flag: vmap translation is unconditional. | — |
@@ -464,6 +464,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `audio.host` | `"default"` | Host audio system: `"default"` (CoreAudio on macOS, WASAPI on Windows, a PulseAudio server or PipeWire's pipewire-pulse on Linux and the other Unixes), `"pulse"`, `"wasapi"`, `"coreaudio"`, or `"null"` (the devices run and their sound is discarded). `"alsa"` and `"pulseaudio"` from older configurations mean `"default"` and `"pulse"`. The stream follows a change of the host's default output device, and keeps running with no device or server until one appears. `--audio-host` overrides. |
 | `audio.prebuf_ms` | `20` | How much sound a stream holds before it plays and keeps queued afterwards: the margin against the emulated device running late, and the latency iris adds. Raise it if sound breaks up on a busy host. |
+| `audio.max_latency_ms` | `3 x prebuf_ms`, at least `100`; `2000` on instruction time | The most sound a stream queues before it skips ahead. A guest on instruction time that is catching up with the host makes sound faster than it plays, so its bound is wide; the stream follows the guest by half a percent, so what is queued plays off slowly. |
 | `audio.latency_ms` | `unset` | How much the host's device should buffer. Unset: the host system's low-latency default. |
 | `audio.channels` | `2` | Speakers the Tezro's multichannel card plays to: 2, 4 (quad), 6 (5.1) or 8 (7.1). The card folds its channels down to this many; any other value plays stereo. Other sound devices are stereo. |
 | `audio.file` | `unset` | Play into this WAV file instead of a sound card: 48 kHz 16-bit, written in real time as the host stream would play it, silence included. For headless runs and for checking what a guest played. |
@@ -499,6 +500,9 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `clock.fixed_mhz` | `half the part's clock (75 on an R4400 Indy)` | CP0 Count MHz; IRIX's CPU inventory and the O2's PROM report twice this rate. |
+| `clock.time` | `host` (a `ci_clock` build: `instructions` on the Indy, Indigo2 and O2) | `host` runs the guest's clocks on the host's. `instructions` runs them on retired instructions, `clock.insn_ns` each, so a delay loop IRIX calibrated before the JIT compiled it still takes the time it was calibrated to. One processor. The guest's clock lags the host's while the host cannot run it at the rate, and an idle guest does not catch up. An Indy's boot chime comes out wrong when its PROM runs below the rate: stretched and low (3.3 to 3.5 s against 1.9 s in two of three runs) or clipped short (0.7 s in the third); a larger `insn_ns` evens it out and slows the guest. |
+| `clock.insn_ns` | `10` | Instruction time: guest nanoseconds per retired instruction, a whole number (10 is 100 MIPS). |
+| `clock.pace` | `true` (`false` in a `ci_clock` build) | Instruction time: sleep while the guest is more than a millisecond ahead of the host, so it never runs faster than `insn_ns` says. A guest that falls behind is not sped up; its clock lags the host's. `false` runs flat out. |
 
 ### [rtc_offset]
 

@@ -13,6 +13,28 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Guest time from instructions
+
+- `[clock] time = "instructions"` runs the guest's clocks (CP0 Count, HEART,
+  the RTC, every device timer) on retired instructions, `insn_ns` each (10 by
+  default), instead of the host's clock. IRIX times its delay loop once, while
+  the loop is still interpreted, and every later delay reuses that figure, so
+  on host time it is only right while the loop runs as it did then. The
+  Octane's calibrated figure ranged from 760 to 1199 ns a pass over six boots,
+  against 520 to 1291 ns for the same loop timed afterwards, and the "RAD UST
+  not incrementing" alert came in five of the six. On instruction time the
+  loop costs the same however it runs: 250 ns in every boot, and no alert.
+  One processor. The guest sleeps while it is ahead of the host (`pace`) and
+  lags the host's clock when the host cannot keep up; an idle guest does not
+  catch up. The audio stream queues up to two seconds on instruction time
+  (`[audio] max_latency_ms`), so the Octane's and O2's boot chimes play whole.
+  The Indy's PROM runs below 100 MIPS on a loaded host, so its chime comes
+  out wrong on the default 10 ns, stretched and low in two of three runs and
+  clipped short in the third; `insn_ns` is the lever, at the price of a slower
+  guest.
+- The `ci_clock` Cargo feature now only chooses the default for `[clock] time`
+  (instructions, unpaced, on the Indy, Indigo2 and O2).
+
 ### IndyCam
 
 - The host camera works with cameras that offer only MJPEG, NV12, RGB or gray
