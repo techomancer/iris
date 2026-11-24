@@ -541,6 +541,10 @@ use monitor::*;
 // into Cause. IP7 (CP0 Count==Compare) is included since the compare timer
 // fires on the hptimer thread and raises it exactly like a device line;
 // writing Compare clears the pending bit again (mips_core.rs write_cp0).
+/// Instruction clock pacing: the CPU sleeps once guest time is more than this ahead of the host's.
+const PACE_SLACK_NS: i64 = 1_000_000;
+const PACE_MAX_SLEEP: Duration = Duration::from_millis(20);
+
 const EXT_INT_MASK: u32 = crate::cpu::mips_core::CAUSE_IP7 |
                           crate::cpu::mips_core::CAUSE_IP6 |
                           crate::cpu::mips_core::CAUSE_IP5 |
@@ -11554,8 +11558,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // (`IdleParkState::wants_probe`).
             #[cfg(all(feature = "idle-pause", feature = "jitv2"))]
             let mut probe_next = false;
-            // Instruction clock: the batch's end is where a due Compare is delivered.
+            // Instruction clock: the batch's end is where a due Compare is
+            // delivered and a CPU ahead of the host sleeps (`pace_clock`).
             let icount = guard.core.insn_ns != 0;
+            let pace_clock = guard.core.timer_mgr.as_ref().map(|t| t.clock().clone()).filter(|c| icount && c.paced());
+            if let Some(c) = &pace_clock {
+                c.level();
+            }
 
             while running.load(Ordering::Relaxed) {
                 // Another thread is holding this CPU: stop here, between
@@ -11668,6 +11677,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 }
                 if icount {
                     guard.core.fire_compare_if_due();
+                    if let Some(clock) = &pace_clock {
+                        let lead = clock.lead_ns();
+                        if lead > PACE_SLACK_NS {
+                            drop(guard);
+                            thread::park_timeout(Duration::from_nanos(lead as u64).min(PACE_MAX_SLEEP));
+                            guard = executor.lock();
+                        }
+                    }
                 }
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() {

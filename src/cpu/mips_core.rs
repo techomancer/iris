@@ -3154,7 +3154,7 @@ mod ip7_ticket_tests {
         assert_eq!(core.insn_ns, 0);
         core.set_timer_manager(Arc::new(crate::hptimer::TimerManager::new()));
         assert_eq!(core.insn_ns, 0);
-        core.set_timer_manager(Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting(4))));
+        core.set_timer_manager(Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting(4, false))));
         assert_eq!(core.insn_ns, 4);
     }
 

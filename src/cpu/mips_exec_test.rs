@@ -8158,6 +8158,34 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(5)).expect("second stop did not return");
     }
 
+    /// A paced instruction clock does not run ahead of the host: a spin at
+    /// 5 us an instruction, which even a debug build's interpreter runs several
+    /// times faster than that, keeps guest time within a few milliseconds of the host's.
+    #[test]
+    fn a_paced_instruction_clock_stays_level_with_the_host() {
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        #[cfg(feature = "jitv2")]
+        { exec.jitv2_dispatch_enabled = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        let tm = Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting(5_000, true)));
+        exec.core.set_timer_manager(tm.clone());
+        let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+        tm.clock().set_cpu_cycles(cpu.cycles_ptr());
+        let started = std::time::Instant::now();
+        crate::traits::Device::start(&*cpu);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        crate::traits::Device::stop(&*cpu);
+        let host = started.elapsed().as_nanos() as u64;
+        let guest = tm.clock().now();
+        assert!(guest > 0, "the guest did not run: {guest} ns of {host}");
+        assert!(guest < host + 5_000_000, "the guest ran ahead of the host: {guest} ns of {host}");
+    }
+
     /// On the instruction clock no timer thread raises IP7, and a spin on one
     /// `beq` never leaves compiled code, so compiled code must test the deadline.
     #[cfg(feature = "jitv2")]

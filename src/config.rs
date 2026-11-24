@@ -2036,6 +2036,11 @@ pub struct ClockConfig {
     /// number. 10 is 100 MIPS.
     #[serde(default = "default_insn_ns")]
     pub insn_ns: u64,
+    /// Instruction time: sleep whenever the guest is more than a millisecond
+    /// ahead of the host, so it never runs faster than `insn_ns` says. Off, it
+    /// runs as fast as the host allows and guest time follows the work done.
+    #[serde(default = "default_pace")]
+    pub pace: bool,
 }
 
 /// What guest time follows ([`ClockConfig::time`]).
@@ -2050,6 +2055,11 @@ fn default_insn_ns() -> u64 {
     crate::cpu::mips_core::NS_PER_GUEST_CYCLE
 }
 
+/// A `ci_clock` build is the deterministic one: it never waits for the host.
+fn default_pace() -> bool {
+    !cfg!(feature = "ci_clock")
+}
+
 impl ClockConfig {
     /// The Count rate for `cpu`: `fixed_mhz`, else half the part's clock.
     pub fn count_hz(&self, cpu: &Part) -> u64 {
@@ -2059,7 +2069,7 @@ impl ClockConfig {
 
 impl Default for ClockConfig {
     fn default() -> Self {
-        Self { fixed_mhz: None, time: None, insn_ns: default_insn_ns() }
+        Self { fixed_mhz: None, time: None, insn_ns: default_insn_ns(), pace: default_pace() }
     }
 }
 
@@ -3673,7 +3683,7 @@ impl MachineConfig {
     pub fn machine_clock(&self) -> crate::clock::Clock {
         match self.insn_ns() {
             0 => crate::clock::Clock::new(),
-            ns => crate::clock::Clock::counting(ns),
+            ns => crate::clock::Clock::counting(ns, self.clock.pace),
         }
     }
 
@@ -6577,9 +6587,9 @@ mod instruction_clock_config_tests {
         assert_eq!(parse("[clock]\ntime = \"host\"\n").insn_ns(), 0, "an explicit setting beats the ci_clock default");
         assert_eq!(parse("[machine]\nprofile = \"o2_ip32\"\n").insn_ns(), if cfg!(feature = "ci_clock") { 10 } else { 0 });
         assert_eq!(parse("[machine]\nprofile = \"octane_ip30\"\n").insn_ns(), 0, "the Octane is not in the ci_clock default");
-        let on = parse("[clock]\ntime = \"instructions\"\ninsn_ns = 4\n");
+        let on = parse("[clock]\ntime = \"instructions\"\ninsn_ns = 4\npace = false\n");
         on.validate().unwrap();
-        assert_eq!(on.insn_ns(), 4);
+        assert_eq!((on.insn_ns(), on.clock.pace), (4, false));
         assert!(parse("[clock]\ntime = \"instructions\"\ninsn_ns = 0\n").validate().unwrap_err().contains("insn_ns"));
         let smp = parse("[clock]\ntime = \"instructions\"\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\ncpus = 2\n");
         assert!(smp.validate().unwrap_err().contains("one processor"));

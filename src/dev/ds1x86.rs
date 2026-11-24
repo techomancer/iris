@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn instruction_clock_time_follows_the_cycle_count() {
         let path = std::env::temp_dir().join(format!("ds1x86-ci-clock-{}", std::process::id()));
-        let rtc = Ds1x86::new(8192, path.to_str().unwrap().to_string(), RtcOffset::default(), Clock::counting(10));
+        let rtc = Ds1x86::new(8192, path.to_str().unwrap().to_string(), RtcOffset::default(), Clock::counting(10, false));
         let cycles = std::cell::UnsafeCell::new(0u64);
         rtc.clock.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
         set_2004(&rtc);
