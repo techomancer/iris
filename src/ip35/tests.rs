@@ -537,7 +537,7 @@ mod code_pages {
 
     fn compile(cpu: &Cpu, page: &mut crate::cpu::jitv2::PhysicalCodePage) {
         page.mark_requested(0);
-        let req = CompileRequest { page: page as *mut _, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: page as *mut _, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
         let mut analyzer = crate::cpu::jitv2::analyzer::Analyzer::new();
         let mut codegen = crate::cpu::jitv2::codegen::Codegen::new();
         let buses = cpu.jitv2.lock().buses().clone();
@@ -590,14 +590,14 @@ mod code_pages {
                 g.compile_queue.set_thread_count(1);
                 g.compile_queue.start(cpu.cached_bus().clone(), stats);
             }
-            cpu.jitv2_flush_from_here(false);
+            cpu.jitv2_flush_from_here();
             let page = page_at(&mut cpu, 0xffff_ffff_bfc0_0000);
             assert_eq!(page.addr_of(0), Some((0x1fc00, true)));
             page.mark_requested(0);
             let jit = cpu.jitv2.clone();
             let g = jit.lock();
             let stats = g.stats.clone();
-            assert!(g.compile_queue.send(CompileRequest { page: page as *mut _, compiled_for_fr1: true, cpu: 0 }, &stats));
+            assert!(g.compile_queue.send(CompileRequest { page: page as *mut _, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
             drop(g);
             assert!(wait_runnable(page), "the restarted pool must compile the PROM's page");
             jit.lock().compile_queue.stop();

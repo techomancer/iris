@@ -1175,6 +1175,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// without going back through `Jitv2`.
     #[cfg(feature = "jitv2")]
     jitv2_pages_base: *mut crate::cpu::jitv2::PhysicalCodePage,
+    /// This CPU's word in the pool's table of current slots
+    /// (`jitv2::CpuSlot`): the slot `pcp` is, published before `pcp` is
+    /// trusted, so the pool never gives that slot to other memory under this
+    /// CPU. Null until `jitv2_bind_fast_lookup`.
+    #[cfg(feature = "jitv2")]
+    jitv2_cpu_slot: *const AtomicU32,
     /// Cheap handle to `jitv2.lock().compile_queue`'s underlying push queue,
     /// cloned once at construction (`CompileQueue::queue_handle`) — lets the
     /// per-dispatch compile-request send (`exec_decoded`'s JIT gate) skip
@@ -2946,7 +2952,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // counter — see `jitv2_compile_queue_handle`/`jitv2_stats`'s own
         // doc comments on the struct fields.
         #[cfg(feature = "jitv2")]
-        let mut jitv2 = crate::cpu::jitv2::Jitv2::for_memory(crate::cpu::jitv2::JITV2_INITIAL_PAGE_CAPACITY, &cfg.memory);
+        let mut jitv2 = crate::cpu::jitv2::Jitv2::for_memory(crate::cpu::jitv2::jitv2::page_pool_capacity(), &cfg.memory);
         // The ISA level travels as data rather than through a global: the
         // model's `MIPS4` const goes to the compile pool here and to this
         // executor's own inline analyzer below, and from there into
@@ -3039,6 +3045,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_world: None,
             #[cfg(feature = "jitv2")]
             jitv2_pages_base: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            jitv2_cpu_slot: std::ptr::null(),
             #[cfg(feature = "jitv2")]
             jitv2_compile_queue_handle,
             #[cfg(feature = "jitv2")]
@@ -3319,7 +3327,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // leave tagless code reading memory under the full model's dirty
         // lines.
         if geometry_changed {
-            self.jitv2_flush_from_here(false);
+            self.jitv2_flush_from_here();
             // Not clear_pcp alone: the fetch nanotlb would still hit, and
             // nothing would re-derive the page step_jit needs.
             self.nanotlb_invalidate();
@@ -3672,6 +3680,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.pcp = page;
         self.core.cur_code_pfn = if page.is_null() { u32::MAX } else { pfn };
         self.pcp_uncached = uncached;
+        // Off every page: the pool may recycle the slot this CPU was on. (A
+        // page is published before this is called with it, by the lookup
+        // that found it.)
+        if page.is_null() {
+            if let Some(slot) = unsafe { self.jitv2_cpu_slot.as_ref() } {
+                slot.store(u32::MAX, Ordering::Release);
+            }
+        }
         // A compile for this CPU's request reads the page here.
         if let Some(page) = unsafe { page.as_ref() } {
             page.set_addr(self.jitv2_cpu, pfn, uncached);
@@ -3689,19 +3705,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// Flush the page pool and compiled code from this CPU: every other CPU
     /// sharing them parks first, and none of the locks it may be waiting on is
-    /// held meanwhile. `only_if_exhausted`: the CPU ahead of this one in line
-    /// may have made the flush unnecessary.
+    /// held meanwhile. Only something explicit asks for this (`j2 flush`, a
+    /// snapshot restore): a full arena is retired and a full page pool
+    /// recycles a slot, both without stopping anything.
     #[cfg(feature = "jitv2")]
-    pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
+    pub(crate) fn jitv2_flush_from_here(&mut self) {
         crate::pf_scope!(crate::perfetto::events::JIT_CPU_FLUSH);
         let bus = self.cached_bus.clone();
         let jit = self.jitv2.clone();
-        let flush = || {
-            let mut j = jit.lock();
-            if !only_if_exhausted || j.pool_exhausted() {
-                unsafe { j.flush_from_cpu_thread(bus); }
-            }
-        };
+        let flush = || unsafe { jit.lock().flush_from_cpu_thread(bus) };
         match self.jitv2_world.clone() {
             Some(world) => world.stop_others(flush),
             None => flush(),
@@ -3757,6 +3769,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let (map, pages) = j.fast_lookup_ptrs(self.jitv2_space);
         self.jitv2_pfn_map = map;
         self.jitv2_pages_base = pages;
+        self.jitv2_cpu_slot = j.cpu_slot_ptr(self.jitv2_cpu);
     }
 
     /// A memory controller moved memory under this CPU's addresses. Compiled
@@ -3780,11 +3793,25 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if self.jitv2_pfn_map.is_null() {
             return None;
         }
-        let slot = unsafe { (*self.jitv2_pfn_map.add(key as usize)).load(Ordering::Acquire) };
-        if slot == crate::cpu::jitv2::jitv2::PFN_MAP_EMPTY {
+        let entry = unsafe { (*self.jitv2_pfn_map.add(key as usize)).load(Ordering::Acquire) };
+        if entry == crate::cpu::jitv2::jitv2::PFN_MAP_EMPTY || self.jitv2_cpu_slot.is_null() {
             return None;
         }
-        Some(unsafe { self.jitv2_pages_base.add(slot as usize) })
+        let slot = crate::cpu::jitv2::jitv2::frame_entry_slot(entry);
+        let page = unsafe { self.jitv2_pages_base.add(slot as usize) };
+        // Publish the slot, then check it still holds the memory the entry
+        // was made for. The pool recycles a slot by moving its tenancy and
+        // then reading every CPU's published slot, so either it sees this
+        // store and leaves the slot alone, or the tenancy read here has
+        // moved and the claim goes to the pool's lock. Both `SeqCst`: with
+        // anything weaker each side can miss the other.
+        unsafe { (*self.jitv2_cpu_slot).store(slot, Ordering::SeqCst) };
+        let page_ref = unsafe { &*page };
+        if !crate::cpu::jitv2::jitv2::frame_entry_current(entry, page_ref.tenancy()) {
+            return None;
+        }
+        page_ref.touch();
+        Some(page)
     }
 
     /// Track a fetched page with [`Self::jitv2_track_pcp`] for `jitv2_split`:
@@ -3875,28 +3902,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // keeps whatever it was pinned to).
         let fr1 = (self.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
         let at = crate::cpu::jitv2::jitv2::PageAt { cpu: self.jitv2_cpu, space: self.jitv2_space, pfn, uncached };
-        let claim = self.jitv2_claim(at, fr1);
-        let claim = if claim == crate::cpu::jitv2::jitv2::Claim::Full {
-            // Pool exhausted: `flush_from_cpu_thread` resets to initial
-            // state and retries — always leaves room for at least one
-            // fresh page. Called from the CPU thread itself (this
-            // function), which is "as good as stopped" for its own
-            // purposes — no need to pause it — so this only pauses the
-            // *compile* queue internally, not the CPU.
-            self.jitv2_flush_from_here(true);
-            // `self.pcp` points into the pool the flush just cleared. The
-            // nanotlb's translations are untouched (memory did not move).
-            self.clear_pcp();
-            self.jitv2_claim(at, fr1)
-        } else {
-            claim
-        };
-        match claim {
+        match self.jitv2_claim(at, fr1) {
+            // The claim published the slot for this CPU under the pool's
+            // lock, and the pool's array never moves.
             crate::cpu::jitv2::jitv2::Claim::Page(slot) => {
-                let page = self.jitv2.lock().page_ptr(slot);
+                let page = unsafe { self.jitv2_pages_base.add(slot as usize) };
                 self.set_pcp(page, pfn, uncached);
             }
-            crate::cpu::jitv2::jitv2::Claim::Full => unreachable!("a flush leaves room for at least one page"),
+            // Every slot is in use, which takes a pool smaller than the
+            // compile queue plus the CPUs: interpret here, and ask again at
+            // the next fetch.
+            crate::cpu::jitv2::jitv2::Claim::Full => self.clear_pcp(),
         }
     }
 
@@ -3910,7 +3926,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let claim = jit.claim_page(at, bus.as_ref(), fr1);
         // The first claim allocates the table, possibly after this executor bound.
         if self.jitv2_pfn_map.is_null() {
-            self.jitv2_pfn_map = jit.pfn_map_ptr(self.jitv2_space);
+            let (map, pages) = jit.fast_lookup_ptrs(self.jitv2_space);
+            self.jitv2_pfn_map = map;
+            self.jitv2_pages_base = pages;
+            self.jitv2_cpu_slot = jit.cpu_slot_ptr(self.jitv2_cpu);
         }
         claim
     }
@@ -4404,6 +4423,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     page: self.pcp,
                     compiled_for_fr1,
                     cpu: self.jitv2_cpu as u8,
+                    // This CPU is on the page, so its slot cannot be
+                    // recycled now; the request may outlive that.
+                    tenancy: page.tenancy(),
                 };
                 if inline_compile {
                     // Sync compiles a page with no code, or one this arrival makes hot,
@@ -11076,6 +11098,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         if self.park.release(crate::cpu::smp::REQUEST_JIT_REMAP) {
             exec.jitv2_layout_changed();
         }
+        // A stepper is outside compiled code: that answers a retire request.
+        #[cfg(feature = "jitv2")]
+        self.park.release(crate::cpu::smp::REQUEST_JIT_RETIRE);
         #[cfg(not(feature = "jitv2"))]
         let _ = exec;
     }
@@ -11542,6 +11567,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     #[cfg(feature = "jitv2")]
                     if park.release(crate::cpu::smp::REQUEST_JIT_REMAP) {
                         guard.jitv2_layout_changed();
+                        continue;
+                    }
+                    // A code arena is being retired. Being here, outside
+                    // compiled code, is the answer; the release says so.
+                    #[cfg(feature = "jitv2")]
+                    if park.release(crate::cpu::smp::REQUEST_JIT_RETIRE) {
                         continue;
                     }
                     #[cfg(feature = "jitv2")]

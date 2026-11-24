@@ -64,6 +64,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### jitv2 flushes
 
+- Under jitv2 the guest no longer stops when compiled code fills its arena or
+  the page pool: the code goes into a ring of three arenas, the oldest of
+  which is retired while every CPU keeps running, and a full page pool reuses
+  the slot of a page nobody is running. Only the pages whose code was in the
+  retired arena compile again. All machines; `j2 status` shows the arenas.
 - Under jitv2, a single-processor machine no longer hangs when the CPU runs out
   of JIT pages (or `j2 flush`, `j2 inline on` or a cache change on the O2 asks
   for a flush) while a compile worker is flushing its full code arena. A

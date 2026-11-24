@@ -515,6 +515,13 @@ pub fn handle_request(
 ) -> bool {
     crate::pf_scope!(crate::perfetto::events::JIT_COMPILE);
     let page = unsafe { &*req.page };
+    // The slot may have gone to other memory since the request was made:
+    // hold it for this compile, or drop the request. The publish may come
+    // after the compile is over, and checks the tenancy again.
+    if !page.pin_for_compile(req.tenancy) {
+        return false;
+    }
+    let tenancy = req.tenancy;
 
     // Clears the page-level in-flight flag on every return path, including
     // early returns and panics — `exec_decoded`'s dispatch gate (mips_exec.rs)
@@ -587,7 +594,7 @@ pub fn handle_request(
             // `func` currently installed, and `publish`'s two early-outs
             // (stale gen, subsumed) leave someone else's code in place.
             page.stage_compile_snapshot(&inputs.words, &inputs.used, &new_entries, gen_snap, req.compiled_for_fr1);
-            if page.publish(&new_entries, jit_fn as *const (), gen_snap, instr_count, code_size, req.compiled_for_fr1) {
+            if page.publish_from(codegen.arena_state(), tenancy, &new_entries, jit_fn as *const (), gen_snap, instr_count, code_size, req.compiled_for_fr1) {
                 page.clear_requested_bits(&new_entries);
                 page.commit_compile_snapshot(gen_snap, &new_entries, req.compiled_for_fr1);
             }
@@ -706,6 +713,13 @@ pub fn handle_request_deferred(
 ) -> bool {
     crate::pf_scope!(crate::perfetto::events::JIT_COMPILE);
     let page = unsafe { &*req.page };
+    // The slot may have gone to other memory since the request was made:
+    // hold it for this compile, or drop the request. The publish may come
+    // after the compile is over, and checks the tenancy again.
+    if !page.pin_for_compile(req.tenancy) {
+        return false;
+    }
+    let tenancy = req.tenancy;
 
     struct ClearScheduledOnDrop<'a> { page: &'a crate::cpu::jitv2::PhysicalCodePage }
     impl Drop for ClearScheduledOnDrop<'_> {
@@ -830,6 +844,7 @@ pub fn handle_request_deferred(
             let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
                 page: req.page, new_entries, gen_snap, instr_count, code_size,
                 compiled_for_fr1: req.compiled_for_fr1,
+                tenancy,
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);
@@ -848,7 +863,7 @@ pub fn handle_request_deferred(
                 page.mark_seal_gap_blocked();
                 *pending += 1;
             }
-            publish_all(&sealed);
+            publish_all(&sealed, codegen.arena_state());
             #[cfg(feature = "developer")]
             {
                 // Count fallback words/regions and the successful-compile
@@ -900,7 +915,10 @@ pub fn handle_request_deferred(
 /// entries pushed by a *different* worker than the one that triggered this
 /// particular sweep — that's fine and expected (see this function's own
 /// callers' doc comments).
-fn publish_all(sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) {
+///
+/// `arena` is the arena the entries were sealed in, which is the calling
+/// `Codegen`'s: a seal only ever returns entries of its own arena.
+fn publish_all(sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo], arena: &crate::cpu::jitv2::paged_memory::PagedArenaState) {
     for entry in sealed {
         let page = unsafe { &*entry.page };
         let jit_fn = entry.jit_fn.expect("publish_all: a sealed entry must always carry a resolved JitFn");
@@ -908,7 +926,7 @@ fn publish_all(sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) {
         // see the comment there for why this plus `publish`'s `gen_snap` check
         // covers every case. Deferred entries sat in the seal queue for even
         // longer than an inline compile, so the window is wider here.
-        if page.publish(&entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size, entry.compiled_for_fr1) {
+        if page.publish_from(arena, entry.tenancy, &entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size, entry.compiled_for_fr1) {
             page.clear_requested_bits(&entry.new_entries);
             // Vouch for the record `handle_request_deferred` staged for this
             // compile — matched by `gen_snap`+`new_entries`, so a record
@@ -944,7 +962,7 @@ pub fn publish_ready_nonforced(codegen: &mut Codegen, pending: &mut PendingCount
     }
     let sealed = codegen.try_seal_ready();
     *pending = pending.saturating_sub(sealed.len());
-    publish_all(&sealed);
+    publish_all(&sealed, codegen.arena_state());
     reconcile_with_seal_queue(codegen, pending);
 }
 
@@ -959,7 +977,7 @@ pub fn force_publish_pending(codegen: &mut Codegen, pending: &mut PendingCount) 
     }
     let sealed = codegen.force_seal_pending();
     *pending = pending.saturating_sub(sealed.len());
-    publish_all(&sealed);
+    publish_all(&sealed, codegen.arena_state());
     reconcile_with_seal_queue(codegen, pending);
 }
 
@@ -1053,7 +1071,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(4);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1073,7 +1091,7 @@ mod tests {
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         let compile = |page: &mut PhysicalCodePage| {
             page.mark_requested(4);
-            let req = CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            let req = CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
             handle_request_for_test(&req, &bus, &mut Analyzer::new(), &mut Codegen::new());
         };
         compile(&mut page);
@@ -1103,7 +1121,7 @@ mod tests {
         let mut codegen = Codegen::new();
 
         page.mark_requested(4);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
         assert!(page.is_runnable(4), "offset 4 must compile and publish on its own");
         let func_after_first_compile = page.func();
@@ -1126,7 +1144,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(0);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1151,7 +1169,7 @@ mod tests {
         let bus: Arc<dyn BusDevice> = Arc::new(ErrDevice);
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         page.mark_requested(0);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1185,7 +1203,7 @@ mod tests {
             let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
             page.mark_requested(4);
             assert!(page.try_schedule_page());
-            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
@@ -1201,7 +1219,7 @@ mod tests {
             let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
             page.mark_requested(0);
             assert!(page.try_schedule_page());
-            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
@@ -1215,7 +1233,7 @@ mod tests {
             let mut page = PhysicalCodePage::new(0, std::ptr::null());
             page.mark_requested(0);
             assert!(page.try_schedule_page());
-            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
@@ -1255,7 +1273,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(4);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1276,7 +1294,7 @@ mod tests {
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(0);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1295,7 +1313,7 @@ mod tests {
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         page.mark_requested(4);
         assert!(page.try_schedule_page());
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
 
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
@@ -1329,7 +1347,7 @@ mod tests {
         for i in 0..N {
             let before = pages.iter().filter(|p| p.is_runnable(4)).count();
             pages[i].mark_requested(4);
-            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
             let mut pending: PendingCount = 0;
             handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
             let own_published = pages[i].is_runnable(4);
@@ -1363,12 +1381,12 @@ mod tests {
         let mut analyzer = Analyzer::new();
         let (mut pending_a, mut pending_b): (PendingCount, PendingCount) = (0, 0);
         pages[0].mark_requested(4);
-        let req = CompileRequest { page: &mut pages[0] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+        let req = CompileRequest { page: &mut pages[0] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut a, &mut pending_a);
         assert_eq!(pending_a, 1, "a's compile must be queued and counted");
         for i in 1..=N {
             pages[i].mark_requested(4);
-            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 };
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 };
             handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut b, &mut pending_b);
         }
         force_publish_pending(&mut b, &mut pending_b);

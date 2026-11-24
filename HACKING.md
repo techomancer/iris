@@ -542,7 +542,7 @@ one `Physical`. `src/cpu/smp.rs` holds what they share:
 - **Getting the machine to yourself.** `World::stop_others` parks every other
   CPU and runs a closure. Call it holding no lock another CPU could be waiting
   on. Two callers take turns, and the one waiting counts as parked. Remapping
-  memory and flushing jitv2 go through it. A remap that moved memory then asks
+  memory and an explicit jitv2 flush go through it. A remap that moved memory then asks
   every CPU (`World::layout_changed`) to forget the addresses of its JIT code
   pages; no compiled code is dropped for it (section 8). A CPU belongs to one
   `World`: every machine hands its world to its CPUs' jitv2 pool
@@ -1410,11 +1410,11 @@ code into host code with Cranelift. The concepts:
   once, but a page with code only when new entries make it hot, so it does not
   re-emit the page on every entry). Until the code is published, the
   interpreter keeps running the page. Published code goes into the page's
-  entry table and is picked up at the next dispatch. A flush or a seal that
-  needs the whole pool meets its workers at the pool barrier
-  (`src/cpu/jitv2/pool_barrier.rs`, with a loom model); a worker gets the data
-  cache geometry and constants when it is spawned, never by taking the pool's
-  lock, so a flush that restarts the workers cannot wait on them. An idle
+  entry table and is picked up at the next dispatch. A forced seal, which
+  needs every worker out of the arena's open page, meets them at the pool
+  barrier (`src/cpu/jitv2/pool_barrier.rs`, with a loom model); a worker gets
+  the data cache geometry and constants when it is spawned, never by taking
+  the pool's lock, so a flush that restarts the workers cannot wait on them. An idle
   worker parks instead of polling: the producer that pushes a request unparks
   the pool if a worker is asleep (a dropped push, on a full queue, wakes
   nobody), and the park's timeout is only a backstop for the periodic
@@ -1479,20 +1479,78 @@ code into host code with Cranelift. The concepts:
   node (`share_pool`; nodes with different processor modules get a pool each,
   because code is specific to the module). Dispatch reads pages lock-free, a
   frame table publishes a slot after its claim, and inline stores bump generations
-  atomically. Compiled code is freed only by a full flush, and every flush parks
-  all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`). Compiled loads
+  atomically. Compiled code is freed an arena at a time, with no CPU stopped
+  (next item), or all at once by an explicit flush, which parks every CPU
+  first (`jitv2_flush_from_here`). Compiled loads
   and stores are plain host accesses, so on a multiprocessor a guest `SYNC`
   compiles to a host fence on hosts that are not x86 (the interpreter's
   `SYNC` does the same).
-- **Flushes take turns through the CPU's world.** A CPU flushes from inside
-  `World::stop_others` and joins the compile workers there, holding the
-  `Jitv2` lock. A worker that leads a flush takes the world with `try_lead`,
-  parks the CPUs, and only then takes the `Jitv2` lock; it gives way if the
-  pool stops while it waits. So a worker never halts a CPU thread (which may
-  be joining that worker) and never waits on the lock a joining thread holds.
-  Workers get their start-up data (cache geometry, JIT constants) before they
-  spawn, for the same reason. A thread that runs no CPU stops the pool with
-  `Jitv2::stop_pool`, which joins with the lock released.
+- **Code lives in a ring of three arenas, and the oldest is retired without
+  stopping anything** (`src/cpu/jitv2/arena_ring.rs`, with a loom model).
+  Nothing in an arena is freed singly: a recompile leaves the old function
+  behind. Workers compile into the *active* arena. When it fills, the worker
+  that notices switches the pool to a *spare* (empty) one; the arena left
+  behind stays *live* and its code keeps running. The switch that uses the
+  last spare also retires the oldest live arena, in this order:
+  1. its publishes are refused from now on (`PagedArenaState::retire`; the
+     test is under the page's publish lock);
+  2. a sweep takes its code off every page that names it
+     (`PhysicalCodePage::retire_code`: the page records the epoch of the arena
+     its function is in). The function pointer becomes the fallback stub,
+     never null, because a CPU may be between `is_runnable` and the call.
+     The page's entry requests go too, so a page that lives through many
+     rotations does not keep every entry point it ever had;
+  3. every CPU is asked to pass a batch boundary (`World::retire_code`,
+     `REQUEST_JIT_RETIRE` on its park slot). The request sets the park bit,
+     so compiled code bails, but the CPU does not park: releasing the request
+     at the boundary is its answer. A parked or stopped CPU has answered.
+     Dispatch loads a page's function afresh on every entry and no code
+     chains into another page's, so a CPU past the boundary cannot be in the
+     arena or get back into it;
+  4. once every CPU has answered and every worker has followed the switch, a
+     worker empties the arena in place (`SharedArena::recycle`: pages back to
+     reserved, cursor to 0, a new epoch), builds the memory helpers into it
+     while it is empty, and it is a spare again.
+  The kick must follow the sweep: a CPU that answers first could still load a
+  function from the arena afterwards. Only the pages whose installed code was
+  in the retired arena compile again, when they are next entered. If the
+  active arena fills while no arena is empty, the workers compile nothing
+  until the reclaim; the CPUs run what is published and interpret the rest.
+  `IRIS_JIT_ARENA_FLUSH_MB` makes arenas small for testing this.
+- **A full page pool recycles a slot nobody is using**
+  (`Jitv2::recycle_slot`, under the pool's lock, from the claim that found no
+  free slot). A clock hand passes over a page entered since its last pass
+  (`PhysicalCodePage::touch` marks it on each page crossing), a page some CPU
+  is on, and a page whose compile request is queued or running; the first
+  page left is emptied and given to the new memory. Three things keep that
+  safe without a lock on the page-crossing path:
+  - *Each CPU publishes the slot it is on* in a word of its own
+    (`jitv2::CpuSlot`, one cache line each). The lock-free lookup stores the
+    slot there and then checks the slot's tenancy; the recycler moves the
+    tenancy and then reads every CPU's word. Both sides use `SeqCst`, so one
+    always sees the other: either the recycler finds the CPU on the slot and
+    leaves it, or the CPU finds the tenancy moved and takes the pool's lock.
+  - *A frame table entry carries the slot's tenancy* (`frame_entry`), a count
+    of how many times the slot has been given to other memory. Nobody visits
+    the frame tables when a slot is recycled: entries for the old tenant stop
+    matching. When the tenancy bits wrap, every frame table is cleared.
+  - *A publish carries the tenancy its compile read* (`PublishInfo::tenancy`).
+    A page with a compile in flight is never recycled, but its publish can
+    wait in the seal queue after the compile is over; if the slot has gone
+    to other memory by then, `publish_from` refuses it.
+  `IRIS_JIT_PAGES` makes the pool small for testing this. Only a pool too
+  small for the CPUs plus the compile queue can have every slot in use; the
+  CPU then interprets and asks again at its next fetch.
+- **A flush of everything still stops the world**, and only something
+  explicit asks for one: `j2 flush`, restoring a snapshot, and inline compile
+  mode when its arena fills. The CPU flushes from inside `World::stop_others`
+  and joins the compile workers there, holding the `Jitv2` lock; every page is
+  reset and every arena emptied. So a worker must never wait on that lock or
+  on a CPU: the arena sweep reaches the page slots directly (the array never
+  moves) and only asks the CPUs, never holds them. Workers get their start-up data
+  (cache geometry, JIT constants) before they spawn, for the same reason. A
+  thread that runs no CPU stops the pool with `Jitv2::stop_pool`, which joins
+  with the lock released.
 - **Uncached fetches the board decodes apart.** A frame table is indexed by
   the physical address of the fetch. The IP35 reset PROM answers an uncached fetch
   at 0x1fc00000 whatever RAM sits behind the cached view there, so a board whose

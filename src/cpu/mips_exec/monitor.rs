@@ -1956,7 +1956,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         return Err("j2 flush: stop the CPU first (`stop`) — flushing while it's running could race a concurrently-executing compiled function".to_string());
                     }
                     let mut exec = self.try_lock_executor()?;
-                    exec.jitv2_flush_from_here(false);
+                    exec.jitv2_flush_from_here();
                     // Mirrors jitv2_track_pcp's own post-flush recovery —
                     // self.pcp would otherwise dangle into the just-cleared
                     // pool.
@@ -2007,10 +2007,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                     {
                                         let jit = exec.jitv2.clone();
                                         let stopped = crate::cpu::jitv2::Jitv2::stop_pool(&jit);
-                                        if let Some(old) = stopped.into_iter().next() {
-                                            let (shared, state) = old.shared_arena();
-                                            drop(old);
-                                            *jit.lock().codegen.lock() = Some(crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared, state));
+                                        if !stopped.is_empty() {
+                                            drop(stopped);
+                                            let jit = jit.lock();
+                                            if let Some((shared, state)) = jit.compile_queue.active_arena() {
+                                                *jit.codegen.lock() = Some(crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared, state));
+                                            }
                                         }
                                     }
                                     exec.jitv2_inline_compile = true;
@@ -2035,11 +2037,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 let old = exec.jitv2.lock().codegen.lock().take();
                                 match old {
                                     Some(old) => {
-                                        let (shared, state) = old.shared_arena();
+                                        // The pool compiles into its own
+                                        // arenas. Whatever the inline
+                                        // `Codegen` published stays where it
+                                        // is: on one of those arenas, or on
+                                        // an arena of its own, which is then
+                                        // kept mapped for the code in it.
                                         drop(old);
                                         let mut jit = exec.jitv2.lock();
                                         let stats = jit.stats.clone();
-                                        jit.compile_queue.start_with_shared_arena(bus, stats, shared, state);
+                                        jit.compile_queue.start(bus, stats);
                                     }
                                     None => {
                                         return Err("j2 inline off: no Codegen available (already owned by a running compile queue?)".to_string());
@@ -3125,16 +3132,39 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                     reserved, crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES,
                                     reserved as f64 * 100.0 / crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES as f64,
                                     used, if reserved == 0 { 0.0 } else { used as f64 * 100.0 / reserved as f64 }).unwrap();
-                            } else if jit.compile_queue.is_running() {
-                                writeln!(writer, "arena reserved: n/a while pooled (no cross-thread byte mirror yet — see function_count for a live signal instead)").unwrap();
                             }
-                            // Mega-flush count: each flush wipes ALL published
-                            // entries, forcing everything to recompile. A count
-                            // that keeps climbing during steady-state execution
-                            // is the arena-fill/flush/recompile death spiral —
-                            // the working set exceeds the arena threshold.
-                            let flushes = crate::cpu::jit_feedback::JIT_FEEDBACK.flush_events.load(Ordering::Relaxed);
-                            writeln!(writer, "mega-flushes (arena/pool wipes, each recompiles everything): {}", flushes).unwrap();
+                            // The pool's ring of arenas: which one is being
+                            // compiled into, which still hold running code,
+                            // which are empty, and how full each is.
+                            if let Some(ring) = jit.compile_queue.ring_status() {
+                                let fill = jit.compile_queue.arena_fill();
+                                let threshold = crate::cpu::jitv2::jitv2::arena_flush_threshold();
+                                for (i, used) in fill.iter().enumerate() {
+                                    let role = if i == ring.active {
+                                        "active (compiled into)"
+                                    } else if ring.retiring == Some(i) {
+                                        "retiring (code off every page, waiting for the CPUs)"
+                                    } else if ring.live.contains(&i) {
+                                        "live (code still runs)"
+                                    } else {
+                                        "spare (empty)"
+                                    };
+                                    writeln!(writer, "arena {}: {} / {} bytes ({:.1}%) — {}",
+                                        i, used, threshold, *used as f64 * 100.0 / threshold as f64, role).unwrap();
+                                }
+                                writeln!(writer, "arena switches: {}; arenas retired: {}, taking the code of {} pages (each compiles again when next entered)",
+                                    ring.switches,
+                                    jit.stats.arena_retires.load(Ordering::Relaxed),
+                                    jit.stats.arena_retired_pages.load(Ordering::Relaxed)).unwrap();
+                                writeln!(writer, "page slots recycled (given to other memory with the pool full): {}",
+                                    jit.stats.pages_recycled.load(Ordering::Relaxed)).unwrap();
+                            }
+                            // Whole-pool flushes: each wipes every page and
+                            // every arena with the CPUs stopped. Only a full
+                            // explicit request (`j2 flush`, a restore) causes one; a full
+                            // arena is retired instead (above).
+                            let flushes = crate::cpu::jitv2::hashstats::FLUSH_EPOCH.load(Ordering::Relaxed);
+                            writeln!(writer, "whole-pool flushes (every page and arena wiped with the CPUs stopped): {}", flushes).unwrap();
                         }
                         // Arena bytes: this block reports emitted code size (arena
                         // bytes + the bytes/instruction histogram), and `developer`
