@@ -11,7 +11,9 @@
 //!
 //! [`REQUEST_JIT_REMAP`] rides the same bit but is not a hold: at the boundary
 //! the CPU forgets where its JIT's code pages are and runs on
-//! ([`World::layout_changed`]).
+//! ([`World::layout_changed`]). [`REQUEST_JIT_RETIRE`] is the other request:
+//! the CPU only has to reach the boundary, which proves it has left whatever
+//! compiled code it was in ([`World::retire_code`]).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,6 +44,13 @@ pub const HOLD_RENDEZVOUS: u32 = 1 << 2;
 /// the addresses it reached its JIT's code pages at. The pages keep their
 /// code, which is keyed by the memory it came from.
 pub const REQUEST_JIT_REMAP: u32 = 1 << 3;
+/// Not a hold: the compile pool is taking a code arena away and has already
+/// taken its code off every page. The CPU answers by releasing the request at
+/// its next batch boundary, which shows it is outside that code and cannot
+/// get back in.
+pub const REQUEST_JIT_RETIRE: u32 = 1 << 4;
+/// The bits that ask the CPU for something without holding it.
+const REQUESTS: u32 = REQUEST_JIT_REMAP | REQUEST_JIT_RETIRE;
 
 const NOT_A_CPU: u8 = u8::MAX;
 
@@ -121,8 +130,8 @@ impl ParkSlot {
         if s.holds == 0 {
             self.word().fetch_and(!HOST_PARK_BIT, Ordering::SeqCst);
         }
-        // A parked CPU does not wait on a remap request; wake it now, not at its next timeout.
-        if s.holds & !REQUEST_JIT_REMAP == 0 {
+        // A parked CPU does not wait on a request; wake it now, not at its next timeout.
+        if s.holds & !REQUESTS == 0 {
             self.changed.notify_all();
         }
         posted
@@ -145,6 +154,15 @@ impl ParkSlot {
         }
     }
 
+    /// Whether the CPU has been through a batch boundary since `request` was
+    /// posted, or is where a boundary would put it: parked, or with no thread.
+    /// Either way it is outside compiled code, and what it enters next it
+    /// looks up afresh.
+    pub fn answered(&self, request: u32) -> bool {
+        let s = self.state.lock();
+        s.holds & request == 0 || s.parked || !self.active.load(Ordering::SeqCst)
+    }
+
     /// A CPU thread is starting or has ended.
     pub fn set_active(&self, on: bool) {
         let _s = self.state.lock();
@@ -153,12 +171,12 @@ impl ParkSlot {
     }
 
     /// The CPU thread, with its executor unlocked: wait out the holds, or
-    /// until the CPU is stopped. A remap request is not waited on.
+    /// until the CPU is stopped. A request is not waited on.
     pub fn park(&self, running: &AtomicBool) {
         let mut s = self.state.lock();
         s.parked = true;
         self.changed.notify_all();
-        while s.holds & !REQUEST_JIT_REMAP != 0 && running.load(Ordering::Relaxed) {
+        while s.holds & !REQUESTS != 0 && running.load(Ordering::Relaxed) {
             self.changed.wait_for(&mut s, Duration::from_millis(1));
         }
         s.parked = false;
@@ -231,6 +249,17 @@ impl World {
     pub fn layout_changed(&self) {
         #[cfg(feature = "jitv2")]
         self.slots().iter().for_each(|s| s.hold(REQUEST_JIT_REMAP));
+    }
+
+    /// A code arena's code is off every page: ask every CPU to pass a batch
+    /// boundary. [`Self::code_retired`] says when all have.
+    pub fn retire_code(&self) {
+        self.slots().iter().for_each(|s| s.hold(REQUEST_JIT_RETIRE));
+    }
+
+    /// Every CPU has left the code [`Self::retire_code`] was called for.
+    pub fn code_retired(&self) -> bool {
+        self.slots().iter().all(|s| s.answered(REQUEST_JIT_RETIRE))
     }
 
     fn slots(&self) -> &[Arc<ParkSlot>] {
@@ -393,6 +422,53 @@ mod tests {
         assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
     }
 
+
+    /// A retire request does not park the CPU, and its release is the answer.
+    #[test]
+    fn a_retire_request_is_answered_by_its_release_and_does_not_park() {
+        let (s, word) = slot(0);
+        s.set_active(true);
+        let world = World::new();
+        world.set_slots(vec![s.clone()]);
+        world.retire_code();
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+        assert!(!world.code_retired(), "a running CPU has not been through a boundary yet");
+        // Would wait for ever if the request counted as a hold.
+        s.park(&AtomicBool::new(true));
+        assert!(s.release(REQUEST_JIT_RETIRE));
+        assert!(world.code_retired());
+        assert_eq!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+    }
+
+    /// A parked CPU and a CPU with no thread are outside compiled code.
+    #[test]
+    fn a_parked_or_stopped_cpu_has_answered_a_retire_request() {
+        let (stopped, _w) = slot(0);
+        let (parked, _w2) = slot(1);
+        parked.set_active(true);
+        let world = World::new();
+        world.set_slots(vec![stopped.clone(), parked.clone()]);
+        world.retire_code();
+        assert!(stopped.answered(REQUEST_JIT_RETIRE));
+        assert!(!parked.answered(REQUEST_JIT_RETIRE));
+        parked.mark_parked(true);
+        assert!(world.code_retired());
+        // It still takes the request when it runs again.
+        parked.mark_parked(false);
+        assert!(!world.code_retired());
+        assert!(parked.release(REQUEST_JIT_RETIRE));
+        assert!(world.code_retired());
+    }
+
+    /// A retire request beside a real hold: the hold still parks the CPU.
+    #[test]
+    fn a_retire_request_keeps_another_hold() {
+        let (s, word) = slot(0);
+        s.hold(REQUEST_JIT_RETIRE);
+        s.hold(HOLD_HEART);
+        assert!(s.release(REQUEST_JIT_RETIRE));
+        assert_ne!(word.load(Ordering::SeqCst) & HOST_PARK_BIT, 0);
+    }
 
     /// A CPU with its own compile pool is in a world of one, whatever its id.
     /// Its own thread has no one to hold; anyone else holds it.

@@ -28,6 +28,7 @@ use parking_lot::Mutex;
 
 use crate::cpu::mips_core::MipsCore;
 use crate::cpu::mips_exec::ExecStatus;
+use crate::cpu::jitv2::arena_ring::{ArenaRing, Switch};
 use crate::cpu::jitv2::pool_barrier::PoolBarrier;
 use crate::traits::{BusDevice, CodeKey, Device};
 
@@ -59,6 +60,13 @@ pub struct CompileRequest {
     /// read at that CPU's address for it, through that CPU's bus
     /// ([`CodeBuses::locate`]).
     pub cpu: u8,
+    /// The page slot's tenancy when the CPU asked
+    /// ([`PhysicalCodePage::tenancy`]). A request can outlive its page: the
+    /// hot lane's copy is still queued when the first copy's compile ends,
+    /// and the pool may then give the slot to other memory. The worker
+    /// checks this before it reads the page
+    /// ([`PhysicalCodePage::pin_for_compile`]).
+    pub tenancy: u32,
 }
 
 unsafe impl Send for CompileRequest {}
@@ -193,6 +201,43 @@ pub fn page_key(pfn: Pfn, uncached: bool, split: bool) -> u32 {
 /// cheaply (it is constructed into an `Arc<Mutex<..>>`).
 pub struct PfnMap(Box<[AtomicU32]>);
 
+/// A frame table entry is the pool slot in its low [`SLOT_BITS`] bits and the
+/// low bits of the slot's tenancy above them (`PhysicalCodePage::tenancy`). A
+/// slot is recycled for other memory without anyone visiting the frame
+/// tables: the tenancy moves, and every entry made for the old tenant stops
+/// matching ([`frame_entry_page`]).
+pub const SLOT_BITS: u32 = 16;
+/// Most slots a pool can have: `u16::MAX`, so no entry reads as
+/// [`PFN_MAP_EMPTY`].
+pub const MAX_POOL_SLOTS: usize = (1 << SLOT_BITS) - 1;
+
+/// The frame table entry for `slot` in its tenancy `tenancy`.
+#[inline(always)]
+pub fn frame_entry(slot: PageSlot, tenancy: u32) -> u32 {
+    tenancy << SLOT_BITS | slot
+}
+
+/// The slot a frame table entry names.
+#[inline(always)]
+pub fn frame_entry_slot(entry: u32) -> PageSlot {
+    entry & ((1 << SLOT_BITS) - 1)
+}
+
+/// Whether `entry` was made for the tenant now in its slot, whose tenancy is
+/// `tenancy`.
+#[inline(always)]
+pub fn frame_entry_current(entry: u32, tenancy: u32) -> bool {
+    entry >> SLOT_BITS == tenancy & ((1 << (32 - SLOT_BITS)) - 1)
+}
+
+/// The slot each CPU of a pool is on, or `NO_SLOT`: one word per CPU, each on
+/// a cache line of its own. A CPU publishes the slot before it trusts it
+/// (store, then check the slot's tenancy again), and the pool never recycles a
+/// published slot (it moves the tenancy, then reads these). One of the two
+/// always sees the other, as long as both sides use `SeqCst`.
+#[repr(align(128))]
+pub struct CpuSlot(pub AtomicU32);
+
 /// `PfnMap`'s own "no slot here" sentinel. Numerically identical to each
 /// impl module's private `NO_SLOT` (both `u32::MAX`), spelled separately
 /// because `PfnMap` is shared code that predates either module in this file
@@ -282,7 +327,7 @@ pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = ARENA_RESERVE_SIZE as u64 -
 
 /// [`CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`], or `IRIS_JIT_ARENA_FLUSH_MB`: a low
 /// value makes the compile workers' own flush happen often enough to test.
-fn arena_flush_threshold() -> u64 {
+pub fn arena_flush_threshold() -> u64 {
     static T: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         std::env::var("IRIS_JIT_ARENA_FLUSH_MB")
@@ -291,6 +336,11 @@ fn arena_flush_threshold() -> u64 {
             .map_or(CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES, |mb| (mb << 20).min(CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES))
     })
 }
+
+/// How often a worker with a full arena and no empty one to move to looks
+/// again. The wait ends when every CPU has passed a batch boundary, which is
+/// well under a millisecond for a running CPU.
+const ARENA_STALL_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
 /// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
@@ -301,6 +351,18 @@ fn arena_flush_threshold() -> u64 {
 /// `mega_flush`'s cost of getting this wrong low (a pool-exhaustion flush) is
 /// cheap relative to permanently carrying a much larger array.
 pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
+
+/// [`JITV2_INITIAL_PAGE_CAPACITY`], or `IRIS_JIT_PAGES`: a low value makes
+/// the pool recycle page slots often enough to test.
+pub fn page_pool_capacity() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("IRIS_JIT_PAGES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(JITV2_INITIAL_PAGE_CAPACITY, |n| n.clamp(16, MAX_POOL_SLOTS))
+    })
+}
 
 /// Depth of the compile-request SPSC ring (§6.4 "bounded queue; drop on full —
 /// hot pages re-trigger"). A starting guess, doubled from 1024 after a live
@@ -744,6 +806,13 @@ pub struct JitStats {
     /// Times a CPU forgot its addresses because a memory controller moved
     /// memory (`Jitv2::forget_addresses`). No code is dropped for one.
     pub remaps: AtomicU64,
+    /// Code arenas the compile pool has retired, and the pages that had code
+    /// in one when it went (they compile again when next entered).
+    pub arena_retires: AtomicU64,
+    pub arena_retired_pages: AtomicU64,
+    /// Page slots taken back from memory nobody was running and given to
+    /// other memory (`Jitv2::recycle_slot`).
+    pub pages_recycled: AtomicU64,
     /// Successful `compile_region` calls that got published
     /// (`comp::handle_request`'s `Some(jit_fn)` arm).
     pub compiles: AtomicU64,
@@ -945,6 +1014,18 @@ pub struct PhysicalCodePage {
     /// installed code, whatever entries the two share. Written only under
     /// `publish_lock`.
     func_fr1: std::sync::atomic::AtomicBool,
+    /// How many times this slot has been given to other memory. It moves,
+    /// under `publish_lock`, when the pool takes the slot back: frame table
+    /// entries and publishes made for the old tenant then no longer match.
+    tenancy: AtomicU32,
+    /// A CPU entered the page since the pool's recycling hand last passed.
+    /// The hand clears it and takes the first page it finds clear.
+    referenced: std::sync::atomic::AtomicBool,
+    /// The arena `func` lives in, as that arena's epoch
+    /// (`PagedArenaState::epoch`), or 0 when `func` is the stub. When the
+    /// compile pool retires an arena it takes the code off every page that
+    /// names it ([`Self::retire_code`]). Written only under `publish_lock`.
+    code_epoch: AtomicU64,
     /// Generation this `func`/`compiled` pair was last published against
     /// (§13.3 step 6). Only ever written to a value `>=` its current value;
     /// numerically advances only when the publish that wrote it was actually
@@ -1469,6 +1550,9 @@ impl PhysicalCodePage {
             compiled: new_bitmap(),
             func: std::sync::atomic::AtomicPtr::new(NO_CODE as *mut ()),
             func_fr1: std::sync::atomic::AtomicBool::new(false),
+            tenancy: AtomicU32::new(0),
+            referenced: std::sync::atomic::AtomicBool::new(false),
+            code_epoch: AtomicU64::new(0),
             entry_gen: AtomicU64::new(0),
             page_scheduled: std::sync::atomic::AtomicBool::new(false),
             hot_wait: std::sync::atomic::AtomicU32::new(0),
@@ -1519,6 +1603,7 @@ impl PhysicalCodePage {
         for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
         self.func.store(NO_CODE as *mut (), Ordering::Relaxed);
         self.func_fr1.store(false, Ordering::Relaxed);
+        self.code_epoch.store(0, Ordering::Relaxed);
         // The snapshot describes the `func` just dropped — see
         // `invalidate_compile_snapshot`.
         self.invalidate_compile_snapshot();
@@ -2187,6 +2272,9 @@ impl PhysicalCodePage {
     /// When `snap_gen` genuinely advances `entry_gen`, `denied` resets to
     /// all-allowed (§13.6): a page-gen bump means the bytes are provably
     /// different from whatever got denied last time.
+    ///
+    /// For code that lives in no rotating arena (the stub, a test's
+    /// function); compiled code goes through [`Self::publish_from`].
     pub fn publish(
         &self,
         new_entries: &[u64; BITMAP_WORDS],
@@ -2196,8 +2284,34 @@ impl PhysicalCodePage {
         code_size: u32,
         fr1: bool,
     ) -> bool {
+        self.publish_from(&crate::cpu::jitv2::paged_memory::PagedArenaState::UNTRACKED, self.tenancy(), new_entries, func, snap_gen, instr_count, code_size, fr1)
+    }
+
+    /// [`Self::publish`] for a function in `arena`. Refused once the arena is
+    /// retired: its code is being taken off the pages, and the test is made
+    /// under `publish_lock`, which [`Self::retire_code`] takes too, so this
+    /// publish either lands first and is swept, or does not land.
+    ///
+    /// `tenancy` is the slot's tenancy when the compile read the page
+    /// ([`Self::tenancy`]). A publish waits in the seal queue after its
+    /// compile is over, and the pool may give the slot to other memory
+    /// meanwhile: the code is then for the wrong page, and is refused.
+    pub fn publish_from(
+        &self,
+        arena: &crate::cpu::jitv2::paged_memory::PagedArenaState,
+        tenancy: u32,
+        new_entries: &[u64; BITMAP_WORDS],
+        func: *const (),
+        snap_gen: u64,
+        instr_count: usize,
+        code_size: u32,
+        fr1: bool,
+    ) -> bool {
         let _guard = self.publish_lock.lock();
 
+        if arena.is_retired() || self.tenancy.load(Ordering::SeqCst) != tenancy {
+            return false;
+        }
         if self.current_gen() > snap_gen {
             return false; // page mutated past this compile's snapshot; discard rather than publish stale code
         }
@@ -2223,6 +2337,7 @@ impl PhysicalCodePage {
         // these same three fields.
         self.func.store(func as *mut (), Ordering::Release);
         self.func_fr1.store(fr1, Ordering::Relaxed);
+        self.code_epoch.store(if func == NO_CODE as *const () { 0 } else { arena.epoch() }, Ordering::Relaxed);
         self.compiles_since_flush.fetch_add(1, Ordering::Relaxed);
         self.instr_count.store(instr_count as u32, Ordering::Relaxed);
         self.code_size.store(code_size, Ordering::Relaxed);
@@ -2269,6 +2384,98 @@ impl PhysicalCodePage {
             // next compile re-derives it. See `fr1`'s own doc comment.
             self.fr_unpinned.store(true, Ordering::Relaxed);
         }
+        true
+    }
+
+    /// See the `tenancy` field.
+    #[inline(always)]
+    pub fn tenancy(&self) -> u32 {
+        self.tenancy.load(Ordering::SeqCst)
+    }
+
+    /// A CPU is entering the page: the recycling hand passes it over once.
+    #[inline(always)]
+    pub fn touch(&self) {
+        // Read first: the line is shared with every CPU on the page.
+        if !self.referenced.load(Ordering::Relaxed) {
+            self.referenced.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A worker is about to compile this page for a request made in tenancy
+    /// `tenancy`: hold the slot for the compile, or say the request is stale.
+    ///
+    /// The worker reads the page's key, bytes and generation pointer, which
+    /// the pool rewrites when it recycles the slot, so the two must not
+    /// overlap. The worker sets the in-flight flag and then reads the
+    /// tenancy; the pool moves the tenancy and then reads the flag
+    /// ([`Jitv2::recycle_slot`]); both `SeqCst`. So either the pool sees the
+    /// flag and leaves the slot, or the worker sees the tenancy moved and
+    /// drops the request. `handle_request`'s guard clears the flag when the
+    /// compile is over.
+    pub fn pin_for_compile(&self, tenancy: u32) -> bool {
+        let was_set = self.page_scheduled.swap(true, Ordering::SeqCst);
+        if self.tenancy.load(Ordering::SeqCst) == tenancy {
+            return true;
+        }
+        // Not this request's page any more. Leave the flag as it was: set,
+        // it is the new tenant's own request.
+        if !was_set {
+            self.page_scheduled.store(false, Ordering::SeqCst);
+        }
+        false
+    }
+
+    /// The recycling hand: was the page entered since the last pass?
+    fn take_referenced(&self) -> bool {
+        self.referenced.swap(false, Ordering::Relaxed)
+    }
+
+    /// The pool is taking this slot back: frame table entries and publishes
+    /// made for its tenant stop matching. Returns the new tenancy.
+    fn end_tenancy(&self) -> u32 {
+        let _guard = self.publish_lock.lock();
+        self.tenancy.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+    }
+
+    /// The epoch of the arena `func` lives in, 0 for the stub.
+    #[inline]
+    pub fn code_epoch(&self) -> u64 {
+        self.code_epoch.load(Ordering::Relaxed)
+    }
+
+    /// The compile pool is retiring the arena of epoch `epoch`: if this
+    /// page's code lives there, take it away. The page keeps its key, its FR
+    /// pin and its denials, and compiles again when it is next entered.
+    ///
+    /// `requested` goes with the code. A page that lives through many
+    /// rotations would otherwise keep every entry point it ever had, and
+    /// compile all of them again each time
+    /// (clanker/jitv2/flush-preserved-entry-point-inflation.md).
+    ///
+    /// A CPU may be between `is_runnable` and `func()` on this page: it then
+    /// calls either the old function, whose arena stays mapped until every
+    /// CPU has left compiled code after this sweep, or the stub.
+    ///
+    /// Returns whether the page had code there.
+    pub fn retire_code(&self, epoch: u64) -> bool {
+        // Snapshot lock first, as `try_skip_redundant_compile` takes them.
+        let mut snapshots = self.snapshots.lock();
+        let _guard = self.publish_lock.lock();
+        if epoch == 0 || self.code_epoch.load(Ordering::Relaxed) != epoch {
+            return false;
+        }
+        for word in self.compiled.iter() { word.store(0, Ordering::Release); }
+        self.func.store(NO_CODE as *mut (), Ordering::Release);
+        self.func_fr1.store(false, Ordering::Relaxed);
+        self.code_epoch.store(0, Ordering::Relaxed);
+        self.instr_count.store(0, Ordering::Relaxed);
+        self.code_size.store(0, Ordering::Relaxed);
+        for word in self.requested.iter() { word.store(0, Ordering::Relaxed); }
+        // The record describes the function just dropped, and a compile in
+        // flight must not come back and vouch for it.
+        snapshots.committed.valid = false;
+        snapshots.staged = None;
         true
     }
 
@@ -2636,10 +2843,15 @@ pub struct Jitv2 {
     /// all see memory at the same addresses has one; a machine of several
     /// nodes has one per node.
     spaces: Vec<Space>,
-    /// Pool capacity, fixed at construction (== `pages.len()`). Claiming past
-    /// this (i.e. with the free list exhausted) triggers `mega_flush` (the
-    /// "ran out of PCPs" resource-exhaustion trigger).
+    /// Pool capacity, fixed at construction (== `pages.len()`). With the free
+    /// list exhausted, a claim recycles a slot nobody is using
+    /// ([`Self::recycle_slot`]).
     capacity: usize,
+    /// The slot each CPU is on: see [`CpuSlot`]. Boxed, so the executors'
+    /// pointers into it stay good when the `Jitv2` moves.
+    cpu_slots: Box<[CpuSlot]>,
+    /// Where the recycling hand stands: the next slot it looks at.
+    hand: usize,
     /// Compile-request fifo + worker thread (§6.4/§9). Constructed alongside
     /// the pool; `start()`/`stop()` are separate calls so the executor
     /// controls the compile thread's lifetime independently (mirrors
@@ -2734,7 +2946,8 @@ pub struct PageAt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claim {
     Page(PageSlot),
-    /// No slot is free: flush and ask again.
+    /// Every slot is in use (a CPU is on it, or its compile is in flight):
+    /// run the page in the interpreter and ask again at the next fetch.
     Full,
 }
 
@@ -2847,13 +3060,18 @@ impl Jitv2 {
         for i in 0..capacity {
             pages[i].next = if i + 1 < capacity { (i + 1) as u32 } else { NO_SLOT };
         }
+        assert!(capacity <= MAX_POOL_SLOTS, "a JIT page pool holds at most {MAX_POOL_SLOTS} pages");
+        let mut compile_queue = CompileQueue::new();
+        compile_queue.set_pages(&pages);
         Self {
+            cpu_slots: (0..POOL_CPUS).map(|_| CpuSlot(AtomicU32::new(NO_SLOT))).collect(),
+            hand: 0,
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
             by_key: std::collections::HashMap::with_capacity(capacity),
             spaces: vec![Space { frames, split, map: PfnMap(Box::new([])) }],
             capacity,
-            compile_queue: CompileQueue::new(),
+            compile_queue,
             codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
             stats: Arc::new(JitStats::default()),
         }
@@ -2893,9 +3111,16 @@ impl Jitv2 {
         if space.map.0.is_empty() {
             space.map = PfnMap::new(space.entries());
         }
-        if let Some(slot) = space.map.get(entry) {
-            self.pages[slot as usize].set_addr(at.cpu, at.pfn, uncached);
-            return Claim::Page(slot);
+        // An entry made for a tenant the slot no longer has is as good as none.
+        if let Some(e) = space.map.get(entry) {
+            let slot = frame_entry_slot(e);
+            let page = &self.pages[slot as usize];
+            if frame_entry_current(e, page.tenancy()) {
+                self.cpu_slots[at.cpu].0.store(slot, Ordering::SeqCst);
+                page.set_addr(at.cpu, at.pfn, uncached);
+                page.touch();
+                return Claim::Page(slot);
+            }
         }
         let addr = at.pfn as u64 * PAGE_SIZE as u64;
         let code = bus.code_page(addr).unwrap_or_else(|| crate::traits::CodePage {
@@ -2906,11 +3131,16 @@ impl Jitv2 {
         let slot = match self.by_key.get(&code.key) {
             Some(&slot) => slot,
             None => {
-                if self.free_head == NO_SLOT {
-                    return Claim::Full;
-                }
-                let slot = self.free_head;
-                self.free_head = self.pages[slot as usize].next;
+                let slot = if self.free_head != NO_SLOT {
+                    let slot = self.free_head;
+                    self.free_head = self.pages[slot as usize].next;
+                    slot
+                } else {
+                    match self.recycle_slot() {
+                        Some(slot) => slot,
+                        None => return Claim::Full,
+                    }
+                };
                 self.pages[slot as usize].claim_code(code, fr1);
                 self.pages[slot as usize].next = NO_SLOT;
                 self.by_key.insert(code.key, slot);
@@ -2918,9 +3148,74 @@ impl Jitv2 {
             }
         };
         debug_assert_eq!(self.pages[slot as usize].key, code.key, "the key index and slot {slot} disagree");
-        self.pages[slot as usize].set_addr(at.cpu, at.pfn, uncached);
-        self.spaces[at.space].map.insert(entry, slot);
+        // Published under the pool's lock, which the recycler holds: no slot
+        // can be taken between this claim and the CPU using it.
+        self.cpu_slots[at.cpu].0.store(slot, Ordering::SeqCst);
+        let page = &self.pages[slot as usize];
+        page.set_addr(at.cpu, at.pfn, uncached);
+        page.touch();
+        let tenancy = page.tenancy();
+        self.spaces[at.space].map.insert(entry, frame_entry(slot, tenancy));
         Claim::Page(slot)
+    }
+
+    /// Take a slot back from memory nobody is running, for a claim that
+    /// found the free list empty. `None` if every slot is in use.
+    ///
+    /// A clock: the hand passes over a page entered since its last pass
+    /// (clearing the mark), a page some CPU is on, and a page whose compile
+    /// request is queued or running (the worker reads the page's key, bytes
+    /// and generation pointer through it; see
+    /// [`PhysicalCodePage::pin_for_compile`] for the worker's half). The first page left is emptied
+    /// and handed out.
+    ///
+    /// Order matters. The tenancy moves first, which stops every lock-free
+    /// lookup from matching the slot; only then are the CPUs' slot words
+    /// read. A CPU that had already matched has published the slot and is
+    /// seen; one that publishes later sees the new tenancy and comes to the
+    /// pool's lock, which the caller holds. A CPU can only schedule a compile
+    /// for a page it is on, so once none is on it the flag is final too.
+    fn recycle_slot(&mut self) -> Option<PageSlot> {
+        let n = self.pages.len();
+        // Two passes: the first may only clear marks.
+        for _ in 0..2 * n {
+            let slot = self.hand;
+            self.hand = (self.hand + 1) % n;
+            let page = &self.pages[slot];
+            if page.take_referenced() || page.is_scheduled() || self.cpu_on(slot as PageSlot) {
+                continue;
+            }
+            let tenancy = page.end_tenancy();
+            if self.cpu_on(slot as PageSlot) || self.pages[slot].page_scheduled.load(Ordering::SeqCst) {
+                // Lost the race to a CPU. The page stays, under its new
+                // tenancy: its frame table entries are made again on demand.
+                continue;
+            }
+            if tenancy & ((1 << (32 - SLOT_BITS)) - 1) == 0 {
+                // The tenancy bits of a frame table entry have wrapped: an
+                // entry made 65536 tenants ago would match again. None may
+                // survive that long.
+                for space in &mut self.spaces {
+                    space.map.clear();
+                }
+            }
+            let key = self.pages[slot].key;
+            self.by_key.remove(&key);
+            self.pages[slot].reset_to_unclaimed();
+            self.stats.pages_recycled.fetch_add(1, Ordering::Relaxed);
+            return Some(slot as PageSlot);
+        }
+        None
+    }
+
+    /// Whether some CPU has published `slot` as the one it is on.
+    fn cpu_on(&self, slot: PageSlot) -> bool {
+        self.cpu_slots.iter().any(|c| c.0.load(Ordering::SeqCst) == slot)
+    }
+
+    /// CPU `cpu`'s word in the pool's table of current slots: see [`CpuSlot`].
+    pub fn cpu_slot_ptr(&self, cpu: usize) -> *const AtomicU32 {
+        &self.cpu_slots[cpu].0
     }
 
     /// Memory moved under the addresses of `space`: forget which frame holds
@@ -3128,6 +3423,11 @@ impl Jitv2 {
         } else {
             self.free_head = NO_SLOT;
         }
+        // No CPU is on a page: each drops its own pointer when it resumes.
+        for c in self.cpu_slots.iter() {
+            c.0.store(NO_SLOT, Ordering::SeqCst);
+        }
+        self.hand = 0;
         crate::cpu::jit_feedback::JIT_FEEDBACK.set_arena_fill(0, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         crate::cpu::jit_feedback::JIT_FEEDBACK.record_flush();
     }
@@ -3137,26 +3437,37 @@ impl Jitv2 {
     pub unsafe fn flush_from_cpu_thread(&mut self, bus: Arc<dyn BusDevice>) {
         let stopped = self.compile_queue.stop();
         let was_threaded = !stopped.is_empty();
-        let mut function_count = 0;
         self.compile_queue.drain_pending_queue();
-        if was_threaded {
-            function_count = stopped.iter().map(|c| c.function_count()).sum();
-        } else if let Some(codegen) = self.codegen.get_mut().as_mut() {
-            function_count = codegen.function_count();
-            unsafe { codegen.reset(); }
-        }
+        // Inline mode compiles through the idle `Codegen`, which sits on one
+        // of the ring's arenas once the pool has ever run (`j2 inline on`
+        // takes the active one), or on an arena of its own otherwise.
+        let inline_on_ring = !was_threaded
+            && self.codegen.get_mut().as_ref().is_some_and(|c| self.compile_queue.owns_arena(&c.shared_arena().0));
+        let function_count = if was_threaded {
+            stopped.iter().map(|c| c.function_count()).sum()
+        } else {
+            self.codegen.get_mut().as_ref().map_or(0, |c| c.function_count())
+        };
         eprintln!(
             "jitv2: mega_flush (from cpu thread) — {} / {} pages used, {} functions compiled",
             self.pages_used(), self.capacity(), function_count,
         );
         self.mega_flush();
-        // The retired workers' arena goes now: every page that could reach
-        // its code was just cleared, and this runs on the CPU thread outside
-        // compiled code. Dropped instead, it stayed mapped for the life of
-        // the process -- `SharedArena`'s `Drop` keeps any arena holding sealed
-        // code -- up to 512 MB each time the page pool ran out.
-        for codegen in stopped {
-            unsafe { codegen.release(); }
+        // Every page that could reach compiled code was just cleared, the
+        // workers are joined, and this runs on the CPU thread outside
+        // compiled code with the other CPUs parked: every arena can go.
+        drop(stopped);
+        if was_threaded || inline_on_ring {
+            unsafe { self.compile_queue.reset_ring(); }
+        }
+        if inline_on_ring {
+            if let (Some(codegen), Some((arena, state))) = (self.codegen.get_mut().as_mut(), self.compile_queue.active_arena()) {
+                unsafe { codegen.reset_with_shared_arena(arena, state); }
+            }
+        } else if !was_threaded {
+            if let Some(codegen) = self.codegen.get_mut().as_mut() {
+                unsafe { codegen.reset(); }
+            }
         }
         if was_threaded {
             let stats = self.stats.clone();
@@ -3164,29 +3475,56 @@ impl Jitv2 {
         }
     }
 
-    /// No page is left to claim. A CPU that waited its turn to flush checks,
-    /// because the CPU ahead of it may have just done it.
-    pub fn pool_exhausted(&self) -> bool {
-        self.free_head == NO_SLOT
-    }
-
-    /// Mirror image of [`Self::flush_from_cpu_thread`], called FROM the
-    /// compile thread.
-    pub unsafe fn flush_from_jit_thread(&mut self, function_count: u32) {
-        eprintln!(
-            "jitv2: mega_flush (from jit thread) — {} / {} pages used, {} functions compiled",
-            self.pages_used(), self.capacity(), function_count,
-        );
-        self.mega_flush();
-    }
 }
 
-/// What a flush hands every worker to rebuild its `Codegen` on: the fresh
-/// shared arena and its state.
+/// One of the compile pool's code arenas, and its state.
 type PoolArena = (
     Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
     Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
 );
+
+/// How many code arenas the compile pool rotates through: the one being
+/// compiled into, the one before it, whose code still runs, and one empty.
+/// See `arena_ring`.
+pub const ARENA_COUNT: usize = 3;
+
+/// Build the memory helpers into `arena`, which must be empty and have no
+/// worker on it: they go at its lowest addresses and are sealed at once (see
+/// `Codegen::emit_mem_helpers`). Every `Codegen` built on the arena
+/// afterwards calls them.
+fn build_arena_helpers(
+    arena: &PoolArena,
+    dc_geometry: crate::cpu::mips_cache_v2::JitDcGeometry,
+    jit_consts: crate::cpu::jitv2::codegen::JitConsts,
+) {
+    let mut codegen = crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(arena.0.clone(), arena.1.clone());
+    codegen.dc_geometry = dc_geometry;
+    codegen.jit_consts = jit_consts;
+    codegen.emit_mem_helpers();
+}
+
+/// The page pool's slots, for the worker that retires an arena. The array is
+/// allocated once and never moves (`Jitv2::pages`), and the sweep touches
+/// only what a page guards with its own locks and atomics.
+#[derive(Clone, Copy)]
+struct PageSlots {
+    base: *const PhysicalCodePage,
+    len: usize,
+}
+
+// SAFETY: see the type; `PhysicalCodePage` is `Sync`.
+unsafe impl Send for PageSlots {}
+unsafe impl Sync for PageSlots {}
+
+impl PageSlots {
+    const NONE: PageSlots = PageSlots { base: std::ptr::null(), len: 0 };
+
+    /// Take the code of the arena of epoch `epoch` off every page. Returns
+    /// how many pages had some.
+    fn retire_code(&self, epoch: u64) -> usize {
+        (0..self.len).filter(|&i| unsafe { &*self.base.add(i) }.retire_code(epoch)).count()
+    }
+}
 
 /// The compile thread pool and its inbound MPMC queue (§6.4/§9 Phase 1:
 /// "mips exec thread pushes work via fifo, jit thread(s) compile").
@@ -3444,7 +3782,12 @@ pub struct CompileQueue {
     thread_reason: Option<String>,
     /// The pool's quiesce barrier and run flag, cloned into every worker:
     /// see `pool_barrier`.
-    barrier: Arc<PoolBarrier<PoolArena>>,
+    barrier: Arc<PoolBarrier<()>>,
+    /// The code arenas, reserved at the first start and kept for the queue's
+    /// life: see `arena_ring`.
+    ring: Option<Arc<ArenaRing<PoolArena>>>,
+    /// The page pool this queue compiles for, for an arena's retirement.
+    pages: PageSlots,
 }
 
 /// A queue dropped on its own (not inside a `Jitv2`) still must not leave
@@ -3452,6 +3795,13 @@ pub struct CompileQueue {
 impl Drop for CompileQueue {
     fn drop(&mut self) {
         self.stop();
+        // The arenas go with the queue: the CPUs that ran their code are
+        // gone by the time their JIT is dropped (`Jitv2::stop_for_drop`).
+        if let Some(ring) = self.ring.take() {
+            for arena in ring.arenas() {
+                unsafe { arena.0.lock().release_ring_owned(); }
+            }
+        }
     }
 }
 
@@ -3476,6 +3826,49 @@ impl CompileQueue {
             thread_count: 1,
             thread_reason: None,
             barrier: Arc::new(PoolBarrier::new()),
+            ring: None,
+            pages: PageSlots::NONE,
+        }
+    }
+
+    /// The page pool whose pages this queue's code is published to. An
+    /// arena's retirement sweeps it.
+    fn set_pages(&mut self, pages: &[PhysicalCodePage]) {
+        self.pages = PageSlots { base: pages.as_ptr(), len: pages.len() };
+    }
+
+    /// The arena the pool compiles into now. `None` before the first start.
+    pub fn active_arena(&self) -> Option<PoolArena> {
+        self.ring.as_ref().map(|ring| ring.active().0)
+    }
+
+    /// Whether `arena` is one of this queue's ring.
+    fn owns_arena(&self, arena: &Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>) -> bool {
+        self.ring.as_ref().is_some_and(|ring| ring.arenas().iter().any(|a| Arc::ptr_eq(&a.0, arena)))
+    }
+
+    /// Which arena is doing what, for `j2 status`. `None` before the first start.
+    pub fn ring_status(&self) -> Option<crate::cpu::jitv2::arena_ring::RingStatus> {
+        self.ring.as_ref().map(|ring| ring.status())
+    }
+
+    /// Bytes handed out of each arena, in ring order.
+    pub fn arena_fill(&self) -> Vec<u64> {
+        self.ring.as_ref().map_or(Vec::new(), |ring| ring.arenas().iter().map(|a| a.1.packing_stats().0).collect())
+    }
+
+    /// Empty every arena and start again on the first: for a flush of the
+    /// whole page pool.
+    ///
+    /// # Safety
+    /// No worker runs, no page holds code from the ring, and every CPU is
+    /// outside compiled code.
+    unsafe fn reset_ring(&mut self) {
+        let Some(ring) = &self.ring else { return };
+        ring.reset(|arena| unsafe { arena.0.lock().recycle() });
+        let (geometry, consts) = (*self.dc_geometry.lock(), *self.jit_consts.lock());
+        for arena in ring.arenas() {
+            build_arena_helpers(arena, geometry, consts);
         }
     }
 
@@ -3536,7 +3929,7 @@ impl CompileQueue {
     /// (contends real compiles for the duration of one queue-front peek,
     /// same as any other `try_seal_ready` call already does).
     pub fn seal_queue_snapshot(&self) -> Option<crate::cpu::jitv2::paged_memory::SealQueueSnapshot> {
-        let (arena, _) = self.barrier.arena()?;
+        let (arena, _) = self.active_arena()?;
         let snapshot = arena.lock().seal_queue_snapshot();
         Some(snapshot)
     }
@@ -3546,7 +3939,7 @@ impl CompileQueue {
     /// `SharedArena::seal_queue_entries`'s own doc comment; not bounded, the
     /// caller decides how much to print.
     pub fn seal_queue_entries(&self) -> Option<Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::cpu::jitv2::PhysicalCodePage)>> {
-        let (arena, _) = self.barrier.arena()?;
+        let (arena, _) = self.active_arena()?;
         let entries = arena.lock().seal_queue_entries();
         Some(entries)
     }
@@ -3693,26 +4086,7 @@ impl CompileQueue {
     }
 
     pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
-        let state = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
-        let shared = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
-            ARENA_RESERVE_SIZE, state.clone(),
-        ).expect("CompileQueue::start: failed to reserve a fresh jitv2 arena");
-        self.start_inner(bus, stats, shared, state);
-    }
-
-    /// Spawn the compile-thread pool with every worker's `Codegen` built on
-    /// top of an *already-reserved* shared arena instead of a fresh one —
-    /// the `j2 inline off` mode-switch path (reusing whatever arena inline
-    /// mode's own `Codegen` was already using, rather than abandoning it —
-    /// see that handler's own comment).
-    pub fn start_with_shared_arena(
-        &mut self,
-        bus: Arc<dyn BusDevice>,
-        stats: Arc<JitStats>,
-        shared: Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
-        state: Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
-    ) {
-        self.start_inner(bus, stats, shared, state);
+        self.start_inner(bus, stats);
     }
 
     /// No-op if already running. `bus` is the executor's `sysad` — every
@@ -3738,27 +4112,39 @@ impl CompileQueue {
         &mut self,
         bus: Arc<dyn BusDevice>,
         stats: Arc<JitStats>,
-        shared: Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
-        state: Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) {
         if !self.threads.is_empty() {
             return;
         }
+        // The arenas are reserved once, here, and outlive every stop: code
+        // published from them keeps running while the pool is stopped.
+        let thread_count = self.thread_count;
+        let ring = self.ring.get_or_insert_with(|| {
+            let arenas = (0..ARENA_COUNT).map(|_| {
+                let state = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+                let shared = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
+                    ARENA_RESERVE_SIZE, state.clone(),
+                ).expect("CompileQueue::start: failed to reserve a jitv2 arena");
+                shared.lock().set_ring_owned();
+                (shared, state)
+            }).collect();
+            Arc::new(ArenaRing::new(arenas, thread_count))
+        }).clone();
+        // Helpers go into an arena while it is empty and no worker is on it.
+        // An arena that already holds code keeps what it has.
+        let (geometry, consts) = (*self.dc_geometry.lock(), *self.jit_consts.lock());
+        for arena in ring.arenas() {
+            if arena.1.packing_stats().0 == 0 && arena.1.helpers().iter().all(|&h| h == 0) {
+                build_arena_helpers(arena, geometry, consts);
+            }
+        }
+        ring.workers_start();
+        let ((shared, state), at) = ring.active();
         self.buses.set_default(bus);
         // Captured before the spawn loop: each worker builds its own
         // `Analyzer` and needs the level by value, not through `&self`.
         let worker_mips4 = self.mips4;
-        // Publish the arena every worker is about to build its own `Codegen`
-        // on into the shared barrier state too — `j2 seal-queue`'s only way
-        // to reach a live `SharedArena` for a read-only snapshot, since no
-        // single worker's own (thread-owned, not externally reachable)
-        // `Codegen` is available to a monitor command. Without this, the
-        // mirror would stay `None` until the first real flush ever
-        // completes (only `run_leader_flush`/`flush_from_cpu_thread`
-        // otherwise write these two fields) — this is the one place besides
-        // those two that ever hands out a fresh arena, so it's the one
-        // place besides those two that must also record it here.
-        self.barrier.start((shared.clone(), state.clone()));
+        self.barrier.start(());
         self.function_counts = (0..self.thread_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
         for i in 0..self.thread_count {
             let mut codegen = crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared.clone(), state.clone());
@@ -3767,9 +4153,9 @@ impl CompileQueue {
             let queue = self.queue.clone();
             let hot = self.hot.clone();
             let bus = self.buses.clone();
-            let cpu = self.cpu.lock().clone();
             let world = self.world.lock().clone();
-            let jitv2 = self.jitv2.lock().clone();
+            let ring = ring.clone();
+            let pages = self.pages;
             let function_count = self.function_counts[i].clone();
             let stats = stats.clone();
             let barrier = self.barrier.clone();
@@ -3778,7 +4164,7 @@ impl CompileQueue {
             self.threads.push(
                 std::thread::Builder::new()
                     .name(format!("jitv2-compile-{i}"))
-                    .spawn(move || Self::worker_loop(queue, hot, bus, codegen, cpu, world, jitv2, function_count, stats, barrier, thread_count, worker_mips4, wake))
+                    .spawn(move || Self::worker_loop(queue, hot, bus, codegen, world, ring, pages, i, at, function_count, stats, barrier, thread_count, worker_mips4, wake))
                     .expect("jitv2-compile spawn"),
             );
         }
@@ -3908,12 +4294,16 @@ impl CompileQueue {
         hot: Arc<CompileLane>,
         bus: Arc<CodeBuses>,
         mut codegen: crate::cpu::jitv2::codegen::Codegen,
-        cpu: Option<Weak<dyn Device>>,
         world: Option<Arc<crate::cpu::smp::World>>,
-        jitv2: Option<Weak<Mutex<Jitv2>>>,
+        ring: Arc<ArenaRing<PoolArena>>,
+        pages: PageSlots,
+        // This worker's number in the pool, and the ring switch its
+        // `codegen` was built for.
+        worker: usize,
+        mut my_switch: u64,
         function_count: Arc<AtomicU32>,
         stats: Arc<JitStats>,
-        barrier: Arc<PoolBarrier<PoolArena>>,
+        barrier: Arc<PoolBarrier<()>>,
         thread_count: usize,
         // The CPU model’s ISA level, for this worker’s `Analyzer`.
         mips4: bool,
@@ -3925,25 +4315,8 @@ impl CompileQueue {
         // Publish this worker's thread handle so the producer can wake it
         // out of the idle park below.
         wake.register(std::thread::current());
-        // First worker to get here builds the shared helpers into the arena's
-        // lowest range. Startup only — the flush path rebuilds them from the
-        // leader while everyone else is parked (see `run_leader_flush`).
-        //
-        // Serialized on a process-wide latch rather than done per worker: a
-        // forced seal mprotects a whole host page to RX, which is only safe
-        // when nothing else can still be bump-allocating into it (see this
-        // function's own note on `handle_request`'s single-caller contract).
-        // Every other worker waits here until the winner is done, so nobody
-        // allocates into that page mid-seal.
-        {
-            static HELPERS_BUILT: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
-            let mut built = HELPERS_BUILT.lock();
-            if !*built {
-                codegen.emit_mem_helpers();
-                *built = true;
-            }
-        }
-
+        // The memory helpers are already in the arena: `start` and a reclaim
+        // build them while the arena is empty and no worker is on it.
 
         let mut analyzer = crate::cpu::jitv2::analyzer::Analyzer::with_isa(mips4);
         let mut pending: crate::cpu::jitv2::comp::PendingCount = 0;
@@ -3973,114 +4346,43 @@ impl CompileQueue {
             *pending = 0;
             barrier.release(None);
         };
-        // Runs the full leader sequence for an arena flush — see
-        // worker_loop's own doc comment for the step-by-step. Called only
-        // after this thread has already won leadership via
-        // `PoolBarrier::try_lead`.
-        let run_leader_flush = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
-                                 function_count: &Arc<AtomicU32>,
-                                 pending: &mut crate::cpu::jitv2::comp::PendingCount| {
-            let Some((cpu, jit)) = cpu.as_ref().and_then(Weak::upgrade).zip(jitv2.as_ref().and_then(Weak::upgrade)) else {
-                // `set_cpu`/`set_owner` were never called, or their target
-                // has since been dropped — this thread already won
-                // leadership (`try_lead`) and every other
-                // worker will either park here too or block waiting for
-                // this generation to end, so failing to release the barrier
-                // would deadlock the whole pool forever, not just skip one
-                // flush. A running pool with no cpu/jitv2 wired is a real
-                // bug (Machine::new always wires both before load can ever
-                // reach a flush threshold) — assert in debug/test builds so
-                // it's caught immediately, but still recover in release so
-                // production never wedges silently.
-                debug_assert!(false, "jitv2 compile pool flush triggered with no cpu/jitv2 wired (set_cpu/set_owner never called, or their target was dropped)");
-                abandon_quiesce(pending);
-                return;
-            };
-            {
-                // Wait for every OTHER worker to park before touching
-                // anything shared — with one worker there are none
-                // (`followers` is `thread_count - 1`, saturating), so this
-                // is immediately satisfied. Bails
-                // out cleanly (no flush performed) if the pool stops
-                // first — see `followers` above for the `CompileQueue::stop()`
-                // race this guards.
-                if !barrier.wait_for_followers(followers) {
-                    abandon_quiesce(pending);
-                    return;
-                }
-                // Discard, not flush: every PendingPublish::page and every
-                // not-yet-finalized FuncId this batch is holding is about to
-                // dangle (the page-pool clear below, plus every worker's
-                // Codegen getting rebuilt on a fresh arena) — see
-                // worker_loop's own doc comment for the full reasoning,
-                // same as drain_pending's existing treatment of in-flight
-                // CompileRequests below.
-                *pending = 0;
-                // cpu.stop() must run with Jitv2's lock NOT held — it locks
-                // the executor and, through it, this same Mutex<Jitv2>
-                // again (own page-pool stats print), which would
-                // self-deadlock this thread on its own non-reentrant lock
-                // if taken here first. Lock only for the actual flush
-                // (flush_from_jit_thread's own doc comment), release before
-                // cpu.start().
-                //
-                // With a world (every real CPU has one): park the CPUs
-                // instead, without blocking on a CPU that leads a flush of
-                // its own. That CPU joins this thread, so give way once the
-                // pool is stopping.
-                let world_hold = match &world {
-                    Some(w) => loop {
-                        if let Some(hold) = w.try_lead() {
-                            break Some(hold);
-                        }
-                        if !barrier.running() {
-                            abandon_quiesce(pending);
-                            return;
-                        }
-                        std::thread::sleep(BARRIER_FOLLOWER_POLL_INTERVAL);
-                    },
-                    None => {
-                        cpu.stop();
-                        None
+        // Take an arena away: refuse its publishes, sweep its code off every
+        // page, then ask every CPU to pass a batch boundary. In that order: a
+        // CPU that answers before the sweep is done could still load a
+        // function from the arena afterwards. The arena is emptied later, by
+        // whichever worker finds the CPUs have all answered (`try_reclaim`
+        // at the top of the loop).
+        let retire = |arena: &PoolArena| {
+            crate::pf_scope!(crate::perfetto::events::JIT_CPU_FLUSH);
+            arena.1.retire();
+            let pages_swept = pages.retire_code(arena.1.epoch());
+            if let Some(w) = &world {
+                w.retire_code();
+            }
+            ring.kicked();
+            crate::cpu::jit_feedback::JIT_FEEDBACK.record_flush();
+            stats.arena_retires.fetch_add(1, Ordering::Relaxed);
+            stats.arena_retired_pages.fetch_add(pages_swept as u64, Ordering::Relaxed);
+        };
+        // The active arena is full: move the pool to a spare one. `true` if
+        // there is none yet, and this worker must wait for a reclaim.
+        let rotate = |my_switch: u64| -> bool {
+            match ring.switch(my_switch) {
+                Switch::Switched { retire: old } => {
+                    // The others may be parked on their idle backstop, and a
+                    // reclaim waits for each of them to follow.
+                    wake.notify_all();
+                    if let Some(arena) = old {
+                        retire(&arena);
                     }
-                };
-                // Every request still sitting in the shared queue right now
-                // points into the pool flush_from_jit_thread is about to
-                // clear — drain them before the flush, not after, or the
-                // next pop() dereferences a dangling PhysicalCodePage
-                // pointer (see drain_pending's own doc comment for the
-                // crash this was confirmed to cause). Safe to drain once
-                // here even though the queue is shared with every other
-                // (already-parked, not popping) worker.
-                Self::drain_pending(&queue, &hot);
-                unsafe { jit.lock().flush_from_jit_thread(codegen.function_count()); }
-                // Build ONE fresh shared arena and rebuild this (leader's
-                // own) Codegen on top of it — every other, parked worker
-                // rebuilds its own once it wakes (`PoolBarrier::park`'s return
-                // value), from the same arena published below.
-                let fresh_state = std::sync::Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
-                let fresh_arena = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
-                    ARENA_RESERVE_SIZE, fresh_state.clone(),
-                ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
-                unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
-                // Build the shared memory helpers here and nowhere else.
-                // Every other worker is parked at the barrier and the fresh
-                // arena has had nothing else allocated into it, so this is
-                // the one moment a forced seal — which mprotects a whole
-                // host page to RX — cannot race another worker still
-                // bump-allocating into that page. Helpers land in the
-                // arena's lowest range; every region compiled afterwards
-                // sits above them and seals normally.
-                codegen.emit_mem_helpers();
-                barrier.release(Some((fresh_arena, fresh_state)));
-                if world_hold.is_none() {
-                    cpu.start();
+                    false
                 }
-                drop(world_hold);
-                // flush_from_jit_thread reset codegen back to 0.
-                function_count.store(0, Ordering::Relaxed);
+                Switch::Behind => false,
+                Switch::NoSpare => true,
             }
         };
+        // The active arena is full and no arena is empty yet.
+        let mut stalled = false;
         // Runs the full leader sequence for a forced-seal-only quiesce — no
         // arena replacement, no CPU stop, just "wait for everyone else to
         // park (guaranteeing none of them is mid-compile — no lower-`start`
@@ -4102,34 +4404,9 @@ impl CompileQueue {
             crate::cpu::jitv2::comp::force_publish_pending(codegen, pending);
             barrier.release(None);
         };
-        // Leader election: the first worker whose own compile triggers
-        // EITHER a flush condition or a forced-seal condition wins this one
-        // shared compare_exchange and runs the corresponding sequence;
-        // every other worker that also observes a trigger (its own, or via
-        // this same check at the top of its next loop iteration) instead
-        // drains/discards its own state and parks at the one shared
-        // barrier, regardless of which kind of leader it's waiting on — see
-        // `pool_barrier` for why one gate covers both. With one worker this
-        // always wins trivially; contention is exercised in `pool_barrier`'s
-        // tests.
-        let try_flush = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
-                          function_count: &Arc<AtomicU32>,
-                          pending: &mut crate::cpu::jitv2::comp::PendingCount| {
-            if barrier.try_lead() {
-                // The followers may be parked on their idle backstop: wake
-                // them, so they reach the barrier now instead of making
-                // this leader wait out the backstop.
-                wake.notify_all();
-                run_leader_flush(codegen, function_count, pending);
-            } else {
-                *pending = 0;
-                if let Some((arena, state)) = barrier.park() {
-                    unsafe { codegen.reset_with_shared_arena(arena, state); }
-                } else {
-                }
-                function_count.store(codegen.function_count(), Ordering::Relaxed);
-            }
-        };
+        // Leader election for a forced seal: the first worker whose compile
+        // needs one wins `try_lead` and runs it; every other worker that
+        // sees the cycle parks at the barrier until it is over.
         let try_force_seal = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
                                pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             if barrier.try_lead() {
@@ -4139,11 +4416,7 @@ impl CompileQueue {
                 run_leader_seal(codegen, pending);
             } else {
                 *pending = 0;
-                if let Some((arena, state)) = barrier.park() {
-                    unsafe { codegen.reset_with_shared_arena(arena, state); }
-                    function_count.store(codegen.function_count(), Ordering::Relaxed);
-                } else {
-                }
+                barrier.park();
             }
         };
         while barrier.running() {
@@ -4159,16 +4432,53 @@ impl CompileQueue {
             // before the leader function returns), so it is a no-op there.
             if barrier.in_progress() {
                 pending = 0;
-                if let Some((arena, state)) = barrier.park() {
-                    unsafe { codegen.reset_with_shared_arena(arena, state); }
-                    function_count.store(codegen.function_count(), Ordering::Relaxed);
-                } else {
-                }
+                barrier.park();
                 continue;
+            }
+            // An arena is on its way out: empty it once every CPU has left
+            // its code and every worker has left it.
+            if ring.retire_pending() {
+                let (geometry, consts) = (codegen.dc_geometry, codegen.jit_consts);
+                ring.try_reclaim(
+                    || world.as_ref().is_none_or(|w| w.code_retired()),
+                    |arena| {
+                        // SAFETY: the sweep took this arena's code off every
+                        // page before the CPUs were asked; each has since
+                        // passed a batch boundary, and no worker is on it.
+                        unsafe { arena.0.lock().recycle(); }
+                        build_arena_helpers(arena, geometry, consts);
+                    },
+                );
+            }
+            // The pool switched arenas: follow. What this worker still has
+            // unsealed in the arena it leaves is dropped, and those pages ask
+            // again; what is ready publishes, since that arena's code still
+            // runs.
+            if ring.switches() != my_switch {
+                crate::cpu::jitv2::comp::publish_ready_nonforced(&mut codegen, &mut pending);
+                pending = 0;
+                let ((arena, state), at) = ring.active();
+                // SAFETY: the arena this `Codegen` leaves belongs to the
+                // ring, which keeps it mapped until its code is retired.
+                unsafe { codegen.reset_with_shared_arena(arena, state); }
+                my_switch = at;
+                ring.reached(worker, at);
+                function_count.store(codegen.function_count(), Ordering::Relaxed);
+                stalled = false;
             }
             #[cfg(all(test, not(loom)))]
             if barrier.take_forced_flush() {
-                try_flush(&mut codegen, &function_count, &mut pending);
+                stalled = rotate(my_switch);
+                continue;
+            }
+            if stalled {
+                // Nothing compiles until an arena is empty. Requests stay
+                // queued or are dropped as on a full queue; the CPUs run what
+                // is published and interpret the rest.
+                stalled = rotate(my_switch);
+                if stalled {
+                    std::thread::park_timeout(ARENA_STALL_POLL);
+                }
                 continue;
             }
             // The hot lane first: pages being executed right now that are
@@ -4226,7 +4536,7 @@ impl CompileQueue {
                         // (handle_request already returned), so it'll only
                         // be retried on this offset's next real arrival —
                         // same as any other "retry later" outcome.
-                        try_flush(&mut codegen, &function_count, &mut pending);
+                        stalled = rotate(my_switch);
                     } else if reserved_bytes > arena_flush_threshold() {
                         // Real bytes reserved in the arena (not a
                         // function-count proxy — see
@@ -4236,7 +4546,7 @@ impl CompileQueue {
                         // unboundedly (nothing else ever frees it — see
                         // Codegen::reset's doc comment) and needs flushing
                         // pre-emptively, before it actually runs out.
-                        try_flush(&mut codegen, &function_count, &mut pending);
+                        stalled = rotate(my_switch);
                     } else if pending >= PENDING_FORCE_SEAL_THRESHOLD {
                         // A continuously busy worker (queue never goes
                         // empty for it) never reaches the `None` arm's
@@ -4349,6 +4659,51 @@ mod tests {
 
     /// A claimed, otherwise-untouched page slot for the FR-pin tests below.
     /// `claim` debug-asserts the slot is clean, so it must start unclaimed.
+    /// `retire_code` takes exactly the named arena's code, with the entry
+    /// requests and the churn snapshot that went with it, and a publish from
+    /// a retired arena is refused.
+    #[test]
+    fn retiring_an_arena_takes_its_code_off_the_page_and_refuses_its_publishes() {
+        use crate::cpu::jitv2::paged_memory::{PagedArenaMemoryProvider, PagedArenaState};
+        let arena = |size| {
+            let state = Arc::new(PagedArenaState::default());
+            let _keep = PagedArenaMemoryProvider::new_shared(size, state.clone()).unwrap();
+            state
+        };
+        let (a, b) = (arena(1 << 16), arena(1 << 16));
+        assert_ne!(a.epoch(), b.epoch());
+        let page = claimed_page(false);
+        let gen = page.current_gen();
+        let mut bits = [0u64; BITMAP_WORDS];
+        bits[0] = 0b101;
+        let words = [0u32; ENTRIES_PER_PAGE];
+        page.mark_requested(0);
+        page.mark_requested(7);
+        page.stage_compile_snapshot(&words, &bits, &bits, gen, false);
+        assert!(page.publish_from(&a, page.tenancy(), &bits, 0x1000 as *const (), gen, 3, 64, false));
+        page.commit_compile_snapshot(gen, &bits, false);
+        assert!(page.has_compile_snapshot() && page.is_runnable(2));
+        assert_eq!(page.code_epoch(), a.epoch());
+
+        assert!(!page.retire_code(b.epoch()), "another arena's retirement leaves the page alone");
+        assert!(page.is_runnable(2));
+
+        assert!(page.retire_code(a.epoch()));
+        assert!(!page.is_runnable(0) && !page.is_runnable(2) && !page.has_code());
+        assert_eq!(page.func(), NO_CODE as *const (), "never null: a CPU may be about to call it");
+        assert!(!page.is_requested(7), "entry requests go with the code");
+        assert!(!page.has_compile_snapshot(), "nothing may re-validate the function that went");
+        assert!(!page.retire_code(a.epoch()), "nothing left to take");
+
+        // A compile that was in flight comes back to publish.
+        a.retire();
+        assert!(!page.publish_from(&a, page.tenancy(), &bits, 0x1000 as *const (), gen, 3, 64, false));
+        assert!(!page.has_code());
+        // The same code from an arena that is still in use lands.
+        assert!(page.publish_from(&b, page.tenancy(), &bits, 0x2000 as *const (), gen, 3, 64, false));
+        assert_eq!(page.code_epoch(), b.epoch());
+    }
+
     fn claimed_page(fr1: bool) -> Box<PhysicalCodePage> {
         let mut page = Box::new(PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null()));
         page.claim(CodeKey::flat(0x1234 << 12), std::ptr::null(), fr1);
@@ -5560,6 +5915,157 @@ mod tests {
         fn code_page(&self, addr: u64) -> Option<crate::traits::CodePage> { Some(crate::traits::CodeKey::flat_page(addr, self.gen_ptr(addr))) }
     }
 
+    fn at(cpu: usize, pfn: Pfn) -> PageAt {
+        PageAt { cpu, space: 0, pfn, uncached: false }
+    }
+
+    /// What the executor's lock-free lookup does with a frame table entry:
+    /// the page it names, if the entry is for the slot's present tenant.
+    fn fast_lookup(jit: &mut Jitv2, pfn: Pfn) -> Option<PageSlot> {
+        let (map, pages) = jit.fast_lookup_ptrs(0);
+        let entry = unsafe { (*map.add(page_key(pfn, false, false) as usize)).load(Ordering::Acquire) };
+        if entry == PFN_MAP_EMPTY {
+            return None;
+        }
+        let slot = frame_entry_slot(entry);
+        frame_entry_current(entry, unsafe { &*pages.add(slot as usize) }.tenancy()).then_some(slot)
+    }
+
+    /// A full pool gives a new page the slot of one nobody is using, and the
+    /// frame that led to the old tenant no longer leads to the slot.
+    #[test]
+    fn a_full_pool_recycles_a_slot_nobody_is_on() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(3);
+        let slots: Vec<PageSlot> = (0..3).map(|pfn| jit.page_at(at(0, pfn), &dev, false).unwrap()).collect();
+        assert_eq!(jit.pages_used(), 3);
+        // The CPU is on the last page it claimed. Every page is marked as
+        // entered, so the hand's first pass only clears marks.
+        let fourth = jit.page_at(at(0, 3), &dev, false).expect("a slot nobody is on is recycled");
+        assert_eq!(fourth, slots[0], "the hand takes the first slot that is not in use");
+        assert_eq!(jit.pages[fourth as usize].key, CodeKey::flat(3 << 12));
+        assert_eq!(jit.pages_used(), 3);
+        assert_eq!(jit.stats.pages_recycled.load(Ordering::Relaxed), 1);
+        assert_eq!(fast_lookup(&mut jit, 3), Some(fourth));
+        assert_eq!(fast_lookup(&mut jit, 0), None, "the old tenant's frame must not reach the new tenant");
+        assert_eq!(fast_lookup(&mut jit, 1), Some(slots[1]), "the pages that stayed are still found without the lock");
+        // The evicted memory comes back as a page of its own.
+        let again = jit.page_at(at(0, 0), &dev, false).unwrap();
+        assert_eq!(jit.pages[again as usize].key, CodeKey::flat(0));
+        assert_ne!(again, fourth, "the CPU was on that slot when it asked");
+    }
+
+    /// The page a CPU is on, and a page whose compile is in flight, are
+    /// never taken: the CPU holds a pointer to the one, a worker to the other.
+    #[test]
+    fn a_slot_in_use_is_not_recycled() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(3);
+        let on = jit.page_at(at(1, 0), &dev, false).unwrap();
+        let queued = jit.page_at(at(0, 1), &dev, false).unwrap();
+        let idle = jit.page_at(at(0, 2), &dev, false).unwrap();
+        assert!(jit.pages[queued as usize].try_schedule_page());
+        // CPU 0 moves on, twice; CPU 1 stays where it is.
+        let next = jit.page_at(at(0, 3), &dev, false);
+        assert_eq!(next, None, "CPU 0 is on the only slot nothing else holds");
+        // Once CPU 0 is off its page that slot can go.
+        jit.cpu_slots[0].0.store(NO_SLOT, Ordering::SeqCst);
+        let next = jit.page_at(at(0, 3), &dev, false).unwrap();
+        assert_eq!(next, idle);
+        assert_eq!(jit.pages[on as usize].key, CodeKey::flat(0), "CPU 1's page was left alone");
+        assert_eq!(jit.pages[queued as usize].key, CodeKey::flat(1 << 12), "the queued page was left alone");
+        // The compile ends and CPU 1 leaves: both slots can go.
+        jit.pages[queued as usize].clear_scheduled();
+        jit.cpu_slots[1].0.store(NO_SLOT, Ordering::SeqCst);
+        assert!(jit.page_at(at(0, 4), &dev, false).is_some());
+        assert!(jit.page_at(at(0, 5), &dev, false).is_some());
+    }
+
+    /// A page entered since the hand last passed is spared once.
+    #[test]
+    fn the_hand_spares_a_page_entered_since_its_last_pass() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(3);
+        let slots: Vec<PageSlot> = (0..3).map(|pfn| jit.page_at(at(0, pfn), &dev, false).unwrap()).collect();
+        // First recycle clears every mark and takes slot 0.
+        assert_eq!(jit.page_at(at(0, 3), &dev, false), Some(slots[0]));
+        // Page 1 is entered again (by another CPU, which then leaves).
+        assert_eq!(jit.page_at(at(1, 1), &dev, false), Some(slots[1]));
+        jit.cpu_slots[1].0.store(NO_SLOT, Ordering::SeqCst);
+        // The hand stands at slot 1: it is marked, so slot 2 goes instead.
+        assert_eq!(jit.page_at(at(0, 4), &dev, false), Some(slots[2]));
+        assert_eq!(jit.pages[slots[1] as usize].key, CodeKey::flat(1 << 12));
+    }
+
+    /// Code compiled for a slot's old tenant must not be installed on the new
+    /// one: its publish waited in the seal queue while the slot was recycled.
+    #[test]
+    fn a_publish_for_a_recycled_slot_is_refused() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(2);
+        let slot = jit.page_at(at(0, 0), &dev, false).unwrap();
+        let tenancy = jit.pages[slot as usize].tenancy();
+        jit.page_at(at(0, 1), &dev, false).unwrap();
+        // Page 0's slot goes to page 2.
+        assert_eq!(jit.page_at(at(0, 2), &dev, false), Some(slot));
+        let page = &jit.pages[slot as usize];
+        assert_ne!(page.tenancy(), tenancy);
+        let mut bits = [0u64; BITMAP_WORDS];
+        bits[0] = 1;
+        let arena = crate::cpu::jitv2::paged_memory::PagedArenaState::UNTRACKED;
+        assert!(!page.publish_from(&arena, tenancy, &bits, 0x1000 as *const (), page.current_gen(), 1, 16, false));
+        assert!(!page.has_code());
+        assert!(page.publish_from(&arena, page.tenancy(), &bits, 0x1000 as *const (), page.current_gen(), 1, 16, false));
+    }
+
+    /// A request can outlive its page (the hot lane's copy). The worker must
+    /// not read a slot that has gone to other memory, and must hold a slot it
+    /// does read.
+    #[test]
+    fn a_worker_pins_the_page_it_compiles_and_drops_a_request_for_a_recycled_slot() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(2);
+        let slot = jit.page_at(at(0, 0), &dev, false).unwrap();
+        let asked = jit.pages[slot as usize].tenancy();
+        // A worker takes the request: the slot is held although no CPU
+        // scheduled it (the hot lane's copy, after the first compile ended).
+        assert!(jit.pages[slot as usize].pin_for_compile(asked));
+        let other = jit.page_at(at(0, 1), &dev, false).unwrap();
+        assert_eq!(jit.page_at(at(0, 2), &dev, false), None, "the only other slot is being compiled");
+        jit.pages[slot as usize].clear_scheduled();
+        // Now it can go, and a request made for the old tenant is stale.
+        jit.cpu_slots[0].0.store(other, Ordering::SeqCst);
+        assert_eq!(jit.page_at(at(0, 2), &dev, false), Some(slot));
+        assert!(!jit.pages[slot as usize].pin_for_compile(asked));
+        assert!(!jit.pages[slot as usize].is_scheduled(), "a stale request leaves no flag behind");
+        // A flag the new tenant set itself survives a stale request.
+        assert!(jit.pages[slot as usize].try_schedule_page());
+        assert!(!jit.pages[slot as usize].pin_for_compile(asked));
+        assert!(jit.pages[slot as usize].is_scheduled());
+    }
+
+    /// A recycled slot starts clean: no code, no entry requests, no denials
+    /// from its last tenant.
+    #[test]
+    fn a_recycled_slot_starts_clean() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(2);
+        let slot = jit.page_at(at(0, 0), &dev, false).unwrap();
+        {
+            let page = &jit.pages[slot as usize];
+            let mut bits = [0u64; BITMAP_WORDS];
+            bits[0] = 1;
+            assert!(page.publish(&bits, 0x1000 as *const (), page.current_gen(), 1, 16, false));
+            page.mark_requested(5);
+            page.denylist(9);
+        }
+        jit.page_at(at(0, 1), &dev, false).unwrap();
+        assert_eq!(jit.page_at(at(0, 2), &dev, false), Some(slot));
+        let page = &jit.pages[slot as usize];
+        assert!(!page.has_code() && !page.is_runnable(0) && !page.is_requested(5) && !page.is_denylisted(9));
+        assert_eq!(page.func(), NO_CODE as *const ());
+    }
+
     #[test]
     fn pfn_of_stops_at_the_pfn_map() {
         let octane = frames_for(&crate::ip30::memory_map(&[2048, 2048, 2048, 2048]));
@@ -5600,7 +6106,9 @@ mod tests {
             jit.page_for(i, (i * PAGE_SIZE) as u64, &dev, false).unwrap();
         }
         assert_eq!(jit.pages_used(), 4);
-        assert!(jit.page_for(4, (4 * PAGE_SIZE) as u64, &dev, false).is_none());
+        // A full pool recycles a slot rather than refuse.
+        assert!(jit.page_for(4, (4 * PAGE_SIZE) as u64, &dev, false).is_some());
+        assert_eq!(jit.pages_used(), 4);
 
         jit.mega_flush();
         assert_eq!(jit.pages_used(), 0);
@@ -5772,7 +6280,7 @@ mod tests {
         let stats = JitStats::default();
         for i in 0..8u16 {
             let _ = i;
-            assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+            assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
         }
         // stop() joins the worker; must return promptly even with requests in flight.
         q.stop();
@@ -5886,16 +6394,15 @@ mod tests {
         fn get_clock(&self) -> u64 { 0 }
     }
 
-    /// A worker leads an arena flush and stops the CPU; the CPU, before it
-    /// stops, flushes the pool itself and joins that worker (issue #306).
-    /// Stopping the CPU by halting it waits for the CPU thread while the CPU
-    /// thread waits for the worker. Through the CPU's world the worker parks
-    /// it instead, and the CPU waiting its turn to flush counts as parked, so
-    /// both flushes finish, one after the other. Run on a spawned thread so a
-    /// regression fails here instead of hanging the test binary.
+    /// A worker retires an arena and asks the CPU to pass a batch boundary;
+    /// the CPU, at that boundary, flushes the pool itself and joins that
+    /// worker (the shape of issue #306, where the worker stopped the CPU
+    /// instead of asking). The worker never waits for the CPU, so the join
+    /// returns, and the flush leaves the ring whole. Run on a spawned thread
+    /// so a regression fails here instead of hanging the test binary.
     #[cfg(not(loom))]
     #[test]
-    fn a_cpu_flush_inside_a_worker_led_flush_takes_its_turn() {
+    fn a_cpu_flush_answering_a_retire_request_joins_the_worker_that_asked() {
         let epoch = crate::cpu::jitv2::hashstats::FLUSH_EPOCH.load(Ordering::SeqCst);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -5913,21 +6420,100 @@ mod tests {
                 g.compile_queue.set_world(world);
                 let stats = g.stats.clone();
                 g.compile_queue.start(dev, stats);
-                g.compile_queue.barrier.force_flush();
+            }
+            // The switch that uses the last spare arena retires the oldest.
+            for switch in 1..ARENA_COUNT as u64 {
+                jit.lock().compile_queue.barrier.force_flush();
+                while cpu.flushes.load(Ordering::SeqCst) == 0
+                    && jit.lock().compile_queue.ring_status().unwrap().switches < switch
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             while cpu.flushes.load(Ordering::SeqCst) == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             cpu_device.stop();
+            let status = jit.lock().compile_queue.ring_status().unwrap();
             let restarted = !Jitv2::stop_pool(&jit).is_empty();
-            let _ = done_tx.send(restarted);
+            let _ = done_tx.send((restarted, status));
             drop(word);
         });
-        let restarted = done_rx.recv_timeout(std::time::Duration::from_secs(20))
-            .expect("the CPU's flush and the worker's flush are waiting for each other");
+        let (restarted, status) = done_rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the CPU's flush and the worker that retired an arena are waiting for each other");
         assert!(restarted, "the CPU's flush did not restart the pool");
         let flushes = crate::cpu::jitv2::hashstats::FLUSH_EPOCH.load(Ordering::SeqCst) - epoch;
-        assert!(flushes >= 2, "expected the worker's and the CPU's flush, saw {flushes}");
+        assert!(flushes >= 1, "the CPU did not flush");
+        assert_eq!((status.active, status.live.len(), status.spare.len(), status.retiring), (0, 0, ARENA_COUNT - 1, None),
+            "a flush of the pool leaves every arena empty");
+    }
+
+    /// A pool with no CPU to ask: a forced rotation.
+    #[cfg(not(loom))]
+    fn rotate_and_wait(jit: &Mutex<Jitv2>, switches: u64) {
+        jit.lock().compile_queue.barrier.force_flush();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while jit.lock().compile_queue.ring_status().unwrap().switches < switches {
+            assert!(std::time::Instant::now() < deadline, "the pool did not switch arenas");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The ring goes round with nothing stopped: the switch that uses the
+    /// last spare retires the oldest arena, whose code leaves its page; the
+    /// arena before the active one keeps its code; and the retired arena
+    /// comes back empty, under a new epoch.
+    #[cfg(not(loom))]
+    #[test]
+    fn the_pool_retires_its_oldest_arena_and_keeps_the_one_before() {
+        let dev: Arc<dyn BusDevice> = Arc::new(FakeDevice(AtomicU64::new(0)));
+        // Two pages with code, one in the first arena and one in the second.
+        // They stand in for the pool's slots, which the sweep walks, and
+        // outlive the pool (declared first, dropped last).
+        let counter = AtomicU64::new(0);
+        let pages: Box<[PhysicalCodePage]> = Box::new([PhysicalCodePage::new(1, &counter), PhysicalCodePage::new(2, &counter)]);
+        let (old, kept) = (&pages[0], &pages[1]);
+        let jit = Mutex::new(Jitv2::new(4));
+        {
+            let mut g = jit.lock();
+            let stats = g.stats.clone();
+            g.compile_queue.set_thread_count(2);
+            g.compile_queue.set_pages(&pages);
+            g.compile_queue.start(dev, stats);
+        }
+        let arenas: Vec<PoolArena> = jit.lock().compile_queue.ring.as_ref().unwrap().arenas().to_vec();
+        let epochs: Vec<u64> = arenas.iter().map(|a| a.1.epoch()).collect();
+        let mut bits = [0u64; BITMAP_WORDS];
+        bits[0] = 1;
+        let func = 0x1000 as *const ();
+        assert!(old.publish_from(&arenas[0].1, old.tenancy(), &bits, func, 0, 1, 16, false));
+        assert!(kept.publish_from(&arenas[1].1, kept.tenancy(), &bits, func, 0, 1, 16, false));
+        assert_eq!((old.code_epoch(), kept.code_epoch()), (epochs[0], epochs[1]));
+
+        rotate_and_wait(&jit, 1);
+        let status = jit.lock().compile_queue.ring_status().unwrap();
+        assert_eq!((status.active, status.live.clone(), status.retiring), (1, vec![0], None), "the first switch retires nothing");
+        assert!(!arenas[0].1.is_retired());
+        assert!(old.is_runnable(0) && kept.is_runnable(0), "a switch takes no code away");
+
+        rotate_and_wait(&jit, 2);
+        // With no CPU to wait for, the reclaim follows as soon as both
+        // workers have moved.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while jit.lock().compile_queue.ring_status().unwrap().retiring.is_some() {
+            assert!(std::time::Instant::now() < deadline, "the retired arena was never reclaimed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = jit.lock().compile_queue.ring_status().unwrap();
+        assert_eq!((status.active, status.live, status.spare), (2, vec![1], vec![0]));
+        assert_ne!(arenas[0].1.epoch(), epochs[0], "the reclaimed arena is a new epoch");
+        assert_eq!(arenas[1].1.epoch(), epochs[1], "the arena before the active one was not touched");
+        assert_eq!(jit.lock().stats.arena_retires.load(Ordering::Relaxed), 1);
+        assert_eq!(jit.lock().stats.arena_retired_pages.load(Ordering::Relaxed), 1);
+        assert!(!old.is_runnable(0) && !old.has_code(), "the retired arena's code is off its page");
+        assert_eq!(old.code_epoch(), 0);
+        assert!(kept.is_runnable(0) && kept.has_code());
+        jit.lock().compile_queue.stop();
     }
 
     /// Minimal `Device` (not `BusDevice`) stand-in for `CompileQueue::set_cpu` —
@@ -6034,7 +6620,7 @@ mod tests {
         // dequeue time.
         page.mark_requested(0);
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
 
         // 30s, not the original 5s: this test passes in ~0.1s in isolation,
         // but the compile-worker thread genuinely needs real CPU time to get
@@ -6089,7 +6675,7 @@ mod tests {
         for page in pages.iter_mut() {
             // §13.2: same as the queue-drain-fallback test above.
             page.mark_requested(0);
-            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
         }
 
         // Poll for the *first* page specifically, well before the full
@@ -6167,7 +6753,7 @@ mod tests {
             // offset must be marked BEFORE sending, or handle_request_deferred
             // finds zero candidates and silently no-ops.
             page.mark_requested(0);
-            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+            assert!(q.send(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
         }
 
         // catch_unwind for the same reason as the other threaded tests in
@@ -6198,7 +6784,7 @@ mod tests {
         let mut q = CompileQueue::new();
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
         q.start(dev, std::sync::Arc::new(JitStats::default()));
         q.stop();
     }
@@ -6213,7 +6799,7 @@ mod tests {
         let stats = JitStats::default();
         let mut accepted = 0;
         for i in 0..(COMPILE_QUEUE_CAPACITY + 10) {
-            if q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats) {
+            if q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats) {
                 accepted += 1;
             }
         }
@@ -6234,7 +6820,7 @@ mod tests {
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         assert!(page.try_schedule_page());
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+        assert!(q.send(CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
         assert!(page.is_scheduled(), "sanity: the send above left the page marked in-flight");
 
         q.drain_pending_queue();
@@ -6251,7 +6837,7 @@ mod tests {
         assert!(page.try_schedule_page());
         let mut ours = CompileQueue::new();
         let mut theirs = CompileQueue::new();
-        push_hot_request(&ours.hot_handle(), CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 });
+        push_hot_request(&ours.hot_handle(), CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 });
         theirs.drain_pending_queue();
         assert!(page.is_scheduled(), "another pool's flush discarded this pool's hot request");
         assert_eq!(theirs.hot_handle().len(), 0);
@@ -6325,14 +6911,14 @@ mod tests {
         }
         assert_eq!(wake.sleepers.load(Ordering::SeqCst), 1, "the worker never parked");
         let stats = JitStats::default();
-        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false, cpu: 0 };
+        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false, cpu: 0, tenancy: 0 };
         assert!(push_compile_request(&queue, req, &stats));
         let waited = worker.join().expect("the worker thread panicked");
         assert!(waited < std::time::Duration::from_secs(30), "the sleeper waited out its backstop: {waited:?}");
         assert_eq!(wake.sleepers.load(Ordering::SeqCst), 0);
         // A dropped push (the lane holds one request already) must not wake
         // anyone, and must not fail for want of a sleeper.
-        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false, cpu: 0 };
+        let req = CompileRequest { page: std::ptr::null_mut(), compiled_for_fr1: false, cpu: 0, tenancy: 0 };
         assert!(!push_compile_request(&queue, req, &stats));
     }
 
@@ -6350,7 +6936,7 @@ mod tests {
         let mut page = Box::new(PhysicalCodePage::new(0, std::ptr::null()));
         assert!(page.try_schedule_page());
         let stats = JitStats::default();
-        assert!(q.send(CompileRequest { page: &mut *page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0 }, &stats));
+        assert!(q.send(CompileRequest { page: &mut *page as *mut PhysicalCodePage, compiled_for_fr1: true, cpu: 0, tenancy: 0 }, &stats));
         // The worker pops the request and drops it (the page has no code to
         // compile), which clears the in-flight flag. Waiting for that proves
         // the request was taken, not left in the queue.

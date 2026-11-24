@@ -77,9 +77,71 @@ pub struct PagedArenaState {
     /// `AnonHugePages` query to exactly this arena's address range.
     arena_ptr: AtomicU64,
     arena_len: AtomicU64,
+    /// Which arena, and which filling of it, this is: unique in the process,
+    /// and new each time the arena is recycled. A page records the epoch of
+    /// the arena its code lives in (`PhysicalCodePage::code_epoch`), which is
+    /// how a retiring arena's code is found. 0 for [`Self::UNTRACKED`] only.
+    epoch: AtomicU64,
+    /// The arena is being taken away: nothing more may be published from it.
+    /// Set before the sweep that takes its code off the pages, and read by
+    /// `PhysicalCodePage::publish` under the page's publish lock, so a publish
+    /// either lands before the sweep reaches its page or is refused.
+    retired: AtomicBool,
+    /// Addresses of the memory helpers built into this arena, by
+    /// `MemHelper::index`, 0 for none. Every `Codegen` on the arena calls the
+    /// same ones.
+    helpers: [std::sync::atomic::AtomicUsize; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT],
 }
 
+/// Source of [`PagedArenaState::epoch`]. Starts at 1: 0 is "no arena".
+static NEXT_ARENA_EPOCH: AtomicU64 = AtomicU64::new(1);
+
 impl PagedArenaState {
+    /// For code whose arena nothing rotates (a publish in a unit test): epoch
+    /// 0, never retired.
+    pub const UNTRACKED: PagedArenaState = PagedArenaState {
+        crossed_page: AtomicBool::new(false),
+        used_bytes: AtomicU64::new(0),
+        reserved_bytes: AtomicU64::new(0),
+        arena_ptr: AtomicU64::new(0),
+        arena_len: AtomicU64::new(0),
+        epoch: AtomicU64::new(0),
+        retired: AtomicBool::new(false),
+        helpers: [const { std::sync::atomic::AtomicUsize::new(0) }; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT],
+    };
+
+    /// See the `epoch` field.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn new_epoch(&self) {
+        self.epoch.store(NEXT_ARENA_EPOCH.fetch_add(1, Ordering::Relaxed), Ordering::SeqCst);
+    }
+
+    /// See the `retired` field.
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::SeqCst)
+    }
+
+    /// Refuse every later publish from this arena. Call before sweeping its
+    /// code off the pages.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+    }
+
+    /// The memory helpers built into this arena, 0 where there is none.
+    pub fn helpers(&self) -> [usize; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT] {
+        std::array::from_fn(|i| self.helpers[i].load(Ordering::Acquire))
+    }
+
+    /// Record the helpers a `Codegen` just built into this arena.
+    pub fn set_helpers(&self, addrs: &[usize; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT]) {
+        for (slot, &addr) in self.helpers.iter().zip(addrs) {
+            slot.store(addr, Ordering::Release);
+        }
+    }
+
     pub fn crossed_page(&self) -> bool {
         self.crossed_page.swap(false, Ordering::Relaxed)
     }
@@ -282,6 +344,30 @@ unsafe fn commit_read_write(ptr: *mut u8, len: usize) -> Result<(), region::Erro
     Ok(())
 }
 
+/// Give `[ptr, ptr+len)` back: no access, and no memory behind it, as it was
+/// when reserved. `allocate` commits it again as the cursor returns.
+#[cfg(not(windows))]
+unsafe fn decommit(ptr: *mut u8, len: usize) {
+    unsafe {
+        region::protect(ptr, len, region::Protection::NONE)
+            .expect("unable to take a recycled jitv2 arena's pages back");
+        // Drop the pages. Linux zero-fills them on the next touch; elsewhere
+        // the kernel may keep the old bytes until it wants the memory, which
+        // is harmless: every byte is written again before it is sealed.
+        #[cfg(target_os = "linux")]
+        libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTNEED);
+        #[cfg(not(target_os = "linux"))]
+        libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_FREE);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn decommit(ptr: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{VirtualFree, MEM_DECOMMIT};
+    let ok = unsafe { VirtualFree(ptr.cast(), len, MEM_DECOMMIT) };
+    assert!(ok != 0, "decommitting a recycled jitv2 arena: {}", io::Error::last_os_error());
+}
+
 /// Port of `cranelift_jit::memory::set_readable_and_executable` — `pub(crate)`
 /// in that crate, so not reachable from here; duplicated verbatim rather than
 /// reimplemented from scratch, to stay exactly in sync with the icache/BTI
@@ -343,6 +429,10 @@ pub struct PublishInfo {
     /// `STATUS_FR` value this region was compiled against. Carried through the
     /// seal queue so the eventual `page.publish` can stamp it on the entry.
     pub compiled_for_fr1: bool,
+    /// The page slot's tenancy when the compile read the page
+    /// (`PhysicalCodePage::tenancy`): a publish for a slot the pool has since
+    /// given to other memory is refused.
+    pub tenancy: u32,
     /// `None` only for a `finalize()` call reached without going through
     /// `Codegen` (a test driving the `JITMemoryProvider` trait directly,
     /// with no publish info to give — see this call site's own comment).
@@ -365,6 +455,7 @@ impl PublishInfo {
             instr_count: 0,
             code_size: 0,
             compiled_for_fr1: false,
+            tenancy: 0,
             jit_fn: None,
         }
     }
@@ -462,9 +553,9 @@ pub struct SharedArena {
     alloc: ManuallyDrop<Option<Reservation>>,
     ptr: *mut u8,
     size: usize,
-    /// Bump cursor — the arena's committed-and-handed-out extent. Monotonic;
-    /// never rewound. Every `allocate()` call, and only `allocate()`, moves
-    /// this forward.
+    /// Bump cursor — the arena's committed-and-handed-out extent. Every
+    /// `allocate()` call moves this forward; only [`Self::recycle`] rewinds
+    /// it, to 0.
     position: usize,
     /// Page-rounded watermark: `[ptr, ptr+sealed_up_to)` is RX right now.
     /// Only `try_seal_ready` moves this forward.
@@ -500,6 +591,10 @@ pub struct SharedArena {
     /// Incremented by every provider handle built over this arena, decremented
     /// by `free_memory`; only the last one out actually frees.
     users: usize,
+    /// The arena belongs to the compile pool's ring, which recycles it in
+    /// place: the last module to leave does not release the reservation,
+    /// because code in it still runs until the ring retires it.
+    ring_owned: bool,
     /// The real `BranchProtection` cranelift computed and passed into the
     /// most recent real `finalize()` call (`JITModule::finalize_definitions()`
     /// derives this from the live ISA — BTI on aarch64 when the target
@@ -568,6 +663,7 @@ impl SharedArena {
             state.arena_ptr.store(ptr as u64, Ordering::Relaxed);
             state.arena_len.store(size as u64, Ordering::Relaxed);
         }
+        state.new_epoch();
         Ok(Self {
             alloc: ManuallyDrop::new(Some(alloc)),
             ptr,
@@ -580,6 +676,7 @@ impl SharedArena {
             // The arena starts with no module attached; each provider handle
             // registers itself in `new_shared`/`new_with_size`.
             users: 0,
+            ring_owned: false,
             last_branch_protection: None,
             last_sealed: Vec::new(),
             state,
@@ -927,12 +1024,64 @@ impl SharedArena {
         // each one's `JITModule::free_memory()` lands here. Only the last one
         // may actually release the mapping — see `users`.
         self.users = self.users.saturating_sub(1);
-        if self.users > 0 {
+        if self.users > 0 || self.ring_owned {
             return;
         }
         self.seal_queue.clear();
         let _: Option<Reservation> = self.alloc.take();
         self.ptr = ptr::null_mut();
+    }
+
+    /// Hand the arena to the compile pool's ring: see `ring_owned`.
+    pub fn set_ring_owned(&mut self) {
+        self.ring_owned = true;
+    }
+
+    /// The shared state every handle on this arena reads.
+    pub fn state(&self) -> &Arc<PagedArenaState> {
+        &self.state
+    }
+
+    /// Empty the arena in place: every page goes back to reserved-only, the
+    /// cursor and the sealed watermark return to 0, the seal queue is
+    /// dropped, and the arena gets a new epoch. The next allocation starts at
+    /// offset 0.
+    ///
+    /// # Safety
+    /// No code in the arena may be running or reachable, and no module may
+    /// still allocate from it: the ring calls this once the arena's code is
+    /// off every page, every CPU has left compiled code since, and every
+    /// worker has moved to another arena.
+    pub unsafe fn recycle(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        let page = region::page::size();
+        let committed = align_up(self.position.max(self.sealed_up_to), page).min(self.size);
+        if committed > 0 {
+            unsafe { decommit(self.ptr, committed) };
+        }
+        self.position = 0;
+        self.sealed_up_to = 0;
+        self.collapsed_up_to = 0;
+        self.seal_queue.clear();
+        self.last_sealed.clear();
+        self.users = 0;
+        self.state.crossed_page.store(false, Ordering::Relaxed);
+        self.state.set_helpers(&[0; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT]);
+        self.record_packing();
+        self.state.new_epoch();
+        self.state.retired.store(false, Ordering::SeqCst);
+    }
+
+    /// Release a ring-owned arena's reservation, for good.
+    ///
+    /// # Safety
+    /// As [`Self::recycle`], and nothing may use the arena again.
+    pub unsafe fn release_ring_owned(&mut self) {
+        self.ring_owned = false;
+        self.users = 0;
+        unsafe { self.free_memory() };
     }
 }
 
@@ -1262,6 +1411,45 @@ mod tests {
         let state = Arc::new(PagedArenaState::default());
         let arena = PagedArenaMemoryProvider::new_with_size(size, state.clone()).unwrap();
         (arena, state)
+    }
+
+    #[test]
+    fn a_recycled_arena_starts_again_at_offset_zero_with_a_new_epoch() {
+        let (mut arena, state) = new_arena(1 << 20);
+        let page = region::page::size();
+        let base = arena.arena_base();
+        let first = arena.allocate(page + 64, 16, JITMemoryKind::Executable).unwrap();
+        assert_eq!(first, base);
+        unsafe { first.write_bytes(0xCC, page + 64) };
+        arena.seal_prefix_no_publish(page + 64);
+        let epoch = state.epoch();
+        assert_ne!(epoch, 0);
+        state.retire();
+        state.set_helpers(&[0x1000; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT]);
+
+        unsafe { arena.shared().lock().recycle() };
+
+        assert_ne!(state.epoch(), epoch, "a recycled arena is a new epoch");
+        assert!(!state.is_retired());
+        assert_eq!(state.helpers(), [0; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT]);
+        assert_eq!(state.packing_stats(), (0, 0));
+        let again = arena.allocate(64, 16, JITMemoryKind::Executable).unwrap();
+        assert_eq!(again, base, "the cursor is back at the start");
+        // Writable again, although the page was sealed read-execute before.
+        unsafe { again.write_bytes(0x90, 64) };
+        #[cfg(target_os = "linux")]
+        assert_eq!(unsafe { again.add(64).read() }, 0, "the old bytes are gone");
+    }
+
+    #[test]
+    fn a_ring_owned_arena_outlives_its_last_module() {
+        let (mut arena, _state) = new_arena(1 << 20);
+        arena.shared().lock().set_ring_owned();
+        arena.register_module_user();
+        unsafe { arena.free_memory() };
+        assert!(!arena.arena_base().is_null(), "the ring, not the last module, releases it");
+        unsafe { arena.shared().lock().release_ring_owned() };
+        assert!(arena.arena_base().is_null());
     }
 
     #[test]

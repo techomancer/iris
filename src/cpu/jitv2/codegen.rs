@@ -743,7 +743,17 @@ impl Codegen {
         shared: std::sync::Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
         state: std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) -> Self {
-        Self::from_module(Self::new_module(Some(shared), Some(state)))
+        let mut codegen = Self::from_module(Self::new_module(Some(shared), Some(state)));
+        codegen.adopt_arena_helpers();
+        codegen
+    }
+
+    /// Use the memory helpers already built into this `Codegen`'s arena, if
+    /// any: they are built once per arena and every `Codegen` on it calls
+    /// the same ones.
+    fn adopt_arena_helpers(&mut self) {
+        let addrs = self.paged_state.helpers();
+        self.mem_helpers = std::array::from_fn(|i| core::num::NonZeroUsize::new(addrs[i]));
     }
 
     fn from_module(
@@ -815,6 +825,12 @@ impl Codegen {
         std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) {
         (self.seal_handle.shared(), self.paged_state.clone())
+    }
+
+    /// The state of the arena this `Codegen` compiles into: its epoch, and
+    /// whether it has been retired.
+    pub fn arena_state(&self) -> &crate::cpu::jitv2::paged_memory::PagedArenaState {
+        &self.paged_state
     }
 
     /// `(base_address, len)` of the underlying arena's real reservation —
@@ -916,13 +932,14 @@ impl Codegen {
         self.last_code_size = 0;
         self.last_blob = None;
         self.last_compile_ran_out_of_memory = false;
-        // Old helper addresses point into the arena that was just freed.
-        // Dropped here, but NOT rebuilt: a forced seal mprotects a whole host
-        // page, which is only safe when nothing else can still be
-        // bump-allocating into it (see `worker_loop`'s note on
-        // `handle_request`'s single-caller contract). The flush *leader*
-        // rebuilds them while every other worker is parked at the barrier.
-        self.mem_helpers = [None; MEM_HELPER_COUNT];
+        // The old helper addresses point into the arena this `Codegen` just
+        // left. Take the new arena's, if it has them, and never build any
+        // here: a forced seal mprotects a whole host page, which is only safe
+        // when nothing else can still be bump-allocating into it (see
+        // `worker_loop`'s note on `handle_request`'s single-caller contract).
+        // The compile pool builds them into an arena while it is still empty
+        // and no worker is on it.
+        self.adopt_arena_helpers();
     }
 
     /// Number of functions compiled into this `Codegen`'s `JITModule` since
@@ -1382,6 +1399,8 @@ impl Codegen {
             self.mem_helpers[helper.index()] = core::num::NonZeroUsize::new(addr);
         }
         self.seal_handle.seal_prefix_no_publish(high_water);
+        // For every other `Codegen` that builds on this arena.
+        self.paged_state.set_helpers(&self.mem_helpers.map(|h| h.map_or(0, |a| a.get())));
         #[cfg(feature = "developer")]
         eprintln!("jitv2: built {built_n} memory helpers, sealed prefix to {high_water}");
     }
