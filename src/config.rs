@@ -784,6 +784,18 @@ impl MachineProfile {
         }
     }
 
+    /// Where the real machine takes a second graphics board, and what iris would need to build it.
+    pub fn second_graphics_hint(self) -> &'static str {
+        use MachineProfile as P;
+        match self {
+            P::IndyIp24 | P::Indigo2Ip22 | P::Indigo2Ip28 => "the dual-head board is the `newport` card in gio0",
+            P::OctaneIp30 => "a second board goes in XIO slot B or C, which needs a second graphics device on the Crossbow",
+            P::Onyx2Ip27 => "a second pipe is a second graphics module, which needs a second Raster Manager set",
+            P::Onyx3000Ip35 => "a G-brick or V-brick takes two pipes, which needs a second pipe on the brick",
+            _ => "the machine has one graphics slot",
+        }
+    }
+
     /// The PROM iris carries for this machine, run when no file is named.
     pub fn embedded_prom(self) -> crate::dev::embedded_prom::EmbeddedProm {
         use crate::dev::embedded_prom::EmbeddedProm;
@@ -3742,12 +3754,12 @@ impl MachineConfig {
         if emu_id != 0 && !matches!(self.machine.profile, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) {
             return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
-        let placement = DevicePlacement::new(self)?;
         let written = self.devices.iter().filter(|d| matches!(d.device, DeviceModel::Graphics)).count();
         if written > 1 {
-            // Octane dual head, Onyx2 and Onyx 3000 pipes and the Indy's dual-head board are real; iris builds one board.
-            return Err(format!("[[devices]] graphics: iris builds one graphics board on the {}", placement.machine()));
+            let machine = self.machine.profile.product_name().unwrap_or(self.machine.profile.label());
+            return Err(format!("[[devices]] graphics: iris builds one graphics board on the {machine}; {}", self.machine.profile.second_graphics_hint()));
         }
+        let placement = DevicePlacement::new(self)?;
         if written == 1 && board == GraphicsBoard::None {
             return Err("[[devices]] graphics: the board `[graphics] board` names is none".into());
         }
@@ -5145,9 +5157,11 @@ mod export_tests {
         assert!(tezro(gfx("v12", "xio11")).unwrap_err().contains("has no slot xio11"), "11 is the second PIC");
         assert_eq!(DevicePlacement::new(&tezro(gfx("v12", "xio13")).unwrap()).unwrap().graphics().unwrap().to_string(), "xio13");
         assert_eq!(DevicePlacement::new(&tezro("[graphics]\nboard = \"v12\"\n".into()).unwrap()).unwrap().graphics().unwrap().to_string(), "xio12");
-        // One device, for a board that is fitted.
+        // One device, for a board that is fitted; the error says where the real machine takes a second.
         let two = format!("{}[[devices]]\ntype = \"graphics\"\n", gfx("v12", "xio13"));
-        assert!(tezro(two).unwrap_err().contains("builds one graphics board"));
+        assert!(tezro(two).unwrap_err().contains("one graphics slot"));
+        let octane = load("octane_ip30", "", "[[devices]]\ntype = \"graphics\"\nat = \"xio11\"\n[[devices]]\ntype = \"graphics\"\nat = \"xio9\"\n");
+        assert!(octane.unwrap_err().contains("xio9 does not take a graphics"), "the Octane has the one graphics slot xio11");
         assert!(tezro("[[devices]]\ntype = \"graphics\"\n".into()).unwrap_err().contains("is none"), "the Tezro has no board by default");
         assert!(load("o2_ip32", "", "[[devices]]\ntype = \"graphics\"\n").unwrap_err().contains("no free slot for a graphics board"));
     }
