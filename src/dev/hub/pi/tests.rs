@@ -934,12 +934,8 @@ fn a_slice_polling_the_others_comparator_is_held_until_both_have_seen_the_code()
     });
     assert!(held(1));
     t.clock.step(POLL_CHECK_NS);
-    let due = t.pi.state.lock().hold_due.unwrap();
-    t.pi.expire(3, due);
     assert!(held(1), "the other slice has retired nothing and little time has passed");
     t.clock.step(SAFETY_NS);
-    let due = t.pi.state.lock().hold_due.unwrap();
-    t.pi.expire(3, due);
     assert!(!held(1), "the PROM's own bound decides");
 }
 
