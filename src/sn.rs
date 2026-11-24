@@ -787,6 +787,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
     ) -> Result<Self, String> {
         let cpus: Vec<Arc<dyn CpuDevice>> = node_cpus.iter().flatten().cloned().collect();
         let first = &cpus[0];
+        timers.clock().set_cpu_cycles(first.cycles_ptr());
         if let Some(status) = &io.status {
             // Every processor's clock is its CP0 Compare: count its matches
             // and publish the rate its deadlines program.

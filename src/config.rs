@@ -2028,9 +2028,8 @@ pub struct ClockConfig {
     /// so a loop the JIT has compiled takes less guest time than the
     /// interpreted loop IRIX timed to calibrate its delays. `instructions`
     /// counts retired instructions, `insn_ns` each, which keeps that
-    /// calibration right at any speed. One processor only, on the Indy and
-    /// Indigo2. Unset is `host`, except in a `ci_clock` build, where the Indy
-    /// and Indigo2 run on instructions.
+    /// calibration right at any speed. One processor only. Unset is `host`,
+    /// except in a `ci_clock` build, where the Indy, Indigo2 and O2 run on instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<ClockTime>,
     /// Instruction time: guest nanoseconds per retired instruction, a whole
@@ -3664,7 +3663,7 @@ impl MachineConfig {
     pub fn insn_ns(&self) -> u64 {
         let on = self.clock.time.map_or(
             cfg!(feature = "ci_clock")
-                && matches!(self.machine.profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28),
+                && matches!(self.machine.profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 | MachineProfile::O2Ip32),
             |t| t == ClockTime::Instructions,
         );
         if on { self.clock.insn_ns } else { 0 }
@@ -4326,10 +4325,8 @@ impl MachineConfig {
             if self.clock.insn_ns == 0 {
                 return Err("clock.insn_ns must be at least 1".into());
             }
-            let supported = matches!(self.machine.profile, MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22
-                | MachineProfile::Indigo2Ip28);
-            if !supported || self.total_cpus() != 1 {
-                return Err("clock.time = \"instructions\" is for one processor, on the Indy and Indigo2".into());
+            if self.total_cpus() != 1 {
+                return Err("clock.time = \"instructions\" is for one processor".into());
             }
         }
         if self.graphics.threads == 0 {
@@ -6578,13 +6575,15 @@ mod instruction_clock_config_tests {
         assert_eq!(cfg.insn_ns(), if cfg!(feature = "ci_clock") { 10 } else { 0 });
         assert_eq!(parse("[machine]\nprofile = \"origin2000_ip27\"\n").insn_ns(), 0, "only the machines that have it follow a ci_clock default");
         assert_eq!(parse("[clock]\ntime = \"host\"\n").insn_ns(), 0, "an explicit setting beats the ci_clock default");
+        assert_eq!(parse("[machine]\nprofile = \"o2_ip32\"\n").insn_ns(), if cfg!(feature = "ci_clock") { 10 } else { 0 });
+        assert_eq!(parse("[machine]\nprofile = \"octane_ip30\"\n").insn_ns(), 0, "the Octane is not in the ci_clock default");
         let on = parse("[clock]\ntime = \"instructions\"\ninsn_ns = 4\n");
         on.validate().unwrap();
         assert_eq!(on.insn_ns(), 4);
         assert!(parse("[clock]\ntime = \"instructions\"\ninsn_ns = 0\n").validate().unwrap_err().contains("insn_ns"));
-        let octane = parse("[clock]\ntime = \"instructions\"\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n");
-        assert!(octane.validate().unwrap_err().contains("one processor"));
-        let origin = parse("[clock]\ntime = \"instructions\"\n[machine]\nprofile = \"origin200_ip29\"\ncpu = \"r10000\"\n");
+        let smp = parse("[clock]\ntime = \"instructions\"\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\ncpus = 2\n");
+        assert!(smp.validate().unwrap_err().contains("one processor"));
+        let origin = parse("[clock]\ntime = \"instructions\"\n[origin2000]\nnodes = 2\n[machine]\nprofile = \"origin2000_ip27\"\n");
         assert!(origin.validate().unwrap_err().contains("one processor"));
     }
 }

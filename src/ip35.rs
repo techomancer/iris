@@ -257,7 +257,7 @@ pub(crate) fn machine(
     let prom = prom_image::resolve(cfg.machine.profile, &cfg.prom, 8 * 1024 * 1024)
         .map_err(|e| format!("{name} {e}"))?
         .bytes;
-    let timers = Arc::new(TimerManager::new());
+    let timers = Arc::new(TimerManager::with_clock(cfg.machine_clock()));
     let clock = timers.clock().clone();
     let specs = node_specs(cfg)?;
     assert!((1..=MAX_NODES).contains(&specs.len()), "a machine has one or two nodes");

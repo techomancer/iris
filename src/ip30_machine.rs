@@ -328,7 +328,7 @@ impl OctaneMachine {
         let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
         let (event_tx, event_rx) = crate::traits::MachineEvents::channel(4);
         let events = event_tx.clone();
-        let timer_manager = Arc::new(TimerManager::new());
+        let timer_manager = Arc::new(TimerManager::with_clock(cfg.machine_clock()));
 
         // Memory, and HEART, whose descriptors place it.
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
@@ -591,6 +591,7 @@ impl OctaneMachine {
             }
         }
         status.set_cpu_cycles(cpu.cycles_ptr());
+        timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
         // Each processor's clock is its CP0 Compare (HEART's counter is
         // IRIX's time base, not its tick): publish the rate it programs.
@@ -2182,6 +2183,33 @@ mod snapshot_tests {
             old.board.as_table_mut().unwrap().remove("clock_ns");
             a.stop();
             assert!(a.apply_snapshot(old).unwrap_err().contains("clock_ns"));
+        }).unwrap().join().unwrap();
+    }
+
+    /// On the instruction clock a restore puts guest time back to the saved reading, and it runs on from
+    /// there at the instruction rate, not from wherever the host's run had got to.
+    #[test]
+    fn guest_time_on_the_instruction_clock_survives_a_restore() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("instruction-clock");
+            let prom = empty_prom(&dir);
+            let mut m = machine_with(&prom, &dir, |cfg| cfg.clock.time = Some(crate::config::ClockTime::Instructions));
+            let clock = m.timer_manager.clock().clone();
+            assert_eq!(clock.insn_ns(), 10);
+            m.cpus[0].step_n_inline(5000).unwrap();
+            let saved_at = clock.now();
+            assert!(saved_at >= 50_000, "the guest has run: {saved_at} ns");
+            m.save_snapshot_in(&dir.join("saves"), "t").unwrap();
+            let saved = m.read_snapshot(&dir.join("saves"), "t").unwrap();
+            clock.start(); // a save leaves the machine stopped
+            m.cpus[0].step_n_inline(20_000).unwrap();
+            assert!(clock.now() >= saved_at + 200_000, "{} then {}", saved_at, clock.now());
+            m.stop();
+            m.apply_snapshot(saved).unwrap();
+            assert_eq!(clock.now(), saved_at, "back to the saved reading");
+            clock.start();
+            m.cpus[0].step_n_inline(1000).unwrap();
+            assert_eq!(clock.now(), saved_at + 10_000, "then 10 ns an instruction");
         }).unwrap().join().unwrap();
     }
 

@@ -206,7 +206,7 @@ pub fn machine(
         .map_err(|e| format!("{} {e}", cfg.machine.profile.product_name().unwrap_or_default()))?
         .bytes;
     let specs = node_specs(cfg)?;
-    let timers = Arc::new(TimerManager::new());
+    let timers = Arc::new(TimerManager::with_clock(cfg.machine_clock()));
     let clock = timers.clock().clone();
     let mut nodes = Vec::new();
     for (i, spec) in specs.iter().enumerate() {

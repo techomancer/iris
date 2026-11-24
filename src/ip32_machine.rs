@@ -210,7 +210,7 @@ impl O2Machine {
             rtc_file: Some(format!("{}.rtc", cfg.nvram).into()),
             rtc_offset: cfg.rtc_offset,
         };
-        let timer_manager = Arc::new(TimerManager::new());
+        let timer_manager = Arc::new(TimerManager::with_clock(cfg.machine_clock()));
         let bus = Ip32Bus::with_options(mem, prom, opts, &timer_manager);
         // MACE audio plays through the host unless audio is off.
         if !cfg.no_audio {
@@ -302,6 +302,7 @@ impl O2Machine {
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_clock(timer_manager.clock().clone());
+        timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
 
         // CRIME's rendering engine draws on its own thread, fed through
