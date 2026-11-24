@@ -448,7 +448,8 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | Note | Kind | Title |
 |---|---|---|
 | [a-by-value-rex3context-costs-every-caller-a-megabyte-frame.md](perf/a-by-value-rex3context-costs-every-caller-a-megabyte-frame.md) | rule | Copying `Rex3Context` (1 MiB HostRW inline) by value gave every inlining caller a 1 MiB stack-probed frame: a third of the GPU raster thread per GO; keep such copies `#[inline(never)]`, with an objdump check |
-| [newport-gpu-raster-is-bound-by-per-go-cost.md](perf/newport-gpu-raster-is-bound-by-per-go-cost.md) | measure | Newport GPU raster on GL demos: the per-GO CPU cost (clock reads, locks, 1024-slot batches, a Vec per span) bound it, not the 256-byte state upload; replay A/B numbers and how to measure |
+| [newport-gpu-raster-is-bound-by-per-go-cost.md](perf/newport-gpu-raster-is-bound-by-per-go-cost.md) | measure | Newport GPU raster on GL demos: the per-GO CPU cost (clock reads, locks, 1024-slot batches, a Vec per span) bound it, not the 256-byte state upload; then the per-pixel shade DDA (now closed form; COLORRED carries junk in bits 20-30); replay A/B numbers and how to measure |
+| [gfifo-consumer-that-catches-up-slows-the-producer.md](perf/gfifo-consumer-that-catches-up-slows-the-producer.md) | rule | A GFIFO consumer that keeps pace makes every push a cache-line transfer; the Newport processor lingers (256 entries / 20 us) before going idle |
 | [decode-cache-conflicts-vary-by-boot.md](perf/decode-cache-conflicts-vary-by-boot.md) | measure | The shadow cache's 64-page decode cache conflicts differently on every boot: up to 25% interpreter variance per boot, gone with 256 pages; compare builds over several boots |
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
 | [guest-compiler-changes-the-benchmark.md](perf/guest-compiler-changes-the-benchmark.md) | measure | The guest compiler is part of the benchmark: GCC 14.2 against 16.2.1 changes Dhrystone and rotate90 by 37% in guest instructions, and the pin that fixes it |
@@ -509,6 +510,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | Note | Kind | Title |
 |---|---|---|
 | [telnet-lines-are-cut-at-256.md](irix/telnet-lines-are-cut-at-256.md) | rule | A command line sent over telnet is cut at 256 characters (tty canonical mode): keep `irix-sh.py run` commands short or push a script; some images' xdm grabs the server until a console login |
+| [backgrounded-shutdown-dies-with-its-telnet-session.md](irix/backgrounded-shutdown-dies-with-its-telnet-session.md) | rule | `shutdown ... &` over irix-sh.py dies with the telnet session when the guest is busy, so it looks like a hang; run it in the foreground or under `nohup` |
 | [cdrom-changer-eject-no-mediad-remount.md](irix/cdrom-changer-eject-no-mediad-remount.md) | open | CD changer `cdrom-eject` does not trigger a `mediad` remount |
 | [delay-loop-calibrated-cold.md](irix/delay-loop-calibrated-cold.md) | open | IRIX calibrates its microsecond delay loop cold, so JIT runs make every delay short (Octane "RAD UST not incrementing") |
 | [default-visual-24bit.md](irix/default-visual-24bit.md) | rule | The ip28 guest's X server defaults to 24-bit TrueColor |

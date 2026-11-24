@@ -85,9 +85,7 @@ pub(super) fn prepare_copy_fill(
     });
     let final_shade = if context.drawmode0.shade() {
         let mut shade = ShadeDda::from_context(context);
-        for _ in 0..walk.visits {
-            shade.advance();
-        }
+        shade.advance_by(walk.visits);
         Some(shade)
     } else {
         None

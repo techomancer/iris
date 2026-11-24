@@ -48,6 +48,10 @@ pub(super) const FLAG_COPY_PARALLEL: u32 = 1 << 12;
 /// A parallel copy reads its source from the snapshot taken before the
 /// batch: the source overlaps the destination.
 pub(super) const FLAG_COPY_SNAPSHOT: u32 = 1 << 13;
+/// A shaded fill or line whose DDA has a closed form (`ShadeDda::is_linear`):
+/// each pixel computes its shade from the state slot's start colours and
+/// slopes and its visit index, and the payload has no checkpoints.
+pub(super) const FLAG_SHADE_LINEAR: u32 = 1 << 14;
 
 /// How a copy fill runs on the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +184,12 @@ impl RexCommand {
         }
     }
 
+    /// The same command with `flags` added.
+    pub(super) fn with_flags(mut self, flags: u32) -> Self {
+        self.flags |= flags;
+        self
+    }
+
     pub(super) fn line(
         state_slot: u32,
         line: LineCommand,
@@ -214,6 +224,9 @@ impl RexCommand {
         }
         if line.shaded {
             flags |= FLAG_SHADED;
+            if line.shade_linear {
+                flags |= FLAG_SHADE_LINEAR;
+            }
         }
         Self {
             kind,
@@ -863,6 +876,7 @@ mod tests {
                 write_mask: u32::MAX,
                 payload_words: 9,
                 shaded: false,
+                shade_linear: false,
             };
             let payload = PayloadRef {
                 offset: 17,

@@ -56,3 +56,19 @@ in `register_processor` (16%), `execute_go` (10%), GFIFO peek and consume
 - `perf record -g --call-graph dwarf -t <tid>` on the `REX3-Resident-P`
   thread alone; a whole-process dwarf profile is swamped by the main thread
   loading the recording and loses the raster thread's samples.
+
+## Shade DDA (2026-11-23)
+
+`prepare_resident_flat_fill` then spent a third of the thread stepping the
+shade DDA once per pixel to make 32-pixel checkpoints for the GPU. The clamp
+is the identity while a component's bit 31 is clear and its low 20 bits stay
+in [0, 0x7FFFF], and with a slope under 0x40000 the first step out lands where
+the clamp pins it for good, so the value after n steps is a clamped line.
+IRIX leaves junk in bits 20-30 of COLORRED (`0x903d33`): testing the whole
+value against 0x7FFFF matched no GO at all, and the stepping fallback then
+made everything slower. Testing the low 20 bits, 99.5-99.96% of shaded GOs
+take the closed form (iconbook 92%). Ideas replay 10.2 -> 7.6 s; the
+producer-bound replays then needed the GFIFO linger
+(`gfifo-consumer-that-catches-up-slows-the-producer.md`). Live, powerflip
+went from about 193k to 360k GOs a second; ideas is bound by the guest CPU
+(about 290k either way, GFIFO median 63 entries).

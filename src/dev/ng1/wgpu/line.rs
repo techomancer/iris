@@ -41,6 +41,9 @@ pub(super) struct LineCommand {
     pub(super) write_mask: u32,
     pub(super) payload_words: u32,
     pub(super) shaded: bool,
+    /// The GPU computes the shade from the start value and the pixel index
+    /// (`ShadeDda::is_linear`); the payload carries no checkpoints.
+    pub(super) shade_linear: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -671,17 +674,19 @@ fn prepare_line_for(
 
     let (shade_payload, final_shade) = if dm0.shade() {
         let mut shade = ShadeDda::from_context(context);
-        let checkpoints = pixel_count.saturating_add(31) / 32;
-        let mut payload = if operation == LineOperation::Draw {
-            Vec::with_capacity(checkpoints as usize * 4)
+        let mut payload = Vec::new();
+        if operation != LineOperation::Draw || shade.is_linear() {
+            // The GPU shades each pixel from the slot's start values.
+            shade.advance_by(u64::from(pixel_count));
         } else {
-            Vec::new()
-        };
-        for index in 0..pixel_count {
-            if operation == LineOperation::Draw && index & 31 == 0 {
-                payload.extend_from_slice(&shade.components());
+            // No closed form: the GPU steps from a checkpoint every 32 pixels.
+            payload.reserve(pixel_count.div_ceil(32) as usize * 4);
+            for index in 0..pixel_count {
+                if index & 31 == 0 {
+                    payload.extend_from_slice(&shade.components());
+                }
+                shade.advance();
             }
-            shade.advance();
         }
         (payload, Some(shade))
     } else {
@@ -714,6 +719,8 @@ fn prepare_line_for(
             write_mask: context.wrmask,
             payload_words: pixel_count,
             shaded: operation == LineOperation::Draw && final_shade.is_some(),
+            shade_linear: final_shade.is_some()
+                && ShadeDda::from_context(context).is_linear(),
         })
     };
     Ok(PreparedLine {
