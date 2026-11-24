@@ -92,12 +92,12 @@ boots to a usable system: shell, networking, X11, the works.
 - **Origin 200/2000, Onyx2 IP27:** SN0 NUMA machines; Onyx2 supports InfiniteReality graphics
 - **Fuel IP34:** IP35 platform, R14000, IOC3, ISP12160, L1 console, VPro optional,
   PS/2 or USB (`[machine] usb_input`) keyboard and mouse, optional ICE1724 audio
-  (`[machine] audio_card`)
+  (an `ice1724` device)
 - **Tezro IP53:** IP35 platform, up to 4 R16000 CPUs, PIC/PXBOW, IOC4, ISP12160, VPro optional,
-  ICE1724 audio (`[machine] audio_card`)
+  ICE1724 audio (an `ice1724` device)
 - **Origin 3200 / Onyx 3000 IP35:** R12000 C-bricks and Fibre Channel storage;
   Onyx 3000 adds InfiniteReality3 or VPro V12 graphics; optional ICE1724 audio
-  (`[machine] audio_card`)
+  (an `ice1724` device)
 - R4400, R5000, R10000, R12000, R14000, R16000 CPUs, selected per machine at runtime
 - A built-in PROM for every machine (the stock SGI images, packed into the
   binary); `prom` names a file to run instead

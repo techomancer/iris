@@ -37,9 +37,10 @@ It uses the same transports as [virtio-serial](virtio-serial.md):
 | Machine | Transport | Where |
 |---|---|---|
 | Indy (IP24), Indigo2 (IP22), Indigo2 IMPACT (IP28) | virtio-mmio v2 | GIO expansion slot `exp0` (`0x1F400000`) or `exp1` (`0x1F600000`, the default) |
-| Octane (IP30) | virtio-pci | Bridge slot 5, or `bridge_slot` (4 to 7): vendor `0x1af4`, device `0x1049` |
+| Octane (IP30) | virtio-pci | the Bridge's extra slots: vendor `0x1af4`, device `0x1049` |
 | Tezro (IP53) | virtio-pci | bus 1 of the IO9's PIC, device 2: vendor `0x1af4`, device `0x1049` |
-| O2 (IP32), Fuel, Origin 200, 2000 and 3200, Onyx2, Onyx 3000 | | Not wired; the section is refused |
+| O2 (IP32), Fuel, Origin 3200, Onyx 3000 | virtio-pci | extra slots on the board's second bus (`--list-slots` shows them) |
+| Origin 200, 2000, Onyx2 | | Not wired; the section is refused |
 
 A slot holds one device: with `[virtio_serial]` on as well, give each its own, or
 the configuration is refused. An Indigo2 kernel dispatches no interrupts for

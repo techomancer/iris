@@ -1,32 +1,37 @@
 # NVM Express controller
 
-iris can fit one NVM Express controller in the O2, or in an Octane's PCI module
-or shoehorn. It is written
+iris can fit NVM Express controllers in the O2's PCI option slot, or in an Octane's PCI module
+or shoehorn, as many as there are slots. It is written
 from the NVM Express Base Specification (revision 1.4) and the PCI
 specifications; it models the specification and nothing vendor-specific. A
 guest needs a driver for it: IRIX has none of its own, and Linux and the BSDs
 carry theirs.
 
 ```toml
-[nvme]
-path = "nvme.img"     # raw or CHD; the card is present when this is set
-overlay = true        # writes go to nvme.img.overlay, as for [scsi.N]
-bridge = false        # true: behind a PCI-to-PCI bridge in the slot
-board = 0             # Octane: which [[xio_board]] (the first by default)
-slot = 1              # Octane: its PCI device (the first free by default)
+[[devices]]
+type = "nvme"
+at   = "pci_slot"     # the O2's PCI option slot; left out, the first free slot
+path = "nvme.img"     # raw or CHD
+overlay = true        # writes go to nvme.img.overlay, as for hdd
 ```
 
 On the Octane the card needs a board to sit in, since its onboard Bridge keeps
 only its built-in devices:
 
 ```toml
-[[xio_board]]
-kind = "pci-cage"     # or "pci-shoehorn"; see docs/pci.md
+[[devices]]
+type = "pci_cage"     # or "pci_shoehorn"; see docs/pci.md
+name = "cage"
+at   = "pci_module"
 
-[nvme]
+[[devices]]
+type = "nvme"
+at   = "cage/pci0/2"  # the module's slots are PCI devices 1 to 3; a shoehorn has 1
 path = "nvme.img"
-slot = 2              # the module's slots are PCI devices 1 to 3; a shoehorn has 1
 ```
+
+To put the card behind a PCI-to-PCI bridge in the slot, add a `pci_bridge` device
+there and name the card's slot `bridge/pci0/0`.
 
 ## Where it sits
 
@@ -39,7 +44,7 @@ The Octane's boards are a Bridge of their own on a Crossbow port
 ([docs/pci.md](pci.md#option-boards-in-xio-slots)): its pins go to HEART, and
 IRIX finds the card in the hardware graph under that port's `pci` node.
 
-With `bridge = true` the slot holds a PCI-to-PCI bridge (type 1 header) and
+Behind a `pci_bridge` the slot holds a PCI-to-PCI bridge (type 1 header) and
 the controller is device 0 on the bus behind it, a DEC 21154 with a 32-bit I/O
 window ([docs/pci.md](pci.md#pci-to-pci-bridges)). Firmware numbers the bus and
 opens the bridge's memory window; a pin of the card reaches the bridge's pins
@@ -114,8 +119,8 @@ copy-on-write overlays, the background sync and the `cow` commands are those
 of [STORAGE.md](../STORAGE.md).
 
 The namespace reports a volatile write cache (Identify Controller VWC is 1),
-and `[nvme] write_cache` sets whether it powers up on. The default is `true`,
-as for `[scsi.N] write_cache`: a plain Write completes once the host has the
+and `write_cache` sets whether it powers up on. The default is `true`,
+as for an `hdd`'s `write_cache`: a plain Write completes once the host has the
 data, Flush and a Write with FUA store what came before them, and the disk
 layer's background sync follows about 5 s after a write. A host crash or power
 loss can lose that much. With `false`, or `--no-write-cache`, every write is

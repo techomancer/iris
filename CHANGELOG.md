@@ -93,38 +93,44 @@ hashes are given where a change is easiest to understand by reading the commit.
   TrueColor X windows draw their colour; they came out as a red ramp. Same
   on the CPU, the REX3 JIT and the GPU raster.
 
-### CD-ROM changes by slot
+### Disks and cards by slot
 
-- `iris-ci cdrom-load` and `cdrom-eject` take a drive by slot or alias, such
-  as `scsi1/t4`, on every machine; the bare number still works and warns.
-- The `/CDROM` remount after a disc change names the drive's own controller,
-  so a drive on the second SCSI controller remounts as `dks1`, not `dks0`.
-- iris-gui loads a picked disc into a CD-ROM on any controller, not only the
-  first.
-
-### virtio and audio cards by slot
-
+- Disks, CD-ROMs, DaynaPorts and cards are `[[devices]]` entries with an
+  optional `at`, a slot such as `scsi1/t4`, `xio13/pci0/2` or `gio0`. A
+  device with no `at` takes the first free slot that suits it. `--device
+  TYPE@SLOT,KEY=VALUE` adds one from the command line and `--list-slots`
+  prints every slot on the machine, what is in it and what it takes.
+  `[scsi.N]` tables, `--scsi1` to `--scsi7`, `--cdrom4` to `--cdrom6`,
+  `[virtio_*]`, `[ultra64]` and `graphics.heads = 2` still read and become
+  entries.
+- Option boards, PCI bridges, NVMe and Fibre Channel cards, the ICE1724 audio
+  card and the GIO cards are device types (`pci_cage`, `pci_shoehorn`,
+  `pci_bridge`, `nvme`, `qla2200`, `ice1724`, `newport`, `virtio_serial`,
+  `virtio_9p`). The graphics board is a `graphics` entry; which board it is
+  stays `[graphics] board`. A slot a machine lacks, a slot that does not
+  take the device, and two devices in one slot are config errors.
+- The older `[[xio_board]]`, `[nvme]` and `[fibre_channel]` sections,
+  `[machine] audio_card`, the `audio` flags of the Fuel, Tezro, Origin 3200
+  and Onyx 3000 sections, `[graphics] node` and `widget`, and `bridge_slot`
+  are no longer read: they are unknown fields. Write the entry instead.
 - virtio-serial and virtio-9p now work on the O2 (PCI device 4), the Fuel,
-  the Origin 3200 and the Onyx 3000 (extra devices on the I-brick's or
-  Fuel's second bus), as well as the Octane and Tezro. They always take a
-  spare slot, never a slot a real card could use; `at` in a
-  `[[devices]]` entry picks one, and `--list-slots` shows them.
-- The ICE1724 audio card is a `[[devices]]` type, `ice1724`, which goes in
-  any real PCI slot. `[machine] audio_card = true` still works and becomes
-  that entry, with a warning.
-
-### Snapshots by slot
-
-- A snapshot records every disk, overlay and card by its slot, not by
-  controller and target number, so an Octane or O2 can hold several NVMe
-  cards, and snapshots work with audio cards on both. A snapshot of a
-  machine with a virtio device is refused. A restore says which `at`
-  keeps a device that moved, and refuses a device added to the config since,
-  which the saved bus has no slot for.
-  Snapshots from this build's predecessors (schema 10 and older) are refused.
-- HELP.md, FEATURES.md and the machine guides describe disks and cards as
-  `[[devices]]` entries, with one section on the old keys, which still load
-  with a warning.
+  the Origin 3200 and the Onyx 3000 (extra slots on the second bus), as well
+  as the Octane and Tezro. They take a spare slot, never a slot a real card
+  could use.
+  The first virtio device takes the first spare slot, so a lone virtio-9p
+  is in Octane slot 7 (was 5) and Tezro device 1 (was 2), and a CD-ROM with
+  no `at` takes the first free target, t1, not 4. Name `at` to keep the old
+  place.
+- `iris-ci cdrom-load` and `cdrom-eject` take a drive by slot or alias, such
+  as `scsi1/t4`, on every machine; the bare number still works and warns. The
+  `/CDROM` remount after a disc change names the drive's own controller, so a
+  drive on the second SCSI controller remounts as `dks1`, not `dks0`.
+  iris-gui loads a picked disc into a CD-ROM on any controller.
+- A snapshot records every disk, overlay and card by its slot, so an Octane
+  or O2 can hold several NVMe cards, and snapshots work with audio cards on
+  both. A restore names the `at` that keeps a device that moved, and refuses
+  a device added to the config since. Snapshots written by earlier builds
+  (schema 10 and older) are refused.
 
 ### Newport colour-index shading
 

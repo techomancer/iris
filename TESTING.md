@@ -193,7 +193,7 @@ waits for the engine.
 ## Ultra64 dev board without gopher64
 
 `tools/tests/ultra64-irq-or.py` runs a headless Indy at its built-in PROM with
-`[ultra64] enabled` and no disks, and plays the N64 side itself with the
+an `ultra64` device and no disks, and plays the N64 side itself with the
 `ultra64-peer` example, which queues messages on the board's shared-memory
 bridge as gopher64 does. The monitor makes the driver's bus accesses and
 `ioc status` shows the GIO slot 0 interrupt. It checks that acknowledging

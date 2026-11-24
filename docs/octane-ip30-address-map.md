@@ -462,7 +462,7 @@ noted with the PC for `ip30 unmapped`.
 | 0x1F70_0000 | device window 3: RAD, `dev/rad1.rs` |
 | 0x1FC0_0000 – 0x1FFF_FFFF | `dev/sflash.rs`: the boot flash with its command set; the CPU's cached view (`CachedFlashLines`) keeps the PROM's cached stores into it. `[octane] flash` keeps the part between runs |
 | 0x2000_0000 up | `dev/heart_mem.rs`: SDRAM as MEMCFG places it, each 32 MB unit a view of one run of a bank, its first 16 KB a bus error to uncached processor accesses; `remap_banks` redraws the table and the ppmem window when a descriptor is written |
-| widgets 9, 10, 12, 13, 14 | bus error, unless an `[[xio_board]]` fills the port |
+| widgets 9, 10, 12, 13, 14 | bus error, unless a `pci_shoehorn` or `pci_cage` device fills the port |
 
 An Octane whose memory runs past 4 GB gets a 16 GB ppmem window in place of the
 usual 4 GB one, so all of it is reached directly and the JIT compiles code
