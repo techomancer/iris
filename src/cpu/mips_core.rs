@@ -654,8 +654,9 @@ pub struct MipsCore {
     /// bug this class of mistake already caused once in this same file.
     #[cfg(feature = "jitv2")]
     pub kill_entry_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
-    /// Instruction clock: `fire_compare_if_due`, called by compiled code at a
-    /// cycle flush once `hot.cycles` has reached the Compare deadline.
+    /// Instruction clock: `deadline_reached`, called by compiled code at a
+    /// cycle flush once `hot.cycles` has reached the Compare deadline or the
+    /// batch's budget.
     #[cfg(feature = "jitv2")]
     pub ci_compare_fn: unsafe extern "C" fn(*mut core::ffi::c_void),
     /// Developer-only per-instruction hook, called by compiled code at the top
@@ -986,6 +987,11 @@ pub struct MipsCore {
     /// each batch and at compiled code's cycle flushes instead of an hptimer.
     /// u64::MAX = disarmed.
     pub count_fire_cycle: u64,
+    /// Instruction clock: `hot.cycles` value at which compiled code leaves
+    /// to let the run loop pace the CPU. u64::MAX = none.
+    pub budget_cycle: u64,
+    /// The earlier of the two: the one threshold compiled code tests at a cycle flush.
+    pub(crate) check_cycle: u64,
     /// developer_ip7: total CP0 Compare writes seen, and how many of those
     /// landed behind Count (which arms a full-wrap ~2^32 wait).
     #[cfg(feature = "developer_ip7")]
@@ -1504,6 +1510,8 @@ impl MipsCore {
             insn_ns: 0,
             count_anchor_cycle: 0,
             count_fire_cycle: u64::MAX,
+            budget_cycle: u64::MAX,
+            check_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
             ip7_writes: 0,
             #[cfg(feature = "developer_ip7")]
@@ -1561,7 +1569,7 @@ impl MipsCore {
             self.count_read_cycle = self.hot.cycles;
             self.count_anchor_instant = std::time::Instant::now();
             self.count_anchor_cycle = self.hot.cycles;
-            self.count_fire_cycle = u64::MAX;
+            self.set_fire_cycle(u64::MAX);
             self.disarm_compare_timer();
             self.tick_rate.reset(0);
             self.cp0_random = self.tlb_entries - 1;
@@ -1979,7 +1987,7 @@ impl MipsCore {
         // function only schedules the next architectural match.
         let ns = compare_delay_ns(self.cp0_compare as u32, self.cp0_count as u32, self.count_hz);
         if self.insn_ns != 0 {
-            self.count_fire_cycle = self.hot.cycles.saturating_add(ns / self.insn_ns);
+            self.set_fire_cycle(self.hot.cycles.saturating_add(ns / self.insn_ns));
             return;
         }
         {
@@ -2055,16 +2063,37 @@ impl MipsCore {
             // Next architectural match is a full 32-bit Count wrap away;
             // normally a Compare write re-arms much sooner.
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
-            self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / self.insn_ns.max(1));
+            self.set_fire_cycle(self.hot.cycles.saturating_add(wrap_ns as u64 / self.insn_ns.max(1)));
             self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
             crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], true);
             self.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
+    /// Compiled code reached the Compare deadline or the budget: deliver a
+    /// due Compare, and on an expired budget have the run loop take over.
+    #[cfg(feature = "jitv2")]
+    pub(crate) fn deadline_reached(&mut self) {
+        self.fire_compare_if_due();
+        if self.hot.cycles >= self.budget_cycle {
+            self.set_budget_cycle(u64::MAX);
+            self.hot.interrupts.fetch_or(crate::cpu::smp::BUDGET_BIT, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn set_fire_cycle(&mut self, cycle: u64) {
+        self.count_fire_cycle = cycle;
+        self.check_cycle = cycle.min(self.budget_cycle);
+    }
+
+    pub(crate) fn set_budget_cycle(&mut self, cycle: u64) {
+        self.budget_cycle = cycle;
+        self.check_cycle = cycle.min(self.count_fire_cycle);
+    }
+
     /// Cancel any armed Count==Compare interrupt source.
     fn disarm_compare_timer(&mut self) {
-        self.count_fire_cycle = u64::MAX;
+        self.set_fire_cycle(u64::MAX);
         if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
             tm.remove(id);
         }
@@ -3158,19 +3187,27 @@ mod ip7_ticket_tests {
         assert_eq!(core.insn_ns, 4);
     }
 
-    /// A Compare deadline the cycles have reached raises IP7, once.
+    /// Compiled code's call at a cycle flush: a due Compare raises IP7, and an
+    /// expired budget asks the run loop to take over, once.
+    #[cfg(feature = "jitv2")]
     #[test]
-    fn instruction_clock_deadline_raises_ip7_once() {
+    fn instruction_clock_deadline_raises_ip7_and_the_budget_bit_once() {
         let mut core = MipsCore::default();
         core.set_instruction_clock(10);
-        core.count_fire_cycle = 100;
+        core.set_fire_cycle(100);
+        core.set_budget_cycle(200);
         core.hot.cycles = 99;
-        core.fire_compare_if_due();
+        core.deadline_reached();
         assert_eq!(core.hot.interrupts.load(Ordering::SeqCst) & CAUSE_IP7 as u64, 0);
         core.hot.cycles = 150;
-        core.fire_compare_if_due();
+        core.deadline_reached();
         assert_ne!(core.hot.interrupts.load(Ordering::SeqCst) & CAUSE_IP7 as u64, 0);
         assert!(core.count_fire_cycle > 150, "the next match is a Count wrap away");
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst) & crate::cpu::smp::BUDGET_BIT, 0, "budget not yet spent");
+        core.hot.cycles = 250;
+        core.deadline_reached();
+        assert_ne!(core.hot.interrupts.load(Ordering::SeqCst) & crate::cpu::smp::BUDGET_BIT, 0);
+        assert_eq!(core.budget_cycle, u64::MAX, "spent until the run loop sets the next");
     }
 
     /// The overrun case still delivers -- suppressing the crossing must not

@@ -3119,15 +3119,16 @@ fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset, stat
 }
 
 /// On the instruction clock there is no timer thread: the Compare deadline is
-/// a `hot.cycles` threshold, tested at each cycle flush. Once due,
-/// `ci_compare_fn` raises IP7 in `hot.interrupts`.
+/// a `hot.cycles` threshold, tested at each cycle flush with the pacing
+/// budget. Once either is due, `ci_compare_fn` raises IP7 in `hot.interrupts`
+/// or sends the CPU back to its run loop.
 fn emit_ci_clock_deadline(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
     let cycles = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, ir::immediates::Offset32::new(core_offset_of_cycles()));
-    let fire_off = ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, count_fire_cycle) as i32);
-    let fire = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, fire_off);
-    let due = ctx.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, cycles, fire);
+    let check_off = ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, check_cycle) as i32);
+    let check = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, check_off);
+    let due = ctx.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, cycles, check);
     let due_block = ctx.builder.create_block();
     let continue_block = ctx.builder.create_block();
     ctx.builder.ins().brif(due, due_block, &[], continue_block, &[]);
@@ -4712,7 +4713,8 @@ pub struct JitConsts {
     /// the rest take the callout, which raises Unimplemented Operation.
     pub cvt_from_l_range_bits: u8,
     /// Guest time is retired instructions: each cycle flush tests the Compare
-    /// deadline. Published and fingerprinted like `lwr_keeps_upper`.
+    /// deadline and the pacing budget. Published and fingerprinted like
+    /// `lwr_keeps_upper`.
     pub instruction_clock: bool,
 }
 

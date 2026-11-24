@@ -33,6 +33,11 @@ pub const MAX_CPUS: usize = 8;
 /// soft-reset request; Cause only takes bits 8..15.
 pub const HOST_PARK_BIT: u64 = 1 << 62;
 
+/// Bit of `MipsCore::hot.interrupts` that compiled code sets when the
+/// instruction clock's budget runs out: the batch ends, and the run loop paces
+/// the CPU and clears it.
+pub const BUDGET_BIT: u64 = 1 << 61;
+
 /// HEART's MODE register disables this processor.
 pub const HOLD_HEART: u32 = 1 << 0;
 /// Another thread needs the machine still ([`World::stop_others`]).

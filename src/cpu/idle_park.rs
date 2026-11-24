@@ -1785,7 +1785,7 @@ mod wake_tests {
         core.set_instruction_clock(10);
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
         core.cp0_compare = 1;
-        core.count_fire_cycle = core.hot.cycles + 300_000; // 3 ms at 10 ns/cycle
+        core.set_fire_cycle(core.hot.cycles + 300_000); // 3 ms at 10 ns/cycle
         let running = AtomicBool::new(true);
 
         let t0 = Instant::now();

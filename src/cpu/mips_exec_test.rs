@@ -2298,7 +2298,7 @@ mod tests {
             | (1 << (crate::cpu::mips_core::STATUS_IM_SHIFT + 7));
         exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
         let deadline = exec.core.hot.cycles + 100_000; // 1 ms of stall at 10 ns/cycle
-        exec.core.count_fire_cycle = deadline;
+        exec.core.set_fire_cycle(deadline);
 
         struct Irq(*const std::sync::atomic::AtomicU64);
         unsafe impl Send for Irq {}
@@ -8163,17 +8163,38 @@ mod tests {
     /// times faster than that, keeps guest time within a few milliseconds of the host's.
     #[test]
     fn a_paced_instruction_clock_stays_level_with_the_host() {
+        paced_spin_stays_level(false);
+    }
+
+    /// The same for a spin that stays inside compiled code, which only its
+    /// budget brings back to the run loop to be paced.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn a_paced_compiled_spin_stays_level_with_the_host() {
+        paced_spin_stays_level(true);
+    }
+
+    fn paced_spin_stays_level(compiled: bool) {
         let mem = Arc::new(MockMemory::new());
         let bus: Arc<dyn BusDevice> = mem.clone();
         let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
             MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
         #[cfg(feature = "jitv2")]
-        { exec.jitv2_dispatch_enabled = false; }
+        {
+            exec.jitv2_dispatch_enabled = compiled;
+            exec.jitv2_inline_compile = true;
+            #[cfg(feature = "fetchverify")]
+            { exec.core.fetch_verify_on = false; }
+        }
+        #[cfg(not(feature = "jitv2"))]
+        let _ = compiled;
         mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
         mem.set_word(0x1004, 0);
         exec.core.pc = 0xffff_ffff_8000_1000;
         let tm = Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting(5_000, true)));
         exec.core.set_timer_manager(tm.clone());
+        #[cfg(feature = "jitv2")]
+        exec.install_jit_hooks();
         let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
         tm.clock().set_cpu_cycles(cpu.cycles_ptr());
         let started = std::time::Instant::now();
@@ -8208,7 +8229,7 @@ mod tests {
         mem.set_word(0x1004, 0);
         exec.core.pc = 0xffff_ffff_8000_1000;
         exec.core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        exec.core.count_fire_cycle = 100;
+        exec.core.set_fire_cycle(100);
 
         // A failed run spins in compiled code for good; the park bit, which
         // compiled code does see, gets it out so the test fails instead.

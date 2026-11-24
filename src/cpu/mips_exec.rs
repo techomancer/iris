@@ -541,8 +541,10 @@ use monitor::*;
 // into Cause. IP7 (CP0 Count==Compare) is included since the compare timer
 // fires on the hptimer thread and raises it exactly like a device line;
 // writing Compare clears the pending bit again (mips_core.rs write_cp0).
-/// Instruction clock pacing: the CPU sleeps once guest time is more than this ahead of the host's.
+/// Instruction clock pacing: the CPU sleeps once guest time is more than this ahead of the host's,
+/// and compiled code returns to the run loop after this much guest time at the latest.
 const PACE_SLACK_NS: i64 = 1_000_000;
+const PACE_BUDGET_NS: u64 = 1_000_000;
 const PACE_MAX_SLEEP: Duration = Duration::from_millis(20);
 
 const EXT_INT_MASK: u32 = crate::cpu::mips_core::CAUSE_IP7 |
@@ -1893,10 +1895,10 @@ unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::
 }
 
 /// Instruction clock: compiled code reached a cycle flush at or past the
-/// Compare deadline.
+/// Compare deadline or the budget.
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_ci_compare(ctx: *mut core::ffi::c_void) {
-    unsafe { (*core_from_arg(ctx)).fire_compare_if_due() }
+    unsafe { (*core_from_arg(ctx)).deadline_reached() }
 }
 
 /// FPU rounding-mode hook: not generic over `<T,C>` (no executor context
@@ -2694,7 +2696,7 @@ macro_rules! step_preamble {
             // with the guest where the hold found it. Running the batch out
             // instead lets a held CPU run up to a whole batch further, past
             // the point the hold was there to keep it from.
-            if pending & crate::cpu::smp::HOST_PARK_BIT != 0 {
+            if pending & (crate::cpu::smp::HOST_PARK_BIT | crate::cpu::smp::BUDGET_BIT) != 0 {
                 return EXEC_RETRY;
             }
 
@@ -11603,6 +11605,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 // takes effect within at most 1000 instructions, same
                 // granularity this loop already gives breakpoint checks/
                 // idle-park/perf sampling.
+                if pace_clock.is_some() {
+                    let budget = guard.core.hot.cycles.saturating_add(PACE_BUDGET_NS / guard.core.insn_ns);
+                    guard.core.set_budget_cycle(budget);
+                }
                 #[cfg(feature = "jitv2")]
                 let jit_on = guard.jitv2_dispatch_enabled;
                 #[cfg(not(feature = "jitv2"))]
@@ -11676,6 +11682,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     guard.batch_hook = Some(hook);
                 }
                 if icount {
+                    guard.core.hot.interrupts.fetch_and(!crate::cpu::smp::BUDGET_BIT, Ordering::SeqCst);
                     guard.core.fire_compare_if_due();
                     if let Some(clock) = &pace_clock {
                         let lead = clock.lead_ns();
