@@ -5,6 +5,13 @@ on the assumption that the loop-carried DDA value is already clamped until this
 is answered — a JIT change resting on exactly that assumption is parked in a
 stash for this reason (see the bottom of this note).
 
+**2026-11-23:** the Newport GPU raster now shades in closed form
+(`ShadeDda::is_linear` / `advance_by` in `src/dev/ng1/wgpu/shade.rs`,
+`linear_shade` in `resident_flat.wgsl`). It is exact for reading (A) below,
+which is what both IRIS engines implement, and is tested against stepping.
+If hardware shows reading (B), change it with the stepping code: under (B) the
+accumulator is a plain wrapping line and the clamp moves to the output.
+
 ## The question
 
 `docs/datasheets/indy/rex3.pdf` (line ~6834 of `pdftotext` output) says:

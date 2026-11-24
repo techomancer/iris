@@ -174,6 +174,8 @@ Before packaging a library:
 tools/irix-sh.py run 'touch /etc/autologin.on; sync; shutdown -p -g0 -y'
 ```
 
+Run it in the foreground: a backgrounded `shutdown ... &` dies with the
+telnet session when the guest is busy (use `nohup` if it must be detached).
 Release builds exit when the guest powers off. `developer` builds stay up:
 wait about a minute, check the log or `tools/mon.py status` for the
 power-off, and only then stop the process. Kill iris by its exact PID

@@ -568,6 +568,56 @@ fn advance_shade(state: RexStateSlot, value: ShadeDda) -> ShadeDda {
     return next;
 }
 
+// One component after `steps` DDA steps, for a start with bit 31 clear and
+// its low 20 bits in [0, 0x7FFFF], and a slope below 0x40000 in magnitude
+// (ShadeDda::is_linear on the CPU): the per-step clamp then reduces to
+// clamping the straight line through the low 20 bits, and bits 20-30 ride
+// along until it clamps.
+fn linear_clamped(start: u32, slope_bits: u32, steps: u32) -> u32 {
+    let slope = bitcast<i32>(slope_bits);
+    var n = steps;
+    // Keep n * slope inside i32: past 0x80000 / |slope| + 1 steps the value
+    // has left the range whatever the start.
+    if n >= 4096u {
+        let magnitude = u32(abs(slope));
+        n = select(0u, min(n, 0x80000u / max(magnitude, 1u) + 1u), magnitude != 0u);
+    }
+    let value = i32(start & 0xfffffu) + i32(n) * slope;
+    if value < 0 {
+        return 0u;
+    }
+    if value > 0x7ffff {
+        return 0x7ffffu;
+    }
+    return (start & 0xfff00000u) | u32(value);
+}
+
+fn linear_shade(state: RexStateSlot, steps: u32, rgb: bool) -> ShadeDda {
+    let start = vec4<u32>(
+        state.words[REX_STATE_COLOR_RED],
+        state.words[REX_STATE_COLOR_ALPHA],
+        state.words[REX_STATE_COLOR_GREEN],
+        state.words[REX_STATE_COLOR_BLUE],
+    );
+    let slope = vec4<u32>(
+        state.words[REX_STATE_SLOPE_RED],
+        state.words[REX_STATE_SLOPE_ALPHA],
+        state.words[REX_STATE_SLOPE_GREEN],
+        state.words[REX_STATE_SLOPE_BLUE],
+    );
+    if !rgb {
+        // Colour index without a CI clamp only wraps.
+        let value = start + slope * steps;
+        return ShadeDda(value.x, value.y, value.z, value.w);
+    }
+    return ShadeDda(
+        linear_clamped(start.x, slope.x, steps),
+        linear_clamped(start.y, slope.y, steps),
+        linear_clamped(start.z, slope.z, steps),
+        linear_clamped(start.w, slope.w, steps),
+    );
+}
+
 fn shade_component(value: u32) -> u32 {
     let integer = (value >> 11u) & 0x1ffu;
     if (value & 0x80000000u) != 0u || integer >= 0x180u {
@@ -592,20 +642,25 @@ fn shade_source(
     } else {
         index = fill_position(state, command, px, py).index;
     }
-    let line_words = select(0u, command.payload_words, line);
-    let checkpoint = command.payload_offset + line_words + (index >> 5u) * 4u;
-    var value = ShadeDda(
-        payload[checkpoint],
-        payload[checkpoint + 1u],
-        payload[checkpoint + 2u],
-        payload[checkpoint + 3u],
-    );
-    var offset = 0u;
-    while offset < (index & 31u) {
-        value = advance_shade(state, value);
-        offset += 1u;
-    }
     let mode = state.words[REX_STATE_DRAW_MODE1];
+    var value: ShadeDda;
+    if (command.flags & REX_FLAG_SHADE_LINEAR) != 0u {
+        value = linear_shade(state, index, ((mode >> 15u) & 1u) != 0u);
+    } else {
+        let line_words = select(0u, command.payload_words, line);
+        let checkpoint = command.payload_offset + line_words + (index >> 5u) * 4u;
+        value = ShadeDda(
+            payload[checkpoint],
+            payload[checkpoint + 1u],
+            payload[checkpoint + 2u],
+            payload[checkpoint + 3u],
+        );
+        var offset = 0u;
+        while offset < (index & 31u) {
+            value = advance_shade(state, value);
+            offset += 1u;
+        }
+    }
     var color = value.red >> 11u;
     if ((mode >> 15u) & 1u) != 0u {
         color = (shade_component(value.blue) << 16u)

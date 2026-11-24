@@ -34,7 +34,7 @@ use super::command::{
     COMMAND_COPY_SPAN, COMMAND_HOST_A_LINE, COMMAND_HOST_BLOCK, COMMAND_HOST_F_LINE,
     COMMAND_HOST_I_LINE, COMMAND_HOST_SPAN, COMMAND_I_LINE, COMMAND_SPAN,
     FLAG_FAST_CLEAR, FLAG_FILL_BLOCK, FLAG_FILL_FIRST_ROW_COMPLETE, FLAG_COPY_PARALLEL, FLAG_COPY_SNAPSHOT, CopyMode, FLAG_LINE_MAJOR_DECREASING,
-    FLAG_LINE_Y_MAJOR, FLAG_READ_AUX, FLAG_SHADED, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
+    FLAG_LINE_Y_MAJOR, FLAG_READ_AUX, FLAG_SHADED, FLAG_SHADE_LINEAR, FLAG_WRITE_AUX, FLAG_WRITE_RGB,
     MAX_PAYLOAD_BYTES, MAX_PAYLOAD_WORDS, PayloadBatch, RexCommand, RexStateSlot, STATE_ALPHA_REF,
     STATE_CLIP_MODE, STATE_COLOR_ALPHA, STATE_COLOR_BACK, STATE_COLOR_BLUE, STATE_COLOR_GREEN,
     STATE_COLOR_RED, STATE_DRAW_MODE0, STATE_DRAW_MODE1, STATE_LINE_MODE, STATE_LINE_PATTERN,
@@ -1087,6 +1087,7 @@ impl ResidentGpu {
                 ("REX_FLAG_FILL_BLOCK", FLAG_FILL_BLOCK),
                 ("REX_FLAG_COPY_PARALLEL", FLAG_COPY_PARALLEL),
                 ("REX_FLAG_COPY_SNAPSHOT", FLAG_COPY_SNAPSHOT),
+                ("REX_FLAG_SHADE_LINEAR", FLAG_SHADE_LINEAR),
                 ("REX_OCTANT_XDEC", OCTANT_XDEC),
                 ("REX_OCTANT_YDEC", OCTANT_YDEC),
                 ("REX_STATE_WORDS", STATE_WORDS as u32),
@@ -1697,7 +1698,7 @@ impl ResidentGpu {
         fill: crate::dev::ng1::rex3_flat_fill::FlatFill,
         slot: RexStateSlot,
         words: &[u32],
-        shaded: bool,
+        shade_flags: u32,
     ) -> Result<(), ResidentError> {
         loop {
             let checkpoint = self.payload.checkpoint();
@@ -1722,10 +1723,11 @@ impl ResidentGpu {
                         slot,
                         fill,
                         payload,
-                        shaded,
+                        false,
                         cid_test(context.clipmode),
                         fill.kind != FillKind::Clear && reads_destination(context),
                     )
+                    .with_flags(shade_flags)
                 },
             );
             match result {
@@ -1794,7 +1796,12 @@ impl ResidentGpu {
             if words.len() > MAX_PAYLOAD_WORDS {
                 return Err(ResidentError::Unsupported("fill shade payload length"));
             }
-            self.enqueue_fill(context, fill, slot, words, shade_payload.is_some())?;
+            let shade = match (command.shaded(), shade_payload.is_some()) {
+                (false, _) => 0,
+                (true, true) => FLAG_SHADED,
+                (true, false) => FLAG_SHADED | FLAG_SHADE_LINEAR,
+            };
+            self.enqueue_fill(context, fill, slot, words, shade)?;
         }
         // Nothing above needs the stream position: take and accept it in
         // one lock (the common GO, a span or block).

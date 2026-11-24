@@ -47,6 +47,11 @@ pub const REX3_BASE: u32 = 0x1F0F0000; // Physical base address of registers
 pub const GFIFO_DEPTH: usize = 65536;
 /// Real hardware GFIFO depth (32 entries). STATUS reports level=1 below this threshold.
 pub const GFIFO_HW_DEPTH: usize = 32;
+/// How long the processor thread lingers on an empty GFIFO for a run of
+/// entries to collect before it goes idle (`register_processor`).
+const GFIFO_LINGER: std::time::Duration = std::time::Duration::from_micros(20);
+const GFIFO_LINGER_ENTRIES: usize = 256;
+const GFIFO_LINGER_SPINS: u32 = 512;
 /// Special GFIFO command to trigger a GO without a register write.
 pub const GFIFO_PURE_GO: u32 = 0xFFFF_0800;
 /// GFIFO_PURE_GO with the GO bit stripped — the reg_offset seen by process_register.
@@ -3461,9 +3466,12 @@ impl Rex3 {
         // Entries since the batch's age was last checked here.
         #[cfg(feature = "wgpu")]
         let mut since_age_check = 0u32;
+        // Whether the ring was found empty and the thread has lingered once.
+        let mut lingered = false;
         loop {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
+                lingered = false;
 
                 #[cfg(feature = "wgpu")]
                 if addr == GFIFO_RESIDENT_FRAME {
@@ -3530,6 +3538,24 @@ impl Rex3 {
                     if since_age_check >= 256 {
                         since_age_check = 0;
                         self.flush_resident_if_due();
+                    }
+                }
+            } else if !lingered {
+                // Linger before going idle. A consumer that keeps pace with
+                // the producer reads the tail and each slot just after the
+                // producer writes them, so every push pays a cache-line
+                // transfer to this core. On a multi-die host that cost more
+                // than the entry itself: a faster raster made the producer
+                // (the guest CPU) slower. Let a run of entries collect,
+                // polling the tail only every few hundred nanoseconds, for at
+                // most a few microseconds.
+                lingered = true;
+                let start = std::time::Instant::now();
+                while self.gfifo.pending_at(0) < GFIFO_LINGER_ENTRIES
+                    && start.elapsed() < GFIFO_LINGER
+                {
+                    for _ in 0..GFIFO_LINGER_SPINS {
+                        std::hint::spin_loop();
                     }
                 }
             } else {

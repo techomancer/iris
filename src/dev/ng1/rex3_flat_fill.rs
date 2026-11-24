@@ -140,6 +140,13 @@ impl PreparedFlatFill {
         self.fill
     }
 
+    /// The GO shades: the DDA advances, and the GPU shades each pixel from
+    /// checkpoints (`shade_payload`) or, without them, in closed form.
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn shaded(&self) -> bool {
+        self.final_shade.is_some()
+    }
+
     #[cfg(feature = "wgpu")]
     pub(crate) fn shade_payload(&self) -> Option<&[u32]> {
         self.shade_payload.as_ref().map(ShadePayload::as_slice)
@@ -239,27 +246,34 @@ pub(crate) fn prepare_resident_flat_fill(
     } else {
         None
     };
+    // Clipping, masks and patterns do not touch the DDA: it steps once for
+    // every pixel the walk visits.
     let (shade_payload, final_shade) = if mode.shade() != 0 {
         let mut shade = ShadeDda::from_context(context);
-        let payload_words = walk
-            .visits
-            .checked_add(31)
-            .and_then(|pixels| pixels.checked_div(32))
-            .and_then(|checkpoints| checkpoints.checked_mul(4))
-            .ok_or("shade payload length")?;
-        if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
-            return Err("shade payload length");
-        }
-        let mut payload = fill.map(|_| ShadePayload::with_capacity(payload_words as usize));
-        for index in 0..walk.visits {
-            if index & 31 == 0 {
-                if let Some(payload) = payload.as_mut() {
+        if fill.is_none() || shade.is_linear() {
+            // The GPU shades each pixel from the slot's start values.
+            shade.advance_by(walk.visits);
+            (None, Some(shade))
+        } else {
+            // No closed form: the GPU steps from a checkpoint every 32 pixels.
+            let payload_words = walk
+                .visits
+                .checked_add(31)
+                .and_then(|pixels| pixels.checked_div(32))
+                .and_then(|checkpoints| checkpoints.checked_mul(4))
+                .ok_or("shade payload length")?;
+            if payload_words > RESIDENT_PAYLOAD_WORDS {
+                return Err("shade payload length");
+            }
+            let mut payload = ShadePayload::with_capacity(payload_words as usize);
+            for index in 0..walk.visits {
+                if index & 31 == 0 {
                     payload.push4(shade.components());
                 }
+                shade.advance();
             }
-            shade.advance();
+            (Some(payload), Some(shade))
         }
-        (payload, Some(shade))
     } else {
         (None, None)
     };

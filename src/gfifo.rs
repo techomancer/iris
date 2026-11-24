@@ -223,6 +223,14 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         tail.wrapping_sub(self.slowest_head(tail)) & Self::MASK
     }
 
+    /// Entries the producer has published that head `h` has not consumed,
+    /// counted from the consumer's own head rather than the published one.
+    /// Called only from head `h`'s thread.
+    #[inline]
+    pub fn pending_at(&self, h: usize) -> usize {
+        self.tail.load(Ordering::Acquire).wrapping_sub(self.local_head[h].get()) & Self::MASK
+    }
+
     /// Entries head `h` has still to consume (approximate, as `len`).
     #[inline]
     pub fn len_at(&self, h: usize) -> usize {

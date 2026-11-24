@@ -631,6 +631,13 @@ The rules that keep this correct:
 - Bulk transfers (HOSTRW pixel data, VDMA) go in as one token followed by
   payload entries (`push_batch`), so one GFIFO round trip carries a whole
   row or block.
+- **A consumer that catches up lingers.** A consumer keeping pace with the
+  producer reads `tail` and each slot just after they are written, and every
+  push then pays a cache-line transfer, more than the entry itself on a
+  multi-die host. Newport's processor thread, on finding its ring empty,
+  waits up to 20 µs for 256 entries to collect, polling `tail` only every
+  512 spin hints, before it goes idle; a faster raster otherwise made the
+  guest CPU slower.
 
 How each board uses it:
 
@@ -886,15 +893,24 @@ major-axis indexing. Rust completion advances `PAT_BIT`, `ZPAT_BIT` and
 `LSRCOUNT` exactly, including `LSADVLAST`. Opaque background colors use the
 ordinary compare/logic/blend/dither pipeline.
 
-Shaded fills and all three line families preserve the CPU model's iterative
-wrap and clamp behavior without making one submission per primitive row. The
-recorder stores the four DDA accumulators at each 32-pixel boundary; a shader
-lane starts from its preceding checkpoint and performs at most 31 exact
-recurrence steps. Line checkpoints follow the fixed coverage words in the
-same payload. The CPU advances the architectural accumulators from the same
-initial state even for clipped, skipped, patterned, alpha-rejected and
-zero-write pixels. A complete 1344 x 1024 shaded fill remains below the fixed
-1 MiB arena and one ordered command.
+Shaded fills and all three line families reproduce the CPU model's per-pixel
+DDA, which steps once for every pixel the walk visits and clamps the
+accumulator each step; clipping, skips, patterns, alpha rejection and the
+write mask do not touch it. The clamp reads only bit 31 and the integer bits
+11-19, so for a component with bit 31 clear, its low 20 bits in
+[0, 0x7FFFF] and a slope under 0x40000 in magnitude, the value after n steps
+is the straight line through the low 20 bits clamped to 0 or 0x7FFFF, with
+bits 20-30 carried along until it clamps; colour index without a CI clamp
+only wraps. When every component qualifies (`ShadeDda::is_linear`, over
+99.5% of the GOs the GL demos send) the command carries
+`REX_FLAG_SHADE_LINEAR` and no payload: each shader lane computes its shade
+from the state slot's start colours and slopes and its visit index, and the
+CPU advances the registers the same way for the whole primitive. Otherwise
+the CPU steps the DDA and stores the four accumulators at each 32-pixel
+boundary; a shader lane starts from its preceding checkpoint and performs at
+most 31 exact recurrence steps. Line checkpoints follow the fixed coverage
+words in the same payload. A complete 1344 x 1024 shaded fill remains below
+the fixed 1 MiB arena and one ordered command.
 
 SCR2SCR blocks, spans and all three line families use the same command ABI and
 resident pipeline, each copy in a batch of its own: the backend submits the
@@ -1116,7 +1132,7 @@ about 6 ms; every reader (a frame cut, HostR, a wait for idle) submits first.
 The processor thread's work per GO is what limits the GL demos, which draw
 millions of spans of a few pixels each. A GO takes the raster lock once
 (whether the raster has a fault is an atomic beside it), the status lock
-twice, and no allocation for a span's shade checkpoints up to 256 pixels.
+twice, and no per-pixel work for the shade DDA (above).
 Timing each GO's command generation and counting which state-slot words
 change from one primitive to the next cost every GO, so both are off unless
 `IRIS_REX3_GPU_STATS` is set; the rest of the telemetry is always on.

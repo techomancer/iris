@@ -37,6 +37,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   also wait far less for the board.
 - The GPU raster handles about half again as many primitives a second on
   GL demos (Ideas in Motion, powerflip, solidview).
+- Gouraud-shaded drawing on the GPU raster no longer costs the emulator time
+  per pixel: powerflip on an Indy draws nearly twice as fast.
 - A resolution change with the wgpu renderer no longer stops the window
   presenting ("Failed to wait for GPU to come idle").
 
