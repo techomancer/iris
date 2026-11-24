@@ -27,7 +27,7 @@ selects the boot-flash backing file, the console (`l1`, `ioc3_a` or
 `ioc3_b`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
 lists its keys.
 
-`[machine] audio_card = true` fits an audio card: the IC Ensemble ICE1724 with
+An `ice1724` device fits an audio card: the IC Ensemble ICE1724 with
 the DMediaPro DM8's converters, the same model as the
 [Tezro's](tezro-ip53.md). It takes the first free PCI slot (device 1 of head E) unless `at` names another, such as device 2 of head F beside the base I/O;
 which device a real Fuel's option slots are is not established, so the slot is

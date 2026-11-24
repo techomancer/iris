@@ -121,26 +121,27 @@ segments, which the PROM loads one after another, so a Linux kernel put in
 the volume header with `mkvh` boots from disk (`--no-split` copies a file
 unchanged). Loading over the network (`bootp()vmlinux`) has no such limit.
 
-More storage goes on an option board in a spare XIO slot (`[[xio_board]]`, a
-PCI shoehorn or the PCI module; see [pci.md](pci.md#option-boards-in-xio-slots)):
-an [NVMe controller](nvme.md) with `[nvme]`, or a
-[Fibre Channel adapter](fibre-channel.md) with a loop of disks with
-`[fibre_channel]`.
+More storage goes on an option board in a spare XIO slot (a `pci_shoehorn` or
+`pci_cage` device, the PCI module; see [pci.md](pci.md#option-boards-in-xio-slots)):
+an [NVMe controller](nvme.md) (`type = "nvme"`), or a
+[Fibre Channel adapter](fibre-channel.md) with a loop of disks (`type = "qla2200"`).
 
 ## Shared directory and virtio-serial
 
-The onboard Bridge has two free PCI slots, which iris uses for virtio devices
-that need a guest driver (IRIX has none of its own):
+The onboard Bridge has four free PCI devices (4 to 7). iris uses 5 to 7 for virtio devices
+that need a guest driver (IRIX has none of its own); device 4's INTA is the IOC3's SuperIO
+interrupt pin, so nothing takes it. A virtio entry with no `at` takes them in the order
+7, 5, 6; `at = "xio15/pci0/N"` picks one:
 
-- `[virtio_9p] enabled = true` puts a host directory on Bridge slot 5, which a
+- A `virtio_9p` device puts a host directory on the Bridge, which a
   guest with a 9P2000.L driver mounts by its `tag`. `owners = "passthrough"`
   with `uid_map` and `gid_map` shows the host's owners instead of one
   configured `uid` and `gid`. It needs a Unix host. See
   [virtio-9p.md](dev/virtio-9p.md).
-- `[virtio_serial] enabled = true` puts a multiport console on Bridge slot 4,
+- A `virtio_serial` device puts a multiport console on the Bridge,
   its ports served on host TCP ports or Unix sockets. See
-  [virtio-serial.md](dev/virtio-serial.md). An Octane with virtio-serial
-  cannot take a snapshot.
+  [virtio-serial.md](dev/virtio-serial.md). A snapshot is refused while one is
+  present.
 
 ## Console, keyboard and mouse
 

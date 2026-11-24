@@ -81,7 +81,7 @@ The IO9's PCI bus, head 0 of the PIC at widget 15, holds the IOC4 at device
 ISP12160 at device 3 and the BCM5701 at device 4. Every Tezro capture that
 prints widget 15 shows the TI bridge there, and no Origin 350 or Onyx 350 IO9
 capture does; why is not known. Its secondary bus is empty unless
-`[machine] audio_card = true` adds the audio controller, and only its type 1 header
+An `ice1724` device at `xio15/pci0/2/pci0/2` adds the audio controller, and only its type 1 header
 is modelled, with the PCI2050's wide windows: 32-bit I/O addressing and
 stored upper 32 bits of the prefetchable base and limit (the window itself is
 32-bit; one above 4 GiB is stored and never forwarded). IRIX lists it as an
@@ -337,11 +337,9 @@ IO9.
 ## Shared directory and virtio-serial
 
 The IO9 PIC's second PCI bus is empty on the board, and iris puts the virtio
-devices there, as it uses the Octane's free Bridge slots: `[virtio_serial]
-enabled = true` adds a virtio-serial console at device 1 of that bus, and
-`[virtio_9p] enabled = true` a shared host directory at device 2, each with
-INTA on PIC input `device - 1`. The `slot` key of those sections is for the
-Indy and Indigo2 and does nothing here. Both need a guest driver; see
+devices there, as it uses the Octane's free Bridge devices: a `virtio_serial` device
+takes device 1 of that bus (`xio15/pci1/1`) and a `virtio_9p` device device 2, each with
+INTA on PIC input `device - 1`, unless `at` names another. Both need a guest driver; see
 [virtio-serial.md](dev/virtio-serial.md) and [virtio-9p.md](dev/virtio-9p.md).
 
 ## Where a boot's time goes

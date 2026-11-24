@@ -8,32 +8,38 @@ their own: the adapter is one controller with one bus, however many disks are
 on the loop.
 
 ```toml
-[[xio_board]]
-kind = "pci-cage"        # or "pci-shoehorn"; see docs/pci.md
+[[devices]]
+type = "pci_cage"        # or "pci_shoehorn"; see docs/pci.md
+name = "cage"
+at = "pci_module"
 
-[fibre_channel]
-slot = 2                 # the board's PCI device (the first free one by default)
-# board = 0              # which [[xio_board]] (the first by default)
-# bridge = false         # true: behind a DEC 21154 PCI-to-PCI bridge in the slot
+[[devices]]
+type = "qla2200"
+name = "fc"
+at = "cage/pci0"         # the first free slot; cage/pci0/2 names one
 
-[fibre_channel.disk.5]   # the loop ID, 0 to 125
+[[devices]]
+type = "hdd"
+at = "fc/l5"             # a loop ID, 0 to 125
 path = "frame0.raw"      # raw or CHD
 overlay = false
 ```
 
-A `[fibre_channel.disk.N]` table is a `[scsi.N]` disk table with a loop ID for
-its key, so `path`, `overlay` and `write_cache` apply. Only plain disks go on
-the loop. The adapter takes the lowest loop ID no disk holds, or the hard
-address the guest asks for. The disks report the machine-wide disk identity in
-INQUIRY, as a `[scsi.N]` disk does.
+A loop disk is an `hdd` with the same options as one on a SCSI bus (`path`,
+`overlay`, `write_cache`). Only plain disks go on the loop. A disk with no
+slot goes on the first free SCSI target before it goes on a loop. The adapter
+takes the lowest loop ID no disk holds, or the hard address the guest asks for.
+The disks report the machine-wide disk identity in INQUIRY, as a SCSI disk
+does. `iris --list-slots` shows the loop's slots under the card.
 
-An unknown key in `[fibre_channel]` itself is an error, so a misspelt `slot`
-does not move the card without a word. A disk table, like a `[scsi.N]` table,
-ignores a key it does not know.
+Put the card behind a PCI-to-PCI bridge with a `pci_bridge` device and
+`at = "bridge/pci0/0"`.
 
-On Origin 3200 and Onyx 3000 the adapter is already fitted on the I-brick.
-Configure its disks with `[fibre_channel.disk.N]`; omit `board`, `slot` and
-`bridge`, which describe Octane option-board placement. See the
+On Origin 3200 and Onyx 3000 the adapter is already fitted on the I-brick, at
+`xio15/pci0/1`. Put its disks at `xio15/pci0/1/lN`. The I-brick's slots are
+`bus1-slot2`, `bus1-slot3` and `bus2-slot1`, `bus2-slot2` (the guide's
+labels; their PCI device numbers are inferred, and the adapter stands for
+`bus1-slot1`). They take PCI cards, not NVMe yet. See the
 [Origin 3200 guide](origin3200-ip35.md).
 
 ## What the guest sees

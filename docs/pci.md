@@ -106,9 +106,10 @@ device `d` reach pin `d`, B and D reach `d ^ 4`: inferred from software, not
 established. `BoardIrq(i)` is pin `i`, shared with the GPIO inputs; the IOC3's
 SuperIO interrupt is `BoardIrq(4)`, and pins 6 and 7 carry the power switch and
 AC-fail inputs. Devices 0 and 1 are the ISP1040s, 2 is the IOC3, 3 is the RAD1
-(no interrupt), 5 is virtio-9p (INTA, pin 5) and 7 virtio-serial on INTB, which
-reaches pin 3; slot 4, whose INTA is the SuperIO pin, stays empty
-(`bridge_slot` moves the virtio devices within 4 to 7).
+(no interrupt). Devices 5 to 7 are the extra slots virtio takes, in the order 7, 5,
+6: a device at 7 is on INTB, which reaches pin 3, and the others on INTA. Device 4
+is no slot, since its INTA is the SuperIO pin: a slot may share no pin with a
+built-in part or the SuperIO interrupt, which every board table is checked for.
 
 ## Octane windows
 
@@ -135,15 +136,23 @@ expects when it sizes it.
 An Octane takes boards that put a PCI bus on a spare XIO slot. Each is a
 Bridge (the onboard one's model) on its own Crossbow port, with its own bus,
 interrupt pins to HEART and DMA through the Crossbow's live links.
-`[[xio_board]]` fits them:
+`pci_shoehorn` and `pci_cage` devices fit them, and a card goes in a slot by `at`:
 
 ```toml
-[[xio_board]]
-kind = "pci-shoehorn"    # one slot, PCI device 1
-# widget = 10            # a shoehorn's XIO slot, 9 to 12; unset: 10, then 12, 9, 11
+[[devices]]
+type = "pci_shoehorn"    # one slot, PCI device 1
+name = "shoe"
+at   = "slot_d"          # a shoehorn's XIO slot, xio9 to xio12 (aliases slot_a to slot_d); left out, the first free
 
-[[xio_board]]
-kind = "pci-cage"        # the Octane PCI module: three slots, PCI devices 1 to 3, port 13
+[[devices]]
+type = "pci_cage"        # the Octane PCI module: three slots, PCI devices 1 to 3, port 13
+name = "cage"
+at   = "pci_module"      # alias of xio13
+
+[[devices]]
+type = "nvme"
+at   = "cage/pci0/2"     # or "cage/pci0": the first free slot
+path = "nvme.img"
 ```
 
 The shoehorn is the single-slot XIO-to-PCI adapter: Bridge revision 4, one

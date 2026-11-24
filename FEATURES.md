@@ -267,9 +267,7 @@ The keys in the sections below, down to `[onyx3000]`, and those of
 machine has beyond the shared keys. Write them in `[machine]`; a key the
 profile does not have is refused. Two are named differently there: `nodes`
 (also accepted as `c_bricks`) is the node boards of an Origin 2000 or Onyx2 and
-the C-bricks of an Origin 3200 or Onyx 3000, and `audio_card` is the `audio`
-key of the Tezro, Fuel, Origin 3200 and Onyx 3000 tables, which fits the
-ICE1724 audio card. The tables named for a machine are the older spelling. They are
+the C-bricks of an Origin 3200 or Onyx 3000. The tables named for a machine are the older spelling. They are
 still read, a `[machine]` key wins over the same key there, and a config saved
 by iris-gui writes `[machine]`.
 
@@ -350,7 +348,7 @@ Origin 3200 settings apply when `machine.profile = "origin3200_ip35"`.
 
 `banks` is per C-brick and defaults to two 256 MiB banks; 256 and 512 MiB banks
 are accepted, in the matched pairs a lane of the memory controller holds. The I-brick's Fibre Channel
-adapter is always fitted; its disks are `[fibre_channel.disk.N]`. A `[origin3200]` table is
+adapter is always fitted; its disks are `hdd` devices at `xio15/pci0/1/lN`. A `[origin3200]` table is
 written to a saved config only when one of these keys is set. See the
 [Origin 3200 guide](docs/origin3200-ip35.md), which lists its limits.
 
@@ -368,10 +366,7 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 | Key | Default | Values and behavior |
 |---|---|---|
 | `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none. `ir2` and `ir2:2rm` are the Onyx2 deskside's InfiniteReality2 pipe with one or two raster managers; `ir2e` and `ir2e:2rm` are the InfiniteReality2E (GE16-4, RM9, 64 MB texture per raster manager), which also fits the deskside. The Onyx2 takes only the first four or `none`; the default is `none`. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI), `v6`, `v8`, `v10`, `v12` (the VPro boards, also `vpro:v12` and so on; need an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision) or `none` (no board: the machine runs on its serial console, with no window). The Fuel takes `v12` or `v10` in its graphics slot, or `none`, its default. The Tezro takes `v12` at widget 12, or `none`, its default. The Onyx 3000 (`onyx3000_ip35`) takes `ir3`, its default, an InfiniteReality3 pipe on a G-brick at widget 11 of the I-brick, or `v12`, on a V-brick with a second C-brick (widget 8, an approximation) or with one C-brick at widget 11 of the I-brick; it has no `none`. |
-| `graphics.node` | the machine's placement | Onyx 3000: the C-brick (0 or 1) whose XIO link reaches the graphics board. Unset, a pipe is on the first and a V12 on the last. On node 0 the board is at the I-brick's port B; on node 1 it is in a brick of that C-brick's own. Other machines refuse a value other than 0. |
-| `graphics.widget` | the machine's placement | The Crosstalk widget the board answers at, for experiment. Onyx 3000: 11 on node 0; 8, 9, 11, 12 or 13 in a brick on node 1 (unset: 8 for a V12, 11 for a pipe). Tezro: 8, 9, 12, 13 or 14 (unset: 12, the only one known to work). Other machines refuse it. |
 | `graphics.flash` | unset | InfiniteReality2: the file that keeps the pipe's 512 KiB flash EEPROM between runs; created when absent. Unset keeps it in memory. |
-| `graphics.heads` | `1` | 1 or 2; dual-head requires Newport. The second head takes GIO expansion slot 0, so `ultra64` is turned off and `test_device` is refused. |
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 | `graphics.threads` | `2` | Worker threads the board's fragment pipeline draws on, at least 1. VPro and InfiniteReality: the screen tiles' owners, besides its front-end and raster threads; more help on a host with cores to spare. |
 | `graphics.tile` | `32` | VPro and InfiniteReality: the fragment pipeline's screen tile size in pixels, a power of two from 8 to 256. Each tile's work runs in order on one worker at a time; with many threads, 64 can be faster. |
@@ -383,30 +378,54 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 
 ### [[devices]]
 
-| Key | Default | Values and behavior |
-|---|---|---|
-| `scsi.<ID>.path` | `""` | Disk/CHD/ISO path; empty CD-ROM means an empty tray. A CD-ROM may also be an `http://` or `https://` URL (`http-media`, [STORAGE.md](STORAGE.md#cd-rom-images-over-http)). |
-| `scsi.<ID>.discs` | `[]` | Additional CD changer images (paths or `http(s)://` URLs). |
-| `scsi.<ID>.cdrom` | `false` | Legacy spelling for kind=cdrom. |
-| `scsi.<ID>.kind` | `disk` | disk, cdrom, daynaport; serialized key is kind. A DaynaPort is refused on the machines with built-in Ethernet only (the O2, the Origin 200, Origin 2000 and Onyx2, the Fuel and the Tezro) and with `network.mode = "stream"`. |
-| `scsi.<ID>.mac` | `00:80:19:44:50:<SCSI ID> when unset` | DaynaPort-only station MAC. |
-| `scsi.<ID>.subnet` | `192.168.10.0/24 when unset` | DaynaPort NAT network; separate from ec0. |
-| `scsi.<ID>.overlay` | `false` | COW sidecar: a raw image's overlay `PATH.overlay`, or a CHD's `.diff.chd` kept until `cow commit` (a compressed CHD gets a diff without it). One emulator at a time can use an overlay: a second is refused at start-up (the lock is on `PATH.overlay.lock`). A `--ci` run keeps its own overlay in the temporary directory. See [STORAGE.md](STORAGE.md). |
-| `scsi.<ID>.write_cache` | `true` | Hard disks: report a write cache, so a write completes once the host has it and a sync follows within about 5 s; `false` stores every write on the host's disk first. See STORAGE.md. |
-| `scsi.<ID>.scratch` | `false` | Host-managed raw scratch volume; cannot be CD-ROM/overlay. |
-| `scsi.<ID>.size_mb` | `64 when unset` | Size of a newly created scratch image; existing files are unchanged. |
-| `scsi.<ID>.controller` | `0` | 0 or 1; controller 1 is accepted on the machines with two SCSI controllers: indigo2_ip22, o2_ip32 (the external bus), octane_ip30 (the external bus), the Origin 200, Origin 2000 and Onyx2, fuel_ip34 and tezro_ip53. A key of 16 + ID names controller 1 directly and does not need it. |
+Disks, CD-ROMs and the cards that go in a machine are `[[devices]]` entries, the same on every machine.
+Each has a `type`, an optional `at` (where it goes) and optional `name` (a local alias for that slot, so
+`at = "cage/pci0"` starts from the device named `cage`), then the type's own keys. A name uses lowercase
+letters, digits, `_` and `-`, and must not look like a slot (`pci2`, `xio15`, `t1`) or shadow a machine alias.
 
-IDs are 1–7, or 1–15 on the wide buses of the Octane, the Origin 200, Origin
-2000 and Onyx2, the Fuel and the Tezro. The Origin 3200 and Onyx 3000 take no
-`[scsi.N]` tables: their disks are `[fibre_channel.disk.N]`. The key is a
-slot: `[scsi.N]` with N 1–15 is id N on controller 0 (or on `controller`,
-when set), and N = 16 + id is that id on controller 1,
-so both controllers can carry the same id; two tables naming one target are
-rejected. If `scsi` is entirely omitted, core defaults attach SCSI #1 as
-`scsi1.raw` and SCSI #4 as `cdrom4.iso`. An explicit map replaces that
-default map; missing slots are unattached. `kind = "daynaport"` needs no image.
-An explicit non-disk kind takes precedence over the legacy cdrom flag.
+`at` is a slot path: tagged hops separated by `/`, such as `xio15/pci0/0/t1` (target 1 of the Octane's first
+SCSI controller), `pci0/3` (the O2's PCI option slot) or `gio1`. Each machine also gives some slots
+aliases, such as `scsi0/t1`, `scsi1/t4`, `pci_slot`, `io2` or `bus1-slot2`. Left out, or naming a bus
+(`xio13/pci0`), `at` picks the first free slot that fits: devices with a full slot claim first, then
+those that name a bus, then the rest, each in file order. A SCSI disk with no slot takes the first free
+target. `iris --list-slots` prints every slot of a machine with its aliases, what is in it and what it
+takes; `--device [NAME:]TYPE[@SLOT][,KEY=VALUE]...` adds or replaces one from the command line.
+
+| `type` | Goes in | Keys |
+|---|---|---|
+| `hdd` | a SCSI target, or a Fibre Channel loop ID | `path` (raw or CHD), `overlay` (copy-on-write sidecar `PATH.overlay`, or a CHD's `.diff.chd`; one emulator at a time can use it, and a `--ci` run keeps its own in the temporary directory; see [STORAGE.md](STORAGE.md)), `write_cache` (default `true`: a write completes once the host has it and a sync follows within about 5 s; `false` stores every write first), `scratch` (a host-managed raw volume; no overlay) and `size_mb` (64 when unset, for a new scratch image) |
+| `cdrom` | a SCSI target | `path` (a file, or an `http://` or `https://` URL, [STORAGE.md](STORAGE.md#cd-rom-images-over-http); empty means an empty tray), `discs` (more changer images), `overlay` |
+| `daynaport` | a SCSI target | `mac` (`00:80:19:44:50:<target>` when unset), `subnet` (`192.168.10.0/24` when unset, separate from ec0's). Refused on the machines with built-in Ethernet only (the O2, the Origin 200, Origin 2000 and Onyx2, the Fuel and the Tezro) and with `network.mode = "stream"`. |
+| `nvme` | a PCI slot | `path` (raw or CHD, at most 2 TiB), `overlay`, `write_cache` (as for `hdd`). An NVM Express controller with one namespace; any number per machine; see [docs/nvme.md](docs/nvme.md). |
+| `qla2200` | a PCI slot | A QLogic ISP2200 Fibre Channel adapter; its disks are `hdd` entries at `CARD/lN`, N the loop ID 0 to 125. The Origin 3200 and Onyx 3000 have one fitted at `xio15/pci0/1`. See [docs/fibre-channel.md](docs/fibre-channel.md). |
+| `ice1724` | a PCI slot | The IC Ensemble ICE1724 audio card; plays as `[audio]` sets. |
+| `pci_cage`, `pci_shoehorn` | an Octane XIO slot (`xio9` to `xio13`; the cage at `xio13`, alias `pci_module`) | The PCI module (slots 1 to 3) and the single-slot XIO-to-PCI adapter; see [docs/pci.md](docs/pci.md#option-boards-in-xio-slots). |
+| `pci_bridge` | a PCI slot | A PCI-to-PCI bridge, with one slot behind it at `BRIDGE/pci0/0`. |
+| `virtio_serial` | a spare slot (a GIO slot on the Indy and Indigo2) | `port` tables, `[[devices.port]]`, at most 31: `name`, `console`, and `tcp_port` (raw TCP on 127.0.0.1) or `socket` (a Unix socket, exclusive with `tcp_port`); one console on TCP 8890 when none. See [docs/dev/virtio-serial.md](docs/dev/virtio-serial.md). |
+| `virtio_9p` | a spare slot | `path` (required), `tag` (`"share"`), `readonly`, `owners` (`"squash"` or `"passthrough"`), `uid`, `gid`, `uid_map`, `gid_map`. Needs a Unix host; see [docs/dev/virtio-9p.md](docs/dev/virtio-9p.md). |
+| `ultra64`, `test_device`, `newport` | `gio0` | The N64 development board (needs an external gopher64 peer), the bare-metal test device (`dump`, `run_config` as `time_pct=N,repeats=N,groups=MASK`; with `cheritest_dump_hook`) and the Indy's or Indigo2's second Newport head. |
+| `graphics` | a graphics port or slot (`gfx`, `xio11`, `node1/xio8`) | Where the board goes; which board it is stays `[graphics] board`. Left out, the machine places it. |
+
+virtio devices take only the spare slots a board has for them, never a real slot (the Octane's Bridge
+devices 7, 5, 4 and 6, the O2's PCI device 4, the Fuel's and I-brick's second bus, the Tezro's IO9 bus
+1); `at` can name any slot. A snapshot records each device at its slot: see [Snapshots](#snapshots).
+
+#### Old keys
+
+The keys iris wrote before `[[devices]]` still load, each with a warning saying what it became, and will be
+removed in a later release: `[scsi.N]` tables (with `controller`, `kind` and `cdrom`), `[ultra64]`,
+`[virtio_serial]` and `[virtio_9p]` (with `slot` and `bridge_slot`), `[nvme]`, `[[xio_board]]`,
+`[fibre_channel]`, `[machine] audio_card`, `[graphics] node` and `widget`, `graphics.heads = 2`,
+`test_device` and its two companions, and the command-line `--scsi1`/`--cdrom4` family and
+`--test-device`.
+
+### Snapshots
+
+A snapshot names every disk, overlay and card by its slot, so any number of NVMe and audio
+cards work. Saving a machine writes each device's slot into the manifest; a restore refuses a device that
+sits at another slot in this machine and says which `at` keeps it, and one added to the config afterwards
+is refused too, since the saved bus has no slot for it. A snapshot of a machine with a virtio device is refused. Snapshots from before slots
+(schema 10 and older) are refused.
 
 ### [network]
 
@@ -521,77 +540,6 @@ clock has drifted. An Octane's NVRAM file with no `.clock` beside it opens
 in QEMU at the time of its last save, since QEMU then takes the image's
 calendar without adding the time since.
 
-### [ultra64]
-
-| Key | Default | Values and behavior |
-|---|---|---|
-| `ultra64.enabled` | `false` | Enable the GIO N64 development board; requires an external gopher64 peer. |
-
-### [virtio_9p]
-
-A host directory the guest mounts, as 9P2000.L over virtio; see
-[docs/dev/virtio-9p.md](docs/dev/virtio-9p.md). For guests that carry a driver.
-Needs a Unix host.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `virtio_9p.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
-| `virtio_9p.slot` | `"exp1"` | `"exp0"` or `"exp1"`, as for `virtio_serial`, and not the slot that device has. Indy and Indigo2 only. |
-| `virtio_9p.bridge_slot` | `5` | The Octane's onboard Bridge slot, 4 to 7, and not the one virtio-serial has. Octane only. |
-| `virtio_9p.path` | required | The host directory. |
-| `virtio_9p.tag` | `"share"` | The name the guest mounts it by; 1 to 64 bytes. |
-| `virtio_9p.readonly` | `false` | Refuse every write from the guest. |
-| `virtio_9p.owners` | `"squash"` | `"squash"`: every file reports `uid`/`gid`, and a guest chown has no effect. `"passthrough"`: the host file's own owner is reported through `uid_map`/`gid_map`, and a guest chown, or the owner the driver gives a new entry, is made on the host; iris must be allowed to chown (root, or CAP_CHOWN). |
-| `virtio_9p.uid`, `virtio_9p.gid` | `0` | With `squash`, the owner every file reports to the guest. With `passthrough`, what an owner without a mapping shows as, and what a new entry belongs to until the driver says otherwise. |
-| `virtio_9p.uid_map`, `virtio_9p.gid_map` | `""` | With `passthrough` only: guest ids to host ids, `"guest:host[:count],..."`, for example `"0:1000,1000:1001:5"`. Empty maps an id to itself. |
-
-### [virtio_serial]
-
-virtio-console / virtio-serial for guests that carry a driver; see
-[docs/dev/virtio-serial.md](docs/dev/virtio-serial.md). Each `[[virtio_serial.port]]`
-table adds a port, in order.
-
-| Key | Default | Values and behavior |
-|---|---|---|
-| `virtio_serial.enabled` | `false` | Present the device. On the Indy and Indigo2 it sits in a GIO expansion slot; on the Octane, on the PCI Bridge; on the Tezro, on the IO9's PCI bus. Refused on the other machines. |
-| `virtio_serial.slot` | `"exp1"` | `"exp0"` (`0x1F400000`, shared with `test_device`, Ultra64 and the second Newport head) or `"exp1"` (`0x1F600000`). Indy and Indigo2 only. |
-| `virtio_serial.bridge_slot` | `7` | The Octane's onboard Bridge slot, 4 to 7. Octane only. In slot 7 the device raises INTB (Bridge pin 3), elsewhere INTA. Keep slot 4 empty: its INTA is the IOC3's SuperIO pin, and OpenBSD's `ioc` driver takes the SuperIO interrupt (the serial console) from the first empty slot's pin. |
-| `virtio_serial.port` | one console on TCP 8890 | Array of ports (at most 31). |
-| `port.name` | none | Name the guest sees (`/dev/virtio-ports/<name>` on Linux); 1 to 200 bytes, unique. |
-| `port.console` | `false` | Tell the guest this port is its console. |
-| `port.tcp_port` | none | Serve the port as raw TCP on 127.0.0.1 (no telnet). Exclusive with `socket`. |
-| `port.socket` | none | Serve the port on a raw Unix socket at this path. |
-
-### [nvme]
-
-An NVM Express controller with one namespace; see [docs/nvme.md](docs/nvme.md).
-O2 and Octane only; on the Octane it sits in a slot of an `[[xio_board]]`.
-
-| Key | Default | Values and behavior |
-|---|---|---|
-| `nvme.path` | none | Disk image for the namespace (raw or CHD, at most 2 TiB). The card is present when this is set. |
-| `nvme.overlay` | `false` | Copy-on-write: writes go to `PATH.overlay`, as for `[scsi.N]`. |
-| `nvme.write_cache` | `true` | The volatile write cache the disk powers up with, as `write_cache` for `[scsi.N]`. On, a write is acknowledged once the disk layer has it and synced within about 5 s; off, each write is stored first. Flush and FUA always store. The guest can change it with Set Features. |
-| `nvme.bridge` | `false` | Put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
-| `nvme.board` | `0` | Octane: which `[[xio_board]]` table holds the card, counting from 0. Refused on the O2. |
-| `nvme.slot` | first free | Octane: the board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). Refused on the O2. |
-
-### [fibre_channel]
-
-A QLogic ISP2200 Fibre Channel adapter with a private loop of disks; see
-[docs/fibre-channel.md](docs/fibre-channel.md). On the Octane it sits in a slot of
-an `[[xio_board]]`; on the Origin 3200 and Onyx 3000 it is the I-brick's own
-adapter, always fitted, and `board`, `slot` and `bridge` are refused. Other
-machines refuse the section. The section is the card; its disks are
-`[fibre_channel.disk.N]` tables, `N` the loop ID (0 to 125).
-
-| Key | Default | Values and behavior |
-|---|---|---|
-| `fibre_channel.bridge` | `false` | Octane: put the card behind a PCI-to-PCI bridge in the slot, instead of in the slot. |
-| `fibre_channel.board` | `0` | Octane: which `[[xio_board]]` table holds the card, counting from 0. |
-| `fibre_channel.slot` | first free | Octane: the board's slot, its PCI device number (the PCI module 1 to 3, a shoehorn 1). |
-| `fibre_channel.disk.N.*` | none | A `[scsi.N]` disk table (`path`, `overlay`, `write_cache`, ...) at loop ID `N`. Plain disks only. |
-
 ### [o2]
 
 Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
@@ -626,8 +574,7 @@ DS1685's NVRAM, behind IOC3, its clock in `<nvram>.clock`), `banks` (the MB in e
 512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
 `headless`, `[clock] fixed_mhz` (CP0 Count; 97.5 for the 195 MHz R10000),
-`[network]`, `[[port_forward]]`, `nat_subnet`, `[scsi.N]` (`controller` 0
-is the internal bus, 1 the external) and `[graphics] board`. See [the Octane guide](docs/octane-ip30.md).
+`[network]`, `[[port_forward]]`, `nat_subnet`, `[[devices]]` (`scsi0` is the internal bus, `scsi1` the external) and `[graphics] board`. See [the Octane guide](docs/octane-ip30.md).
 
 | Key | Default | Values and behavior |
 |---|---|---|
@@ -635,17 +582,6 @@ is the internal bus, 1 the external) and `[graphics] board`. See [the Octane gui
 
 `octane.graphics` is retired: a config that still has it is refused with a
 message naming `[graphics] board`, where the board is now set.
-
-### [[xio_board]]
-
-An option board in one of the Octane's XIO slots, each with a Bridge and a PCI
-bus of its own; see [docs/pci.md](docs/pci.md#option-boards-in-xio-slots).
-Octane only. The array takes one table per board.
-
-| Key | Default | Values and behavior |
-|---|---|---|
-| `xio_board.kind` | required | `"pci-shoehorn"`: the single-slot XIO-to-PCI adapter, its slot PCI device 1. `"pci-cage"`: the Octane PCI module, slots at PCI devices 1 to 3. |
-| `xio_board.widget` | cage 13; shoehorn the first free of 10, 12, 9, 11 | The XIO slot, Crossbow port: 9 to 12 for a shoehorn, 13 for the module. Not the one the graphics board is in (11 with `[graphics] board` set), and no two boards share one. |
 
 ### Hardware constraints and precedence
 
@@ -710,7 +646,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--validate` | Check the configuration (parse, settings, files, directories, ports) without starting the machine; exit 0 or 1. See [HELP.md](HELP.md#checking-a-configuration). |
 | `--list-net-interfaces` | Print the host network interfaces libpcap can bridge onto, then exit. Requires a build with --features pcap. |
 | `--no-scsi-deferred-int` | Disable deferred SCSI status interrupts (default: enabled for OpenBSD/NetBSD compatibility). |
-| `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `[scsi.N]` and in `[nvme]`): slower, but a host crash loses no completed write. |
+| `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `hdd` and `nvme` device): slower, but a host crash loses no completed write. |
 | `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`. |
 | `--cache MODEL` | Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`), `full` or `shadow`. Overrides `[machine] cache`. The R10000 family is always `shadow`. |
 | `--graphics` | Graphics board: `newport` (default), `xz` (2 GE7 on Indigo2, 4 on Indy), `elan` (4 GE7, Indigo2), `extreme` (8 GE7, Indigo2), `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel, `v12` on the Tezro and Onyx 3000), `ir2`, `ir2:2rm`, `ir2e`, `ir2e:2rm` (Onyx2), `ir3` (Onyx 3000) or `none`. Overrides `[graphics] board`. |
@@ -725,10 +661,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--serial-socket-a`, `--serial-socket-b` | Also serve channel A or B on a Unix socket. |
 | `--keyboard LAYOUT` | Physical host keyboard: `ansi` (default), `iso` or `jis`. Use `jis` for a Japanese keyboard with the PROM's `keybd` set to JP. Sets `keyboard`. |
 | `--serial-log-a`, `--serial-log-b` | Log what the guest sends on channel A or B when it is not the console. |
-| `--test-device` | Map the bare-metal test device into GIO expansion slot 0: SIGNATURE, PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT (terminate with the guest's exit code). Off by default. |
-| `--test-device-dump` | Where the test device writes its machine-state dump. |
-| `--test-device-run-config` | Ask a bare-metal guest for a shorter run through the test device: `time_pct=N,repeats=N,groups=MASK`, any of them (`test_device_run_config`). Needs --test-device. |
-| `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs --test-device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
+| `--device test_device@gio0` | Map the bare-metal test device into GIO expansion slot 0: SIGNATURE, PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT (terminate with the guest's exit code). Off by default. Its `dump` key says where the machine-state dump goes; `run_config` asks a bare-metal guest for a shorter run, as `time_pct=N,repeats=N,groups=MASK`, any of them. |
+| `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs a `test_device` device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
 | `--tftp-dir` | Serve this directory read-only over TFTP at the gateway address, so the PROM can network-boot from it: `boot -f bootp()<file>`. Off when unset. |
 | `--rsh-dir` | Let the guest `rsh <gateway> cat\|dd\|ls\|echo\|pwd` against this directory, read-only, through a built-in rsh server at the gateway (TCP 514). Nothing is executed on the host. Off when unset. |
 | `--perfetto FILE` | Record a Perfetto trace from startup (`perfetto` builds). `--perfetto-cats LIST` (default `all`) and `--perfetto-clock host\|guest` (default `host`) select what and on which timeline. See [docs/perfetto.md](docs/perfetto.md). |

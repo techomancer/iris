@@ -747,11 +747,15 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 # ── Disks, CD-ROMs and cards ─────────────────────────────────────────────────
 
-# Valid IDs: 1–7 (1–15 on the Octane). For a hard disk, set cdrom = false. On a machine with two
-# controllers (Indigo2, O2) [scsi.N] is id N on controller 0 and [scsi.16+N]
-# is id N on controller 1, so one id can be used on both; `controller = 1`
-# in a [scsi.N] table does the same for that one device.
-[scsi.1]
+# Each is a [[devices]] entry: a type, where it goes (`at`) and the type's own options.
+# `at` is a slot: scsi0/t1 is target 1 of the first SCSI controller, scsi1/t4 target 4
+# of the second (the Indigo2 and O2 have two), gio0 a GIO slot, or a full path such as
+# xio15/pci0/0/t1. Left out, a device takes the first free slot that fits, in file
+# order. `iris --list-slots` prints every slot on the machine, its aliases, what is in it and
+# what it takes. Valid targets: 1–7 (1–15 on the Octane); the controller is target 0.
+[[devices]]
+type    = "hdd"
+at      = "scsi0/t1"
 path    = "scsi1.raw"       # raw or .chd image
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
 # write_cache = true        # the disk's write cache (default true). true: a write completes once the host has it and a sync follows within ~5 s, so a host crash or
@@ -815,23 +819,25 @@ prebuf_ms = 20              # sound held before playing: the margin against a la
 # channels = 2              # speakers for the Tezro's multichannel card: 2, 4, 6 or 8
 # file = "out.wav"          # play into a WAV file instead of a sound card
 
-# [ultra64]                 # N64 dev board
-# enabled = true
-
-# [virtio_serial]           # Indy, Indigo2, Octane, Tezro: byte channels for a guest with a driver (docs/dev/virtio-serial.md)
-# enabled = true
-# [virtio_9p]               # Indy, Indigo2, Octane, Tezro: a host directory the guest mounts (docs/dev/virtio-9p.md)
-# enabled = true
+# Cards go in the same list. Left without `at`, a virtio device takes a spare slot the
+# board has for it, and a PCI card the first real slot.
+# [[devices]]                # N64 dev board in a GIO slot (Indy, Indigo2)
+# type = "ultra64"
+# at   = "gio0"
+# [[devices]]                # byte channels for a guest with a driver (docs/dev/virtio-serial.md)
+# type = "virtio_serial"
+# [[devices]]                # a host directory the guest mounts (docs/dev/virtio-9p.md)
+# type = "virtio_9p"
 # path = "shared"
+# [[devices]]                # NVMe controller and the ICE1724 audio card in a PCI slot (docs/nvme.md, docs/pci.md)
+# type = "nvme"
+# path = "nvme.raw"
 
 # What one machine has beyond these keys also goes in [machine] and is described in
-# its guide in docs/: for example nodes = 2 (C-bricks or node boards), flash, console,
-# usb_input = true (the Fuel's USB keyboard and mouse) and audio_card = true (the ICE1724
-# audio card of the Tezro, Fuel, Origin 3200 and Onyx 3000).
-# The older tables named for a machine ([o2], [octane], [origin200], [origin2000],
-# [onyx2], [fuel], [tezro], [origin3200], [onyx3000]) are still read.
-# [graphics] node and widget say where the graphics board plugs in on the Onyx 3000
-# (and widget on the Tezro); left out, the machine places it.
+# its guide in docs/: for example nodes = 2 (C-bricks or node boards), flash, console
+# and usb_input = true (the Fuel's USB keyboard and mouse).
+# The graphics board's slot is a device too: type = "graphics" and `at` (xio11, node1/xio8 on the Onyx 3000);
+# left out, the machine places it. Which board it is stays [graphics] board.
 
 # ── Host tuning and debugging ────────────────────────────────────────────────
 
@@ -875,10 +881,22 @@ The controller itself is target 0. The Indigo2 and the O2 have two controllers,
 `scsi1/t1` are different disks. The monitor's `scsi1` addresses the second
 controller.
 
-On the Octane the internal bus (controller 0) has three drive bays, and the
-PROM and IRIX look for devices on it only at ids 1–3. Put a CD-ROM, and any
-fourth disk, on the external bus: `controller = 1`, or `[scsi.20]` for id 4
-there. iris warns at start-up about a device it will never find.
+On the Octane the internal bus (`scsi0`) has three drive bays, and the PROM and
+IRIX look for devices on it only at targets 1–3. Put a CD-ROM, and any fourth
+disk, on the external bus: `scsi1/t4`. iris warns at start-up about a device it
+will never find.
+
+### Old keys
+
+The keys iris wrote before `[[devices]]` still load, with a warning that says
+what each became, and will be removed in a later release. `[scsi.N]` tables
+(`[scsi.17]` is target 1 of `scsi1`), `controller`, `kind` and `cdrom` in them,
+`[ultra64]`, `[virtio_serial]` and `[virtio_9p]` with their `slot` and
+`bridge_slot`, `[nvme]`, `[[xio_board]]`, `[fibre_channel]`, `[machine]
+audio_card`, `[graphics] node` and `widget`, `graphics.heads = 2` and
+`test_device` become `[[devices]]` entries; the command-line `--scsi1`, `--cdrom4`
+and `--test-device` and their relatives become `--device` overrides. Snapshots
+from before this change are refused.
 
 ---
 
@@ -978,10 +996,8 @@ Automation and debugging
   --perfetto <FILE>           Record a Perfetto trace from startup (--features perfetto);
                               --perfetto-cats and --perfetto-clock as for the monitor's perfetto start
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry
-  --test-device               Map the bare-metal test device into GIO slot 0
-  --test-device-dump <FILE>   Where its machine-state dump goes
-  --test-device-run-config <FIELDS>
-                              Ask the guest for a shorter run (time_pct=N,repeats=N)
+  --device test_device@gio0   Map the bare-metal test device into GIO slot 0; its `dump` and
+                              `run_config` (time_pct=N,repeats=N) keys say where it dumps and how long it runs
   --cheritest-dump-hook       CP0 register 26 writes trigger a dump (tests only)
 
   -h, --help                  Print help
@@ -1067,8 +1083,9 @@ development board IPC bridge.  The IRIS-compatible fork lives at:
 1. Enable the dev board in `iris.toml` and start IRIS:
 
    ```toml
-   [ultra64]
-   enabled = true
+   [[devices]]
+   type = "ultra64"
+   at   = "gio0"
    ```
 
    The board is built into every IRIS binary; without the device no
