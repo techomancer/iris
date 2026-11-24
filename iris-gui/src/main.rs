@@ -298,7 +298,7 @@ struct App {
     /// egui texture holding the most recent REX3 framebuffer. Allocated
     /// lazily on the first frame that needs it.
     fb_tex: Option<egui::TextureHandle>,
-    /// Second Newport head when `graphics.heads == 2`.
+    /// Second Newport head, when one is fitted.
     fb_tex_head1: Option<egui::TextureHandle>,
     /// Sequence number of the last frame we uploaded; used to skip the
     /// upload when the renderer hasn't produced a new frame.
@@ -2028,7 +2028,7 @@ impl App {
     /// Draw the live REX3 framebuffer as an egui image, scaled to fit
     /// the available area while preserving aspect ratio.
     fn framebuffer_panel(&mut self, ui: &mut egui::Ui) {
-        if self.cfg.graphics.heads == 2 {
+        if self.cfg.has_device("newport") {
             self.framebuffer_panel_dual(ui);
             return;
         }
@@ -2924,7 +2924,7 @@ impl App {
         if !self.show_ultra64_help {
             return;
         }
-        let enabled = self.cfg.ultra64.enabled;
+        let enabled = self.cfg.has_device("ultra64");
 
         let mut open = true;
         egui::Window::new(t!("help-ultra64-title"))

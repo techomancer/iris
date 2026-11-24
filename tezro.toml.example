@@ -28,10 +28,6 @@ cpus = 4
 flash = "ignore/tezro/flash.bin"
 console = "l1"
 l1_port = 18882
-# Add the ICE1724 audio controller behind the IO9's PCI bridge (default false).
-# It plays as [audio] sets (unset no_audio for sound); [audio] channels = 2, 4,
-# 6 or 8 is how many speakers its channels fold down to.
-# audio_card = true
 
 [graphics]
 board = "none"
@@ -48,14 +44,21 @@ path = "ignore/tezro/irix.raw"
 overlay = true
 # write_cache = false  # default true. false stores every write before it completes, like SGI's drives (slower); true can lose ~5 s of writes in a host crash. See STORAGE.md
 
+# Optional: the ICE1724 audio controller behind the IO9's PCI bridge. It plays
+# as [audio] sets (unset no_audio for sound); [audio] channels = 2, 4, 6 or 8 is
+# how many speakers its channels fold down to.
+# [[devices]]
+# type = "ice1724"
+# at   = "xio15/pci0/2/pci0/2"
+
 # Optional, on the IO9's PCI bus, for a guest with drivers for them:
 # a virtio-serial port (docs/dev/virtio-serial.md) and a host directory the
-# guest mounts (docs/dev/virtio-9p.md).
-# [virtio_serial]
-# enabled = true
-# [[virtio_serial.port]]
+# guest mounts (docs/dev/virtio-9p.md). They take the bus's spare slots.
+# [[devices]]
+# type = "virtio_serial"
+# [[devices.port]]
 # tcp_port = 8890
-# [virtio_9p]
-# enabled = true
-# path    = "ignore/tezro/share"
+# [[devices]]
+# type = "virtio_9p"
+# path = "ignore/tezro/share"
 # tag     = "share"

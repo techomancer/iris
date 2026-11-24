@@ -661,11 +661,10 @@ mod tests {
         let card = crate::dev::nvme::Card::open(&crate::config::NvmeConfig {
             path: img.to_string_lossy().into_owned(),
             overlay: false,
-            bridge,
             ..Default::default()
         })
         .unwrap();
-        card.attach(pci.bus(), IP32_OPTION_SLOT);
+        crate::dev::nvme::tests::attach(&card, pci.bus(), IP32_OPTION_SLOT, bridge);
         let cycle = |bus: u32, dev: u32, reg: u32, val: u32| {
             pci.write32(bridge_reg(macepci_reg::CONFIG_ADDR), cfg(bus << 16 | dev << 11, reg));
             pci.write32(bridge_reg(macepci_reg::CONFIG_DATA), val);

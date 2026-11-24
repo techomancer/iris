@@ -35,9 +35,9 @@ serial_port_b = $((port + 2))
 scsi = {}
 [machine]
 profile = "$profile"
-[graphics]
-board = "none"
 EOT
+# Only the Octane has a graphics board to leave out.
+[ "$machine" = octane ] && printf '[graphics]\nboard = "none"\n' >> iris.toml
 "$bin" --config iris.toml > out.log 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT

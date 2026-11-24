@@ -3,7 +3,7 @@
 # iris --config origin3200.toml
 # The IP35 PROM (6.210) is built in; `prom` overrides it with a raw payload or a
 # version-six container. No disk images are included.
-# Disks hang off the I-brick's Fibre Channel adapter: [fibre_channel.disk.N], N the loop ID.
+# Disks hang off the I-brick's Fibre Channel adapter, at xio15/pci0/1/lN, N the loop ID.
 
 # prom = "ignore/origin3200/ip35prom.payload.bin"
 nvram = "ignore/origin3200/nvram.bin"
@@ -20,9 +20,6 @@ profile = "origin3200_ip35"
 nodes = 2
 console = "l1"
 l1_port = 18882
-# Fit the ICE1724 audio card in an I-brick PCI slot (default false). It plays as [audio]
-# sets; unset no_audio for sound.
-# audio_card = true
 
 [graphics]
 board = "none"
@@ -30,6 +27,14 @@ board = "none"
 [network]
 mode = "off"
 
-[fibre_channel.disk.1]
+[[devices]]
+type = "hdd"
+at = "xio15/pci0/1/l1"
 path = "ignore/origin3200/system.raw"
 overlay = true
+
+# Optional: the ICE1724 audio card in an I-brick PCI slot (bus1-slot2, bus1-slot3, bus2-slot1 or
+# bus2-slot2). It plays as [audio] sets; unset no_audio for sound.
+# [[devices]]
+# type = "ice1724"
+# at   = "bus1-slot2"

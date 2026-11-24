@@ -17,9 +17,9 @@ checked in one place. Nothing else decides whether a disk or card fits.
 - `ConfiguredDevice` (`src/devices.rs`): one `[[devices]]` entry: a
   `DeviceModel` (its type and options), an optional `at` and `name`, and a
   `default` flag for the disks a config gets when it names none.
-- `DevicePlacement`: which slot each device got, the machine's slots and the
-  PCI buses the constructor built. `new(cfg)` is strict; `lenient` gives an
-  editor each device's slot whatever else is wrong.
+- `DevicePlacement`: which slot each device got, the slots grown by what
+  devices brought, and the PCI buses the constructor built. `new(cfg)` is
+  strict; `lenient` gives an editor each device's slot whatever else is wrong.
 
 **Placement.** `at` is a slot path whose first step may be a machine alias or
 another entry's `name`. Devices claim in three passes, each in file order:
@@ -27,7 +27,9 @@ a full path to one slot, then a bus (`scsi1`), then no `at`, which takes the
 first free slot of its family in list order. A slot that does not exist, does
 not take the device or is already taken is an error naming the slot and the
 device; a device is never dropped. Only a default device that finds no room is
-left out.
+left out. A device with no slot yet may wait for one a later device brings (a PCI
+module's slots, a Fibre Channel loop). Spare `Extra` slots take virtio by
+default and a card only when it names them.
 
 **Giving a machine its slots.** Add `slots(s: &mut Vec<MachineSlot>)` beside
 the constructor and call it from `MachineProfile::slots`. It builds no hardware:

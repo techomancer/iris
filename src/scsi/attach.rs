@@ -16,6 +16,8 @@ use crate::topology::{scsi_buses, scsi_target, DevicePlacement};
 pub struct TableRef {
     /// The slot, controller * 16 + id (`config::scsi_slot`).
     pub slot: u8,
+    /// Where the disk is.
+    pub at: crate::slot_path::MachineSlotPath,
     pub is_cdrom: bool,
     pub path: String,
     /// The image's size on the host, 0 if it cannot be read.
@@ -114,6 +116,7 @@ pub fn attach_from_config(cfg: &MachineConfig, log_prefix: Option<&str>, resolve
         }
         out.tables.push(TableRef {
             slot: key,
+            at: at.clone(),
             is_cdrom: dev.is_cdrom(),
             path: dev.path.clone(),
             size_bytes: std::fs::metadata(&dev.path).map(|m| m.len()).unwrap_or(0),

@@ -1,8 +1,8 @@
 cpu_cache = "full"
 cpu_model = "R4400"
-created_at_unix = 1794437730
+created_at_unix = 1795423968
 features = ["tlbvmap"]
 host_arch = "x86_64"
 installed_bundles = []
 nvram = "nvram.bin"
-schema_version = 6
+schema_version = 11

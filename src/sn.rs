@@ -745,6 +745,20 @@ pub struct BoardIo {
     pub cpus: Option<Box<dyn Fn(&[Arc<dyn CpuDevice>]) + Send + Sync>>,
 }
 
+impl BoardIo {
+    /// Start, stop, reset and give commands to `cards` with the board's other devices.
+    pub fn with_cards(mut self, cards: &Arc<crate::devices::AttachedCards>) -> Self {
+        self.devices.extend(cards.devices());
+        self.monitor.extend(cards.devices());
+        let (reset, cards) = (std::mem::replace(&mut self.reset, Box::new(|| {})), cards.clone());
+        self.reset = Box::new(move || {
+            cards.power_on();
+            reset();
+        });
+        self
+    }
+}
+
 /// One IP27 or IP35 machine: its node boards, L1s, processors and board I/O. Each family builds it
 /// with its own `machine` function (`ip27.rs`, `ip35.rs`).
 pub struct Machine<C: Device + Resettable + 'static, F: Device + Resettable + 'static> {

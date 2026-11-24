@@ -262,7 +262,7 @@ fn the_io9_has_a_ti_bridge_with_an_empty_bus_at_device_2() {
     }
 }
 
-/// With `[tezro] audio`, the ICE1724 answers at device 2 of the TI bridge's secondary bus and
+/// With an `ice1724` entry, the ICE1724 answers at device 2 of the TI bridge's secondary bus and
 /// nowhere else on it, and its reset state is the DM8 board's; without it the bus stays empty.
 #[test]
 fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on() {
@@ -284,7 +284,7 @@ fn the_audio_controller_is_the_only_function_behind_the_bridge_when_audio_is_on(
         })
     };
     let mut silent = tezro_config(&dir, 1);
-    silent.tezro.audio = true;
+    silent.devices.push(crate::devices::ConfiguredDevice { at: None, ..crate::devices::ConfiguredDevice::new("", crate::devices::DeviceModel::Ice1724) });
     silent.no_audio = true;
     let (ids, [class, subsystem, interrupt], monitors, reports) = behind(silent);
     assert!(reports, "the monitor has an audio report with the card");
@@ -909,5 +909,22 @@ fn a_failed_nvram_save_is_an_error() {
         std::fs::remove_file(&nvram).unwrap();
         std::fs::create_dir(&nvram).unwrap();
         assert!((m.io.flush_nvram)().is_err(), "the save reported success");
+    });
+}
+
+/// virtio goes in the IO9 PIC's empty bus 1, devices 1 and 2, in entry order.
+#[cfg(unix)]
+#[test]
+fn virtio_takes_the_second_bus_of_the_io9() {
+    use crate::dev::pic::HEAD_OFFSET;
+    let dir = TempPath::dir("tezro-virtio");
+    let mut cfg = tezro_config(&dir, 1);
+    for text in ["type = \"virtio_serial\"", "type = \"virtio_9p\"\npath = \"/tmp\""] {
+        cfg.devices.push(crate::devices::ConfiguredDevice::from_table(toml::from_str(text).unwrap()).unwrap());
+    }
+    with_machine(cfg, |m| {
+        let io = Pio(m.nodes[0].chip.pio());
+        let id = |device: u64| io.pio_read(widget(15, HEAD_OFFSET + 0x2_0000 + (device << 12)), 4).data;
+        assert_eq!((id(1), id(2)), (0x1043_1af4, 0x1049_1af4));
     });
 }

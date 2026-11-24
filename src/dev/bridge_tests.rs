@@ -1879,7 +1879,6 @@ fn nvme_ready_follows_enable_through_every_lane_mode_and_width() {
         let card = crate::dev::nvme::Card::open(&crate::config::NvmeConfig {
             path: img.to_string_lossy().into_owned(),
             overlay: false,
-            bridge: false,
             ..Default::default()
         })
         .unwrap();

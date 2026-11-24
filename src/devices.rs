@@ -1,10 +1,21 @@
 //! `[[devices]]`: what a config places, and the device types it can name. An entry has a `type`, an optional `at` (a slot path,
 //! which may start with a machine alias or another entry's `name`), a `name` and the type's options; each type is one row of [`DEVICE_TYPES`].
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::config::{ScsiDeviceConfig, ScsiKind};
-use crate::topology::DeviceFamily;
+use std::sync::Arc;
+
+use crate::config::{MachineConfig, NvmeConfig, ScsiDeviceConfig, ScsiKind, Virtio9pConfig, VirtioSerialConfig};
+use crate::dev::ice1724::{Ice1724, Variant};
+use crate::dev::isp2200::{card::Loop, Isp2200};
+use crate::dev::nvme::Nvme;
+use crate::hptimer::TimerManager;
+use crate::dev::xio_pci::{Kind, CAGE_SLOTS, SHOEHORN_SLOTS};
+use crate::slot_path::MachineSlotPath;
+use crate::dev::virtio::pci::VirtioPci;
+use crate::pci::{DevFn, PciToPciBridge, PCI_INTA};
+use crate::topology::{loop_slots, pci_bus_slots, DeviceFamily, DevicePlacement, MachineSlot, MachineSlotKind};
 
 /// What a device is, with its options. A family step adds a variant here and
 /// its rows to [`DEVICE_TYPES`].
@@ -12,6 +23,40 @@ use crate::topology::DeviceFamily;
 pub enum DeviceModel {
     /// A target on a SCSI bus: `hdd`, `cdrom` or `daynaport`, by its kind.
     Scsi(ScsiDeviceConfig),
+    Nvme(NvmeConfig),
+    /// An XIO option board: the PCI shoehorn or the Octane's PCI module.
+    XioBoard(crate::dev::xio_pci::Kind),
+    /// A DEC 21154 PCI-to-PCI bridge in a slot, with one slot behind it.
+    PciBridge,
+    Ice1724,
+    Qla2200,
+    /// The N64 development board.
+    Ultra64,
+    /// The bare-metal harness's console, dump and exit register.
+    TestDevice(TestDeviceConfig),
+    /// A second Newport board, beside the one in the graphics slot.
+    Newport,
+    /// The machine's graphics board, which `[graphics] board` names; the entry says where it goes.
+    Graphics,
+    VirtioSerial(VirtioSerialConfig),
+    Virtio9p(Virtio9pConfig),
+}
+
+/// What the test device's run-configuration register publishes and where its
+/// DUMP register writes: `iris-testdev-dump.json` in the working directory
+/// when unset.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TestDeviceConfig {
+    pub dump: Option<String>,
+    /// As `time_pct=10,repeats=3`. Unset publishes 0, which the bare-metal
+    /// benchmark suite reads as "every kernel, full length".
+    pub run_config: Option<String>,
+}
+
+impl TestDeviceConfig {
+    pub fn run(&self) -> Result<crate::dev::testdev::RunConfig, String> {
+        self.run_config.as_deref().map_or(Ok(crate::dev::testdev::RunConfig::ALL), |s| s.parse().map_err(|e| format!("run_config {s:?}: {e}")))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -20,7 +65,7 @@ pub struct ConfiguredDevice {
     pub at: Option<String>,
     pub device: DeviceModel,
     /// One of the disks a config with none gets: placed after everything else and
-    /// dropped when it finds no slot. Never written to a file.
+    /// dropped when it finds no slot. Written like any entry, and read back as one.
     pub default: bool,
 }
 
@@ -30,14 +75,63 @@ pub struct DeviceTypeSpec {
     /// The option keys the type takes besides `type`, `name` and `at`.
     keys: &'static [&'static str],
     parse: fn(&DeviceTypeSpec, toml::Table) -> Result<DeviceModel, String>,
+    /// The slots a device of the type brings once placed, such as the bus a
+    /// bridge puts behind it. Placement adds them before it places the devices that go there.
+    pub slots: Option<fn(&DeviceModel, &MachineSlotPath, &mut Vec<MachineSlot>)>,
 }
 
 /// Every device type, one row each.
 pub const DEVICE_TYPES: &[DeviceTypeSpec] = &[
-    DeviceTypeSpec { name: "hdd", family: DeviceFamily::Scsi, keys: &["path", "write_cache", "overlay", "scratch", "size_mb"], parse: scsi_target },
-    DeviceTypeSpec { name: "cdrom", family: DeviceFamily::Scsi, keys: &["path", "discs", "overlay"], parse: scsi_target },
-    DeviceTypeSpec { name: "daynaport", family: DeviceFamily::Scsi, keys: &["mac", "subnet"], parse: scsi_target },
+    DeviceTypeSpec { name: "hdd", family: DeviceFamily::Disk, keys: &["path", "write_cache", "overlay", "scratch", "size_mb"], parse: scsi_target, slots: None },
+    DeviceTypeSpec { name: "cdrom", family: DeviceFamily::Scsi, keys: &["path", "discs", "overlay"], parse: scsi_target, slots: None },
+    DeviceTypeSpec { name: "daynaport", family: DeviceFamily::Scsi, keys: &["mac", "subnet"], parse: scsi_target, slots: None },
+    DeviceTypeSpec { name: "pci_cage", family: DeviceFamily::Cage, keys: &[], parse: |_, _| Ok(DeviceModel::XioBoard(Kind::Cage)), slots: Some(|_, at, s| pci_bus_slots(s, &at.pci(0).to_string(), "PCI module", CAGE_SLOTS)) },
+    DeviceTypeSpec { name: "pci_shoehorn", family: DeviceFamily::Xio, keys: &[], parse: |_, _| Ok(DeviceModel::XioBoard(Kind::Shoehorn)), slots: Some(|_, at, s| pci_bus_slots(s, &at.pci(0).to_string(), "PCI shoehorn", SHOEHORN_SLOTS)) },
+    // One slot behind it, device 0, where iris has always put a card.
+    DeviceTypeSpec { name: "pci_bridge", family: DeviceFamily::Pci, keys: &[], parse: |_, _| Ok(DeviceModel::PciBridge), slots: Some(|_, at, s| pci_bus_slots(s, &at.pci(0).to_string(), "pci bridge", &[(0, MachineSlotKind::PCI_SLOT, None)])) },
+    DeviceTypeSpec { name: "ice1724", family: DeviceFamily::Pci, keys: &[], parse: |_, _| Ok(DeviceModel::Ice1724), slots: None },
+    DeviceTypeSpec { name: "qla2200", family: DeviceFamily::Pci, keys: &[], parse: |_, _| Ok(DeviceModel::Qla2200), slots: Some(|_, at, s| loop_slots(s, at)) },
+    DeviceTypeSpec { name: "nvme", family: DeviceFamily::Pci, keys: &["path", "overlay", "write_cache"], parse: nvme, slots: None },
+    DeviceTypeSpec { name: "ultra64", family: DeviceFamily::Gio, keys: &[], parse: |_, _| Ok(DeviceModel::Ultra64), slots: None },
+    DeviceTypeSpec {
+        name: "test_device",
+        family: DeviceFamily::Gio,
+        keys: &["dump", "run_config"],
+        parse: |_, o| options::<TestDeviceConfig>(o).and_then(|c| c.run().map(|_| DeviceModel::TestDevice(c))),
+        slots: None,
+    },
+    DeviceTypeSpec { name: "newport", family: DeviceFamily::Gio, keys: &[], parse: |_, _| Ok(DeviceModel::Newport), slots: None },
+    // Where the board goes; which board it is stays a `[graphics]` setting.
+    DeviceTypeSpec { name: "graphics", family: DeviceFamily::Gfx, keys: &[], parse: |_, _| Ok(DeviceModel::Graphics), slots: None },
+    DeviceTypeSpec {
+        name: "virtio_serial",
+        family: DeviceFamily::Virtio,
+       
+        keys: &["port"],
+        parse: |_, o| options(o).map(|v: VirtioSerialConfig| DeviceModel::VirtioSerial(VirtioSerialConfig { enabled: true, ..v })),
+        slots: None,
+    },
+    DeviceTypeSpec {
+        name: "virtio_9p",
+        family: DeviceFamily::Virtio,
+       
+        keys: &["path", "tag", "readonly", "uid", "gid", "owners", "uid_map", "gid_map"],
+        parse: |_, o| options(o).map(|v: Virtio9pConfig| DeviceModel::Virtio9p(Virtio9pConfig { enabled: true, ..v })),
+        slots: None,
+    },
 ];
+
+fn nvme(_: &DeviceTypeSpec, opts: toml::Table) -> Result<DeviceModel, String> {
+    let cfg: NvmeConfig = toml::Value::Table(opts).try_into().map_err(|e: toml::de::Error| e.message().to_string())?;
+    if cfg.path.is_empty() {
+        return Err("needs a path".into());
+    }
+    Ok(DeviceModel::Nvme(cfg))
+}
+
+fn options<T: DeserializeOwned>(opts: toml::Table) -> Result<T, String> {
+    toml::Value::Table(opts).try_into().map_err(|e: toml::de::Error| e.message().to_string())
+}
 
 fn scsi_kind(name: &str) -> ScsiKind {
     match name {
@@ -48,7 +142,7 @@ fn scsi_kind(name: &str) -> ScsiKind {
 }
 
 fn scsi_target(t: &DeviceTypeSpec, opts: toml::Table) -> Result<DeviceModel, String> {
-    let mut dev: ScsiDeviceConfig = toml::Value::Table(opts).try_into().map_err(|e: toml::de::Error| e.message().to_string())?;
+    let mut dev: ScsiDeviceConfig = options(opts)?;
     dev.kind_field = scsi_kind(t.name);
     dev.cdrom = dev.kind_field == ScsiKind::Cdrom;
     Ok(DeviceModel::Scsi(dev))
@@ -62,6 +156,17 @@ impl DeviceModel {
                 ScsiKind::Cdrom => "cdrom",
                 ScsiKind::Daynaport => "daynaport",
             },
+            DeviceModel::Nvme(_) => "nvme",
+            DeviceModel::XioBoard(kind) => kind.name(),
+            DeviceModel::PciBridge => "pci_bridge",
+            DeviceModel::Ice1724 => "ice1724",
+            DeviceModel::Qla2200 => "qla2200",
+            DeviceModel::Ultra64 => "ultra64",
+            DeviceModel::TestDevice(_) => "test_device",
+            DeviceModel::Newport => "newport",
+            DeviceModel::Graphics => "graphics",
+            DeviceModel::VirtioSerial(_) => "virtio_serial",
+            DeviceModel::Virtio9p(_) => "virtio_9p",
         };
         DEVICE_TYPES.iter().find(|t| t.name == name).expect("every variant has a type")
     }
@@ -69,30 +174,50 @@ impl DeviceModel {
     pub fn scsi(&self) -> Option<&ScsiDeviceConfig> {
         match self {
             DeviceModel::Scsi(d) => Some(d),
+            _ => None,
         }
     }
 
     pub fn scsi_mut(&mut self) -> Option<&mut ScsiDeviceConfig> {
         match self {
             DeviceModel::Scsi(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn nvme_mut(&mut self) -> Option<&mut NvmeConfig> {
+        match self {
+            DeviceModel::Nvme(d) => Some(d),
+            _ => None,
         }
     }
 
     /// What `--list-slots` says is there.
     pub fn summary(&self) -> String {
         match self {
-            DeviceModel::Scsi(d) if d.path.is_empty() => self.spec().name.to_string(),
-            DeviceModel::Scsi(d) => format!("{} {}", self.spec().name, d.path),
+            DeviceModel::Scsi(ScsiDeviceConfig { path, .. }) | DeviceModel::Nvme(NvmeConfig { path, .. }) if !path.is_empty() => {
+                format!("{} {path}", self.spec().name)
+            }
+            _ => self.spec().name.to_string(),
         }
     }
 
+    /// The options that differ from the type's defaults, as a file writes them.
     fn options(&self) -> toml::Table {
+        fn changed<T: Serialize + Default>(now: &T, keys: &[&str]) -> toml::Table {
+            let default = toml::Table::try_from(T::default()).expect("options serialize");
+            let now = toml::Table::try_from(now).expect("options serialize");
+            now.into_iter().filter(|(k, v)| keys.contains(&k.as_str()) && default.get(k) != Some(v)).collect()
+        }
         let keys = self.spec().keys;
-        let (now, default) = match self {
-            DeviceModel::Scsi(d) => (toml::Table::try_from(d), toml::Table::try_from(ScsiDeviceConfig::default())),
-        };
-        let default = default.expect("options serialize");
-        now.expect("options serialize").into_iter().filter(|(k, v)| keys.contains(&k.as_str()) && default.get(k) != Some(v)).collect()
+        match self {
+            DeviceModel::Scsi(d) => changed(d, keys),
+            DeviceModel::Nvme(d) => changed(d, keys),
+            DeviceModel::TestDevice(d) => changed(d, keys),
+            DeviceModel::VirtioSerial(d) => changed(d, keys),
+            DeviceModel::Virtio9p(d) => changed(d, keys),
+            DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Newport | DeviceModel::Graphics => toml::Table::new(),
+        }
     }
 }
 
@@ -154,6 +279,182 @@ impl ConfiguredDevice {
     }
 }
 
+/// Said at startup and by `--validate` when an audio card is placed with
+/// `no_audio` set: the guest sees the card and nothing is played.
+pub(crate) const AUDIO_WITH_NO_AUDIO: &str = "an ice1724 card is placed but no_audio is set: the card plays to nowhere";
+
+/// An NVMe card at its slot.
+pub struct NvmeCard {
+    pub at: MachineSlotPath,
+    pub nvme: Arc<Nvme>,
+    pub cfg: NvmeConfig,
+}
+
+/// A Fibre Channel adapter at its slot, with its loop's disks as a snapshot records them.
+pub struct FibreCard {
+    pub at: MachineSlotPath,
+    pub fc: Arc<Isp2200>,
+    pub disks: Vec<crate::snapshot::DiskRef>,
+}
+
+/// What [`DevicePlacement::build_cards`] built, each at its slot, for the machine to start, stop, reset and snapshot.
+#[derive(Default)]
+pub struct AttachedCards {
+    pub nvme: Vec<NvmeCard>,
+    pub fibre: Vec<FibreCard>,
+    pub virtio: Vec<(MachineSlotPath, Arc<VirtioPci>)>,
+    pub audio: Vec<(MachineSlotPath, Arc<Ice1724>)>,
+}
+
+impl AttachedCards {
+    pub fn devices(&self) -> impl Iterator<Item = Arc<dyn crate::traits::Device>> + '_ {
+        let audio = self.audio.iter().map(|(_, a)| a.clone() as Arc<dyn crate::traits::Device>);
+        let fibre = self.fibre.iter().map(|f| f.fc.clone() as Arc<dyn crate::traits::Device>);
+        let nvme = self.nvme.iter().map(|c| c.nvme.clone() as Arc<dyn crate::traits::Device>);
+        self.virtio.iter().map(|(_, v)| v.clone() as Arc<dyn crate::traits::Device>).chain(audio).chain(fibre).chain(nvme)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nvme.is_empty() && self.fibre.is_empty() && self.virtio.is_empty() && self.audio.is_empty()
+    }
+
+    pub fn power_on(&self) {
+        for (_, v) in &self.virtio {
+            crate::traits::Resettable::power_on(&**v);
+        }
+        for (_, a) in &self.audio {
+            a.reset();
+        }
+    }
+
+    /// The type and slot of each card, for a snapshot's manifest.
+    pub fn manifest(&self) -> Vec<(String, MachineSlotPath)> {
+        let nvme = self.nvme.iter().map(|c| ("nvme".to_string(), c.at.clone()));
+        let virtio = self.virtio.iter().map(|(at, v)| (if v.core().device_id() == crate::dev::virtio::console::DEVICE_ID { "virtio_serial" } else { "virtio_9p" }.to_string(), at.clone()));
+        let fibre = self.fibre.iter().map(|f| ("qla2200".to_string(), f.at.clone()));
+        nvme.chain(virtio).chain(fibre).chain(self.audio.iter().map(|(at, _)| ("ice1724".to_string(), at.clone()))).collect()
+    }
+
+    /// The NVMe cards' and the Fibre Channel loops' disks, by the card's slot.
+    pub fn disk_buses(&self) -> Vec<crate::snapshot::DiskBus<'_>> {
+        use crate::scsi_monitor::ScsiTargets;
+        let nvme = self.nvme.iter().map(|c| crate::snapshot::DiskBus::card(c.at.clone(), c.nvme.scsi_bus()));
+        nvme.chain(self.fibre.iter().map(|f| crate::snapshot::DiskBus::loop_ids(f.at.clone(), f.fc.bus()))).collect()
+    }
+
+    /// The manifest's record of each card's disks.
+    pub fn disk_refs(&self) -> Vec<crate::snapshot::DiskRef> {
+        let nvme = self.nvme.iter().map(|c| crate::dev::nvme::disk_ref(&c.cfg, &c.nvme, c.at.clone()));
+        nvme.chain(self.fibre.iter().flat_map(|f| f.disks.clone())).collect()
+    }
+
+    /// Why a snapshot cannot hold these cards now, if it cannot.
+    pub fn snapshot_blocker(&self) -> Option<String> {
+        self.virtio.first().map(|(at, _)| format!("the virtio device at {at} has no saved state yet"))
+    }
+
+    /// Each card's state under its slot.
+    pub fn save_state(&self) -> toml::Value {
+        use crate::traits::Saveable;
+        let mut t = toml::Table::new();
+        for c in &self.nvme {
+            t.insert(c.at.to_string(), c.nvme.save_state());
+        }
+        for f in &self.fibre {
+            t.insert(f.at.to_string(), f.fc.save_state());
+        }
+        for (at, a) in &self.audio {
+            t.insert(at.to_string(), a.save_state());
+        }
+        toml::Value::Table(t)
+    }
+
+    /// Put back what [`AttachedCards::save_state`] gave; a card with no entry is refused.
+    pub fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        use crate::traits::Saveable;
+        let state = |at: &MachineSlotPath| crate::snapshot::field(v, &at.to_string()).map_err(|_| format!("snapshot has no state for the card at {at}"));
+        for c in &self.nvme {
+            c.nvme.load_state(state(&c.at)?).map_err(|e| format!("nvme at {}: {e}", c.at))?;
+        }
+        for f in &self.fibre {
+            f.fc.load_state(state(&f.at)?).map_err(|e| format!("qla2200 at {}: {e}", f.at))?;
+        }
+        for (at, d) in &self.audio {
+            d.load_state(state(at)?).map_err(|e| format!("ice1724 at {at}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl DevicePlacement {
+/// Build the PCI cards at the slots placement gave them, each bridge before the cards behind it, then check every PCI bus slot has its bus.
+pub fn build_cards(&mut self, cfg: &MachineConfig, timers: &Arc<TimerManager>) -> Result<AttachedCards, String> {
+    let mut cards: Vec<(ConfiguredDevice, MachineSlotPath)> = self.placed()
+        .filter(|(_, at)| self.slot(at).is_some_and(|s| s.kind.takes(DeviceFamily::Pci, true)))
+        .map(|(d, at)| (d.clone(), at.clone()))
+        .collect();
+    cards.sort_by_key(|(_, at)| at.depth());
+    let mut out = AttachedCards::default();
+    let profile = cfg.machine.profile;
+    for (d, at) in cards {
+        let bus = at.parent().and_then(|b| self.pci(&b).cloned()).ok_or_else(|| format!("{at}: no PCI bus is built there"))?;
+        let slot = DevFn { device: at.last_number().unwrap_or(0), function: 0 };
+        let pin = match self.slot(&at).map(|s| &s.kind) {
+            Some(MachineSlotKind::Extra { pin }) => *pin,
+            _ => PCI_INTA,
+        };
+        let virtio = |name: &str, core| {
+            let dev = Arc::new(VirtioPci::with_pin(core, pin));
+            bus.attach(slot, dev.clone());
+            eprintln!("iris: {name} at {at}");
+            dev
+        };
+        match &d.device {
+            DeviceModel::Nvme(cfg) => {
+                profile.refuse_nvme()?;
+                let card = crate::dev::nvme::Card::open(cfg)?;
+                card.attach(&bus, slot.device);
+                eprintln!("iris: NVMe at {at}");
+                out.nvme.push(NvmeCard { at: at.clone(), nvme: card.nvme, cfg: cfg.clone() });
+            }
+            DeviceModel::VirtioSerial(v) => out.virtio.push((at.clone(), virtio("virtio-serial", crate::dev::virtio::console::from_config(v)))),
+            DeviceModel::Virtio9p(v) => out.virtio.push((at.clone(), virtio("virtio-9p", crate::dev::virtio::p9::from_config(v)))),
+            DeviceModel::Ice1724 => {
+                let card = Arc::new(Ice1724::new(timers, Variant::Dm8));
+                if cfg.no_audio {
+                    eprintln!("iris: {AUDIO_WITH_NO_AUDIO}");
+                } else {
+                    card.enable_output(cfg.audio.clone());
+                }
+                bus.attach(slot, card.clone());
+                card.register_locks();
+                eprintln!("iris: ICE1724 at {at}");
+                out.audio.push((at.clone(), card));
+            }
+            DeviceModel::Qla2200 => {
+                if !out.fibre.is_empty() {
+                    return Err("[[devices]] qla2200: the machine takes one Fibre Channel adapter".into());
+                }
+                let disks = self.card_loop(&at);
+                let card = crate::dev::isp2200::card::Card::open(&disks, cfg.ci, timers)?;
+                card.attach(&bus, slot.device);
+                card.fc.register_locks();
+                eprintln!("iris: Fibre Channel at {at}, {} loop disk(s)", disks.len());
+                out.fibre.push(FibreCard { disks: crate::dev::isp2200::card::disk_refs(&at, &disks), at: at.clone(), fc: card.fc });
+            }
+            DeviceModel::PciBridge => {
+                let ppb = PciToPciBridge::dec_21154(&bus, slot);
+                bus.attach(slot, ppb.clone());
+                self.bind_pci(&at.pci(0).to_string(), ppb.secondary().clone())?;
+            }
+            other => return Err(format!("[[devices]] {} at {at}: this machine cannot build it", other.spec().name)),
+        }
+    }
+    self.check_pci()?;
+    Ok(out)
+}
+}
+
 impl Serialize for ConfiguredDevice {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
@@ -201,7 +502,7 @@ mod tests {
     fn a_key_the_type_lacks_or_an_unknown_type_is_an_error() {
         assert!(entry("type = \"cdrom\"\nscratch = true").unwrap_err().contains("cdrom takes no key scratch"));
         assert!(entry("type = \"hdd\"\ncontroller = 1").unwrap_err().contains("no key controller"));
-        assert!(entry("type = \"floppy\"").unwrap_err().contains("types: hdd, cdrom, daynaport"));
+        assert!(entry("type = \"floppy\"").unwrap_err().contains("types: hdd, cdrom, daynaport, pci_cage"));
         assert!(entry("at = \"scsi0/t1\"").unwrap_err().contains("needs a type"));
     }
 

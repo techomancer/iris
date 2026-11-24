@@ -379,9 +379,9 @@ impl NewMachineDialog {
                         // user explicitly opted in.
                         cfg.devices.clear();
                         if self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
-                            let mut fc = iris::config::FibreChannelConfig::default();
-                            fc.disks.insert(1, ScsiDeviceConfig { path: self.scsi1_path.clone(), ..Default::default() });
-                            cfg.fibre_channel = Some(fc);
+                            // On the I-brick's loop, at loop ID 1.
+                            let disk = ScsiDeviceConfig { path: self.scsi1_path.clone(), ..Default::default() };
+                            cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/l1", iris::devices::DeviceModel::Scsi(disk)));
                         }
                         if !self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
                             cfg.set_disk(1, ScsiDeviceConfig {

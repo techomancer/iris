@@ -1299,6 +1299,18 @@ pub(crate) fn temp_image(tag: &str) -> TempPath {
     image(tag, 64)
 }
 
+/// Put `card` in `device` of `bus`, or behind the generic bridge there.
+pub(crate) fn attach(card: &super::Card, bus: &PciBus, device: u8, bridge: bool) {
+    let at = DevFn { device, function: 0 };
+    if bridge {
+        let ppb = PciToPciBridge::dec_21154(bus, at);
+        bus.attach(at, ppb.clone());
+        card.attach(ppb.secondary(), 0);
+    } else {
+        card.attach(bus, device);
+    }
+}
+
 
 /// Put `n` in a used state through its registers and state: admin queues
 /// programmed, enabled, an I/O queue pair present and the interrupt masked.

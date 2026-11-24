@@ -6,6 +6,7 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
 
+use crate::devices::DeviceModel as Card;
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig, ScsiDeviceConfig};
 use crate::machine_state::GuestState;
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEventQueue, MachineEvents, MachineFatal};
@@ -154,6 +155,8 @@ pub struct Machine {
     /// size per SCSI id). Written into snapshot manifests and validated on
     /// restore so captured state never lands on a different base disk.
     disks: Vec<DiskRef>,
+    /// The GIO cards and where they sit, recorded in snapshot manifests.
+    gio_slots: Vec<(String, crate::slot_path::MachineSlotPath)>,
     /// Configured nvram file path, recorded in snapshot manifests.
     nvram_path: String,
     /// Host-forced Newport resolution from `[graphics] resolution` at construction.
@@ -188,12 +191,8 @@ struct RollbackCheckpoint {
     /// Snapshot directory (saves/<name>/) — re-used by rollback to reflink
     /// the COW overlays back into place.
     overlay_dir: std::path::PathBuf,
-    /// Per-SCSI-id dirty sector lists from cow.toml at the time of restore.
-    overlay_sets: Vec<(usize, Vec<u64>)>,
-    /// Same, for the second (fullhouse) SCSI controller — kept in a
-    /// separate list/subdirectory (see `capture_rollback_checkpoint`) since
-    /// controller 0 and controller 1 can each have a device at the same id.
-    overlay_sets1: Vec<(usize, Vec<u64>)>,
+    /// Each disk's dirty sectors from cow.toml at the time of restore.
+    overlay_sets: crate::snapshot::OverlaySets,
 
     /// Native-endian RAM bank words. `bank_words[i].len() ==
     /// banks[i].size_bytes / 4` for present banks; populated for all four.
@@ -223,36 +222,6 @@ struct RollbackCheckpoint {
     rex3_head1: Option<toml::Value>,
     mgras: Option<MgrasCheckpoint>,
     gr2: Option<Gr2Checkpoint>,
-}
-
-/// Parse a `cow.toml`/`cow1.toml`-shaped table (`{"scsi<id>": [dirty
-/// sectors...]}`) into `(id, dirty_sectors)` pairs. Shared by rollback
-/// capture and snapshot load so the two paths can't drift.
-/// Inverse of `parse_cow_table`: build a `{"scsi<id>": [dirty sectors...]}`
-/// table from `export_overlays`'s output.
-pub(crate) fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
-    let mut tbl = toml::map::Map::new();
-    for (id, dirty) in overlays {
-        let arr: Vec<toml::Value> = dirty.into_iter().map(|v| toml::Value::Integer(v as i64)).collect();
-        tbl.insert(format!("scsi{}", id), toml::Value::Array(arr));
-    }
-    toml::Value::Table(tbl)
-}
-
-pub(crate) fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
-    let mut sets = Vec::new();
-    if let Some(tbl) = cow_toml.as_table() {
-        for (k, v) in tbl {
-            let Some(id_str) = k.strip_prefix("scsi") else { continue };
-            let Ok(id) = id_str.parse::<usize>() else { continue };
-            let Some(arr) = v.as_array() else { continue };
-            let dirty: Vec<u64> = arr.iter()
-                .filter_map(|x| x.as_integer().map(|i| i as u64))
-                .collect();
-            sets.push((id, dirty));
-        }
-    }
-    sets
 }
 
 /// Full-machine in-memory checkpoint captured from *live* running state
@@ -297,34 +266,6 @@ pub(crate) struct LiveCheckpoint {
     rex3_head1: Option<toml::Value>,
     mgras: Option<MgrasCheckpoint>,
     gr2: Option<Gr2Checkpoint>,
-}
-
-/// The test device, the ultra64 dev board and the second Newport head all
-/// decode GIO expansion slot 0, so the test device cannot share a machine
-/// with either. Panics rather than exiting: `Machine::new`
-/// already panics on bad input, and a host that embeds IRIS catches that
-/// (`iris-gui`'s worker wraps construction in `catch_unwind`) — killing the
-/// application over a configuration mistake is not a choice a library gets to
-/// make for its caller.
-fn check_testdev_slot_free(ultra64_present: bool, head1_present: bool) {
-    if ultra64_present {
-        panic!("--test-device and the ultra64 dev board both claim GIO slot 0");
-    }
-    if head1_present {
-        panic!("--test-device and the second graphics head (graphics.heads = 2) both claim GIO slot 0");
-    }
-}
-
-/// A virtio device's GIO slot must not be one another device decodes: the
-/// Ultra64 board, `--test-device` and the second Newport head take slot 0. Panics for the same reason `check_testdev_slot_free` does.
-fn check_virtio_slot_free(section: &str, slot: crate::dev::ioc::GioSlot, ultra64: bool, testdev: bool, head1: bool) {
-    use crate::dev::ioc::GioSlot;
-    match slot {
-        GioSlot::Exp0 if ultra64 || testdev || head1 => {
-            panic!("[{section}] slot = \"exp0\" is taken by the ultra64 board, --test-device or the second graphics head; use \"exp1\"")
-        }
-        _ => {}
-    }
 }
 
 /// One Newport head's monitor commands under numbered names: `rex1`,
@@ -414,7 +355,11 @@ impl Machine {
     ) -> Result<Self, String> {
         cfg.validate_newport_raster_gate()?;
         // The rig takes any part: `MachineConfig::cpu_part` looks at this.
-        cfg.test_device |= testdev_override.is_some();
+        if testdev_override.is_some() && !cfg.has_device("test_device") {
+            cfg.set_device("test_device", true);
+        }
+        let resolved = crate::topology::DevicePlacement::new(&cfg)?;
+        let gio: Vec<(u8, Card)> = resolved.placed().filter_map(|(d, at)| Some((at.gio_slot()?, d.device.clone()))).collect();
         // Capture config flags that are needed after the local `cfg` binding
         // is shadowed later in this function.
         let ci_enabled = cfg.ci;
@@ -557,7 +502,6 @@ impl Machine {
         // size.
         // The buses are filled before the controllers exist and handed to them.
         let scsi_buses = Hpc3::new_scsi_buses(guinness);
-        let resolved = crate::topology::DevicePlacement::new(&cfg)?;
         let attached = match crate::scsi::attach_from_config(&cfg, None, &resolved, &scsi_buses.iter().collect::<Vec<_>>()) {
             Ok(a) => a,
             Err(e) => {
@@ -609,8 +553,9 @@ impl Machine {
         }
         let scratch_path = attached.scratch;
         // The Indy and Indigo2 have always listed CD-ROMs beside the disks.
-        let disk_provenance: Vec<DiskRef> = attached.tables.iter()
-            .map(|t| DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
+        let disk_provenance = DiskRef::from_tables(&attached.tables, true);
+        let gio_slots: Vec<(String, crate::slot_path::MachineSlotPath)> = gio.iter()
+            .map(|(slot, c)| (c.spec().name.to_string(), crate::slot_path::MachineSlotPath::root().gio(*slot)))
             .collect();
         let nvram_provenance = cfg.nvram.clone();
 
@@ -668,7 +613,7 @@ impl Machine {
             Some(r)
         };
 
-        let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.heads < 2 {
+        let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || !gio.iter().any(|c| matches!(c.1, Card::Newport)) {
             None
         } else {
             let r = Rex3::new(status.clone());
@@ -753,10 +698,7 @@ impl Machine {
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
-        let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled && rex3_head1.is_some() {
-            eprintln!("ultra64: disabled, the second graphics head is in its GIO slot (graphics.heads = 2)");
-            None
-        } else if cfg.ultra64.enabled {
+        let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = gio.iter().any(|c| matches!(c.1, Card::Ultra64)).then(|| {
             match crate::dev::ultra64::Ultra64::new(ioc.irq_line(crate::dev::ioc::IocInterrupt::GioExp0)) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
@@ -764,9 +706,7 @@ impl Machine {
                     None
                 }
             }
-        } else {
-            None
-        };
+        }).flatten();
 
         // VINO (Video-In, No Out) — GIO64 at 0x1F080000
         let vino = crate::dev::vino::Vino::new();
@@ -776,19 +716,14 @@ impl Machine {
         // `cfg` is shadowed by MipsCpuConfig further down; grab this first.
         let cheritest_hook = cfg.cheritest_dump_hook;
 
-        // Bare-metal test device (--test-device): default off, and refused
-        // alongside the ultra64 dev board, which claims the same GIO slot.
+        // Bare-metal test device: default off.
         let testdev = if let Some(dev) = testdev_override {
-            check_testdev_slot_free(ultra64.is_some(), rex3_head1.is_some());
             Some(dev)
-        } else if cfg.test_device {
-            check_testdev_slot_free(ultra64.is_some(), rex3_head1.is_some());
-            let path = cfg.test_device_dump.clone()
-                .unwrap_or_else(|| crate::dev::testdev::DEFAULT_DUMP_PATH.to_string());
+        } else if let Some(Card::TestDevice(t)) = gio.iter().map(|c| &c.1).find(|c| matches!(c, Card::TestDevice(_))) {
+            let path = t.dump.clone().unwrap_or_else(|| crate::dev::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
                       crate::dev::testdev::TEST_DEV_BASE, path);
-            let run = cfg.test_device_run_config()
-                .expect("test_device_run_config: validate() should have caught this");
+            let run = t.run().expect("validate() checked the run config");
             Some(Arc::new(crate::dev::testdev::TestDevice::with_run_config(path, run)))
         } else {
             None
@@ -799,14 +734,9 @@ impl Machine {
         // virtio devices: GIO expansion slot 0 or 1, on the line the IOC gives
         // that slot (the Indy's two direct pins, or the Indigo2's EXT_IO
         // fan-out). They master the bus through `phys`.
-        let virtio_mmio = |section: &str, name: &str, slot: crate::config::VirtioGioSlot, core| {
-            use crate::config::VirtioGioSlot;
-            use crate::dev::ioc::{GioSlot, IocInterrupt, GIO_SLOT_BASES, GIO_SLOT_MAP, profile_idx};
-            let slot = match slot {
-                VirtioGioSlot::Exp0 => GioSlot::Exp0,
-                VirtioGioSlot::Exp1 => GioSlot::Exp1,
-            };
-            check_virtio_slot_free(section, slot, ultra64.is_some(), testdev.is_some(), rex3_head1.is_some());
+        let virtio_mmio = |name: &str, slot: u8, core| {
+            use crate::dev::ioc::{GIO_SLOT_BASES, IocInterrupt};
+            let slot = if slot == 0 { GioSlot::Exp0 } else { GioSlot::Exp1 };
             let source = match (guinness, slot) {
                 (true, GioSlot::Exp0) => IocInterrupt::GioExp0,
                 (true, _) => IocInterrupt::GioExp1,
@@ -821,21 +751,13 @@ impl Machine {
             );
             (Arc::new(dev), base)
         };
-        let virtio = cfg.virtio_serial.enabled.then(|| {
-            virtio_mmio(
-                "virtio_serial",
-                "virtio-serial",
-                cfg.virtio_serial.slot,
-                crate::dev::virtio::console::from_config(&cfg.virtio_serial),
-            )
+        let virtio = gio.iter().find_map(|(slot, c)| match c {
+            Card::VirtioSerial(v) => Some(virtio_mmio("virtio-serial", *slot, crate::dev::virtio::console::from_config(v))),
+            _ => None,
         });
-        let virtio_9p = cfg.virtio_9p.enabled.then(|| {
-            virtio_mmio(
-                "virtio_9p",
-                "virtio-9p",
-                cfg.virtio_9p.slot,
-                crate::dev::virtio::p9::from_config(&cfg.virtio_9p),
-            )
+        let virtio_9p = gio.iter().find_map(|(slot, c)| match c {
+            Card::Virtio9p(v) => Some(virtio_mmio("virtio-9p", *slot, crate::dev::virtio::p9::from_config(v))),
+            _ => None,
         });
 
         let board = Arc::new(Ip22Bus::new(phys.clone(), Ip22Devices {
@@ -1127,6 +1049,7 @@ impl Machine {
             last_restore_checkpoint: None,
             scratch_path,
             disks: disk_provenance,
+            gio_slots,
             nvram_path: nvram_provenance,
             display_resolution,
             newport_active,
@@ -1484,6 +1407,16 @@ impl Machine {
         self.cpu.fasttick_count()
     }
 
+    /// The SCSI buses by slot, for a snapshot's overlays.
+    fn placed_disk_buses(&self) -> Vec<crate::snapshot::DiskBus<'_>> {
+        crate::snapshot::disk_buses((0..).map(Hpc3::scsi_at), self.scsi_buses(), None)
+    }
+
+    /// Where the GIO card of `ty` sits, if there is one.
+    fn gio_at(&self, ty: &str) -> Option<&crate::slot_path::MachineSlotPath> {
+        self.gio_slots.iter().find(|(t, _)| t == ty).map(|(_, at)| at)
+    }
+
     /// Every SCSI bus on the board: the first controller's, and the second's
     /// on a Fullhouse Indigo2.
     pub(crate) fn scsi_buses(&self) -> Vec<&crate::scsi::ScsiBus> {
@@ -1712,14 +1645,12 @@ impl Machine {
         #[cfg(feature = "wgpu")]
         let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
 
-        // Re-read cow.toml (and cow1.toml, for controller 1) so rollback
-        // knows which dirty sectors to import back. The files were just
-        // consumed by load_snapshot but they're tiny and re-reading from
-        // page cache is cheap (~µs).
+        // Re-read cow.toml so rollback knows which dirty sectors to import
+        // back. The file was just consumed by load_snapshot but it is tiny
+        // and re-reading from page cache is cheap (~µs).
         let overlay_dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&overlay_dir);
-        let overlay_sets = snap.read_toml("cow.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
-        let overlay_sets1 = snap.read_toml("cow1.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
+        let overlay_sets = snap.read_toml("cow.toml").map(|v| crate::snapshot::parse_cow_table(&v)).unwrap_or_default();
 
         self.restart_peripherals();
         self.cpu.start();
@@ -1727,7 +1658,6 @@ impl Machine {
         Ok(RollbackCheckpoint {
             overlay_dir,
             overlay_sets,
-            overlay_sets1,
             bank_words,
             framebuffers,
             #[cfg(feature = "wgpu")]
@@ -1792,15 +1722,8 @@ impl Machine {
         // Reflink the overlay back into place. saves/<name>/scsi*.overlay is
         // unchanged by guest writes (writes go to the live overlay), so this
         // can re-import directly.
-        self.hpc3.scsi().import_overlays(&cp.overlay_dir, &cp.overlay_sets)
-            .map_err(|e| format!("rollback: COW overlay import: {}", e))?;
-        if let Some(dev) = self.hpc3.scsi1() {
-            // Controller 1's overlays live in a "ctrl1" subdirectory so a
-            // device at the same id on both controllers never collides on
-            // the same scsi<id>.overlay filename.
-            dev.import_overlays(&cp.overlay_dir.join("ctrl1"), &cp.overlay_sets1)
-                .map_err(|e| format!("rollback: COW overlay import (controller 1): {}", e))?;
-        }
+        crate::snapshot::import_overlays(&cp.overlay_dir, &self.placed_disk_buses(), &cp.overlay_sets)
+            .map_err(|e| format!("rollback: {e}"))?;
 
         self.restart_peripherals();
         self.cpu.start();
@@ -2055,6 +1978,7 @@ impl Machine {
         // later restore can refuse a mismatched base disk / build. (features are
         // filled by for_current_save.)
         manifest.disks = self.disks.clone();
+        manifest.devices = self.gio_slots.clone();
         manifest.nvram = Some(self.nvram_path.clone());
         // The CPU is a runtime choice now, so it is state the restore must match.
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
@@ -2065,20 +1989,20 @@ impl Machine {
         // Device state — schema_version=2 writes *.bin (postcard-encoded
         // BinValue tree); legacy writes *.toml. write_state encapsulates the
         // choice so this orchestrator stays format-agnostic.
-        snap.write_state("cpu",    &self.cpu.save_state(),                         sv).map_err(|e| e.to_string())?;
-        snap.write_state("mc",     &self.mc.save_state(),                          sv).map_err(|e| e.to_string())?;
-        snap.write_state("ioc",    &self.hpc3.ioc().save_state(),                  sv).map_err(|e| e.to_string())?;
-        snap.write_state("scc",    &self.hpc3.ioc().scc().save_state(),            sv).map_err(|e| e.to_string())?;
-        snap.write_state("pit",    &self.hpc3.ioc().pit().save_state(),            sv).map_err(|e| e.to_string())?;
-        snap.write_state("ps2",    &self.hpc3.ioc().ps2().save_state(),            sv).map_err(|e| e.to_string())?;
-        snap.write_state("rtc",    &self.hpc3.rtc().save_state(),                  sv).map_err(|e| e.to_string())?;
-        snap.write_state("eeprom", &self.hpc3.eeprom().lock().save_state_owned(),  sv).map_err(|e| e.to_string())?;
-        snap.write_state("scsi",   &self.hpc3.scsi().save_state(),                 sv).map_err(|e| e.to_string())?;
+        snap.write_state("cpu",    &self.cpu.save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("mc",     &self.mc.save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("ioc",    &self.hpc3.ioc().save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("scc",    &self.hpc3.ioc().scc().save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("pit",    &self.hpc3.ioc().pit().save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("ps2",    &self.hpc3.ioc().ps2().save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("rtc",    &self.hpc3.rtc().save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("eeprom", &self.hpc3.eeprom().lock().save_state_owned()).map_err(|e| e.to_string())?;
+        snap.write_state("scsi",   &self.hpc3.scsi().save_state()).map_err(|e| e.to_string())?;
         if let Some(dev) = self.hpc3.scsi1() {
-            snap.write_state("scsi1", &dev.save_state(), sv).map_err(|e| e.to_string())?;
+            snap.write_state("scsi1", &dev.save_state()).map_err(|e| e.to_string())?;
         }
-        snap.write_state("seeq",   &self.hpc3.seeq().save_state(),                 sv).map_err(|e| e.to_string())?;
-        snap.write_state("hpc3",   &self.hpc3.save_state(),                        sv).map_err(|e| e.to_string())?;
+        snap.write_state("seeq",   &self.hpc3.seeq().save_state()).map_err(|e| e.to_string())?;
+        snap.write_state("hpc3",   &self.hpc3.save_state()).map_err(|e| e.to_string())?;
 
         // REX3 (optional — absent in headless config). Framebuffers are
         // included in the chunks manifest below for v3+; v2 wrote them as
@@ -2089,8 +2013,8 @@ impl Machine {
             #[cfg(not(feature = "wgpu"))]
             let resident_state: Option<&toml::Value> = None;
             match resident_state {
-                Some(state) => snap.write_state("rex3", state, sv),
-                None => snap.write_state("rex3", &rex3.save_state(), sv),
+                Some(state) => snap.write_state("rex3", state),
+                None => snap.write_state("rex3", &rex3.save_state()),
             }.map_err(|e| e.to_string())?;
             if sv < 3 {
                 #[cfg(feature = "wgpu")]
@@ -2104,8 +2028,8 @@ impl Machine {
                 rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
-        if let Some(td) = &self.board.testdev {
-            snap.write_state("testdev", &td.save_state(), sv).map_err(|e| e.to_string())?;
+        if let (Some(td), Some(at)) = (&self.board.testdev, self.gio_at("test_device")) {
+            snap.write_state(&at.to_string(), &td.save_state()).map_err(|e| e.to_string())?;
         }
         if let Some(rex3) = &self.board.rex3_head1 {
             #[cfg(feature = "wgpu")]
@@ -2113,8 +2037,8 @@ impl Machine {
             #[cfg(not(feature = "wgpu"))]
             let resident_state: Option<&toml::Value> = None;
             match resident_state {
-                Some(state) => snap.write_state("rex3_head1", state, sv),
-                None => snap.write_state("rex3_head1", &rex3.save_state(), sv),
+                Some(state) => snap.write_state("rex3_head1", state),
+                None => snap.write_state("rex3_head1", &rex3.save_state()),
             }.map_err(|e| e.to_string())?;
             // The v3 chunk manifest covers only the primary head. Keep the
             // second head in the existing named-plane format in every raster
@@ -2132,11 +2056,11 @@ impl Machine {
         }
         let gr2_snapshot = self.board.gr2.as_ref().map(|gr2| gr2.snapshot_parts()).transpose()?;
         if let Some((metadata, _)) = &gr2_snapshot {
-            snap.write_state("gr2", &toml::Value::String(metadata.clone()), sv).map_err(|e| e.to_string())?;
+            snap.write_state("gr2", &toml::Value::String(metadata.clone())).map_err(|e| e.to_string())?;
         }
         let mgras_snapshot = self.board.mgras.as_ref().map(|mgras| mgras.snapshot_parts()).transpose()?;
         if let Some((metadata, _)) = &mgras_snapshot {
-            snap.write_state("mgras", &toml::Value::String(metadata.clone()), sv).map_err(|e| e.to_string())?;
+            snap.write_state("mgras", &toml::Value::String(metadata.clone())).map_err(|e| e.to_string())?;
         }
 
         // Bulk memory: v3+ goes to the content-addressable chunk store
@@ -2184,23 +2108,9 @@ impl Machine {
             }
         }
 
-        // COW overlays per SCSI device, plus a `cow.toml` with the dirty
-        // sector set for each one. Keeps the on-disk filesystem state
-        // consistent with the captured RAM.
-        let overlays = self.hpc3.scsi().export_overlays(&snap.dir)
-            .map_err(|e| format!("COW overlay export: {}", e))?;
-        snap.write_toml("cow.toml", &build_cow_table(overlays))
-            .map_err(|e| e.to_string())?;
-        if let Some(dev) = self.hpc3.scsi1() {
-            // Own subdirectory + cow1.toml so controller 1 never collides
-            // with controller 0's scsi<id>.overlay filenames.
-            let ctrl1_dir = snap.dir.join("ctrl1");
-            std::fs::create_dir_all(&ctrl1_dir).map_err(|e| e.to_string())?;
-            let overlays1 = dev.export_overlays(&ctrl1_dir)
-                .map_err(|e| format!("COW overlay export (controller 1): {}", e))?;
-            snap.write_toml("cow1.toml", &build_cow_table(overlays1))
-                .map_err(|e| e.to_string())?;
-        }
+        // Each disk's copy-on-write overlay, by slot, with the dirty sectors in
+        // `cow.toml`: the filesystem state stays consistent with the captured RAM.
+        crate::snapshot::export_overlays(&snap, &self.placed_disk_buses())?;
 
         #[cfg(feature = "wgpu")]
         if remove_incomplete {
@@ -2287,12 +2197,8 @@ impl Machine {
                         m.host_arch, std::env::consts::ARCH
                     ));
                 }
-                if m.schema_version > SCHEMA_VERSION {
-                    return Err(format!(
-                        "snapshot schema_version {} is newer than this iris build supports ({})",
-                        m.schema_version, SCHEMA_VERSION
-                    ));
-                }
+                crate::snapshot::check_schema(name, m.schema_version)?;
+                crate::snapshot::check_slots(&m, &self.gio_slots)?;
                 if let Some(rev) = &m.iris_git_rev {
                     if let Some(my_rev) = option_env!("IRIS_GIT_REV") {
                         if rev != my_rev {
@@ -2328,21 +2234,21 @@ impl Machine {
                         m.cpu_model.as_deref(), self.cpu.model_name()) { fatal.push(e); }
                     if let Some(e) = crate::snapshot::cache_model_mismatch(
                         m.cpu_cache.as_deref(), m.cpu_model.as_deref(), self.cpu.cache_kind()) { fatal.push(e); }
-                    // Every recorded disk must still be configured at the same SCSI
-                    // id with the same size. The host *path* is only where the file
+                    // Every recorded disk must still be configured at the same slot
+                    // with the same size. The host *path* is only where the file
                     // happens to live (it moves when disks are relocated, e.g. into a
                     // dist/ dir), so a path-only difference is a warning, not fatal —
-                    // a disk's identity for restore is its id + size, not its path.
+                    // a disk's identity for restore is its slot + size, not its path.
                     for d in &m.disks {
-                        match self.disks.iter().find(|c| c.id == d.id) {
+                        match self.disks.iter().find(|c| c.at == d.at) {
                             None => fatal.push(format!(
-                                "snapshot disk SCSI {} ('{}') is not configured in this run", d.id, d.path)),
+                                "snapshot disk at {} ('{}') is not configured in this run", d.at, d.path)),
                             Some(cur) if cur.size_bytes != d.size_bytes => fatal.push(format!(
-                                "SCSI {} ('{}') size differs: snapshot {} bytes vs current {} bytes",
-                                d.id, d.path, d.size_bytes, cur.size_bytes)),
+                                "disk at {} ('{}') size differs: snapshot {} bytes vs current {} bytes",
+                                d.at, d.path, d.size_bytes, cur.size_bytes)),
                             Some(cur) if cur.path != d.path => eprintln!(
-                                "load_snapshot: SCSI {} path differs: snapshot '{}' vs current '{}' (same size — continuing)",
-                                d.id, d.path, cur.path),
+                                "load_snapshot: disk at {} path differs: snapshot '{}' vs current '{}' (same size — continuing)",
+                                d.at, d.path, cur.path),
                             Some(_) => {}
                         }
                     }
@@ -2365,70 +2271,67 @@ impl Machine {
 
                 m.schema_version
             }
-            None => {
-                eprintln!("load_snapshot: no snapshot.toml in {} — treating as legacy v0 (no manifest)", dir.display());
-                0
-            }
+            None => return Err(format!("saves/{name}: no snapshot.toml")),
         };
 
         // Device state — read_state picks <base>.bin (v2+) or <base>.toml
         // (legacy). v2 also falls back to .toml if .bin is absent.
-        let cpu = snap.read_state("cpu", schema_version).map_err(|e| e.to_string())?;
+        let cpu = snap.read_state("cpu").map_err(|e| e.to_string())?;
         self.cpu.load_state(&cpu)?;
 
-        let mc = snap.read_state("mc", schema_version).map_err(|e| e.to_string())?;
+        let mc = snap.read_state("mc").map_err(|e| e.to_string())?;
         self.mc.load_state(&mc)?;
 
-        let ioc = snap.read_state("ioc", schema_version).map_err(|e| e.to_string())?;
+        let ioc = snap.read_state("ioc").map_err(|e| e.to_string())?;
         self.hpc3.ioc().load_state(&ioc)?;
 
-        let scc = snap.read_state("scc", schema_version).map_err(|e| e.to_string())?;
+        let scc = snap.read_state("scc").map_err(|e| e.to_string())?;
         self.hpc3.ioc().scc().load_state(&scc)?;
 
-        let pit = snap.read_state("pit", schema_version).map_err(|e| e.to_string())?;
+        let pit = snap.read_state("pit").map_err(|e| e.to_string())?;
         self.hpc3.ioc().pit().load_state(&pit)?;
 
-        let ps2 = snap.read_state("ps2", schema_version).map_err(|e| e.to_string())?;
+        let ps2 = snap.read_state("ps2").map_err(|e| e.to_string())?;
         self.hpc3.ioc().ps2().load_state(&ps2)?;
 
-        let rtc = snap.read_state("rtc", schema_version).map_err(|e| e.to_string())?;
+        let rtc = snap.read_state("rtc").map_err(|e| e.to_string())?;
         self.hpc3.rtc().load_state(&rtc)?;
 
-        let eeprom = snap.read_state("eeprom", schema_version).map_err(|e| e.to_string())?;
+        let eeprom = snap.read_state("eeprom").map_err(|e| e.to_string())?;
         self.hpc3.eeprom().lock().load_state_mut(&eeprom)?;
 
-        let scsi = snap.read_state("scsi", schema_version).map_err(|e| e.to_string())?;
+        let scsi = snap.read_state("scsi").map_err(|e| e.to_string())?;
         self.hpc3.scsi().load_state(&scsi)?;
 
         // scsi1.* is absent from snapshots saved before the second SCSI
         // controller existed, and from guinness machines — both are
         // legitimate "leave controller 1 untouched" cases, not errors.
         if let Some(dev) = self.hpc3.scsi1() {
-            if let Ok(scsi1) = snap.read_state("scsi1", schema_version) {
+            if let Ok(scsi1) = snap.read_state("scsi1") {
                 dev.load_state(&scsi1)?;
             }
         }
 
-        let seeq = snap.read_state("seeq", schema_version).map_err(|e| e.to_string())?;
+        let seeq = snap.read_state("seeq").map_err(|e| e.to_string())?;
         self.hpc3.seeq().load_state(&seeq)?;
 
-        let hpc3 = snap.read_state("hpc3", schema_version).map_err(|e| e.to_string())?;
+        let hpc3 = snap.read_state("hpc3").map_err(|e| e.to_string())?;
         self.hpc3.load_state(&hpc3)?;
 
         if let Some(rex3) = &self.board.rex3 {
-            let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
+            let rex3_v = snap.read_state("rex3").map_err(|e| e.to_string())?;
             rex3.load_state(&rex3_v)?;
             if schema_version < 3 {
                 rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
-        if let Some(td) = &self.board.testdev {
-            if let Ok(v) = snap.read_state("testdev", schema_version) {
+        if let (Some(td), Some(at)) = (&self.board.testdev, self.gio_at("test_device")) {
+            if let Ok(v) = snap.read_state(&at.to_string()) {
                 td.load_state(&v)?;
             }
         }
         if let Some(rex3) = &self.board.rex3_head1 {
-            let head1_state = snap.read_state("rex3_head1", schema_version);
+            let head1_state = snap.read_state("rex3_head1");
             #[cfg(feature = "wgpu")]
             if rex3.resident_active() {
                 if let Err(error) = &head1_state {
@@ -2451,12 +2354,12 @@ impl Machine {
             }
         }
         let gr2_metadata = if schema_version >= 10 && self.board.gr2.is_some() {
-            let value = snap.read_state("gr2", schema_version).map_err(|e| e.to_string())?;
+            let value = snap.read_state("gr2").map_err(|e| e.to_string())?;
             Some(value.as_str().ok_or("GR2 snapshot metadata is not a string")?.to_string())
         } else {
             if schema_version < 10 {
                 if let Some(gr2) = &self.board.gr2 {
-                    if let Ok(gr2_v) = snap.read_state("gr2", schema_version) {
+                    if let Ok(gr2_v) = snap.read_state("gr2") {
                         gr2.load_state(&gr2_v)?;
                     }
                 }
@@ -2464,7 +2367,7 @@ impl Machine {
             None
         };
         let mgras_metadata = if schema_version >= 8 && self.board.mgras.is_some() {
-            let value = snap.read_state("mgras", schema_version).map_err(|e| e.to_string())?;
+            let value = snap.read_state("mgras").map_err(|e| e.to_string())?;
             Some(value.as_str().ok_or("mgras snapshot metadata is not a string")?.to_string())
         } else {
             None
@@ -2547,22 +2450,8 @@ impl Machine {
             }
         }
 
-        // COW overlays — best-effort for backward compatibility with
-        // snapshots saved before overlay capture was added.
-        if let Ok(cow_toml) = snap.read_toml("cow.toml") {
-            let sets = parse_cow_table(&cow_toml);
-            self.hpc3.scsi().import_overlays(&snap.dir, &sets)
-                .map_err(|e| format!("COW overlay import: {}", e))?;
-            if let Some(dev) = self.hpc3.scsi1() {
-                if let Ok(cow1_toml) = snap.read_toml("cow1.toml") {
-                    let sets1 = parse_cow_table(&cow1_toml);
-                    dev.import_overlays(&snap.dir.join("ctrl1"), &sets1)
-                        .map_err(|e| format!("COW overlay import (controller 1): {}", e))?;
-                }
-            }
-        } else {
-            eprintln!("load_snapshot: no cow.toml in snapshot — overlays left unchanged");
-        }
+        let sets = snap.read_toml("cow.toml").map(|t| crate::snapshot::parse_cow_table(&t)).map_err(|e| format!("cow.toml: {e}"))?;
+        crate::snapshot::import_overlays(&snap.dir, &self.placed_disk_buses(), &sets)?;
 
         self.restart_peripherals();
         Ok(())
@@ -3022,7 +2911,7 @@ mod production_newport_wgpu_tests {
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 let mut cfg = production_config(&nv_dir);
-                cfg.graphics.heads = 2;
+                cfg.set_device("newport", true);
 
                 let mut machine = Machine::try_new(cfg).expect("construct production resident machine");
                 let primary = machine.get_rex3().expect("primary Newport");
@@ -3277,10 +3166,15 @@ mod gr2_checkpoint_tests {
 #[cfg(test)]
 mod virtio_tests {
     use super::*;
-    use crate::config::{MachineProfile, VirtioGioSlot};
+    use crate::config::MachineProfile;
     use crate::dev::virtio::mmio::{MAGIC, REG_DEVICE_ID, REG_MAGIC};
 
-    fn probe(profile: MachineProfile, slot: VirtioGioSlot, base: u64) {
+    /// A `[[devices]]` entry from its TOML text.
+    fn card(text: &str) -> crate::devices::ConfiguredDevice {
+        crate::devices::ConfiguredDevice::from_table(toml::from_str(text).unwrap()).unwrap()
+    }
+
+    fn probe(profile: MachineProfile, slot: &'static str, base: u64) {
         let nv = crate::test_temp::TempPath::dir("virtio-nv");
         let nv_dir = nv.to_path_buf();
         std::thread::Builder::new()
@@ -3296,10 +3190,8 @@ mod virtio_tests {
                     cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
                     cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact);
                 }
-                cfg.virtio_serial.enabled = true;
-                cfg.virtio_serial.slot = slot;
                 // One unconnected port: no sockets in a unit test.
-                cfg.virtio_serial.ports = vec![Default::default()];
+                cfg.devices.push(card(&format!("type = \"virtio_serial\"\nat = \"{slot}\"\n[[port]]")));
                 let m = Machine::new(cfg);
                 let phys = &m.board.phys;
                 assert_eq!(phys.read32(base + REG_MAGIC).data, MAGIC, "{profile:?} {slot:?}");
@@ -3326,10 +3218,8 @@ mod virtio_tests {
                 crate::test_temp::nvram_in(&mut cfg, &nv_dir);
                 cfg.devices.clear();
                 cfg.machine.profile = MachineProfile::IndyIp24;
-                cfg.graphics.heads = 2;
-                cfg.ultra64.enabled = true;
+                cfg.set_device("newport", true);
                 let m = Machine::new(cfg);
-                assert!(m.board.ultra64.is_none(), "the second head has the Ultra64's slot");
                 let sys_id = m.board.phys.read32((IOC_BASE + crate::dev::ioc::IOC_SYS_ID) as u64).data;
                 assert!((sys_id >> 1) & 0xF >= 4, "a baseboard revision that takes a second board");
                 let phys = &m.board.phys;
@@ -3362,17 +3252,17 @@ mod virtio_tests {
 
     #[test]
     fn indy_slot_exp1() {
-        probe(MachineProfile::IndyIp24, VirtioGioSlot::Exp1, 0x1F60_0000);
+        probe(MachineProfile::IndyIp24, "gio1", 0x1F60_0000);
     }
 
     #[test]
     fn indy_slot_exp0() {
-        probe(MachineProfile::IndyIp24, VirtioGioSlot::Exp0, 0x1F40_0000);
+        probe(MachineProfile::IndyIp24, "gio0", 0x1F40_0000);
     }
 
     #[test]
     fn ip28_slot_exp1() {
-        probe(MachineProfile::Indigo2Ip28, VirtioGioSlot::Exp1, 0x1F60_0000);
+        probe(MachineProfile::Indigo2Ip28, "gio1", 0x1F60_0000);
     }
 
     #[cfg(unix)]
@@ -3388,12 +3278,8 @@ mod virtio_tests {
                 cfg.machine.cpu = Some("r10000".into());
                 cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
                 cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact);
-                cfg.virtio_serial.enabled = true;
-                cfg.virtio_serial.slot = VirtioGioSlot::Exp1;
-                cfg.virtio_serial.ports = vec![Default::default()];
-                cfg.virtio_9p.enabled = true;
-                cfg.virtio_9p.slot = VirtioGioSlot::Exp0;
-                cfg.virtio_9p.path = std::env::temp_dir().display().to_string();
+                cfg.devices.push(card("type = \"virtio_serial\"\nat = \"gio1\"\n[[port]]"));
+                cfg.devices.push(card(&format!("type = \"virtio_9p\"\nat = \"gio0\"\npath = {:?}", std::env::temp_dir().display().to_string())));
                 assert_eq!(cfg.validate(), Ok(()));
                 let m = Machine::new(cfg);
                 let phys = &m.board.phys;
@@ -3410,33 +3296,21 @@ mod virtio_tests {
     fn one_slot_holds_one_device() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.virtio_serial.enabled = true;
-        cfg.virtio_9p.enabled = true;
-        cfg.virtio_9p.path = "/tmp".into();
-        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("a GIO slot holds one device"));
+        cfg.devices.push(card("type = \"virtio_serial\"\nat = \"gio1\""));
+        cfg.devices.push(card("type = \"virtio_9p\"\nat = \"gio1\"\npath = \"/tmp\""));
+        assert!(cfg.validate().unwrap_err().contains("gio1 is taken by the virtio_serial"));
     }
 
-    /// On the Octane the virtio devices take Bridge slots 4 and 5 unless
-    /// `bridge_slot` names one of 4 to 7, and two cannot share one.
-    #[cfg(unix)]
+    /// On the Octane the virtio devices take the Bridge's extra slots, 7 then 5.
     #[test]
-    fn octane_virtio_bridge_slots() {
-        let mut cfg = MachineConfig::default();
-        cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.virtio_serial.enabled = true;
-        cfg.virtio_9p.enabled = true;
-        cfg.virtio_9p.path = "/tmp".into();
-        assert_eq!(cfg.octane_virtio_slots(), Ok((7, 5)));
-        cfg.virtio_serial.bridge_slot = Some(6);
-        cfg.virtio_9p.bridge_slot = Some(7);
-        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 7)));
-        assert_eq!(cfg.validate_virtio_9p_for_test(), Ok(()));
-        cfg.virtio_9p.bridge_slot = Some(6);
-        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("both in Bridge slot 6"));
-        cfg.virtio_9p.bridge_slot = Some(3);
-        assert!(cfg.validate_virtio_9p_for_test().unwrap_err().contains("slots 4 to 7"));
-        cfg.virtio_9p.enabled = false;
-        cfg.virtio_9p.bridge_slot = Some(6);
-        assert_eq!(cfg.octane_virtio_slots(), Ok((6, 6)), "a disabled device holds no slot");
+    fn octane_virtio_takes_the_bridge_extra_rows() {
+        let places = |text: &str| {
+            let mut cfg = MachineConfig::from_toml_str(&format!("devices = []\n[machine]\nprofile = \"octane_ip30\"\n{text}")).unwrap();
+            cfg.resolve_slots()?;
+            let p = crate::topology::DevicePlacement::new(&cfg)?;
+            Ok::<_, String>((0..cfg.devices.len()).filter_map(|i| Some(p.at(i)?.to_string())).collect::<Vec<_>>())
+        };
+        let both = "[virtio_serial]\nenabled = true\n[virtio_9p]\nenabled = true\npath = \"/tmp\"\n";
+        assert_eq!(places(both).unwrap(), ["xio15/pci0/7", "xio15/pci0/5"]);
     }
 }

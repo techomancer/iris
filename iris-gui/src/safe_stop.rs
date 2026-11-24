@@ -27,7 +27,7 @@ fn persists_to_base(path: &str, overlay: bool) -> bool {
 /// This is a config/status heuristic, not a guest shutdown acknowledgement:
 /// `cpu_halted` includes zero measured throughput. The machine's own disks
 /// are inspected: `[scsi.N]` (not on the IP35 brick machines, which have
-/// none), `[fibre_channel.disk.N]` and `[nvme]`. CD-ROMs, scratch, overlays,
+/// none), the disks on Fibre Channel loops and `[nvme]`. CD-ROMs, scratch, overlays,
 /// DaynaPort and `.chd` names are excluded from the warning. The filename
 /// check does not distinguish an uncompressed CHD that writes in place from a
 /// compressed parent with a diff. See STORAGE.md for the actual persistence
@@ -46,14 +46,13 @@ pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
             r.writable_disks.push(t!("safestop-scsi-disk", id = crate::extra_ui::scsi_name(k)));
         }
     }
-    if let Some(fc) = &cfg.fibre_channel {
-        for (id, disk) in &fc.disks {
-            if persists_to_base(&disk.path, disk.overlay) {
-                r.writable_disks.push(t!("safestop-fc-disk", id = *id));
-            }
+    for (id, i) in cfg.loop_disks() {
+        let disk = cfg.devices[i].device.scsi().expect("listed by loop_disks");
+        if persists_to_base(&disk.path, disk.overlay) {
+            r.writable_disks.push(t!("safestop-fc-disk", id = id));
         }
     }
-    if persists_to_base(&cfg.nvme.path, cfg.nvme.overlay) {
+    if cfg.nvme().is_some_and(|n| persists_to_base(&n.path, n.overlay)) {
         r.writable_disks.push(t!("safestop-nvme-disk"));
     }
     r
@@ -91,9 +90,7 @@ mod tests {
     fn ip35_warns_for_its_fibre_channel_disks_not_the_scsi_map() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = iris::config::MachineProfile::Origin3200Ip35;
-        let mut fc = iris::config::FibreChannelConfig::default();
-        fc.disks.insert(1, iris::config::ScsiDeviceConfig { path: "root.raw".into(), ..Default::default() });
-        cfg.fibre_channel = Some(fc);
+        cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/l1", iris::devices::DeviceModel::Scsi(iris::config::ScsiDeviceConfig { path: "root.raw".into(), ..Default::default() })));
         let r = evaluate(&running(false), &cfg);
         assert_eq!(r.writable_disks.len(), 1);
         assert!(r.writable_disks[0].contains('1'));

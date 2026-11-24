@@ -137,23 +137,66 @@ fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
     assert_eq!(status.map(|s| s & 1), [0, 0], "nothing plugged in");
     assert!(mouse, "without the USB pair the PS/2 mouse does");
 }
-/// `[machine] audio_card` fits the ICE1724 at device 2 of head F, its two I/O BARs reachable once
-/// placed; without it the slot is empty.
+/// An `ice1724` entry puts the ICE1724 in the slot it names, here device 2 of head F, its two I/O
+/// BARs reachable once placed; without one the slot is empty.
 #[test]
-fn the_fuel_takes_the_audio_card_at_device_2() {
+fn the_fuel_takes_the_audio_card_in_a_slot() {
     let dir = TempPath::dir("fuel-audio");
-    let slot = |audio| {
+    let slot = |audio: bool| {
         let mut cfg = fuel_config(&dir);
-        cfg.fuel.audio = audio;
+        cfg.devices.extend(audio.then(|| crate::devices::ConfiguredDevice::new("xio15/pci0/2", crate::devices::DeviceModel::Ice1724)));
         cfg.no_audio = true;
         with_machine(cfg, |m| {
-            let read = m.nodes[0].chip.pio().read32(pio_widget(15, 0x2_0000 + (u64::from(crate::ip35::AUDIO_CARD_DEVICE) << 12)));
+            let read = m.nodes[0].chip.pio().read32(pio_widget(15, 0x2_0000 + (2 << 12)));
             ((read.status == BUS_OK).then_some(read.data), m.io.monitor.iter().any(|d| d.audio_report().is_some()))
         })
     };
     assert_eq!(slot(true), (Some(0x1724_1412), true));
     let (id, report) = slot(false);
     assert!(id.is_none_or(|id| id == u32::MAX) && !report, "empty without the key");
+}
+
+/// virtio takes head F's extra slots, 6 then 7, never a slot; a real slot refuses it.
+#[test]
+fn virtio_takes_the_extra_rows_of_head_f() {
+    let dir = TempPath::dir("fuel-virtio");
+    let entry = |text: &str| crate::devices::ConfiguredDevice::from_table(toml::from_str(text).unwrap()).unwrap();
+    let mut cfg = fuel_config(&dir);
+    cfg.devices.extend([entry("type = \"virtio_serial\""), entry("type = \"virtio_serial\"")]);
+    with_machine(cfg, |m| {
+        let id = |device: u64| m.nodes[0].chip.pio().read32(pio_widget(15, 0x2_0000 + (device << 12))).data;
+        assert_eq!((id(6), id(7), id(2)), (0x1043_1af4, 0x1043_1af4, u32::MAX));
+    });
+    let mut cfg = fuel_config(&dir);
+    cfg.devices.push(entry("type = \"virtio_serial\"\nat = \"xio15/pci0/2\""));
+    assert!(cfg.validate().unwrap_err().contains("xio15/pci0/2 does not take a virtio_serial"));
+}
+
+/// The check agrees with the constructor: an NVMe card is refused before the machine is built.
+#[test]
+fn an_nvme_card_is_refused_by_the_check() {
+    let dir = TempPath::dir("fuel-nvme");
+    let mut cfg = fuel_config(&dir);
+    cfg.devices.push(crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"nvme\"\npath = \"n.img\"").unwrap()).unwrap());
+    assert!(cfg.validate().unwrap_err().contains("the Fuel takes no NVMe card yet"));
+}
+
+/// A Fibre Channel adapter in a slot of head F is built, with the disk placed on its loop,
+/// and not dropped the way every machine but the Octane used to.
+#[test]
+fn a_fibre_channel_adapter_in_a_slot_is_built_with_its_loop() {
+    let dir = TempPath::dir("fuel-fibre");
+    let entry = |text: &str| crate::devices::ConfiguredDevice::from_table(toml::from_str(text).unwrap()).unwrap();
+    let disk = TempPath::file("fuel-fibre-disk", &[0u8; 4096]);
+    let mut cfg = fuel_config(&dir);
+    cfg.devices.extend([
+        entry("type = \"qla2200\"\nat = \"xio15/pci0/2\"\nname = \"fc\""),
+        entry(&format!("type = \"hdd\"\nat = \"fc/l5\"\npath = {:?}", disk.to_string_lossy())),
+    ]);
+    with_machine(cfg, |m| {
+        let id = |device: u64| m.nodes[0].chip.pio().read32(pio_widget(15, 0x2_0000 + (device << 12))).data;
+        assert_eq!(id(2) & 0xffff, 0x1077, "the adapter answers in the slot");
+    });
 }
 
 /// A Fuel with `graphics` in its graphics slot.

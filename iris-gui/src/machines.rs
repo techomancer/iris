@@ -2,6 +2,7 @@
 //! disk and in the editor; external paths keep the spelling the user chose; the selected machine folder is the emulator's working directory.
 
 use iris::config::MachineConfig;
+use iris::devices::DeviceModel;
 use std::path::{Component, Path, PathBuf};
 
 pub fn validate_name(name: &str) -> Result<(), String> {
@@ -76,7 +77,7 @@ pub fn read(path: &Path) -> Result<MachineConfig, String> {
 /// own memory, as the core does for an unset `banks`).
 pub fn to_toml(cfg: &MachineConfig) -> Result<String, String> {
     // Through text: `toml::Table::try_from` refuses the integer-keyed maps
-    // (`[scsi.N]`, `[fibre_channel.disk.N]`) that the document writer accepts.
+    // (`[scsi.N]`) that the document writer accepts.
     let text = toml::to_string_pretty(&cfg.for_writing()).map_err(|e| e.to_string())?;
     let unset_banks = !cfg.banks_set && cfg.banks == MachineConfig::default().banks;
     if !unset_banks && cfg.jitv2_threads_set {
@@ -141,7 +142,6 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
     ] {
         if let Some(path) = path { visit(path); }
     }
-    visit(&mut cfg.nvme.path);
     visit(&mut cfg.virtio_9p.path);
     if let Some(file) = &mut cfg.audio.file {
         let mut path = file.to_string_lossy().into_owned();
@@ -151,13 +151,9 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
     for port in &mut cfg.virtio_serial.ports {
         if let Some(path) = &mut port.socket { visit(path); }
     }
-    if let Some(fc) = &mut cfg.fibre_channel {
-        for disk in fc.disks.values_mut() { visit(&mut disk.path); }
-    }
     for path in [
         &mut cfg.serial_log,
         &mut cfg.load_elf,
-        &mut cfg.test_device_dump,
         &mut cfg.network.tftp_dir,
         &mut cfg.network.rsh_dir,
     ] {
@@ -169,10 +165,19 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
     if !iris::config::ci_socket_is_tcp(&cfg.ci_socket) {
         visit(&mut cfg.ci_socket);
     }
-    for dev in cfg.devices.iter_mut().filter_map(|d| d.device.scsi_mut()) {
-        visit(&mut dev.path);
-        for disc in &mut dev.discs {
-            visit(disc);
+    for d in &mut cfg.devices {
+        match &mut d.device {
+            DeviceModel::Scsi(dev) => {
+                visit(&mut dev.path);
+                for disc in &mut dev.discs {
+                    visit(disc);
+                }
+            }
+            DeviceModel::Nvme(n) => visit(&mut n.path),
+            DeviceModel::TestDevice(t) => t.dump.iter_mut().for_each(&mut visit),
+            DeviceModel::Virtio9p(v) => visit(&mut v.path),
+            DeviceModel::VirtioSerial(v) => v.ports.iter_mut().filter_map(|p| p.socket.as_mut()).for_each(&mut visit),
+            DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Newport | DeviceModel::Graphics => {}
         }
     }
     if let Some(nfs) = &mut cfg.nfs {
@@ -412,7 +417,10 @@ pub(crate) mod tests {
         cfg.network.tftp_dir = Some(root.0.join("tftp").to_string_lossy().into_owned());
         cfg.serial_log = Some(dir.join("console.log").to_string_lossy().into_owned());
         cfg.load_elf = Some(root.0.join("test.elf").to_string_lossy().into_owned());
-        cfg.test_device_dump = Some(dir.join("dump.json").to_string_lossy().into_owned());
+        cfg.set_device("test_device", true);
+        if let Some(DeviceModel::TestDevice(t)) = cfg.devices.last_mut().map(|d| &mut d.device) {
+            t.dump = Some(dir.join("dump.json").to_string_lossy().into_owned());
+        }
         cfg.jitv2.cache_dir = dir.join("jit-cache").to_string_lossy().into_owned();
         cfg.ci_socket = "tcp:127.0.0.1:19851".into();
         cfg.debug.debug_log = "scsi=debug,cpu=warn".into();
@@ -444,11 +452,12 @@ pub(crate) mod tests {
         let mut cfg = MachineConfig::default();
         cfg.tezro.flash = Some(dir.join("flash.bin").to_string_lossy().into_owned());
         cfg.origin2000.io_prom = Some(dir.join("io6prom.img").to_string_lossy().into_owned());
-        cfg.nvme.path = dir.join("disk.raw").to_string_lossy().into_owned();
-        cfg.fibre_channel = Some(Default::default());
-        cfg.fibre_channel.as_mut().unwrap().disks.insert(1, iris::config::ScsiDeviceConfig {
+        let nvme = iris::config::NvmeConfig { path: dir.join("disk.raw").to_string_lossy().into_owned(), ..Default::default() };
+        cfg.devices.push(iris::devices::ConfiguredDevice::new("pci_slot", iris::devices::DeviceModel::Nvme(nvme)));
+        cfg.machine.profile = iris::config::MachineProfile::Origin3200Ip35;
+        cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/l1", iris::devices::DeviceModel::Scsi(iris::config::ScsiDeviceConfig {
             path: dir.join("fc.raw").to_string_lossy().into_owned(), ..Default::default()
-        });
+        })));
         cfg.virtio_serial.ports.push(iris::config::VirtioSerialPort {
             socket: Some(dir.join("port.sock").to_string_lossy().into_owned()), ..Default::default()
         });
@@ -456,8 +465,8 @@ pub(crate) mod tests {
         let back = read(&config_path(&root.0, "tezro").unwrap()).unwrap();
         assert_eq!(back.tezro.flash.as_deref(), Some("flash.bin"));
         assert_eq!(back.origin2000.io_prom.as_deref(), Some("io6prom.img"));
-        assert_eq!(back.nvme.path, "disk.raw");
-        assert_eq!(back.fibre_channel.unwrap().disks[&1].path, "fc.raw");
+        assert_eq!(back.nvme().unwrap().path, "disk.raw");
+        assert_eq!(back.loop_disks().iter().map(|d| back.devices[d.1].device.scsi().unwrap().path.as_str()).collect::<Vec<_>>(), ["fc.raw"]);
         assert_eq!(back.virtio_serial.ports[0].socket.as_deref(), Some("port.sock"));
     }
 

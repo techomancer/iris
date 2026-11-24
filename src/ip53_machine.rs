@@ -17,7 +17,7 @@
 //! - The PCI devices at 1 to 4 and the IOC4 (0x53), ISP12160 (6) and BCM5701 (0x15) revisions
 //!   are as consoles print them (established). INTA and INTC reaching PIC input d - 1 is IRIX's
 //!   pin rule; the board wiring, INTB and INTD are unknown.
-//! - The audio controller (`[machine] audio_card`) is the ICE1724 with the DM8's converters, at device 2
+//! - The audio controller (an `ice1724` entry) is the ICE1724 with the DM8's converters, at device 2
 //!   of the TI bridge's bus (`AUDIO_DEVICE`, inferred by exclusion); its converters, subsystem
 //!   IDs and EEPROM are a model choice, not Tezro evidence. Its INTA reaches PIC input 1 via the
 //!   bridge's rotation (wiring unknown).
@@ -48,7 +48,7 @@ use crate::clock::Clock;
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};
-use crate::dev::pic::{Function, Pic};
+use crate::dev::pic::{Function, Pic, PIC_ROUTING};
 use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::devlog::LogModule;
 use crate::hptimer::TimerManager;
@@ -58,7 +58,8 @@ use crate::xtalk::Upstream;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::serial::{connect_serial_ports, SerialPort};
 use crate::sn::BoardIo;
-use crate::pci::{DevFn, PciToPciBridge};
+use crate::pci::{DevFn, PciToPciBridge, PCI_INTA};
+use crate::topology::MachineSlotKind;
 use crate::sn::{NodeBoard};
 use crate::traits::{Device, Resettable};
 use std::path::{Path, PathBuf};
@@ -75,17 +76,31 @@ const HOST_WIDGET: u8 = 10;
 /// The device the V12's packets name at Bedrock IO's inbound permission check.
 const INBOUND_DEVICE: u8 = 0;
 
-/// The ISP12160's two channels.
-fn scsi_at() -> [String; 2] {
-    [0, 1].map(|c| format!("xio{IO9_WIDGET}/pci0/{SCSI_DEVICE}/c{c}"))
-}
+/// The IO9 PIC's bus 0: the IOC4, the TI bridge, the ISP12160 and the BCM5701.
+pub(crate) const IO9_BUS0_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
+        (IOC4_DEVICE, MachineSlotKind::Fixed("ioc4"), None),
+        (TI_BRIDGE_DEVICE, MachineSlotKind::Fixed("pci2050"), None),
+        (SCSI_DEVICE, MachineSlotKind::Fixed("isp12160"), None),
+        (ETH_DEVICE, MachineSlotKind::Fixed("bcm5701"), None),
+    ];
+
+/// Bus 1, empty on the board: two extra slots.
+pub(crate) const IO9_BUS1_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::Extra { pin: PCI_INTA }, None), (2, MachineSlotKind::Extra { pin: PCI_INTA }, None)];
 
 /// The Tezro's slots.
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
-    crate::topology::fixed_slot(s, &format!("xio{IO9_WIDGET}/pci0/{SCSI_DEVICE}"), "isp12160", &[]);
-    for at in scsi_at() {
-        crate::topology::scsi_bus_slots(s, &at, "isp12160 channel", 15);
+    // The V12's port first, the only one known to work; the others are for experiment.
+    for w in [VPRO_WIDGET, 8, 9, 13, 14] {
+        crate::topology::open_slot(s, &format!("xio{w}"), &[crate::topology::DeviceFamily::Gfx], &[]);
     }
+    crate::topology::pci_bus_slots(s, &format!("xio{IO9_WIDGET}/pci0"), "Tezro IO9 PIC, bus 0", IO9_BUS0_SLOTS);
+    // The ISP12160's two channels.
+    for c in [0, 1] {
+        crate::topology::scsi_bus_slots(s, &format!("xio{IO9_WIDGET}/pci0/{SCSI_DEVICE}/c{c}"), "isp12160 channel", 15);
+    }
+    crate::topology::pci_bus_slots(s, &format!("xio{IO9_WIDGET}/pci1"), "Tezro IO9 PIC, bus 1", IO9_BUS1_SLOTS);
+    let behind_ti = format!("xio{IO9_WIDGET}/pci0/{TI_BRIDGE_DEVICE}/pci0");
+    crate::topology::pci_bus_slots(s, &behind_ti, "TI PCI2050 secondary bus", &[(AUDIO_DEVICE, MachineSlotKind::PCI_SLOT, None)]);
 }
 
 /// IO9's PCI functions: configuration device on head 0.
@@ -98,14 +113,9 @@ const TI_BRIDGE_DEVICE: u8 = 2;
 const TI_BRIDGE_VENDOR: u16 = 0x104c;
 const TI_BRIDGE_ID: u16 = 0xac28;
 const TI_BRIDGE_REVISION: u8 = 1;
-/// The audio controller's device on the TI bridge's secondary bus: inferred from IRIX listings
-/// printing `1412:1724` at "slot 2" beside the bridge.
+/// The slot on the TI bridge's secondary bus, where an audio controller goes: inferred from IRIX
+/// listings printing `1412:1724` at "slot 2" beside the bridge.
 const AUDIO_DEVICE: u8 = 2;
-/// The IO9 PIC's bus 1, empty on the board, carries the virtio functions
-/// (`[virtio_serial]`, `[virtio_9p]`): a software choice, as on the Octane.
-const VIRTIO_BUS: usize = 1;
-const VIRTIO_SERIAL_DEVICE: u8 = 1;
-const VIRTIO_9P_DEVICE: u8 = 2;
 
 /// The Tezro's default memory in MiB: 4 GiB as 1024, 1024 and four 512 MiB banks
 /// (QEMU's layout, matching a captured Tezro). Banks 4 and 5 sit at 4 to 6 GiB.
@@ -324,8 +334,8 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     Ok(vec![spec(chip, cpus, &banks, cfg.network().mac, Some(cfg.tezro_system_serial()), vpro, cfg.tezro.flash.as_deref().map(PathBuf::from))?])
 }
 
-/// The IO9's devices around the node: the PXBOW and PICs, IOC4, ISP12160, BCM5701, the audio
-/// controller when asked for, and the V12. The clocked devices run on `timers`.
+/// The IO9's devices around the node: the PXBOW and PICs, IOC4, ISP12160, BCM5701, the cards the
+/// config places, and the V12. The clocked devices run on `timers`.
 pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &[Arc<L1>], timers: &Arc<TimerManager>, clock: &Clock) -> Result<BoardIo, String> {
     let (bedrock, l1) = (&nodes[0].chip, &l1s[0]);
     let cpus = usize::from(cfg.machine.cpus());
@@ -351,10 +361,10 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     status.set_scsi_wide(true);
     // The V12's interrupt packets and DMA reach Bedrock IO as the PIC's do. Nothing counts the
     // processors' stores into its graphics page or returns credits for them.
+    let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
     let vpro = (cfg.graphics_board() == GraphicsBoard::V12)
         .then(|| {
-            let widget = cfg.graphics.widget.unwrap_or(VPRO_WIDGET);
-            check_vpro_widget(widget)?;
+            let widget = resolved.graphics().and_then(|at| at.xio_port()).map_or(VPRO_WIDGET, |p| p.1);
             attach_vpro(cfg, bedrock, widget, bedrock.interrupt_sender(widget, Some(INBOUND_DEVICE)), &status, |vpro| {
                 pxbow.attach_widget(widget, vpro).map_err(|e| format!("Tezro V12: {e:?}"))?;
                 Ok(pxbow.route(widget))
@@ -391,19 +401,17 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         TI_BRIDGE_REVISION,
     );
     io9.attach(0, TI_BRIDGE_DEVICE, ti.clone(), Function::default());
-    let audio = cfg.tezro.audio.then(|| {
-        let card = crate::ip35::audio_card(cfg, timers);
-        ti.secondary().attach(DevFn { device: AUDIO_DEVICE, function: 0 }, card.clone());
-        card
-    });
     io9.attach(0, SCSI_DEVICE, scsi.clone(), Function::default());
     io9.attach(0, ETH_DEVICE, eth.clone(), Function { self_ordered_pio: false, req64: true });
 
     let (table, product) = (cfg.machine.profile.table_name().unwrap_or_default(), cfg.machine.profile.product_name().unwrap_or_default());
     let buses = [0, 1].map(|c| scsi.bus_for_channel(c).expect("the ISP12160 has two channels"));
-    let resolved = crate::topology::DevicePlacement::new(cfg)?;
+    for head in [0, 1] {
+        resolved.bind_pci(&format!("xio{IO9_WIDGET}/pci{head}"), io9.bus(head).clone())?;
+    }
+    resolved.bind_pci(&format!("xio{IO9_WIDGET}/pci0/{TI_BRIDGE_DEVICE}/pci0"), ti.secondary().clone())?;
     let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &resolved, &buses)?;
-    let virtio = Arc::new(attach_virtio(cfg, &io9));
+    let cards = Arc::new(resolved.build_cards(cfg, timers)?);
     eprintln!("iris: {}", if vpro.is_some() { cfg.graphics_board().label() } else { "no graphics" });
     let console_index = cfg.tezro.console.index();
     connect_serial_ports(cfg, "Tezro", &serial_ports(cfg, l1, &ioc4, &serial), console_index)?;
@@ -415,16 +423,11 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     if let Some(vpro) = &vpro {
         monitor.push(vpro.clone());
     }
-    if let Some(audio) = &audio {
-        monitor.push(audio.clone());
-    }
     let mut devices: Vec<Arc<dyn Device>> = Vec::new();
     devices.extend(vpro.iter().map(|v| v.clone() as Arc<dyn Device>));
     devices.extend([ioc4.clone() as Arc<dyn Device>, eth.clone(), scsi.clone()]);
-    devices.extend(audio.iter().map(|a| a.clone() as Arc<dyn Device>));
-    devices.extend(virtio.iter().map(|v| v.clone() as Arc<dyn Device>));
-    let (reset_virtio, reset_presence, reset_ioc4, reset_scsi, reset_eth, reset_pics, reset_vpro) =
-        (virtio, presence.clone(), ioc4.clone(), scsi.clone(), eth.clone(), pics.clone(), vpro.clone());
+    let (reset_presence, reset_ioc4, reset_scsi, reset_eth, reset_pics, reset_vpro) =
+        (presence.clone(), ioc4.clone(), scsi.clone(), eth.clone(), pics.clone(), vpro.clone());
     let held = presence.clone();
     let cpu_presence = presence;
     scsi.register_locks();
@@ -432,9 +435,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     eth.register_locks();
     for pic in &pics {
         pic.register_locks();
-    }
-    if let Some(audio) = &audio {
-        audio.register_locks();
     }
     let (cpu_eth, disks) = (eth.clone(), scsi.clone());
     Ok(BoardIo {
@@ -449,9 +449,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
             }
             if let Some(vpro) = &reset_vpro {
                 vpro.power_on();
-            }
-            for v in reset_virtio.iter() {
-                Resettable::power_on(&**v);
             }
         }),
         at_batch: (running.count() > 1).then(|| Arc::new(move || held.at_batch()) as Arc<dyn Fn() + Send + Sync>),
@@ -472,7 +469,8 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
             cpu_presence.set_cpus(all);
             cpu_eth.set_cpu_cycles(all.iter().map(|c| c.cycles_ptr()).collect());
         })),
-    })
+    }
+    .with_cards(&cards))
 }
 
 /// The board's serial connections in console order: the L1, then the IOC4's
@@ -517,41 +515,9 @@ fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[A
     ]
 }
 
-/// The virtio functions the config enables, on the IO9 PIC's bus 1, each
-/// with its INTA on input `device - 1`, as `Pic::attach` routes it.
-fn attach_virtio(cfg: &MachineConfig, io9: &Arc<Pic>) -> Vec<Arc<crate::dev::virtio::pci::VirtioPci>> {
-    use crate::dev::virtio::pci::VirtioPci;
-    let mut attached = Vec::new();
-    let mut attach = |device: u8, name: &str, dev: VirtioPci| {
-        let dev = Arc::new(dev);
-        io9.attach(VIRTIO_BUS, device, dev.clone(), Function::default());
-        eprintln!("iris: {name} on the IO9 PIC, bus {VIRTIO_BUS} device {device}");
-        attached.push(dev);
-    };
-    if cfg.virtio_serial.enabled {
-        attach(VIRTIO_SERIAL_DEVICE, "virtio-serial",
-            VirtioPci::new(crate::dev::virtio::console::from_config(&cfg.virtio_serial)));
-    }
-    if cfg.virtio_9p.enabled {
-        attach(VIRTIO_9P_DEVICE, "virtio-9p", VirtioPci::new(crate::dev::virtio::p9::from_config(&cfg.virtio_9p)));
-    }
-    attached
-}
-
-
 /// Where the V12 sits: widget 12 behind the PIC that owns widget 0 (QEMU's graphics slot). On the
 /// one-processor board the guide names no widget or route for it; this is inferred.
 const VPRO_WIDGET: u8 = 12;
-
-/// `[graphics] widget`: a port of the crossbar the V12 can take, which the host port, the second
-/// PIC and the IO9 are not. Only 12 is known to work; the others are for experiment.
-pub(crate) fn check_vpro_widget(widget: u8) -> Result<(), String> {
-    if (8..=14).contains(&widget) && widget != HOST_WIDGET && widget != SECOND_PIC_WIDGET {
-        Ok(())
-    } else {
-        Err(format!("graphics.widget {widget} is not a free port of the Tezro's crossbar (valid: 8, 9, 12, 13, 14)"))
-    }
-}
 
 #[cfg(test)]
 mod tests;

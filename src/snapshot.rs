@@ -14,10 +14,6 @@
 //   bank1.bin      — 128 MB RAM bank B
 //   bank2.bin      — 128 MB RAM bank C
 //   bank3.bin      — 128 MB RAM bank D
-//
-// Before schema_version 2 device state was *.toml (hex strings):
-// schema_version = 1: same layout but device state is *.toml.
-// schema_version = 0 (no manifest): legacy, also *.toml.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -72,12 +68,14 @@ use toml::Value;
 ///
 /// v9 → v10: `ChunksManifest` gains named GR2 board state, VRAM, and Z-buffer
 /// chunks. The board's small metadata remains in its device state file.
-pub const SCHEMA_VERSION: u32 = 10;
+///
+/// v10 → v11: disks, overlays and placed devices are named by slot path (`xio15/pci0/0/t1`) where they were numbered by
+/// controller and target id, so each side refuses the other schema.
+pub const SCHEMA_VERSION: u32 = 11;
 
-/// The oldest schema this build reads. The v6 through v10 chunk manifests are
-/// decoded explicitly; absent KONA, IMPACT, VPro, or GR2 lists become empty. Raise
-/// this when a change makes an older snapshot unreadable.
-pub const OLDEST_SCHEMA: u32 = 6;
+/// The oldest schema this build reads. Raise this when a change makes an older
+/// snapshot unreadable.
+pub const OLDEST_SCHEMA: u32 = 11;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 
@@ -93,9 +91,20 @@ pub struct Snapshot {
 /// hashing multi-GB images.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskRef {
-    pub id: u8,
+    /// Where the disk is: its SCSI target or loop ID, or for an NVMe card the card.
+    pub at: crate::slot_path::MachineSlotPath,
     pub path: String,
     pub size_bytes: u64,
+}
+
+impl DiskRef {
+    /// The disks of `tables` as a manifest records them, by slot; CD-ROMs only when `cdroms` (the Indy and Indigo2 list them, the O2 and Octane do not).
+    pub fn from_tables(tables: &[crate::scsi::TableRef], cdroms: bool) -> Vec<DiskRef> {
+        tables.iter()
+            .filter(|t| cdroms || !t.is_cdrom)
+            .map(|t| DiskRef { at: t.at.clone(), path: t.path.clone(), size_bytes: t.size_bytes })
+            .collect()
+    }
 }
 
 /// Reject a restore whose CPU model differs from the running machine's.
@@ -160,7 +169,8 @@ pub fn enabled_features() -> Vec<String> {
 /// older ones itself.
 pub fn check_schema(name: &str, found: u32) -> Result<(), String> {
     if !(OLDEST_SCHEMA..=SCHEMA_VERSION).contains(&found) {
-        return Err(format!("snapshot {name} is schema {found}; this build reads schemas {OLDEST_SCHEMA} to {SCHEMA_VERSION}"));
+        let reads = if OLDEST_SCHEMA == SCHEMA_VERSION { format!("schema {SCHEMA_VERSION}") } else { format!("schemas {OLDEST_SCHEMA} to {SCHEMA_VERSION}") };
+        return Err(format!("snapshot {name} is schema {found}; this build reads {reads}"));
     }
     Ok(())
 }
@@ -183,10 +193,10 @@ pub fn check_provenance(m: &Manifest, cpu_model: &str, cache_kind: &str, disks: 
         fatal.push(e);
     }
     for d in &m.disks {
-        match disks.iter().find(|c| c.id == d.id) {
-            None => fatal.push(format!("snapshot disk {}:{} ('{}') is not configured in this run", d.id / 16, d.id % 16, d.path)),
+        match disks.iter().find(|c| c.at == d.at) {
+            None => fatal.push(format!("snapshot disk at {} ('{}') is not configured in this run", d.at, d.path)),
             Some(c) if c.size_bytes != d.size_bytes => fatal.push(format!(
-                "disk {}:{} ('{}') size differs: snapshot {} bytes vs current {}", d.id / 16, d.id % 16, d.path, d.size_bytes, c.size_bytes)),
+                "disk at {} ('{}') size differs: snapshot {} bytes vs current {}", d.at, d.path, d.size_bytes, c.size_bytes)),
             Some(_) => {}
         }
     }
@@ -199,6 +209,115 @@ pub fn check_provenance(m: &Manifest, cpu_model: &str, cache_kind: &str, disks: 
         }
     }
     Ok(())
+}
+
+/// Each disk's copy-on-write dirty sectors, by the disk's slot path.
+pub type OverlaySets = Vec<(crate::slot_path::MachineSlotPath, Vec<u64>)>;
+
+/// A SCSI bus that holds disks, at its slot, for the overlays a snapshot keeps.
+pub struct DiskBus<'a> {
+    pub at: crate::slot_path::MachineSlotPath,
+    pub bus: &'a crate::scsi::ScsiBus,
+    /// The slot of a disk on the bus: a target or a loop ID of it. None for a card with one disk
+    /// and no target slot, such as an NVMe, where the card is the disk's slot.
+    child: Option<fn(&crate::slot_path::MachineSlotPath, u8) -> crate::slot_path::MachineSlotPath>,
+}
+
+impl<'a> DiskBus<'a> {
+    /// A controller's bus: its disks are its targets.
+    pub fn targets(at: crate::slot_path::MachineSlotPath, bus: &'a crate::scsi::ScsiBus) -> Self {
+        Self { at, bus, child: Some(crate::slot_path::MachineSlotPath::target) }
+    }
+
+    /// A Fibre Channel adapter's loop: its disks are loop IDs.
+    pub fn loop_ids(at: crate::slot_path::MachineSlotPath, bus: &'a crate::scsi::ScsiBus) -> Self {
+        Self { at, bus, child: Some(crate::slot_path::MachineSlotPath::loop_id) }
+    }
+
+    pub fn card(at: crate::slot_path::MachineSlotPath, bus: &'a crate::scsi::ScsiBus) -> Self {
+        Self { at, bus, child: None }
+    }
+
+    /// The slot of the disk at `id` on this bus.
+    pub fn disk(&self, id: usize) -> crate::slot_path::MachineSlotPath {
+        self.child.map_or_else(|| self.at.clone(), |child| child(&self.at, id as u8))
+    }
+
+    fn id_of(&self, at: &crate::slot_path::MachineSlotPath) -> Option<usize> {
+        let Some(child) = self.child else { return (*at == self.at).then_some(0) };
+        let n = at.last_number()?;
+        (child(&self.at, n) == *at).then_some(n as usize)
+    }
+}
+
+/// The overlay buses of a machine: its SCSI controllers at `slots`, in the order its slot list
+/// declares them, then its cards'.
+pub fn disk_buses<'a>(
+    slots: impl IntoIterator<Item = crate::slot_path::MachineSlotPath>,
+    controllers: impl IntoIterator<Item = &'a crate::scsi::ScsiBus>,
+    cards: Option<&'a crate::devices::AttachedCards>,
+) -> Vec<DiskBus<'a>> {
+    let mut v: Vec<_> = slots.into_iter().zip(controllers).map(|(at, bus)| DiskBus::targets(at, bus)).collect();
+    v.extend(cards.into_iter().flat_map(|c| c.disk_buses()));
+    v
+}
+
+/// Copy every disk's overlay into a directory named by its bus's slot path under the snapshot,
+/// and write `cow.toml`: each disk's dirty sectors, keyed by the disk's slot path.
+pub fn export_overlays(snap: &Snapshot, buses: &[DiskBus]) -> Result<(), String> {
+    let mut tbl = toml::map::Map::new();
+    for b in buses {
+        let dir = snap.dir.join(b.at.to_string());
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let sets = b.bus.export_overlays(&dir).map_err(|e| format!("COW overlay export ({}): {e}", b.at))?;
+        for (id, dirty) in sets {
+            let arr = dirty.into_iter().map(|v| Value::Integer(v as i64)).collect();
+            tbl.insert(b.disk(id).to_string(), Value::Array(arr));
+        }
+    }
+    snap.write_toml("cow.toml", &Value::Table(tbl)).map_err(|e| e.to_string())
+}
+
+/// What a `cow.toml` lists. Keys that are not slot paths are ignored.
+pub fn parse_cow_table(cow_toml: &Value) -> OverlaySets {
+    let mut sets = Vec::new();
+    if let Some(tbl) = cow_toml.as_table() {
+        for (k, v) in tbl {
+            let (Ok(at), Some(arr)) = (k.parse::<crate::slot_path::MachineSlotPath>(), v.as_array()) else { continue };
+            sets.push((at, arr.iter().filter_map(|x| x.as_integer().map(|i| i as u64)).collect()));
+        }
+    }
+    sets
+}
+
+/// The overlays `export_overlays` wrote under `dir`, put back on the buses that hold their
+/// disks. A disk with no entry keeps its overlay, and an entry for a slot with no disk is ignored.
+pub fn import_overlays(dir: &std::path::Path, buses: &[DiskBus], sets: &OverlaySets) -> Result<(), String> {
+    for (at, dirty) in sets {
+        for b in buses {
+            let Some(id) = b.id_of(at) else { continue };
+            b.bus.import_overlays(&dir.join(b.at.to_string()), &[(id, dirty.clone())])
+                .map_err(|e| format!("COW overlay import ({at}): {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a snapshot whose devices are not this machine's: one that moved (the error names the
+/// `at` that pins it), and one added to the config since, whose bus the saved state has no slot for.
+pub fn check_slots(m: &Manifest, current: &[(String, crate::slot_path::MachineSlotPath)]) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    for (ty, at) in &m.devices {
+        if !current.iter().any(|(t, a)| t == ty && a == at) {
+            wrong.push(format!("snapshot has a {ty} at {at}, this machine has none there: set at = \"{at}\""));
+        }
+    }
+    for (ty, at) in current {
+        if !m.devices.iter().any(|(t, a)| t == ty && a == at) {
+            wrong.push(format!("config has a {ty} at {at}, which the snapshot has none of: remove it, or save again"));
+        }
+    }
+    if wrong.is_empty() { Ok(()) } else { Err(format!("snapshot devices differ:\n  - {}", wrong.join("\n  - "))) }
 }
 
 /// Top-level snapshot manifest. Lives at `saves/<name>/snapshot.toml`. Written
@@ -216,8 +335,10 @@ pub struct Manifest {
     /// Cargo features enabled in the build that captured this snapshot.
     /// Empty for legacy manifests written before provenance was recorded.
     pub features: Vec<String>,
-    /// Configured SCSI disks at capture time. Empty for legacy manifests.
+    /// Configured SCSI disks at capture time.
     pub disks: Vec<DiskRef>,
+    /// The other placed devices at capture time: their type and resolved slot.
+    pub devices: Vec<(String, crate::slot_path::MachineSlotPath)>,
     /// Configured nvram file path at capture time. None for legacy manifests.
     pub nvram: Option<String>,
     /// Emulated CPU at capture time. None for legacy manifests, and for those
@@ -252,6 +373,7 @@ impl Manifest {
             // Filled in by the Machine, which is the only thing that knows the
             // configured disks and nvram path.
             disks: Vec::new(),
+            devices: Vec::new(),
             nvram: None,
             cpu_model: None,
             cpu_cache: None,
@@ -285,12 +407,21 @@ impl Manifest {
         if !self.disks.is_empty() {
             let disks: Vec<Value> = self.disks.iter().map(|d| {
                 let mut dt = toml::map::Map::new();
-                dt.insert("id".into(), Value::Integer(d.id as i64));
+                dt.insert("at".into(), Value::String(d.at.to_string()));
                 dt.insert("path".into(), Value::String(d.path.clone()));
                 dt.insert("size_bytes".into(), Value::Integer(d.size_bytes as i64));
                 Value::Table(dt)
             }).collect();
             tbl.insert("disks".into(), Value::Array(disks));
+        }
+        if !self.devices.is_empty() {
+            let devices: Vec<Value> = self.devices.iter().map(|(ty, at)| {
+                let mut dt = toml::map::Map::new();
+                dt.insert("type".into(), Value::String(ty.clone()));
+                dt.insert("at".into(), Value::String(at.to_string()));
+                Value::Table(dt)
+            }).collect();
+            tbl.insert("devices".into(), Value::Array(devices));
         }
         if let Some(cm) = &self.cpu_model {
             tbl.insert("cpu_model".into(), Value::String(cm.clone()));
@@ -338,10 +469,17 @@ impl Manifest {
             .map(|arr| arr.iter().filter_map(|x| {
                 let t = x.as_table()?;
                 Some(DiskRef {
-                    id: t.get("id").and_then(|v| v.as_integer())? as u8,
+                    at: t.get("at").and_then(|v| v.as_str())?.parse().ok()?,
                     path: t.get("path").and_then(|v| v.as_str())?.to_string(),
                     size_bytes: t.get("size_bytes").and_then(|v| v.as_integer())? as u64,
                 })
+            }).collect())
+            .unwrap_or_default();
+        let devices = tbl.get("devices")
+            .and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|x| {
+                let t = x.as_table()?;
+                Some((t.get("type")?.as_str()?.to_string(), t.get("at")?.as_str()?.parse().ok()?))
             }).collect())
             .unwrap_or_default();
         let nvram = tbl.get("nvram").and_then(|x| x.as_str()).map(String::from);
@@ -358,6 +496,7 @@ impl Manifest {
             installed_bundles,
             features,
             disks,
+            devices,
             nvram,
             cpu_model,
             cpu_cache,
@@ -433,29 +572,13 @@ impl Snapshot {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
-    /// Write a device save_state value, picking `<base>.bin` for v2+ and
-    /// `<base>.toml` for legacy schemas. Centralizes the per-call branching
-    /// in machine.rs.
-    pub fn write_state(&self, base: &str, v: &Value, schema_version: u32) -> std::io::Result<()> {
-        if schema_version >= 2 {
-            self.write_value_bin(&format!("{}.bin", base), v)
-        } else {
-            self.write_toml(&format!("{}.toml", base), v)
-        }
+    /// Write a device save_state value as `<base>.bin`.
+    pub fn write_state(&self, base: &str, v: &Value) -> std::io::Result<()> {
+        self.write_value_bin(&format!("{base}.bin"), v)
     }
 
-    /// Read a device save_state value. For v2+ tries `<base>.bin` first and
-    /// falls back to `<base>.toml` for snapshots half-migrated by external
-    /// tooling. For legacy schemas reads `<base>.toml` directly.
-    pub fn read_state(&self, base: &str, schema_version: u32) -> std::io::Result<Value> {
-        if schema_version >= 2 {
-            match self.read_value_bin(&format!("{}.bin", base)) {
-                Ok(v) => Ok(v),
-                Err(_) => self.read_toml(&format!("{}.toml", base)),
-            }
-        } else {
-            self.read_toml(&format!("{}.toml", base))
-        }
+    pub fn read_state(&self, base: &str) -> std::io::Result<Value> {
+        self.read_value_bin(&format!("{base}.bin"))
     }
 
     pub fn ensure_dir(&self) -> std::io::Result<()> {
@@ -528,89 +651,9 @@ pub struct Gr2Chunk {
     pub hashes: Vec<ChunkHash>,
 }
 
-/// `chunks.bin` as schema 9 wrote it: `ChunksManifest` before `gr2_chunks`.
-#[derive(Serialize, Deserialize)]
-struct ChunksManifestV9 {
-    bank_chunks: [Vec<ChunkHash>; 4],
-    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
-    kona_chunks: Vec<crate::dev::kona::KonaChunk>,
-    mgras_chunks: Vec<MgrasChunk>,
-    odyssey_chunks: Vec<OdysseyChunk>,
-}
-
-/// `chunks.bin` as schema 8 wrote it: `ChunksManifest` before `odyssey_chunks`.
-#[derive(Serialize, Deserialize)]
-struct ChunksManifestV8 {
-    bank_chunks: [Vec<ChunkHash>; 4],
-    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
-    kona_chunks: Vec<crate::dev::kona::KonaChunk>,
-    mgras_chunks: Vec<MgrasChunk>,
-}
-
-/// `chunks.bin` as schema 7 wrote it: `ChunksManifest` before `mgras_chunks`.
-#[derive(Serialize, Deserialize)]
-struct ChunksManifestV7 {
-    bank_chunks: [Vec<ChunkHash>; 4],
-    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
-    kona_chunks: Vec<crate::dev::kona::KonaChunk>,
-}
-
-/// `chunks.bin` as schema 6 wrote it: `ChunksManifest` before `kona_chunks`.
-#[derive(Deserialize)]
-struct ChunksManifestV6 {
-    bank_chunks: [Vec<ChunkHash>; 4],
-    framebuffer_chunks: Option<(Vec<ChunkHash>, Vec<ChunkHash>)>,
-}
-
 impl ChunksManifest {
-    /// Decode a `chunks.bin` of schema 6 through 10. Older layouts must consume
-    /// every byte so a corrupt current manifest cannot be accepted as one.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        let current = match postcard::from_bytes::<ChunksManifest>(bytes) {
-            Ok(m) => return Ok(m),
-            Err(e) => e,
-        };
-        if let Ok((old, [])) = postcard::take_from_bytes::<ChunksManifestV9>(bytes) {
-            return Ok(ChunksManifest {
-                bank_chunks: old.bank_chunks,
-                framebuffer_chunks: old.framebuffer_chunks,
-                kona_chunks: old.kona_chunks,
-                mgras_chunks: old.mgras_chunks,
-                odyssey_chunks: old.odyssey_chunks,
-                gr2_chunks: Vec::new(),
-            });
-        }
-        if let Ok((old, [])) = postcard::take_from_bytes::<ChunksManifestV8>(bytes) {
-            return Ok(ChunksManifest {
-                bank_chunks: old.bank_chunks,
-                framebuffer_chunks: old.framebuffer_chunks,
-                kona_chunks: old.kona_chunks,
-                mgras_chunks: old.mgras_chunks,
-                odyssey_chunks: Vec::new(),
-                gr2_chunks: Vec::new(),
-            });
-        }
-        if let Ok((old, [])) = postcard::take_from_bytes::<ChunksManifestV7>(bytes) {
-            return Ok(ChunksManifest {
-                bank_chunks: old.bank_chunks,
-                framebuffer_chunks: old.framebuffer_chunks,
-                kona_chunks: old.kona_chunks,
-                mgras_chunks: Vec::new(),
-                odyssey_chunks: Vec::new(),
-                gr2_chunks: Vec::new(),
-            });
-        }
-        match postcard::take_from_bytes::<ChunksManifestV6>(bytes) {
-            Ok((old, [])) => Ok(ChunksManifest {
-                bank_chunks: old.bank_chunks,
-                framebuffer_chunks: old.framebuffer_chunks,
-                kona_chunks: Vec::new(),
-                mgras_chunks: Vec::new(),
-                odyssey_chunks: Vec::new(),
-                gr2_chunks: Vec::new(),
-            }),
-            _ => Err(current),
-        }
+        postcard::from_bytes(bytes)
     }
 
     /// Iterate every chunk hash referenced by this manifest. Used by `gc`
@@ -936,125 +979,13 @@ mod tests {
     fn check_schema_names_the_range_it_reads() {
         let older = OLDEST_SCHEMA - 1;
         let e = check_schema("old", older).unwrap_err();
-        assert!(e.contains(&format!("schema {older}")) && e.contains(&format!("{OLDEST_SCHEMA} to {SCHEMA_VERSION}")), "{e}");
+        assert!(e.contains(&format!("schema {older}")) && e.contains(&format!("reads schema {SCHEMA_VERSION}")), "{e}");
         assert!(check_schema("newer", SCHEMA_VERSION + 1).is_err());
         assert!(check_schema("current", SCHEMA_VERSION).is_ok());
         assert!(check_schema("oldest", OLDEST_SCHEMA).is_ok());
     }
 
-    /// `chunks.bin` as a schema 6 build wrote it, byte for byte: postcard of the
-    /// four bank lists (a varint count, then 32 raw bytes a hash) and the
-    /// framebuffer option, with nothing after it. Bank 0 holds one hash.
-    fn v6_chunks_bin(framebuffer: bool) -> Vec<u8> {
-        let mut b = vec![1u8];
-        b.extend([0xab; 32]);
-        b.extend([0, 0, 0]);
-        if framebuffer {
-            // Some((rgb, aux)): rgb one hash, aux none.
-            b.push(1);
-            b.push(1);
-            b.extend([0xcd; 32]);
-            b.push(0);
-        } else {
-            b.push(0);
-        }
-        b
-    }
-
-    /// A schema 6 snapshot of an Indy, an O2 or an Octane still loads: the
-    /// manifest passes the schema check and `chunks.bin`, which has no board
-    /// list, reads with that list empty.
-    #[test]
-    fn a_schema_6_snapshot_loads_with_no_board_chunks() {
-        for framebuffer in [false, true] {
-            let dir = unique_tmp_dir("schema6");
-            let snap = Snapshot::new(&dir);
-            let mut m = Manifest::for_current_save();
-            m.schema_version = 6;
-            snap.write_manifest(&m).unwrap();
-            snap.write_bin("chunks.bin", &v6_chunks_bin(framebuffer)).unwrap();
-            let loaded = snap.read_manifest().unwrap().unwrap();
-            check_schema("v6", loaded.schema_version).unwrap();
-            let chunks = snap.read_chunks_manifest().unwrap();
-            assert_eq!(chunks.bank_chunks[0], vec![[0xab; 32]]);
-            assert!(chunks.bank_chunks[1..].iter().all(|b| b.is_empty()));
-            assert_eq!(chunks.framebuffer_chunks, framebuffer.then(|| (vec![[0xcd; 32]], vec![])));
-            assert!(chunks.kona_chunks.is_empty());
-            assert!(chunks.mgras_chunks.is_empty());
-            assert!(chunks.odyssey_chunks.is_empty());
-            assert!(chunks.gr2_chunks.is_empty());
-            assert_eq!(chunks.referenced_hashes().count(), 1 + framebuffer as usize);
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    #[test]
-    fn a_schema_7_chunk_manifest_loads_with_no_impact_chunks() {
-        let old = ChunksManifestV7 {
-            bank_chunks: std::array::from_fn(|i| if i == 1 { vec![[7; 32]] } else { Vec::new() }),
-            framebuffer_chunks: None,
-            kona_chunks: vec![crate::dev::kona::KonaChunk { name: "state".into(), hashes: vec![[8; 32]] }],
-        };
-        let bytes = postcard::to_allocvec(&old).unwrap();
-        let back = ChunksManifest::from_bytes(&bytes).unwrap();
-        assert_eq!(back.bank_chunks[1], vec![[7; 32]]);
-        assert_eq!(back.kona_chunks, old.kona_chunks);
-        assert!(back.mgras_chunks.is_empty());
-        assert!(back.odyssey_chunks.is_empty());
-        assert!(back.gr2_chunks.is_empty());
-    }
-
-    #[test]
-    fn a_schema_8_chunk_manifest_loads_with_no_vpro_chunks() {
-        let old = ChunksManifestV8 {
-            bank_chunks: std::array::from_fn(|i| if i == 2 { vec![[7; 32]] } else { Vec::new() }),
-            framebuffer_chunks: None,
-            kona_chunks: vec![crate::dev::kona::KonaChunk {
-                name: "state".into(),
-                hashes: vec![[8; 32]],
-            }],
-            mgras_chunks: vec![MgrasChunk {
-                name: "front".into(),
-                words: 19,
-                hashes: vec![[9; 32]],
-            }],
-        };
-        let bytes = postcard::to_allocvec(&old).unwrap();
-        let back = ChunksManifest::from_bytes(&bytes).unwrap();
-        assert_eq!(back.bank_chunks[2], old.bank_chunks[2]);
-        assert_eq!(back.kona_chunks, old.kona_chunks);
-        assert_eq!(back.mgras_chunks, old.mgras_chunks);
-        assert!(back.odyssey_chunks.is_empty());
-        assert!(back.gr2_chunks.is_empty());
-    }
-
-    #[test]
-    fn a_schema_9_chunk_manifest_loads_with_no_gr2_chunks() {
-        let old = ChunksManifestV9 {
-            bank_chunks: std::array::from_fn(|i| if i == 3 { vec![[7; 32]] } else { Vec::new() }),
-            framebuffer_chunks: None,
-            kona_chunks: vec![],
-            mgras_chunks: vec![MgrasChunk {
-                name: "front".into(),
-                words: 19,
-                hashes: vec![[9; 32]],
-            }],
-            odyssey_chunks: vec![OdysseyChunk {
-                name: "vram".into(),
-                words: 23,
-                hashes: vec![[10; 32]],
-            }],
-        };
-        let bytes = postcard::to_allocvec(&old).unwrap();
-        let back = ChunksManifest::from_bytes(&bytes).unwrap();
-        assert_eq!(back.bank_chunks[3], old.bank_chunks[3]);
-        assert_eq!(back.mgras_chunks, old.mgras_chunks);
-        assert_eq!(back.odyssey_chunks, old.odyssey_chunks);
-        assert!(back.gr2_chunks.is_empty());
-    }
-
-    /// The current layout still round-trips, and a file that is neither a
-    /// complete current layout nor an exact older layout is refused.
+    /// The current layout round-trips, and a cut-short file is refused.
     #[test]
     fn a_chunks_manifest_of_the_current_layout_round_trips_and_garbage_is_refused() {
         let mut m = ChunksManifest::default();
@@ -1090,10 +1021,44 @@ mod tests {
             ChunksManifest::from_bytes(&bytes[..bytes.len() - 1]).is_err(),
             "cut short"
         );
-        let mut padded = v6_chunks_bin(false);
-        padded.extend([5, 5]);
-        assert!(ChunksManifest::from_bytes(&padded).is_err(), "trailing bytes after a v6 layout");
         assert!(ChunksManifest::from_bytes(&[]).is_err());
+    }
+
+    /// Overlays are kept per bus under its slot and listed by each disk's slot, so the same target on two
+    /// controllers, an NVMe card and a loop disk name four different files, and they come back by slot.
+    #[test]
+    fn overlays_round_trip_by_slot_across_buses() {
+        use crate::scsi::{ScsiBus, ScsiIdentities, ScsiIdentity};
+        let id = ScsiIdentity::new(b"TEST    ", b"SNAPSHOT        ", b"1.0 ");
+        let bus = || ScsiBus::new(16, ScsiIdentities { disk: id, cdrom: id });
+        let (a, b, card, fc) = (bus(), bus(), bus(), bus());
+        let dir = unique_tmp_dir("overlays");
+        let image = dir.join("d.raw");
+        fs::write(&image, vec![0u8; 4096]).unwrap();
+        let disk = crate::config::ScsiDeviceConfig { path: image.to_string_lossy().into_owned(), overlay: true, ..Default::default() };
+        for (bus, at) in [(&a, 3), (&b, 3), (&card, 0), (&fc, 9)] {
+            crate::scsi::attach_table(bus, at, "x", &disk, None, None).unwrap();
+        }
+        let loc = |s: &str| s.parse::<crate::slot_path::MachineSlotPath>().unwrap();
+        let buses = [
+            DiskBus::targets(loc("hpc3/c0"), &a),
+            DiskBus::targets(loc("hpc3/c1"), &b),
+            DiskBus::card(loc("xio13/pci0/1"), &card),
+            DiskBus::loop_ids(loc("xio13/pci0/2"), &fc),
+        ];
+        let snap = Snapshot::new(dir.join("saves/s"));
+        snap.ensure_dir().unwrap();
+        export_overlays(&snap, &buses).unwrap();
+        let mut sets = parse_cow_table(&snap.read_toml("cow.toml").unwrap());
+        sets.sort();
+        let mut named: Vec<String> = sets.iter().map(|s| s.0.to_string()).collect();
+        named.sort();
+        assert_eq!(named, ["hpc3/c0/t3", "hpc3/c1/t3", "xio13/pci0/1", "xio13/pci0/2/l9"]);
+        for f in ["hpc3/c0/scsi3.overlay", "hpc3/c1/scsi3.overlay", "xio13/pci0/1/scsi0.overlay", "xio13/pci0/2/scsi9.overlay"] {
+            assert!(snap.dir.join(f).exists(), "{f}");
+        }
+        import_overlays(&snap.dir, &buses, &sets).expect("each comes back from its own slot");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
@@ -1117,7 +1082,8 @@ mod tests {
             description: Some("post install".into()),
             installed_bundles: vec!["grep-2.5.4".into(), "sed-4.2.2".into()],
             features: vec!["jit".into(), "tlbvmap".into()],
-            disks: vec![DiskRef { id: 1, path: "irix53.raw".into(), size_bytes: 4294967296 }],
+            disks: vec![DiskRef { at: "hpc3/c0/t1".parse().unwrap(), path: "irix53.raw".into(), size_bytes: 4294967296 }],
+            devices: vec![("virtio_serial".into(), "gio1".parse().unwrap())],
             nvram: Some("nvram-irix53.bin".into()),
             cpu_model: Some("R5000".into()),
             cpu_cache: Some("shadow".into()),
@@ -1134,6 +1100,7 @@ mod tests {
         assert_eq!(m2.installed_bundles, m.installed_bundles);
         assert_eq!(m2.features, m.features);
         assert_eq!(m2.disks, m.disks);
+        assert_eq!(m2.devices, m.devices);
         assert_eq!(m2.nvram, m.nvram);
         assert_eq!(m2.cpu_model, m.cpu_model);
         assert_eq!(m2.machine, m.machine);
@@ -1151,6 +1118,7 @@ mod tests {
             installed_bundles: vec![],
             features: vec![],
             disks: vec![],
+            devices: vec![],
             nvram: None,
             cpu_model: None,
             cpu_cache: None,
@@ -1302,41 +1270,14 @@ mod tests {
     }
 
     #[test]
-    fn write_state_v2_writes_bin_and_reads_back() {
-        let dir = unique_tmp_dir("state-v2");
+    fn write_state_writes_bin_and_reads_back() {
+        let dir = unique_tmp_dir("state-bin");
         let snap = Snapshot::new(&dir);
         let v = sample_value();
-        snap.write_state("cpu", &v, 2).expect("write v2");
+        snap.write_state("cpu", &v).expect("write");
         assert!(dir.join("cpu.bin").exists(), "expected cpu.bin to be written");
-        assert!(!dir.join("cpu.toml").exists(), "v2 must not write cpu.toml");
-        let back = snap.read_state("cpu", 2).expect("read v2");
-        assert_eq!(back, v);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn write_state_v1_writes_toml_and_reads_back() {
-        let dir = unique_tmp_dir("state-v1");
-        let snap = Snapshot::new(&dir);
-        let v = sample_value();
-        snap.write_state("cpu", &v, 1).expect("write v1");
-        assert!(dir.join("cpu.toml").exists(), "expected cpu.toml to be written");
-        assert!(!dir.join("cpu.bin").exists(), "v1 must not write cpu.bin");
-        let back = snap.read_state("cpu", 1).expect("read v1");
-        assert_eq!(back, v);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn read_state_v2_falls_back_to_toml_when_bin_missing() {
-        // External tooling may legitimately produce a v2 manifest with .toml
-        // device files (e.g. dump-and-edit workflow). Loader must be tolerant.
-        let dir = unique_tmp_dir("state-fallback");
-        let snap = Snapshot::new(&dir);
-        let v = sample_value();
-        snap.write_toml("cpu.toml", &v).expect("write toml");
-        let back = snap.read_state("cpu", 2).expect("read with fallback");
-        assert_eq!(back, v);
+        assert!(!dir.join("cpu.toml").exists(), "no cpu.toml");
+        assert_eq!(snap.read_state("cpu").expect("read"), v);
         let _ = fs::remove_dir_all(&dir);
     }
 

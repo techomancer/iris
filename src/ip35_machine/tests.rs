@@ -1,5 +1,6 @@
 use super::*;
-use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NvmeConfig, ScsiDeviceConfig};
+use crate::devices::{DeviceModel, ConfiguredDevice};
 use crate::dev::xbridge::{HEAD_E, HEAD_F};
 use crate::ip35::test_support::{config, headless, widget, with_machine};
 use crate::dev::bedrock::Bedrock;
@@ -28,26 +29,42 @@ fn the_ibricks_slots_read_back_as_wired() {
         assert_eq!(pio.read32(widget(u64::from(SPARE_PORT), 0)).status, BUS_ERR, "port B is empty");
     });
 }
-/// `[machine] audio_card` fits the ICE1724 at device 2 of the I-brick's head F, on either product,
-/// with the monitor's audio report; without it the slot is empty.
+/// An `ice1724` entry puts the ICE1724 in the slot it names, here device 2 of the I-brick's head F,
+/// on either product, with the monitor's audio report; without one the slot is empty.
 #[test]
-fn the_audio_card_sits_at_device_2_of_the_ibrick_when_asked_for() {
+fn the_audio_card_sits_in_the_ibrick_slot_it_is_placed_in() {
     let dir = TempPath::dir("o3k-audio");
     let slot = |cfg: MachineConfig| {
         with_machine(cfg, |m| {
-            let read = m.nodes[0].chip.pio().read32(widget(u64::from(HEAD_F), 0x2_0000 + (u64::from(crate::ip35::AUDIO_CARD_DEVICE) << 12)));
+            let read = m.nodes[0].chip.pio().read32(widget(u64::from(HEAD_F), 0x2_0000 + (2 << 12)));
             ((read.status == BUS_OK).then_some(read.data), m.io.monitor.iter().any(|d| d.audio_report().is_some()))
         })
     };
     let fitted = |mut cfg: MachineConfig| {
         cfg.no_audio = true;
-        if cfg.machine.profile == MachineProfile::Onyx3000Ip35 { cfg.onyx3000.audio = true } else { cfg.origin3200.audio = true }
+        cfg.devices.push(crate::devices::ConfiguredDevice::new("xio15/pci0/2", crate::devices::DeviceModel::Ice1724));
         cfg
     };
     for cfg in [config(&dir, 1), onyx_config(&dir, GraphicsBoard::Ir3)] {
         let (id, report) = slot(cfg.clone());
         assert!(id.is_none_or(|id| id == u32::MAX) && !report, "{:?}: empty without the key", cfg.machine.profile);
         assert_eq!(slot(fitted(cfg.clone())), (Some(0x1724_1412), true), "{:?}", cfg.machine.profile);
+    }
+}
+
+/// virtio takes head F's one extra slot, device 7, on either product; device 0 is the IOC3's SuperIO pin.
+#[test]
+fn virtio_takes_the_extra_rows_of_the_ibricks_head_f() {
+    let dir = TempPath::dir("o3k-virtio");
+    for mut cfg in [config(&dir, 1), onyx_config(&dir, GraphicsBoard::Ir3)] {
+        let entry = || crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"virtio_serial\"").unwrap()).unwrap();
+        cfg.devices.push(entry());
+        with_machine(cfg, |m| {
+            let id = |device: u64| m.nodes[0].chip.pio().read32(widget(u64::from(HEAD_F), 0x2_0000 + (device << 12)));
+            assert_eq!(id(7).data, 0x1043_1af4);
+            assert_ne!(id(0).data, 0x1043_1af4, "device 0 is no extra slot");
+            assert_ne!(id(2).data, 0x1043_1af4, "a slot stays free for a card");
+        });
     }
 }
 
@@ -85,16 +102,20 @@ fn the_configuration_refuses_what_the_row_does_not_hold() {
     assert!(refused(&cfg).contains("share one size"), "{}", refused(&cfg));
     cfg.banks = [256, 128, 0, 0, 0, 0, 0, 0];
     assert!(refused(&cfg).contains("256 or 512"));
-    let fc = |extra: &str| -> MachineConfig {
+    let loop_disk = |at: &str| -> MachineConfig {
         let mut cfg = config(&dir, 1);
-        cfg.fibre_channel = Some(toml::from_str(extra).unwrap());
+        cfg.devices.push(ConfiguredDevice::new(at, DeviceModel::Scsi(ScsiDeviceConfig { path: "d.img".into(), ..Default::default() })));
         cfg
     };
-    fc("[disk.1]\npath = \"d.img\"").validate().unwrap();
-    for key in ["board = 0", "slot = 1", "bridge = true"] {
-        assert!(refused(&fc(key)).contains("on the I-brick"), "{key}");
-    }
-    assert!(refused(&fc("[disk.126]\npath = \"d.img\"")).contains("loop ID"));
+    loop_disk("xio15/pci0/1/l1").validate().unwrap();
+    assert!(refused(&loop_disk("xio15/pci0/1/l126")).contains("no slot xio15/pci0/1/l126"));
+    let mut cfg = config(&dir, 1);
+    let image = dir.join("n.img");
+    std::fs::write(&image, vec![0u8; 1 << 20]).unwrap();
+    cfg.devices.push(ConfiguredDevice::new("bus1-slot2", DeviceModel::Nvme(NvmeConfig { path: image.to_string_lossy().into_owned(), ..Default::default() })));
+    cfg.resolve_slots().unwrap();
+    let err = std::thread::Builder::new().stack_size(64 << 20).spawn(move || crate::ip35::test_support::machine(&cfg).err()).unwrap().join().unwrap();
+    assert!(err.expect("the machine refuses a card in a slot").contains("takes no NVMe card"));
     let mut cfg = config(&dir, 1);
     cfg.set_disk(2, toml::from_str("path = \"d.raw\"").unwrap());
     assert!(refused(&cfg).contains("has no slot scsi0/t2"), "{}", refused(&cfg));
@@ -132,7 +153,7 @@ fn the_prom_still_fetches_under_a_512_mib_bank() {
         assert_eq!(t0, 0xffff_ffff_a600_0000, "the first instruction was the PROM's lui, not RAM's zero word");
     });
 }
-/// The `[fibre_channel.disk.N]` disks are on the I-brick's loop at the loop IDs
+/// The disks placed on the I-brick's loop are on the I-brick's loop at the loop IDs
 /// they name, and a machine with none still has the adapter.
 #[test]
 fn the_loop_has_the_configured_disks() {
@@ -140,7 +161,7 @@ fn the_loop_has_the_configured_disks() {
     let image = dir.join("d.raw");
     std::fs::write(&image, vec![0u8; 1 << 20]).unwrap();
     let mut cfg = config(&dir, 1);
-    cfg.fibre_channel = Some(toml::from_str(&format!("[disk.3]\npath = {:?}\noverlay = true", image.to_string_lossy())).unwrap());
+    cfg.devices.push(ConfiguredDevice::new("xio15/pci0/1/l3", DeviceModel::Scsi(ScsiDeviceConfig { path: image.to_string_lossy().into_owned(), overlay: true, ..Default::default() })));
     let attached = |m: &mut Machine<Bedrock, Flash>| {
         let mut attached = Vec::new();
         (m.io.disks)(&mut |buses| {
@@ -336,25 +357,27 @@ fn either_board_takes_one_or_two_c_bricks() {
     });
 }
 
-/// `[graphics] node` and `widget` move the board: a V12 in a brick of its own answers at the
-/// widget named, and a pipe named onto the second C-brick answers there and not on the I-brick.
+/// A `graphics` device moves the board: a V12 in a brick of its own answers at the slot named,
+/// and a pipe named onto the second C-brick answers there and not on the I-brick.
 #[test]
-fn the_graphics_keys_place_the_board() {
+fn a_graphics_device_places_the_board() {
     let dir = TempPath::dir("o3k-placement");
+    let at = |cfg: &mut MachineConfig, at: &str| cfg.devices.push(ConfiguredDevice::new(at, DeviceModel::Graphics));
     let mut cfg = onyx_config(&dir, GraphicsBoard::V12);
-    cfg.graphics.widget = Some(12);
-    assert_eq!(placement(&cfg), Placement { node: 1, widget: 12 });
+    at(&mut cfg, "node1/xio12");
+    assert_eq!(graphics_port(&cfg), Ok(GraphicsPort { node: 1, widget: 12 }));
     with_machine(cfg, |m| {
         let second = m.nodes[1].chip.pio();
         assert_eq!(second.read32(widget(12, 0x04)).status, BUS_OK);
         assert_ne!(second.read32(widget(u64::from(VPRO_WIDGET), 0x04)).status, BUS_OK);
     });
     let mut cfg = onyx_config(&dir, GraphicsBoard::V12);
-    cfg.graphics.node = Some(0);
-    assert_eq!(placement(&cfg), Placement { node: 0, widget: PIPE_WIDGET });
+    at(&mut cfg, "xio11");
+    assert_eq!(graphics_port(&cfg), Ok(GraphicsPort { node: 0, widget: PIPE_WIDGET }));
+    assert_eq!(graphics_port(&onyx_config(&dir, GraphicsBoard::V12)), Ok(GraphicsPort { node: 1, widget: VPRO_WIDGET }), "a V12 with no slot takes the V-brick");
     let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
     cfg.onyx3000.c_bricks = Some(2);
-    cfg.graphics.node = Some(1);
+    at(&mut cfg, "node1/xio11");
     let attached: Vec<_> = node_specs(&cfg).unwrap().iter().map(|s| s.l1.attached.map(|b| (b.type_code, b.graphics_bay))).collect();
     assert_eq!(attached, [Some((0x49, None)), Some((0x58, Some(G_BRICK_BAY)))]);
     with_machine(cfg, |m| {

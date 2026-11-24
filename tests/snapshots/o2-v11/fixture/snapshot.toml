@@ -1,9 +1,9 @@
 cpu_cache = "shadow"
-cpu_model = "shadow"
-created_at_unix = 1795342821
+cpu_model = "R5000"
+created_at_unix = 1795423980
 features = ["tlbvmap"]
 host_arch = "x86_64"
 installed_bundles = []
-machine = "octane_ip30"
+machine = "o2_ip32"
 nvram = "nvram.bin"
-schema_version = 10
+schema_version = 11

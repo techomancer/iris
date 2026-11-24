@@ -262,18 +262,18 @@ pub struct Ip22Bus {
     /// The bus everything is mapped on: what the CPU and DMA masters use.
     pub phys: Arc<Physical>,
     pub rex3: Option<Arc<Rex3>>,
-    /// Second Newport head (dual-head Indigo2 / `graphics.heads = 2`).
+    /// Second Newport head, a `newport` device in GIO expansion slot 0.
     pub rex3_head1: Option<Arc<Rex3>>,
     /// GR2 graphics (`graphics.board = xz | extreme`), see src/dev/gr2.
     pub gr2: Option<Arc<Gr2>>,
     /// IMPACT/MGRAS graphics (`graphics.board = solidimpact | highimpact | maximpact`).
     pub mgras: Option<Arc<Mgras>>,
     pub ultra64: Option<Arc<Ultra64>>,
-    /// Bare-metal test device (`--test-device`), in GIO expansion slot 0.
+    /// Bare-metal test device, in GIO expansion slot 0.
     pub testdev: Option<Arc<crate::dev::testdev::TestDevice>>,
-    /// virtio-serial (`[virtio_serial]`) in a GIO expansion slot.
+    /// virtio-serial in a GIO expansion slot.
     pub virtio: Option<Arc<crate::dev::virtio::mmio::VirtioMmio>>,
-    /// virtio-9p (`[virtio_9p]`) in a GIO expansion slot.
+    /// virtio-9p in a GIO expansion slot.
     pub virtio_9p: Option<Arc<crate::dev::virtio::mmio::VirtioMmio>>,
     pub vino: Vino,
     /// Where the 512 KB alias at physical 0 points — see `alias_offset_for`.
@@ -385,15 +385,15 @@ impl Ip22Bus {
             set(RAMROM_BASE, RAMROM_BASE + RAMROM_SIZE, u64.clone(), "ultra64");
         }
 
-        // Test device (--test-device): GIO expansion slot 0, which is empty on a
+        // Test device: GIO expansion slot 0, which is empty on a
         // stock Indy and otherwise answers with a GIO timeout. See testdev.rs.
         if let Some(td) = &d.testdev {
             use crate::dev::testdev::{TEST_DEV_BASE, TEST_DEV_SIZE};
             set(TEST_DEV_BASE, TEST_DEV_BASE + TEST_DEV_SIZE, td.clone(), "test device");
         }
 
-        // virtio-serial (`[virtio_serial]`): a GIO expansion slot, 64 KB window.
-        // Machine::new refuses a slot another device already claims.
+        // virtio: a GIO expansion slot, 64 KB window. Placement has already
+        // refused a slot another card holds.
         if let Some((v, base)) = &d.virtio {
             set(*base, *base + crate::dev::virtio::mmio::WINDOW as u32, v.clone(), "virtio-serial");
         }

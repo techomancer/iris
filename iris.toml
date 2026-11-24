@@ -209,8 +209,9 @@ mode           = "nat"
 # N64 development board (Ultra64 GIO card). Needs the ultra64 branch of
 # github.com/techomancer/gopher64, which maps the shared-memory bridge
 # (/iris_n64_bridge). See HELP.md.
-#[ultra64]
-#enabled = true
+#[[devices]]
+#type = "ultra64"
+#at   = "gio0"
 
 # ── Machine ───────────────────────────────────────────────────────────────────
 # profile: "indy_ip24" (default), "indigo2_ip22" (same as --ip22), "indigo2_ip28",

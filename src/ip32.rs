@@ -138,8 +138,7 @@ pub static PCI0_ROUTING: IntxRouting = IntxRouting {
         (2, [Some(9), None, None, None]),                // external SCSI
         (3, [Some(10), Some(13), Some(14), Some(15)]),   // INTB-D shared
         // The specification routes device 4; no O2 board populates it. Using
-        // it for virtio-serial is iris's choice of a spare number, not
-        // hardware use.
+        // it for virtio is iris's choice of a spare number, not hardware use.
         (4, [Some(11), None, None, None]),
     ],
     board_irqs: &[],
@@ -150,6 +149,7 @@ pub(crate) const PCI0_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
     (IP32_SCSI_SLOT, MachineSlotKind::ScsiBus { part: "aic7880", ids: 7 }, None),
     (IP32_SCSI_SLOT_B, MachineSlotKind::ScsiBus { part: "aic7880", ids: 7 }, None),
     (IP32_OPTION_SLOT, MachineSlotKind::PCI_SLOT, Some("pci_slot")),
+    (4, MachineSlotKind::Extra { pin: PCI_INTA }, None),
 ];
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
@@ -476,9 +476,8 @@ pub struct Ip32Bus {
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
-    /// The NVMe card in the "PCI option" slot (`[nvme]`), set once when
-    /// the machine attaches it.
-    pub nvme: std::sync::OnceLock<Arc<crate::dev::nvme::Nvme>>,
+    /// The NVMe, virtio and audio cards the entries placed, set once when the machine attaches them.
+    pub cards: std::sync::OnceLock<crate::devices::AttachedCards>,
 }
 
 impl Ip32Bus {
@@ -487,7 +486,7 @@ impl Ip32Bus {
         use crate::scsi_monitor::ScsiTargets;
         let controllers = self.scsi.lock().unwrap().clone();
         controllers.iter().try_for_each(|c| c.bus().flush())?;
-        self.nvme.get().map_or(Ok(()), |n| n.scsi_bus().flush())
+        self.cards.get().into_iter().flat_map(|c| &c.nvme).try_for_each(|c| c.nvme.scsi_bus().flush())
     }
 
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
@@ -524,22 +523,10 @@ impl Ip32Bus {
                 gbe.tr = crime.tr.clone();
                 gbe
             },
-            mace: Mace::new(ram.clone(), crime, ust, &IntxRouting {
-        devices: 32,
-        irqs: 16,
-        intx: &[
-            (1, [Some(8), None, None, None]),                // internal SCSI
-            (2, [Some(9), None, None, None]),                // external SCSI
-            (3, [Some(10), Some(13), Some(14), Some(15)]),   // INTB-D shared
-            // The specification routes device 4; no O2 board populates it. Using
-            // it for virtio is iris's choice of a spare number, not hardware use.
-            (4, [Some(11), None, None, None]),
-        ],
-        board_irqs: &[],
-    }, timers),
+            mace: Mace::new(ram.clone(), crime, ust, &PCI0_ROUTING, timers),
             misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
-            nvme: std::sync::OnceLock::new(),
+            cards: std::sync::OnceLock::new(),
         };
         bus.gbe.tr.start_from_env();
         if let Some(mac) = opts.mac {
@@ -828,6 +815,9 @@ impl Ip32Bus {
             [&*m.ust, &m.rtc, &m.ps2, &m.id, &*m.com0, &*m.com1, &m.sdma, &*m.isa];
         for d in devices {
             d.power_on();
+        }
+        if let Some(cards) = self.cards.get() {
+            cards.power_on();
         }
     }
 
