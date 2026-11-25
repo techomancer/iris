@@ -78,7 +78,6 @@ pub mod saa7191;
 pub mod seeq8003;
 pub mod sgi_nvram;
 pub mod testdev;
-pub mod timer;
 pub mod ultra64;
 pub mod vino;
 pub mod virtio;
