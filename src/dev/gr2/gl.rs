@@ -541,6 +541,39 @@ impl GlState {
         if self.pixfmt == re3::PIXFMT_CI12 { 4095.0 / 255.0 } else { 1.0 }
     }
 
+    /// Colour-index drawing: R carries the index (/255), which must stay exact.
+    fn ci(&self) -> bool {
+        matches!(self.pixfmt, re3::PIXFMT_CI8 | re3::PIXFMT_CI12)
+    }
+
+    /// The GE's float to 8-bit colour, as a real Indy XZ draws it: RGB
+    /// components become min(255, floor(v * 256)) (clears and flat colour
+    /// agree for all 1025 steps of test/gltest/quanttest); round(v * 255)
+    /// put most scenes 1 off. Colour index keeps the index exact.
+    fn color_scale(&self) -> f32 {
+        if self.ci() { 255.0 } else { 256.0 }
+    }
+
+    /// The top of an RGB channel in iterator units: just under 256, so the
+    /// integer part stops at 255 as floor(v * 256) does.
+    fn color_top(&self, k: usize) -> f32 {
+        if self.ci() {
+            255.0 * if k == 0 { self.cmax() } else { 1.0 }
+        } else {
+            255.0 + 2047.0 / 2048.0
+        }
+    }
+
+    /// R, G, B as RE3 8.11 iterator values (12.11 for a colour index in R).
+    fn to_fixed(&self, c: [f32; 4]) -> [u32; 3] {
+        if self.ci() {
+            to_fixed(c, self.cmax())
+        } else {
+            let q = |v: f32| ((v.clamp(0.0, 1.0) * 256.0).min(255.0) as u32) << 11;
+            [q(c[0]), q(c[1]), q(c[2])]
+        }
+    }
+
     fn ensure_init(&mut self) {
         if self.inited == 0 {
             self.inited = 1;
@@ -1451,7 +1484,7 @@ impl Hq2Engine {
                 out.shram(READBACK_SHRAM + 1, g.win[1] as u32);
             }
             T_IRIS_GET_COLOR => {
-                for (k, w) in to_fixed(g.color, g.cmax()).into_iter().enumerate() {
+                for (k, w) in g.to_fixed(g.color).into_iter().enumerate() {
                     out.shram(READBACK_SHRAM + k, w);
                 }
             }
@@ -1639,7 +1672,7 @@ impl Hq2Engine {
             T_IRIS_MOVE => "IRISGL_MOVE".to_string(),
             T_GET_ORIGIN => format!("GL_GET_ORIGIN -> ({}, {})", g.win[0], g.win[1]),
             T_IRIS_GET_COLOR => {
-                let c = to_fixed(g.color, g.cmax());
+                let c = g.to_fixed(g.color);
                 format!("IRISGL_GET_COLOR -> ({}, {}, {})", c[0] >> 11, c[1] >> 11, c[2] >> 11)
             }
             T_PIX_START => "GL_PIXELS_START".to_string(),
@@ -1908,7 +1941,7 @@ impl Hq2Engine {
             _ => 0,
         };
         let c = if mask != 0 { [((c[0].floor() as i64) & mask) as f32 / 255.0, 0.0, 0.0, 1.0] } else { c };
-        let rgb = to_fixed(c, self.gl.cmax());
+        let rgb = self.gl.to_fixed(c);
         self.gl_color_regs(rgb, out);
         out.reg(re3::REG_DR, 0);
         out.reg(re3::REG_DG, 0);
@@ -1966,7 +1999,7 @@ impl Hq2Engine {
         let x0 = g.win[0] + (rx - xorig).floor() as i32;
         let bottom = g.win[1] + (ry - yorig).floor() as i32;
         let wmask = if w >= 32 { u32::MAX } else { !(u32::MAX >> w) };
-        let c = to_fixed(g.cpos_color, g.cmax());
+        let c = g.to_fixed(g.cpos_color);
         self.gl_setup(out);
         self.gl_color_regs(c, out);
         for r in 0..h {
@@ -2005,7 +2038,7 @@ impl Hq2Engine {
         };
         let (x0, top) = (g.win[0] + cx - xorig, g.win[1] + cy - yorig + h - 1);
         let wmask = if w >= 32 { u32::MAX } else { !(u32::MAX >> w) };
-        let c = to_fixed(g.color, g.cmax());
+        let c = g.to_fixed(g.color);
         self.gl_setup(out);
         self.gl_color_regs(c, out);
         for (r, &bits) in rows.iter().take(h as usize).enumerate() {
@@ -2077,7 +2110,7 @@ impl Hq2Engine {
             while e < w as usize && px(e) == v {
                 e += 1;
             }
-            self.gl_color_regs(to_fixed(colour(v), cmax), out);
+            self.gl_color_regs(self.gl.to_fixed(colour(v)), out);
             let (x0, x1) = (wx + n as i32 * zx, wx + e as i32 * zx);
             for dy in 0..zy {
                 let (pieces, np) = self.gl.span_pieces(wy + dy, x0, x1);
@@ -2127,7 +2160,7 @@ impl Hq2Engine {
             return;
         }
         self.gl_setup(out);
-        self.gl_color_regs(to_fixed(c, self.gl.cmax()), out);
+        self.gl_color_regs(self.gl.to_fixed(c), out);
         for r in &rects[..n] {
             for y in r[1]..r[3] {
                 self.span(r[0], y, (r[2] - r[0]) as u32, None, out);
@@ -2150,7 +2183,7 @@ impl Hq2Engine {
         let (y0, y1) = (p.y.min(q.y).floor() as i32, p.y.max(q.y).floor() as i32);
         self.gl_setup(out);
         let c = self.gl.color;
-        self.gl_color_regs(to_fixed(c, self.gl.cmax()), out);
+        self.gl_color_regs(self.gl.to_fixed(c), out);
         let mut run = |e: &mut Self, xa: i32, xb: i32, y: i32| {
             let (pieces, np) = e.gl.span_pieces(y, xa, xb + 1);
             for &(s, t) in &pieces[..np] {
@@ -2179,7 +2212,7 @@ impl Hq2Engine {
             return;
         }
         self.gl_setup(out);
-        self.gl_color_regs(to_fixed(color, self.gl.cmax()), out);
+        self.gl_color_regs(self.gl.to_fixed(color), out);
         self.span(x, y, 1, None, out);
         self.gl_done(out);
     }
@@ -2289,10 +2322,11 @@ impl Hq2Engine {
         // Colour: start at step i0, per-pixel steps from the ends (8.11).
         let mut start = [0u32; 3];
         let mut step = [0u32; 3];
+        let cs = self.gl.color_scale();
         for k in 0..3 {
-            let m = 255.0 * if k == 0 { cmax } else { 1.0 };
-            let c0 = (lerp(ca[k], cb[k]) * 255.0).clamp(0.0, m);
-            let d = (cb[k] - ca[k]) * 255.0 / steps;
+            let m = self.gl.color_top(k);
+            let c0 = (lerp(ca[k], cb[k]) * cs).clamp(0.0, m);
+            let d = (cb[k] - ca[k]) * cs / steps;
             start[k] = (c0 * 2048.0) as u32;
             step[k] = ((d * 2048.0) as i32) as u32;
         }
@@ -2492,11 +2526,29 @@ impl Hq2Engine {
             }
             _ => {}
         }
-        match (smooth, self.gl_zs_active()) {
-            (true, true) => self.raster_poly::<true, true>(v, prov.c, out, done),
-            (true, false) => self.raster_poly::<true, false>(v, prov.c, out, done),
-            (false, true) => self.raster_poly::<false, true>(v, prov.c, out, done),
-            (false, false) => self.raster_poly::<false, false>(v, prov.c, out, done),
+        let zs = self.gl_zs_active();
+        // The GE draws a polygon as a fan of triangles from its first
+        // vertex: a real Indy XZ shades a quad (and each quad of a strip, and
+        // a GL_POLYGON) with the v0-v2 diagonal visible. Interpolating over
+        // the whole polygon gave a different gradient on 30 % of its pixels.
+        // Only interpolated attributes can tell the two apart.
+        if n > 3 && (smooth || zs) {
+            for k in 1..n - 1 {
+                let tri = [v[0], v[k], v[k + 1]];
+                self.raster_poly_dispatch(smooth, zs, &tri, prov.c, out, done);
+            }
+            return;
+        }
+        self.raster_poly_dispatch(smooth, zs, v, prov.c, out, done);
+    }
+
+    fn raster_poly_dispatch(&mut self, smooth: bool, zs: bool, v: &[Wv], flat: [f32; 4], out: &mut dyn Re3Sink,
+                            done: &mut Option<&mut dyn FnMut(String)>) {
+        match (smooth, zs) {
+            (true, true) => self.raster_poly::<true, true>(v, flat, out, done),
+            (true, false) => self.raster_poly::<true, false>(v, flat, out, done),
+            (false, true) => self.raster_poly::<false, true>(v, flat, out, done),
+            (false, false) => self.raster_poly::<false, false>(v, flat, out, done),
         }
     }
 
@@ -2521,8 +2573,7 @@ impl Hq2Engine {
         // SHADED spans iterate colour and Z per pixel: smooth shading, depth
         // or stencil work and blending (flat colour = zero deltas).
         let iter = SMOOTH || ZS || blend;
-        let cmax = self.gl.cmax();
-        let flat_fixed = to_fixed(flat, cmax);
+        let flat_fixed = self.gl.to_fixed(flat);
         self.gl_setup(out);
         if iter {
             out.reg(re3::REG_DX, 1 << 14);
@@ -2545,6 +2596,8 @@ impl Hq2Engine {
         let mut ch = [(top, (top + 1) % n, 0usize), (top, (top + n - 1) % n, 0usize)];
         let step = [1, n - 1];
         // Attributes along a chain at row centre yc: x, z, r, g, b, a.
+        let cs = self.gl.color_scale();
+        let ctop = [self.gl.color_top(0), self.gl.color_top(1), self.gl.color_top(2)];
         let at = |a: &Wv, b: &Wv, yc: f32| -> [f32; 6] {
             let t = (yc - b.y) / (a.y - b.y);
             let l = |p: f32, q: f32| q + (p - q) * t;
@@ -2553,9 +2606,10 @@ impl Hq2Engine {
                 r[1] = l(a.z, b.z);
             }
             if SMOOTH {
-                for k in 0..4 {
-                    r[2 + k] = l(a.c[k], b.c[k]) * 255.0;
+                for k in 0..3 {
+                    r[2 + k] = l(a.c[k], b.c[k]) * cs;
                 }
+                r[5] = l(a.c[3], b.c[3]) * 255.0;
             } else if blend {
                 r[5] = flat[3] * 255.0;
             }
@@ -2605,7 +2659,7 @@ impl Hq2Engine {
                 let (mut start, mut stepc) = ([0u32; 3], [0u32; 3]);
                 for k in 0..3 {
                     if SMOOTH {
-                        let (s0, d) = run(2 + k, 255.0 * if k == 0 { cmax } else { 1.0 });
+                        let (s0, d) = run(2 + k, ctop[k]);
                         start[k] = (s0 * 2048.0) as u32;
                         stepc[k] = ((d * 2048.0) as i32) as u32;
                     } else {

@@ -115,22 +115,25 @@ const GEDMA_OUT_STALL_LIMIT_NS: u64 = 2_000_000_000;
 /// Which board is installed. Same hardware family; only the probe answers differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gr2Variant {
-    /// 2 GE7s. Indy XZ and Indigo2 XZ.
+    /// 2 GE7s. Indigo2 XZ.
     Xz,
+    /// 4 GE7s. Indigo2 Elan, and every Indy XZ (hinv says GR3-XZ on Indy,
+    /// GR3-Elan on Indigo2; libGLcore names both GR3-Elan from the GE count).
+    Elan,
     /// 8 GE7s. Indigo2 Extreme.
     Extreme,
 }
 
 impl Gr2Variant {
     pub fn ges(self) -> u32 {
-        match self { Self::Xz => 2, Self::Extreme => 8 }
+        match self { Self::Xz => 2, Self::Elan => 4, Self::Extreme => 8 }
     }
     /// Board revision in rd0 (GR2.h naming: 4 = GR3, 5..8 = GU1).
     pub fn board_rev(self) -> u32 {
-        match self { Self::Xz => 4, Self::Extreme => 6 }
+        match self { Self::Xz | Self::Elan => 4, Self::Extreme => 6 }
     }
     pub fn name(self) -> &'static str {
-        match self { Self::Xz => "XZ", Self::Extreme => "Extreme" }
+        match self { Self::Xz => "XZ", Self::Elan => "Elan", Self::Extreme => "Extreme" }
     }
 }
 

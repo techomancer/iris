@@ -1083,9 +1083,14 @@ pub enum GraphicsBoard {
     #[default]
     #[clap(name = "newport", alias = "xl")]
     Newport,
-    /// GR2 XZ (2 GE7) — Indy XZ or Indigo2 XZ (`src/dev/gr2`). In bring-up.
+    /// GR2 XZ (`src/dev/gr2`): 2 GE7 on Indigo2; on Indy the XZ has 4 GE7
+    /// (the Elan's), so `xz` there is the 4-GE board. In bring-up.
     #[clap(name = "xz", alias = "gr2", alias = "gr2_xz", alias = "gr2-xz")]
     Xz,
+    /// GR2 Elan (4 GE7) — Indigo2 only; hinv says GR3-Elan. An Indy's XZ is
+    /// already this board.
+    #[clap(name = "elan", alias = "gr2_elan", alias = "gr2-elan")]
+    Elan,
     /// GR2 Extreme (8 GE7) — Indigo2 only (`src/dev/gr2`). In bring-up.
     #[clap(name = "extreme", alias = "gr2_extreme", alias = "gr2-extreme")]
     Extreme,
@@ -1139,9 +1144,10 @@ pub enum GraphicsBoard {
 
 impl GraphicsBoard {
     /// Every board, in the order menus list them, `None` last.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Newport,
         Self::Xz,
+        Self::Elan,
         Self::Extreme,
         Self::SolidImpact,
         Self::HighImpact,
@@ -1155,6 +1161,7 @@ impl GraphicsBoard {
         match self {
             Self::Newport => "Newport (XL)",
             Self::Xz => "GR2 XZ",
+            Self::Elan => "GR2 Elan",
             Self::Extreme => "GR2 Extreme",
             Self::SolidImpact => "IMPACT Solid",
             Self::HighImpact => "IMPACT High",
@@ -1176,6 +1183,7 @@ impl GraphicsBoard {
         match self {
             Self::Newport => "newport",
             Self::Xz => "xz",
+            Self::Elan => "elan",
             Self::Extreme => "extreme",
             Self::SolidImpact => "solidimpact",
             Self::HighImpact => "highimpact",
@@ -1241,7 +1249,7 @@ impl GraphicsBoard {
             // a V-brick.
             MachineProfile::Onyx3000Ip35 => matches!(self, Self::Ir3 | Self::V12),
             MachineProfile::Indigo2Ip22 => !self.is_vpro() && !self.is_kona() && self != Self::None,
-            _ => !self.is_vpro() && !self.is_kona() && !matches!(self, Self::Extreme | Self::None),
+            _ => !self.is_vpro() && !self.is_kona() && !matches!(self, Self::Extreme | Self::Elan | Self::None),
         }
     }
 
@@ -1267,6 +1275,7 @@ impl std::str::FromStr for GraphicsBoard {
         match lower.as_str() {
             "newport" | "xl" => Ok(Self::Newport),
             "xz" | "gr2" | "gr2_xz" | "gr2-xz" => Ok(Self::Xz),
+            "elan" | "gr2_elan" | "gr2-elan" => Ok(Self::Elan),
             "extreme" | "gr2_extreme" | "gr2-extreme" => Ok(Self::Extreme),
             "solidimpact" | "impact:solid" | "solid_impact" | "solid-impact" | "solid" => Ok(Self::SolidImpact),
             "highimpact" | "impact:high" | "high_impact" | "high-impact" | "high" => Ok(Self::HighImpact),
@@ -3978,10 +3987,12 @@ impl MachineConfig {
         let board = self.graphics_board();
         if board != GraphicsBoard::Newport {
             let name = board.as_str();
-            if board == GraphicsBoard::Extreme && self.machine.profile != MachineProfile::Indigo2Ip22 {
-                return Err(
-                    "graphics.board \"extreme\" is only valid on Indigo2 (machine.profile = indigo2_ip22)".into(),
-                );
+            if matches!(board, GraphicsBoard::Extreme | GraphicsBoard::Elan)
+                && self.machine.profile != MachineProfile::Indigo2Ip22
+            {
+                return Err(format!(
+                    "graphics.board \"{name}\" is only valid on Indigo2 (machine.profile = indigo2_ip22)"
+                ));
             }
             if !board.supports(self.machine.profile) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
