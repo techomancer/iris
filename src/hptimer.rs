@@ -358,6 +358,7 @@ impl TimerInner {
             w.upgrade().map_or(TimerReturn::Delete, |t| {
                 #[cfg(test)]
                 if t.tm.upgrade().is_some_and(|tm| tm.manual.load(Ordering::Relaxed)) {
+                    t.state.lock().id = None;
                     return TimerReturn::Delete;
                 }
                 t.expire()
@@ -844,6 +845,15 @@ mod timer_tests {
         clock.step(1_000);
         assert_eq!(fired(&d), [1_000]);
         assert!(!d.timer.is_armed());
+    }
+
+    /// A manual host timer is deleted without running, so the timer must stop pointing at it.
+    #[test]
+    fn a_manual_host_timer_is_forgotten_when_it_goes() {
+        let (d, _clock) = dev();
+        d.timer.start();
+        d.timer.set_due(Some(1_000));
+        assert!(crate::test_board::until(|| d.timer.0.state.lock().id.is_none()));
     }
 
     #[test]
