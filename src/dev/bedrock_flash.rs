@@ -598,10 +598,6 @@ mod tests {
     fn tm() -> Arc<TimerManager> {
         Arc::new(TimerManager::new())
     }
-    /// Time the flash by a clock the test steps.
-    fn on(clock: &crate::clock::Clock) -> Arc<TimerManager> {
-        Arc::new(TimerManager::with_clock(clock.clone()))
-    }
     fn erase_select(v: &FlashView, part: u64, offset: u64) {
         unlock(v, part);
         assert_eq!(v.write64(part + 8 * 0x555, 0x80), BUS_OK);
@@ -951,8 +947,8 @@ mod tests {
     /// toggles once.
     #[test]
     fn status_reads_toggle_once_each_while_other_threads_read_the_array() {
-        let clock = crate::clock::Clock::stepped();
-        let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
+        let clock = crate::test_board::Stepped::new();
+        let f = Flash::new(&[], FirmwareRecord::FUEL, &clock.tm).unwrap();
         let v = f.boot_view();
         program(&v, 0, 0x200, 0x1234);
         program(&v, SECOND_POSITION, 0x200, 0x5678);
@@ -991,8 +987,8 @@ mod tests {
     /// The erase timer's callback commits an erase to the array and the backing file with nothing touching the flash.
     #[test]
     fn an_erase_completes_with_the_cpu_idle() {
-        let clock = crate::clock::Clock::stepped();
-        let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
+        let clock = crate::test_board::Stepped::new();
+        let f = Flash::new(&[], FirmwareRecord::FUEL, &clock.tm).unwrap();
         let v = f.boot_view();
         program(&v, 0, 0x200, 0);
         erase_select(&v, 0, 0x200);
@@ -1005,8 +1001,8 @@ mod tests {
     /// The PROM polls erase completion and can reset the chip before selected sectors change.
     #[test]
     fn erase_completes_only_for_selected_sectors_and_reset_cancels_it() {
-        let clock = crate::clock::Clock::stepped();
-        let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
+        let clock = crate::test_board::Stepped::new();
+        let f = Flash::new(&[], FirmwareRecord::FUEL, &clock.tm).unwrap();
         let v = f.boot_view();
         program(&v, 0, 0x200, 0);
         program(&v, 0, 0x10000, 0);
@@ -1085,8 +1081,8 @@ mod tests {
             program(&v, SECOND_POSITION, (PART_SIZE - 2) as u64, 0x5678);
             drop(v);
             drop(f);
-            let clock = crate::clock::Clock::stepped();
-            let f = Flash::with_file(&[], &path, FirmwareRecord::FUEL, &on(&clock)).unwrap();
+            let clock = crate::test_board::Stepped::new();
+            let f = Flash::with_file(&[], &path, FirmwareRecord::FUEL, &clock.tm).unwrap();
             let v = f.boot_view();
             assert_eq!(v.read16(0x200).data, 0x1234);
             assert_eq!(
@@ -1133,8 +1129,8 @@ mod tests {
             assert_eq!(v.read16(0x200).data, 0xffff);
         }
         {
-            let clock = crate::clock::Clock::stepped();
-            let f = Flash::new(&[], FirmwareRecord::FUEL, &on(&clock)).unwrap();
+            let clock = crate::test_board::Stepped::new();
+            let f = Flash::new(&[], FirmwareRecord::FUEL, &clock.tm).unwrap();
             let v = f.boot_view();
             program(&v, 0, 0x200, 0);
             let path =
