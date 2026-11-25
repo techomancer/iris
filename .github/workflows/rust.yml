@@ -60,7 +60,7 @@ jobs:
       run: rustup show
     - name: Install dependencies
       if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev ${{ matrix.os == 'ubuntu-24.04' && 'pulseaudio pulseaudio-utils' || '' }}
     # Pull requests restore main's cache but never save their own, so they
     # cannot push main's entries out of the repository's 10 GB cache quota.
     - uses: Swatinem/rust-cache@v2
@@ -119,8 +119,6 @@ jobs:
       if: matrix.os == 'ubuntu-24.04'
       timeout-minutes: 10
       run: |
-        sudo apt-get update
-        sudo apt-get install -y pulseaudio pulseaudio-utils
         scripts/audio-loopback-test.sh \
           cargo nextest run --workspace ${{ matrix.features }} -E 'test(/_on_the_real_device$/)'
     - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
