@@ -1933,6 +1933,7 @@ pub fn token_name(t: u32) -> Option<&'static str> {
         0x0E7 => "POLYGON_OFFSET",
         0x0E9 => "SAVE_TEXMODE",
         0x0EA => "RESTORE_TEXMODE",
+        0x0EB => "TEX_BASE",
         0x0EC => "RSS_REG_SHADOW_IDX",
         0x0ED => "SET_DATA",
         0x0EE => "GET_MATERIALFV",

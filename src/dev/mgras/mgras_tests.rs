@@ -2971,6 +2971,33 @@ fn gl_texgen_object_linear() {
     m.stop_engines();
 }
 
+/// Texgen in a context that never sent a texture coordinate (powerflip's
+/// sphere-mapped models): Q is GL's initial 1, not 0. With Q = 0 the TE got
+/// 1/W = 0 and the models drew white (issue 844).
+#[test]
+fn gl_texgen_without_texcoord_keeps_q_one() {
+    let m = gl_board([1.0, 0.5, 0.75]);
+    gl_tex_image_4x4(&m);
+    gl_tex_bind_4x4(&m, 0x10004, 0x40859);
+    for (c, plane) in [(0x2000, [1.0 / 200.0, 0.0, 0.0, -0.5]), (0x2001, [0.0, 1.0 / 100.0, 0.0, -1.0])] {
+        fifo_token(&m, 0x5A, &[c, 0x2500, 0x2401]);
+        fifo_token(&m, 0x5B, &[c, 0x2501]);
+        fifo_token(&m, 0x5C, &plane.map(f));
+        fifo_token(&m, 0x75, &[c - 0x2000 + 0xC60]);
+    }
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    fifo_token(&m, 0x1D, &[]);
+    for p in [[100.0, 100.0], [300.0, 100.0], [300.0, 200.0], [100.0, 200.0]] {
+        fifo_token(&m, 0x00, &[f(p[0]), f(p[1]), f(0.0)]);
+    }
+    fifo_token(&m, 0x27, &[]);
+    for (s, t) in [(0, 0), (3, 0), (0, 3), (2, 1)] {
+        let (x, y) = (100 + 50 * s + 25, 100 + 25 * t + 12);
+        assert_eq!(gl_px(&m, x, y), 0xA5_0000 | (t as u32 * 0x40) << 8 | s as u32 * 0x40, "texel ({s}, {t})");
+    }
+    m.stop_engines();
+}
+
 /// glPointSize 4 (token 0x04D): a 4x4 square around the point.
 #[test]
 fn gl_point_size_draws_a_square() {

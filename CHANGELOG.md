@@ -29,6 +29,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   iris listens on), and `watch <command>` to keep any command's answer
   updating on one line.
 
+### IMPACT texturing
+
+- Two textured GL programs no longer overwrite each other's textures on
+  IMPACT (seen on Indigo2): buttonfly's buttons stay intact while a demo
+  it launched runs (issue 844).
+- Sphere-mapped models that never set a texture coordinate (powerflip's
+  Flowers models) now show their texture instead of drawing white.
+
 ### GR2 (XZ and Extreme)
 
 - IRIS GL text drawn with a colour set after `cmov` now shows: SOFTIMAGE
