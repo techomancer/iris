@@ -24,6 +24,11 @@
 //! takes `components * depth` nibbles (depth 4, 8 or 12 bits) rounded up to
 //! a power of two, as on the board.
 //!
+//! - **Base page.** The pages the driver programs (TXMIPMAP, TXBORDER,
+//!   TXDETAIL, TL_MIPMAP, TL_BORDER) are relative to TXBASE. The kernel
+//!   hands each process a run of TRAM pages and sends its first page as GE
+//!   token 0x0EB, which the GE keeps with the context; libGLcore numbers
+//!   pages from 0 in every process (`based`).
 //! - **Save and restore.** libGLcore's texture manager moves textures by
 //!   saving TRAM pages to host memory and loading them back elsewhere,
 //!   through a view of TRAM as a level 64 texels wide in the texture's own
@@ -79,6 +84,9 @@ pub mod reg {
     pub const TXLOD: u32 = 0x183;
     pub const TXBCOLOR_RG: u32 = 0x184;
     pub const TXBCOLOR_BA: u32 = 0x185;
+    /// The context's base page: every TRAM page the TE addresses
+    /// (sampling, loading, reading back) is relative to it.
+    pub const TXBASE: u32 = 0x186;
     /// Index into the per-level tables below, advanced by each table write.
     pub const TXADDR: u32 = 0x190;
     pub const TXMIPMAP: u32 = 0x191;
@@ -196,6 +204,16 @@ pub const TRAM_BYTES: usize = 4 << 20;
 pub(crate) const TRAM_NIBBLES: usize = TRAM_BYTES * 2;
 /// A TRAM page: 16 KB with 4 TRAMs.
 pub(crate) const PAGE_NIBBLES: usize = 16384 * 2;
+
+/// A TRAM page as the TE addresses it: the context's page (bits 7:0 of a
+/// TXMIPMAP, TXBORDER, TXDETAIL, TL_MIPMAP or TL_BORDER value) after
+/// TXBASE. The kernel gives each process its own run of pages and sends
+/// the base with it; libGLcore's pages count from 0 in every process, and
+/// without the base two of them shared TRAM (issue 844: buttonfly's
+/// buttons picked up powerflip's flowers).
+pub(crate) fn based(regs: &[u32], page: u32) -> u32 {
+    page.wrapping_add(regs[reg::TXBASE as usize]) & 0xFF
+}
 
 /// Texel offset in a shared page of a level whose larger side is `n` (<=
 /// 16): 16x16 first, then 8x8, 4x4, 2x2, 1x1.
@@ -401,10 +419,10 @@ impl Te1 {
         let sel = ((mode >> 3) & 3) as usize;
         let d = depth_nibbles(mode >> 5);
         let (w, h) = (1usize << ((spec >> 4) & 0xF), 1usize << ((spec >> 8) & 0xF));
-        let page = regs[reg::TL_MIPMAP as usize] & 0xFF;
+        let page = based(regs, regs[reg::TL_MIPMAP as usize]);
         // The origin is signed: a GL border starts at -1. Border texels go
         // to the border page; anything further out is dropped.
-        let border_page = regs[reg::TL_BORDER as usize] & 0xFF;
+        let border_page = based(regs, regs[reg::TL_BORDER as usize]);
         let s0 = regs[reg::TL_S_LEFT as usize] as i32 as i64;
         let t = regs[reg::TL_T_BOTTOM as usize] as i32 as i64 + line as i64;
         let (wi, hi) = (w as i64, h as i64);
@@ -489,7 +507,7 @@ impl Te1 {
         let xfrmode = regs[0x159];
         let wide = xfrmode & 0xF == 1;
         let n = Self::read_texel_bytes(xfrmode) as usize / if wide { 2 } else { 1 };
-        let page = self.tables[0][0] & 0xFF;
+        let page = based(regs, self.tables[0][0]);
         let mut out = Vec::with_capacity(w as usize * n * 2);
         for s in 0..w as usize {
             let a = texel_addr(page, w as usize, 1 << 13, s, line as usize, cell_nibbles(d));
@@ -565,7 +583,7 @@ impl Te1 {
         if ls.max(lt) <= 4 {
             return None;
         }
-        let page = self.tables[0][0] & 0xFF;
+        let page = based(regs, self.tables[0][0]);
         let want = page << 16 | lt << 8 | ls << 4;
         let have = self.owner[page as usize];
         (have != 0 && have != want).then_some((want, have))
@@ -579,8 +597,8 @@ impl Te1 {
         let mut pages = [0u32; 16];
         let mut border_pages = [0u32; 16];
         for (k, p) in pages.iter_mut().enumerate() {
-            *p = self.tables[0][k] & 0xFF;
-            border_pages[k] = self.tables[1][k] & 0xFF;
+            *p = based(regs, self.tables[0][k]);
+            border_pages[k] = based(regs, self.tables[1][k]);
         }
         // The border colour as the texel class's components (12 bits).
         let c = |v: u32| v & 0xFFF;
@@ -624,7 +642,7 @@ impl Te1 {
         }
         Detail {
             on: 1,
-            page: regs[reg::TXDETAIL as usize] & 0xFF,
+            page: based(regs, regs[reg::TXDETAIL as usize]),
             log,
             shift_s: ((size & 0xF) as i32 + up).max(0) as u32,
             shift_t: (((size >> 4) & 0xF) as i32 + up).max(0) as u32,
@@ -916,6 +934,41 @@ pub fn tex_env(mode1: u32, env_rg: u32, env_b: u32, f: [i32; 4], tex: [i32; 4]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two contexts, both with their texture at page 0 but different
+    /// TXBASE (issue 844, buttonfly and powerflip): each load lands at its
+    /// own base and each sampler reads its own texels back.
+    #[test]
+    fn txbase_offsets_every_page() {
+        // SAFETY: Te1 is plain data, valid zeroed.
+        let mut te = unsafe { Box::<Te1>::new_zeroed().assume_init() };
+        let mut regs = vec![0u32; 0x400];
+        // A 4x4 RGBA8 level at page 0, one colour per context.
+        regs[reg::TL_MODE as usize] = 3 << 1 | 1 << 5;
+        regs[reg::TL_SPEC as usize] = 2 << 8 | 2 << 4;
+        regs[reg::TEXMODE1 as usize] = TEXMODE1_ENABLE | 3 << 3 | 4 << 9;
+        regs[reg::TEXMODE2 as usize] = 1 << 2;
+        regs[reg::TXSIZE as usize] = 2 << 4 | 2;
+        te.table_write(reg::TXMIPMAP, 0, 0);
+        for (base, v) in [(0x1D, 0x40u8), (0, 0xC0)] {
+            regs[reg::TXBASE as usize] = base;
+            for t in 0..4 {
+                te.load_line(&regs, t, &[v; 16]);
+            }
+        }
+        for (base, v) in [(0x1D, 0x40u8), (0, 0xC0)] {
+            regs[reg::TXBASE as usize] = base;
+            let smp = te.sampler(&regs);
+            assert_eq!(smp.pages[0], base);
+            let got = smp.texel(&te, 0, 1, 2);
+            // 12-bit components: the byte is the top eight bits.
+            assert_eq!((got[0] >> 4) as u8, v, "base {base:#x}");
+        }
+        // The base wraps within TRAM's 256 pages.
+        regs[reg::TXBASE as usize] = 0xFF;
+        te.table_write(reg::TXMIPMAP, 0, 2);
+        assert_eq!(te.sampler(&regs).pages[0], 1);
+    }
 
     /// A detail texture as the driver sets one up (base 8x8 RGBA8, detail
     /// 256 at level -3, a constant weight of 1): the sample is the base

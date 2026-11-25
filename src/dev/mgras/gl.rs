@@ -119,6 +119,12 @@ pub(super) mod tok {
     /// shadow, table shadow, register, value] (TXMIPMAP, TXBORDER and
     /// DETAILSCALE, indexed by TXADDR).
     pub const RSS_REG_SHADOW_IDX: u32 = 0x0EC;
+    /// The context's TRAM base page (TE1 TXBASE): the kernel's texture
+    /// space allocator gives each process a run of pages and sends this
+    /// when it places or moves it (0 around its own saves and restores).
+    /// The pages libGLcore programs are relative to it, so two processes
+    /// can both use "page 0".
+    pub const TEX_BASE: u32 = 0x0EB;
     /// glTexGen: [coordinate 0x2000 + i (S T R Q), GL_TEXTURE_GEN_MODE,
     /// mode]; a plane's header [coordinate, GL_OBJECT_PLANE / EYE_PLANE],
     /// then its data (4 floats).
@@ -694,6 +700,10 @@ impl Gl {
         self.color = [1.0; 4];
         self.current_index = 1.0;
         self.normal = [0.0, 0.0, 1.0];
+        // GL's initial texture coordinate is (0, 0, 0, 1). Programs that
+        // generate S and T (sphere maps) and never call glTexCoord keep its
+        // Q; a zero Q gave the TE 1/W = 0 and those models drew white.
+        self.texcoord = [0.0, 0.0, 0.0, 1.0];
         self.lt.init();
         self.nm_dirty = 1;
         self.fog_end = 1.0;
@@ -1371,6 +1381,9 @@ impl Gl {
             }
             tok::RSS_REG_SHADOW_IDX if d.len() >= 4 => {
                 self.te_write(d[2] & 0x3FF, d[3], sink);
+            }
+            tok::TEX_BASE if !d.is_empty() => {
+                self.te_write(te_reg::TXBASE, d[0], sink);
             }
             tok::SEND_PIXELS if d.len() >= 8 => {
                 self.send_pixels.copy_from_slice(&d[..8]);
