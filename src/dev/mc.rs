@@ -67,7 +67,15 @@ struct MemoryControllerState {
     cpu: Option<Weak<dyn Device>>,
     /// The GIO DMA engine's interrupt (the IOC's MC DMA line).
     dma_irq: Option<IrqLine>,
+    /// Every value written to CTRLD, oldest first, capped at
+    /// `CTRLD_LOG_LEN`, and the total number of writes (`mc regs` shows
+    /// both). Firmware and IRIX each reprogram the refresh preload.
+    ctrld_writes: Vec<u32>,
+    ctrld_write_count: u64,
 }
+
+/// How many CTRLD writes `mc regs` keeps.
+const CTRLD_LOG_LEN: usize = 16;
 
 /// Where one RAM bank answers after a MEMCFG write:
 /// `(base, addr_mask, limit, subbank_span)`. See
@@ -141,6 +149,8 @@ impl MemoryController {
                 rpss_cycle_acc: 0,
                 cpu: None,
                 dma_irq: None,
+                ctrld_writes: Vec::new(),
+                ctrld_write_count: 0,
             })),
             giodma: Arc::new(GioDma::new()),
             phys: Arc::new(OnceLock::new()),
@@ -813,6 +823,11 @@ impl BusDevice for MemoryController {
             }
             REG_CTRLD => {
                 state.regs[(REG_CTRLD / 4) as usize] = val;
+                state.ctrld_write_count += 1;
+                if state.ctrld_writes.len() == CTRLD_LOG_LEN {
+                    state.ctrld_writes.remove(0);
+                }
+                state.ctrld_writes.push(val);
                 BUS_OK
             }
             REG_REF_CTR => {
@@ -1191,7 +1206,9 @@ impl Device for MemoryController {
                     writeln!(writer, "  CPUCTRL1     : {:08x}", reg(REG_CPUCTRL1)).unwrap();
                     writeln!(writer, "  SYSID        : {:08x}", reg(REG_SYSID)).unwrap();
                     writeln!(writer, "  RPSS_DIVIDER : {:08x}", reg(REG_RPSS_DIVIDER)).unwrap();
-                    writeln!(writer, "  CTRLD        : {:08x}", reg(REG_CTRLD)).unwrap();
+                    writeln!(writer, "  CTRLD        : {:08x}  ({} writes, last {}: {})", reg(REG_CTRLD),
+                        s.ctrld_write_count, s.ctrld_writes.len(),
+                        s.ctrld_writes.iter().map(|v| format!("{v:x}")).collect::<Vec<_>>().join(" ")).unwrap();
                     writeln!(writer, "  REF_CTR      : {:08x}", reg(REG_REF_CTR)).unwrap();
                     writeln!(writer, "  GIO64_ARB    : {:08x}", reg(REG_GIO64_ARB)).unwrap();
                     writeln!(writer, "  CPU_TIME     : {:08x}", reg(REG_CPU_TIME)).unwrap();

@@ -297,6 +297,9 @@ pub struct Ip22Devices {
     pub virtio: Option<(Arc<crate::dev::virtio::mmio::VirtioMmio>, u32)>,
     pub virtio_9p: Option<(Arc<crate::dev::virtio::mmio::VirtioMmio>, u32)>,
     pub vino: Vino,
+    /// The Indigo2's (empty) EISA bus; `None` on the Indy, whose VINO sits in
+    /// that window instead.
+    pub eisa: Option<Arc<crate::dev::eisa::Eisa>>,
     pub mc: MemoryController,
     pub hpc3: Hpc3,
     pub prom: PromPort,
@@ -325,9 +328,17 @@ impl Ip22Bus {
         // remap_banks() is called by the MC when MEMCFG is written.
         // At boot, the MC's initial MEMCFG values trigger an initial remap.
 
-        // Map VINO (64KB at 0x00080000)
-        set(crate::dev::vino::VINO_BASE, crate::dev::vino::VINO_BASE + 0x1_0000,
-            Arc::new(d.vino.clone()), "vino");
+        // The window at 0x00080000 is VINO on the Indy and the EISA bus (I/O
+        // space and the EIU) on the Indigo2, which has no VINO.
+        let indy = d.eisa.is_none();
+        if let Some(eisa) = &d.eisa {
+            use crate::dev::eisa::{EISA_BASE, EISA_END};
+            set(EISA_BASE, EISA_END, eisa.clone(), "eisa");
+        } else {
+            // Map VINO (64KB at 0x00080000)
+            set(crate::dev::vino::VINO_BASE, crate::dev::vino::VINO_BASE + 0x1_0000,
+                Arc::new(d.vino.clone()), "vino");
+        }
 
         // Map Mystery Hole
         phys.map_black_hole(MYSTERY_HOLE_BASE as u64, MYSTERY_HOLE_END as u64);
@@ -413,7 +424,9 @@ impl Ip22Bus {
         // through the GIO alias landed at 0x1E080000 — gio_err_ptr region —
         // returning 0xFFFFFFFF. The IRIX vino driver's chip_id check then
         // mismatches and no /hw/.../vino node is created.)
-        phys.map_alias(0x1F080000, 0x1F090000, 0xE1000000, "vino gio alias");
+        if indy {
+            phys.map_alias(0x1F080000, 0x1F090000, 0xE1000000, "vino gio alias");
+        }
 
         Self {
             phys,

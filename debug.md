@@ -578,7 +578,7 @@ devices are [listed below](#sgi-o2-ip32).
 
 | Command | Description |
 |---|---|
-| `mc regs` | Memory Controller registers, including MEMCFG |
+| `mc regs` | Memory Controller registers, including MEMCFG; CTRLD also lists its write count and last 16 values written |
 | `mc dma` | VDMA (graphics DMA) state |
 | `mc dma xlate [vaddr] [w]` | Walk the VDMA address translation for `vaddr` (default MEMADR) without side effects; `w` = the transfer writes memory |
 | `mc vdma <on\|off>` | VDMA trace to `vdma.log` |
