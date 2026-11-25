@@ -111,14 +111,14 @@ struct Record {
     barcode: &'static str,
     part: &'static str,
     revision: &'static str,
-    name: &'static str,
+    name: std::borrow::Cow<'static, str>,
     serial: u64,
 }
 
 impl Record {
     fn part(&self) -> w1::Ds2505 {
         board_record_part(
-            &BoardRecord { barcode: self.barcode, part: self.part, revision: self.revision, name: self.name },
+            &BoardRecord { barcode: self.barcode, part: self.part, revision: self.revision, name: &self.name },
             self.serial,
         )
     }
@@ -144,73 +144,77 @@ struct Identity {
 }
 
 impl Identity {
-    /// The Octane. A PM10 has one processor and a PM20 two, and the PROM's
-    /// diagnostics hold the record to the processors HEART reports.
-    fn octane(cpus: u8) -> Identity {
+    /// The processor module for the configured processor and processor
+    /// count, whichever chassis it sits in. A PM10 carries one processor and a
+    /// PM20 two; the PROM's power-on test holds the name's prefix to the
+    /// processors HEART reports. The R10000 module is the original Octane's
+    /// (PM10/PM20). Later modules carry their clock in the name, from two
+    /// reference Octane2s: a single 360 MHz R12000 is PM10360MHZ,
+    /// 030-1590-002 rev B; two 600 MHz R14000s are PM20600MHZ, 030-1778-001
+    /// rev C. Other counts and clocks keep their family's part number
+    /// (approximation: no inventory of them is at hand).
+    fn processor_module(part: &Part, cpus: u8) -> Record {
+        let count = if cpus > 1 { "PM20" } else { "PM10" };
+        let (part_no, revision, name) = match part.family {
+            parts::Family::R10000 => ("030-0888-004", "B", std::borrow::Cow::Borrowed(count)),
+            parts::Family::R14000 => ("030-1778-001", "C", format!("{count}{}MHZ", part.mhz).into()),
+            _ => ("030-1590-002", "B", format!("{count}{}MHZ", part.mhz).into()),
+        };
+        Record { barcode: "EMUU00", part: part_no, revision, name, serial: 0x5145_4d55_5500 }
+    }
+
+    /// The Octane's chassis records, from its inventory, around `processor`.
+    fn octane(processor: Record) -> Identity {
         Identity {
-            processor: Record {
-                barcode: "EMUU00",
-                part: "030-0888-004",
-                revision: "B",
-                name: if cpus > 1 { "PM20" } else { "PM10" },
-                serial: 0x5145_4d55_5500,
-            },
+            processor,
             system_board: Record {
                 barcode: "EMUN00",
                 part: "030-0887-003",
                 revision: "F",
-                name: "IP30",
+                name: "IP30".into(),
                 serial: 0x5145_4d55_4e00,
             },
             front_plane: Record {
                 barcode: "EMUF00",
                 part: "030-0891-003",
                 revision: "A",
-                name: "FP1",
+                name: "FP1".into(),
                 serial: 0x5145_4d55_4600,
             },
             power_supply: Record {
                 barcode: "EMUS00",
                 part: "060-0028-003",
                 revision: "A",
-                name: "PWR.SPPLY.SR",
+                name: "PWR.SPPLY.SR".into(),
                 serial: 0x5145_4d55_5300,
             },
         }
     }
 
-    /// The Octane2, from one reference unit's inventory. The processor
-    /// module is that unit's single-processor 360 MHz one, for any processor
-    /// count: no inventory of a dual-processor Octane2 is at hand
-    /// (approximation).
-    fn octane2() -> Identity {
+    /// The Octane2's chassis records, from one reference unit's inventory,
+    /// around `processor`.
+    fn octane2(processor: Record) -> Identity {
         Identity {
-            processor: Record {
-                barcode: "EMUU00",
-                part: "030-1590-002",
-                revision: "B",
-                name: "PM10360MHZ",
-                serial: 0x5145_4d55_5500,
-            },
+            processor,
             system_board: Record {
                 barcode: "EMUN00",
                 part: "030-1467-001",
                 revision: "B",
-                name: "IP30",
+                name: "IP30".into(),
                 serial: 0x5145_4d55_4e00,
             },
             front_plane: Record {
                 barcode: "EMUF00",
                 part: "030-0891-003",
                 revision: "H",
-                name: "FP1",
+                name: "FP1".into(),
                 serial: 0x5145_4d55_4600,
             },
             power_supply: Record {
                 barcode: "EMUS00",
                 part: "060-0035-002",
                 revision: "A",
-                name: "PWR.SPPLY.ER",
+                name: "PWR.SPPLY.ER".into(),
                 serial: 0x5145_4d55_5300,
             },
         }
@@ -328,8 +332,11 @@ impl OctaneMachine {
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, timer_manager.clock().clone()));
-        // HEART's MicroLAN holds the processor module's record.
-        let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
+        // HEART's MicroLAN holds the processor module's record. The module
+        // follows the processor settings alone; the chassis records follow
+        // the product.
+        let processor = Identity::processor_module(part, cpu_count);
+        let identity = if octane2 { Identity::octane2(processor) } else { Identity::octane(processor) };
         heart.set_microlan(identity.processor.bus());
 
         let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
@@ -1673,30 +1680,37 @@ mod tests {
     /// supply; HEART's and the Bridge's hold one record each.
     #[test]
     fn each_product_carries_its_own_identity_records() {
-        let o = Identity::octane(1);
-        let o2 = Identity::octane2();
+        let o = Identity::octane(Identity::processor_module(&parts::R10000_195, 1));
+        let o2 = Identity::octane2(Identity::processor_module(&parts::R12000_360, 1));
         let key = |i: &Identity| {
-            [&i.processor, &i.system_board, &i.front_plane, &i.power_supply].map(|r| (r.part, r.revision, r.name))
+            [&i.processor, &i.system_board, &i.front_plane, &i.power_supply].map(|r| (r.part, r.revision, r.name.to_string()))
         };
         assert_eq!(
             key(&o),
             [
-                ("030-0888-004", "B", "PM10"),
-                ("030-0887-003", "F", "IP30"),
-                ("030-0891-003", "A", "FP1"),
-                ("060-0028-003", "A", "PWR.SPPLY.SR"),
+                ("030-0888-004", "B", "PM10".into()),
+                ("030-0887-003", "F", "IP30".into()),
+                ("030-0891-003", "A", "FP1".into()),
+                ("060-0028-003", "A", "PWR.SPPLY.SR".into()),
             ]
         );
         assert_eq!(
             key(&o2),
             [
-                ("030-1590-002", "B", "PM10360MHZ"),
-                ("030-1467-001", "B", "IP30"),
-                ("030-0891-003", "H", "FP1"),
-                ("060-0035-002", "A", "PWR.SPPLY.ER"),
+                ("030-1590-002", "B", "PM10360MHZ".into()),
+                ("030-1467-001", "B", "IP30".into()),
+                ("030-0891-003", "H", "FP1".into()),
+                ("060-0035-002", "A", "PWR.SPPLY.ER".into()),
             ]
         );
-        assert_eq!(Identity::octane(2).processor.name, "PM20", "a dual-processor Octane's module");
+        // The module follows the processor settings, never the graphics board.
+        let module = |p: &Part, n: u8| Identity::processor_module(p, n).name.to_string();
+        assert_eq!(module(&parts::R10000_195, 2), "PM20", "two R10000s");
+        assert_eq!(module(&parts::R12000_360, 2), "PM20360MHZ", "two 360 MHz R12000s");
+        assert_eq!(module(&parts::R14000_600, 1), "PM10600MHZ", "one 600 MHz R14000");
+        // octopus, a real dual 600 MHz R14000 Octane2.
+        let r14k = Identity::processor_module(&parts::R14000_600, 2);
+        assert_eq!((r14k.part, r14k.revision, &*r14k.name), ("030-1778-001", "C", "PM20600MHZ"));
         let families = |bus: &w1::Bus| {
             let mut f: Vec<u8> = bus.roms().iter().map(|rom| rom[0]).collect();
             f.sort();

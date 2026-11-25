@@ -38,7 +38,7 @@ address there. The kernel later writes one, and the slave is running IRIX.
 
 The PROM also checks that the processor module's name agrees with the active
 bits: a `PM10` has one processor and a `PM20` two. The emulator reports the
-module that matches `cpus`.
+module that matches `cpu` and `cpus`, on either product.
 
 ## HEART, per processor
 
