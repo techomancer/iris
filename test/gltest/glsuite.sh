@@ -2,18 +2,21 @@
 # Every GL check suite in the guest, for comparing two runs (two raster
 # units, two builds). Expects test/gltest copied to /shared/gltest and the
 # piglit irix tree to /shared/piglit (TESTING.md).
-#   sh glsuite.sh TAG [suites...]   suites: state pix vis tex lines scenes piglit
+#   sh glsuite.sh TAG [suites...]   suites: state pix vis tex lines scenes ximg piglit
+# PIGLIT_LIST picks the board's piglit list (default vpro.list; express.list
+# for XZ and Extreme, impact.list, newport.list).
 # Results in /usr/tmp/res-TAG, copied to /shared/results/TAG as each
 # suite finishes; progress in its "progress" file.
 TAG=${1:?tag}; shift
-SUITES=${*:-"state pix vis tex lines scenes piglit"}
+SUITES=${*:-"state pix vis tex lines scenes ximg piglit"}
+PIGLIT_LIST=${PIGLIT_LIST:-vpro.list}
 R=/usr/tmp/res-$TAG
 S=/shared/results/$TAG
 DISPLAY=:0; export DISPLAY
 mkdir -p $R $S
 rm -rf /usr/tmp/gltest; cp -r /shared/gltest /usr/tmp/gltest
 cd /usr/tmp/gltest
-xset s off 2>/dev/null; xset s noblank 2>/dev/null
+xset s reset 2>/dev/null; xset s off 2>/dev/null; xset s noblank 2>/dev/null
 out() { cp -r $R/* $S/ 2>/dev/null; }
 stamp() { echo "`date '+%H:%M:%S'` $*" >> $R/progress; out; }
 has() { case " $SUITES " in *" $1 "*) return 0 ;; esac; return 1; }
@@ -60,9 +63,14 @@ if has scenes; then
     done
     stamp scenes
 fi
+if has ximg; then
+    ./ximgtest > $R/ximgtest.txt 2>&1
+    stamp ximg
+fi
 if has piglit; then
     rm -rf /usr/tmp/piglit; cp -r /shared/piglit /usr/tmp/piglit
-    cd /usr/tmp/piglit/irix && ./piglit-run.sh -t 300 -o $R/piglit lists/vpro.list > $R/piglit.log 2>&1
+    PIGLIT_XRESTART="sh /usr/tmp/gltest/xrestart.sh"; export PIGLIT_XRESTART
+    cd /usr/tmp/piglit/irix && ./piglit-run.sh -t 300 -o $R/piglit lists/$PIGLIT_LIST > $R/piglit.log 2>&1
     stamp piglit
 fi
 stamp done

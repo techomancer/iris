@@ -1,7 +1,8 @@
 #!/bin/sh
 # Restart the X server in each root visual class and depth, log in again
 # (autologin), and capture: the desktop through scrsave, xdpyinfo, and a GL
-# quadrants check and a smooth triangle read back through GL and scrsave.
+# quadrants check, a smooth triangle read back through GL and scrsave, and
+# the X image transfers in every visual (ximgtest).
 #   sh xsweep.sh TAG [modes...]   modes: tc24 pc8 pc12 tc12 tc15 tc30 dc24
 # Results in /usr/tmp/res-TAG/x-MODE, copied to /shared/results/TAG.
 TAG=${1:?tag}; shift
@@ -40,7 +41,8 @@ for m in $MODES; do
     $G -p none --scene quadrants --check --read front --readout $D/quadrants --hold 0 > $D/quadrants.txt 2>&1
     $G -p triangles --smooth --size 256x256 --read front --readout $D/tri --hold 4000 > $D/tri.txt 2>&1 &
     sleep 3; /usr/sbin/scrsave $D/tri.rgb; wait
-    stamp "$m: `grep -c FAIL $D/quadrants.txt` quadrant failures, root `grep 'depth of root' $D/xdpyinfo.txt`"
+    /usr/tmp/gltest/ximgtest > $D/ximgtest.txt 2>&1
+    stamp "$m: `grep -c FAIL $D/quadrants.txt` quadrant failures, `grep -c FAIL $D/ximgtest.txt` ximg failures, root `grep 'depth of root' $D/xdpyinfo.txt`"
 done
 # Back to the server as it was.
 cp $X.orig $X; touch /etc/autologin.on; killall Xsgi

@@ -271,6 +271,7 @@ GR2 (XZ/Extreme): HQ2 HLE, GL state, FIN handshakes, the RE3 span JIT. Hardware 
 |---|---|---|
 | [DESIGN.md](gr2/DESIGN.md) | design | GR2 design |
 | [video-timing-from-vc1-tables.md](gr2/video-timing-from-vc1-tables.md) | rule | GR2 refresh rate: the VC1 frame and line-state table formats (units of five clocks), two known clocks; PROM-checked only. Also the O2's totals and dot clock |
+| [real-xz-comparison.md](gr2/real-xz-comparison.md) | open | Real Indy XZ vs emulated, same suites: fixed colour floor(v*256), quad fan, 4 GE; open EXP2 fog, local spot, X XYBitmap / 4-bit TrueColor / overlay XReadDisplay; glx-window-life kills Xsgi (piglit X restart hook); running on a real machine |
 | [vdma-timeout-and-tracing.md](gr2/vdma-timeout-and-tracing.md) | rule | IRIX's VDMA wait is 500 000 DELAY(1) polls (a few hundred ms host); full GR2 tracing slows GEDMA DMA past it (VDMA TIMEOUT, board reset, kernel fault); measure untraced with `mc vdma on`; GIO32 path translates per page |
 | [bringup.md](gr2/bringup.md) | howto | GR2 bring-up: emulator-side gotchas |
 | [cx-save-must-wait-for-hq.md](gr2/cx-save-must-wait-for-hq.md) | rule | Context save: GEDMA reads must wait for the queued 0x1E1 |
