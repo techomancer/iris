@@ -37,6 +37,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   image upload of 130 KB now takes about 5 ms). Slow uploads could outlast
   IRIX's DMA timeout, and the kernel then reset the board or panicked (seen
   with SOFTIMAGE while tracing).
+- An Indy's XZ now has 4 geometry engines, as on hardware: OpenGL reports
+  it as GR3-Elan, as a real Indy does. Indigo2 gains `board = "elan"` (4
+  engines) next to `xz` (2).
+- GL clears and flat colours on XZ now match a real Indy XZ exactly (they
+  were often one step off), and smooth-shaded quads, quad strips and
+  polygons shade along the same diagonal as the hardware.
 
 ### Newport on the GPU raster
 

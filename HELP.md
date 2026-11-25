@@ -727,7 +727,7 @@ cpu     = "r4400"           # unset: the machine's first. Indy, IP22: r4400/r500
                             # Origin 3200, Onyx 3000: 1, 2 or 4 on each C-brick; Origin 200/2000, Onyx2: 1 or 2 on each node board
 
 [graphics]
-board      = "newport"      # Indy, Indigo2: "newport", "xz", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); "extreme" on IP22 only
+board      = "newport"      # Indy, Indigo2: "newport", "xz", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); "elan", "extreme" on IP22 only (an Indy's "xz" has the Elan's 4 GE7s)
                             # Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
                             # Onyx2: "ir2", "ir2:2rm", "ir2e", "ir2e:2rm" or "none" (default); Onyx 3000: "ir3" (default) or "v12"
                             # Fuel: "v10", "v12" or "none" (default); Tezro: "v12" or "none" (default); Origin 200/2000/3200: "none"

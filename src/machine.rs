@@ -702,9 +702,17 @@ impl Machine {
         // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
         // selecting the board is explicit, and the PROM needs it to probe.
         let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
-            crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Extreme => {
+            crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Elan | crate::config::GraphicsBoard::Extreme => {
+                use crate::config::GraphicsBoard;
                 use crate::dev::gr2::{Gr2, Gr2Variant};
-                let variant = if cfg.graphics_board() == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
+                // The Indy's XZ has 4 GE7s (libGLcore calls it GR3-Elan);
+                // the Indigo2 sold XZ with 2 and Elan with 4.
+                let variant = match cfg.graphics_board() {
+                    GraphicsBoard::Extreme => Gr2Variant::Extreme,
+                    GraphicsBoard::Elan => Gr2Variant::Elan,
+                    _ if guinness => Gr2Variant::Elan,
+                    _ => Gr2Variant::Xz,
+                };
                 let g = Gr2::new(variant, status.clone());
                 // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a

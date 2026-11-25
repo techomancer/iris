@@ -114,6 +114,7 @@ fn decode_raw<T>(name: &str, bytes: &[u8]) -> Result<Box<T>, String> {
 fn variant_name(variant: Gr2Variant) -> &'static str {
     match variant {
         Gr2Variant::Xz => "xz",
+        Gr2Variant::Elan => "elan",
         Gr2Variant::Extreme => "extreme",
     }
 }
@@ -390,7 +391,7 @@ mod tests {
 
     #[test]
     fn xz_and_extreme_round_trip_complete_state_and_partial_hq2_command() {
-        for variant in [Gr2Variant::Xz, Gr2Variant::Extreme] {
+        for variant in [Gr2Variant::Xz, Gr2Variant::Elan, Gr2Variant::Extreme] {
             let g = live_gr2(variant);
             command(&g, PUC_INIT, 1);
             command(&g, PUC_COLOR, 7);
