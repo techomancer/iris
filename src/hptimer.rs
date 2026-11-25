@@ -17,14 +17,10 @@ pub enum TimerReturn {
     /// Keep the timer as is. If it's recurring, it schedules the next expiration by adding its period.
     /// If it's a one-shot timer, it gets deleted.
     Continue,
-    /// Keep the timer in the manager, but mark as disabled.
-    Disable,
     /// Remove the timer from the manager completely.
     Delete,
     /// Reschedule the timer to trigger exactly once at the given relative Duration from now.
     RescheduleOneShot(Duration),
-    /// Convert (or keep) the timer as recurring with a new period. The next expiration will be the old expiration + the new period.
-    RescheduleRecurring(Duration),
 }
 
 /// A type-erased closure and context pair.
@@ -58,7 +54,6 @@ const SPIN_THRESHOLD: Duration = Duration::from_micros(80);
 struct TimerEntry {
     next_expiration: Instant,
     period: Option<Duration>,
-    enabled: bool,
     in_fifo: bool,
     callback: Option<Box<dyn TimerCallback>>,
 }
@@ -220,7 +215,6 @@ impl TimerManager {
         let id = inner.allocate(TimerEntry {
             next_expiration: Instant::now() + expire_in,
             period: None,
-            enabled: true,
             in_fifo: false,
             callback: Some(Box::new(CallbackWithContext { context, cb })),
         });
@@ -239,7 +233,6 @@ impl TimerManager {
         let id = inner.allocate(TimerEntry {
             next_expiration: expire_at,
             period: Some(period),
-            enabled: true,
             in_fifo: false,
             callback: Some(Box::new(CallbackWithContext { context, cb })),
         });
@@ -252,38 +245,6 @@ impl TimerManager {
     pub fn remove(&self, id: TimerId) -> bool {
         let mut inner = self.inner.lock();
         inner.deallocate(id)
-    }
-
-    /// Turn on a timer that was previously disabled.
-    pub fn enable(&self, id: TimerId) -> bool {
-        let mut inner = self.inner.lock();
-        let (generation, idx) = ((id >> 32) as u32, (id & 0xFFFFFFFF) as usize);
-        if let Some(slot) = inner.slots.get_mut(idx) {
-            if slot.generation == generation {
-                if let Some(t) = &mut slot.timer {
-                    t.enabled = true;
-                    drop(inner);
-                    self.wake_up();
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Temporarily disable a timer.
-    pub fn disable(&self, id: TimerId) -> bool {
-        let mut inner = self.inner.lock();
-        let (generation, idx) = ((id >> 32) as u32, (id & 0xFFFFFFFF) as usize);
-        if let Some(slot) = inner.slots.get_mut(idx) {
-            if slot.generation == generation {
-                if let Some(t) = &mut slot.timer {
-                    t.enabled = false;
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     fn wake_up(&self) {
@@ -495,7 +456,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
             for index in 0..guard.slots.len() {
                 let slot = &mut guard.slots[index];
                 if let Some(t) = &mut slot.timer {
-                    if t.enabled && !t.in_fifo && t.next_expiration <= now {
+                    if !t.in_fifo && t.next_expiration <= now {
                         t.in_fifo = true;
                         let generation = slot.generation;
                         guard.fifo.push_back((index, generation));
@@ -508,10 +469,8 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                 if let Some(slot) = guard.slots.get_mut(idx) {
                     if slot.generation == generation {
                         if let Some(t) = &mut slot.timer {
-                            if t.enabled {
-                                let cb = t.callback.take();
-                                to_call = Some((idx, generation, cb, t.period, t.next_expiration));
-                            }
+                            let cb = t.callback.take();
+                            to_call = Some((idx, generation, cb, t.period, t.next_expiration));
                             // Processed, take it out of the fifo queue logic
                             t.in_fifo = false;
                         }
@@ -523,7 +482,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
             if to_call.is_none() {
                 for slot in guard.slots.iter() {
                     if let Some(t) = &slot.timer {
-                        if t.enabled && !t.in_fifo {
+                        if !t.in_fifo {
                             if let Some(w) = next_wakeup {
                                 if t.next_expiration < w {
                                     next_wakeup = Some(t.next_expiration);
@@ -558,14 +517,12 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                         t.callback = Some(cb);
 
                         let period = t.period;
-                        let enabled = t.enabled;
                         match result {
                             TimerReturn::Continue => {
                                 if let Some(period) = period {
                                     t.next_expiration += period;
                                     let now = Instant::now();
                                     if catch_up + 1 < MAX_CATCHUP
-                                        && enabled
                                         && t.next_expiration <= now
                                     {
                                         catch_up += 1;
@@ -578,19 +535,12 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                                     guard.deallocate(((generation as u64) << 32) | (idx as u64));
                                 }
                             }
-                            TimerReturn::Disable => {
-                                t.enabled = false;
-                            }
                             TimerReturn::Delete => {
                                 guard.deallocate(((generation as u64) << 32) | (idx as u64));
                             }
                             TimerReturn::RescheduleOneShot(new_delay) => {
                                 t.next_expiration = Instant::now() + new_delay;
                                 t.period = None;
-                            }
-                            TimerReturn::RescheduleRecurring(new_period) => {
-                                t.period = Some(new_period);
-                                t.next_expiration += new_period;
                             }
                         }
                     }
