@@ -87,10 +87,10 @@
 //!   0x40. A configuration read of a register nothing describes (BARs 2 and
 //!   3, 0x40, 0x41, 0x43, 0x60) reads 0 and ignores writes, and is logged;
 //!   so is a whole-dword write there, but a narrower write is not seen.
-//! * The sample clock runs on host time, less the time the machine was
-//!   stopped, not on the emulated CPU's progress. A jump of more than a
-//!   second is not replayed through memory; the engine resumes at the
-//!   present.
+//! * The sample clock runs on the machine clock, which holds still while
+//!   the machine is stopped, not on the emulated CPU's progress. A jump of
+//!   more than a second is not replayed through memory; the engine resumes
+//!   at the present.
 //! * Hold-up approximation, an emulator policy with no hardware
 //!   counterpart: a timer more than one flow tick behind its deadline means
 //!   the host held up the timer thread, so the card's clock is set back to

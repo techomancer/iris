@@ -47,9 +47,9 @@
 //! * The reset values, the BAR size and the PCI class are the emulator's
 //!   choices.
 //! * The serial ring engine is the one the IOC3 uses (`ioc_serial_dma.rs`) and
-//!   carries its approximations: timers run on host time and receive-ring-full
-//!   is a level that follows a held entry. After a failed ring transfer the port
-//!   halts until a channel reset.
+//!   carries its approximations: receive-ring-full is a level that follows a
+//!   held entry. After a failed ring transfer the port halts until a channel
+//!   reset.
 //! * Register 0x20 reads the DMA-idle bit unless a transfer is under way.
 //!   Transfers complete inside the access that starts them, so software
 //!   always finds the engine idle.

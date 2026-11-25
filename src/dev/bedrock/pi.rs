@@ -173,8 +173,8 @@ pub(super) struct Pi {
     /// The machine tick (time / `TICK`) at which the counter read zero, modulo 2^64: the counter
     /// is 55 bits, too wide for a nanosecond origin.
     origin: AtomicU64,
-    /// The latest clock reading `count` has used: processors on different sockets read the host
-    /// clock a few hundred ns apart, but the counter never goes back.
+    /// The latest clock reading `count` has used: processors on different sockets read the machine
+    /// clock (host TSC) a few hundred ns apart, but the counter never goes back.
     seen: AtomicU64,
     /// The count while the counter's clock is stopped, else `RUNNING`.
     held: AtomicU64,
