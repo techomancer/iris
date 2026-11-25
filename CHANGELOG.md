@@ -138,6 +138,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 - virtio-serial on the Octane moved from Bridge slot 4 to slot 7 (INTB), off
   the SuperIO interrupt pin: Linux's serial console no longer dies when
   virtio_console loads, and OpenBSD finds its console with no `bridge_slot`.
+- A dual-processor Octane with V10 or V12 graphics passes the PROM's power-on
+  test: the processor module record now follows `cpu` and `cpus`, not the
+  graphics board (`PM20360MHZ` for two 360 MHz R12000s).
 ### PCI-to-PCI bridges
 
 - The bridge in front of a `bridge = true` Fibre Channel or NVMe card decodes

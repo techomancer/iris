@@ -198,19 +198,26 @@ straps GPIO inputs 2 and 3 high (read on an Octane2's PROM monitor as pin data
 pin 0 the white power LED, shown as the status bar's green one, pin 1 the red
 fault LED; they are taken as active high, which no source settles.
 
-The products differ in four one-wire records, which belong to the product, not
-the chip (`ip30_machine.rs`, `Identity`):
+The products differ in three one-wire chassis records, and HEART's line
+carries the processor module, which follows the `[machine]` processor
+settings, not the product (`ip30_machine.rs`, `Identity`):
 
 | Record | Wire | Octane | Octane2 |
 |---|---|---|---|
 | front plane `FP1` | IOC3 | 030-0891-003 rev A | 030-0891-003 rev H |
 | power supply | IOC3 | `PWR.SPPLY.SR` 060-0028-003 rev A | `PWR.SPPLY.ER` 060-0035-002 rev A |
 | system board `IP30` | Bridge | 030-0887-003 rev F | 030-1467-001 rev B |
-| processor module | HEART | 030-0888-004 rev B, `PM10` or `PM20` | 030-1590-002 rev B, `PM10360MHZ` |
 
-The Octane2 values are one reference unit's inventory. The processor module is
-that unit's single-processor 360 MHz one, used for any processor count
-(approximation). Barcodes and ROM serials are synthetic (`EMU...`). Whether the
+| Processor module (HEART) | Record |
+|---|---|
+| R10000 | 030-0888-004 rev B, `PM10` (one CPU) or `PM20` (two) |
+| R12000 | 030-1590-002 rev B, `PM10<MHz>MHZ` or `PM20<MHz>MHZ` |
+| R14000 | 030-1778-001 rev C, `PM10<MHz>MHZ` or `PM20<MHz>MHZ` |
+
+The Octane2 chassis values are one reference unit's inventory. The module
+records come from two real Octane2s: a single 360 MHz R12000 (`PM10360MHZ`)
+and two 600 MHz R14000s (`PM20600MHZ`). Other counts and clocks follow the
+same pattern with their family's part number (approximation). Barcodes and ROM serials are synthetic (`EMU...`). Whether the
 PROM or IRIX acts on these records was not checked.
 
 ### Origin 200 (`IP29`)
