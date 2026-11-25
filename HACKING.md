@@ -187,6 +187,10 @@ pub trait Resettable { fn power_on(&self); }
   `OLDEST_SCHEMA` names the floor.
 - **Resettable** is power-on state.
 
+`src/dev/mace_uart.rs` is the small live device to copy: register decode as a
+`BusDevice`, the lifecycle as a `Device`, and a deadline on the machine clock
+through `hptimer::Timer`, started and stopped with the device.
+
 A device that answers every width the same way writes one inherent
 `access(&self, a, size, value) -> BusRead64` and expands the eight sized
 methods with `access_widths!()` (`src/dev/widths.rs`); `widths::access` splits
