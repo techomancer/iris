@@ -842,13 +842,13 @@ impl Slot {
         let Some(timers) = shared.timers.get() else { return };
         let now = (shared.clock)();
         let Some(at) = chain.run(head, now) else { return };
-        let context = (Arc::downgrade(handle), chain.generation);
-        chain.timer = Some(timers.add_one_shot(Duration::from_nanos(at - now), context, |(handle, generation)| {
+        let (handle, generation) = (Arc::downgrade(handle), chain.generation);
+        chain.timer = Some(timers.add_one_shot(Duration::from_nanos(at - now), move || {
             use crate::hptimer::TimerReturn;
             let Some(handle) = handle.upgrade() else { return TimerReturn::Delete };
             let (Some(shared), Some(head)) = (handle.refresh.upgrade(), handle.board()) else { return TimerReturn::Delete };
             let mut chain = handle.chain.lock();
-            if chain.generation != *generation {
+            if chain.generation != generation {
                 return TimerReturn::Delete;
             }
             let now = (shared.clock)();

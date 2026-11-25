@@ -519,7 +519,7 @@ impl Hal2 {
         let mut pcm: Vec<i16> = Vec::new();
         let mut raw: Vec<(i16, i16)> = Vec::new();
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             let mut due = pacer.due();
             meter.skipped(0, Skip::Stale, pacer.take_skipped());
             // Keep within READ_AHEAD_MS of the position the guest last polled
@@ -616,7 +616,7 @@ impl Hal2 {
         let dma_client = self.dma_clients[dma_ch].clone();
         let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
                 let _ = dma_client.write(0, false);
                 if mode == MODE_STEREO || mode == MODE_QUAD {
@@ -661,7 +661,7 @@ impl Hal2 {
         let ar_state = self.ar_state.clone();
         let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
                 if let Some((val, st)) = dma_client.read() {
                     if !st.refused() {
@@ -703,7 +703,7 @@ impl Hal2 {
         let ar_state = self.ar_state.clone();
         let mut pacer = Pacer::new(rate);
 
-        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
+        let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || {
             for _ in 0..pacer.due() {
                 let val = ar_state.lock().loopback.pop_front().unwrap_or(0);
                 let _ = dma_client.write(val, false);

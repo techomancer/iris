@@ -23,26 +23,6 @@ pub enum TimerReturn {
     RescheduleOneShot(Duration),
 }
 
-/// A type-erased closure and context pair.
-pub trait TimerCallback: Send {
-    fn call(&mut self) -> TimerReturn;
-}
-
-struct CallbackWithContext<C, F> {
-    context: C,
-    cb: F,
-}
-
-impl<C, F> TimerCallback for CallbackWithContext<C, F>
-where
-    C: Send,
-    F: FnMut(&mut C) -> TimerReturn + Send,
-{
-    fn call(&mut self) -> TimerReturn {
-        (self.cb)(&mut self.context)
-    }
-}
-
 /// How far short of a deadline the worker stops sleeping and starts spinning.
 /// A park overshoots by the kernel's timer slack plus scheduling latency, so
 /// the margin has to exceed that for the deadline to be met.
@@ -55,7 +35,7 @@ struct TimerEntry {
     next_expiration: Instant,
     period: Option<Duration>,
     in_fifo: bool,
-    callback: Option<Box<dyn TimerCallback>>,
+    callback: Option<Box<dyn FnMut() -> TimerReturn + Send>>,
 }
 
 /// Represents a slot in our arena.
@@ -205,36 +185,34 @@ impl TimerManager {
         }
     }
 
-    /// Add a new one-shot timer to the manager counting from now, with its own context.
-    pub fn add_one_shot<C, F>(&self, expire_in: Duration, context: C, cb: F) -> TimerId
+    /// Add a new one-shot timer to the manager counting from now.
+    pub fn add_one_shot<F>(&self, expire_in: Duration, cb: F) -> TimerId
     where
-        C: Send + 'static,
-        F: FnMut(&mut C) -> TimerReturn + Send + 'static,
+        F: FnMut() -> TimerReturn + Send + 'static,
     {
         let mut inner = self.inner.lock();
         let id = inner.allocate(TimerEntry {
             next_expiration: Instant::now() + expire_in,
             period: None,
             in_fifo: false,
-            callback: Some(Box::new(CallbackWithContext { context, cb })),
+            callback: Some(Box::new(cb)),
         });
         drop(inner);
         self.wake_up();
         id
     }
 
-    /// Add a recurring timer to the manager, with its own context.
-    pub fn add_recurring<C, F>(&self, expire_at: Instant, period: Duration, context: C, cb: F) -> TimerId
+    /// Add a recurring timer to the manager.
+    pub fn add_recurring<F>(&self, expire_at: Instant, period: Duration, cb: F) -> TimerId
     where
-        C: Send + 'static,
-        F: FnMut(&mut C) -> TimerReturn + Send + 'static,
+        F: FnMut() -> TimerReturn + Send + 'static,
     {
         let mut inner = self.inner.lock();
         let id = inner.allocate(TimerEntry {
             next_expiration: expire_at,
             period: Some(period),
             in_fifo: false,
-            callback: Some(Box::new(CallbackWithContext { context, cb })),
+            callback: Some(Box::new(cb)),
         });
         drop(inner);
         self.wake_up();
@@ -384,7 +362,8 @@ impl TimerInner {
         self.unarm(st);
         let (Some(due), Some(tm)) = (st.due, self.tm.upgrade()) else { return };
         let delay = Duration::from_nanos(due.saturating_sub(self.clock.now()));
-        st.id = Some(tm.add_one_shot(delay, Arc::downgrade(self), move |w: &mut Weak<Self>| {
+        let w = Arc::downgrade(self);
+        st.id = Some(tm.add_one_shot(delay, move || {
             w.upgrade().map_or(TimerReturn::Delete, |t| {
                 #[cfg(test)]
                 if t.tm.upgrade().is_some_and(|tm| tm.manual.load(Ordering::Relaxed)) {
@@ -500,7 +479,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
         const MAX_CATCHUP: u32 = 8;
         if let Some((idx, generation, cb_opt, _og_period, _og_expiration)) = to_call {
             if let Some(mut cb) = cb_opt {
-                let mut result = cb.call();
+                let mut result = cb();
                 let mut catch_up = 0u32;
 
                 loop {
@@ -528,7 +507,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                                         catch_up += 1;
                                         cb = t.callback.take().unwrap();
                                         drop(guard);
-                                        result = cb.call();
+                                        result = cb();
                                         continue;
                                     }
                                 } else {

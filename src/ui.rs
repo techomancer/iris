@@ -1305,9 +1305,8 @@ impl Ui {
             timer_manager.add_recurring(
                 Instant::now() + Duration::from_millis(10),
                 Duration::from_millis(10),
-                (ps2, delta),
-                |(ps2, delta)| {
-                    Self::flush_mouse_delta(ps2, delta, true);
+                move || {
+                    Self::flush_mouse_delta(&ps2, &delta, true);
                     TimerReturn::Continue
                 },
             );

@@ -1996,8 +1996,8 @@ impl MipsCore {
             );
             self.timer_id = Some(tm.add_one_shot(
                 std::time::Duration::from_nanos(ns),
-                (irq, fasttick, wrap, ticket, seq_ref, cpu),
-                |(irq, fasttick, wrap, ticket, seq_ref, cpu)| {
+                move || {
+                    let irq = &irq; // capture the Send wrapper, not its raw pointer field
                     // SAFETY: points into the MipsCore owned by the executor's
                     // top-level Arc<Mutex<..>>, which outlives the armed timer
                     // (Drop for MipsCore removes it). Same contract as
@@ -2007,11 +2007,11 @@ impl MipsCore {
                     // Compare write since this one-shot was scheduled has
                     // already issued a new ticket, so this claim fails and the
                     // interrupt the guest just acked is not re-asserted.
-                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick, *cpu);
+                    let won = claim_ip7(&seq_ref, ticket, irq_ref, &fasttick, cpu);
                     if !won {
                         return crate::hptimer::TimerReturn::Delete;
                     }
-                    crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
+                    crate::hptimer::TimerReturn::RescheduleOneShot(wrap)
                 },
             ));
         }
