@@ -347,7 +347,6 @@ impl Device for HeadCommands {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { self.rex.is_running() }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         self.rex.register_commands().into_iter()

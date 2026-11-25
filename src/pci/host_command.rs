@@ -28,7 +28,6 @@ impl Device for PciHostCommands {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("pci".to_string(), "PCI hosts: pci status | pci config <slot>".to_string())]

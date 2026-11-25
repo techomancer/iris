@@ -424,7 +424,6 @@ impl crate::traits::Device for MaceSerialDma {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("sdma".to_string(), "MACE serial DMA: sdma status".to_string())]

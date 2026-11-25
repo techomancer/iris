@@ -1510,7 +1510,6 @@ impl Device for Hpc3 {
         self.seeq.start();
     }
     fn is_running(&self) -> bool { self.ioc.is_running() }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn audio_report(&self) -> Option<String> {
         self.hal2.as_ref().and_then(|hal2| hal2.audio_report())

@@ -821,10 +821,6 @@ impl PciFunction for Nvme {
 impl Device for Nvme {
     fn step(&self, _cycles: u64) {}
 
-    fn get_clock(&self) -> u64 {
-        0
-    }
-
     /// Stop the worker; a command it is running finishes first, so a
     /// snapshot sees none half done. Commands run inline until `start`.
     fn stop(&self) {

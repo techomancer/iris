@@ -1446,10 +1446,6 @@ impl Device for ImpactXio {
     fn is_running(&self) -> bool {
         self.mgras.is_running()
     }
-
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 impl Resettable for ImpactXio {

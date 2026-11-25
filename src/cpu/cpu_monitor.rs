@@ -141,9 +141,6 @@ impl Device for CpuMonitor {
     fn is_running(&self) -> bool {
         self.cpus.iter().any(|c| c.clone().as_device().is_running())
     }
-    fn get_clock(&self) -> u64 {
-        self.cpus[0].clone().as_device().get_clock()
-    }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let mut c = self.cpus[0].monitor_commands();

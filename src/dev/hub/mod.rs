@@ -686,9 +686,6 @@ impl Device for Hub {
     fn is_running(&self) -> bool {
         self.pi.is_running()
     }
-    fn get_clock(&self) -> u64 {
-        self.pi.rt_count()
-    }
 }
 
 #[cfg(test)]

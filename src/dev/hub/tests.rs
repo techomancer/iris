@@ -630,7 +630,7 @@ fn the_hub_is_a_device_whose_counter_is_its_clock() {
     hub.start();
     assert!(hub.is_running());
     clock.step(800 * 1234);
-    assert_eq!(hub.get_clock(), 1234);
+    assert_eq!(hub.pi.rt_count(), 1234);
     hub.step(1);
     hub.stop();
     assert!(!hub.is_running());

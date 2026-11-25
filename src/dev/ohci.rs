@@ -568,9 +568,6 @@ impl Device for Ohci {
         self.running.load(Ordering::Acquire)
     }
     fn step(&self, _: u64) {}
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 #[cfg(test)]

@@ -278,7 +278,6 @@ impl Device for MaceRtc {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("rtc".to_string(), "DS1687 RTC: rtc status | rtc dump | rtc r <reg> | rtc w <reg> <val>".to_string())]

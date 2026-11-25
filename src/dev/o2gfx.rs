@@ -3582,7 +3582,6 @@ impl crate::traits::Device for Gbe {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("gbe".to_string(), "GBE display engine: gbe status | gbe trace <file> [re,cpu,gbe,crime,irq|all] | gbe trace off|flush".to_string())]
@@ -3624,7 +3623,6 @@ impl crate::traits::Device for CrimeRe {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("re".to_string(), "CRIME rendering engine: re status | re notes | re dither [on|off] | re trace <file> [re,cpu,gbe,crime,irq|all] | re trace off|flush | re rec <file>|off".to_string())]

@@ -775,9 +775,6 @@ impl Device for Origin2000Module {
     fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Acquire)
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 impl Resettable for Origin2000Module {

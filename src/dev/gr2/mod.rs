@@ -1287,10 +1287,6 @@ impl Device for Gr2 {
         self.running.load(Ordering::Relaxed)
     }
 
-    fn get_clock(&self) -> u64 {
-        0
-    }
-
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
             ("gr2".into(), "GR2 graphics: status|hq|ge|shram|ucode|vc1|xmap|clut|dac|pix|trace (gr2 help)".into()),

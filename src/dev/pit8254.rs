@@ -459,7 +459,6 @@ impl Device for Pit8254 {
     }
 
     fn is_running(&self) -> bool { self.running.load(Ordering::Acquire) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("pit".to_string(), "PIT commands: pit status | pit debug <on|off> [DEV]".to_string())]

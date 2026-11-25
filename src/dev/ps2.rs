@@ -1143,7 +1143,6 @@ impl Device for Ps2Controller {
     fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
     fn start(&self) { self.running.store(true, Ordering::Relaxed); }
     fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 esc | ps2 key <shift|ctrl|alt> <down|up> | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]

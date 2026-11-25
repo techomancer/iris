@@ -420,7 +420,6 @@ mod tests {
         fn stop(&self) {}
         fn start(&self) {}
         fn is_running(&self) -> bool { false }
-        fn get_clock(&self) -> u64 { 0 }
         fn register_commands(&self) -> Vec<(String, String)> {
             vec![("ping".to_string(), "ping status".to_string())]
         }
@@ -445,7 +444,6 @@ mod tests {
             fn stop(&self) {}
             fn start(&self) {}
             fn is_running(&self) -> bool { true }
-            fn get_clock(&self) -> u64 { 0 }
             fn register_commands(&self) -> Vec<(String, String)> { vec![("say".into(), "say".into())] }
             fn execute_command(&self, _: &str, _: &[&str], mut w: Box<dyn Write + Send>) -> Result<(), String> {
                 writeln!(w, "{}", self.0).map_err(|e| e.to_string())
@@ -476,7 +474,6 @@ mod tests {
         fn stop(&self) {}
         fn start(&self) {}
         fn is_running(&self) -> bool { true }
-        fn get_clock(&self) -> u64 { 0 }
         fn audio_report(&self) -> Option<String> { Some(format!("audio: {}\n", self.0)) }
         fn audio_frames(&self) -> Option<u64> { Some(self.0.len() as u64) }
         fn register_commands(&self) -> Vec<(String, String)> {
@@ -591,7 +588,6 @@ mod tests {
         fn stop(&self) {}
         fn start(&self) {}
         fn is_running(&self) -> bool { false }
-        fn get_clock(&self) -> u64 { 0 }
         fn register_commands(&self) -> Vec<(String, String)> {
             vec![("count".to_string(), "count".to_string())]
         }

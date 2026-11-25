@@ -487,9 +487,6 @@ impl Device for Timekeeper {
     fn is_running(&self) -> bool {
         false
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
     fn stop(&self) {
         if let Err(e) = self.flush_nvram() {
             log::error!("Timekeeper: saving failed: {e}");

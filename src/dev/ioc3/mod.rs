@@ -1215,10 +1215,6 @@ impl Device for Ioc3 {
     fn is_running(&self) -> bool {
         self.sh.running.load(Ordering::SeqCst)
     }
-
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 impl Resettable for Ioc3 {

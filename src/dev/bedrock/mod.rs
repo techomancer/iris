@@ -574,9 +574,6 @@ impl Device for Bedrock {
     fn is_running(&self) -> bool {
         self.pi[0].is_running()
     }
-    fn get_clock(&self) -> u64 {
-        self.pi[0].count(&self.clock)
-    }
 }
 
 impl Resettable for Bedrock {

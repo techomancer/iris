@@ -196,9 +196,6 @@ impl crate::traits::Device for MaceId {
     fn is_running(&self) -> bool {
         true
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("onewire".to_string(), "MACE identity line: onewire status".to_string())]

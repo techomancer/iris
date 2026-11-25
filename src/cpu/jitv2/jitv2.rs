@@ -6427,7 +6427,6 @@ mod tests {
         }
         fn start(&self) {}
         fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
-        fn get_clock(&self) -> u64 { 0 }
     }
 
     /// A worker retires an arena and asks the CPU to pass a batch boundary;
@@ -6563,7 +6562,6 @@ mod tests {
         fn stop(&self) {}
         fn start(&self) {}
         fn is_running(&self) -> bool { true }
-        fn get_clock(&self) -> u64 { 0 }
     }
 
     /// Every word decodes as `ADDIU r1, r0, 1` — a real, compilable

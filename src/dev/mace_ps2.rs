@@ -337,7 +337,6 @@ impl Device for MacePs2 {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let mut c = vec![("maceps2".to_string(), "MACE PS/2 ports: maceps2 status | maceps2 traffic".to_string())];

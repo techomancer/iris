@@ -1405,7 +1405,6 @@ impl Device for Vino {
     fn stop(&self) { Vino::stop(self); }
     fn start(&self) { Vino::start(self); }
     fn is_running(&self) -> bool { self.running.load(std::sync::atomic::Ordering::Relaxed) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![(

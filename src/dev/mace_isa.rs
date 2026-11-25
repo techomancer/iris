@@ -190,7 +190,6 @@ impl Device for MaceIsa {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("isa".to_string(), "MACE ISA interrupts: isa status".to_string())]
