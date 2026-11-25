@@ -34,7 +34,7 @@ read and no wake, so each receive thread parks for `RX_IDLE` (2 ms) between
 polls. That bounds input latency and costs a wakeup per port.
 
 **How to apply.** For a new Octane device, build a `Timer`, arm it with
-`arm_at` and reuse the catch-up that register accesses already run. Add a thread only for
+`set_due` and reuse the catch-up that register accesses already run. Add a thread only for
 something that blocks or takes milliseconds, and join it in `stop` so nothing
 touches guest memory or the interrupt line after the machine stops. Do not run
 slow host work, file or SCSI, on the timer thread or the CPU thread. If

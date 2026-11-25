@@ -836,7 +836,7 @@ impl Inner {
         if let Some(id) = s.audio_timer.take() {
             self.timers.remove(id);
         }
-        self.status.cancel();
+        self.status.set_due(None);
         *s = State::new(now, self.ust_free_running);
         s.status_gen = gen;
     }
@@ -1117,7 +1117,7 @@ impl Inner {
 
     fn cancel_status(&self, s: &mut State) {
         s.status_due = None;
-        self.status.cancel();
+        self.status.set_due(None);
     }
 
     fn status_base(s: &State) -> u64 {
@@ -1164,7 +1164,7 @@ impl Inner {
         // The timer counts machine time; the card's clock is that less the time held back.
         let due = (Self::status_deadline(s, s.status_done + 1) + self.stalled_ns.load(Ordering::SeqCst)).max(0) as u64;
         s.status_due = Some(due);
-        self.status.arm_at(due);
+        self.status.set_due(Some(due));
     }
 
     /// The status timer fired: complete one slot and arm the next. A fire for
@@ -1667,7 +1667,7 @@ impl Saveable for Rad1 {
             }
             *s = loaded;
             // Starting the card arms the schedule it loaded.
-            i.status.cancel();
+            i.status.set_due(None);
         }
         // The clock reads `saved_now` again, with the same time held back
         // for timer hold-ups, which later on-time completions repay; and

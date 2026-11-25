@@ -557,7 +557,7 @@ impl Device for Ohci {
         self.sync_clock();
         self.running.store(false, Ordering::Release);
         self.anchor.store(u64::MAX, Ordering::Release);
-        self.timer.cancel();
+        self.timer.set_due(None);
         self.timer.stop();
         // A frame another thread is running finishes before stop returns.
         while self.busy.load(Ordering::Acquire) {

@@ -41,7 +41,7 @@ machine time.
 
 - Build it in the constructor: `Timer::new(&tm, &me, callback)`, with `me` the
   `Weak` from `Arc::new_cyclic`. The callback is `Fn(&Device, due)`.
-- Set it with `arm_at(when)`, `set_due(Option)` or `cancel()`. These are safe
+- Set it with `set_due(Option)`; `None` forgets the deadline. It is safe
   before `start`; the deadline waits.
 - `Device::start` calls `Timer::start`, `Device::stop` calls `Timer::stop`.
   `stop` removes the host timer, keeps the deadline (a save sees it, `start`

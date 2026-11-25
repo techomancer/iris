@@ -295,17 +295,8 @@ impl Timer {
         Self(inner)
     }
 
-    /// Arm, or re-arm, for absolute machine time `when`.
-    pub fn arm_at(&self, when: u64) {
-        self.set_due(Some(when));
-    }
-
-    /// Forget the deadline. A callback already running is not waited for.
-    pub fn cancel(&self) {
-        self.set_due(None);
-    }
-
-    /// `arm_at` for `Some`, `cancel` for `None`.
+    /// Arm, or re-arm, for absolute machine time `Some(when)`; `None` forgets the
+    /// deadline, and a callback already running is not waited for.
     pub fn set_due(&self, due: Option<u64>) {
         if self.0.due_word.load(Ordering::Relaxed) == crate::clock::encode(due) {
             return;
@@ -337,7 +328,7 @@ impl Timer {
         self.0.clock.now()
     }
 
-    /// From `Device::start`: arm the deadline `stop` kept or `arm_at` set.
+    /// From `Device::start`: arm the deadline `stop` kept or `set_due` set.
     pub fn start(&self) {
         let mut st = self.0.state.lock();
         st.running = true;
@@ -831,7 +822,7 @@ mod timer_tests {
                 d.fired.lock().push(due);
                 if d.rearm.load(Ordering::SeqCst) > 0 {
                     d.rearm.fetch_sub(1, Ordering::SeqCst);
-                    d.timer.arm_at(due + 10);
+                    d.timer.set_due(Some(due + 10));
                 }
             }),
             fired: Mutex::new(Vec::new()),
@@ -848,7 +839,7 @@ mod timer_tests {
     fn a_timer_fires_once_when_the_machine_clock_reaches_it() {
         let (d, clock) = dev();
         d.timer.start();
-        d.timer.arm_at(1_000);
+        d.timer.set_due(Some(1_000));
         assert!(fired(&d).is_empty(), "the host timer ran ahead of the stepped clock");
         clock.step(1_000);
         assert_eq!(fired(&d), [1_000]);
@@ -859,12 +850,12 @@ mod timer_tests {
     fn a_replaced_or_cancelled_deadline_does_not_fire() {
         let (d, clock) = dev();
         d.timer.start();
-        d.timer.arm_at(1_000_000);
-        d.timer.arm_at(50);
+        d.timer.set_due(Some(1_000_000));
+        d.timer.set_due(Some(50));
         clock.step(50);
         assert_eq!(fired(&d), [50]);
-        d.timer.arm_at(60);
-        d.timer.cancel();
+        d.timer.set_due(Some(60));
+        d.timer.set_due(None);
         clock.step(1_000);
         assert_eq!(fired(&d), [50]);
     }
@@ -872,13 +863,13 @@ mod timer_tests {
     #[test]
     fn stop_keeps_the_deadline_and_start_arms_it() {
         let (d, clock) = dev();
-        d.timer.arm_at(10);
+        d.timer.set_due(Some(10));
         clock.step(10);
         assert!(fired(&d).is_empty(), "a timer never started stays quiet");
         d.timer.start();
         clock.tm.run_due();
         assert_eq!(fired(&d), [10]);
-        d.timer.arm_at(30);
+        d.timer.set_due(Some(30));
         d.timer.stop();
         clock.step(100);
         assert_eq!(d.timer.due(), Some(30));
@@ -893,7 +884,7 @@ mod timer_tests {
         let (d, clock) = dev();
         d.rearm.store(2, Ordering::SeqCst);
         d.timer.start();
-        d.timer.arm_at(5);
+        d.timer.set_due(Some(5));
         clock.step(100);
         assert_eq!(fired(&d), [5, 15, 25]);
         assert!(!d.timer.is_armed());
@@ -903,33 +894,33 @@ mod timer_tests {
     fn a_deadline_that_did_not_move_or_moved_later_keeps_its_host_timer() {
         let (d, clock) = dev();
         d.timer.start();
-        d.timer.arm_at(1_000);
+        d.timer.set_due(Some(1_000));
         let id = d.timer.0.state.lock().id;
         assert!(id.is_some());
-        d.timer.arm_at(1_000);
+        d.timer.set_due(Some(1_000));
         assert_eq!(d.timer.0.state.lock().id, id);
-        d.timer.arm_at(5_000);
+        d.timer.set_due(Some(5_000));
         assert_eq!(d.timer.0.state.lock().id, id);
         clock.step(1_000);
         assert!(fired(&d).is_empty(), "fired at the deadline it moved away from");
         clock.step(4_000);
         assert_eq!(fired(&d), [5_000]);
-        d.timer.arm_at(9_000);
+        d.timer.set_due(Some(9_000));
         let id = d.timer.0.state.lock().id;
-        d.timer.arm_at(6_000);
+        d.timer.set_due(Some(6_000));
         assert_ne!(d.timer.0.state.lock().id, id);
     }
 
     #[test]
     fn a_repeated_deadline_does_not_take_the_lock() {
         let (d, _clock) = dev();
-        d.timer.arm_at(1_000);
+        d.timer.set_due(Some(1_000));
         let held = d.timer.0.state.lock();
         let done = Arc::new(AtomicBool::new(false));
         let t = {
             let (d, done) = (d.clone(), done.clone());
             thread::spawn(move || {
-                d.timer.arm_at(1_000);
+                d.timer.set_due(Some(1_000));
                 done.store(true, Ordering::SeqCst);
             })
         };

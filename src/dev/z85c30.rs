@@ -407,7 +407,7 @@ impl Tx {
         }
         let start = if follows { ch.tx_clock } else { ch.tx_clock.max(self.timer.now()) };
         ch.tx_clock = start + ch.tx_delay * 1000;
-        self.timer.arm_at(ch.tx_clock);
+        self.timer.set_due(Some(ch.tx_clock));
     }
 
     /// The character's time is up: send it, tell the driver, start the next.
@@ -799,7 +799,7 @@ impl Resettable for Z85c30 {
     fn power_on(&self) {
         for (ch, t) in [(&self.channel_a, &self.tx[0]), (&self.channel_b, &self.tx[1])] {
             ch.lock().reset();
-            t.timer.cancel();
+            t.timer.set_due(None);
         }
     }
 }
@@ -847,11 +847,11 @@ impl Saveable for Z85c30 {
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         if let Some(ca) = get_field(v, "ch_a") {
             channel_from_toml(ca, &mut self.channel_a.lock());
-            self.tx[0].timer.cancel();
+            self.tx[0].timer.set_due(None);
         }
         if let Some(cb) = get_field(v, "ch_b") {
             channel_from_toml(cb, &mut self.channel_b.lock());
-            self.tx[1].timer.cancel();
+            self.tx[1].timer.set_due(None);
         }
         Ok(())
     }
