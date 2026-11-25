@@ -1449,7 +1449,6 @@ pub struct Rex3 {
     pub cmap0: Mutex<Cmap>,
     pub cmap1: Mutex<Cmap>,
     pub bt445: Mutex<Bt445>,
-    clock: AtomicU64,
     /// Which head of a dual-head machine this board is: 1 names its thread,
     /// locks and monitor commands apart from the first board's.
     head_index: std::sync::atomic::AtomicU8,
@@ -1668,7 +1667,6 @@ impl Rex3 {
             cmap0: Mutex::new(Cmap::new(0)),
             cmap1: Mutex::new(Cmap::new(1)),
             bt445: Mutex::new(Bt445::new()),
-            clock: AtomicU64::new(0),
             head_index: std::sync::atomic::AtomicU8::new(0),
             running: AtomicBool::new(false),
             gfxbusy: Arc::new(AtomicBool::new(false)),
@@ -4531,9 +4529,7 @@ impl Rex3 {
 }
 
 impl Device for Rex3 {
-    fn step(&self, cycles: u64) {
-        self.clock.fetch_add(cycles, Ordering::Relaxed);
-    }
+    fn step(&self, _cycles: u64) {}
 
     fn stop(&self) {
         #[cfg(feature = "wgpu")]
@@ -4717,10 +4713,6 @@ impl Device for Rex3 {
 
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
-    }
-
-    fn get_clock(&self) -> u64 {
-        self.clock.load(Ordering::Relaxed)
     }
 
     fn register_commands(&self) -> Vec<(String, String)> {

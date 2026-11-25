@@ -152,7 +152,7 @@ pub trait BusDevice: Send + Sync {
 
 pub trait Device: Send + Sync {
     fn start(&self); fn stop(&self); fn is_running(&self) -> bool;
-    fn step(&self, cycles: u64); fn get_clock(&self) -> u64;
+    fn step(&self, cycles: u64);
     fn signal(&self, signal: Signal) {}
     fn register_commands(&self) -> Vec<(String, String)> { vec![] } // monitor commands
     fn execute_command(&self, cmd: &str, args: &[&str], w: Box<dyn Write + Send>) -> Result<(), String> { .. }

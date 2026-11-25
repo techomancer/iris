@@ -435,9 +435,6 @@ impl Device for Flash {
     fn is_running(&self) -> bool {
         false
     }
-    fn get_clock(&self) -> u64 {
-        self.timers[0].now()
-    }
 }
 
 pub struct FlashView {

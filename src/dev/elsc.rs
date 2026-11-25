@@ -2386,9 +2386,6 @@ impl Device for Elsc {
     fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 impl I2cTarget for Elsc {

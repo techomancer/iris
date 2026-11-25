@@ -14,7 +14,6 @@ use parking_lot::Mutex;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device};
 
 struct TimerInner {
-    clock: u64,
     running: bool,
     counter: u32,
     target: u32,
@@ -32,7 +31,6 @@ impl Timer {
     pub fn new() -> Self {
         Timer {
             inner: Arc::new(Mutex::new(TimerInner {
-                clock: 0,
                 running: false,
                 counter: 0,
                 target: 0,
@@ -51,7 +49,6 @@ impl Device for Timer {
     fn step(&self, cycles: u64) {
         let mut inner = self.inner.lock();
         if inner.running {
-            inner.clock += cycles;
             inner.counter = inner.counter.wrapping_add(cycles as u32);
         }
     }
@@ -66,10 +63,6 @@ impl Device for Timer {
 
     fn is_running(&self) -> bool {
         self.inner.lock().running
-    }
-
-    fn get_clock(&self) -> u64 {
-        self.inner.lock().clock
     }
 }
 

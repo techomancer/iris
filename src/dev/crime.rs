@@ -381,7 +381,6 @@ impl Device for Crime {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [on|off|n] | crime touched | crime trace <file> [re,cpu,gbe,crime,irq|all] | crime trace off|flush".to_string())]

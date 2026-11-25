@@ -224,9 +224,6 @@ impl Device for VirtioMmio {
     fn is_running(&self) -> bool {
         self.core.is_running()
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 impl Resettable for VirtioMmio {

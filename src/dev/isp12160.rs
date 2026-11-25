@@ -258,7 +258,6 @@ impl Device for Isp12160 {
     fn start(&self) { Device::start(&self.0) }
     fn stop(&self) { Device::stop(&self.0) }
     fn is_running(&self) -> bool { Device::is_running(&self.0) }
-    fn get_clock(&self) -> u64 { Device::get_clock(&self.0) }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let usage = crate::scsi_monitor::SCSI_USAGE;

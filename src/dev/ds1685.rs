@@ -422,10 +422,6 @@ impl Device for Ds1685 {
     fn is_running(&self) -> bool {
         self.slot.running.load(Ordering::SeqCst)
     }
-
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 impl Drop for Ds1685 {

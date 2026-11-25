@@ -2057,7 +2057,6 @@ impl<P: IspPart> crate::traits::Device for Isp<P> {
     fn stop(&self) { self.stop_ring() }
     fn start(&self) { self.start_ring() }
     fn is_running(&self) -> bool { self.worker.lock().is_some() }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let usage = crate::scsi_monitor::SCSI_USAGE;

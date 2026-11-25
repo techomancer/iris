@@ -1427,7 +1427,6 @@ impl Device for Rad1 {
     fn start(&self) { self.inner.resume() }
     fn stop(&self) { self.inner.pause() }
     fn is_running(&self) -> bool { self.inner.armed.load(Ordering::SeqCst) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn audio_frames(&self) -> Option<u64> {
         Some(self.inner.meter.total())

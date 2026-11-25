@@ -394,9 +394,6 @@ impl Device for Marker {
     fn is_running(&self) -> bool {
         false
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 /// A machine starts its board's devices in order and stops them in reverse: markers before and

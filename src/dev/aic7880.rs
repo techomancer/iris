@@ -724,7 +724,6 @@ impl crate::traits::Device for Aic7880 {
     }
 
     fn is_running(&self) -> bool { self.running.load(Ordering::Acquire) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let usage = crate::scsi_monitor::SCSI_USAGE;

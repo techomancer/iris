@@ -357,10 +357,6 @@ impl Device for Odyssey {
     fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
     }
-
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 impl Drop for Odyssey {

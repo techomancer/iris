@@ -1133,8 +1133,6 @@ impl Device for Hal2 {
         self.running.load(Ordering::Acquire)
     }
 
-    fn get_clock(&self) -> u64 { 0 }
-
     /// `audio status`: codec A is the only output counted. Its rate is the
     /// guest's while its timer runs.
     fn audio_frames(&self) -> Option<u64> {

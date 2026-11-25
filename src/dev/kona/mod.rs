@@ -852,10 +852,6 @@ impl Device for Kona {
         self.shared.running.load(SeqCst)
     }
 
-    fn get_clock(&self) -> u64 {
-        0
-    }
-
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("kona".into(), "InfiniteReality pipe: status|counters|hash|pix X Y|shot FILE.png (kona help)".into())]
     }

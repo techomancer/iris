@@ -589,7 +589,6 @@ pub trait Device: Send + Sync {
     fn stop(&self);
     fn start(&self);
     fn is_running(&self) -> bool;
-    fn get_clock(&self) -> u64;
 
     fn signal(&self, _signal: Signal) {}
 

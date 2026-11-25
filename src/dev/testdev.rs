@@ -494,7 +494,6 @@ impl Device for TestDevice {
     fn stop(&self) { self.running.store(false, Ordering::Relaxed); }
     fn start(&self) { self.running.store(true, Ordering::Relaxed); }
     fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("testdev".to_string(), "Test device status: testdev".to_string())]

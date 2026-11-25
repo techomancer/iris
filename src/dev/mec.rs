@@ -758,7 +758,6 @@ impl crate::traits::Device for Mec {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("mec".to_string(), "MACE Ethernet: mec status".to_string())]

@@ -413,10 +413,6 @@ impl Device for L1 {
         self.running.load(Ordering::Acquire)
     }
 
-    fn get_clock(&self) -> u64 {
-        0
-    }
-
     fn step(&self, _cycles: u64) {}
 }
 impl Drop for L1 {

@@ -391,7 +391,6 @@ impl Device for Ds1x86 {
     }
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("rtc".to_string(), "RTC commands: rtc status | rtc save [file] | rtc debug <on|off> | rtc dump | rtc r <offset> | rtc w <offset> <val> [DEV]".to_string())]

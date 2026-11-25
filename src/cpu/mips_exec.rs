@@ -11737,10 +11737,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
     fn is_running(&self) -> bool { 
         self.running.load(Ordering::SeqCst) 
     }
-    
-    fn get_clock(&self) -> u64 {
-        self.cycles_ptr.get()
-    }
 
     fn signal(&self, signal: Signal) {
         // Safety: interrupts_ptr points into the executor's MipsCore, which

@@ -268,9 +268,6 @@ impl Device for NodeFlash {
     fn is_running(&self) -> bool {
         false
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 }
 
 struct Chip(Arc<NodeFlash>);

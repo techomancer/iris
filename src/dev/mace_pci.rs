@@ -370,7 +370,6 @@ impl crate::traits::Device for MacePci {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 }
 
 #[cfg(test)]

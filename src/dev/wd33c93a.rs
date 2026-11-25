@@ -957,7 +957,6 @@ impl Device for Wd33c93a {
         }).unwrap());
     }
     fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![

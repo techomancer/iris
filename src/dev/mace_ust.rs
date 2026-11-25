@@ -152,7 +152,6 @@ impl Device for MaceUst {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("ust".to_string(), "MACE UST: ust status".to_string())]

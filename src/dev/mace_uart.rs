@@ -171,7 +171,6 @@ impl Device for MaceUart {
     fn stop(&self) { self.timer.stop(); }
     fn start(&self) { self.timer.start(); }
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![(self.name.to_string(), format!("16550 UART: {0} status | {0} output [bytes] | {0} type <text>", self.name))]

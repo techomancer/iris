@@ -748,9 +748,6 @@ impl crate::traits::Device for Heart {
     fn is_running(&self) -> bool {
         true
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("heart".into(), "HEART: heart [status|unsupported]".into())]

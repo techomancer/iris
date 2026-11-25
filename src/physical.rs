@@ -332,8 +332,6 @@ pub struct Physical {
     error_bus: ErrorBus,
 
     trace: AtomicBool,
-    start_tick: u64,
-    host_freq: u64,
 }
 
 // Safety: the table's pointers point at devices this bus or its machine keeps
@@ -360,9 +358,6 @@ impl Physical {
     /// [`Self::with_window`] whose region bitmap counts `1 << shift` byte
     /// regions, as `PpMemSpace::over_window_regions`.
     pub fn with_window_regions(banks: Vec<RamBank>, window: u64, shift: u32) -> Arc<Self> {
-        let host_freq = crate::platform::get_host_tick_frequency();
-        let start_tick = crate::platform::get_host_ticks();
-
         let devmap = SparseDeviceMap::new().unwrap_or_else(|e| {
             panic!("iris: cannot reserve the physical address decode table: {e}")
         });
@@ -408,8 +403,6 @@ impl Physical {
             black_hole: BlackHoleRegion::new(),
             error_bus: ErrorBus::new(),
             trace: AtomicBool::new(false),
-            start_tick,
-            host_freq,
         })
     }
 
@@ -806,9 +799,7 @@ impl Physical {
 }
 
 impl Device for Physical {
-    fn step(&self, _cycles: u64) {
-        // Timers are now updated on read/write based on host clock
-    }
+    fn step(&self, _cycles: u64) {}
 
     fn stop(&self) {
     }
@@ -818,12 +809,6 @@ impl Device for Physical {
 
     fn is_running(&self) -> bool {
         true
-    }
-
-    fn get_clock(&self) -> u64 {
-        let now = crate::platform::get_host_ticks();
-        let diff = now.saturating_sub(self.start_tick);
-        ((diff as u128 * 50_000_000) / (self.host_freq as u128)) as u64
     }
 
     fn register_commands(&self) -> Vec<(String, String)> {

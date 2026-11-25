@@ -835,7 +835,6 @@ impl crate::traits::Device for Ip32Bus {
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         self.devices().iter().flat_map(|d| d.register_commands()).collect()

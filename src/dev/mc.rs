@@ -1098,7 +1098,6 @@ impl Device for MemoryController {
         }).unwrap());
     }
     fn is_running(&self) -> bool { true }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![

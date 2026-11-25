@@ -242,7 +242,6 @@ impl Ultra64 {
 impl Device for Ultra64 {
     fn step(&self, _cycles: u64) {}
     fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) {

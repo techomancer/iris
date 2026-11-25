@@ -784,7 +784,6 @@ impl Device for Ioc {
         self.ps2.start();
     }
     fn is_running(&self) -> bool { self.scc.is_running() }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let mut cmds = vec![("ioc".to_string(), "IOC commands: ioc status | ioc ticks (8254 timer service: fired/acked/merged, fire-to-ack waits; each call starts a new window)".to_string())];

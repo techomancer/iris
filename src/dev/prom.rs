@@ -11,7 +11,6 @@ const PROM_SIZE: u64 = 1024 * 1024; // 1MB
 
 struct PromInner {
     data: Vec<u32>,
-    clock: AtomicU64,
     running: AtomicBool,
     /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): "rom device points all generation
     /// pointers to single u64 initialized to 0" — ROM content never mutates, so every
@@ -53,7 +52,6 @@ impl Prom {
         Prom {
             inner: Arc::new(PromInner {
                 data,
-                clock: AtomicU64::new(0),
                 running: AtomicBool::new(false),
                 #[cfg(feature = "jitv2")]
                 gen: AtomicU64::new(0),
@@ -71,9 +69,7 @@ impl Prom {
 }
 
 impl Device for Prom {
-    fn step(&self, _cycles: u64) {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
-    }
+    fn step(&self, _cycles: u64) {}
 
     fn stop(&self) {
         self.inner.running.store(false, Ordering::SeqCst);
@@ -86,16 +82,10 @@ impl Device for Prom {
     fn is_running(&self) -> bool {
         self.inner.running.load(Ordering::SeqCst)
     }
-
-    fn get_clock(&self) -> u64 {
-        self.inner.clock.load(Ordering::Relaxed)
-    }
 }
 
 impl BusDevice for PromPort {
     fn read8(&self, addr: u64) -> BusRead8 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
-
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
             return BusRead8::ok(0xFF);
         }
@@ -114,13 +104,10 @@ impl BusDevice for PromPort {
     }
 
     fn write8(&self, _addr: u64, _val: u8) -> u32 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 
     fn read16(&self, addr: u64) -> BusRead16 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
-
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
             return BusRead16::ok(0xFFFF);
         }
@@ -139,13 +126,10 @@ impl BusDevice for PromPort {
     }
 
     fn write16(&self, _addr: u64, _val: u16) -> u32 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 
     fn read32(&self, addr: u64) -> BusRead32 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
-
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
             return BusRead32::ok(0xFFFFFFFF);
         }
@@ -161,13 +145,10 @@ impl BusDevice for PromPort {
     }
 
     fn write32(&self, _addr: u64, _val: u32) -> u32 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 
     fn read64(&self, addr: u64) -> BusRead64 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
-
         // Read two consecutive 32-bit words
         let high = { let _r = self.read32(addr); if _r.is_ok() { _r.data as u64 } else { 0xFFFFFFFF } };
         let low = { let _r = self.read32(addr + 4); if _r.is_ok() { _r.data as u64 } else { 0xFFFFFFFF } };
@@ -176,7 +157,6 @@ impl BusDevice for PromPort {
     }
 
     fn write64(&self, _addr: u64, _val: u64) -> u32 {
-        self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 

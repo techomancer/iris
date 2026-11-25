@@ -1827,9 +1827,6 @@ impl Device for Ice1724 {
     fn is_running(&self) -> bool {
         self.inner.armed.load(Ordering::SeqCst)
     }
-    fn get_clock(&self) -> u64 {
-        0
-    }
 
     fn audio_frames(&self) -> Option<u64> {
         // The engines keep their own counts; the meter only mirrors them for a report.

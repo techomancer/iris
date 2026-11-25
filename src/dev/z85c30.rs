@@ -748,7 +748,6 @@ impl Device for Z85c30 {
     }
 
     fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
-    fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("serial".to_string(), "serial status  — dump SCC channel A/B registers and FIFO state".to_string())]
