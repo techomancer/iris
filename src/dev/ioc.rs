@@ -6,7 +6,7 @@ use crate::traits::MachineEvents;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, toml_u8, hex_u8, toml_u16, hex_u16, toml_u32, hex_u32};
 use crate::dev::z85c30::Z85c30;
-use crate::dev::pit8254::{Pit8254, TimerCallback};
+use crate::dev::pit8254::Pit8254;
 use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
 use crate::dev::ps2::Ps2Controller;
 use crate::hptimer::TimerManager;
@@ -555,28 +555,25 @@ impl InterruptController for IocInputs {
     }
 }
 
-struct IocTimerCallback {
+/// One PIT channel's interrupt. The system and fast clocks both count into
+/// `ticks`, the status bar's rate (`Ioc::set_clock_ticks`).
+fn timer_tick(
     state: Arc<Mutex<IocState>>,
     source: IocInterrupt,
-    /// The status bar's clock-tick counter (see `Ioc::set_clock_ticks`).
     ticks: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
-}
-
-impl TimerCallback for IocTimerCallback {
-    fn callback(&self) {
-        // Both timers: the system clock and the fast clock. The rate they
-        // are measured against is their sum (`Ioc::set_clock_ticks`).
-        if let Some(t) = self.ticks.get() {
+) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        if let Some(t) = ticks.get() {
             t.fetch_add(1, Ordering::Relaxed);
         }
-        let mut state = self.state.lock();
-        match self.source {
+        let mut state = state.lock();
+        match source {
             IocInterrupt::Mappable0 => { state.ticks[0].fire(); state.map_stat |= 1 << 0 }
             IocInterrupt::Mappable1 => { state.ticks[1].fire(); state.map_stat |= 1 << 1 }
             _ => {}
         }
         state.update_interrupts();
-    }
+    })
 }
 
 /// Line `n` is the [`IocInterrupt`] numbered `n`, as through [`Ioc::irq_line`].
@@ -655,17 +652,8 @@ impl Ioc {
         let serial_irq = IrqLine::new(Arc::new(IocInputs(state.clone())), IocInterrupt::Serial.line());
 
         let clock_ticks = Arc::new(std::sync::OnceLock::new());
-        let timer0_cb = Arc::new(IocTimerCallback {
-            state: state.clone(),
-            source: IocInterrupt::Mappable0,
-            ticks: clock_ticks.clone(),
-        });
-
-        let timer1_cb = Arc::new(IocTimerCallback {
-            state: state.clone(),
-            source: IocInterrupt::Mappable1,
-            ticks: clock_ticks.clone(),
-        });
+        let timer0_cb = timer_tick(state.clone(), IocInterrupt::Mappable0, clock_ticks.clone());
+        let timer1_cb = timer_tick(state.clone(), IocInterrupt::Mappable1, clock_ticks.clone());
 
         let ps2_irq = IrqLine::new(Arc::new(IocInputs(state.clone())), IocInterrupt::KbMouse.line());
 
@@ -1434,12 +1422,12 @@ mod tests {
         let ioc = Ioc::new(&Arc::new(TimerManager::new()), false);
         let hz = Arc::new(AtomicU64::new(0));
         ioc.set_clock_ticks(hz.clone(), Arc::new(AtomicU64::new(0)));
-        let cb = |source| IocTimerCallback { state: ioc.state.clone(), source, ticks: ioc.clock_ticks.clone() };
+        let cb = |source| timer_tick(ioc.state.clone(), source, ioc.clock_ticks.clone());
         let (t0, t1) = (cb(IocInterrupt::Mappable0), cb(IocInterrupt::Mappable1));
 
-        t0.callback();
-        t1.callback();
-        t1.callback(); // lands on the pending one
+        t0();
+        t1();
+        t1(); // lands on the pending one
         assert_eq!(hz.load(Ordering::Relaxed), 3, "both timers count");
 
         let mut s = ioc.state.lock();

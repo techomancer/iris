@@ -7,10 +7,6 @@ use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16
 use crate::hptimer::{Timer, TimerManager};
 use std::io::Write;
 
-pub trait TimerCallback: Send + Sync {
-    fn callback(&self);
-}
-
 struct Channel {
     // Registers
     count: u16, // Current count value (simulated)
@@ -60,7 +56,7 @@ impl Channel {
 /// One counter and the deadline that ends its period. Lock order: `chan`, then the timer's state.
 struct Slot {
     chan: Mutex<Channel>,
-    callback: Option<Arc<dyn TimerCallback>>,
+    callback: Option<Arc<dyn Fn() + Send + Sync>>,
     debug: Arc<AtomicBool>,
     timer: Timer,
 }
@@ -84,7 +80,7 @@ impl Slot {
             println!("PIT: Channel {} expired", idx);
         }
         if let Some(cb) = &self.callback {
-            cb.callback();
+            cb();
         }
     }
 }
@@ -102,9 +98,9 @@ pub struct Pit8254 {
 }
 
 impl Pit8254 {
-    pub fn new(tm: &Arc<TimerManager>, base_frequency: u32, cb0: Option<Arc<dyn TimerCallback>>, cb1: Option<Arc<dyn TimerCallback>>, cb2: Option<Arc<dyn TimerCallback>>) -> Self {
+    pub fn new(tm: &Arc<TimerManager>, base_frequency: u32, cb0: Option<Arc<dyn Fn() + Send + Sync>>, cb1: Option<Arc<dyn Fn() + Send + Sync>>, cb2: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
         let debug = Arc::new(AtomicBool::new(false));
-        let slot = |idx: usize, callback: Option<Arc<dyn TimerCallback>>| {
+        let slot = |idx: usize, callback: Option<Arc<dyn Fn() + Send + Sync>>| {
             Arc::new_cyclic(|me| Slot {
                 chan: Mutex::new(Channel::new(callback.is_some())),
                 callback,
@@ -567,16 +563,16 @@ mod tests {
     // when the test suite runs with multiple threads.
     static SERIAL: Mutex<()> = Mutex::new(());
 
-    struct CountCallback(Arc<AtomicU32>);
-    impl TimerCallback for CountCallback {
-        fn callback(&self) { self.0.fetch_add(1, AOrdering::SeqCst); }
+    fn count_callback(n: &Arc<AtomicU32>) -> Arc<dyn Fn() + Send + Sync> {
+        let n = n.clone();
+        Arc::new(move || { n.fetch_add(1, AOrdering::SeqCst); })
     }
 
     fn make_pit(freq: u32) -> Pit8254 {
         Pit8254::new(&Arc::new(TimerManager::new()), freq, None, None, None)
     }
 
-    fn make_pit_cb(freq: u32, cb: Arc<dyn TimerCallback>) -> Pit8254 {
+    fn make_pit_cb(freq: u32, cb: Arc<dyn Fn() + Send + Sync>) -> Pit8254 {
         Pit8254::new(&Arc::new(TimerManager::new()), freq, None, None, Some(cb))
     }
 
@@ -616,7 +612,7 @@ mod tests {
         pit
     }
 
-    fn start_and_program_cb(freq: u32, reload: u16, cb: Arc<dyn TimerCallback>) -> Pit8254 {
+    fn start_and_program_cb(freq: u32, reload: u16, cb: Arc<dyn Fn() + Send + Sync>) -> Pit8254 {
         let pit = make_pit_cb(freq, cb);
         pit.start();
         program_mode2(&pit, 2, reload);
@@ -688,7 +684,7 @@ mod tests {
     fn an_interrupting_channel_follows_the_machine_clock() {
         let clock = crate::test_board::Stepped::new();
         let n = Arc::new(AtomicU32::new(0));
-        let pit = Pit8254::new(&clock.tm, 1_000_000, None, None, Some(Arc::new(CountCallback(n.clone()))));
+        let pit = Pit8254::new(&clock.tm, 1_000_000, None, None, Some(count_callback(&n)));
         pit.start();
         program_mode2(&pit, 2, 1000); // 1 ms
         clock.step(999_000);
@@ -791,7 +787,7 @@ mod tests {
     fn test_ch2_callback_rate() {
         let _lock = SERIAL.lock().unwrap();
         let counter = Arc::new(AtomicU32::new(0));
-        let cb = Arc::new(CountCallback(counter.clone())) as Arc<dyn TimerCallback>;
+        let cb = count_callback(&counter);
         let pit = start_and_program_cb(1_000_000, 1000, cb);
         thread::sleep(Duration::from_millis(100));
         pit.stop();
