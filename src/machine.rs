@@ -26,6 +26,9 @@ pub const CPUS: &[&Part] = &[&parts::R4400_150, &parts::R5000_180_EARLY];
 
 /// The IP28's.
 pub const IP28_CPUS: &[&Part] = &[&parts::R10000_195_EARLY];
+/// The IP28's SysClk divisor as R10000 Config.EC encodes it, and its value.
+const IP28_SYSCLK_EC: u32 = 7;
+const IP28_SYSCLK_DIV: u64 = 4;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
@@ -455,14 +458,20 @@ impl Machine {
         // IP28: IRIX takes the CPU speed from the PROM's `cpufreq` (194, i.e.
         // a 195 MHz R10000) instead of measuring it, and times with it: UST
         // assumes Count at half that, and the RPSS cycle counter the MC clock
-        // at the CPU clock (Config.EC is 0, a 1:1 system-clock ratio) over the
+        // at the CPU clock over the Config.EC system-clock divisor and the
         // divider it programs. The generic 33 MHz Count and 50 MHz MC made
         // UST run at a third of real time (Quake in slow motion) and the
         // cycle counter at a quarter.
+        //
+        // The board runs SysAD, and so the MC, at a quarter of the CPU clock
+        // (EC 7, 195 / 4 = 48.75 MHz). The PROM and IRIX also size the MC
+        // refresh preload (CTRLD) from EC; with EC 0, which the PROM's
+        // `system` command prints as "?", it came out four times too long and
+        // IRIX warned of an old PROM on every boot.
         let count_hz = cfg.clock.count_hz(cfg_cpu_model);
         if cfg.machine.profile.ip28() {
             // The R10000's Count ticks at half the pipeline clock.
-            mc.set_clock_hz(2 * count_hz);
+            mc.set_clock_hz(2 * count_hz / IP28_SYSCLK_DIV);
         }
 
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
@@ -846,6 +855,7 @@ impl Machine {
             virtio,
             virtio_9p,
             vino,
+            eisa: (!guinness).then(|| Arc::new(crate::dev::eisa::Eisa::new())),
             mc: mc.clone(),
             hpc3: hpc3.clone(),
             prom: prom_port,
@@ -921,12 +931,18 @@ impl Machine {
         //    family monomorphises its own CPU (`crate::cpu::build`) — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         let memory = Arc::new(crate::ip22_bus::memory_map(cfg.machine.profile.ip28()));
+        let cfg_ip28 = cfg.machine.profile.ip28();
         macro_rules! build_cpu { ($cache:ty) => {{
         let cfg = MipsCpuConfig::for_model::<$cache>(memory.clone()).with_prid(cfg_cpu_model.prid());
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
         // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
         executor.phys_mask = u32::MAX as u64;
+        if cfg_ip28 {
+            // R10000 Config.EC (bits 12:9), the SysClk divisor the mode
+            // word latches at reset: 7 is divide by 4.
+            executor.core.cp0_config |= IP28_SYSCLK_EC << 9;
+        }
 
         // Load default symbol maps if they exist
         {

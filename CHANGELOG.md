@@ -37,6 +37,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Sphere-mapped models that never set a texture coordinate (powerflip's
   Flowers models) now show their texture instead of drawing white.
 
+### Indigo2
+
+- IRIX on the R10000 Indigo2 no longer warns "Old IP28 prom installed --
+  memory refresh was incorrectly configured" at every boot, and the PROM's
+  `system` command shows a SysAD divisor of 4 instead of "?".
+- Indigo2s now have an EISA bus with every slot empty: `hinv` lists
+  "EISA bus: adapter 0". Indigo2s no longer show a VINO (an Indy-only chip).
+- `mc regs` lists the last 16 values written to CTRLD.
+
 ### GR2 (XZ and Extreme)
 
 - IRIS GL text drawn with a colour set after `cmov` now shows: SOFTIMAGE
