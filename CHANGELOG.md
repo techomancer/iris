@@ -29,6 +29,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   iris listens on), and `watch <command>` to keep any command's answer
   updating on one line.
 
+### GR2 (XZ and Extreme)
+
+- IRIS GL text drawn with a colour set after `cmov` now shows: SOFTIMAGE
+  2.66's dialog buttons and viewport titles were blank (issue 844).
+- Pixel DMA to XZ and Extreme boards runs about five times faster (an
+  image upload of 130 KB now takes about 5 ms). Slow uploads could outlast
+  IRIX's DMA timeout, and the kernel then reset the board or panicked (seen
+  with SOFTIMAGE while tracing).
+
 ### Newport on the GPU raster
 
 - Scrolling and other large screen-to-screen copies no longer stall the

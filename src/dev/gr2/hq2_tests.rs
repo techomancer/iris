@@ -1847,9 +1847,11 @@ fn iris_glyph16_at_cmov() {
     gl_setup_window(g);
     let fl = |v: f32| v.to_bits();
     for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
-    cmd(g, 0x6913, 0x0000_00ff);
+    cmd(g, 0x6913, 0x00ff_0000);
     for x in [40.0f32, 50.0, 0.0] { cmd(g, 0x866, fl(x)); }
-    cmd(g, 0x6913, 0x00ff_0000); // after cmov: glyphs keep the cmov colour
+    // After cmov: charstr draws in the colour current when it runs, not the
+    // one at the cmov (SOFTIMAGE sets its button label colour here).
+    cmd(g, 0x6913, 0x0000_00ff);
     // 3 rows (odd: padding first): top 0x8000, middle 0x4000, bottom 0xc000.
     let glyph = [0x0002_0003, 0x0000_0000, 0x0005_0000, 0xffff_0000, 0x8000_dead, 0xc000_4000, 0, 0, 0, 0, 0, 0, 0];
     for _ in 0..2 {
