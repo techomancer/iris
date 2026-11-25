@@ -736,7 +736,7 @@ impl Inner {
                 let Some(tm) = self.timers_live() else { return };
                 let me = self.me.clone();
                 let period = Duration::from_millis(PUMP_MS);
-                s.audio_timer = Some(tm.add_recurring(Instant::now() + period, period, (), move |_| {
+                s.audio_timer = Some(tm.add_recurring(Instant::now() + period, period, move || {
                     let Some(i) = me.upgrade() else { return TimerReturn::Delete };
                     i.pump()
                 }));
