@@ -456,7 +456,10 @@ pub struct GlState {
     vb_edge: [u32; VB],
     /// Character position (cmov): window x, y; 0 valid, 1 clipped.
     cpos: [i32; 3],
-    /// Colour latched by cmov for the characters drawn there.
+    /// Colour latched by the OpenGL raster position (0x105) for glBitmap.
+    /// IRIS GL characters are not latched: charstr draws in the colour
+    /// current when it runs, and programs set it after cmov (SOFTIMAGE's
+    /// button labels came out in the button's colour).
     cpos_color: [f32; 4],
     /// OpenGL raster position (window-relative, fractional), set by 0x105
     /// and advanced by glBitmap; validity is cpos\[2\].
@@ -1191,7 +1194,6 @@ impl Hq2Engine {
                     (wv.y - g.win[1] as f32).floor() as i32,
                     (wv.ok == 0) as i32,
                 ];
-                g.cpos_color = g.color;
             }
             T_IRIS_CHAR16 | T_IRIS_CHAR16_TALL | T_IRIS_CHAR32 => {
                 let b = &b[..n as usize];
@@ -2003,7 +2005,7 @@ impl Hq2Engine {
         };
         let (x0, top) = (g.win[0] + cx - xorig, g.win[1] + cy - yorig + h - 1);
         let wmask = if w >= 32 { u32::MAX } else { !(u32::MAX >> w) };
-        let c = to_fixed(g.cpos_color, g.cmax());
+        let c = to_fixed(g.color, g.cmax());
         self.gl_setup(out);
         self.gl_color_regs(c, out);
         for (r, &bits) in rows.iter().take(h as usize).enumerate() {

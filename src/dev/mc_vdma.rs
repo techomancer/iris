@@ -1119,10 +1119,34 @@ impl MemoryController {
     /// issued as a single register access at the port address. Bytes are
     /// packed MSB-first, as on the big-endian bus; a short tail (<4 bytes)
     /// goes out left-justified in the word.
+    ///
+    /// The memory side is translated once per page, not per byte: a byte-wise
+    /// walk took the DMA lock (which the CPU's DMA_RUN polls contend for) and
+    /// read a PTE four times a word, so a 130 KB pixel DMA ran for tens of
+    /// milliseconds and, slowed further by tracing, outlasted IRIX's VDMA
+    /// timeout (issue 844). A fault is still raised on the first byte of the
+    /// page that faults.
     fn dma_gio32(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob) -> VdmaResult {
         let mut mem_vaddr = job.mem_vaddr;
         let mut exc = false;
         let step = |v: u32| if job.dir_up { v.wrapping_add(1) } else { v.wrapping_sub(1) };
+        let page_mask: u32 = if job.ctl & 0x2 != 0 { 0x3fff } else { 0xfff };
+        // (virtual page, physical page) of the last translation.
+        let mut page: Option<(u32, u32)> = None;
+        let mut mem_addr = |vaddr: u32, writing: bool| -> Option<u32> {
+            if !job.xlate {
+                return Some(vaddr);
+            }
+            let vpage = vaddr & !page_mask;
+            if let Some((v, p)) = page {
+                if v == vpage {
+                    return Some(p | (vaddr & page_mask));
+                }
+            }
+            let pa = self.translate_addr(vaddr, writing)?;
+            page = Some((vpage, pa & !page_mask));
+            Some(pa)
+        };
         let mut zoom_count = job.zoom_count;
         let mut byte_count = job.byte_count;
 
@@ -1139,14 +1163,14 @@ impl MemoryController {
                             std::hint::spin_loop();
                         };
                         for k in 0..length {
-                            let Some(pa) = self.dma_mem_addr(job, mem_vaddr, true) else { exc = true; break 'dma; };
+                            let Some(pa) = mem_addr(mem_vaddr, true) else { exc = true; break 'dma; };
                             phys.write8(pa as u64, (data >> (24 - 8 * k)) as u8);
                             mem_vaddr = step(mem_vaddr);
                         }
                     } else {
                         let mut data = 0u32;
                         for k in 0..length {
-                            let Some(pa) = self.dma_mem_addr(job, mem_vaddr, false) else { exc = true; break 'dma; };
+                            let Some(pa) = mem_addr(mem_vaddr, false) else { exc = true; break 'dma; };
                             let b = phys.read8(pa as u64);
                             data |= (if b.is_ok() { b.data as u32 } else { 0 }) << (24 - 8 * k);
                             mem_vaddr = step(mem_vaddr);
@@ -1167,12 +1191,6 @@ impl MemoryController {
             mem_vaddr = (mem_vaddr as i32).wrapping_add(job.stride) as u32;
         }
         VdmaResult { mem_vaddr, exc }
-    }
-
-    /// Memory-side address for one byte: translated or identity.
-    #[inline]
-    fn dma_mem_addr(&self, job: &VdmaJob, vaddr: u32, writing: bool) -> Option<u32> {
-        if job.xlate { self.translate_addr(vaddr, writing) } else { Some(vaddr) }
     }
 
     /// True when the GIO slot holding `addr` is programmed 32 bits wide in
@@ -2458,6 +2476,40 @@ mod gio32_tests {
             stopper.join().unwrap();
         });
         assert!(!mc.dma_running());
+    }
+
+    /// Translated GIO32 transfers look up each page once and reuse it; the
+    /// cache must still follow the page table across a page boundary. Two
+    /// virtual pages map to physical pages in reverse order, and the transfer
+    /// starts unaligned 6 bytes before the boundary, so one word straddles it.
+    #[test]
+    fn translated_gio32_follows_the_page_table_across_pages() {
+        let (bus, mc) = setup();
+        const PT: u32 = 0x1_0000;
+        const VBASE: u32 = 0x0040_0000;
+        let (p0, p1) = (0x3_0000u32, 0x2_0000u32);
+        let pte = |pa: u32| ((pa >> 6) & 0x03ff_ffc0) | 0x2 | 0x4;
+        bus.mem.write32(PT as u64, pte(p0));
+        bus.mem.write32(PT as u64 + 4, pte(p1));
+        {
+            let mut st = mc.giodma().state.lock();
+            st.ctl = DMA_CTL_XLATE; // 4K pages, 4-byte PTEs
+            st.tlb_hi[0] = VBASE & 0xffc0_0000;
+            st.tlb_lo[0] = ((PT >> 6) & 0x03ff_ffc0) | 0x2;
+        }
+        // Last 6 bytes of virtual page 0, first 6 of virtual page 1.
+        for i in 0..6u32 {
+            bus.mem.write8((p0 + 0xffa + i) as u64, 0x10 + i as u8);
+            bus.mem.write8((p1 + i) as u64, 0x20 + i as u8);
+        }
+        let mut j = job(12, false);
+        j.xlate = true;
+        j.ctl = DMA_CTL_XLATE;
+        j.mem_vaddr = VBASE + 0xffa;
+        let r = mc.dma_dispatch(&j);
+        assert!(!r.exc);
+        assert_eq!(*bus.writes.lock(), vec![0x1011_1213, 0x1415_2021, 0x2223_2425]);
+        assert_eq!(r.mem_vaddr, VBASE + 0x1006);
     }
 
     #[test]
