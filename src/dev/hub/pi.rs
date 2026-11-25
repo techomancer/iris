@@ -196,7 +196,7 @@ pub struct Pi {
     /// The clock reading at which the counter read zero, modulo 2^64.
     rt_origin: AtomicU64,
     /// The latest clock reading the counter register has used: processors on different sockets
-    /// read the host clock a few hundred ns apart, but the counter never goes back.
+    /// read the machine clock (host TSC) a few hundred ns apart, but the counter never goes back.
     rt_seen: AtomicU64,
     /// A match pends whether or not enabled; enable only gates the line.
     rt_pending: [AtomicBool; 2],

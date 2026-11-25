@@ -112,7 +112,7 @@ impl TimerManager {
         &self.clock
     }
 
-    /// The manager owns the machine clock that every guest-visible clock reads; timers run on host time.
+    /// The manager owns the machine clock that every guest-visible clock reads; its worker waits on host time.
     pub fn with_clock(clock: Clock) -> Self {
         let inner = Arc::new(Mutex::new(TimerManagerInner {
             slots: Vec::new(),

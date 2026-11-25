@@ -93,8 +93,8 @@ struct Regs {
     /// machine clock, which holds still while the machine is stopped.
     saved_count: u64,
     epoch_ns: u64,
-    /// The largest count handed out: CPU threads on different sockets read the host clock a few
-    /// hundred ns apart, but one counter never goes back.
+    /// The largest count handed out: CPU threads on different sockets read the machine clock (host
+    /// TSC) a few hundred ns apart, but one counter never goes back.
     last_count: std::cell::Cell<u64>,
     widget_control: u32,
     widget_request_timeout: u32,
@@ -802,7 +802,7 @@ impl crate::traits::Device for Heart {
 }
 
 // HEART's state for a snapshot: its registers, the counter and the
-// MicroLAN. The counter runs on the host clock: it is saved as its value
+// MicroLAN. The counter runs on the machine clock: it is saved as its value
 // and how far into its tick it was, and resumes from there at the load, as
 // the CPU's Count does, so the guest sees no jump. A MicroLAN slot in
 // progress keeps its deadline in machine time, which a restore puts back first. After a load HEART drives every
