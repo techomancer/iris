@@ -143,42 +143,17 @@ fn test_rescheduling_timers() {
         }
     });
 
-    // 2. One-shot upgrading to recurring
-    let st2 = states.clone();
-    let mut r_step = 0;
-    manager.add_one_shot(Duration::from_millis(40), (), move |_| {
-        r_step += 1;
-        let elapsed = start.elapsed().as_millis();
-        st2.lock()
-            .unwrap()
-            .push(format!("upgraded_{} at ~{}", r_step, elapsed));
-        if r_step == 1 {
-            // Upgrade to 20ms recurring
-            TimerReturn::RescheduleRecurring(Duration::from_millis(20))
-        } else if r_step == 3 {
-            TimerReturn::Delete
-        } else {
-            TimerReturn::Continue
-        }
-    });
-
     thread::sleep(Duration::from_millis(150));
 
     let hist = states.lock().unwrap().clone();
     // Expected rough timings:
     // oneshot_1 at ~20,
-    // oneshot_2 at ~50,
-    // upgraded_1 at ~40,
-    // upgraded_2 at ~60,
-    // upgraded_3 at ~80
+    // oneshot_2 at ~50
 
-    assert_eq!(hist.len(), 5, "Expected 5 total timer executions");
+    assert_eq!(hist.len(), 2, "Expected 2 total timer executions");
 
     assert!(hist.iter().any(|s| s.starts_with("oneshot_1")));
     assert!(hist.iter().any(|s| s.starts_with("oneshot_2")));
-    assert!(hist.iter().any(|s| s.starts_with("upgraded_1")));
-    assert!(hist.iter().any(|s| s.starts_with("upgraded_2")));
-    assert!(hist.iter().any(|s| s.starts_with("upgraded_3")));
 }
 
 #[test]

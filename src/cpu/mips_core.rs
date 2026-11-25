@@ -2131,7 +2131,7 @@ impl MipsCore {
         // Materialize past count_now's cycles memo (cycles may not have
         // moved since the last read, but real time has under the wall-clock
         // build; rewinding the memo is harmless under ci_clock), and deliver
-        // a Compare this advance steps over: the one-shot is disabled below
+        // a Compare this advance steps over: the one-shot is removed below
         // and the restart arms the next match from the latched Count, so a
         // deadline the timer thread had not fired yet would otherwise wait
         // a whole Count wrap.
@@ -2139,8 +2139,8 @@ impl MipsCore {
         self.materialize_count(true);
         self.count_read_cycle = self.hot.cycles;
         self.count_paused = true;
-        if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id) {
-            tm.disable(id);
+        if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
+            tm.remove(id);
         }
     }
 
