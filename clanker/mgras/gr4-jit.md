@@ -13,8 +13,7 @@ an emitter.
   `cargo test --release --features gr4-jit --lib rss_jit`.
 - Rust and Cranelift differ in these places, and the emitters spell Rust out:
   - `f64::round` rounds halves away from zero, while `nearest` rounds them
-    to even (`E::round`, or `round_nonneg` once a clamp has made the value
-    non-negative or NaN).
+    to even (`E::round`).
   - `clamp` and `min` let NaN through or prefer the number, while
     `fmin`/`fmax` propagate NaN.
   - `as` conversions saturate (`fcvt_to_*_sat`).

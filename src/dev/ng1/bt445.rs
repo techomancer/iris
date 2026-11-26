@@ -237,12 +237,6 @@ impl Bt445 {
         self.rgb_counter = 0;
     }
 
-    // ── SoG accessors (used by monitor status) ────────────────────────────────────────────────
-
-    pub fn sog_enabled(&self) -> bool {
-        self.cmd1() & CMD1_SOG_ENABLE != 0
-    }
-
     /// The pixel clock the PLL makes: 20 MHz x M / ((N + 1) x 2^P), with M
     /// in rate register 0 and N and P in the low six and top two bits of
     /// rate register 1. Fitted to IRIX's Newport video format files, which
