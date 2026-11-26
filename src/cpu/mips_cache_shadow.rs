@@ -1,7 +1,7 @@
 //! A cache that is visible to software but stays out of the data path.
 //!
 //! Every load, store and instruction fetch goes straight to memory, exactly as
-//! in [`PassthroughCacheOf`](crate::cpu::mips_cache_v2::PassthroughCacheOf). What
+//! in `PassthroughCacheOf` (test-only, in `mips_cache_v2`). What
 //! this adds is a *shadow*: tag and data arrays that only the CACHE
 //! instruction ever touches.
 //!
