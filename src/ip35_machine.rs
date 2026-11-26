@@ -55,6 +55,7 @@ use crate::dev::ioc3::IO7;
 use crate::dev::isp2200::card::Card;
 use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::l1::{AttachedBrick, BoardIdentity, ComputeNode, L1Config, L1};
+use crate::dev::battery_clock::YearBase;
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET, PCI_ROUTING};
 use crate::hptimer::TimerManager;
@@ -222,7 +223,8 @@ fn build_baseio(
     link_reset: impl Fn(u8) + Send + Sync + 'static,
 ) -> Result<BoardIo, String> {
     let l1 = &l1s[0];
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
+    // IRIX on the IP35 machines counts the Timekeeper's year cell from 1968.
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), YearBase::From(1968), timers.clock().clone())?);
     let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
     for head in [HEAD_E, HEAD_F] {
         resolved.bind_pci(&format!("xio{head}/pci0"), xbridge.bus(head).clone())?;

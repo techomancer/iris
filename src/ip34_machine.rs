@@ -22,6 +22,7 @@ use crate::dev::ioc3::{IP34, IP34_NO_PS2};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1Config, L1};
 use crate::dev::odyssey::Odyssey;
+use crate::dev::battery_clock::YearBase;
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, PCI_ROUTING};
 use crate::hptimer::TimerManager;
@@ -129,7 +130,8 @@ fn build_baseio(
     heartbeat: Arc<AtomicU64>,
     vpro: Option<Arc<Odyssey>>,
 ) -> Result<BoardIo, String> {
-    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), timers.clock().clone())?);
+    // IRIX on the Fuel counts the Timekeeper's year cell from 1968.
+    let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), YearBase::From(1968), timers.clock().clone())?);
     let pci = xbridge.bus(HEAD_F);
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
     let (ioc3, serial) = attach_ioc3(timers, cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());
