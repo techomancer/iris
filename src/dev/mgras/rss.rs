@@ -679,12 +679,6 @@ pub(super) fn widen(v: u32, n: u32) -> u32 {
     }
 }
 
-/// An 8-8-8 colour (red in 7:0) to a 12-bit pixel, red in 3:0 (the host
-/// format X uses for its 12-bit visual).
-pub(super) fn to_rgb12(v: u32) -> u32 {
-    (v >> 4 & 0xF) | (v >> 8 & 0xF0) | (v >> 12 & 0xF00)
-}
-
 /// A 12-bit pixel to 8-8-8, each nibble repeated.
 pub(super) fn from_rgb12(c: u32) -> u32 {
     let n = (c & 0xF) | (c & 0xF0) << 4 | (c & 0xF00) << 8;

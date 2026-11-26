@@ -60,12 +60,6 @@ impl Source {
         self
     }
 
-    /// `const NAME: i32 = value;` at the top.
-    pub fn define_i32(mut self, name: &str, value: i32) -> Source {
-        self.defines.push((name.to_owned(), format!("{value}i")));
-        self
-    }
-
     /// The assembled WGSL.
     pub fn text(&self) -> Result<String, String> {
         let mut out = String::new();

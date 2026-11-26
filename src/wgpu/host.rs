@@ -61,12 +61,6 @@ impl HostBuffer {
         self.size
     }
 
-    /// Whether the buffer is in host memory (written in place) rather than
-    /// fed through the upload ring.
-    pub fn in_host_memory(&self) -> bool {
-        !self.ptr.is_null()
-    }
-
     /// Store `bytes` at `offset` (both multiples of 4). In host memory the
     /// store is immediate, so the range must not be one a submission still
     /// in flight reads; otherwise it goes up ahead of the next submission.

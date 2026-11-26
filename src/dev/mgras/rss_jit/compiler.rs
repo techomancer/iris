@@ -419,19 +419,6 @@ impl<'a> E<'a> {
         self.b.ins().select(up, r, t)
     }
 
-    /// `f64::round` for x >= +-0 or NaN (what a clamp to [0, n] leaves):
-    /// the fraction is then non-negative, so no sign handling. NaN stays
-    /// NaN, and converts to 0 as Rust's `as` does.
-    fn round_nonneg(&mut self, x: Value) -> Value {
-        let t = self.b.ins().trunc(x);
-        let d = self.b.ins().fsub(x, t);
-        let half = self.f64c(0.5);
-        let up = self.b.ins().fcmp(FloatCC::GreaterThanOrEqual, d, half);
-        let one = self.f64c(1.0);
-        let r = self.b.ins().fadd(t, one);
-        self.b.ins().select(up, r, t)
-    }
-
     /// `clamp(lo, hi)`: below lo, lo; above hi, hi; NaN stays.
     fn clamp(&mut self, x: Value, lo: Value, hi: Value) -> Value {
         let c = self.b.ins().fcmp(FloatCC::LessThan, x, lo);
@@ -440,44 +427,12 @@ impl<'a> E<'a> {
         self.b.ins().select(c, hi, x)
     }
 
-    fn clamp01(&mut self, x: Value) -> Value {
-        let (lo, hi) = if self.b.func.dfg.value_type(x) == F32 { (self.f32c(0.0), self.f32c(1.0)) } else { (self.f64c(0.0), self.f64c(1.0)) };
-        self.clamp(x, lo, hi)
-    }
-
-    /// `f64::max`: the number when one side is NaN.
-    fn max_num(&mut self, a: Value, b: Value) -> Value {
-        let gt = self.b.ins().fcmp(FloatCC::GreaterThan, a, b);
-        let bnan = self.b.ins().fcmp(FloatCC::Unordered, b, b);
-        let alt = self.b.ins().select(bnan, a, b);
-        self.b.ins().select(gt, a, alt)
-    }
-
     /// `f64::min`: the number when one side is NaN.
     fn min_num(&mut self, a: Value, b: Value) -> Value {
         let lt = self.b.ins().fcmp(FloatCC::LessThan, a, b);
         let bnan = self.b.ins().fcmp(FloatCC::Unordered, b, b);
         let alt = self.b.ins().select(bnan, a, b);
         self.b.ins().select(lt, a, alt)
-    }
-
-    fn itof(&mut self, x: Value) -> Value {
-        self.b.ins().fcvt_from_sint(F64, x)
-    }
-
-    /// `rss::compare` on floats (OpenGL order, "a OP b").
-    fn fcompare(&mut self, func: u8, a: Value, b: Value) -> Value {
-        let cc = match func & 7 {
-            0 => return self.b.ins().iconst(I8, 0),
-            1 => FloatCC::LessThan,
-            2 => FloatCC::Equal,
-            3 => FloatCC::LessThanOrEqual,
-            4 => FloatCC::GreaterThan,
-            5 => FloatCC::NotEqual,
-            6 => FloatCC::GreaterThanOrEqual,
-            _ => return self.b.ins().iconst(I8, 1),
-        };
-        self.b.ins().fcmp(cc, a, b)
     }
 
     /// `rss::compare` on values exact in f64 (stencil, depth).
