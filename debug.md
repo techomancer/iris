@@ -615,7 +615,7 @@ a forced termination; a normal stop saves them automatically.
 
 | Command | Description |
 |---|---|
-| `ports` | Every host socket iris is listening on, with what it is for: the monitor, port forwards (TCP and UDP), VNC, the GDB stub, the CI socket, serial and virtio console sockets, the O2 control port |
+| `ports` | Every host socket iris is listening on, with what it is for: the monitor, port forwards (TCP and UDP), VNC, the GDB stub, the CI socket, serial and virtio console sockets |
 | `seeq status` | SEEQ 8003 ethernet state |
 | `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
 | `net interfaces` | Host interfaces available for PCAP |
@@ -722,16 +722,12 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `rtc status` / `rtc dump` / `rtc r <reg>` / `rtc w <reg> <val>` | DS1687 RTC |
 | `onewire status` | MACE identity register and the ID chip holding the MAC address |
 
-`o2 <command>` runs the same commands `[o2] control_port` serves, one per line:
+`o2 <command>` is the O2's own diagnostics, one reply line each (`ok ...` or `err ...`). Screen shots, typing, keys and the mouse are the shared `screen`, `ptr` and `key` commands, as on every machine.
 
 | Command | Description |
 |---|---|
-| `o2 shot PATH` | Screen shot (PNG) |
 | `o2 status` | GBE display state |
 | `o2 pixel X Y` | One screen pixel |
-| `o2 type TEXT` | Type on the PS/2 keyboard (`\r` is Enter) |
-| `o2 key\|keydown\|keyup NAME` | Press, hold or release a key |
-| `o2 mouse DX DY [BUTTONS]` / `o2 click [BUTTON]` | Move the mouse / click |
 | `o2 pc` / `o2 regs` | CPU PC / registers as last published |
 | `o2 peek ADDR LEN PATH` | Physical memory to a file (up to 1 MB) |
 | `o2 retrace PATH` | Recorded rendering-engine primitives (`IRIS_IP32_RE_TRACE`) |

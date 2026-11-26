@@ -418,15 +418,6 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             ui.checkbox(&mut cfg.o2.mouse, "")
                 .tip(t!("config-o2-mouse-tip"));
             ui.end_row();
-            ui.label(t!("config-o2-control-port"));
-            let mut port = cfg.o2.control_port.unwrap_or(0) as i32;
-            if ui.add(DragValue::new(&mut port).range(0..=65535))
-                .tip(t!("config-o2-control-port-tip"))
-                .changed()
-            {
-                cfg.o2.control_port = if port == 0 { None } else { Some(port as u16) };
-            }
-            ui.end_row();
             ui.label(t!("config-o2-arcs-fpu"));
             ui.checkbox(&mut cfg.o2.arcs_fpu, "")
                 .tip(t!("config-o2-arcs-fpu-tip"));

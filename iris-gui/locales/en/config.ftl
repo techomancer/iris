@@ -447,8 +447,6 @@ config-o2-section = O2 options
 config-o2-section-subtitle =
 config-o2-mouse = PS/2 mouse
 config-o2-mouse-tip = A mouse on the O2's second PS/2 port, alongside the graphics console.
-config-o2-control-port = Control port
-config-o2-control-port-tip = A TCP port on 127.0.0.1 for driving the machine from a script: screenshots, keys, the mouse. Leave it 0 for none.
 config-o2-arcs-fpu = FPU in ARCS
 config-o2-arcs-fpu-tip = Report the FPU to the PROM firmware. Off for a machine IRIX 6.5 must run without one.
 

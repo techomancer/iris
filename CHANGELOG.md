@@ -391,6 +391,26 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### O2
 
+- `[o2] control_port` is gone, and so are `o2 shot`, `type`, `key`,
+  `keydown`, `keyup`, `mouse` and `click`. The monitor's `screen`, `ptr` and
+  `key` commands, which every machine has, do the same on `monitor_port`
+  (`iris-ci screenshot` also takes shots):
+
+  | Was | Now |
+  |---|---|
+  | `shot PATH` | `screen shot PATH` |
+  | `type TEXT` | `key type TEXT` |
+  | `key\|keydown\|keyup NAME` | `key NAME [down\|up]` |
+  | `mouse DX DY [BUTTONS]` | `ptr rel DX DY` (hold with `ptr down`) |
+  | `click [BUTTON]` | `ptr down` then `ptr up`, or `ptr click X Y [BUTTON]` |
+
+  Differences: `key type` no longer expands `\r`, `\e`, `\b` and `\t`; follow
+  it with `key enter`. `ptr click` needs coordinates and an enabled hardware
+  cursor, which steers there. Buttons are `left`, `middle` or `right` (or `1`,
+  `2`, `3`), no longer a bitmask in which 2 was right. `ptr rel` splits large
+  moves into 200-pixel packets, as `mouse` did. The O2's own `o2
+  status|pixel|pc|regs|peek|retrace|scsi|unmapped|ps2log|crimelog` stay. A
+  config that still sets `control_port` is refused as an unknown key.
 - OpenBSD finds its SCSI disks and CD-ROM again: since 2026-10-31 its
   accesses to the AIC-7880s went to memory, so every command timed out
   ("board is not responding").

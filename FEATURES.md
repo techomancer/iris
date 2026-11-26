@@ -619,7 +619,6 @@ the file is loaded, with a note, and never written back.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `o2.mouse` | `true` | PS/2 mouse on the second port (with the graphics console). |
-| `o2.control_port` | unset | TCP port on 127.0.0.1 serving the `o2` monitor commands for scripts. |
 | `o2.arcs_fpu` | `false` | Test aid: lend a kernel the FPU while it runs inside the PROM. |
 
 ### [octane]

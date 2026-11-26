@@ -103,7 +103,7 @@ pub struct Crime {
     int: Mutex<IntState>,
     /// The guest's last accesses to the interrupt registers (status, mask,
     /// HARDINT, SOFTINT): `(write, offset, value)`, newest last, for the
-    /// control port's `crimelog` (chasing interrupt storms).
+    /// `o2 crimelog` (chasing interrupt storms).
     /// Off until the monitor's `crime irqlog on`, and not kept in a
     /// `lightning` build: IRIX reads INTSTAT and writes INTMASK on every
     /// interrupt and every spl change.

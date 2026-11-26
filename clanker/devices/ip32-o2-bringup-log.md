@@ -11,7 +11,7 @@ The O2 runs as a machine like the others: `profile = "o2_ip32"`, configured
 by the shared keys (`prom`, `nvram` for the PROM's flash, `banks` as DIMM
 kits, `[scsi.N]` on controllers 0 and 1, `serial_port_a`/`b`, `headless`,
 `[network]`, `[clock] fixed_mhz`) with `[o2]` holding only `mouse`,
-`control_port` and `arcs_fpu`; the old `[o2]` spellings of the rest are
+`arcs_fpu` (and once `control_port`); the old `[o2]` spellings of the rest are
 folded in on load (2026-10-24). Started with `iris --config`. Its devices
 are on the shared monitor (`monitor_port`, default 8888).
 
@@ -47,7 +47,7 @@ Diagnostics that remain, all off unless set:
 | variable | what it does |
 |---|---|
 | `IRIS_IP32_HOT` | per-register access counters for MACE, GBE and the rendering engine (finding a driver polling a bit nothing sets) |
-| `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the control port's `retrace` |
+| `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the monitor's `o2 retrace` |
 | `IRIS_IP32_MEC_TRACE` | Ethernet frames sent and received, and why a received one was dropped |
 | `IRIS_O2_AUDIO_TRACE` | audio output activity, and each time a ring ran dry between sounds |
 | `IRIS_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling (every sound card) |
@@ -1901,7 +1901,7 @@ was wrong, and what it turned out to be:
   audio path holds. Quake 2 under emulation does not keep the port fed,
   and `s_mixahead` does not change that.
 
-Instruments added for it: the control port's `pixel X Y` (one scanned-out
+Instruments added for it: the monitor's `o2 pixel X Y` (one scanned-out
 point: frame-buffer word, DID, mode-table entry, colour map, overlay) and
 `unmapped`; `IRIS_O2_FRAG_PROBE=x,y` (every triangle fragment at a pixel,
 with texture coordinates, LOD and level); `IRIS_AUDIO_DUMP` (each
