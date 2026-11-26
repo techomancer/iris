@@ -987,6 +987,7 @@ pub trait MipsCache: Send + Sync {
 
 /// Passthrough cache that performs no caching - all accesses go directly to memory
 /// Useful for testing and debugging
+#[cfg(test)]
 pub struct PassthroughCacheOf<const MIPS4: bool> {
     downstream: Arc<dyn BusDevice>,
     llbit: UnsafeCell<bool>,
@@ -996,14 +997,19 @@ pub struct PassthroughCacheOf<const MIPS4: bool> {
 }
 
 // Safety: Single-threaded access only (CPU thread)
+#[cfg(test)]
 unsafe impl<const MIPS4: bool> Send for PassthroughCacheOf<MIPS4> {}
+#[cfg(test)]
 unsafe impl<const MIPS4: bool> Sync for PassthroughCacheOf<MIPS4> {}
 
 /// MIPS III passthrough — the default for tests that do not care about ISA level.
+#[cfg(test)]
 pub type PassthroughCache = PassthroughCacheOf<false>;
 /// MIPS IV passthrough, for tests that exercise MIPS IV opcodes.
+#[cfg(test)]
 pub type PassthroughCacheM4 = PassthroughCacheOf<true>;
 
+#[cfg(test)]
 impl<const MIPS4: bool> PassthroughCacheOf<MIPS4> {
     pub fn new(downstream: Arc<dyn BusDevice>) -> Self {
         Self {
@@ -1015,12 +1021,14 @@ impl<const MIPS4: bool> PassthroughCacheOf<MIPS4> {
     }
 }
 
+#[cfg(test)]
 impl<const MIPS4: bool> From<Arc<dyn BusDevice>> for PassthroughCacheOf<MIPS4> {
     fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
     }
 }
 
+#[cfg(test)]
 impl<const MIPS4: bool> CpuModel for PassthroughCacheOf<MIPS4> {
     const MIPS4: bool = MIPS4;
     const PRID: u32 = if MIPS4 { 0x0000_2321 } else { 0x0000_0440 };
@@ -1029,6 +1037,7 @@ impl<const MIPS4: bool> CpuModel for PassthroughCacheOf<MIPS4> {
     const NAME: &'static str = "passthrough";
 }
 
+#[cfg(test)]
 impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
     const IC_SIZE: usize = 0;
     const IC_LINE: usize = 0;

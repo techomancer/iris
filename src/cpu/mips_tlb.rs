@@ -1488,6 +1488,7 @@ impl Tlb for MipsTlb {
     }
 }
 
+#[cfg(test)]
 /// Passthrough TLB implementation for testing
 ///
 /// This implementation performs simple identity mapping for low addresses
@@ -1498,6 +1499,7 @@ pub struct PassthroughTlb {
     max_identity_addr: u64,
 }
 
+#[cfg(test)]
 impl PassthroughTlb {
     /// Create a new passthrough TLB
     ///
@@ -1513,6 +1515,7 @@ impl PassthroughTlb {
     }
 }
 
+#[cfg(test)]
 impl Tlb for PassthroughTlb {
     fn translate<const IS_64BIT: u8>(&mut self, virt_addr: u64, _asid: u8, _access_type: AccessType) -> TlbResult {
         // Identity map addresses below max_identity_addr.
