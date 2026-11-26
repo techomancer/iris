@@ -2263,6 +2263,17 @@ pub struct AudioConfig {
     /// late, and the latency added. Default 20.
     #[serde(default = "default_audio_prebuf_ms")]
     pub prebuf_ms: u64,
+    /// The most sound (ms) the stream may queue before it skips ahead. Unset:
+    /// three times `prebuf_ms`, at least 100, and 2000 when guest time is
+    /// instructions, where a guest catching up with the host makes sound
+    /// faster than it plays. The stream follows the guest by half a percent,
+    /// so a backlog of this size takes minutes to play off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_latency_ms: Option<u64>,
+    /// Guest time is instructions: set when the configuration is settled
+    /// ([`MachineConfig::settle_audio`]), not read from a file.
+    #[serde(skip)]
+    pub instruction_time: bool,
     /// How much (ms) the host's device should buffer. Unset: the host
     /// system's low-latency default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2283,7 +2294,7 @@ fn is_default_audio_channels(n: &usize) -> bool { *n == 2 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), latency_ms: None, channels: default_audio_channels(), file: None }
+        Self { host: AudioHost::Default, prebuf_ms: default_audio_prebuf_ms(), max_latency_ms: None, instruction_time: false, latency_ms: None, channels: default_audio_channels(), file: None }
     }
 }
 
@@ -3409,6 +3420,7 @@ impl MachineConfig {
         cfg.fold_deprecated();
         cfg.fold_machine_keys().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         cfg.settle_jitv2_threads();
+        cfg.settle_audio();
         Ok(cfg)
     }
 
@@ -3677,6 +3689,12 @@ impl MachineConfig {
             |t| t == ClockTime::Instructions,
         );
         if on { self.clock.insn_ns } else { 0 }
+    }
+
+    /// Tell `[audio]` whether guest time is instructions, which the streams' latency bound
+    /// follows. Run where a configuration is finished, after the clock and machine are known.
+    pub fn settle_audio(&mut self) {
+        self.audio.instruction_time = self.insn_ns() != 0;
     }
 
     /// The machine clock `[clock]` asks for.
@@ -4806,6 +4824,7 @@ impl Cli {
         if let Some(n) = self.jitv2_threads { cfg.jitv2.threads = n; cfg.jitv2_threads_set = true; }
         // After `--machine`, which can change the CPU count.
         cfg.settle_jitv2_threads();
+        cfg.settle_audio();
         if let Some(m) = self.jitv2_compile { cfg.jitv2.compile = m; }
 
         // Helper: insert or update a SCSI device entry.
@@ -6573,7 +6592,7 @@ mod instruction_clock_config_tests {
     use super::*;
 
     fn parse(toml: &str) -> MachineConfig {
-        toml::from_str(toml).expect("parse")
+        MachineConfig::from_toml_str(toml).expect("parse")
     }
 
     /// Instruction time is opt in: left alone, guest time follows the host.
@@ -6591,6 +6610,10 @@ mod instruction_clock_config_tests {
         on.validate().unwrap();
         assert_eq!((on.insn_ns(), on.clock.pace), (4, false));
         assert!(parse("[clock]\ntime = \"instructions\"\ninsn_ns = 0\n").validate().unwrap_err().contains("insn_ns"));
+        assert_eq!(parse("").audio.instruction_time, cfg!(feature = "ci_clock"));
+        assert!(parse("[clock]\ntime = \"instructions\"\n").audio.instruction_time);
+        assert!(!parse("[clock]\ntime = \"host\"\n").audio.instruction_time);
+        assert!(!toml::to_string(&parse("[clock]\ntime = \"instructions\"\n").audio).unwrap().contains("instruction_time"), "a setting, not saved");
         let smp = parse("[clock]\ntime = \"instructions\"\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\ncpus = 2\n");
         assert!(smp.validate().unwrap_err().contains("one processor"));
         let origin = parse("[clock]\ntime = \"instructions\"\n[origin2000]\nnodes = 2\n[machine]\nprofile = \"origin2000_ip27\"\n");

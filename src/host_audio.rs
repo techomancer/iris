@@ -25,6 +25,31 @@ const MAX_RATE: u32 = 96000;
 /// prebuffer asks for it (see [`open_output`]).
 const MAX_LATENCY: Duration = Duration::from_millis(100);
 
+/// The most a stream queues on instruction time, where a guest that lags and then catches up makes
+/// sound faster than it plays (see `AudioConfig::max_latency_ms`).
+const INSTRUCTION_TIME_MAX_LATENCY: Duration = Duration::from_millis(2000);
+
+/// How much sound the stream may queue: what `[audio]` says, else the usual bound.
+fn max_latency(audio: &AudioConfig, prebuffer: Duration) -> Duration {
+    let bound = match audio.max_latency_ms {
+        Some(ms) => Duration::from_millis(ms),
+        None if audio.instruction_time => INSTRUCTION_TIME_MAX_LATENCY,
+        None => MAX_LATENCY.max(prebuffer * 3),
+    };
+    #[cfg(test)]
+    LAST_MAX_LATENCY_MS.store(bound.as_millis() as u64, Ordering::Relaxed);
+    bound
+}
+
+/// The bound the last stream opened with, for the test that a builder settled its config.
+#[cfg(test)]
+static LAST_MAX_LATENCY_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn last_max_latency_ms() -> u64 {
+    LAST_MAX_LATENCY_MS.load(Ordering::Relaxed)
+}
+
 /// Open and start a host output stream for the device `who`, playing
 /// `channels`-wide frames at `rate` Hz (which [`Output::set_rate`] changes
 /// later) as `[audio]` asks. The stream opens even when the host has no
@@ -58,7 +83,7 @@ pub fn open_outputs(audio: &AudioConfig, who: &str, channels: usize, rates: &[u3
         rate,
         max_rate: MAX_RATE.max(rate),
         prebuffer,
-        max_latency: MAX_LATENCY.max(prebuffer * 3),
+        max_latency: max_latency(audio, prebuffer),
         device_latency: audio.latency_ms.map(Duration::from_millis),
         null_fallback: true,
         // A file has no clock of its own to follow.
@@ -586,6 +611,18 @@ mod tests {
 
     fn open(cfg: &AudioConfig, channels: usize) -> Option<Output> {
         open_output(cfg, "test", channels, FILE_RATE, "IRIS_TEST_CAPTURE")
+    }
+
+    /// A stream queues the usual few prebuffers, or 2 s on instruction time, or what `[audio]` says.
+    #[test]
+    fn the_queue_bound_follows_the_clock_and_the_config() {
+        let ms = |a: &AudioConfig| max_latency(a, Duration::from_millis(a.prebuf_ms)).as_millis();
+        let mut a = AudioConfig::default();
+        assert_eq!(ms(&a), 100);
+        a.instruction_time = true;
+        assert_eq!(ms(&a), 2000);
+        a.max_latency_ms = Some(700);
+        assert_eq!(ms(&a), 700);
     }
 
     /// One layout for every card: each output's counts, then the stream's.

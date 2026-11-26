@@ -38,7 +38,9 @@ use crate::traits::{Device, MachineEvent, MachineEventQueue, MachineFatal};
 ///
 /// Construction can put more than a megabyte on the stack, so call this from
 /// a thread with a large one, as `main.rs` and iris-gui do.
-pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
+pub fn build(mut cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
+    // A configuration made in code was never parsed, so settle what parsing settles.
+    cfg.settle_audio();
     cfg.validate_newport_raster_gate()?;
     crate::machine::set_emulator_profile(cfg.machine.profile);
     if let Some(line) = host_id_line(&cfg) {
@@ -75,6 +77,25 @@ fn build_checks_newport_resident_mode_without_prior_full_validation() {
     cfg.graphics.newport_mode = Some(crate::config::NewportWgpuMode::Readback);
     let error = build(cfg).err().expect("Newport mode gate");
     assert!(error.contains("applies only"), "{error}");
+}
+
+/// A machine built from a configuration made in code (never parsed) opens its audio with the bound its
+/// clock calls for: wide on instruction time, which a `ci_clock` build gives the Indy.
+#[cfg(test)]
+#[test]
+fn build_settles_a_configuration_made_in_code_before_its_audio_opens() {
+    std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+        let mut cfg = MachineConfig::default();
+        cfg.audio.host = crate::config::AudioHost::Null;
+        cfg.nvram = std::env::temp_dir().join(format!("iris-settle-{}.nv", std::process::id())).to_string_lossy().into_owned();
+        cfg.scsi.clear();
+        cfg.monitor_port = Some(0);
+        let mut machine = build(cfg).expect("an Indy");
+        machine.start();
+        machine.stop();
+        let want = if cfg!(feature = "ci_clock") { 2000 } else { 100 };
+        assert_eq!(crate::host_audio::last_max_latency_ms(), want);
+    }).unwrap().join().unwrap();
 }
 
 #[cfg(all(test, not(feature = "wgpu")))]
