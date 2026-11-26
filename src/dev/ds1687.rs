@@ -255,7 +255,10 @@ impl MaceRtc {
         if battery_clock::sets(self.now(), t) {
             self.set.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        *self.clock.lock().unwrap() = (t, self.machine.now());
+        // A time write does not reset the countdown chain (only DV2 does): the next second comes at the old phase.
+        let mut clock = self.clock.lock().unwrap();
+        let now = self.machine.now();
+        *clock = (t, now - now.saturating_sub(clock.1) % 1_000_000_000);
     }
 
     fn reg_of(addr: u32) -> Option<usize> {
@@ -442,6 +445,24 @@ impl BusDevice for MaceRtc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writing the time does not restart the second: IRIX on the O2 writes its
+    /// time back every 32 s, and each write lost the part second already run.
+    #[test]
+    fn a_time_write_keeps_the_seconds_phase() {
+        let r = MaceRtc::new(Clock::stepped());
+        let reg = |n: u32| ((n << 8) | 7) as u64;
+        let write_secs = |s: u8| {
+            r.write8(reg(0x0b), 0x80 | 0x04 | 0x02);
+            r.write8(reg(0), s);
+            r.write8(reg(0x0b), 0x04 | 0x02);
+        };
+        write_secs(10);
+        r.machine.step(900_000_000);
+        write_secs(10);
+        r.machine.step(100_000_000);
+        assert_eq!(r.read8(reg(0)).data, 11, "a second after the first write");
+    }
 
     /// The RTC runs, from host time, and a guest that sets it with SET moves it.
     #[test]
