@@ -23,6 +23,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{format_unix_utc, RtcOffset};
 
+/// How a clock's year digits relate to the host's calendar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YearBase {
+    /// The host's own year.
+    Gregorian,
+    /// The year digits count from this year. The DS1744 shifts the host date
+    /// into 2000 to 2099 and accepts only 1968; the M48T35 takes any year.
+    From(u32),
+}
+
 /// A clock reference read back from its file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reference {

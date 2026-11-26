@@ -12,7 +12,8 @@
 //! of the main loop.
 
 use super::*;
-use crate::dev::ds1744::{self, Ds1744, YearBase};
+use crate::dev::battery_clock::YearBase;
+use crate::dev::ds1744::{self, Ds1744};
 use crate::irq::LevelProbe;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use crate::pci::PciDmaStatus;

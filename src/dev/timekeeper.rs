@@ -13,7 +13,7 @@
 
 use crate::traits::{BusDevice, BusRead8, Device, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
-use crate::dev::battery_clock::{self, unix_now};
+use crate::dev::battery_clock::{self, unix_now, YearBase};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -136,7 +136,15 @@ impl State {
     }
 }
 
-/// Fuel's 1968-based clock. Ordinary storage starts blank; the guest owns it.
+/// The part has no century digits, so only a year to count from will do.
+fn first_year(base: YearBase) -> Result<i64, String> {
+    match base {
+        YearBase::From(year) => Ok(i64::from(year)),
+        YearBase::Gregorian => Err("Timekeeper: the M48T35 has no century digits, so it needs YearBase::From".into()),
+    }
+}
+
+/// Ordinary storage starts blank; the guest owns it.
 /// The lower candidate clock addresses are independent RAM, with no aliases.
 pub struct Timekeeper {
     initial_epoch: i64,
@@ -147,7 +155,8 @@ pub struct Timekeeper {
 }
 impl Timekeeper {
     /// The part seeded with the host's date, running on the machine `clock`.
-    pub fn new_on(clock: Clock) -> Result<Self, String> {
+    /// `base` is the year the two-digit year cell counts from.
+    pub fn new_on(clock: Clock, base: YearBase) -> Result<Self, String> {
         let host = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
@@ -170,6 +179,7 @@ impl Timekeeper {
         }
         let t = Self::at_on(
             clock,
+            base,
             year,
             month,
             days + 1,
@@ -180,10 +190,10 @@ impl Timekeeper {
         Ok(t)
     }
     /// Open authoritative saved clock state before applying new-store year limits.
-    pub fn with_nvram_file(path: &Path, clock: Clock) -> Result<Self, String> {
-        Self::backed(path, Self::new_on(clock.clone()), clock)
+    pub fn with_nvram_file(path: &Path, base: YearBase, clock: Clock) -> Result<Self, String> {
+        Self::backed(path, base, Self::new_on(clock.clone(), base), clock)
     }
-    fn backed(path: &Path, initial: Result<Self, String>, clock: Clock) -> Result<Self, String> {
+    fn backed(path: &Path, base: YearBase, initial: Result<Self, String>, clock: Clock) -> Result<Self, String> {
         let saved = match std::fs::read(path) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -191,7 +201,7 @@ impl Timekeeper {
         };
         let part = if saved_calendar(&saved).is_some() {
             // This seed is replaced by the authoritative image before exposure.
-            Self::at_on(clock, 1968, 1, 1, 0, 0, 0)?
+            Self::at_on(clock, base, first_year(base)?, 1, 1, 0, 0, 0)?
         } else {
             initial?
         };
@@ -201,6 +211,7 @@ impl Timekeeper {
     /// A deterministic initial date; subsequent seconds follow the machine `clock`.
     pub fn at_on(
         clock: Clock,
+        base: YearBase,
         year: i64,
         month: i64,
         day: i64,
@@ -208,8 +219,9 @@ impl Timekeeper {
         minute: i64,
         second: i64,
     ) -> Result<Self, String> {
-        if !(1968..=2067).contains(&year) {
-            return Err("Timekeeper: initial year is outside 1968-2067".into());
+        let base = first_year(base)?;
+        if !(base..base + 100).contains(&year) {
+            return Err(format!("Timekeeper: initial year is outside {base}-{}", base + 99));
         }
         if !(1..=12).contains(&month)
             || !(1..=month_days(year, month)).contains(&day)
@@ -220,7 +232,7 @@ impl Timekeeper {
             return Err("Timekeeper: invalid initial calendar".into());
         }
         let epoch = Calendar {
-            year: year - 1968,
+            year: year - base,
             month,
             day,
             hour,
@@ -505,7 +517,13 @@ mod tests {
     use crate::traits::{BusDevice, Resettable};
 
     fn at(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Result<Timekeeper, String> {
-        Timekeeper::at_on(Clock::stepped(), year, month, day, hour, minute, second)
+        Timekeeper::at_on(Clock::stepped(), YearBase::From(1968), year, month, day, hour, minute, second)
+    }
+
+    /// With no century digits the part cannot count from the host's own year.
+    #[test]
+    fn a_gregorian_year_base_is_refused() {
+        assert!(Timekeeper::at_on(Clock::stepped(), YearBase::Gregorian, 2026, 1, 1, 0, 0, 0).is_err());
     }
 
     /// The guest can freeze, stop, stage, and resume the M48T35 calendar.
@@ -565,18 +583,18 @@ mod tests {
         t.flush_nvram().unwrap();
         drop(t);
         // Saved clock state is authoritative even if the host date is out of range.
-        let restored = Timekeeper::backed(&path, at(2068, 1, 1, 0, 0, 0), Clock::stepped()).unwrap();
+        let restored = Timekeeper::backed(&path, YearBase::From(1968), at(2068, 1, 1, 0, 0, 0), Clock::stepped()).unwrap();
         restored.power_on();
         assert_eq!(restored.read8(0x7f8).data, 0x42);
         assert_eq!(restored.read8(reg::YEAR as u64).data, 0x58);
         drop(restored);
         std::fs::remove_file(dir.join("nvram.clock")).unwrap();
         std::fs::write(&path, [0xa5; 2048]).unwrap();
-        assert!(Timekeeper::backed(&path, at(2026, 1, 1, 0, 0, 0), Clock::stepped()).is_err());
+        assert!(Timekeeper::backed(&path, YearBase::From(1968), at(2026, 1, 1, 0, 0, 0), Clock::stepped()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), vec![0xa5; 2048]);
         assert!(!dir.join("nvram.clock").exists());
         std::fs::remove_file(&path).unwrap();
-        assert!(Timekeeper::backed(&path, at(2068, 1, 1, 0, 0, 0), Clock::stepped()).is_err());
+        assert!(Timekeeper::backed(&path, YearBase::From(1968), at(2068, 1, 1, 0, 0, 0), Clock::stepped()).is_err());
         assert!(!path.exists());
         std::fs::remove_dir(dir).unwrap();
     }

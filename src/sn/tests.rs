@@ -488,3 +488,18 @@ fn a_dropped_machine_frees_its_processors_and_nodes() {
         assert!(chips.iter().all(|c| c.upgrade().is_none()), "a node chip outlives the Origin 3200");
     });
 }
+
+/// IRIX counts the Timekeeper's year cell from 1970 on the IP27 machines and 1968 on the IP35 ones.
+#[test]
+fn each_family_counts_the_timekeeper_year_from_its_own_base() {
+    use crate::test_temp::TempPath;
+    let (o200, fuel) = (TempPath::dir("sn-year-origin200"), TempPath::dir("sn-year-fuel"));
+    let (o200_cfg, fuel_cfg) = (crate::ip27::test_support::config(crate::config::MachineProfile::Origin200Ip29, &o200, 1), crate::ip35::test_support::fuel_config(&fuel));
+    crate::display_stop_tests::big_stack(move || {
+        drop(crate::ip27::test_support::machine(&o200_cfg).unwrap());
+        drop(crate::ip35::test_support::machine(&fuel_cfg).unwrap());
+    });
+    let year = |d: &TempPath| std::fs::read(d.join("nvram.bin")).unwrap()[0x7fff];
+    let bcd = |b: u8| u32::from(b >> 4) * 10 + u32::from(b & 15);
+    assert_eq!(bcd(year(&o200)) + 1970, bcd(year(&fuel)) + 1968);
+}

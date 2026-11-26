@@ -37,7 +37,7 @@ use crate::clock::Clock;
 use parking_lot::Mutex;
 
 use crate::config::{civil_from_days, days_from_civil};
-use crate::dev::battery_clock;
+use crate::dev::battery_clock::{self, YearBase};
 use crate::traits::{BusDevice, BusRead8, BUS_ERR, BUS_OK};
 
 pub const SIZE: usize = 0x8000;
@@ -54,16 +54,6 @@ const BATTERY_FLAG: u8 = 0x80;
 const CLOCK_TAG: &[u8; 8] = b"DS1742R1";
 /// Test mode flips the seconds' low bit every 976562 ns.
 const TEST_BIT_NS: i64 = 976_562;
-
-/// How the guest's year digits relate to the host's calendar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum YearBase {
-    /// The host's own year.
-    Gregorian,
-    /// The year digits count from this year: the host date is shifted into
-    /// 2000 to 2099. Only 1968 is accepted.
-    From(u32),
-}
 
 fn bcd(v: i64) -> u8 {
     ((v / 10) * 16 + v % 10) as u8
