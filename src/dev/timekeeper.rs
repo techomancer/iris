@@ -358,7 +358,7 @@ impl Timekeeper {
         let st = self.st.lock();
         if let Some(path) = &st.file {
             let (image, reference) = Self::image(&st, self.host(&st), unix_now());
-            std::fs::write(path, image).map_err(|e| e.to_string())?;
+            crate::nv_storage::save(&path.to_string_lossy(), &image).map_err(|e| e.to_string())?;
             use std::io::Write;
             std::fs::OpenOptions::new()
                 .write(true)
