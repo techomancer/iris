@@ -11,8 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixListener;
+use std::net::TcpListener;
 
 use crate::config::{ci_socket_is_tcp, ci_socket_tcp_addr};
 
@@ -175,72 +175,56 @@ pub fn start_server(
 #[cfg(unix)]
 fn start_unix_server(server: Arc<CiServer>, path: &str, listener: UnixListener) -> Result<(), String> {
     eprintln!("iris: --ci control socket listening at {}", path);
-    let server_clone = server.clone();
     let port = crate::ports::register("unix", path, "CI socket");
-    thread::Builder::new()
-        .name("iris-ci-accept".into())
-        .spawn(move || {
-            let _port = port;
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(stream) => {
-                        if server_clone.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CI_CONNECTIONS {
-                            server_clone.connections.fetch_sub(1, Ordering::AcqRel);
-                            eprintln!("iris-ci-accept: too many connections (max {MAX_CI_CONNECTIONS}); refusing");
-                            continue;
-                        }
-                        let s = server_clone.clone();
-                        thread::Builder::new()
-                            .name("iris-ci-handler".into())
-                            .spawn(move || {
-                                handle_client(s.clone(), stream);
-                                s.connections.fetch_sub(1, Ordering::AcqRel);
-                            })
-                            .ok();
-                    }
-                    Err(e) => eprintln!("iris-ci-accept: {}", e),
-                }
-            }
-        })
-        .map_err(|e| format!("failed to spawn CI accept thread: {}", e))?;
-    Ok(())
+    accept_loop(server, port, move || {
+        let stream = listener.accept()?.0;
+        let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
+        Ok((stream.try_clone()?, stream))
+    })
 }
 
-#[cfg(windows)]
 fn start_tcp_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
-    start_tcp_server_impl(server, path)
-}
-
-#[cfg(not(windows))]
-fn start_tcp_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
-    start_tcp_server_impl(server, path)
-}
-
-fn start_tcp_server_impl(server: Arc<CiServer>, path: &str) -> Result<(), String> {
     let addr = ci_socket_tcp_addr(path);
     let listener = TcpListener::bind(&addr)
         .map_err(|e| format!("failed to bind TCP CI socket {}: {}", addr, e))?;
     eprintln!("iris: --ci control socket listening at tcp:{}", addr);
-    let server_clone = server.clone();
     let port = crate::ports::register("tcp", &addr, "CI socket");
+    accept_loop(server, port, move || {
+        let stream = listener.accept()?.0;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
+        Ok((stream.try_clone()?, stream))
+    })
+}
+
+/// Take connections from `accept` as (writer, reader) halves, one handler
+/// thread each, refusing past `MAX_CI_CONNECTIONS`.
+fn accept_loop<W, R>(
+    server: Arc<CiServer>,
+    port: crate::ports::PortGuard,
+    mut accept: impl FnMut() -> std::io::Result<(W, R)> + Send + 'static,
+) -> Result<(), String>
+where
+    W: Write + Send + 'static,
+    R: Read + Send + 'static,
+{
     thread::Builder::new()
         .name("iris-ci-accept".into())
         .spawn(move || {
             let _port = port;
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(stream) => {
-                        let _ = stream.set_nodelay(true);
-                        if server_clone.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CI_CONNECTIONS {
-                            server_clone.connections.fetch_sub(1, Ordering::AcqRel);
+            loop {
+                match accept() {
+                    Ok((writer, reader)) => {
+                        if server.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CI_CONNECTIONS {
+                            server.connections.fetch_sub(1, Ordering::AcqRel);
                             eprintln!("iris-ci-accept: too many connections (max {MAX_CI_CONNECTIONS}); refusing");
                             continue;
                         }
-                        let s = server_clone.clone();
+                        let s = server.clone();
                         thread::Builder::new()
                             .name("iris-ci-handler".into())
                             .spawn(move || {
-                                handle_client_tcp(s.clone(), stream);
+                                handle_client_lines(s.clone(), BufReader::new(reader), writer);
                                 s.connections.fetch_sub(1, Ordering::AcqRel);
                             })
                             .ok();
@@ -278,29 +262,6 @@ fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: 
         // still asked to quit, so a failed write does not cancel it.
         if quit { exit_after_quit(&server.machine); }
         if !written { break; }
-    }
-}
-
-#[cfg(unix)]
-fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
-    let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
-    match stream.try_clone() {
-        Ok(writer) => {
-            let reader = BufReader::new(stream);
-            handle_client_lines(server, reader, writer);
-        }
-        Err(e) => eprintln!("iris-ci-handler: clone failed: {}", e),
-    }
-}
-
-fn handle_client_tcp(server: Arc<CiServer>, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
-    match stream.try_clone() {
-        Ok(writer) => {
-            let reader = BufReader::new(stream);
-            handle_client_lines(server, reader, writer);
-        }
-        Err(e) => eprintln!("iris-ci-handler: clone failed: {}", e),
     }
 }
 
