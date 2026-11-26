@@ -163,15 +163,6 @@ fn dispmode_text(mode: u32) -> String {
     }
 }
 
-fn write_png(path: &Path, width: usize, height: usize, data: &[u8], color: png::ColorType) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
-    enc.set_color(color);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut w = enc.write_header().map_err(std::io::Error::other)?;
-    w.write_image_data(data).map_err(std::io::Error::other)
-}
-
 impl Odyssey {
     /// The frame the scan-out registers describe now, and board memory.
     fn screen(&self) -> Result<(Frame, VramPtr, DisplayRegs), String> {
@@ -894,7 +885,7 @@ impl Odyssey {
         for &p in &px {
             rgb.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
         }
-        write_png(&dir.join("screen.png"), w, h, &rgb, png::ColorType::Rgb).map_err(io)?;
+        crate::disp::write_png(&dir.join("screen.png"), w as u32, h as u32, png::ColorType::Rgb, &rgb).map_err(io)?;
         std::fs::write(dir.join("board.bin"), mem.address_bytes().collect::<Vec<u8>>()).map_err(io)?;
         let mut layout = match self.state.quiesce(QUIESCE) {
             Some(g) => Self::layout_text(&g),

@@ -515,16 +515,8 @@ pub fn save_png(path: &str, px: &[u32], w: usize, h: usize, crop: Option<(usize,
             rgb.extend_from_slice(&[p as u8, (p >> 8) as u8, (p >> 16) as u8]);
         }
     }
-    let tmp = format!("{path}.tmp");
-    {
-        let f = std::fs::File::create(&tmp).map_err(|e| format!("{path}: {e}"))?;
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), cw as u32, ch as u32);
-        enc.set_color(png::ColorType::Rgb);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
-        wr.write_image_data(&rgb).map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| format!("{path}: {e}"))?;
+    crate::disp::write_png(std::path::Path::new(path), cw as u32, ch as u32, png::ColorType::Rgb, &rgb)
+        .map_err(|e| format!("{path}: {e}"))?;
     Ok((cw, ch))
 }
 
