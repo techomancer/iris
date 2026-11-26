@@ -245,6 +245,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | [blendalpha-and-alpha-blending.md](rex3/blendalpha-and-alpha-blending.md) | rule | REX3 BLENDALPHA: what it selects, and why the `blast` billboard exposes it |
 | [cidmatch-aux-plane-base.md](rex3/cidmatch-aux-plane-base.md) | rule | CIDMATCH probe used the wrong framebuffer base on aux-plane draws — 2026-09-18 |
 | [cidmatch-is-a-mask.md](rex3/cidmatch-is-a-mask.md) | rule | CIDMATCH selects permitted CIDs |
+| [fastclear-packs-colorvram-in-rgb-mode.md](rex3/fastclear-packs-colorvram-in-rgb-mode.md) | rule | Fastclear packs the 24-bit COLORVRAM to 4/8/12bpp in RGB mode; Xsgi fills 8-bit TrueColor windows that way (were red ramps) |
 | [fastclear-cid-divergence.md](rex3/fastclear-cid-divergence.md) | rule | FASTCLEAR + CID checking: three code paths, two of which ignored CID — 2026-09-15 |
 | [gfifo-batching-constraints.md](rex3/gfifo-batching-constraints.md) | measure | Batching GFIFO publication: what must still be ordered |
 | [REX3 synthetic replay corpus](../src/dev/ng1/testdata/README.md) | howto | Redistributable zero-state corpus, strict CPU gate and optional hardware GPU replay |
