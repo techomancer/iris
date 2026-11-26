@@ -1191,6 +1191,7 @@ impl PagedArenaMemoryProvider {
     /// Called only for the handle that actually goes inside a `JITModule` —
     /// that is the one whose `free_memory()` cranelift invokes. Sibling
     /// handles (`Codegen::seal_handle`) never free, so they must not count.
+    #[cfg(test)]
     pub fn register_module_user(&self) {
         self.inner.lock().users += 1;
     }

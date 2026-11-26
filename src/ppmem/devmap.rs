@@ -446,6 +446,7 @@ impl SparseDeviceMap {
     }
 
     /// Entries per table page.
+    #[cfg(test)]
     pub fn page_slots(&self) -> u64 {
         self.inner.per_page as u64
     }
@@ -493,6 +494,7 @@ impl SparseDeviceMap {
     }
 
     /// Whether the page holding `slot` has been written (or faulted in).
+    #[cfg(test)]
     pub fn is_mapped(&self, slot: u64) -> bool {
         let _g = self.inner.lock();
         let st = unsafe { &*self.inner.st.get() };
