@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use super::hq3::host;
 use super::rss::{self, Rss, REG_NAMES};
 use super::{dcb, disp, tag, te1, Mgras, MGRAS_SLOT_GFX_BASE};
+use crate::trace_writer::TraceFile;
 
 pub const TRACE_HQ: u32 = 1;
 pub const TRACE_RSS: u32 = 2;
@@ -50,19 +50,16 @@ struct CpuRun {
 
 /// Trace sink state; lives in `Mgras::trace` behind a mutex.
 pub struct MgrasTrace {
-    out: Option<BufWriter<File>>,
-    path: String,
-    start: Option<Instant>,
+    file: TraceFile,
     hq_seq: u64,
     rss_seq: u64,
     cpu_seq: u64,
     run: Option<CpuRun>,
-    last_flush: Option<Instant>,
 }
 
 impl MgrasTrace {
     pub const fn new() -> Self {
-        Self { out: None, path: String::new(), start: None, hq_seq: 0, rss_seq: 0, cpu_seq: 0, run: None, last_flush: None }
+        Self { file: TraceFile::new(), hq_seq: 0, rss_seq: 0, cpu_seq: 0, run: None }
     }
 
     /// Emit the pending collapsed CPU run, if any.
@@ -71,19 +68,12 @@ impl MgrasTrace {
         let dir = if r.write { "wr" } else { "rd" };
         let seq = self.cpu_seq;
         if r.count == 1 {
-            self.line(format_args!("CPU #{seq:06} {dir} {} = {:#010x}", region_detail(r.first), r.val));
+            self.file.line(format_args!("CPU #{seq:06} {dir} {} = {:#010x}", region_detail(r.first), r.val));
         } else if r.bulk {
-            self.line(format_args!("CPU #{seq:06} {dir} {} x{} ({} .. {}) last={:#010x}",
+            self.file.line(format_args!("CPU #{seq:06} {dir} {} x{} ({} .. {}) last={:#010x}",
                 r.kind, r.count, region_detail(r.first), region_detail(r.last), r.val));
         } else {
-            self.line(format_args!("CPU #{seq:06} {dir} {} = {:#010x}  (x{})", region_detail(r.first), r.val, r.count));
-        }
-    }
-
-    fn line(&mut self, text: std::fmt::Arguments) {
-        let t = self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-        if let Some(f) = self.out.as_mut() {
-            let _ = writeln!(f, "{t:12.6} {text}");
+            self.file.line(format_args!("CPU #{seq:06} {dir} {} = {:#010x}  (x{})", region_detail(r.first), r.val, r.count));
         }
     }
 }
@@ -121,7 +111,7 @@ impl Mgras {
         t.close_run();
         t.hq_seq += 1;
         let seq = t.hq_seq;
-        t.line(format_args!("HQ  #{seq:06} {desc}"));
+        t.file.line(format_args!("HQ  #{seq:06} {desc}"));
     }
 
     /// One `rss_fifo` entry, after the RSS applied it (so an executed
@@ -156,7 +146,7 @@ impl Mgras {
         t.close_run();
         t.rss_seq += 1;
         let seq = t.rss_seq;
-        t.line(format_args!("RSS #{seq:06} {text}"));
+        t.file.line(format_args!("RSS #{seq:06} {text}"));
     }
 
     /// Flush the trace file (called every frame from the display thread; it
@@ -166,13 +156,9 @@ impl Mgras {
             return;
         }
         let mut t = self.trace.lock();
-        let due = t.last_flush.map_or(true, |l| l.elapsed().as_millis() >= 500);
-        if force || due {
+        if t.file.due(force) {
             t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                let _ = f.flush();
-            }
-            t.last_flush = Some(Instant::now());
+            t.file.flush(force);
         }
     }
 
@@ -181,16 +167,13 @@ impl Mgras {
         if !cfg!(feature = "gputrace") {
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "needs a build with the gputrace feature (on with developer)"));
         }
-        let f = File::create(path)?;
         let mut t = self.trace.lock();
-        t.out = Some(BufWriter::with_capacity(1 << 20, f));
-        t.path = path.to_string();
-        t.start = Some(Instant::now());
+        t.file.open(path)?;
         t.hq_seq = 0;
         t.rss_seq = 0;
         t.cpu_seq = 0;
         t.run = None;
-        t.line(format_args!("IMPACT {:?} trace started (mask {mask:#x})", self.kind));
+        t.file.line(format_args!("IMPACT {:?} trace started (mask {mask:#x})", self.kind));
         drop(t);
         self.trace_mask.store(mask, Ordering::SeqCst);
         Ok(())
@@ -200,9 +183,8 @@ impl Mgras {
         self.trace_mask.store(0, Ordering::SeqCst);
         let mut t = self.trace.lock();
         t.close_run();
-        let mut f = t.out.take()?;
-        let _ = f.flush();
-        Some(format!("{} (hq {} / rss {} / cpu {} entries)", t.path, t.hq_seq, t.rss_seq, t.cpu_seq))
+        let (path, _) = t.file.close()?;
+        Some(format!("{path} (hq {} / rss {} / cpu {} entries)", t.hq_seq, t.rss_seq, t.cpu_seq))
     }
 
     // ── monitor commands ─────────────────────────────────────────────────────
@@ -502,7 +484,7 @@ impl Mgras {
         let t = self.trace.lock();
         let mask = self.trace_mask.load(Ordering::Relaxed);
         if mask != 0 {
-            writeln!(w, "  trace: {} (mask {mask:#x}) hq={} rss={} cpu={} entries", t.path, t.hq_seq, t.rss_seq, t.cpu_seq)?;
+            writeln!(w, "  trace: {} (mask {mask:#x}) hq={} rss={} cpu={} entries", t.file.path(), t.hq_seq, t.rss_seq, t.cpu_seq)?;
         }
         drop(t);
         for u in self.unhandled.lock().iter() {

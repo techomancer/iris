@@ -18,9 +18,8 @@
 //! `IRIS_REX3_TRACE=<file>` starts a full trace when the board starts.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
-use crate::trace_writer::TraceWriter;
+use crate::trace_writer::TraceFile;
 
 use super::*;
 
@@ -43,22 +42,20 @@ struct CpuRun {
 
 /// Trace sink state; lives in `Rex3::trace`.
 pub struct Rex3Trace {
-    out: Option<TraceWriter>,
-    start: Option<Instant>,
+    file: TraceFile,
     gf_seq: u64,
     cpu_seq: u64,
     run: Option<CpuRun>,
-    last_flush: Option<Instant>,
 }
 
 impl Rex3Trace {
     pub const fn new() -> Self {
-        Self { out: None, start: None, gf_seq: 0, cpu_seq: 0, run: None, last_flush: None }
+        Self { file: TraceFile::new(), gf_seq: 0, cpu_seq: 0, run: None }
     }
 
     #[cfg(feature = "wgpu")]
     pub(super) fn is_active(&self) -> bool {
-        self.out.is_some()
+        self.file.is_open()
     }
 
     /// Emit the pending collapsed CPU run, if any.
@@ -70,16 +67,9 @@ impl Rex3Trace {
         let go = if r.off & 0x0800 != 0 { " GO" } else { "" };
         let val = if r.bits > 32 { format!("{:#018x}", r.val) } else { format!("{:#010x}", r.val) };
         if r.count == 1 {
-            self.line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}"));
+            self.file.line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}"));
         } else {
-            self.line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}  (x{})", r.count));
-        }
-    }
-
-    fn line(&mut self, text: std::fmt::Arguments) {
-        let t = self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-        if let Some(f) = self.out.as_mut() {
-            f.line(format_args!("{t:12.6} {text}"));
+            self.file.line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}  (x{})", r.count));
         }
     }
 }
@@ -158,7 +148,7 @@ impl Rex3 {
         t.close_run();
         t.cpu_seq += 1;
         let seq = t.cpu_seq;
-        t.line(format_args!("DMA #{seq:06} {text}"));
+        t.file.line(format_args!("DMA #{seq:06} {text}"));
     }
 
     /// One GFIFO entry, after `process_register` applied it and before its
@@ -204,7 +194,7 @@ impl Rex3 {
         t.close_run();
         t.gf_seq += 1;
         let seq = t.gf_seq;
-        t.line(format_args!("GF  #{seq:06} {text}"));
+        t.file.line(format_args!("GF  #{seq:06} {text}"));
     }
 
     /// Hand the trace to its writer thread (called every frame from the
@@ -214,13 +204,9 @@ impl Rex3 {
             return;
         }
         let mut t = self.trace.lock();
-        let due = t.last_flush.map_or(true, |l| l.elapsed().as_millis() >= 500);
-        if force || due {
+        if t.file.due(force) {
             t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                f.flush();
-            }
-            t.last_flush = Some(Instant::now());
+            t.file.flush(force);
         }
     }
 
@@ -228,14 +214,12 @@ impl Rex3 {
     pub fn start_trace(&self, path: &str, mask: u32) -> std::io::Result<()> {
         #[cfg(feature = "wgpu")]
         self.reject_resident_operation("tracing").map_err(std::io::Error::other)?;
-        let f = TraceWriter::create(path)?;
         let mut t = self.trace.lock();
-        t.out = Some(f);
-        t.start = Some(Instant::now());
+        t.file.open(path)?;
         t.gf_seq = 0;
         t.cpu_seq = 0;
         t.run = None;
-        t.line(format_args!("REX3 trace started (mask {mask:#x})"));
+        t.file.line(format_args!("REX3 trace started (mask {mask:#x})"));
         drop(t);
         self.tap.fetch_and(!TRACE_ALL, Ordering::SeqCst);
         self.tap.fetch_or(mask & TRACE_ALL, Ordering::SeqCst);
@@ -248,9 +232,7 @@ impl Rex3 {
         self.tap.fetch_and(!TRACE_ALL, Ordering::SeqCst);
         let mut t = self.trace.lock();
         t.close_run();
-        let f = t.out.take()?;
-        let path = f.path.clone();
-        let res = f.finish();
+        let (path, res) = t.file.close()?;
         Some(match res {
             Ok(bytes) => format!("{path} (gfifo {} / cpu {} entries, {bytes} bytes)", t.gf_seq, t.cpu_seq),
             Err(e) => format!("{path}: write failed: {e}"),
@@ -263,9 +245,6 @@ impl Rex3 {
         match args {
             ["flush"] => {
                 self.trace_flush(true);
-                if let Some(f) = self.trace.lock().out.as_mut() {
-                    f.sync();
-                }
                 e(writeln!(w, "trace flushed"))
             }
             [] | ["off"] => e(match self.stop_trace() {

@@ -20,10 +20,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
 
 use crate::dev::o2gfx::{gbe_reg, gl_coord, re_reg};
-use crate::trace_writer::TraceWriter;
+use crate::trace_writer::TraceFile;
 
 /// Interface buffer entries as the engine applies them.
 pub const TRACE_RE: u32 = 1;
@@ -58,22 +57,13 @@ struct Run {
 }
 
 struct Sink {
-    out: Option<TraceWriter>,
-    start: Option<Instant>,
+    file: TraceFile,
     re_seq: u64,
     seq: u64,
     run: Option<Run>,
-    last_flush: Option<Instant>,
 }
 
 impl Sink {
-    fn line(&mut self, text: std::fmt::Arguments) {
-        let t = self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-        if let Some(f) = self.out.as_mut() {
-            f.line(format_args!("{t:12.6} {text}"));
-        }
-    }
-
     fn close_run(&mut self) {
         let Some(r) = self.run.take() else { return };
         let seq = self.seq;
@@ -85,7 +75,7 @@ impl Sink {
         };
         let val = if r.bits > 32 { format!("{:#018x}", r.val) } else { format!("{:#010x}", r.val) };
         let times = if r.count > 1 { format!("  (x{})", r.count) } else { String::new() };
-        self.line(format_args!("{tag:3} #{seq:06} {dir} {name} = {val}{times}{note}"));
+        self.file.line(format_args!("{tag:3} #{seq:06} {dir} {name} = {val}{times}{note}"));
     }
 }
 
@@ -96,7 +86,7 @@ pub struct O2Trace {
 
 impl Default for O2Trace {
     fn default() -> Self {
-        Self { mask: AtomicU32::new(0), s: Mutex::new(Sink { out: None, start: None, re_seq: 0, seq: 0, run: None, last_flush: None }) }
+        Self { mask: AtomicU32::new(0), s: Mutex::new(Sink { file: TraceFile::new(), re_seq: 0, seq: 0, run: None }) }
     }
 }
 
@@ -149,7 +139,7 @@ impl O2Trace {
         t.close_run();
         t.seq += 1;
         let seq = t.seq;
-        t.line(format_args!("{tag:3} #{seq:06} {text}"));
+        t.file.line(format_args!("{tag:3} #{seq:06} {text}"));
     }
 
     /// One interface buffer entry, before it is applied. `regs` holds the
@@ -170,7 +160,7 @@ impl O2Trace {
         t.close_run();
         t.re_seq += 1;
         let seq = t.re_seq;
-        t.line(format_args!("RE  #{seq:06} {name}{go} = {v}{run}"));
+        t.file.line(format_args!("RE  #{seq:06} {name}{go} = {v}{run}"));
     }
 
     /// Hand the trace to its writer thread (called from the machine's service
@@ -180,12 +170,9 @@ impl O2Trace {
             return;
         }
         let mut t = self.s.lock().unwrap();
-        if force || t.last_flush.map_or(true, |l| l.elapsed().as_millis() >= 500) {
+        if t.file.due(force) {
             t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                f.flush();
-            }
-            t.last_flush = Some(Instant::now());
+            t.file.flush(force);
         }
     }
 
@@ -194,14 +181,12 @@ impl O2Trace {
         if !cfg!(feature = "gputrace") {
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "needs a build with the gputrace feature (on with developer)"));
         }
-        let f = TraceWriter::create(path)?;
         let mut t = self.s.lock().unwrap();
-        t.out = Some(f);
-        t.start = Some(Instant::now());
+        t.file.open(path)?;
         t.re_seq = 0;
         t.seq = 0;
         t.run = None;
-        t.line(format_args!("O2 graphics trace started (mask {mask:#x})"));
+        t.file.line(format_args!("O2 graphics trace started (mask {mask:#x})"));
         drop(t);
         self.mask.store(mask, Ordering::SeqCst);
         Ok(())
@@ -213,9 +198,7 @@ impl O2Trace {
         self.mask.store(0, Ordering::SeqCst);
         let mut t = self.s.lock().unwrap();
         t.close_run();
-        let f = t.out.take()?;
-        let path = f.path.clone();
-        let res = f.finish();
+        let (path, res) = t.file.close()?;
         Some(match res {
             Ok(bytes) => format!("{path} (re {} / other {} entries, {bytes} bytes)", t.re_seq, t.seq),
             Err(e) => format!("{path}: write failed: {e}"),
@@ -237,9 +220,6 @@ impl O2Trace {
         match args {
             ["flush"] => {
                 self.flush(true);
-                if let Some(f) = self.s.lock().unwrap().out.as_mut() {
-                    f.sync();
-                }
                 e(writeln!(w, "trace flushed"))
             }
             [] | ["off"] => e(match self.stop() {

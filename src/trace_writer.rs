@@ -16,6 +16,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 /// Bytes collected before a buffer is handed to the writer thread.
 const CHUNK: usize = 1 << 20;
@@ -145,6 +146,79 @@ impl Drop for TraceWriter {
     }
 }
 
+/// The writer, start time and flush throttle the graphics traces share. A
+/// board's sink keeps its own sequence counters and collapsed access run.
+pub struct TraceFile {
+    out: Option<TraceWriter>,
+    start: Option<Instant>,
+    last_flush: Option<Instant>,
+}
+
+impl TraceFile {
+    pub const fn new() -> Self {
+        Self { out: None, start: None, last_flush: None }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.out.is_some()
+    }
+
+    /// The file's path, or "" when none is open.
+    pub fn path(&self) -> &str {
+        self.out.as_ref().map_or("", |f| f.path.as_str())
+    }
+
+    /// Start a trace into `path`, replacing one that runs.
+    pub fn open(&mut self, path: &str) -> io::Result<()> {
+        self.out = Some(TraceWriter::create(path)?);
+        self.start = Some(Instant::now());
+        self.last_flush = None;
+        Ok(())
+    }
+
+    /// Append `text` stamped with the seconds since `open`.
+    pub fn line(&mut self, text: std::fmt::Arguments) {
+        let t = self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+        if let Some(f) = self.out.as_mut() {
+            f.line(format_args!("{t:12.6} {text}"));
+        }
+    }
+
+    /// Append `text` as it is, with no stamp.
+    pub fn raw(&mut self, text: std::fmt::Arguments) {
+        if let Some(f) = self.out.as_mut() {
+            f.line(text);
+        }
+    }
+
+    /// Whether `flush` should run: forced, or 500 ms since the last one. The
+    /// caller closes its pending access run first.
+    pub fn due(&self, force: bool) -> bool {
+        force || self.last_flush.map_or(true, |l| l.elapsed().as_millis() >= 500)
+    }
+
+    /// Hand what is collected to the writer thread; when `force`, wait until
+    /// it is in the file.
+    pub fn flush(&mut self, force: bool) {
+        if let Some(f) = self.out.as_mut() {
+            if force {
+                f.sync();
+            } else {
+                f.flush();
+            }
+        }
+        self.last_flush = Some(Instant::now());
+    }
+
+    /// Write out everything and close: the path and the bytes written, or
+    /// None when no trace was open.
+    pub fn close(&mut self) -> Option<(String, io::Result<u64>)> {
+        let f = self.out.take()?;
+        let path = f.path.clone();
+        Some((path, f.finish()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +241,29 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), want, "sync must leave everything put so far in the file");
         assert_eq!(w.finish().unwrap(), want.len() as u64);
         assert_eq!(std::fs::read(&path).unwrap(), want);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_forced_flush_leaves_the_stamped_lines_in_the_file() {
+        let path = std::env::temp_dir().join(format!("trace_file_{}.txt", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let mut f = TraceFile::new();
+        assert!(!f.is_open() && f.close().is_none());
+        f.open(&path).unwrap();
+        f.raw(format_args!("# header"));
+        f.line(format_args!("GF  #{:06} x", 1));
+        assert!(f.due(false), "nothing has flushed yet");
+        f.flush(true);
+        assert!(!f.due(false), "a flush starts the 500 ms throttle");
+        assert!(f.due(true));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("# header"));
+        let l = lines.next().unwrap();
+        assert!(l.ends_with(" GF  #000001 x") && l.as_bytes()[..12].iter().all(|b| b.is_ascii_digit() || *b == b'.' || *b == b' '), "{l}");
+        let (p, bytes) = f.close().unwrap();
+        assert_eq!((p.as_str(), bytes.unwrap()), (path.as_str(), text.len() as u64));
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -24,10 +24,7 @@
 //! All of it needs the `gputrace` feature (on with `developer`); without it
 //! `Trace::on` is a constant false and every hook compiles away.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -43,6 +40,7 @@ use super::consts::{
 use super::debug::begin_name;
 use super::assembly::Prim;
 use super::draw::{RasterOp, RASTER_CLEAR};
+use crate::trace_writer::TraceFile;
 
 pub const TRACE_FIFO: u32 = 1;
 pub const TRACE_DRAW: u32 = 2;
@@ -81,22 +79,17 @@ struct CpuRun {
 
 /// The sink, behind `Trace::sink`.
 pub(super) struct TraceSink {
-    out: Option<BufWriter<File>>,
-    path: String,
-    start: Instant,
+    file: TraceFile,
     /// Lines per class, in `CLASSES` order.
     seq: [u64; 4],
     run: Option<CpuRun>,
-    last_flush: Instant,
 }
 
 impl TraceSink {
     fn line(&mut self, class: usize, text: std::fmt::Arguments) {
         self.seq[class] += 1;
-        let (seq, t) = (self.seq[class], self.start.elapsed().as_secs_f64());
-        if let Some(f) = self.out.as_mut() {
-            let _ = writeln!(f, "{t:12.6} {:<4} #{seq:06} {text}", CLASSES[class].0.to_ascii_uppercase());
-        }
+        let seq = self.seq[class];
+        self.file.line(format_args!("{:<4} #{seq:06} {text}", CLASSES[class].0.to_ascii_uppercase()));
     }
 
     /// Emit the pending collapsed CPU run, if any.
@@ -123,11 +116,7 @@ impl Default for Trace {
 
 impl Trace {
     pub fn new() -> Self {
-        let now = Instant::now();
-        Trace {
-            mask: AtomicU32::new(0),
-            sink: Mutex::new(TraceSink { out: None, path: String::new(), start: now, seq: [0; 4], run: None, last_flush: now }),
-        }
+        Trace { mask: AtomicU32::new(0), sink: Mutex::new(TraceSink { file: TraceFile::new(), seq: [0; 4], run: None }) }
     }
 
     /// Whether a trace of `what` runs. A constant false without `gputrace`,
@@ -143,17 +132,11 @@ impl Trace {
         if !cfg!(feature = "gputrace") {
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "needs a build with the gputrace feature (on with developer)"));
         }
-        let f = File::create(path)?;
         let mut t = self.sink.lock();
-        t.out = Some(BufWriter::with_capacity(1 << 20, f));
-        t.path = path.to_string();
-        t.start = Instant::now();
-        t.last_flush = t.start;
+        t.file.open(path)?;
         t.seq = [0; 4];
         t.run = None;
-        if let Some(f) = t.out.as_mut() {
-            let _ = writeln!(f, "# VPro trace ({})", mask_names(mask));
-        }
+        t.file.raw(format_args!("# VPro trace ({})", mask_names(mask)));
         drop(t);
         self.mask.store(mask, Ordering::SeqCst);
         Ok(())
@@ -164,9 +147,8 @@ impl Trace {
         self.mask.store(0, Ordering::SeqCst);
         let mut t = self.sink.lock();
         t.close_run();
-        let mut f = t.out.take()?;
-        let _ = f.flush();
-        Some(format!("{} ({})", t.path, Self::counts(&t)))
+        let (path, _) = t.file.close()?;
+        Some(format!("{path} ({})", Self::counts(&t)))
     }
 
     fn counts(t: &TraceSink) -> String {
@@ -177,8 +159,7 @@ impl Trace {
     pub fn status(&self) -> Option<String> {
         let mask = self.mask.load(Ordering::Relaxed);
         let t = self.sink.lock();
-        t.out.as_ref()?;
-        Some(format!("tracing to {} ({}): {}", t.path, mask_names(mask), Self::counts(&t)))
+        t.file.is_open().then(|| format!("tracing to {} ({}): {}", t.file.path(), mask_names(mask), Self::counts(&t)))
     }
 
     /// Write the buffered lines out: at most twice a second unless forced.
@@ -188,12 +169,9 @@ impl Trace {
             return;
         }
         let mut t = self.sink.lock();
-        if force || t.last_flush.elapsed().as_millis() >= 500 {
+        if t.file.due(force) {
             t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                let _ = f.flush();
-            }
-            t.last_flush = Instant::now();
+            t.file.flush(force);
         }
     }
 

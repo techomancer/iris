@@ -13,7 +13,8 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+
+use crate::trace_writer::TraceFile;
 
 use super::hq2::{index_label, HQ_TOKEN_GEDMA};
 use super::re3::{self, describe_ir, REG_NAMES, RE3_SRC_HQ};
@@ -39,19 +40,16 @@ struct CpuRun {
 
 /// Trace sink state; lives in `Gr2::trace` behind a mutex.
 pub struct Gr2Trace {
-    out: Option<BufWriter<File>>,
-    path: String,
-    start: Option<Instant>,
+    file: TraceFile,
     hq_seq: u64,
     re3_seq: u64,
     cpu_seq: u64,
     run: Option<CpuRun>,
-    last_flush: Option<Instant>,
 }
 
 impl Gr2Trace {
     pub const fn new() -> Self {
-        Self { out: None, path: String::new(), start: None, hq_seq: 0, re3_seq: 0, cpu_seq: 0, run: None, last_flush: None }
+        Self { file: TraceFile::new(), hq_seq: 0, re3_seq: 0, cpu_seq: 0, run: None }
     }
 
     /// Emit the pending collapsed CPU run, if any.
@@ -61,20 +59,13 @@ impl Gr2Trace {
         let seq = self.cpu_seq;
         if r.count == 1 {
             let d = region_detail(r.first);
-            self.line(format_args!("CPU #{:06} {dir} {d} = {:#010x}", seq, r.val));
+            self.file.line(format_args!("CPU #{:06} {dir} {d} = {:#010x}", seq, r.val));
         } else if r.bulk {
-            self.line(format_args!("CPU #{:06} {dir} {} x{} ({} .. {}) last={:#010x}",
+            self.file.line(format_args!("CPU #{:06} {dir} {} x{} ({} .. {}) last={:#010x}",
                 seq, r.kind, r.count, region_detail(r.first), region_detail(r.last), r.val));
         } else {
             let d = region_detail(r.first);
-            self.line(format_args!("CPU #{:06} {dir} {d} = {:#010x}  (x{})", seq, r.val, r.count));
-        }
-    }
-
-    fn line(&mut self, text: std::fmt::Arguments) {
-        let t = self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-        if let Some(f) = self.out.as_mut() {
-            let _ = writeln!(f, "{t:12.6} {text}");
+            self.file.line(format_args!("CPU #{:06} {dir} {d} = {:#010x}  (x{})", seq, r.val, r.count));
         }
     }
 }
@@ -113,13 +104,9 @@ impl Gr2 {
             return;
         }
         let mut t = self.trace.lock();
-        let due = t.last_flush.map_or(true, |l| l.elapsed().as_millis() >= 500);
-        if force || due {
+        if t.file.due(force) {
             t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                let _ = f.flush();
-            }
-            t.last_flush = Some(Instant::now());
+            t.file.flush(force);
         }
     }
 
@@ -127,7 +114,7 @@ impl Gr2 {
     pub(super) fn trace_note(&self, text: &str) {
         let mut t = self.trace.lock();
         t.close_run();
-        t.line(format_args!("NOTE {text}"));
+        t.file.line(format_args!("NOTE {text}"));
     }
 
     /// One HQ FIFO entry, as consumed by the HQ2 thread.
@@ -138,11 +125,11 @@ impl Gr2 {
         let seq = t.hq_seq;
         let name = index_label(index);
         if index == super::hq2::HQ_TOKEN_UNSTALL {
-            t.line(format_args!("HQ  #{seq:06} UNSTALL (microcode restart)"));
+            t.file.line(format_args!("HQ  #{seq:06} UNSTALL (microcode restart)"));
         } else if index == HQ_TOKEN_GEDMA {
-            t.line(format_args!("HQ  #{seq:06} GEDMA data = {val:#010x}"));
+            t.file.line(format_args!("HQ  #{seq:06} GEDMA data = {val:#010x}"));
         } else {
-            t.line(format_args!("HQ  #{seq:06} fifo[{index:#05x} {name}] = {val:#010x}"));
+            t.file.line(format_args!("HQ  #{seq:06} fifo[{index:#05x} {name}] = {val:#010x}"));
         }
     }
 
@@ -150,7 +137,7 @@ impl Gr2 {
     pub(super) fn trace_hq_exec(&self, desc: &str) {
         let mut t = self.trace.lock();
         let seq = t.hq_seq;
-        t.line(format_args!("HQ  #{seq:06} exec {desc}"));
+        t.file.line(format_args!("HQ  #{seq:06} exec {desc}"));
     }
 
     /// One RE3 FIFO entry, before it is applied (so `IR` decodes the
@@ -163,22 +150,22 @@ impl Gr2 {
         match addr {
             re3::RE3_OP_COPY_A => {
                 let f = |s: u32| (val >> s) as u16 as i16;
-                t.line(format_args!("RE3 #{seq:06} op  COPYRECT src=({}, {}) size={}x{}", f(0), f(16), f(32), f(48)));
+                t.file.line(format_args!("RE3 #{seq:06} op  COPYRECT src=({}, {}) size={}x{}", f(0), f(16), f(32), f(48)));
             }
             re3::RE3_OP_COPY_B => {
                 let f = |s: u32| (val >> s) as u16 as i16;
-                t.line(format_args!("RE3 #{seq:06} op  COPYRECT dst=({}, {})  [GL y, bottom-up]", f(0), f(16)));
+                t.file.line(format_args!("RE3 #{seq:06} op  COPYRECT dst=({}, {})  [GL y, bottom-up]", f(0), f(16)));
             }
-            re3::RE3_OP_READ_ADVANCE => t.line(format_args!("RE3 #{seq:06} op  READBUF advance")),
-            re3::RE3_OP_SYNC_BOUNDARY => t.line(format_args!("RE3 #{seq:06} op  synchronization boundary")),
-            re3::RE3_OP_PIXFMT => t.line(format_args!("RE3 #{seq:06} op  PIXFMT {}", match val { 1 => "RGB12", 2 => "CI12", 3 => "CI8", 4 => "RGB8", 5 => "RGB4", _ => "native" })),
-            re3::RE3_OP_ZCTL => t.line(format_args!("RE3 #{seq:06} op  ZCTL test={} func={} zmask={:#08x}", val & 1, (val >> 1) & 7, (val >> 8) & 0xff_ffff)),
-            re3::RE3_OP_STENCIL => t.line(format_args!("RE3 #{seq:06} op  STENCIL on={} func={} ref={} mask={:#x} wmask={:#x} ops fail={} zfail={} zpass={}",
+            re3::RE3_OP_READ_ADVANCE => t.file.line(format_args!("RE3 #{seq:06} op  READBUF advance")),
+            re3::RE3_OP_SYNC_BOUNDARY => t.file.line(format_args!("RE3 #{seq:06} op  synchronization boundary")),
+            re3::RE3_OP_PIXFMT => t.file.line(format_args!("RE3 #{seq:06} op  PIXFMT {}", match val { 1 => "RGB12", 2 => "CI12", 3 => "CI8", 4 => "RGB8", 5 => "RGB4", _ => "native" })),
+            re3::RE3_OP_ZCTL => t.file.line(format_args!("RE3 #{seq:06} op  ZCTL test={} func={} zmask={:#08x}", val & 1, (val >> 1) & 7, (val >> 8) & 0xff_ffff)),
+            re3::RE3_OP_STENCIL => t.file.line(format_args!("RE3 #{seq:06} op  STENCIL on={} func={} ref={} mask={:#x} wmask={:#x} ops fail={} zfail={} zpass={}",
                 val & 1, (val >> 1) & 7, (val >> 4) & 0xff, (val >> 12) & 0xff, (val >> 20) & 0xff, (val >> 28) & 0xf, (val >> 32) & 0xf, (val >> 36) & 0xf)),
-            re3::RE3_OP_BLEND => t.line(format_args!("RE3 #{seq:06} op  BLEND on={} src={} dst={}", val & 1, (val >> 1) & 7, (val >> 4) & 7)),
-            re3::RE3_OP_ALPHA => t.line(format_args!("RE3 #{seq:06} op  ALPHA start={:.3} step={:.5}", (val as u32) as f32 / 2048.0, ((val >> 32) as u32 as i32) as f32 / 2048.0)),
-            re3::RE3_OP_ZFILL_A => t.line(format_args!("RE3 #{seq:06} op  ZFILL rect ({}, {})-({}, {})", val & 0xffff, (val >> 16) & 0xffff, (val >> 32) & 0xffff, val >> 48)),
-            re3::RE3_OP_ZFILL_B => t.line(format_args!("RE3 #{seq:06} op  ZFILL value={:#010x} mask={:#010x}", val as u32, val >> 32)),
+            re3::RE3_OP_BLEND => t.file.line(format_args!("RE3 #{seq:06} op  BLEND on={} src={} dst={}", val & 1, (val >> 1) & 7, (val >> 4) & 7)),
+            re3::RE3_OP_ALPHA => t.file.line(format_args!("RE3 #{seq:06} op  ALPHA start={:.3} step={:.5}", (val as u32) as f32 / 2048.0, ((val >> 32) as u32 as i32) as f32 / 2048.0)),
+            re3::RE3_OP_ZFILL_A => t.file.line(format_args!("RE3 #{seq:06} op  ZFILL rect ({}, {})-({}, {})", val & 0xffff, (val >> 16) & 0xffff, (val >> 32) & 0xffff, val >> 48)),
+            re3::RE3_OP_ZFILL_B => t.file.line(format_args!("RE3 #{seq:06} op  ZFILL value={:#010x} mask={:#010x}", val as u32, val >> 32)),
             _ => {
                 let src = if addr & RE3_SRC_HQ != 0 { "hq " } else { "cpu" };
                 let reg = (addr & !RE3_SRC_HQ) as usize & 63;
@@ -191,7 +178,7 @@ impl Gr2 {
                     re3::REG_RWMODE => format!("  ({})", re3::rwmode_name(v)),
                     _ => String::new(),
                 };
-                t.line(format_args!("RE3 #{seq:06} {src} {} = {v:#x}{extra}", REG_NAMES[reg]));
+                t.file.line(format_args!("RE3 #{seq:06} {src} {} = {v:#x}{extra}", REG_NAMES[reg]));
             }
         }
     }
@@ -457,7 +444,7 @@ impl Gr2 {
         let t = self.trace.lock();
         let mask = self.trace_mask.load(Ordering::Relaxed);
         if mask != 0 {
-            writeln!(w, "  trace: {} ({}{}{}) hq={} re3={} cpu={} entries", t.path,
+            writeln!(w, "  trace: {} ({}{}{}) hq={} re3={} cpu={} entries", t.file.path(),
                 if mask & TRACE_HQ != 0 { "hq " } else { "" }, if mask & TRACE_RE3 != 0 { "re3 " } else { "" },
                 if mask & TRACE_CPU != 0 { "cpu" } else { "" }, t.hq_seq, t.re3_seq, t.cpu_seq)?;
         }
@@ -474,9 +461,8 @@ impl Gr2 {
                 self.trace_mask.store(0, Ordering::SeqCst);
                 let mut t = self.trace.lock();
                 t.close_run();
-                if let Some(mut f) = t.out.take() {
-                    let _ = f.flush();
-                    writeln!(w, "trace closed: {} (hq {} / re3 {} entries)", t.path, t.hq_seq, t.re3_seq)?;
+                if let Some((path, _)) = t.file.close() {
+                    writeln!(w, "trace closed: {path} (hq {} / re3 {} entries)", t.hq_seq, t.re3_seq)?;
                 } else {
                     writeln!(w, "trace not active")?;
                 }
@@ -495,19 +481,15 @@ impl Gr2 {
                         _ => TRACE_HQ | TRACE_RE3 | TRACE_CPU,
                     };
                 }
-                let f = match File::create(path) {
-                    Ok(f) => f,
-                    Err(e) => return writeln!(w, "cannot create {path}: {e}"),
-                };
                 let mut t = self.trace.lock();
-                t.out = Some(BufWriter::with_capacity(1 << 20, f));
-                t.path = path.to_string();
-                t.start = Some(Instant::now());
+                if let Err(e) = t.file.open(path) {
+                    return writeln!(w, "cannot create {path}: {e}");
+                }
                 t.hq_seq = 0;
                 t.re3_seq = 0;
                 t.cpu_seq = 0;
                 t.run = None;
-                t.line(format_args!("GR2 {} trace started (mask {mask:#x})", self.variant.name()));
+                t.file.line(format_args!("GR2 {} trace started (mask {mask:#x})", self.variant.name()));
                 drop(t);
                 self.trace_mask.store(mask, Ordering::SeqCst);
                 writeln!(w, "tracing to {path}")?;
