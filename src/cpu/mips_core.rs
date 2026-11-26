@@ -1590,24 +1590,6 @@ impl MipsCore {
     /// Write a GPR by index. Unconditionally re-zeros gpr\[0\] to avoid a branch.
     #[inline(always)]
     pub fn write_gpr(&mut self, reg: u32, value: u64) {
-        // IP28 bring-up: `IRIS_IP28_WATCHGPR=<n>` reports every write to that
-        // GPR with the PC that did it. One cached bool and a compare against a
-        // register number already in hand; unarmed it is a predictable branch.
-        #[cfg(debug_assertions)]
-        let _ = ();
-        {
-            static WATCH: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-            let watch = *WATCH.get_or_init(|| {
-                std::env::var("IRIS_IP28_WATCHGPR").ok().and_then(|v| v.trim().parse().ok())
-            });
-            if watch == Some(reg) {
-                // The register number is a parameter, so it stays an
-                // environment variable; only the output moves, so it can be
-                // redirected with `log mips file <path>`.
-                crate::dlog!(crate::devlog::LogModule::Mips,
-                             "ip28gpr: ${reg} = {value:#018x} at pc={:#018x}", self.pc);
-            }
-        }
         unsafe { *self.gpr.get_unchecked_mut(reg as usize) = value; }
         self.gpr[0] = 0;
     }
