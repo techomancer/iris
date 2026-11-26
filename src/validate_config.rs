@@ -122,7 +122,6 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
             ("machine.serial_port_d", cfg.tezro.serial_port_d.unwrap_or(8884)),
         ]),
         MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => ports.push(l1(cfg.ip35_section().l1_port)),
-        MachineProfile::O2Ip32 => ports.extend(cfg.o2.control_port.map(|p| ("machine.control_port", p))),
         _ => {}
     }
     let virtio = &cfg.virtio_serial;
@@ -270,10 +269,6 @@ mod tests {
         assert!(problems(&cfg).iter().any(|p| p == "machine.serial_port_c and serial_port_b both use port 8881"), "{:?}", problems(&cfg));
         cfg.tezro.serial_port_c = None;
         assert!(!problems(&cfg).iter().any(|p| p.contains("both use port")), "{:?}", problems(&cfg));
-        cfg.machine.profile = MachineProfile::O2Ip32;
-        cfg.o2.control_port = Some(8888);
-        assert!(problems(&cfg).iter().any(|p| p == "machine.control_port and monitor_port both use port 8888"), "{:?}", problems(&cfg));
-        cfg.o2.control_port = None;
         cfg.virtio_serial.enabled = true;
         cfg.serial_port_a = Some(8890);
         assert!(problems(&cfg).iter().any(|p| p == "virtio_serial tcp_port and serial_port_a both use port 8890"), "{:?}", problems(&cfg));

@@ -320,20 +320,6 @@ impl O2Machine {
         let display = Arc::new(O2Display::new(bus.clone(), status.clone(), paused.clone()));
         let head: Arc<dyn crate::display::Head> = display.clone();
         display.head.attach(Arc::downgrade(&head));
-        if let Some(port) = o2.control_port {
-            match std::net::TcpListener::bind(("127.0.0.1", port)) {
-                Ok(l) => {
-                    eprintln!("iris: O2 control on 127.0.0.1:{port} (the monitor's `o2` commands; `help o2` there lists them)");
-                    let bus = bus.clone();
-                    let reg = crate::ports::register("tcp", format!("127.0.0.1:{port}"), "O2 control");
-                    std::thread::Builder::new().name("O2-Control".into()).spawn(move || {
-                        let _port = reg;
-                        control_server(l, bus)
-                    }).unwrap();
-                }
-                Err(e) => eprintln!("iris: O2 control port {port}: {e}"),
-            }
-        }
         // The shared monitor, as the other machines have it: the CPU's
         // commands (registers, breakpoints, memory) and the O2's devices'.
         let monitor = crate::monitor::Monitor::new();
@@ -431,7 +417,7 @@ impl O2Machine {
             LAST_REGS[37].store(exec.core.cp0_compare, Ordering::Relaxed);
             LAST_REGS[38].store(exec.core.hot.interrupts.load(Ordering::Relaxed), Ordering::Relaxed);
             LAST_REGS[39].store(exec.core.fasttick_count.load(Ordering::Relaxed), Ordering::Relaxed);
-            // Instructions retired, for an idle-MIPS reading over the control port.
+            // Instructions retired, for an idle-MIPS reading from `o2 regs`.
             LAST_REGS[40].store(exec.core.hot.cycles, Ordering::Relaxed);
             LAST_REGS[41].store(exec.core.cp0_config as u64, Ordering::Relaxed);
             if !boot.post_done.load(Ordering::Relaxed) {
@@ -1123,19 +1109,6 @@ impl crate::gfx_display::GfxDisplay for O2Display {
     }
 }
 
-/// The control port: one command per line, one reply line each (`ok ...` or
-/// `err ...`). For scripts and for an assistant driving the machine while a
-/// person watches its window.
-///
-/// - `shot PATH`: the screen as a PNG.
-/// - `type TEXT`: type it on the PS/2 keyboard (`\r` Enter, `\e` Escape,
-///   `\b` Backspace, `\t` Tab).
-/// - `key NAME`, `keydown NAME`, `keyup NAME`: a key by its winit name
-///   (`Enter`, `KeyA`, `F1`, `ShiftLeft`, `ArrowUp`...).
-/// - `mouse DX DY [BUTTONS]`: move by DX, DY (screen pixels, y down) with
-///   BUTTONS held (1 left, 2 right, 4 middle).
-/// - `click [BUTTON]`: press and release (default 1, left).
-/// - `status`: what the display is showing, and the GBE registers behind it.
 /// Where the CPU was at the end of its last batch, and how many batches it
 /// has run: enough to tell a guest spinning in one place from one that is
 /// still moving, without stopping it.
@@ -1146,8 +1119,8 @@ static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static LAST_REGS: [std::sync::atomic::AtomicU64; 42] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 42];
 
-/// The control commands on the shared monitor, as `o2 <command> [args]`:
-/// the same commands, and replies, as the control port's.
+/// The O2's own diagnostics on the shared monitor, as `o2 <command> [args]`.
+/// Each replies with one line, `ok ...` or `err ...`.
 struct O2Control {
     bus: Arc<Ip32Bus>,
     rgba: Mutex<Vec<u8>>,
@@ -1167,8 +1140,7 @@ impl Device for O2Control {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("o2".to_string(), "O2 control: o2 shot PATH | status | pixel X Y | type TEXT | key|keydown|keyup NAME | \
-            mouse DX DY [BUTTONS] | click [BUTTON] | pc | regs | peek ADDR LEN PATH | \
+        vec![("o2".to_string(), "O2 diagnostics: o2 status | pixel X Y | pc | regs | peek ADDR LEN PATH | \
             retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH".to_string())]
     }
 
@@ -1184,37 +1156,8 @@ impl Device for O2Control {
     }
 }
 
-fn control_server(listener: std::net::TcpListener, bus: Arc<Ip32Bus>) {
-    use std::io::{BufRead, BufReader, Write};
-    for conn in listener.incoming().flatten() {
-        let bus = bus.clone();
-        let _ = std::thread::Builder::new().name("O2-Control-Client".into()).spawn(move || {
-            let mut out = match conn.try_clone() {
-                Ok(o) => o,
-                Err(_) => return,
-            };
-            let mut rgba = vec![0u8; 2048 * 2048 * 4];
-            for line in BufReader::new(conn).lines().map_while(Result::ok) {
-                let (cmd, arg) = line.trim_end().split_once(' ').unwrap_or((line.trim_end(), ""));
-                let reply = control_command(&bus, cmd, arg, &mut rgba);
-                if writeln!(out, "{reply}").is_err() {
-                    break;
-                }
-            }
-        });
-    }
-}
-
 fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> String {
-    let kb = bus.mace.ps2.devices();
     match cmd {
-        "shot" => match bus.render_screen(rgba) {
-            Some((w, h)) => match crate::disp::save_png_rgba8(arg, &rgba[..(w * h * 4) as usize], w, h) {
-                Ok(()) => format!("ok {w}x{h}"),
-                Err(e) => format!("err {e}"),
-            },
-            None => "err display off".into(),
-        },
         "pc" => format!(
             "ok pc 0x{:08x} after {} batches",
             LAST_PC.load(Ordering::Relaxed),
@@ -1302,62 +1245,6 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         "status" => {
             let shown = bus.render_screen(rgba);
             format!("ok display {shown:?}; {}", bus.gbe.summary())
-        }
-        _ if kb.is_none() => "err no keyboard or mouse (graphics = false)".into(),
-        "type" => {
-            let kb = kb.unwrap();
-            let text = arg.replace("\\r", "\r").replace("\\e", "\x1b").replace("\\b", "\x08").replace("\\t", "\t");
-            let mut n = 0;
-            for c in text.chars() {
-                if c == '\t' {
-                    kb.push_kb(winit::keyboard::KeyCode::Tab, true);
-                    kb.push_kb(winit::keyboard::KeyCode::Tab, false);
-                    n += 1;
-                } else if kb.type_char(c) {
-                    n += 1;
-                }
-            }
-            format!("ok {n}")
-        }
-        "key" | "keydown" | "keyup" => match crate::ip32_screen::keycode(arg.trim()) {
-            Some(k) => {
-                let kb = kb.unwrap();
-                if cmd != "keyup" {
-                    kb.push_kb(k, true);
-                }
-                if cmd != "keydown" {
-                    kb.push_kb(k, false);
-                }
-                "ok".into()
-            }
-            None => format!("err no key {arg:?}"),
-        },
-        "mouse" => {
-            let v: Vec<i32> = arg.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-            if v.len() < 2 {
-                return "err mouse DX DY [BUTTONS]".into();
-            }
-            let buttons = v.get(2).copied().unwrap_or(0) as u8;
-            let kb = kb.unwrap();
-            // A PS/2 packet carries at most 255 either way: send big moves in steps.
-            let (mut dx, mut dy) = (v[0], v[1]);
-            loop {
-                let (sx, sy) = (dx.clamp(-200, 200), dy.clamp(-200, 200));
-                kb.push_mouse_input(buttons, sx, sy, 0);
-                dx -= sx;
-                dy -= sy;
-                if dx == 0 && dy == 0 {
-                    break;
-                }
-            }
-            "ok".into()
-        }
-        "click" => {
-            let b: u8 = arg.trim().parse().unwrap_or(1);
-            let kb = kb.unwrap();
-            kb.push_mouse_input(b, 0, 0, 0);
-            kb.push_mouse_input(0, 0, 0, 0);
-            "ok".into()
         }
         _ => format!("err unknown command {cmd:?}"),
     }

@@ -230,7 +230,7 @@ pub struct Gbe {
     pub hot: Mutex<BTreeMap<u32, u64>>,
     /// Time in microseconds (MACE UST).
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// The control port's `pixel X Y`: the point to describe on the next
+    /// The monitor's `o2 pixel X Y`: the point to describe on the next
     /// frame, and what the scan-out found there.
     pub probe: Mutex<(Option<(usize, usize)>, String)>,
     /// The four vertical-timing interrupts, into CRIME's latched inputs
@@ -3833,7 +3833,7 @@ mod tests {
     }
 
     /// Replay a recorded register trace (IRIS_IP32_RE_TRACE, saved with the
-    /// control port's `retrace`) into a fresh RE and save what TLB A shows
+    /// `o2 retrace`) into a fresh RE and save what TLB A shows
     /// at 32 bpp as a PNG: RE_REPLAY=trace RE_REPLAY_PNG=out.png. CPU writes
     /// to the frame buffer are not in the trace, so only drawing shows.
     #[test]

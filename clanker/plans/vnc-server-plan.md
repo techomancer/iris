@@ -114,8 +114,8 @@ Own implementation, std::net, thread per client like the monitor/CI socket
 → map to `KeyCode`, layout-independent; TigerVNC and noVNC send it). Fallback:
 X keysym → `KeyCode` table for a US layout (`src/keysym.rs`), mapping a
 shifted symbol to its physical key. Clients already send Shift
-themselves. The same table backs monitor `key NAME` and can replace
-`ip32_screen::keycode`.
+themselves. The same table backs monitor `key NAME` and the O2's key
+commands, which had a table of their own.
 
 **Pointer: closed loop on the hardware cursor.** VNC gives absolute
 positions; the guest wants relative PS/2 packets that X then accelerates.
