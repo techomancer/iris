@@ -829,10 +829,6 @@ mistaken for GUI settings.
 | `IRIS_IDLE_SLICE_US` | `idle-pause` builds, on a multiprocessor: the longest park in microseconds while every CPU is idle (default 10000); a CPU that ran an interrupt handler or other work wakes the others sooner. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_IDLE_WARMUP_SECS` | `idle-pause` builds: seconds after CPU start before idle parking engages (default 60; 0 disables the warm-up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_INTRUN` | Integer interrupt-check coalescing budget for JIT v2 code; also used by offline tools. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs), [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
-| `IRIS_IP28_CACHEOPS` | Presence traces cache ops in the legacy R10K cache model; all broadens logging. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
-| `IRIS_IP28_EXC_VADDR` | IP28 exception virtual-address trace filter. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
-| `IRIS_IP28_TLBW` | wired enables extra IP28 Wired/TLB-write tracing. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
-| `IRIS_IP28_WATCH` | IP28 physical-address/window access trace filter. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
 | `IRIS_IP28_WATCHGPR` | Guest GPR index whose writes are traced in IP28 bring-up. | [src/cpu/mips_core.rs](src/cpu/mips_core.rs) |
 | `IRIS_IP30_TRACE` | Any presence logs the Octane's first distinct unmapped accesses and enables HEART diagnostic tracing. | [src/ip30.rs](src/ip30.rs), [src/dev/heart.rs](src/dev/heart.rs) |
 | `IRIS_IP32_HOT` | Any presence counts O2 register accesses (MACE, GBE, rendering engine) for finding a driver polling a bit nothing sets; costs speed. | [src/ip32.rs](src/ip32.rs) |

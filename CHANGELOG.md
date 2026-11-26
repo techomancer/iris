@@ -56,6 +56,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Indigo2s now have an EISA bus with every slot empty: `hinv` lists
   "EISA bus: adapter 0". Indigo2s no longer show a VINO (an Indy-only chip).
 - `mc regs` lists the last 16 values written to CTRLD.
+- The `IRIS_IP28_*` debug environment variables and `log mips mask cp0` are gone.
 
 ### GR2 (XZ and Extreme)
 

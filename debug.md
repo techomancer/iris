@@ -662,7 +662,7 @@ function started that reached no memory, and each interrupt pin's edges
 and the HEART vector it sets or clears. `heart` logs HEART's register
 accesses, one counter read in 256 with the host's clock, and every
 interrupt vector raised or lowered. Mask categories: `pdma` —
-`hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
+`hal enet scsi`; `mips` — `insn tlb mem fpu`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
 every module also takes `on`/`all`, `off`/`none` or a hex mask.
 `bedrock` covers the devices of the Bedrock node (Fuel, Tezro, Origin 3200,
