@@ -1351,22 +1351,21 @@ fn combine_host_dda<M: Mode>(ctx: &Rex3Context, m: &M, host_pixel: u32) -> u32 {
 #[inline(always)]
 pub fn fastclear_color<M: Mode>(ctx: &Rex3Context, m: &M) -> u32 {
     let v = ctx.colorvram;
+    // RGB mode: COLORVRAM holds a 24-bit BGR colour, packed to the plane
+    // depth without dither (the spec loads it after RGBMODE and DRAWDEPTH).
+    // CI mode: it already holds a plane-depth index.
+    let rgb = m.rgbmode() != 0;
     match m.drawdepth() {
         DRAWMODE1_DRAWDEPTH_4 => {
-            let c = v & 0xf;
+            let c = if rgb { rgb24_to_rgb4(v) } else { v & 0xf };
             c | (c << 4) | (c << 8) | (c << 16)
         }
         DRAWMODE1_DRAWDEPTH_8 => {
-            let c = v & 0xff;
+            let c = if rgb { rgb24_to_rgb8(v) } else { v & 0xff };
             c | (c << 8) | (c << 16)
         }
         DRAWMODE1_DRAWDEPTH_12 => {
-            // 12bpp: RGB mode takes nibbles from colorvram, CI the low 12 bits.
-            let c = if m.rgbmode() != 0 {
-                ((v & 0xf00000) >> 12) | ((v & 0xf000) >> 8) | ((v & 0xf0) >> 4)
-            } else {
-                v & 0x000fff
-            };
+            let c = if rgb { rgb24_to_rgb12(v) } else { v & 0x000fff };
             c | (c << 12)
         }
         _ => v & 0xffffff,

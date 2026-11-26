@@ -4372,6 +4372,28 @@ mod jit_tests {
         );
     }
 
+    /// RGB fastclear at the packed depths: the JIT packs COLORVRAM as the
+    /// interpreter does (fastclear_packs_colorvram_to_the_rgb_plane_depth
+    /// pins the interpreter's value).
+    #[test]
+    fn jit_fastclear_rgb_packed_depths() {
+        for depth in [DRAWMODE1_DRAWDEPTH_4, DRAWMODE1_DRAWDEPTH_8, DRAWMODE1_DRAWDEPTH_12] {
+            let dm1 = DRAWMODE1_PLANES_RGB | (depth << 3) | (1 << 15)
+                | DRAWMODE1_LOGICOP_SRC_SH | (1 << 17);
+            compare_jit_interp(0, 0, 15, 7,
+                |rex| {
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK,    0xFFFFFF);
+                    reg(rex, REX3_CLIPMODE,  0xF << 9);
+                    reg(rex, REX3_COLORVRAM, 0x00ff_9224);
+                    reg(rex, REX3_XYENDI,    xy(15, 7));
+                    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+                },
+                DM0_DRAW_BLOCK, dm1,
+            );
+        }
+    }
+
     /// RGB24 solid fill span.
     #[test]
     fn jit_solid_fill_span_rgb24() {
@@ -9547,6 +9569,40 @@ fn test_span_end_leaves_y_and_x_past_end() {
 // ("Where IRIS diverges from real hardware"). A change to either side should
 // fail a test here rather than show up as an OS-only bug.
 // ============================================================================
+
+/// Fastclear a 4x2 block in RGB mode at `depth` and return the stored word.
+fn fastclear_rgb_and_sample(rex: &Rex3, depth: u32, colorvram: u32) -> u32 {
+    reg(rex, REX3_DRAWMODE1, DRAWMODE1_PLANES_RGB | (depth << 3) | (1 << 15)
+        | DRAWMODE1_LOGICOP_SRC_SH | (1 << 17));
+    reg(rex, REX3_WRMASK,    0xFFFFFF);
+    reg(rex, REX3_CLIPMODE,  0xF << CLIPMODE_CIDMATCH_SHIFT);
+    // After DRAWMODE1, as the spec requires (§3.5.5).
+    reg(rex, REX3_COLORVRAM, colorvram);
+    reg(rex, REX3_XYENDI,    xy(3, 1));
+    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    read_pixel(rex, 2, 1)
+}
+
+/// In RGB mode COLORVRAM is a 24-bit BGR colour that a fastclear packs to the
+/// plane depth, as every other RGB write does: 1:2:1 at 4bpp, 2:3:3 at 8bpp,
+/// 4:4:4 at 12bpp. Xsgi clears 8-bit TrueColor windows this way; taking the
+/// low bits instead stored the red byte, so every fill came out as a red ramp.
+#[test]
+fn fastclear_packs_colorvram_to_the_rgb_plane_depth() {
+    let rex = &make_rex3();
+    rex3init(rex);
+    // 0xBBGGRR: R 0x24 (1/7), G 0x92 (4/7), B 0xff (3/3).
+    let bgr = 0x00ff_9224;
+    let px = fastclear_rgb_and_sample(rex, DRAWMODE1_DRAWDEPTH_8, bgr);
+    assert_eq!(px & 0xff, 3 << 6 | 4 << 3 | 1, "8bpp: B2 G3 R3");
+    let px = fastclear_rgb_and_sample(rex, DRAWMODE1_DRAWDEPTH_4, bgr);
+    assert_eq!(px & 0xf, 1 << 3 | 2 << 1, "4bpp: B1 G2 R1");
+    let px = fastclear_rgb_and_sample(rex, DRAWMODE1_DRAWDEPTH_12, bgr);
+    assert_eq!(px & 0xfff, 0xf92, "12bpp: B4 G4 R4");
+    let px = fastclear_rgb_and_sample(rex, DRAWMODE1_DRAWDEPTH_24, bgr);
+    assert_eq!(px & 0xff_ffff, bgr, "24bpp: as written");
+}
 
 /// `DRAWMODE1.PLANES=RGB`, 24bpp, with the caller's LOGICOP/COMPARE.
 const DM1_RGB24_PLANES: u32 = DRAWMODE1_PLANES_RGB

@@ -87,6 +87,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The older `rex-gpu` feature and its `IRIS_REX3_GPU` switch are gone:
   `raster = "wgpu"` is the one way to draw Newport on the host GPU.
 
+### Newport 8-bit TrueColor
+
+- On Indy and Indigo2 Newport, solid fills in 8-bit (and 4- and 12-bit)
+  TrueColor X windows draw their colour; they came out as a red ramp. Same
+  on the CPU, the REX3 JIT and the GPU raster.
+
 ### Newport colour-index shading
 
 - With the REX3 JIT (always on in iris-gui), smooth-shaded colour-index

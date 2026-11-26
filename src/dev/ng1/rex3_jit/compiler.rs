@@ -578,10 +578,16 @@ fn emit_pixel_write(
     // Mirrors fastclear_color / blend / logic_op paths in process_pixel_draw.
     // colorhost beats fastclear
     let result_val: Value = if dm1.fastclear() && !color_host {
-        // fastclear_color: replicate colorvram nibble/byte/etc into all plane slots
+        // fastclear_color: in RGB mode pack the 24-bit colorvram to the plane
+        // depth (no dither), then replicate it into all plane slots.
+        let packed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
+            emit_compress_ir(b, pctx.colorvram_v, dm1.drawdepth(), false)
+        } else {
+            pctx.colorvram_v
+        };
         match dm1.drawdepth() {
             0 => {
-                let c   = b.ins().band_imm_s(pctx.colorvram_v, 0xf);
+                let c   = b.ins().band_imm_s(packed, 0xf);
                 let c4  = b.ins().ishl_imm_s(c, 4);
                 let c8  = b.ins().ishl_imm_s(c, 8);
                 let c16 = b.ins().ishl_imm_s(c, 16);
@@ -590,29 +596,16 @@ fn emit_pixel_write(
                 b.ins().bor(r1, r2)
             }
             1 => {
-                let c   = b.ins().band_imm_s(pctx.colorvram_v, 0xff);
+                let c   = b.ins().band_imm_s(packed, 0xff);
                 let c8  = b.ins().ishl_imm_s(c, 8);
                 let c16 = b.ins().ishl_imm_s(c, 16);
                 let r1 = b.ins().bor(c, c8);
                 b.ins().bor(r1, c16)
             }
             2 => {
-                if dm1.rgbmode() {
-                    let hi  = b.ins().band_imm_s(pctx.colorvram_v, 0xf00000i64);
-                    let his = b.ins().ushr_imm_s(hi, 12);
-                    let mid = b.ins().band_imm_s(pctx.colorvram_v, 0xf000i64);
-                    let mids= b.ins().ushr_imm_s(mid, 8);
-                    let lo  = b.ins().band_imm_s(pctx.colorvram_v, 0xf0i64);
-                    let los = b.ins().ushr_imm_s(lo, 4);
-                    let r1  = b.ins().bor(his, mids);
-                    let c   = b.ins().bor(r1, los);
-                    let c12 = b.ins().ishl_imm_s(c, 12);
-                    b.ins().bor(c, c12)
-                } else {
-                    let c   = b.ins().band_imm_s(pctx.colorvram_v, 0xfffi64);
-                    let c12 = b.ins().ishl_imm_s(c, 12);
-                    b.ins().bor(c, c12)
-                }
+                let c   = b.ins().band_imm_s(packed, 0xfffi64);
+                let c12 = b.ins().ishl_imm_s(c, 12);
+                b.ins().bor(c, c12)
             }
             _ => b.ins().band_imm_s(pctx.colorvram_v, 0xffffffi64),
         }

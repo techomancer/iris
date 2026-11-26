@@ -56,7 +56,7 @@ REX3 handles colors as multi-part values to enable highly precise, drift-free Go
     *   `0x0210` **SLOPERED**, `0x0214` **SLOPEALPHA**, `0x0218` **SLOPEGRN**, `0x021C` **SLOPEBLUE**: Color delta per pixel for shading. Written format is `s(7)12.11` (sign bit, 7 unused, 12 integer, 11 fraction). Can be written as signed magnitude and the hardware converts it to two's complement.
 *   **Special Colors:**
     *   `0x0018` **COLORBACK**: Background color used for opaque stippling (drawing "off" bits as solid) or as a constant destination blend color.
-    *   `0x001C` **COLORVRAM**: Fastclear color. Injected into VRAM during hardware blockfill passes.
+    *   `0x001C` **COLORVRAM**: Fastclear color. Injected into VRAM during hardware blockfill passes. Write it after DRAWMODE1's RGBMODE and DRAWDEPTH: in RGB mode it is a 24-bit BGR colour, packed to the plane depth like any other RGB write (1:2:1 at 4 bits, 2:3:3 at 8, 4:4:4 at 12, without dither); in CI mode it is the index itself.
 
 ### 6. Stipple, Pattern, & Host Data Registers
 *   `0x0008` **LSMODE**: Line stipple mode register. Sets length (`LSLENGTH`) and repeat factor (`LSREPEAT`).
