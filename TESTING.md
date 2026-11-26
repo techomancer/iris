@@ -371,18 +371,6 @@ anchor is held, after guard release, and after anchor removal:
 REX3_CORPUS_IO_DIR=target cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_filesystem_security -- --ignored --nocapture
 ```
 
-The hardware GPU gate is explicitly ignored unless selected. It requires an
-integrated/discrete adapter, checks nonzero handled work and declared
-fallbacks, and reports unavailable hardware rather than passing it. The batch
-case compares framebuffer state and completed readback at the instant the
-display fence is published, before any subsequent idle flush. The second
-selected GPU test injects an early signal and requires this check to reject
-stale pixels even when the later final state matches:
-
-```sh
-REX3_GPU_BACKEND=vulkan cargo test -p iris --lib --features rex-gpu,rex-jit,rexdiag rex3_corpus_gpu_ -- --ignored --nocapture --test-threads=1
-```
-
 The **resident Newport raster** has CPU-only limit, status and GFIFO gate
 tests, plus ignored hardware parity tests. Production activation uses the same
 backend; the hardware tests retain direct injection so they can isolate plane
@@ -755,10 +743,9 @@ compiles the `iris` crate fewer times than the others: it skips
 `cargo build --workspace` and the SIMD lane step because nextest builds and
 runs the same code, and runs the REX3 replay corpus tests in the same build
 (the one ignored filesystem test runs in a second invocation over that build).
-`rex-gpu` is not in either set: it turns on the whole `wgpu` feature, whose GPU
-suites need a named adapter. The other platforms only compile it, with a
-`cargo check` of the `rex3-gpu-probe` example. Pull requests restore `main`'s
-build cache but never save one, so they cannot push `main`'s entries out of the
+Neither set includes `wgpu`: its GPU suites need a named adapter, so Windows and
+macOS only run `cargo check -p iris --lib --features wgpu`. Pull requests
+restore `main`'s build cache but never save one, so they cannot push `main`'s entries out of the
 repository's cache quota. The Linux, AppImage and Windows package builds in
 `build.yml` cache only the cargo registry and git checkouts, not their target
 trees.

@@ -11,8 +11,7 @@ compatibility when requested. The exact dual-backend gate and the production
 lifecycle matrix pass on Vulkan and D3D12. An installed IRIX 6.5 desktop,
 Showcase and the animated Atlantis demo also pass on CPU raster and both
 resident backends with matching pixels, zero unsupported work, no fallback,
-bounded presentation latency and better live command throughput. The
-tile-binned `IRIS_REX3_GPU` prototype remains separate and CPU-canonical.
+bounded presentation latency and better live command throughput.
 The submission branch remains cumulative with #757 and #758 until those
 prerequisites merge. Its isolated M9-M16 delta is one commit; rebase that
 commit onto current upstream after the prerequisites land.
@@ -165,8 +164,7 @@ for the proper accelerated path receives wgpu for both.
 This matrix is now available in the standalone `iris` frontend. Newport
 `raster = "wgpu"` defaults to direct same-device wgpu presentation and fails
 startup rather than falling back to GL/CPU. `newport_mode = "readback"`
-explicitly selects the slow compatibility path. The separate
-`IRIS_REX3_GPU` experiment remains CPU-canonical and mutually exclusive.
+explicitly selects the slow compatibility path.
 `iris-gui` still lacks a direct eframe wgpu presenter and therefore cannot
 host the proper visible direct mode. A build with the iris-gui `wgpu` feature
 can deliberately host resident Newport through `newport_mode = "readback"`.
@@ -175,8 +173,8 @@ can deliberately host resident Newport through `newport_mode = "readback"`.
 
 ### Current REX3 experiment
 
-The current implementation and measurements are described in
-[rex3-gpu-parallelization.md](rex3-gpu-parallelization.md).
+The earlier `rex-gpu` prototype has been removed. Its design and measurements
+are in `clanker/plans/rex3-gpu-parallelization.md` as of commit 5782a35d5.
 
 Useful pieces to retain:
 
@@ -704,11 +702,10 @@ presentation or the common wgpu presenter.
 Completed 2026-11-10. The referenced `wgpuopt` commits were already ancestors
 of the updated main branch, so none were cherry-picked. Main uses upstream
 wgpu 30.0.1 and has no active vendored wgpu-core override to preserve. The
-legacy `rex-gpu` prototype now builds on the common `Arc<Gpu>` and exposes it
-through `GfxDisplay`, so a wgpu window reuses the same device. The prototype
-still synchronizes through its CPU-canonical framebuffer. The later
-production activation gives Newport `raster = "wgpu"` its distinct
-GPU-authoritative meaning rather than selecting this prototype.
+legacy `rex-gpu` prototype (since removed) then built on the common
+`Arc<Gpu>` and exposed it through `GfxDisplay`, so a wgpu window reused the
+same device. The later production activation gave Newport `raster = "wgpu"`
+its GPU-authoritative meaning.
 
 ### M1 - Full authoritative GPU planes
 
@@ -733,7 +730,7 @@ fences and direct test frames. Explicit selected-plane observation returns a
 snapshot; the caller separately installs and acknowledges a CPU shadow.
 Quiescent reset/reseed and partial restore are tested. This does not expose a
 live raster selector or implement board-level HOSTR, snapshots or other raw
-consumers; the legacy `rex-gpu` replay/live prototype remains CPU-canonical.
+consumers.
 
 ### M2 - Direct wgpu scanout
 
@@ -1187,8 +1184,7 @@ Production configuration uses `[graphics] raster = "wgpu"` in a build with
 the `wgpu` feature. `newport_mode = "direct"` is the default.
 `newport_mode = "readback"` is an explicit slow compatibility/validation
 selection and never a fallback. Explicit Metal and GL resident backends are
-rejected; `auto` must resolve to Vulkan or D3D12. `IRIS_REX3_GPU` cannot be
-combined with this mode.
+rejected; `auto` must resolve to Vulkan or D3D12.
 
 Live embedded-PROM boots on Vulkan and D3D12 each accepted 7,319 operations
 and 204 architectural no-ops with zero unsupported work. Direct offscreen

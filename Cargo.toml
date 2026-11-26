@@ -193,11 +193,6 @@ embedded-proms = []
 rex-dirty-upload = []
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
-# Host-GPU prototype for REX3 replay and opt-in live experiments. This is
-# deliberately separate from `gpujit`: it builds on the opt-in damage tracker
-# and the common wgpu device/presentation layer. The live CPU renderer remains
-# the default.
-rex-gpu = ["gputrace", "rex-dirty-upload", "wgpu"]
 # Host-GPU rasterisation on wgpu: board memory on the GPU, primitives binned
 # into 8x8 tiles and rasterised by compute kernels (src/wgpu, and
 # src/dev/<board>/wgpu for each board). See clanker/plans/wgpu-raster.md.
@@ -501,11 +496,6 @@ required-features = ["jitv2", "j2wp"]
 [[example]]
 name = "ultra64-peer"
 path = "examples/ultra64_peer.rs"
-
-[[example]]
-name = "rex3-gpu-probe"
-path = "examples/rex3_gpu_probe.rs"
-required-features = ["rex-gpu"]
 
 # Mac App Store fix (guideline 2.5.1): eframe's winit (0.30) calls the private
 # SkyLight API `CGSSetWindowBackgroundBlurRadius`, whose symbol Apple's binary

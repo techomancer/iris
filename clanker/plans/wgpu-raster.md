@@ -37,8 +37,8 @@ again, not a host-GL approximation (that path was tried for VPro and
 retired; see `odyssey-quad-pipeline.md`).
 
 Newport (REX3) is out of scope: its primitives are spans, and no batching
-amortises a GPU round trip over a span. See the `rex-gpu` replay prototype
-for what that looks like.
+amortises a GPU round trip over a span (the since-removed `rex-gpu`
+prototype measured that).
 
 ## Why compute, and why nothing is mapped
 

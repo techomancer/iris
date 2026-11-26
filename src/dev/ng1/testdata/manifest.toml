@@ -9,10 +9,6 @@ cpu_features = [
     "rex-jit",
     "rexdiag",
 ]
-gpu_features = [
-    "rex-gpu",
-    "rexdiag",
-]
 
 [[case]]
 name = "overlap_windows"
@@ -22,7 +18,6 @@ tags = [
     "rgb24",
     "blocks",
     "overlap",
-    "gpu-eligible",
 ]
 records = 35
 read_transactions = 2
@@ -37,12 +32,8 @@ checkpoint_indices = [
 cpu_compiled_go = 4
 cpu_interpreter_fallback = 0
 compiled_shapes = 1
-gpu_handled = 4
-gpu_interpreter_fallback = 0
 display_fences = 0
 blake3 = "ac33152e2796df78595fa526ef7dbfdfa527301e1d64d403a079fb14b50364d4"
-
-[case.gpu_fallback_reasons]
 
 [[case.probes]]
 x = 15
@@ -76,7 +67,6 @@ intent = "Thirty-two independent 1,200-pixel RGB24 spans."
 tags = [
     "rgb24",
     "span-1200",
-    "gpu-eligible",
 ]
 records = 78
 read_transactions = 1
@@ -91,12 +81,8 @@ checkpoint_indices = [
 cpu_compiled_go = 32
 cpu_interpreter_fallback = 0
 compiled_shapes = 1
-gpu_handled = 32
-gpu_interpreter_fallback = 0
 display_fences = 0
 blake3 = "e004c7ae1dae152ecaa65c9755f6372c0aa6f85240cbe90182b28947e6d11e15"
-
-[case.gpu_fallback_reasons]
 
 [[case.probes]]
 x = 10
@@ -122,7 +108,6 @@ tags = [
     "8x8",
     "span-8",
     "single-pixel",
-    "gpu-eligible",
 ]
 records = 198
 read_transactions = 1
@@ -137,12 +122,8 @@ checkpoint_indices = [
 cpu_compiled_go = 88
 cpu_interpreter_fallback = 0
 compiled_shapes = 2
-gpu_handled = 88
-gpu_interpreter_fallback = 0
 display_fences = 0
 blake3 = "6132da489ef494aa5460c37ded69913a0824fd6a8471e216c23d2218dd5b87e9"
-
-[case.gpu_fallback_reasons]
 
 [[case.probes]]
 x = 100
@@ -179,7 +160,6 @@ tags = [
     "hostw",
     "hostr",
     "residual-shifter",
-    "mixed-fallback",
 ]
 records = 33
 read_transactions = 2
@@ -195,16 +175,10 @@ checkpoint_indices = [
 cpu_compiled_go = 4
 cpu_interpreter_fallback = 0
 compiled_shapes = 4
-gpu_handled = 1
-gpu_interpreter_fallback = 3
 display_fences = 0
 residual_shifter = "9100000000000000"
 residual_count = 1
 blake3 = "9b3e0cd162c37fce1163736b95ae11696d3d77fccc82a13a6036fa6dc42b69d5"
-
-[case.gpu_fallback_reasons]
-opcode = 1
-"primitive shape" = 2
 
 [[case.probes]]
 x = 8
@@ -236,7 +210,6 @@ tags = [
     "hostr",
     "dma-bulk",
     "dma-read",
-    "mixed-fallback",
 ]
 records = 30
 read_transactions = 2
@@ -252,14 +225,8 @@ checkpoint_indices = [
 cpu_compiled_go = 4
 cpu_interpreter_fallback = 0
 compiled_shapes = 3
-gpu_handled = 1
-gpu_interpreter_fallback = 3
 display_fences = 0
 blake3 = "a17d938558b8607a45a944de04795f3533a6bf45880e2d716982b4f713cde3e8"
-
-[case.gpu_fallback_reasons]
-opcode = 2
-"primitive shape" = 1
 
 [[case.probes]]
 x = 1
@@ -289,8 +256,6 @@ tags = [
     "rgb24",
     "smask0",
     "ci8",
-    "mixed-fallback",
-    "gpu-resume",
 ]
 records = 40
 read_transactions = 1
@@ -305,14 +270,8 @@ checkpoint_indices = [
 cpu_compiled_go = 4
 cpu_interpreter_fallback = 0
 compiled_shapes = 3
-gpu_handled = 2
-gpu_interpreter_fallback = 2
 display_fences = 0
 blake3 = "7532d5f32592aca180eaefd7ba0605eab894ff9e6cece0b52d353a26b666468d"
-
-[case.gpu_fallback_reasons]
-"clip mode" = 1
-"pixel format" = 1
 
 [[case.probes]]
 x = 30
@@ -348,7 +307,6 @@ tags = [
     "overlap",
     "batch-1024",
     "display-fence",
-    "gpu-eligible",
 ]
 records = 1046
 read_transactions = 1
@@ -363,12 +321,8 @@ checkpoint_indices = [
 cpu_compiled_go = 1025
 cpu_interpreter_fallback = 0
 compiled_shapes = 1
-gpu_handled = 1025
-gpu_interpreter_fallback = 0
 display_fences = 1
 blake3 = "b18345343677e0b8693462b2320dd2f8998624f53ae374389272553e599c790a"
-
-[case.gpu_fallback_reasons]
 
 [[case.probes]]
 x = 5

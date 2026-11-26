@@ -588,9 +588,7 @@ planes.
 compatibility/validation mode for a GL or CPU compositor. It synchronizes both
 complete 2048 x 1024 planes -- 16 MiB -- for each newly composed frame and may
 take up to two seconds on first capture. It is never selected because direct
-presentation failed. The older `IRIS_REX3_GPU` prototype remains
-CPU-canonical, requires a `rex-gpu` build, and is mutually exclusive with the
-production resident selector. Other boards retain their historical
+presentation failed. Other boards retain their historical
 wgpu-to-OpenGL window fallback; direct resident Newport does not.
 
 iris-gui can run only that explicit Newport readback mode when built with

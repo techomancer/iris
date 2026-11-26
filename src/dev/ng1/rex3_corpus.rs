@@ -20,11 +20,6 @@ const GENERATOR: &str = "src/dev/ng1/rex3_corpus.rs";
 const PROVENANCE: &str =
     "Independently authored register programs on zeroed power-on boards; no guest captures or pixels.";
 const CPU_FEATURES: &[&str] = &["gputrace", "rex-jit", "rexdiag"];
-const GPU_FEATURES: &[&str] = &["rex-gpu", "rexdiag"];
-#[cfg(feature = "rex-gpu")]
-const CORPUS_GPU_BATCH_DRAWS: usize = 1024;
-#[cfg(feature = "rex-gpu")]
-const CORPUS_GPU_JOURNAL_DRAWS: usize = 65536;
 
 const CM: u32 = 0xf << CLIPMODE_CIDMATCH_SHIFT;
 const CM_CLIPPED: u32 = CM | CLIPMODE_ENSMASK_SMASK0;
@@ -65,8 +60,6 @@ struct Definition {
     tags: &'static [&'static str],
     shapes: &'static [Shape],
     go_count: u64,
-    gpu_handled: u64,
-    gpu_fallback: &'static [(&'static str, u64)],
     probes: &'static [(usize, usize, u32)],
     residual: Option<(u64, u32)>,
     display_fences: u32,
@@ -78,11 +71,9 @@ fn definitions() -> Vec<Definition> {
             name: "overlap_windows",
             intent: "Ordered, overlapping synthetic RGB24 window-like blocks.",
             program,
-            tags: &["rgb24", "blocks", "overlap", "gpu-eligible"],
+            tags: &["rgb24", "blocks", "overlap"],
             shapes: &[Shape(BLOCK, RGB24, CM)],
             go_count: 4,
-            gpu_handled: 4,
-            gpu_fallback: &[],
             probes: &[
                 (15, 15, 0x332211),
                 (45, 35, 0x665544),
@@ -97,11 +88,9 @@ fn definitions() -> Vec<Definition> {
             name: "long_spans",
             intent: "Thirty-two independent 1,200-pixel RGB24 spans.",
             program,
-            tags: &["rgb24", "span-1200", "gpu-eligible"],
+            tags: &["rgb24", "span-1200"],
             shapes: &[Shape(SPAN, RGB24, CM)],
             go_count: 32,
-            gpu_handled: 32,
-            gpu_fallback: &[],
             probes: &[(10, 40, 0xac6824), (1209, 71, 0xac6824), (1209, 72, 0)],
             residual: None,
             display_fences: 0,
@@ -110,11 +99,9 @@ fn definitions() -> Vec<Definition> {
             name: "tiny_tiles",
             intent: "Sixty-four 8x8 blocks, eight 8-pixel spans and sixteen single-pixel blocks.",
             program,
-            tags: &["rgb24", "8x8", "span-8", "single-pixel", "gpu-eligible"],
+            tags: &["rgb24", "8x8", "span-8", "single-pixel"],
             shapes: &[Shape(BLOCK, RGB24, CM), Shape(SPAN, RGB24, CM)],
             go_count: 88,
-            gpu_handled: 88,
-            gpu_fallback: &[],
             probes: &[
                 (100, 100, 0x352413),
                 (163, 163, 0x352413),
@@ -129,14 +116,7 @@ fn definitions() -> Vec<Definition> {
             name: "hostrw_residual",
             intent: "RGB24 HOSTW/HOSTR checkpoints and a partial packed CI8 HOSTW word.",
             program,
-            tags: &[
-                "rgb24",
-                "ci8",
-                "hostw",
-                "hostr",
-                "residual-shifter",
-                "mixed-fallback",
-            ],
+            tags: &["rgb24", "ci8", "hostw", "hostr", "residual-shifter"],
             shapes: &[
                 Shape(BLOCK, RGB24, CM),
                 Shape(HOSTW, RGB24_HOST, CM),
@@ -144,8 +124,6 @@ fn definitions() -> Vec<Definition> {
                 Shape(HOSTW, CI8_HOST, CM),
             ],
             go_count: 4,
-            gpu_handled: 1,
-            gpu_fallback: &[("opcode", 1), ("primitive shape", 2)],
             probes: &[
                 (8, 8, 0x123456),
                 (20, 20, 0xab),
@@ -159,22 +137,13 @@ fn definitions() -> Vec<Definition> {
             name: "dma_hostrw",
             intent: "Packed CI8 bulk HOSTW plus bulk and primed scalar HOSTR.",
             program,
-            tags: &[
-                "ci8",
-                "hostw",
-                "hostr",
-                "dma-bulk",
-                "dma-read",
-                "mixed-fallback",
-            ],
+            tags: &["ci8", "hostw", "hostr", "dma-bulk", "dma-read"],
             shapes: &[
                 Shape(BLOCK, RGB24, CM),
                 Shape(HOSTW_ROW, CI8_HOST64, CM),
                 Shape(HOSTR_ROW, CI8_HOST64, CM),
             ],
             go_count: 4,
-            gpu_handled: 1,
-            gpu_fallback: &[("opcode", 2), ("primitive shape", 1)],
             probes: &[
                 (1, 1, 0x030201),
                 (20, 20, 0x11),
@@ -188,15 +157,13 @@ fn definitions() -> Vec<Definition> {
             name: "clip_ci8_mixed",
             intent: "SMASK0 clipping and CI8 fallback between eligible RGB24 blocks.",
             program,
-            tags: &["rgb24", "smask0", "ci8", "mixed-fallback", "gpu-resume"],
+            tags: &["rgb24", "smask0", "ci8"],
             shapes: &[
                 Shape(BLOCK, RGB24, CM),
                 Shape(BLOCK, RGB24, CM_CLIPPED),
                 Shape(BLOCK, CI8, CM),
             ],
             go_count: 4,
-            gpu_handled: 2,
-            gpu_fallback: &[("clip mode", 1), ("pixel format", 1)],
             probes: &[
                 (30, 30, 0x302010),
                 (33, 32, 0x605040),
@@ -211,17 +178,9 @@ fn definitions() -> Vec<Definition> {
             name: "batch_1025_fence",
             intent: "A surviving first-batch pixel and an overlapping 1,025th draw before an XMAP display fence.",
             program,
-            tags: &[
-                "rgb24",
-                "overlap",
-                "batch-1024",
-                "display-fence",
-                "gpu-eligible",
-            ],
+            tags: &["rgb24", "overlap", "batch-1024", "display-fence"],
             shapes: &[Shape(BLOCK, RGB24, CM)],
             go_count: 1025,
-            gpu_handled: 1025,
-            gpu_fallback: &[],
             probes: &[(5, 5, 0x030201), (6, 5, 0xc0b0a0), (7, 5, 0)],
             residual: None,
             display_fences: 1,
@@ -593,7 +552,6 @@ struct CorpusManifest {
     generator: String,
     output_anchor: String,
     cpu_features: Vec<String>,
-    gpu_features: Vec<String>,
     #[serde(rename = "case")]
     cases: Vec<CaseManifest>,
 }
@@ -614,21 +572,11 @@ struct CaseManifest {
     cpu_compiled_go: u64,
     cpu_interpreter_fallback: u64,
     compiled_shapes: usize,
-    gpu_handled: u64,
-    gpu_interpreter_fallback: u64,
-    gpu_fallback_reasons: BTreeMap<String, u64>,
     display_fences: u32,
     residual_shifter: Option<String>,
     residual_count: Option<u32>,
     blake3: String,
     probes: Vec<Probe>,
-}
-
-fn reasons(def: &Definition) -> BTreeMap<String, u64> {
-    def.gpu_fallback
-        .iter()
-        .map(|(name, count)| ((*name).into(), *count))
-        .collect()
 }
 
 fn case_manifest(def: &Definition, recs: &[Rec], text: &str) -> CaseManifest {
@@ -668,9 +616,6 @@ fn case_manifest(def: &Definition, recs: &[Rec], text: &str) -> CaseManifest {
         cpu_compiled_go: def.go_count,
         cpu_interpreter_fallback: 0,
         compiled_shapes: def.shapes.len(),
-        gpu_handled: def.gpu_handled,
-        gpu_interpreter_fallback: def.gpu_fallback.iter().map(|(_, n)| n).sum(),
-        gpu_fallback_reasons: reasons(def),
         display_fences: def.display_fences,
         residual_shifter: def.residual.map(|(v, _)| format!("{v:016x}")),
         residual_count: def.residual.map(|(_, n)| n),
@@ -691,7 +636,6 @@ fn manifest(cases: Vec<CaseManifest>) -> CorpusManifest {
         generator: GENERATOR.into(),
         output_anchor: corpus_io::OUTPUT_ANCHOR.into(),
         cpu_features: CPU_FEATURES.iter().map(|s| (*s).into()).collect(),
-        gpu_features: GPU_FEATURES.iter().map(|s| (*s).into()).collect(),
         cases,
     }
 }
@@ -796,7 +740,6 @@ fn validate_files(
         || parsed.generator != GENERATOR
         || parsed.output_anchor != corpus_io::OUTPUT_ANCHOR
         || parsed.cpu_features != CPU_FEATURES
-        || parsed.gpu_features != GPU_FEATURES
     {
         return Err("unsupported or altered corpus manifest metadata".into());
     }
@@ -910,14 +853,6 @@ fn validate_files(
         if entry != actual {
             return Err(format!(
                 "{}: case metadata or checkpoint/read counts differ",
-                entry.file
-            ));
-        }
-        if entry.gpu_handled == 0
-            || entry.gpu_handled + entry.gpu_interpreter_fallback != entry.cpu_compiled_go
-        {
-            return Err(format!(
-                "{}: inconsistent GPU handling/fallback expectations",
                 entry.file
             ));
         }
@@ -1061,45 +996,9 @@ fn compare_fence_images(expected: &FenceImage, actual: &FenceImage) -> Result<()
     Ok(())
 }
 
-#[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-fn verify_gpu_fence(
-    // Readback is damage-limited, so its size no longer equals the image's;
-    // the planes themselves are compared by compare_fence_images.
-    _image: &FenceImage,
-    report: Option<&crate::dev::ng1::rex3_gpu::ReplayReport>,
-) -> Result<(), String> {
-    let report = report.ok_or("GPU report missing at display fence publication")?;
-    let telemetry = report
-        .telemetry
-        .as_ref()
-        .ok_or("GPU telemetry missing at display fence publication")?;
-    let reasons = &telemetry.flush_reasons;
-    if report.error.is_some()
-        || report.pending_draws != 0
-        || report.submissions != 2
-        || report.fences != 1
-        || report.bytes_read_back == 0
-        || report.bytes_read_back > crate::dev::ng1::rex3_gpu::GPU_PLANE_BYTES
-        || reasons.display_fence != 1
-        || reasons.batch_full != 1
-        || reasons.idle != 0
-        || reasons.wait_idle != 0
-        || reasons.cpu_fallback != 0
-        || reasons.explicit != 0
-        || reasons.exit != 0
-    {
-        return Err(format!(
-            "display fence signaled before its GPU readback completed: {report:?}"
-        ));
-    }
-    Ok(())
-}
-
 struct FenceEvent {
     image: Arc<FenceImage>,
     validation: Result<(), String>,
-    #[cfg(feature = "rex-gpu")]
-    gpu: Option<crate::dev::ng1::rex3_gpu::ReplayReport>,
 }
 
 struct CaseRun {
@@ -1161,8 +1060,6 @@ enum Engine {
     Interpreter,
     #[cfg(all(feature = "rex-jit", feature = "rexdiag"))]
     Compiled,
-    #[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-    Gpu,
 }
 
 #[cfg(all(feature = "rex-jit", feature = "rexdiag"))]
@@ -1213,19 +1110,9 @@ fn run_case(
     case: &LoadedCase,
     engine: Engine,
     expected_fence: Option<Arc<FenceImage>>,
-    signal_fence_early: bool,
 ) -> CaseRun {
     let mut board = CorpusBoard::new(def.display_fences != 0);
     let rex = Arc::clone(&board.rex);
-    #[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-    let is_gpu = matches!(engine, Engine::Gpu);
-    #[cfg(not(all(feature = "rex-gpu", feature = "rexdiag")))]
-    let is_gpu = false;
-    #[cfg(feature = "rex-gpu")]
-    rex.test_signal_fence_early
-        .store(signal_fence_early, Ordering::Relaxed);
-    #[cfg(not(feature = "rex-gpu"))]
-    assert!(!signal_fence_early);
     let (fence_sender, fence_receiver) = mpsc::channel();
     if def.display_fences != 0 {
         let expected_count = def.display_fences;
@@ -1239,8 +1126,6 @@ fn run_case(
                 rgb: unsafe { &*rex.fb_rgb.get() }.to_vec(),
                 aux: unsafe { &*rex.fb_aux.get() }.to_vec(),
             });
-            #[cfg(feature = "rex-gpu")]
-            let gpu = rex.gpu_replay_report();
             let mut validation = if (image.published, image.xmap, image.gfifo)
                 == (expected_count, expected_count, expected_count)
             {
@@ -1250,58 +1135,14 @@ fn run_case(
             };
             if let Some(expected) = &expected_fence {
                 validation = validation.and_then(|()| compare_fence_images(expected, &image));
-            } else if is_gpu {
-                validation = Err("GPU fence reference is missing".into());
             }
-            #[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-            if is_gpu {
-                validation = validation.and_then(|()| verify_gpu_fence(&image, gpu.as_ref()));
-            }
-            let _ = fence_sender.send(FenceEvent {
-                image,
-                validation,
-                #[cfg(feature = "rex-gpu")]
-                gpu,
-            });
+            let _ = fence_sender.send(FenceEvent { image, validation });
         }));
     }
     match engine {
         Engine::Interpreter => {}
         #[cfg(all(feature = "rex-jit", feature = "rexdiag"))]
         Engine::Compiled => compile_shapes(&rex, def),
-        #[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-        Engine::Gpu => {
-            let backend = std::env::var("REX3_GPU_BACKEND").unwrap_or_else(|_| "auto".into());
-            let diagnostics = rex
-                .enable_gpu_replay_with_options(
-                    &backend,
-                    crate::dev::ng1::rex3_gpu::ProfilingOptions {
-                        telemetry: true,
-                        timestamps: false,
-                    },
-                )
-                .unwrap_or_else(|e| panic!("hardware GPU corpus validation unavailable: {e}"));
-            assert!(
-                matches!(
-                    diagnostics.device_type,
-                    wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
-                ),
-                "hardware GPU corpus validation unavailable: {diagnostics}"
-            );
-            assert_eq!(
-                diagnostics.max_batch_draws,
-                crate::dev::ng1::rex3_gpu::DEFAULT_MAX_BATCH_DRAWS,
-                "GPU corpus requires the default batch size; unset REX3_GPU_BATCH_DRAWS"
-            );
-            // The committed batch_1025_fence recording was authored around a
-            // 1,024-draw boundary; pin it independently of the default.
-            rex.raster
-                .lock()
-                .legacy_mut()
-                .expect("GPU replay enabled")
-                .set_test_limits(CORPUS_GPU_BATCH_DRAWS, CORPUS_GPU_JOURNAL_DRAWS);
-            eprintln!("{}: GPU {diagnostics}", def.name);
-        }
     }
     let report = tests::replay_recs_with_hook(&rex, rex.as_ref(), &case.records, true, |i, rec| {
         if i != 0 && matches!(rec, Rec::Hash(_)) {
@@ -1330,60 +1171,6 @@ fn run_case(
                 "{}: compiled GO dispatch or unexpected interpreter fallback",
                 def.name
             ),
-            #[cfg(feature = "rex-gpu")]
-            Engine::Gpu => {
-                let gpu = rex.gpu_replay_report().expect("GPU report");
-                assert_eq!(gpu.error, None, "{}: GPU error", def.name);
-                assert_eq!(
-                    gpu.timestamp_error, None,
-                    "{}: GPU timestamp error",
-                    def.name
-                );
-                assert_eq!(
-                    gpu.handled_draws, case.metadata.gpu_handled,
-                    "{}: GPU handled",
-                    def.name
-                );
-                assert_eq!(
-                    gpu.fallback_draws, case.metadata.gpu_interpreter_fallback,
-                    "{}: GPU fallback",
-                    def.name
-                );
-                assert_eq!(
-                    gpu.fallback_reasons, case.metadata.gpu_fallback_reasons,
-                    "{}: GPU fallback reasons",
-                    def.name
-                );
-                assert_eq!(
-                    (jit, interp),
-                    (0, case.metadata.gpu_interpreter_fallback),
-                    "{}: fallback must run on the interpreter",
-                    def.name
-                );
-                assert!(
-                    gpu.handled_draws > 0 && gpu.submissions > 0 && gpu.fences > 0,
-                    "{}: GPU must actually submit and fence draws: {gpu:?}",
-                    def.name
-                );
-                assert_eq!(gpu.pending_draws, 0, "{}: pending GPU draws", def.name);
-                if def.display_fences != 0 {
-                    let telemetry = gpu.telemetry.as_ref().expect("GPU batch telemetry");
-                    assert!(
-                        telemetry.flush_reasons.batch_full > 0,
-                        "{}: did not cross the 1,024-draw batch boundary: {telemetry:?}",
-                        def.name
-                    );
-                    assert!(
-                        telemetry.flush_reasons.display_fence > 0,
-                        "{}: display fence did not flush pending GPU work: {telemetry:?}",
-                        def.name
-                    );
-                }
-                eprintln!(
-                    "{}: GPU handled={} interpreter_fallback={} reasons={:?}",
-                    def.name, gpu.handled_draws, gpu.fallback_draws, gpu.fallback_reasons
-                );
-            }
         }
     }
     eprintln!(
@@ -1418,7 +1205,7 @@ fn rex3_replay_testdata() {
             .iter()
             .find(|def| def.name == case.metadata.name)
             .unwrap();
-        let reference = run_case(def, case, Engine::Interpreter, None, false);
+        let reference = run_case(def, case, Engine::Interpreter, None);
         if let Some(event) = &reference.fence {
             event.validation.as_ref().unwrap();
         }
@@ -1428,7 +1215,7 @@ fn rex3_replay_testdata() {
                 .fence
                 .as_ref()
                 .map(|event| Arc::clone(&event.image));
-            let compiled = run_case(def, case, Engine::Compiled, expected, false);
+            let compiled = run_case(def, case, Engine::Compiled, expected);
             if let Some(event) = &compiled.fence {
                 event.validation.as_ref().unwrap();
             }
@@ -1445,109 +1232,6 @@ fn rex3_replay_testdata() {
     #[cfg(not(all(feature = "rex-jit", feature = "rexdiag")))]
     eprintln!("REX3 corpus: interpreter only; strict CPU coverage requires rex-jit and rexdiag");
     eprintln!("REX3 corpus: {} cases executed", cases.len());
-}
-
-#[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-#[test]
-#[ignore = "requires a conformant hardware GPU; explicitly run with --ignored"]
-fn rex3_corpus_gpu_hardware() {
-    let defs = definitions();
-    let files =
-        read_directory(&corpus_directory(), &defs).expect("required REX3 corpus is unavailable");
-    let cases = validate_files(&files, &defs).expect("invalid required REX3 corpus");
-    assert!(!cases.is_empty(), "GPU corpus executed zero cases");
-    for case in &cases {
-        let def = defs
-            .iter()
-            .find(|def| def.name == case.metadata.name)
-            .unwrap();
-        let reference = run_case(def, case, Engine::Interpreter, None, false);
-        let expected = reference
-            .fence
-            .as_ref()
-            .map(|event| Arc::clone(&event.image));
-        let gpu = run_case(def, case, Engine::Gpu, expected, false);
-        if let Some(event) = &gpu.fence {
-            event
-                .validation
-                .as_ref()
-                .unwrap_or_else(|e| panic!("{}: {e}", def.name));
-            let report = event.gpu.as_ref().expect("GPU report at display fence");
-            let reasons = &report
-                .telemetry
-                .as_ref()
-                .expect("GPU fence telemetry")
-                .flush_reasons;
-            eprintln!(
-                "{}: at fence publication: submissions={} fences={} readback_bytes={} \
-                 batch_full={} display_fence={} idle={} wait_idle={}",
-                def.name,
-                report.submissions,
-                report.fences,
-                report.bytes_read_back,
-                reasons.batch_full,
-                reasons.display_fence,
-                reasons.idle,
-                reasons.wait_idle
-            );
-        }
-        compare_snapshots(def.name, "GPU", &reference.snapshot, &gpu.snapshot);
-    }
-    eprintln!("REX3 GPU corpus: {} hardware cases executed", cases.len());
-}
-
-#[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-#[test]
-#[ignore = "requires a conformant hardware GPU; explicitly run with --ignored"]
-fn rex3_corpus_gpu_rejects_early_fence_signal() {
-    let defs = definitions();
-    let files =
-        read_directory(&corpus_directory(), &defs).expect("required REX3 corpus is unavailable");
-    let cases = validate_files(&files, &defs).expect("invalid required REX3 corpus");
-    let def = defs
-        .iter()
-        .find(|def| def.name == "batch_1025_fence")
-        .unwrap();
-    let case = cases
-        .iter()
-        .find(|case| case.metadata.name == def.name)
-        .unwrap();
-    let reference = run_case(def, case, Engine::Interpreter, None, false);
-    let reference_image = Arc::clone(&reference.fence.as_ref().unwrap().image);
-    let early = run_case(
-        def,
-        case,
-        Engine::Gpu,
-        Some(Arc::clone(&reference_image)),
-        true,
-    );
-    let event = early.fence.as_ref().expect("early fence observation");
-    assert!(
-        event.validation.as_ref().unwrap_err().contains("stale"),
-        "early fence must fail the immediate framebuffer comparison"
-    );
-    assert_ne!(
-        event.image.rgb[5 * 2048 + 5],
-        reference_image.rgb[5 * 2048 + 5],
-        "the overlapping pixel must still be stale at the injected early signal"
-    );
-    assert!(
-        verify_gpu_fence(&event.image, event.gpu.as_ref())
-            .unwrap_err()
-            .contains("readback completed"),
-        "an early signal must fail the readback-completion check"
-    );
-    let report = event.gpu.as_ref().expect("early GPU fence report");
-    eprintln!(
-        "{}: rejected early fence: pending={} fences={} readback_bytes={}",
-        def.name, report.pending_draws, report.fences, report.bytes_read_back
-    );
-    compare_snapshots(
-        def.name,
-        "later GPU idle flush",
-        &reference.snapshot,
-        &early.snapshot,
-    );
 }
 
 #[test]
@@ -1569,17 +1253,6 @@ fn rex3_corpus_fence_checker_rejects_stale_framebuffer() {
     assert!(compare_fence_images(&expected, &stale)
         .unwrap_err()
         .contains("stale"));
-    #[cfg(all(feature = "rex-gpu", feature = "rexdiag"))]
-    {
-        let report = crate::dev::ng1::rex3_gpu::ReplayReport {
-            pending_draws: 1,
-            telemetry: Some(crate::dev::ng1::rex3_gpu::StageTelemetry::default()),
-            ..Default::default()
-        };
-        assert!(verify_gpu_fence(&stale, Some(&report))
-            .unwrap_err()
-            .contains("readback completed"));
-    }
 }
 
 #[test]
@@ -1724,11 +1397,9 @@ fn validation_fixture() -> (Vec<Definition>, BTreeMap<String, Vec<u8>>) {
         name: "fixture",
         intent: "In-memory validation fixture.",
         program: validation_fixture_program,
-        tags: &["gpu-eligible"],
+        tags: &[],
         shapes: &[Shape(BLOCK, RGB24, CM)],
         go_count: 1,
-        gpu_handled: 1,
-        gpu_fallback: &[],
         probes: &[(0, 0, 1)],
         residual: None,
         display_fences: 0,

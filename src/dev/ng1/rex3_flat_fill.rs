@@ -1,4 +1,4 @@
-//! Flat fills shared by Newport's GPU raster implementations.
+//! Flat fills for Newport's GPU raster.
 //!
 //! Matching happens after the GO's setup, without changing the context. Keep
 //! the prepared command across a batch-full retry and finish it only after
@@ -186,14 +186,16 @@ impl PreparedFlatFill {
     }
 }
 
-/// Match and normalize one already-set-up GO, without mutating its context.
-/// The rejection strings are the legacy prototype's fallback reasons.
+/// A stricter matcher than the resident one, for tests to compare it with:
+/// RGB flat fills only, with no clipping, offsets or pixel operations.
+/// Matches and normalizes one already-set-up GO without mutating its context.
+#[cfg(test)]
 pub(crate) fn prepare_flat_fill(context: &Rex3Context) -> Result<PreparedFlatFill, &'static str> {
-    prepare(context, false)
+    prepare(context)
 }
 
-/// The resident path also handles simple auxiliary-plane fills. The legacy
-/// prototype continues to accept RGB only.
+/// The resident path also handles simple auxiliary-plane fills and
+/// `prepare_flat_fill` accepts RGB only.
 #[cfg(feature = "wgpu")]
 pub(crate) fn prepare_resident_flat_fill(
     context: &Rex3Context,
@@ -286,7 +288,8 @@ pub(crate) fn prepare_resident_flat_fill(
     })
 }
 
-fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &'static str> {
+#[cfg(test)]
+fn prepare(context: &Rex3Context) -> Result<PreparedFlatFill, &'static str> {
     let dm0 = context.drawmode0;
     let dm1 = context.drawmode1;
     let adrmode = dm0.adrmode();
@@ -314,62 +317,41 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         return Err("host transfer");
     }
     let mode = rex3_shape::unpack(dm0.0, dm1.0, context.clipmode);
-    let fast_clear = allow_aux && mode.fastclear() != 0;
     if dm0.colorhost()
         || dm0.alphahost()
         || dm0.skipfirst()
         || dm0.skiplast()
         || dm0.length32()
         || dm0.lronly()
-        || (!allow_aux && dm0.xyoffset())
+        || dm0.xyoffset()
         || dm0.endptfilter()
         || dm0.ystride()
     {
         return Err("draw mode 0");
     }
-    if !fast_clear && !allow_aux && (dm0.shade() || dm0.ciclamp()) {
+    if dm0.shade() || dm0.ciclamp() {
         return Err("draw mode 0");
     }
-    let plane = if allow_aux {
-        match dm1.planes() {
-            DRAWMODE1_PLANES_RGB | DRAWMODE1_PLANES_RGBA => FillPlane::Rgb,
-            DRAWMODE1_PLANES_OLAY | DRAWMODE1_PLANES_PUP | DRAWMODE1_PLANES_CID => {
-                FillPlane::Aux
-            }
-            _ => return Err("pixel format"),
+    let plane = match dm1.planes() {
+        DRAWMODE1_PLANES_RGB if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() => {
+            FillPlane::Rgb
         }
-    } else {
-        match dm1.planes() {
-            DRAWMODE1_PLANES_RGB
-                if dm1.drawdepth() == DRAWMODE1_DRAWDEPTH_24 && dm1.rgbmode() =>
-            {
-                FillPlane::Rgb
-            }
-            _ => return Err("pixel format"),
-        }
+        _ => return Err("pixel format"),
     };
-    if !allow_aux && dm1.yflip() {
+    if dm1.yflip() {
         return Err("pixel operation");
     }
-    if !fast_clear {
-        let unsupported = if allow_aux {
-            dm1.fastclear()
-        } else {
-            dm1.dblsrc()
-                || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
-                || dm1.dither()
-                || dm1.fastclear()
-                || dm1.blend()
-                || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
-        };
-        if unsupported {
-            return Err("pixel operation");
-        }
+    if dm1.dblsrc()
+        || dm1.compare() != DRAWMODE1_COMPARE_DISABLE
+        || dm1.dither()
+        || dm1.fastclear()
+        || dm1.blend()
+        || dm1.logicop() != DRAWMODE1_LOGICOP_SRC
+    {
+        return Err("pixel operation");
     }
-    if !allow_aux
-        && (context.clipmode & CLIPMODE_ENSMASK_MASK != 0
-            || context.clipmode & CLIPMODE_CIDMATCH_MASK
-                != 0xF << CLIPMODE_CIDMATCH_SHIFT)
+    if context.clipmode & CLIPMODE_ENSMASK_MASK != 0
+        || context.clipmode & CLIPMODE_CIDMATCH_MASK != 0xF << CLIPMODE_CIDMATCH_SHIFT
     {
         return Err("clip mode");
     }
@@ -392,7 +374,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         };
     if !x_direction_matches
         || !y_direction_matches
-        || (!allow_aux && octant & (OCTANT_XDEC | OCTANT_YDEC) != 0)
+        || octant & (OCTANT_XDEC | OCTANT_YDEC) != 0
     {
         return Err("negative direction");
     }
@@ -420,12 +402,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     let x0 = walker_x0 + x_move + x_window - REX3_COORD_BIAS;
     let x1 = walker_x1 + x_move + x_window - REX3_COORD_BIAS;
     let physical_y = |raw: i32| {
-        let absolute = (raw >> 11) + y_move + y_window;
-        if dm1.yflip() {
-            0x23ff - absolute
-        } else {
-            absolute - REX3_COORD_BIAS
-        }
+        (raw >> 11) + y_move + y_window - REX3_COORD_BIAS
     };
     let y0 = physical_y(context.ystart);
     let y1 = if adrmode == DRAWMODE0_ADRMODE_BLOCK {
@@ -443,18 +420,10 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
     let fill = if min_x > max_x || min_y > max_y || context.wrmask == 0 {
         None
     } else {
-        let color = if fast_clear {
-            debug_assert_ne!(mode.fastclear(), 0);
-            fastclear_color(context, &mode)
-        } else {
-            let raw_color = (context.get_colori() & 0x00FF_FFFF)
-                | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
-            raw_color
-        };
+        let color = (context.get_colori() & 0x00FF_FFFF)
+            | (Rex3Context::clamp_color_component(context.coloralpha) << 24);
         Some(FlatFill {
-            kind: if fast_clear {
-                FillKind::Clear
-            } else if block {
+            kind: if block {
                 FillKind::Block
             } else {
                 FillKind::Span
@@ -499,29 +468,7 @@ fn prepare(context: &Rex3Context, allow_aux: bool) -> Result<PreparedFlatFill, &
         ).0
     });
     #[cfg(feature = "wgpu")]
-    let (shade_payload, final_shade) = if allow_aux && mode.shade() != 0 {
-        let mut shade = ShadeDda::from_context(context);
-        let payload_words = pattern_advances
-            .checked_add(31)
-            .and_then(|pixels| pixels.checked_div(32))
-            .and_then(|checkpoints| checkpoints.checked_mul(4))
-            .ok_or("shade payload length")?;
-        if fill.is_some() && payload_words > RESIDENT_PAYLOAD_WORDS {
-            return Err("shade payload length");
-        }
-        let mut payload = fill.map(|_| ShadePayload::with_capacity(payload_words as usize));
-        for index in 0..pattern_advances {
-            if index & 31 == 0 {
-                if let Some(payload) = payload.as_mut() {
-                    payload.push4(shade.components());
-                }
-            }
-            shade.advance();
-        }
-        (payload, Some(shade))
-    } else {
-        (None, None)
-    };
+    let (shade_payload, final_shade) = (None, None);
     Ok(PreparedFlatFill {
         fill,
         advance,
@@ -797,9 +744,9 @@ mod tests {
                     normalized.drawmode1.0 |= (1 << 16) | (1 << 17) | (1 << 18);
                     normalized.colorvram = 0x00ab_cdef;
                 }
-                let legacy_error = prepare_flat_fill(&normalized).unwrap_err();
+                let strict_error = prepare_flat_fill(&normalized).unwrap_err();
                 assert_eq!(
-                    legacy_error,
+                    strict_error,
                     if fast_clear {
                         "pixel operation"
                     } else {
