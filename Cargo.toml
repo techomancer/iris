@@ -93,8 +93,8 @@ opcodefusion = []
 # Incompatible with interactive debugging. For end-user / benchmarking builds only.
 lightning = ["opcodefusion"]
 # O(1) TLB fast path: 512KB inline vmap indexed by VA[31:13] replaces linear scan
-# for 32-bit and sign-extended 64-bit VAs. Always on; kept as a feature flag so
-# downstream tooling that passes --features tlbvmap still compiles cleanly.
+# for 32-bit and sign-extended 64-bit VAs. On by default; without it every
+# lookup falls through to the MRU scan.
 tlbvmap = []
 # Line editing for the terminal console (src/console_edit.rs): history with the
 # up and down arrows, Ctrl-R search, cursor keys, kept for the session. Without it,

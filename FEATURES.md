@@ -28,7 +28,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. Also times the Indy's DS1386 and 8254 on the cycle count. | — |
 | `opcodefusion` | Interpreter instruction fusion; breakpoints on a fused second instruction cannot fire. | — |
 | `lightning` | Strip breakpoints/traceback for speed; hides GUI Debug controls. | `opcodefusion` |
-| `tlbvmap` | Compatibility flag: vmap translation is unconditional. | — |
+| `tlbvmap` | O(1) TLB fast path (the vmap); without it lookups use the MRU scan. On by default. | — |
 | `tlbstats` | TLB path/entries-walked counters, printed at exit. | — |
 | `jitstats` | Measure eligibility for JIT inline memory accesses. | — |
 | `tlbcheck` | Full JTLB consistency checks after TLB writes; diagnostic overhead. | — |
@@ -950,7 +950,7 @@ both the interpreter and jitv2.
 | `j2wp` | Compatibility alias for `jitv2`; whole-page compilation is the only implementation |
 | `hostcall` / `hostgl` | Private host-service syscalls / host OpenGL for IRIX programs; `hostgl` has macOS (CGL) and Linux (EGL) backends |
 | `debug_cache` | Track one cache line across all operations |
-| `tlbvmap` | Vestigial; the vmap TLB fast path is always on |
+| `tlbvmap` | The vmap TLB fast path; on by default |
 | `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`clanker/cpu/r5k-l1i-cache-bugs.md`) |
 
 </details>
