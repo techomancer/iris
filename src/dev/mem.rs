@@ -1,14 +1,19 @@
+#[cfg(test)]
 use std::cell::UnsafeCell;
+#[cfg(test)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "jitv2")]
+#[cfg(all(test, feature = "jitv2"))]
 use std::sync::atomic::AtomicU64;
-use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, BUS_OK, BUS_ERR, Resettable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, BUS_OK, BUS_ERR};
+#[cfg(test)]
+use crate::traits::Resettable;
 
-#[cfg(feature = "jitv2")]
+#[cfg(all(test, feature = "jitv2"))]
 const JITV2_PAGE_SIZE: usize = crate::cpu::jitv2::jitv2::PAGE_SIZE as usize;
 
-/// Memory Module with direct word access
+/// Memory Module with direct word access. Test-only: `PpMemory` is the machines' RAM,
+/// and the tests keep this as an independent reference for it.
 ///
 /// Stores memory as u32 words in native (host) byte order for maximum performance.
 /// Big Endian conversion happens only on sub-word (8/16-bit) accesses.
@@ -23,6 +28,7 @@ const JITV2_PAGE_SIZE: usize = crate::cpu::jitv2::jitv2::PAGE_SIZE as usize;
 /// Uses UnsafeCell for zero-overhead memory access. Safe because:
 /// - Memory access is serialized through the bus interface
 /// - Alignment and bounds guaranteed by caller/decoder
+#[cfg(test)]
 pub struct Memory {
     data: UnsafeCell<Vec<u32>>,
     size_words: usize,
@@ -41,8 +47,10 @@ pub struct Memory {
 
 // Safety: Memory is safe to share across threads because access is controlled
 // through the BusDevice interface which serializes access through the bus.
+#[cfg(test)]
 unsafe impl Sync for Memory {}
 
+#[cfg(test)]
 impl Memory {
     /// Create a new memory block.
     ///
@@ -156,6 +164,7 @@ impl Memory {
     }
 }
 
+#[cfg(test)]
 impl Resettable for Memory {
     fn power_on(&self) {
         let data = unsafe { self.data() };
@@ -165,6 +174,7 @@ impl Resettable for Memory {
     }
 }
 
+#[cfg(test)]
 impl BusDevice for Memory {
     #[inline(always)]
     fn read8(&self, addr: u64) -> BusRead8 {
@@ -354,6 +364,7 @@ impl BusDevice for Memory {
 }
 
 // Implement BusDevice for Arc<Memory> to allow using Arc-wrapped memory directly
+#[cfg(test)]
 impl BusDevice for Arc<Memory> {
     fn read8(&self, addr: u64) -> BusRead8 {
         (**self).read8(addr)

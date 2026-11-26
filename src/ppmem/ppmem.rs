@@ -1,5 +1,5 @@
 //! Host-MMU-backed physical memory banks, in place of
-//! [`crate::dev::mem::Memory`] on every machine (ppmem is unconditional).
+//! `dev::mem::Memory` on every machine (ppmem is unconditional).
 //!
 //! See `docs/ppmem-design.md`. In short: a bank's storage is a shared-memory
 //! object rather than a `Vec<u32>`, which lets the same bank be mapped into
@@ -181,7 +181,7 @@ pub trait MappedMemory {
 
 /// One physical memory bank.
 ///
-/// The ppmem counterpart of [`crate::dev::mem::Memory`], with the same storage
+/// The ppmem counterpart of the test-only `dev::mem::Memory`, with the same storage
 /// layout and the same interface. Cheap to clone-share via `Arc`; the backing
 /// object is refcounted so the bank stays alive as long as either the bank
 /// handle or any mapping of it does.
