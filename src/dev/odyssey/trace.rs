@@ -59,7 +59,7 @@ pub(super) fn trace_mask(spec: &str) -> Result<u32, String> {
     }
     spec.split(',').try_fold(0, |m, c| match CLASSES.iter().find(|(n, _)| *n == c) {
         Some((_, bit)) => Ok(m | bit),
-        None => Err(format!("unknown trace class '{c}' (fifo, gl, cpu, dma, all)")),
+        None => Err(format!("unknown trace class '{c}' (fifo, draw, cpu, dma, all)")),
     })
 }
 

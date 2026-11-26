@@ -344,6 +344,7 @@ fn trace_needs_gputrace_and_then_writes_the_classes_asked_for() {
     let p = path.to_string_lossy().to_string();
     let err = vpro(&v, &format!("trace {p} hq")).expect_err("not a VPro class");
     assert!(err.contains("unknown trace class 'hq'"), "{err}");
+    assert!(err.contains("(fifo, draw, cpu, dma, all)"), "the list names the real classes: {err}");
 
     let started = vpro(&v, &format!("trace {p} fifo,draw,cpu"));
     if !cfg!(feature = "gputrace") {
