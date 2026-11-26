@@ -219,6 +219,13 @@ impl Pacer {
     /// [`Pacer::due`] with `elapsed` as the time since the start.
     fn due_at(&mut self, elapsed: Duration) -> u64 {
         let target = (elapsed.as_nanos() as u64).saturating_mul(self.rate) / 1_000_000_000;
+        // Instruction time has no host jitter to smooth, and a guest catching up with the host
+        // runs several times faster than a wake can drain at a cap.
+        if self.clock.insn_ns() != 0 {
+            let due = target.saturating_sub(self.done);
+            self.done += due;
+            return due;
+        }
         let backlog = target.saturating_sub(self.done);
         let max_backlog = self.rate * PACE_MAX_BACKLOG.as_millis() as u64 / 1000;
         if backlog > max_backlog {
@@ -1163,6 +1170,20 @@ mod tests {
         assert_eq!(p.due(), 0);
         board.step(1_000_000);
         assert!(p.due() > 0);
+    }
+
+    /// On instruction time a guest that caught up five seconds in one wake is owed all of
+    /// them at once, with none skipped.
+    #[test]
+    fn pacer_has_no_cap_on_instruction_time() {
+        let cycles = std::cell::UnsafeCell::new(0u64);
+        let clock = Clock::counting(10, false);
+        clock.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.get()));
+        let mut p = Pacer::new(11025, &clock);
+        // SAFETY: only this thread writes it; the clock reads it here, between.
+        unsafe { *cycles.get() = 500_000_000 };
+        assert_eq!(p.due(), 11025 * 5);
+        assert_eq!(p.take_skipped(), 0);
     }
 
     /// A stall past PACE_MAX_BACKLOG is dropped and counted.
