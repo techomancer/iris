@@ -17,7 +17,7 @@ use std::thread;
 use std::sync::Arc;
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, FifoDevice, DmaClient, DmaStatus, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog};
 use crate::snapshot::{get_field, toml_u8, toml_bool, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::scsi::{self, ScsiBus, ScsiIdentities, scsi_cmd, ScsiRequest, ScsiDataLength};
@@ -514,19 +514,6 @@ impl Wd33c93a {
         self.bus.import_overlays(dir, dirty_sets)
     }
 
-    pub fn read_fifo(&self) -> u8 {
-        let mut state = self.state.lock();
-        state.fifo.pop_front().unwrap_or(0)
-    }
-
-    pub fn write_fifo(&self, val: u8, notify: bool) {
-        let mut state = self.state.lock();
-        state.fifo.push_back(val);
-        if notify {
-            self.cond.notify_one();
-        }
-    }
-
     pub fn read(&self, addr: u32) -> BusRead8 {
         let mut state = self.state.lock();
 
@@ -868,15 +855,6 @@ impl Wd33c93a {
         use crate::locks::register_mutex_fn;
         register_mutex_fn("scsi::state", self, |s| s.state.is_locked());
         register_mutex_fn("scsi::thread", self, |s| s.thread.is_locked());
-    }
-}
-
-impl FifoDevice for Wd33c93a {
-    fn read_fifo(&self) -> u8 {
-        self.read_fifo()
-    }
-    fn write_fifo(&self, val: u8, notify: bool) {
-        self.write_fifo(val, notify)
     }
 }
 
