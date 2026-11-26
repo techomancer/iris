@@ -7818,10 +7818,10 @@ mod tests {
         let mut filler = PhysicalCodePage::new(0, std::ptr::null());
         let fifo = exec.jitv2_compile_queue_handle.clone();
         for _ in 0..COMPILE_QUEUE_CAPACITY {
-            fifo.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).unwrap();
+            fifo.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0, tenancy: 0 }).unwrap();
         }
         let lane = exec.jitv2_hot_queue_handle.clone();
-        while lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).is_ok() {}
+        while lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0, tenancy: 0 }).is_ok() {}
         let mut arrive = |n| {
             for _ in 0..n {
                 exec.core.pc = 0xffff_ffff_8000_1000;
@@ -7832,7 +7832,7 @@ mod tests {
         };
         arrive(HOT_PROMOTE_ARRIVALS);
         lane.pop().unwrap();
-        assert!(lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).is_ok(), "a full lane took nothing");
+        assert!(lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0, tenancy: 0 }).is_ok(), "a full lane took nothing");
         lane.pop().unwrap();
         arrive(HOT_PROMOTE_ARRIVALS);
         let page = exec.jitv2_current_page();
@@ -7859,7 +7859,7 @@ mod tests {
         let mut filler = PhysicalCodePage::new(0, std::ptr::null());
         let lane = exec.jitv2_hot_queue_handle.clone();
         let fifo = exec.jitv2_compile_queue_handle.clone();
-        while lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0 }).is_ok() {}
+        while lane.push(CompileRequest { page: &mut filler, compiled_for_fr1: false, cpu: 0, tenancy: 0 }).is_ok() {}
         let mut arrive = |n| {
             for _ in 0..n {
                 exec.core.pc = 0xffff_ffff_8000_1000;
