@@ -220,7 +220,10 @@ impl Ds1744 {
             + from_bcd(s[3]) * 3600
             + from_bcd(s[2]) * 60
             + from_bcd(s[1] & 0x7f);
-        st.reference_ns = self.now_ns();
+        // A running oscillator keeps its phase through a time write; one that was stopped starts fresh.
+        let now = self.now_ns();
+        let running = !st.stopped && s[1] & OSCILLATOR_STOP == 0;
+        st.reference_ns = if running { now - (now - st.reference_ns).rem_euclid(1_000_000_000) } else { now };
         st.weekday = s[4] & (TEST_MODE | 7);
         st.stopped = s[1] & OSCILLATOR_STOP != 0;
         true

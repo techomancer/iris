@@ -65,6 +65,18 @@ impl Rig {
     }
 }
 
+/// A calendar write loads the counters but does not restart the second the
+/// oscillator was counting: a guest that rewrites the time every so often
+/// must not lose the part second already run each time.
+#[test]
+fn a_calendar_write_keeps_the_seconds_phase() {
+    let r = Rig::new();
+    r.step(900_000_000);
+    r.set_time(0x10, 0x00, 0x00, 0x01, 0x01, 0x24, 0x20);
+    r.step(100_000_000);
+    assert_eq!(r.rd(CONTROL + 1), 0x11, "a second after the clock started");
+}
+
 /// Ports test_fresh_seed: with the 1968 base the guest's year digits count
 /// from 1968 and the weekday follows the host's calendar, across a day.
 #[test]
