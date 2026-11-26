@@ -983,6 +983,8 @@ pub struct MipsCore {
     pub insn_ns: u64,
     /// Instruction clock: `hot.cycles` value the virtual count is anchored at.
     pub(crate) count_anchor_cycle: u64,
+    /// Instruction clock: the part of a Count tick the anchor has run, in ns times Hz.
+    pub(crate) count_frac: u64,
     /// Instruction clock: `hot.cycles` value at which IP7 fires, checked at
     /// each batch and at compiled code's cycle flushes instead of an hptimer.
     /// u64::MAX = disarmed.
@@ -1509,6 +1511,7 @@ impl MipsCore {
             timer_id: None,
             insn_ns: 0,
             count_anchor_cycle: 0,
+            count_frac: 0,
             count_fire_cycle: u64::MAX,
             budget_cycle: u64::MAX,
             check_cycle: u64::MAX,
@@ -1569,6 +1572,7 @@ impl MipsCore {
             self.count_read_cycle = self.hot.cycles;
             self.count_anchor_instant = std::time::Instant::now();
             self.count_anchor_cycle = self.hot.cycles;
+            self.count_frac = 0;
             self.set_fire_cycle(u64::MAX);
             self.disarm_compare_timer();
             self.tick_rate.reset(0);
@@ -1825,12 +1829,16 @@ impl MipsCore {
         } else {
             self.count_anchor_instant.elapsed().as_nanos() as u64
         };
-        let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
+        let acc = elapsed_ns as u128 * self.count_hz as u128 + self.count_frac as u128;
+        let ticks = (acc / 1_000_000_000) as u64;
+        if self.insn_ns != 0 {
+            // A tick is not a whole number of cycles: keep the remainder exactly.
+            self.count_anchor_cycle = cycles;
+            self.count_frac = (acc % 1_000_000_000) as u64;
+        }
         if ticks != 0 {
-            let consumed_ns = ((ticks as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
-            if self.insn_ns != 0 {
-                self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / self.insn_ns);
-            } else {
+            if self.insn_ns == 0 {
+                let consumed_ns = ((ticks as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
                 self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns);
             }
             let before = self.cp0_count as u32;
@@ -1909,7 +1917,7 @@ impl MipsCore {
         } else {
             self.count_anchor_instant.elapsed().as_nanos() as u64
         };
-        let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
+        let ticks = ((elapsed_ns as u128 * self.count_hz as u128 + self.count_frac as u128) / 1_000_000_000) as u64;
         (self.cp0_count as u32).wrapping_add(ticks as u32)
     }
 
@@ -2119,6 +2127,7 @@ impl MipsCore {
     pub fn reanchor_count_and_reschedule(&mut self) {
         self.count_read_cycle = self.hot.cycles;
         self.count_anchor_cycle = self.hot.cycles;
+        self.count_frac = 0;
         self.count_anchor_instant = std::time::Instant::now();
         self.schedule_compare_timer();
     }
@@ -3160,6 +3169,21 @@ mod ip7_ticket_tests {
         assert_eq!(core.count_peek(), expected, "Count lost the ticks counted before the stop");
     }
 
+    /// An R5000's 90 MHz Count is 0.9 of a tick per 10 ns instruction. Read
+    /// every other instruction, as a calibration loop does, it still counts
+    /// 90 MHz, not one tick a cycle (IRIX then saw a 200 MHz O2).
+    #[test]
+    fn instruction_clock_count_read_often_keeps_its_rate() {
+        let mut core = MipsCore::default();
+        core.set_instruction_clock(10);
+        core.set_count_hz(90_000_000);
+        for _ in 0..500_000 {
+            core.hot.cycles += 2;
+            core.count_now();
+        }
+        assert_eq!(core.count_now(), 900_000, "10 ms of instructions");
+    }
+
     /// Count on the instruction clock is the retired cycles at `insn_ns` each,
     /// whatever the host does, and a hard reset does not take guest time back.
     #[test]
@@ -3173,6 +3197,22 @@ mod ip7_ticket_tests {
         assert_eq!(core.count_peek(), 0, "Count restarts from the reset");
         core.hot.cycles += 250_000;
         assert_eq!(core.count_peek(), 33_000);
+    }
+
+    /// The sub-tick remainder belongs to the Count it was earned on: a Count write or a reset starts it over.
+    #[test]
+    fn instruction_clock_count_write_and_reset_clear_the_remainder() {
+        let mut core = MipsCore::default();
+        core.set_instruction_clock(10);
+        core.hot.cycles = 8; // 80 ns: 2.64 ticks at 33 MHz
+        assert_eq!(core.count_now(), 2);
+        assert_ne!(core.count_frac, 0);
+        core.write_cp0(9, 100);
+        assert_eq!(core.count_frac, 0);
+        core.hot.cycles += 8;
+        assert_eq!(core.count_now(), 102, "two ticks, not three");
+        core.reset(false);
+        assert_eq!(core.count_frac, 0);
     }
 
     /// A core's time is the one its machine clock keeps, in every build: a host-clock manager
