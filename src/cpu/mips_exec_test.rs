@@ -2297,8 +2297,11 @@ mod tests {
         exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE
             | (1 << (crate::cpu::mips_core::STATUS_IM_SHIFT + 7));
         exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
-        let deadline = exec.core.hot.cycles + 100_000; // 1 ms of stall at 10 ns/cycle
-        exec.core.set_fire_cycle(deadline);
+        // 1 ms of stall at 10 ns/cycle, armed as the guest arms it.
+        let count = exec.core.count_now();
+        exec.core.write_cp0(11, count.wrapping_add((exec.core.count_hz / 1000) as u32) as u64);
+        let deadline = exec.core.count_fire_cycle;
+        assert!(deadline <= exec.core.hot.cycles + 100_000);
 
         struct Irq(*const std::sync::atomic::AtomicU64);
         unsafe impl Send for Irq {}
@@ -8229,7 +8232,8 @@ mod tests {
         mem.set_word(0x1004, 0);
         exec.core.pc = 0xffff_ffff_8000_1000;
         exec.core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        exec.core.set_fire_cycle(100);
+        let count = exec.core.count_now();
+        exec.core.write_cp0(11, count.wrapping_add(33) as u64); // 1 us at 33 MHz: 100 cycles
 
         // A failed run spins in compiled code for good; the park bit, which
         // compiled code does see, gets it out so the test fails instead.

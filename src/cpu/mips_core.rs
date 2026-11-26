@@ -2072,9 +2072,8 @@ impl MipsCore {
             // normally a Compare write re-arms much sooner.
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
             self.set_fire_cycle(self.hot.cycles.saturating_add(wrap_ns as u64 / self.insn_ns.max(1)));
-            self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
-            crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], true);
-            self.fasttick_count.fetch_add(1, Ordering::Relaxed);
+            // Claim the armed ticket, as the host timer does, so a Count read crossing Compare does not deliver it again.
+            claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count, self.cpu_id);
         }
     }
 
@@ -3169,6 +3168,21 @@ mod ip7_ticket_tests {
         assert_eq!(core.count_peek(), expected, "Count lost the ticks counted before the stop");
     }
 
+    /// A Compare the instruction clock delivers is one tick: the handler's
+    /// Count read that follows must not deliver it again.
+    #[test]
+    fn instruction_clock_compare_counts_one_tick() {
+        let mut core = MipsCore::default();
+        core.set_instruction_clock(10);
+        core.set_count_hz(90_000_000);
+        core.write_cp0(11, 900);
+        core.hot.cycles += 2_000;
+        core.fire_compare_if_due();
+        assert_ne!(core.hot.interrupts.load(Ordering::SeqCst) & CAUSE_IP7 as u64, 0);
+        core.count_now();
+        assert_eq!(core.fasttick_count.load(Ordering::Relaxed), 1);
+    }
+
     /// An R5000's 90 MHz Count is 0.9 of a tick per 10 ns instruction. Read
     /// every other instruction, as a calibration loop does, it still counts
     /// 90 MHz, not one tick a cycle (IRIX then saw a 200 MHz O2).
@@ -3234,6 +3248,7 @@ mod ip7_ticket_tests {
     fn instruction_clock_deadline_raises_ip7_and_the_budget_bit_once() {
         let mut core = MipsCore::default();
         core.set_instruction_clock(10);
+        core.arm_ip7_sequence();
         core.set_fire_cycle(100);
         core.set_budget_cycle(200);
         core.hot.cycles = 99;
