@@ -619,12 +619,6 @@ impl Machine {
         let resident_gpu = if newport_active
             && cfg.graphics.raster == crate::config::RasterUnit::Wgpu
         {
-            if std::env::var_os("IRIS_REX3_GPU").is_some() {
-                return Err(
-                    "IRIS_REX3_GPU and production Newport graphics.raster = \"wgpu\" are mutually exclusive"
-                        .into(),
-                );
-            }
             let options = crate::wgpu::GpuOptions {
                 backend: cfg.graphics.gpu_backend.clone(),
                 ..Default::default()

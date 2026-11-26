@@ -146,12 +146,6 @@ guide and changelog when it lands.
 
 ## Graphics
 
-- [x] **Measurement — REX3 live telemetry and synthetic baseline.** Completed
-  locally on 2026-11-06: opt-in accounting and bounded timestamps, the adaptive
-  telemetry A/A gate, and the corrected seeded five-sample Vulkan gate. The
-  stable telemetry A/A passed; that barrier shader failed both speed gates.
-  Superseded by the tile-binned shader (below). Details:
-  [REX3 GPU profiling and gates](rex3/live-gpu-profiling-and-gates.md).
 - [x] **Capture — synthetic REX3 guest workloads.** Fourteen private captures
   of seven ROM-free direct-MMIO cases under compiled and interpreted CPU
   rendering passed guest pixel and host screenshot checks. They are not real
@@ -182,21 +176,9 @@ guide and changelog when it lands.
   The non-vacuous manifest gate compares reads, hashes, context and full planes
   on the interpreter and counter-proven Cranelift; Linux CI is configured to
   run that gate, deterministic regeneration and link/size security checks.
-  An explicitly selected RTX 5070 Vulkan run verified handling/fallback and
-  completed readback at fence publication; injected early publication and a
-  dropped first batch are rejected even when later draws overlap.
+  A dropped first batch is rejected even when later draws overlap.
   Metal/D3D12 corpus runs, real GFIFO-full back-pressure and broader REX3 modes
   remain open. See the [corpus README](../src/dev/ng1/testdata/README.md).
-- [x] **REX3 GPU recovery (lean).** Accepted draws are journaled (65,536
-  draws / 4,194,304 pixels) until each synchronization; on a GPU error, device
-  loss or readback timeout the journal is replayed on the CPU, the engine is
-  disabled and its wgpu objects are leaked. The hardened version (process
-  lease, quarantine, stop deadlines, fault-injection suite, patched wgpu-core)
-  is a follow-up: [follow-up plan](plans/rex3-gpu-live-follow-ups.md).
-- [x] **Experiment — order-preserving REX3 tiles.** Tile binning on the CPU,
-  one workgroup per 32x32 tile, tile-major GPU plane, damage-limited readback.
-  Vulkan, lean PR tree: raster ~3.3x, tiny ~1.54x (gates 1.20x / 0.95x). See
-  [the parallelization plan](plans/rex3-gpu-parallelization.md).
 - [ ] **Implementation — VPro quad worker pool.** Balance shading and stores over a pool fed by the rasteriser in batches of ~16 quads, the rasteriser running a quad itself when the pool is dry, in-order completion by atomics per 8x8-grid position. See `clanker/plans/odyssey-quad-pipeline.md`, "Idea: a quad worker pool".
 - [ ] **Implementation — VPro memory access, specialised.** Board-memory
   access goes through run-time field decoding per pixel (`odyssey/view.rs`).

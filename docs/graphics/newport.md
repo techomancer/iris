@@ -141,10 +141,7 @@ data, and the stepping rules for blocks, spans and lines. A STEPZ GO steps the
 iterators over one pixel and leaves the pattern as the guest set it
 (`execute_stepz_go`).
 
-There are two host-GPU paths. `rex-gpu` (`rex3_gpu.rs`) is a prototype behind its
-own feature. It draws on the GPU for replays (`REX3_REPLAY_ENGINE=gpu`), and
-`IRIS_REX3_GPU=<backend>` turns on an experimental live renderer; the CPU renderer
-stays the default. The `wgpu` feature composes the display on the GPU for the
+The `wgpu` feature composes the display on the GPU for the
 window (`Ng1Scanout`, in `wgpu/`, used from `src/ui.rs`) when `renderer = "wgpu"`
 is set. That path does not change what the processor does.
 
@@ -242,15 +239,13 @@ The device commands: `vc2 status|ramdump`, `xmap status|dump`,
   and, with `rex-jit`, the compiled shaders. `rex3_replay_testdata` replays them;
   `testdata/README.md` has the commands.
 - Smaller test sets sit beside the code: `rex3_shape.rs`, `rex3_jit_queue.rs`,
-  `vc2_timings.rs`, `wgpu/tests.rs`, `tests/rex3_dirty.rs`, and `rex3_gpu.rs`
-  (behind `rex-gpu`).
+  `vc2_timings.rs`, `wgpu/tests.rs` and `tests/rex3_dirty.rs`.
 - The resident raster, direct scanout, CPU-plane protection, frame ordering
   and capture tests are in `wgpu/resident_tests.rs`, `wgpu/direct_tests.rs`
   and `rex3_plane_tests.rs`; [TESTING.md](../../TESTING.md) describes the
   required hardware gate.
 - Benchmarks are ignored tests in `rex3_tests.rs` (the `gfifo_*` ones and
   `dispatch_lookup_cost`). Run them with `--ignored`.
-- `examples/rex3_gpu_probe.rs` probes the host-GPU path.
 
 Design notes for this board are in `clanker/rex3/`. The published documents for
 its chips are in `docs/datasheets/indy/`: `rex3.pdf`, `vc2.pdf`, `xmap9.pdf`, `bt445_ramdac.pdf`

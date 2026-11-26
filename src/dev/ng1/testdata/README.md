@@ -13,8 +13,8 @@ representative desktop workload or a performance benchmark.
 repository's interpreter, checks independently specified reads and pixels,
 then emits canonical text `REX3REC` records and BLAKE3 state checkpoints.
 `manifest.toml` identifies the generator, license, features, per-case intent,
-coverage tags, reads, checkpoint indices, dispatch expectations, fallback
-reasons, checksums, and the required `output_anchor` name. The first, explicit
+coverage tags, reads, checkpoint indices, dispatch expectations,
+checksums, and the required `output_anchor` name. The first, explicit
 mark(s), and final checkpoint are mandatory. The recordings and manifest are
 generated; this README and `.rex3-corpus-root` are not. Repository attributes
 keep generated files' canonical LF line endings on every checkout.
@@ -96,20 +96,10 @@ unavailable, the affected checks are reported as such. Windows without file
 symlink privilege tests junctions instead; Linux CI exercises file and
 directory symlinks when the configured job runs.
 
-GPU validation is optional and explicitly ignored unless selected:
-`cargo test -p iris --lib --features rex-gpu,rex-jit,rexdiag
-rex3_corpus_gpu_ -- --ignored --nocapture --test-threads=1`. It requires an actual
-integrated/discrete adapter and the default batch size; the test then pins the
-batch to the 1,024 draws these recordings were authored for. It verifies
-handled/fallback counts and reasons, interpreter fallback, state equivalence,
-and the batch-full and display-fence flushes. The batch case preserves pixel
-(6,5) from the first 1,024 draws while draw 1,025 overwrites (5,5); dropping
-the first batch fails both the pixel probe and checkpoints. A test-only
-observer compares both framebuffer planes at the `gfifo_fence` publication,
-before any later idle flush, and requires completed display-fence readback.
-An injected early publication proves that stale pixels fail even if a later
-idle flush repairs the final state. An unavailable adapter is not reported as
-a successful GPU validation.
+The batch case preserves pixel (6,5) from the first 1,024 draws while draw
+1,025 overwrites (5,5); dropping the first batch fails both the pixel probe and
+checkpoints. A test-only observer compares both framebuffer planes at the
+`gfifo_fence` publication, before any later idle flush.
 
 The DMA case uses one 64-bit word per transfer; BUS_BUSY retry is covered by
 separate mocked replay tests, not by a full real GFIFO. Multiword DMA resume,

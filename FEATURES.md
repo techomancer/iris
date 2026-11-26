@@ -46,7 +46,6 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `rex-dirty-upload` | Track conservative Newport framebuffer damage and copy/upload only dirty regions. Opt-in; the default retains the original REX3 and presentation paths. | — |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `wgpu` | Host-GPU rasterisation through the common wgpu layer (VPro, IMPACT and experimental GPU-authoritative Newport), plus wgpu window composition. Newport production activation is initially validated on Vulkan and D3D12 and fails closed without CPU fallback. Work in progress; see `clanker/plans/GPUTodo.md`. | `dep:bytemuck`, `dep:pollster`, `dep:wgpu`, `dep:ash` |
-| `rex-gpu` | Experimental Newport wgpu/WGSL flat-fill engine for replay and, with `IRIS_REX3_GPU`, live rendering. It uses the common wgpu device/presentation layer. The CPU renderer remains the default; this feature is not part of `gpujit` or release builds. | `gputrace`, `rex-dirty-upload`, `wgpu` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit`, `gr2-jit` |
@@ -379,7 +378,7 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 | `graphics.threads` | `2` | Worker threads the board's fragment pipeline draws on, at least 1. VPro and InfiniteReality: the screen tiles' owners, besides its front-end and raster threads; more help on a host with cores to spare. |
 | `graphics.tile` | `32` | VPro and InfiniteReality: the fragment pipeline's screen tile size in pixels, a power of two from 8 to 256. Each tile's work runs in order on one worker at a time; with many threads, 64 can be faster. |
-| `graphics.raster` | `cpu` | VPro, IMPACT and Newport: where the raster unit runs. `cpu` keeps the existing board path; `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature). Newport's experimental production mode makes its complete RGB and auxiliary planes GPU-authoritative, has no unsupported-operation CPU fallback, and is separate from the older CPU-canonical `IRIS_REX3_GPU` prototype. An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
+| `graphics.raster` | `cpu` | VPro, IMPACT and Newport: where the raster unit runs. `cpu` keeps the existing board path; `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature). Newport's experimental production mode makes its complete RGB and auxiliary planes GPU-authoritative and has no unsupported-operation CPU fallback. An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
 | `graphics.newport_mode` | `direct` when Newport uses wgpu | `direct` shares the resident GPU with the wgpu window presenter and fails startup rather than falling back to GL/CPU; `readback` explicitly selects the slow compatibility/validation compositor, synchronizing both complete planes for each newly composed frame. It applies only to Newport with `raster = "wgpu"`. |
 | `graphics.gpu_backend` | `auto` | The wgpu backend for `raster = "wgpu"`: auto, vulkan, metal, dx12 or gl. `WGPU_BACKEND` overrides it. Experimental production Newport initially accepts only Vulkan or D3D12; `auto` must resolve to one of them. |
 
@@ -727,7 +726,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`. |
 | `--cache MODEL` | Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`), `full` or `shadow`. Overrides `[machine] cache`. The R10000 family is always `shadow`. |
 | `--graphics` | Graphics board: `newport` (default), `xz` (2 GE7 on Indigo2, 4 on Indy), `elan` (4 GE7, Indigo2), `extreme` (8 GE7, Indigo2), `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel, `v12` on the Tezro and Onyx 3000), `ir2`, `ir2:2rm`, `ir2e`, `ir2e:2rm` (Onyx2), `ir3` (Onyx 3000) or `none`. Overrides `[graphics] board`. |
-| `--raster` | VPro and IMPACT: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). Newport currently rejects `wgpu`; use `IRIS_REX3_GPU` only for its legacy experimental prototype. |
+| `--raster` | VPro, IMPACT and Newport: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |
 | `--renderer` | What draws the window: `gl` (default) or `wgpu` (`renderer`; needs a build with the `wgpu` feature). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |
@@ -884,7 +883,6 @@ mistaken for GUI settings.
 | `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
 | `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). Also traces an offline replay (`VPRO_REPLAY`); a test that replays several sessions adds `.1`, `.2` and so on for the later ones. | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
 | `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
-| `IRIS_REX3_GPU` | `auto`, `vulkan`, `metal`, `dx12`, or `gl` enables the CPU-canonical legacy live REX3 GPU prototype in a `rex-gpu` build. Unset keeps that prototype off; this does not select production `[graphics] raster = "wgpu"`, and the two modes are mutually exclusive. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_REX3_GPU_STATS` | Set (any value) to add the costlier Newport GPU-raster telemetry to `rex status`: command generation time per GO and which state-slot words change from one primitive to the next. Read when the GPU raster starts. | [src/dev/ng1/wgpu/resident.rs](src/dev/ng1/wgpu/resident.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
@@ -899,10 +897,7 @@ mistaken for GUI settings.
 | `IRIS_WGPU_LOAD` | With the `wgpu` feature: a directory of kernels to compile instead of the built-in ones. A kernel is replaced when the directory holds a file of the name `IRIS_WGPU_DUMP` writes for it, so a dumped kernel can be edited and tried without a rebuild. | [src/wgpu/shader.rs](src/wgpu/shader.rs) |
 | `MGRAS_BIN_EDGES` | With the `wgpu` feature: `0` makes the IMPACT GPU unit's bin pass place GL triangles by their box alone, instead of also testing their span bounds at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/mgras/wgpu/mod.rs](src/dev/mgras/wgpu/mod.rs) |
 | `REX3_FORCE_FULL_UPLOAD` | `1` restores the two-full-plane Newport texture upload in a `rex-dirty-upload` build, for comparison. | [src/gl_compositor.rs](src/gl_compositor.rs) |
-| `REX3_GPU_BACKEND` | Legacy `rex-gpu` replay, probe and test backend: `auto`, `vulkan`, `metal`, `dx12` or `gl`. The live prototype instead uses `IRIS_REX3_GPU`. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
-| `REX3_GPU_BATCH_DRAWS` | `rex-gpu` builds: draws per bounded GPU batch, 1 to 65536 (default 16384). Does not enable the GPU engine. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
-| `REX3_GPU_TELEMETRY` | `1` enables REX3 GPU stage timing and batch accounting; unset or `0` disables it. Does not enable the GPU engine. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
-| `REX3_GPU_TIMESTAMPS` | `1` requests optional GPU compute and readback timestamp queries and enables telemetry; unset or `0` disables them. | [src/dev/ng1/rex3_gpu.rs](src/dev/ng1/rex3_gpu.rs) |
+| `REX3_GPU_BACKEND` | Backend for the GPU raster in REX3 replay: `auto`, `vulkan`, `metal`, `dx12` or `gl`. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `VPRO_BIN_EDGES` | With the `wgpu` feature: `0` makes the VPro GPU unit's bin pass place triangles by their box alone, instead of also testing their edges at each 32x32 coarse tile and 8x8 tile; for comparing the two. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
 | `VPRO_TILE_CACHE` | With the `wgpu` feature: `1` makes the VPro GPU raster kernel hold each 8x8 tile's blocks of the destination in workgroup memory for the batch and store the changed ones back at the end of the tile, instead of an atomic per access; off by default (slower on the measured workloads). | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
 | `WGPU_BACKEND` | With the `wgpu` feature: the wgpu backend to open, overriding `[graphics] gpu_backend` (a comma list of `vulkan`, `metal`, `dx12`, `gl`). The other variables wgpu reads itself apply too, for example `WGPU_VALIDATION`, `WGPU_DEBUG`, `WGPU_GL_FENCE_BEHAVIOR` and `WGPU_GLES_MINOR_VERSION`. | [src/wgpu/device.rs](src/wgpu/device.rs) |
@@ -957,9 +952,7 @@ tests, and subprocesses the tests start. A normal run never needs them.
 | `MGRAS_TEST_BOARD`, `MGRAS_REPLAY_BOARD`, `MGRAS_REPLAY_NOCHECK` | `max` runs the IMPACT board tests, or a replay, on Maximum IMPACT's two raster engines; `MGRAS_REPLAY_NOCHECK` replays a recording that starts mid-session for timing and its final state, unchecked. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `REX3_CORPUS_IO_DIR`, `REX3_CORPUS_MUTATOR_EXPECT`, `REX3_CORPUS_MUTATOR_LINK`, `REX3_CORPUS_MUTATOR_TARGET` | The ignored corpus-writer filesystem test's build directory, and its child process's internal selectors. | [src/dev/ng1/rex3_corpus_io.rs](src/dev/ng1/rex3_corpus_io.rs) |
 | `REX3_CORPUS_OUT` | Existing directory, relative to the repository, the ignored REX3 shader-corpus generator writes into. | [src/dev/ng1/rex3_corpus.rs](src/dev/ng1/rex3_corpus.rs) |
-| `REX3_GPU_AA_MAX_ROUNDS` | Maximum rounds for the ignored REX3 telemetry A/A test: a multiple of 8 in `16..=128`, default `48`. | [src/dev/ng1/rex3_gpu_telemetry.rs](src/dev/ng1/rex3_gpu_telemetry.rs) |
-| `REX3_GPU_AA_SAMPLE_MS` | Target milliseconds per sample for the ignored REX3 telemetry A/A test: `100..=2000`, default `600`. | [src/dev/ng1/rex3_gpu_telemetry.rs](src/dev/ng1/rex3_gpu_telemetry.rs) |
-| `REX3_REPLAY` | Recording for the ignored one-file REX3 replay test. `REX3_REPLAY_ENGINE` is `jit` (default), `interp`, `resident` (the GPU raster, `wgpu`, with `REX3_GPU_BACKEND`) or `gpu` (`rex-gpu`, with `REX3_GPU_BACKEND`); `REX3_REPLAY_LIMIT=<n>` replays the first n records; `REX3_REPLAY_NOCHECK` skips the checkpoints; `REX3_REPLAY_TRACE=<file>` traces the replay; `REX3_REPLAY_STATE=<file>` writes the final register state as TOML; `REX3_REPLAY_OUT=<png>` saves the screen. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
+| `REX3_REPLAY` | Recording for the ignored one-file REX3 replay test. `REX3_REPLAY_ENGINE` is `jit` (default), `interp`, or `resident` (the GPU raster, `wgpu`, with `REX3_GPU_BACKEND`); `REX3_REPLAY_LIMIT=<n>` replays the first n records; `REX3_REPLAY_NOCHECK` skips the checkpoints; `REX3_REPLAY_TRACE=<file>` traces the replay; `REX3_REPLAY_STATE=<file>` writes the final register state as TOML; `REX3_REPLAY_OUT=<png>` saves the screen. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `REX3_RESIDENT_BACKEND` | Test-only resident GPU adapter backend: `auto`, `vulkan`, `dx12`, `metal` or `gl`. The ignored hardware tests require the selected backend and a hardware adapter; this variable does not enable a live renderer. See [TESTING.md](TESTING.md). | [src/dev/ng1/wgpu/resident_tests.rs](src/dev/ng1/wgpu/resident_tests.rs) |
 | `RE_REPLAY`, `RE_SPEED` | O2 rendering-engine traces (`IRIS_IP32_RE_TRACE`, saved with `retrace`) for the ignored replay and replay-speed tests. `RE_REPLAY_PNG` names the replay's image (default `replay.png`); `RE_REPLAY_BUF`, `RE_REPLAY_LOW`, `RE_REPLAY_HALF`, `RE_REPLAY_PX`, `RE_REPLAY_PRELOAD`, `RE_REPLAY_PRELOAD_EVERY` and `RE_GOURAUD` select what it shows and preloads; `RE_SPEED_PASSES` (default 5) the timed passes. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `VPRO_GOLDEN` | `tolerance` lets a VPro golden frame whose hash changed pass inside its stored limits. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
@@ -1222,184 +1215,6 @@ both backends, and the animated Atlantis demo improved live REX3 throughput by
 42.1% on Vulkan and 24.3% on D3D12 while using 5.9% and 7.7% less host CPU,
 respectively, on the acceptance host. The mode remains experimental and
 opt-in while that application/adapter matrix is broadened.
-
-### REX3 live GPU renderer (legacy experiment, `--features rex-gpu`)
-
-`rex-gpu` adds a wgpu/WGSL compute path for Newport flat fills, used for
-differential replay of REX3 recordings and, when `IRIS_REX3_GPU` is set, as an
-**experimental** live renderer. It is deliberately separate from `gpujit` and
-is not enabled by default or in release packaging; without `IRIS_REX3_GPU` a
-`rex-gpu` build renders exactly as before. It uses the common `wgpu` feature's
-device and presentation layer, and also enables `gputrace`, which supplies the
-REX3 record/replay harness, and `rex-dirty-upload`, whose damage snapshots
-publish completed GPU work to the existing presentation path.
-
-The prototype still makes the CPU framebuffer canonical and synchronizes
-before presentation and CPU fallback. It is not selected by
-`[graphics] raster = "wgpu"` and cannot be enabled at the same time as that
-GPU-authoritative production mode. See [TESTING.md](TESTING.md) for the
-separate gates and remaining limits.
-
-The GPU subset is intentionally narrow: complete `DRAW` blocks and spans with
-positive integer coordinates, 24-bit RGB planes, RGB color mode, `SRC` logic
-operation, disabled alpha compare, no screen masks, and no shading, blending,
-dithering, patterns, host pixels or batched host transfers, fast clear, XY
-move, Y-flip, skip flags, continuation state, or length-32 mode. Write masks
-(including the upper byte) and screen-edge clipping are supported. Unsupported
-draws first synchronize pending GPU work, then use the existing CPU path.
-
-The CPU bins each accepted fill into the 32 x 32 screen tiles it covers. The
-shader runs one workgroup per tile and applies that tile's fills in submission
-order, so draw order is kept without GPU barriers. The GPU copy of the RGB
-plane holds only the 1,344 x 1,024 screen, stored tile by tile (5.25 MiB).
-
-Supported fills share bounded command batches. Consecutive full batches remain
-GPU-resident; a CPU observation boundary, display fence, unsupported draw, or
-idle GFIFO synchronizes the tiles drawn since the last synchronization back to
-the CPU. A CPU fallback, or any other CPU write to the plane (snapshot restore,
-reset, framebuffer load), invalidates the GPU copy so the next supported batch
-uploads the current CPU plane. Transfers, submissions, fences, handled draws,
-fallbacks, and fallback reasons are reported.
-
-Accepted draws are also kept in an ordered journal until the next
-synchronization, capped at 65,536 draws and 4,194,304 pixels; reaching a cap
-synchronizes first. If the GPU reports an error, loses its device, or a
-readback does not complete within 10 seconds, the journal is replayed onto the
-CPU plane, the GPU engine is disabled for the rest of the run, and rendering
-continues on the CPU. The failed device is deliberately leaked rather than
-destroyed, because destroying a lost device can block or abort inside wgpu.
-
-On an RTX 5070 under Vulkan, long spans (1,280 pixels) render at about 3.3x
-the CPU renderer's throughput through the full GFIFO, and 8-pixel draws at
-about 1.5x, where both renderers spend most of their time on shared GFIFO
-handling. Both are measured in the same `rex-gpu,rex-jit` release build.
-
-`REX3_GPU_TELEMETRY=1` adds host stage timings, parameter bytes, flush reasons,
-and a power-of-two batch-size histogram to the GPU report. Match and enqueue
-times sample one in every 256 matcher attempts; they are sampled sums and
-counts, not timings for all draws. The `sampled_draws` count includes sampled
-unsupported or retried attempts. The enqueue sample can include an upload.
-Resource creation, command encoding, submission, polling, blocking device
-wait, mapping, and CPU framebuffer copy have separate monotonic wall-time
-counters. GPU work is asynchronous, so those counters and the overall elapsed
-time are not necessarily additive. The basic draw and transfer counters remain
-available without telemetry. Snapshot deltas reject different engines or a
-telemetry reset instead of silently subtracting unrelated counters. They also
-reject changes in timestamp support or timestamp errors between snapshots.
-
-`REX3_GPU_TIMESTAMPS=1` also enables telemetry and requests optional wgpu
-timestamp features. Diagnostics say whether compute timestamps and readback
-transfer timestamps are enabled, unsupported, or unavailable; missing support
-does not disable the renderer. `readback_transfer: false` in an enabled status
-means encoder timestamps are unsupported and transfer totals are absent, not
-zero. Timestamp samples are resolved and mapped at the existing framebuffer
-readback, not with a wait after each full batch.
-Drain before both snapshots when attributing timestamp samples to an interval;
-otherwise a later readback can collect earlier submissions.
-Profiling allocates extra per-submission resources and can alter performance.
-At most 64 submissions are retained between readbacks, with a slot reserved
-for the final readback; skipped submissions are counted, and timestamp readback
-bytes are reported separately from framebuffer readback bytes. The measured
-transfer is the GPU buffer-to-readback copy, not the `queue.write_buffer`
-upload, for which GPU timing is unavailable. Encoder timestamp ordering can
-vary by backend and driver, so transfer timings are approximate rather than
-exact device-bus timings. A timestamp end value below its start (which can
-indicate counter wrap) discards only that stage's sample and increments its
-`discarded` count; profiling continues. A wrap that leaves the end value above
-the start cannot be detected without the device counter width. Other profiling
-errors are reported separately from renderer errors and invalidate the
-accumulated GPU timestamp totals. Hardware validation reports an inconclusive
-result if a requested stage produces no usable timestamps, including when all
-its samples were discarded. Both variables accept only `0` or `1` and neither
-enables the GPU.
-
-`REX3_GPU_BACKEND=auto|vulkan|metal|dx12|gl` selects the backend. `auto` tries
-Vulkan then D3D12 on Windows, Metal on macOS, and Vulkan then GL elsewhere. The
-hardware probe checks adapter selection, two ordered overlapping fills,
-architectural context progression, batching, and readback:
-
-`REX3_GPU_BATCH_DRAWS` changes the bounded batch size for experiments from its
-default of 16,384 draws; accepted values are 1 through 65,536. A batch is also
-submitted early when its fills would cover more than 1,048,576 tiles in total,
-counting a tile once per fill that touches it. It does not enable the GPU
-engine by itself.
-
-```sh
-REX3_GPU_BACKEND=vulkan cargo run --release --example rex3-gpu-probe --features rex-gpu
-```
-
-The live experiment uses the same backend names through `IRIS_REX3_GPU`.
-Normal Newport rasterization remains on the CPU when it is unset:
-
-```sh
-IRIS_REX3_GPU=vulkan cargo run --release --features rex-gpu
-```
-
-Replay an existing recording with:
-
-```sh
-REX3_REPLAY=draw.rec REX3_REPLAY_ENGINE=gpu REX3_GPU_BACKEND=vulkan \
-  cargo test --release --features rex-gpu rex3_replay_file -- --ignored --nocapture
-```
-
-GPU replay fails rather than reporting success if adapter/device setup fails,
-wgpu reports an error, a readback times out, checkpoints diverge, or the
-recording submits no draw through the initial GPU subset.
-
-The ignored live GFIFO gate interleaves five CPU/GPU samples per workload,
-includes the final drain, verifies generated CPU shader dispatch, and compares
-every GPU sample's full framebuffer with the same CPU draw sequence. Each
-sample starts from a fresh deterministic framebuffer and uses different fill
-colors, including distinct colors for each successive full-width pass. The
-workload rejects more than 2^24 passes rather than silently repeating that
-palette. GPU restoration invalidates its copy, so the first timed draw
-includes the upload. The generated CPU shader is checked outside timing and
-also used for the independent CPU reference replay; dispatch counters run only
-if the production `rexdiag` feature is enabled. The gate always enables interval
-telemetry; its untimed reference replays can make it much longer than its
-minimum sample time. Optional GPU timestamp profiling remains controlled by
-`REX3_GPU_TIMESTAMPS`.
-
-The ignored A/A test warms both modes, then uses alternating CPU/CPU and
-GPU-off/GPU-off controls and balanced GPU off/on/on/off or on/off/off/on
-blocks. Warmup determines a fixed draw count per engine targeting 600 ms per
-sample by default; all measured samples for that engine do the same work and
-include the final drain. `REX3_GPU_AA_SAMPLE_MS` accepts `100..=2000` and
-`REX3_GPU_AA_MAX_ROUNDS` accepts multiples of 8 in `16..=128`. The default
-maximum is 48 rounds (about four minutes at the target rate, before drain and
-host variation). Invalid settings fail before GPU initialization.
-
-The test checks after 16 rounds and every eight thereafter, stopping early when
-the evidence is decisive or continuing to the configured maximum. It reports
-individual rates, variation, the stop reason, and the median paired on/off
-throughput change. Each block interpolates its outer samples to the inner
-sample midpoint to reduce linear drift. The sign-test interval spends a fixed
-error budget across the planned looks, retaining at least 97.87% nominal
-simultaneous coverage for each metric, assuming independent blocks with a
-common median. CPU A/A results are reported as diagnostics and do not affect
-the decision. The GPU-off A/A interval must cover zero and lie inside ±3%,
-with its median absolute pair change and first/second half shift below 3%.
-The telemetry order effect must also be below 3%. Its first/second half shift
-is reported as a diagnostic but does not gate the decision; a large shift can
-indicate that the common-median assumption does not hold. **PASS** requires the
-entire telemetry interval inside ±3%; **FAIL** requires it entirely on the
-slower side outside −3%. Otherwise the test continues, and reports
-**INCONCLUSIVE** at the maximum, including when an apparent speedup exceeds
-+3%. Both FAIL and INCONCLUSIVE return a failing test status so an inconclusive
-run cannot be mistaken for acceptance. Timestamp profiling is disabled for
-this comparison; when `rex-jit` is enabled, compiled CPU comparisons require
-`IRIS_NO_JIT` to be unset.
-The isolated empty-fill enqueue test measures the per-attempt CPU hot path
-without GFIFO or GPU submissions; it is diagnostic, not the acceptance gate.
-The bounded readback test explicitly requests timestamps and reports when the
-adapter cannot provide them:
-
-```sh
-cargo test --release --features rex-gpu,rex-jit gpu_live_gfifo_performance_gate -- --ignored --nocapture --test-threads=1
-cargo test --release --features rex-gpu,rex-jit gpu_live_gfifo_instrumentation_noise -- --ignored --nocapture --test-threads=1
-cargo test --release --features rex-gpu gpu_empty_enqueue_telemetry_cost -- --ignored --nocapture --test-threads=1
-cargo test --release --features rex-gpu gpu_timestamp_readback_is_bounded -- --ignored --nocapture --test-threads=1
-```
 
 ### Newport framebuffer presentation
 

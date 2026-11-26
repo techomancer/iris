@@ -670,35 +670,6 @@ synchronization boundaries, candidate framebuffer/Z traffic, host reads and
 JIT activity. The display path separately counts frames and the host pixels it
 scans. These counters reset rather than round-trip in a snapshot.
 
-The optional `rex-gpu` feature builds on `rex-dirty-upload` and adds the older
-wgpu path for Newport flat fills on the `REX3-Processor` thread. It is used by
-recording replay and, only when `IRIS_REX3_GPU` is set, by the experimental
-CPU-canonical live renderer. It is deliberately separate from production
-`[graphics] raster = "wgpu"` and the two selectors are mutually exclusive.
-
-The CPU framebuffer stays canonical at every observation point. Supported
-fills are batched; the engine synchronizes (reads the GPU work back into the
-CPU plane) before an unsupported draw falls back to the CPU, before the GFIFO
-becomes idle or exits, at a display fence, in `wait_idle`, and before any
-other CPU write to the plane, and only then releases `GFXBUSY` or publishes
-the fence. Completed work publishes through the existing damage tracker.
-
-The GPU copy of the RGB plane covers only the 1,344 x 1,024 screen and is
-stored tile-major in 32 x 32 tiles (5.25 MiB). The CPU bins each accepted
-fill into the tiles it covers; the shader runs one workgroup per tile, each
-invocation owning four pixels and applying that tile's fills in submission
-order, so no GPU barrier is needed. A synchronization copies back only the
-rows of tiles touched since the previous one: every other tile still equals
-the CPU plane, because only accepted fills change the GPU plane and any CPU
-mutation first makes the next draw re-upload it.
-
-Every accepted fill is also journaled until the next synchronization (at most
-65,536 draws or 4,194,304 pixels). On any GPU error, device loss or readback
-timeout the journal is replayed onto the CPU plane, which still holds the
-last synchronization, and the engine is disabled; the guest-visible context
-already advanced when each draw was accepted. The failed wgpu objects are
-leaked, since destroying a lost device can block or abort inside wgpu.
-
 Scanout is decoupled from drawing: the refresh thread reads the framebuffer
 without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
@@ -806,8 +777,8 @@ thread too, at their lines.
 ### Newport resident GPU backend
 
 The resident raster in `src/dev/ng1/wgpu/resident.rs` is the experimental
-GPU-authoritative production path selected by `[graphics] raster = "wgpu"`;
-it is not the `rex-gpu` prototype. Machine construction creates one validated
+GPU-authoritative production path selected by `[graphics] raster = "wgpu"`.
+Machine construction creates one validated
 Vulkan or D3D12 `Arc<Gpu>`, shares it across both Newport heads, and activates
 each board while it is still exclusively owned. Activation seeds complete
 linear 2048 x 1024 RGB and auxiliary planes before the board is published.
@@ -848,8 +819,7 @@ normalizer accepts blocks whose endpoint ordering matches increasing or
 decreasing X/Y octants, while spans remain left-to-right. Active fast clears
 reuse the canonical REX3 mode decoder, take their replicated source from
 `COLORVRAM`, bypass dead blend/dither/logic/stipple/shade state, and retain
-WRMASK plus RGB or auxiliary destination selection. The legacy CPU-canonical
-`rex-gpu` matcher keeps its previous narrower acceptance rules.
+WRMASK plus RGB or auxiliary destination selection.
 
 Integer, fractional and antialiased lines consume the context after the
 canonical setup boundary, so fractional setup and architectural advancement

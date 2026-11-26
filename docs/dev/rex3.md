@@ -392,8 +392,5 @@ missing interrupt and the no-poll burst respectively.
   window renderer (`wgpu` feature). Its resident raster (`resident.rs`,
   `direct.rs`, with `rex3_plane.rs` and `rex3_frame.rs`) is built for tests
   only; `graphics.raster = "wgpu"` is refused on Newport.
-- `src/dev/ng1/rex3_gpu.rs` — the experimental host-GPU flat-fill engine
-  (`rex-gpu` feature, live only with `IRIS_REX3_GPU`); the CPU renderer stays
-  the default.
 - `clanker/rex3/` — findings: CIDMATCH is a mask, blend alpha, host and line alpha, fastclear and CID,
   GFIFO batching, HOSTRW batching, LINE+HOST not being JIT-able.

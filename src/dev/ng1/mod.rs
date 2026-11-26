@@ -13,7 +13,6 @@
 //!                    (submodules of rex3.rs; test-only)
 //!   rex3_dirty.rs    per-tile damage tracking of the planes
 //!   rex3_flat_fill.rs flat fills the GPU raster paths share (`wgpu`)
-//!   rex3_gpu.rs      host-GPU flat-fill prototype (`rex-gpu`, `IRIS_REX3_GPU`)
 //!   rex3_jit/        Cranelift shader JIT (`rex-jit`)
 //!   rex3_jit_queue.rs its priority compile queue, free of Cranelift types
 //!   wgpu/            the display composed on the host GPU (`wgpu`), and the
@@ -28,8 +27,6 @@ pub(crate) mod rex3_dirty;
 #[cfg(feature = "wgpu")]
 pub(crate) mod rex3_flat_fill;
 pub mod rex3_generic;
-#[cfg(feature = "rex-gpu")]
-pub mod rex3_gpu;
 pub mod rex3_shaders;
 pub mod rex3_shape;
 /// Draw-shape corpus persistence. Deliberately NOT behind `rex-jit`: the corpus

@@ -83,7 +83,7 @@ boots to a usable system: shell, networking, X11, the works.
 - IRIX 5.3 works too
 - **Indy IP24:** X11 / Newport (REX3) graphics works, with mouse and keyboard input
   (IntelliMouse wheel included), HAL2 audio, and IndyCam video-in through VINO.
-  Experimental live rendering on the host GPU via `rex-gpu` (`IRIS_REX3_GPU`).
+  Experimental live rendering on the host GPU (`graphics.raster = "wgpu"`).
 - **Indigo2 IP22:** Newport, GR2 XZ/Extreme, and IMPACT graphics; two SCSI controllers
 - **Indigo2 IP28:** R10000, IMPACT graphics, and up to 1 GB with two 512 MB banks
 - **O2 IP32:** CRIME/MACE, GBE display, R5000/R10000/R12000, up to 1 GB, two SCSI buses, networking

@@ -8,8 +8,7 @@ Same monitor syntax as gr2/mgras:
   rex trace <file> [gfifo,cpu|all]   rex trace off|flush   IRIS_REX3_TRACE=<file>
   rex rec <file>[.txt]               rex rec mark|off      IRIS_REX3_REC=<file>
   REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored --nocapture
-    (REX3_REPLAY_ENGINE=interp|jit|gpu, REX3_REPLAY_TRACE, REX3_REPLAY_NOCHECK;
-     gpu requires rex-gpu)
+    (REX3_REPLAY_ENGINE=interp|jit|resident, REX3_REPLAY_TRACE, REX3_REPLAY_NOCHECK)
 `rex buslog` is gone; the GF trace lines replace rex3.log (bulk-transfer
 lines keep the same word-count/first/last text).
 

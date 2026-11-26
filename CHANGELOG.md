@@ -84,6 +84,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   per pixel: powerflip on an Indy draws nearly twice as fast.
 - A resolution change with the wgpu renderer no longer stops the window
   presenting ("Failed to wait for GPU to come idle").
+- The older `rex-gpu` feature and its `IRIS_REX3_GPU` switch are gone:
+  `raster = "wgpu"` is the one way to draw Newport on the host GPU.
 
 ### Newport colour-index shading
 

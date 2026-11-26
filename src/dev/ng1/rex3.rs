@@ -15,8 +15,6 @@ use crate::dev::ng1::bt445::Bt445;
 use crate::dev::ng1::rex3_dirty::{DamagePlane, DamageRect};
 #[cfg(feature = "rex-dirty-upload")]
 use crate::dev::ng1::rex3_dirty::DamageTracker;
-#[cfg(feature = "rex-gpu")]
-use crate::dev::ng1::rex3_gpu::FlushReason;
 use bitfield::bitfield;
 use crate::disp::Rex3Screen;
 use std::io::Write;
@@ -1338,73 +1336,36 @@ struct GoDamage {
     rect: DamageRect,
 }
 
-#[cfg(any(feature = "rex-gpu", feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RasterModeKind {
     Cpu,
-    #[cfg(feature = "rex-gpu")]
-    LegacyReplay,
-    #[cfg(feature = "wgpu")]
     Resident,
 }
 
-#[cfg(any(feature = "rex-gpu", feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 impl RasterModeKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Cpu => "CPU raster",
-            #[cfg(feature = "rex-gpu")]
-            Self::LegacyReplay => "GPU replay",
-            #[cfg(feature = "wgpu")]
-            Self::Resident => "resident raster",
-        }
-    }
-
-    fn ensure_available(self, requested: Self) -> Result<(), String> {
+    fn ensure_available(self) -> Result<(), String> {
         if self == Self::Cpu {
             Ok(())
-        } else if self == requested {
-            Err(format!("REX3 {} is already enabled", self.name()))
         } else {
-            Err(format!("REX3 {} and {} are mutually exclusive", self.name(), requested.name()))
+            Err("REX3 resident raster is already enabled".into())
         }
     }
 }
 
-#[cfg(any(feature = "rex-gpu", feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 enum RasterMode {
     Cpu,
-    #[cfg(feature = "rex-gpu")]
-    LegacyReplay(crate::dev::ng1::rex3_gpu::Rex3Gpu),
-    #[cfg(feature = "wgpu")]
     Resident(crate::dev::ng1::wgpu::resident::ResidentRaster),
 }
 
-#[cfg(any(feature = "rex-gpu", feature = "wgpu"))]
+#[cfg(feature = "wgpu")]
 impl RasterMode {
     fn kind(&self) -> RasterModeKind {
         match self {
             Self::Cpu => RasterModeKind::Cpu,
-            #[cfg(feature = "rex-gpu")]
-            Self::LegacyReplay(_) => RasterModeKind::LegacyReplay,
-            #[cfg(feature = "wgpu")]
             Self::Resident(_) => RasterModeKind::Resident,
-        }
-    }
-
-    #[cfg(feature = "rex-gpu")]
-    fn legacy(&self) -> Option<&crate::dev::ng1::rex3_gpu::Rex3Gpu> {
-        match self {
-            Self::LegacyReplay(gpu) => Some(gpu),
-            _ => None,
-        }
-    }
-
-    #[cfg(feature = "rex-gpu")]
-    fn legacy_mut(&mut self) -> Option<&mut crate::dev::ng1::rex3_gpu::Rex3Gpu> {
-        match self {
-            Self::LegacyReplay(gpu) => Some(gpu),
-            _ => None,
         }
     }
 }
@@ -1420,7 +1381,7 @@ pub struct Rex3 {
     // Each bit of a pixel represents a plane.
     pub fb_rgb: UnsafeCell<CpuPlane>,
     pub fb_aux: UnsafeCell<CpuPlane>,
-    #[cfg(any(feature = "rex-gpu", feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
     raster: Mutex<RasterMode>,
     fatal_sender: Mutex<Option<std::sync::mpsc::Sender<crate::traits::MachineFatal>>>,
     #[cfg(feature = "wgpu")]
@@ -1500,8 +1461,6 @@ pub struct Rex3 {
     pub gfifo_fence: AtomicU32,
     #[cfg(all(test, feature = "gputrace"))]
     fence_observer: Mutex<Option<Box<dyn Fn(&Rex3, u32) + Send>>>,
-    #[cfg(all(test, feature = "rex-gpu"))]
-    test_signal_fence_early: AtomicBool,
     pub debug: Arc<AtomicBool>,
     #[cfg(feature = "developer")]
     pub block_debug: Arc<AtomicBool>,
@@ -1644,7 +1603,7 @@ impl Rex3 {
             context: UnsafeCell::new(Rex3Context::power_on_default()),
             fb_rgb: UnsafeCell::new(fb_rgb),
             fb_aux: UnsafeCell::new(fb_aux),
-            #[cfg(any(feature = "rex-gpu", feature = "wgpu"))]
+            #[cfg(feature = "wgpu")]
             raster: Mutex::new(RasterMode::Cpu),
             fatal_sender: Mutex::new(None),
             #[cfg(feature = "wgpu")]
@@ -1694,8 +1653,6 @@ impl Rex3 {
             gfifo_fence: AtomicU32::new(0),
             #[cfg(all(test, feature = "gputrace"))]
             fence_observer: Mutex::new(None),
-            #[cfg(all(test, feature = "rex-gpu"))]
-            test_signal_fence_early: AtomicBool::new(false),
             debug: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "developer")]
             block_debug: Arc::new(AtomicBool::new(false)),
@@ -1757,52 +1714,6 @@ impl Rex3 {
         }
     }
 
-    #[cfg(feature = "rex-gpu")]
-    pub(crate) fn enable_gpu_replay(
-        &self,
-        backend: &str,
-    ) -> Result<crate::dev::ng1::rex3_gpu::AdapterDiagnostics, String> {
-        self.enable_gpu_replay_using(|| crate::dev::ng1::rex3_gpu::Rex3Gpu::new(backend))
-    }
-
-    #[cfg(feature = "rex-gpu")]
-    pub(crate) fn gpu_replay_report(&self) -> Option<crate::dev::ng1::rex3_gpu::ReplayReport> {
-        self.raster.lock().legacy().map(|gpu| gpu.report())
-    }
-
-    #[cfg(feature = "rex-gpu")]
-    fn enable_gpu_replay_using(
-        &self,
-        create: impl FnOnce() -> Result<crate::dev::ng1::rex3_gpu::Rex3Gpu, String>,
-    ) -> Result<crate::dev::ng1::rex3_gpu::AdapterDiagnostics, String> {
-        let mut mode = self.raster.lock();
-        mode.kind().ensure_available(RasterModeKind::LegacyReplay)?;
-        let gpu = create()?;
-        let diagnostics = gpu.diagnostics().clone();
-        *mode = RasterMode::LegacyReplay(gpu);
-        Ok(diagnostics)
-    }
-
-    #[cfg(all(feature = "rex-gpu", test))]
-    fn enable_gpu_replay_with_options(
-        &self,
-        backend: &str,
-        options: crate::dev::ng1::rex3_gpu::ProfilingOptions,
-    ) -> Result<crate::dev::ng1::rex3_gpu::AdapterDiagnostics, String> {
-        self.enable_gpu_replay_using(|| {
-            crate::dev::ng1::rex3_gpu::Rex3Gpu::new_with_options(backend, options)
-        })
-    }
-
-    #[cfg(all(feature = "rex-gpu", test))]
-    fn set_gpu_telemetry_enabled(&self, enabled: bool) -> Result<(), String> {
-        self.raster
-            .lock()
-            .legacy_mut()
-            .ok_or_else(|| "REX3 GPU replay is not enabled".to_owned())?
-            .set_telemetry_enabled(enabled)
-    }
-
     /// The caller serializes producers and lifecycle transitions. A stopped
     /// worker and an empty, fully published FIFO are the only boundary at
     /// which the context and both authoritative planes can be snapshotted.
@@ -1848,7 +1759,7 @@ impl Rex3 {
         &mut self,
         backend: impl crate::dev::ng1::wgpu::resident::ResidentBackend + 'static,
     ) -> Result<(), String> {
-        self.raster.get_mut().kind().ensure_available(RasterModeKind::Resident)?;
+        self.raster.get_mut().kind().ensure_available()?;
         self.check_resident_quiescent().map_err(|error| error.to_string())?;
         if self.head.renderer_slot().lock().is_some() {
             return Err("REX3 live resident scanout is not implemented".into());
@@ -1877,12 +1788,6 @@ impl Rex3 {
         gpu: Arc<crate::wgpu::Gpu>,
         mode: frame::ResidentDisplayMode,
     ) -> Result<(), crate::dev::ng1::wgpu::resident::ResidentError> {
-        use crate::dev::ng1::wgpu::resident::ResidentError;
-        if std::env::var_os("IRIS_REX3_GPU").is_some() {
-            return Err(ResidentError::InvalidState(
-                "IRIS_REX3_GPU and production Newport wgpu raster are mutually exclusive",
-            ));
-        }
         self.activate_resident_gpu(gpu)?;
         *self.resident_display_mode.get_mut() = Some(mode);
         Ok(())
@@ -1895,7 +1800,7 @@ impl Rex3 {
         profiling: bool,
     ) -> Result<(), crate::dev::ng1::wgpu::resident::ResidentError> {
         use crate::dev::ng1::wgpu::resident::{ResidentError, ResidentGpu, ResidentRaster};
-        self.raster.get_mut().kind().ensure_available(RasterModeKind::Resident)
+        self.raster.get_mut().kind().ensure_available()
             .map_err(ResidentError::Failed)?;
         self.check_resident_quiescent()?;
         if self.head.renderer_slot().lock().is_some() {
@@ -2161,106 +2066,11 @@ impl Rex3 {
         }
     }
 
-    #[cfg(feature = "rex-gpu")]
-    fn flush_gpu_replay(&self, reason: FlushReason) {
-        let mut mode = self.raster.lock();
-        if let Some(gpu) = mode.legacy_mut() {
-            self.flush_gpu_replay_locked(gpu, reason);
-        }
-    }
-
-    /// Bring the CPU plane up to date with every accepted GPU draw. Returns
-    /// false if the GPU failed; the CPU plane is then recovered from the
-    /// journal and the engine stays disabled.
-    #[cfg(feature = "rex-gpu")]
-    fn flush_gpu_replay_locked(
-        &self,
-        gpu: &mut crate::dev::ng1::rex3_gpu::Rex3Gpu,
-        reason: FlushReason,
-    ) -> bool {
-        if gpu.is_disabled() {
-            return false;
-        }
-        let rgb = unsafe { &mut *self.fb_rgb.get() };
-        match gpu.flush(rgb, reason) {
-            Ok(damage) => {
-                self.fb_damage.publish(&damage);
-                true
-            }
-            Err(error) => {
-                self.recover_gpu_replay(gpu, error);
-                false
-            }
-        }
-    }
-
-    #[cfg(feature = "rex-gpu")]
-    fn recover_gpu_replay(&self, gpu: &mut crate::dev::ng1::rex3_gpu::Rex3Gpu, error: String) {
-        log::error!("REX3 GPU failed; continuing on the CPU renderer: {error}");
-        eprintln!("REX3: live GPU renderer failed; continuing on the CPU: {error}");
-        let rgb = unsafe { &mut *self.fb_rgb.get() };
-        let damage = gpu.recover(rgb, error);
-        self.fb_damage.publish(&damage);
-    }
-
-    /// Run `write` on the CPU RGB plane outside the draw path. Outstanding
-    /// GPU work is synchronized first, and the next GPU draw re-uploads the
-    /// plane, so neither copy can overwrite the other.
+    /// Run `write` on the CPU RGB plane outside the draw path.
     fn with_cpu_rgb_write(&self, write: impl FnOnce(&mut [u32])) {
         #[cfg(feature = "wgpu")]
         self.reject_resident_operation("CPU framebuffer writes").unwrap();
-        #[cfg(feature = "rex-gpu")]
-        let mut mode = self.raster.lock();
-        #[cfg(feature = "rex-gpu")]
-        if let Some(gpu) = mode.legacy_mut() {
-            self.flush_gpu_replay_locked(gpu, FlushReason::Explicit);
-        }
         write(unsafe { &mut *self.fb_rgb.get() });
-        #[cfg(feature = "rex-gpu")]
-        if let Some(gpu) = mode.legacy_mut() {
-            gpu.cpu_framebuffer_changed();
-        }
-    }
-
-    #[cfg(feature = "rex-gpu")]
-    fn try_gpu_replay_draw(&self, context: &mut Rex3Context) -> bool {
-        let mut mode = self.raster.lock();
-        let Some(gpu) = mode.legacy_mut() else {
-            return false;
-        };
-        if gpu.is_disabled() {
-            return false;
-        }
-        loop {
-            let result = {
-                let rgb = unsafe { &*self.fb_rgb.get() };
-                gpu.try_enqueue(context, rgb)
-            };
-            match result {
-                Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Enqueued) => return true,
-                Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::FlushRequired) => {
-                    if gpu.checkpoint_required() {
-                        if !self.flush_gpu_replay_locked(gpu, FlushReason::Explicit) {
-                            return false;
-                        }
-                    } else if let Err(error) = gpu.submit(FlushReason::BatchFull) {
-                        self.recover_gpu_replay(gpu, error);
-                        return false;
-                    }
-                }
-                Ok(crate::dev::ng1::rex3_gpu::EnqueueResult::Unsupported(reason)) => {
-                    gpu.note_fallback(reason);
-                    if self.flush_gpu_replay_locked(gpu, FlushReason::CpuFallback) {
-                        gpu.cpu_framebuffer_changed();
-                    }
-                    return false;
-                }
-                Err(error) => {
-                    self.recover_gpu_replay(gpu, error);
-                    return false;
-                }
-            }
-        }
     }
 
     // diag atomic bit assignments — set while holding a lock or inside a loop section.
@@ -3415,8 +3225,6 @@ impl Rex3 {
             return;
         }
         self.wait_gfifo_idle();
-        #[cfg(feature = "rex-gpu")]
-        self.flush_gpu_replay(FlushReason::WaitIdle);
     }
 
     // A resident DMA read can return BUS_BUSY only before publishing its GO.
@@ -3520,8 +3328,6 @@ impl Rex3 {
                 if exit {
                     #[cfg(feature = "wgpu")]
                     let _ = self.submit_resident(crate::dev::ng1::wgpu::telemetry::FlushReason::Exit);
-                    #[cfg(feature = "rex-gpu")]
-                    self.flush_gpu_replay(FlushReason::Exit);
                     self.gfxbusy.store(false, Ordering::Release);
                     self.gfifo.flush_head();
                     break; 
@@ -3568,8 +3374,6 @@ impl Rex3 {
                     // idle) submits first.
                     #[cfg(feature = "wgpu")]
                     self.flush_resident_if_due();
-                    #[cfg(feature = "rex-gpu")]
-                    self.flush_gpu_replay(FlushReason::Idle);
                     self.gfxbusy.store(false, Ordering::Release);
                     is_busy = false;
                     //self.update_gfifo_irqs();
@@ -3714,14 +3518,6 @@ impl Rex3 {
             if let Err(error) = result {
                 log::error!("REX3 {error}");
             }
-            return;
-        }
-
-        #[cfg(feature = "rex-gpu")]
-        if self.try_gpu_replay_draw(ctx) {
-            #[cfg(feature = "rexdiag")]
-            self.diag
-                .fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
             return;
         }
 
@@ -4094,7 +3890,7 @@ impl Rex3 {
         match reg_offset {
             // EXIT sentinel: signal the consumer loop to stop.
             GFIFO_EXIT => { exit = true; }
-            // DISP_SYNC: legacy/CPU draws are visible before this fence.
+            // DISP_SYNC: CPU draws are visible before this fence.
             // Resident tests submit the prefix here; actual GPU completion
             // is tracked separately from this ordered submission fence.
             GFIFO_DISP_SYNC => {
@@ -4103,26 +3899,9 @@ impl Rex3 {
                     // A failed prefix is not a completed display fence.
                     return false;
                 }
-                #[cfg(all(test, feature = "rex-gpu"))]
-                let early = self.test_signal_fence_early.load(Ordering::Relaxed);
-                #[cfg(all(test, feature = "rex-gpu"))]
-                if early {
-                    self.gfifo_fence.store(val64 as u32, Ordering::Release);
-                    self.observe_test_fence(val64 as u32);
-                }
-                #[cfg(feature = "rex-gpu")]
-                self.flush_gpu_replay(FlushReason::DisplayFence);
-                #[cfg(all(test, feature = "rex-gpu"))]
-                if !early {
-                    self.gfifo_fence.store(val64 as u32, Ordering::Release);
-                    self.observe_test_fence(val64 as u32);
-                }
-                #[cfg(not(all(test, feature = "rex-gpu")))]
-                {
-                    self.gfifo_fence.store(val64 as u32, Ordering::Release);
-                    #[cfg(all(test, feature = "gputrace"))]
-                    self.observe_test_fence(val64 as u32);
-                }
+                self.gfifo_fence.store(val64 as u32, Ordering::Release);
+                #[cfg(all(test, feature = "gputrace"))]
+                self.observe_test_fence(val64 as u32);
             }
             // PURE_GO sentinel (GO-only, no register write): no-op here; execute_go() is
             // triggered by the GO bit in the loop.
@@ -4384,10 +4163,6 @@ impl Rex3 {
         dst_rgb[..n].copy_from_slice(&rgb[..n]);
         if n != 0 {
             self.mark_framebuffer_full(DamagePlane::Rgb);
-            #[cfg(feature = "rex-gpu")]
-            if let Some(gpu) = self.raster.lock().legacy_mut() {
-                gpu.cpu_framebuffer_changed();
-            }
         }
 
         let dst_aux = unsafe { &mut *self.fb_aux.get() };
@@ -4457,7 +4232,6 @@ impl Rex3 {
             return self.load_resident_framebuffers(dir, prefix);
         }
         self.wait_idle();
-        let mut rgb_changed = false;
         let path_rgb = dir.join(format!("{prefix}_rgb.bin"));
         if path_rgb.exists() {
             let bytes = std::fs::read(path_rgb)?;
@@ -4470,7 +4244,6 @@ impl Rex3 {
             }
             if count != 0 {
                 self.mark_framebuffer_full(DamagePlane::Rgb);
-                rgb_changed = true;
             }
         }
 
@@ -4488,14 +4261,6 @@ impl Rex3 {
                 self.mark_framebuffer_full(DamagePlane::Aux);
             }
         }
-        #[cfg(feature = "rex-gpu")]
-        if rgb_changed {
-            if let Some(gpu) = self.raster.lock().legacy_mut() {
-                gpu.cpu_framebuffer_changed();
-            }
-        }
-        #[cfg(not(feature = "rex-gpu"))]
-        let _ = rgb_changed;
         Ok(())
     }
 
@@ -4610,13 +4375,6 @@ impl Device for Rex3 {
             let _ = handle.join();
         }
 
-        #[cfg(feature = "rex-gpu")]
-        if std::env::var_os("IRIS_REX3_GPU").is_some() {
-            if let Some(report) = self.gpu_replay_report() {
-                eprintln!("REX3: live GPU report: {report:?}");
-            }
-        }
-
         // Save the corpus in every build. `seen_shapes` is device state, so this
         // works with or without `rex-jit` and with IRIS_NO_JIT set — the cases
         // where the old JIT-owned save wrote nothing at all.
@@ -4651,30 +4409,6 @@ impl Device for Rex3 {
             return;
         }
         if self.running.swap(true, Ordering::SeqCst) { return; }
-
-        #[cfg(feature = "rex-gpu")]
-        if let Ok(backend) = std::env::var("IRIS_REX3_GPU") {
-            let already_enabled = self.raster.lock().legacy().is_some();
-            if !already_enabled {
-                match self.enable_gpu_replay(&backend) {
-                    Ok(diagnostics) => {
-                        eprintln!("REX3: experimental live GPU renderer enabled: {diagnostics}")
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "REX3: cannot enable IRIS_REX3_GPU={backend}; using CPU renderer: {error}"
-                        )
-                    }
-                }
-            }
-        }
-        #[cfg(not(feature = "rex-gpu"))]
-        if let Some(backend) = std::env::var_os("IRIS_REX3_GPU") {
-            eprintln!(
-                "REX3: ignoring IRIS_REX3_GPU={}; rebuild with --features rex-gpu",
-                backend.to_string_lossy()
-            );
-        }
 
         let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
 
@@ -6179,14 +5913,7 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
         if let RasterMode::Resident(raster) = &*self.raster.lock() {
             return raster.gpu();
         }
-        #[cfg(feature = "rex-gpu")]
-        {
-            return self.raster.lock().legacy().and_then(|gpu| gpu.gpu());
-        }
-        #[cfg(not(feature = "rex-gpu"))]
-        {
-            None
-        }
+        None
     }
     #[cfg(feature = "wgpu")]
     fn requires_same_device_wgpu_presenter(&self) -> bool {
