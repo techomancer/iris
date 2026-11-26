@@ -295,16 +295,6 @@ impl PpMemory {
         self.base
     }
 
-    /// Bump the generation of the page holding bank byte offset `off`, for a
-    /// write made through [`Self::host_ptr`] rather than `BusDevice`.
-    #[cfg(feature = "jitv2")]
-    #[inline]
-    pub fn bump_gen_off(&self, off: usize) {
-        let page = (off & self.mask()) / JITV2_PAGE_SIZE;
-        // Release, after the bytes, as `bump_gen`.
-        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Release) };
-    }
-
     /// The shared object behind this bank, for mapping it into a window.
     pub fn shared(&self) -> &Arc<SharedMem> {
         &self.mem
