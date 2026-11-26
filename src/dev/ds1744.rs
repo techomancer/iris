@@ -282,7 +282,7 @@ impl Ds1744 {
         let mut image = st.ram.clone();
         image.extend_from_slice(&self.image(st));
         let reference = battery_clock::encode(CLOCK_TAG, battery_clock::unix_now(), None);
-        let result = std::fs::write(&path, &image)
+        let result = crate::nv_storage::save(&path.to_string_lossy(), &image)
             .and_then(|()| battery_clock::write(&battery_clock::companion(&path), &reference));
         st.storage_failed = result.is_err();
         result.map_err(|e| {

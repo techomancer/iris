@@ -693,7 +693,7 @@ impl Ip32Bus {
     pub fn save_flash(&self) {
         let Some(path) = &self.flash_file else { return };
         let p = self.flash.bytes.lock().unwrap();
-        match std::fs::write(path, &p[..]) {
+        match crate::nv_storage::save(&path.to_string_lossy(), &p[..]) {
             Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
             Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
         }
