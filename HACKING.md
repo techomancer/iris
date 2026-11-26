@@ -207,8 +207,7 @@ Devices connect to each other through device-specific `connect()` /
 interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
 channel; `wait_active` lets a device thread block until the guest arms the
 channel, which HPC3 signals from the arming register write instead of being
-polled), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
-(below), `GfxDisplay` (a graphics board's screen, for the window and
+polled), `InterruptController`/`IrqLine` (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 
 Serial lines have two halves. A UART model owns the registers: the Indy's
