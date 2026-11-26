@@ -2535,12 +2535,14 @@ impl MipsCore {
 
     /// Read FPR as single-precision float
     #[inline]
+    #[cfg(test)]
     pub fn read_fpr_s(&self, reg: u32) -> f32 {
         f32::from_bits(self.fpr[reg as usize] as u32)
     }
 
     /// Write FPR as single-precision float (lower 32 bits)
     #[inline]
+    #[cfg(test)]
     pub fn write_fpr_s(&mut self, reg: u32, value: f32) {
         // Keep upper 32 bits unchanged
         self.fpr[reg as usize] = (self.fpr[reg as usize] & 0xFFFFFFFF_00000000) | (value.to_bits() as u64);

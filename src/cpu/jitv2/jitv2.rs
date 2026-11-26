@@ -3055,6 +3055,7 @@ impl Jitv2 {
 
     /// Keep an uncached page of a frame apart from its cached page, in space 0.
     /// Before any page is claimed.
+    #[cfg(test)]
     pub fn split_uncached_code(&mut self) {
         let frames = self.spaces[0].frames;
         self.set_space(0, frames, true);
