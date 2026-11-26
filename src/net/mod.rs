@@ -321,8 +321,6 @@ impl NatControl {
         PcapStatus::from_u8(self.pcap_status.load(Ordering::Relaxed))
     }
     pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
-    pub fn dbg_udp(&self)  -> bool { self.debug_udp.load(Ordering::Relaxed) }
-    pub fn dbg_icmp(&self) -> bool { self.debug_icmp.load(Ordering::Relaxed) }
     /// The guest's likely default gateway (in-subnet ARP target it can't
     /// resolve), or None if none seen.
     pub fn observed_gateway(&self) -> Option<Ipv4Addr> {

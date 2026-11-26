@@ -2990,14 +2990,6 @@ pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
     banks
 }
 
-/// The first four banks of a full `banks` array, for legacy four-bank callers.
-/// This discards banks 4 through 7; profile-aware front ends use the full array.
-pub fn banks_to4(banks: [u32; MAX_BANKS]) -> [u32; 4] {
-    let mut four = [0u32; 4];
-    four.copy_from_slice(&banks[..4]);
-    four
-}
-
 /// `banks` as TOML: any length from 1 to [`MAX_BANKS`] is read and padded
 /// with zeros; it is written with at least four entries and no trailing
 /// zeros beyond them, so a four-bank machine's config looks as it always has.
@@ -4406,12 +4398,6 @@ impl MachineConfig {
             rx_hold:      self.network.rx_hold.unwrap_or(true),
             stream:       self.network.stream.clone(),
         }
-    }
-
-    /// Return the active disc path for a CD-ROM device (first of `discs` list,
-    /// falling back to `path`).
-    pub fn active_disc(dev: &ScsiDeviceConfig) -> &str {
-        dev.discs.first().map(|s| s.as_str()).unwrap_or(&dev.path)
     }
 }
 

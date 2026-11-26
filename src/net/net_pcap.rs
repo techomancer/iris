@@ -477,12 +477,6 @@ impl NetBackend for PcapEngine {
     }
 }
 
-/// True when the requested mode is PCAP. Convenience so callers don't need to
-/// import NetMode just to branch.
-pub fn is_pcap_mode(mode: NetMode) -> bool {
-    mode == NetMode::Pcap
-}
-
 /// Classify a libpcap open/activate error into a [`PcapStatus`] the GUI can act
 /// on. pcap 2.x has no dedicated permission variant — EPERM/EACCES surface as
 /// `PcapError(String)` or `ErrnoError`, both of which Display to text containing
