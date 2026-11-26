@@ -752,7 +752,8 @@ mod fault {
         pub(super) fn install() {
             unsafe {
                 let mut sa: libc::sigaction = std::mem::zeroed();
-                // Through `*const ()`: see `hwwatch.rs` on why not a direct cast.
+                // Through `*const ()`: a direct cast of the function item to an
+                // integer trips `function_casts_as_integer`.
                 sa.sa_sigaction = handler as *const () as usize;
                 // ONSTACK so a thread with an alternate stack keeps using it,
                 // as Rust's handler expects; NODEFER so a fault inside the
