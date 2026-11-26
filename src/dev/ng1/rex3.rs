@@ -833,26 +833,6 @@ fn to_slope(val: i32) -> u32 {
     (val as u32) & 0xFFFFF
 }
 
-/// Write an 8-bit grayscale PNG (used by `rex fbdump`'s ci.png).
-fn write_png_gray(path: &std::path::Path, rows: &[u8], width: usize, height: usize) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
-    enc.set_color(png::ColorType::Grayscale);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    writer.write_image_data(rows).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-}
-
-/// Write a 24-bit RGB PNG (used by `rex fbdump`'s rgb.png).
-fn write_png_rgb(path: &std::path::Path, rows: &[u8], width: usize, height: usize) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    writer.write_image_data(rows).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-}
-
 /// Compact snapshot of one block/span draw for the draw-debug overlay.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DrawRecord {
@@ -4210,7 +4190,7 @@ impl Rex3 {
         for &word in rgb.iter() {
             ci_rows.push((word & 0xFF) as u8);
         }
-        write_png_gray(&dir.join("ci.png"), &ci_rows, W, H)?;
+        crate::disp::write_png(&dir.join("ci.png"), W as u32, H as u32, png::ColorType::Grayscale, &ci_rows)?;
 
         // rgb.png: full 24-bit rgb (word is 24-bit BGR: bits[7:0]=B [15:8]=G [23:16]=R).
         let mut rgb_rows = Vec::with_capacity(W * H * 3);
@@ -4219,7 +4199,7 @@ impl Rex3 {
             rgb_rows.push(((word >>  8) & 0xFF) as u8); // G
             rgb_rows.push(( word        & 0xFF) as u8); // B
         }
-        write_png_rgb(&dir.join("rgb.png"), &rgb_rows, W, H)?;
+        crate::disp::write_png(&dir.join("rgb.png"), W as u32, H as u32, png::ColorType::Rgb, &rgb_rows)?;
 
         Ok(())
     }

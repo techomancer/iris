@@ -3918,7 +3918,7 @@ mod tests {
                 }
             }
         }
-        crate::disp::save_png_rgba8(&out, &rgba, w, h).unwrap();
+        crate::disp::write_png(std::path::Path::new(&out), w, h, png::ColorType::Rgba, &rgba).unwrap();
         // RE_REPLAY_PX="x,y x,y": the raw 32-bit words there.
         for xy in std::env::var("RE_REPLAY_PX").unwrap_or_default().split_whitespace() {
             let (x, y) = xy.split_once(',').unwrap();

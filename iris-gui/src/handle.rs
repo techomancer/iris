@@ -772,7 +772,7 @@ fn worker_loop(
                 for &word in &px[..w * h] {
                     rgba.extend_from_slice(&(word | 0xFF00_0000).to_le_bytes());
                 }
-                match write_png(&path, w as u32, h as u32, &rgba) {
+                match iris::disp::write_png(&path, w as u32, h as u32, png::ColorType::Rgba, &rgba).map_err(|e| e.to_string()) {
                     Ok(()) => { let _ = evt_tx.send(Evt::Screenshot(path)); }
                     Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-failed", error = e))); }
                 }
@@ -880,17 +880,6 @@ fn stop_machine_timed(m: Box<dyn Workstation>) -> Result<(), String> {
         Ok(Err(msg)) => Err(t!("emu-stop-failed", error = msg)),
         Err(_) => Err(t!("emu-stop-timeout")),
     }
-}
-
-fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
-    use std::fs::File;
-    use std::io::BufWriter;
-    let file = File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(BufWriter::new(file), w, h);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().map_err(|e| e.to_string())?;
-    writer.write_image_data(rgba).map_err(|e| e.to_string())
 }
 
 fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {
