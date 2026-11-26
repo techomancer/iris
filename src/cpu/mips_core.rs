@@ -2522,12 +2522,6 @@ impl MipsCore {
         }
     }
 
-    /// Check if CPU is in kernel mode
-    #[inline]
-    pub fn is_kernel_mode(&self) -> bool {
-        matches!(self.get_privilege_mode(), PrivilegeMode::Kernel)
-    }
-
     /// Check if interrupts are enabled
     pub fn interrupts_enabled(&self) -> bool {
         // IE bit must be set, and not in exception mode (EXL=0, ERL=0)
@@ -2879,11 +2873,6 @@ pub enum PrivilegeMode {
 pub const PRIV_KERNEL: u8     = PrivilegeMode::Kernel     as u8;
 pub const PRIV_SUPERVISOR: u8 = PrivilegeMode::Supervisor as u8;
 pub const PRIV_USER: u8       = PrivilegeMode::User       as u8;
-
-impl PrivilegeMode {
-    #[inline]
-    pub const fn as_u8(self) -> u8 { self as u8 }
-}
 
 impl Default for MipsCore {
     fn default() -> Self {
