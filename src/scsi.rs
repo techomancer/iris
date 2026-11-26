@@ -339,13 +339,6 @@ impl ScsiDevice {
         self.media.node().size()
     }
 
-    /// Set the logical block size, as a controller does for its own
-    /// convention after a bus reset (the O2's: an SGI CD-ROM in 512-byte
-    /// blocks).
-    pub fn set_logical_block_size(&mut self, n: u64) {
-        self.logical_block_size = n;
-    }
-
     /// The logical block size a device powers up with: 2048 for a CD-ROM,
     /// 512 for a disk.
     pub fn power_on_block_size(&mut self) {

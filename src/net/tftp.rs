@@ -172,12 +172,6 @@ impl TftpServer {
         self.transfers.len()
     }
 
-    /// Whether `client` still has a transfer in flight. The NAT uses this to
-    /// drop the client bookkeeping it keeps alongside.
-    pub fn has_transfer(&self, client: &ClientId) -> bool {
-        self.transfers.contains_key(client)
-    }
-
     fn start_read(&mut self, client: ClientId, body: &[u8], now: Instant) -> Vec<u8> {
         let Some((name, mode)) = parse_request(body) else {
             ttrace!(self, "{} malformed request ({} bytes)", who(client), body.len());
