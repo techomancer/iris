@@ -414,10 +414,12 @@ devices 7, 5, 4 and 6, the O2's PCI device 4, the Fuel's and I-brick's second bu
 
 The keys iris wrote before `[[devices]]` still load, each with a warning saying what it became, and will be
 removed in a later release: `[scsi.N]` tables (with `controller`, `kind` and `cdrom`), `[ultra64]`,
-`[virtio_serial]` and `[virtio_9p]` (with `slot` and `bridge_slot`), `[nvme]`, `[[xio_board]]`,
-`[fibre_channel]`, `[machine] audio_card`, `[graphics] node` and `widget`, `graphics.heads = 2`,
-`test_device` and its two companions, and the command-line `--scsi1`/`--cdrom4` family and
-`--test-device`.
+`[virtio_serial]` and `[virtio_9p]` (with `slot`), `graphics.heads = 2`, `test_device` and its two companions,
+and the command-line `--scsi1`/`--cdrom4` family and `--test-device`.
+
+`[nvme]`, `[[xio_board]]`, `[fibre_channel]`, `[machine] audio_card`, the `audio` flags, `[graphics] node` and
+`widget`, and `bridge_slot` no longer load. A file with one is refused, and the error names the `[[devices]]`
+entry to write instead.
 
 ### Snapshots
 

@@ -891,12 +891,14 @@ will never find.
 The keys iris wrote before `[[devices]]` still load, with a warning that says
 what each became, and will be removed in a later release. `[scsi.N]` tables
 (`[scsi.17]` is target 1 of `scsi1`), `controller`, `kind` and `cdrom` in them,
-`[ultra64]`, `[virtio_serial]` and `[virtio_9p]` with their `slot` and
-`bridge_slot`, `[nvme]`, `[[xio_board]]`, `[fibre_channel]`, `[machine]
-audio_card`, `[graphics] node` and `widget`, `graphics.heads = 2` and
-`test_device` become `[[devices]]` entries; the command-line `--scsi1`, `--cdrom4`
-and `--test-device` and their relatives become `--device` overrides. Snapshots
-from before this change are refused.
+`[ultra64]`, `[virtio_serial]` and `[virtio_9p]` with their `slot`,
+`graphics.heads = 2` and `test_device` become `[[devices]]` entries; the
+command-line `--scsi1`, `--cdrom4` and `--test-device` and their relatives
+become `--device` overrides. Snapshots from before this change are refused.
+
+`[nvme]`, `[[xio_board]]`, `[fibre_channel]`, `[machine] audio_card`, the `audio`
+flags, `[graphics] node` and `widget`, and `bridge_slot` no longer load. A file
+with one is refused, and the error names the `[[devices]]` entry to write instead.
 
 ---
 

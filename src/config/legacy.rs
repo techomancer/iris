@@ -82,6 +82,32 @@ pub(super) fn virtio_cards(cfg: &mut MachineConfig) {
     }
 }
 
+/// What replaces each key that placement dropped, and the sections it was valid in (none: anywhere).
+const DROPPED: &[(&str, &[&str], &str)] = &[
+    ("xio_board", &[], "a `pci_cage` or `pci_shoehorn` [[devices]] entry at the XIO slot"),
+    ("nvme", &[], "an `nvme` [[devices]] entry"),
+    ("fibre_channel", &[], "a `qla2200` [[devices]] entry, with its disks as `hdd` entries at CARD/lN"),
+    ("audio_card", &[], "an `ice1724` [[devices]] entry"),
+    ("audio", &["fuel", "tezro", "origin3200", "onyx3000"], "an `ice1724` [[devices]] entry"),
+    ("node", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
+    ("widget", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
+    ("bridge_slot", &[], "the `at` of the virtio [[devices]] entry"),
+];
+
+/// A parse error for a dropped key, with what to write instead; any other error as it was.
+pub(super) fn name_replacement(e: toml::de::Error, text: &str) -> toml::de::Error {
+    let key = e.message().strip_prefix("unknown field `").and_then(|m| m.split('`').next());
+    let section = || {
+        let before = text.get(..e.span()?.start)?;
+        let header = before.lines().rev().find_map(|l| l.trim().strip_prefix('['))?;
+        header.trim_start_matches('[').split(']').next()
+    };
+    match key.and_then(|k| DROPPED.iter().find(|d| d.0 == k && (d.1.is_empty() || section().is_some_and(|s| d.1.contains(&s))))) {
+        Some((key, _, instead)) => <toml::de::Error as serde::de::Error>::custom(format!("{e}\n`{key}` is no longer read: write {instead}")),
+        None => e,
+    }
+}
+
 /// A bare drive id (`16 * controller + id`), the only way older versions
 /// named a drive to load or eject.
 pub(crate) fn drive_number(spec: &str) -> Option<usize> {
@@ -346,6 +372,12 @@ mod tests {
         ] {
             let e = MachineConfig::from_toml_str(text).err().map(|e| e.to_string()).unwrap_or_else(|| format!("{key} parsed"));
             assert!(e.contains("unknown field") && e.contains(key), "{key}: {e}");
+            assert!(e.contains(&format!("`{key}` is no longer read: write ")) && e.contains("[[devices]]"), "{key}: the error says what replaces it:\n{e}");
+        }
+        // A key of the same name in another section is only a typo.
+        for text in ["banana = 1", "[machine]\naudio = true\n", "[tezro]\nnode = 1\n"] {
+            let e = MachineConfig::from_toml_str(text).unwrap_err().to_string();
+            assert!(e.contains("unknown field") && !e.contains("no longer read"), "{text}: {e}");
         }
     }
 
