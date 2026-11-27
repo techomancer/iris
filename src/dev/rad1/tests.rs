@@ -9,6 +9,7 @@ use crate::hptimer::TimerManager;
 use crate::pci::PciDma;
 use crate::traits::Device;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const BAR: u64 = 0x1300_0000;
 
@@ -725,19 +726,36 @@ fn the_output_pump_runs_only_while_the_channel_does() {
     let (r, _ram, _tm) = timed_card();
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
-    assert!(r.state.lock().audio_timer.is_none(), "no host audio, no pump");
+    assert!(!r.state.lock().pumping, "no host audio, no pump");
     wr(&r, 0x58, 0x2000_0000);
     r.enable_output(crate::config::AudioConfig::default());
     wr(&r, 0x58, 0x2000_0001);
-    assert!(r.state.lock().audio_timer.is_some());
+    assert!(r.state.lock().pumping);
     // The pump moves frames the guest never asked about.
     assert!(until(|| r.state.lock().chan[CH_OUT].frames > 0), "the pump never ran");
     Device::stop(&r);
-    assert!(r.state.lock().audio_timer.is_none(), "stop removes it");
+    assert!(!r.state.lock().pumping, "stop removes it");
     Device::start(&r);
-    assert!(r.state.lock().audio_timer.is_some(), "start re-arms it");
+    assert!(r.state.lock().pumping, "start re-arms it");
     wr(&r, 0x58, 0x2000_0000);
-    assert!(r.state.lock().audio_timer.is_none());
+    assert!(!r.state.lock().pumping);
+    Device::stop(&r);
+}
+
+/// The pump is a deadline on the machine clock: it does not run until the clock reaches it.
+#[test]
+fn the_output_pump_waits_for_the_machine_clock() {
+    let board = crate::test_board::Stepped::new();
+    let (r, _ram) = dma_card_on(board.tm.clone());
+    Device::start(&r);
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    r.enable_output(crate::config::AudioConfig::default());
+    wr(&r, 0x58, 0x2000_0001);
+    assert!(r.state.lock().pumping);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(r.state.lock().chan[CH_OUT].frames, 0, "nothing is pumped before the clock moves");
+    board.step(PUMP_NS * 5);
+    assert!(r.state.lock().chan[CH_OUT].frames > 0, "the pump runs once the clock does");
     Device::stop(&r);
 }
 
@@ -1583,7 +1601,8 @@ fn a_tone_in_guest_memory_reaches_the_host_on_a_stepped_clock() {
 fn a_tone_reaches_a_file_through_the_real_pump() {
     use crate::host_audio::test_signal::*;
     let (left, right) = (5.0 * 44100.0 / 512.0, 10.0 * 44100.0 / 512.0);
-    let (r, ram) = dma_card_on(Arc::new(TimerManager::new()));
+    let tm = Arc::new(TimerManager::new());
+    let (r, ram) = dma_card_on(tm.clone());
     {
         let mut m = ram.0.lock().unwrap();
         for (n, f) in tones(512, 44100, left, right, 16000.0).chunks_exact(2).enumerate() {
