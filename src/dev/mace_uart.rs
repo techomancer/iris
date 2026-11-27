@@ -7,13 +7,14 @@
 //! register reads back zero and the firmware simply never transmits.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::dev::ns16550::{com_reg, Ns16550};
 use crate::dev::serial_host::SerialBackend;
 use crate::hptimer::{Timer, TimerManager};
 use crate::ip32::*;
 use crate::irq::IrqLine;
+use crate::net::wake::{host_io, HostPump};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, Saveable, BUS_OK};
 
 /// The TL16PIR552's reference over 16 until the guest programs the prescaler.
@@ -30,6 +31,9 @@ pub struct MaceUart {
     irq: OnceLock<IrqLine>,
     /// The receive timeout, on the machine clock.
     timer: Timer,
+    me: Weak<Self>,
+    /// The host-IO pump, while the machine runs.
+    host: Mutex<Option<HostPump>>,
 }
 
 impl MaceUart {
@@ -42,7 +46,7 @@ impl MaceUart {
         Arc::new_cyclic(|me| {
             let mut core = Ns16550::new(BAUDBASE, tm.clock().clone());
             core.set_ti_prescaler(UART_CLOCK_HZ);
-            Self { core: Mutex::new(core), name, irq: OnceLock::new(), timer: Timer::new(tm, me, |u: &Self, _| u.pump()) }
+            Self { core: Mutex::new(core), name, irq: OnceLock::new(), timer: Timer::new(tm, me, |u: &Self, _| _ = u.pump()), me: me.clone(), host: Mutex::new(None) }
         })
     }
 
@@ -57,15 +61,17 @@ impl MaceUart {
     }
 
     /// Move what the host end typed into the receive FIFO and let the receive timeout run
-    /// out; the service loop and status reads call it.
-    pub fn pump(&self) {
-        let changed = {
+    /// out; whether any input arrived.
+    pub fn pump(&self) -> bool {
+        let (moved, changed) = {
             let mut c = self.core();
-            c.pump() | c.check_timeout()
+            let moved = c.pump();
+            (moved, moved | c.check_timeout())
         };
         if changed {
             self.update_irq();
         }
+        moved
     }
 
     /// Queue characters for the guest to read, as if they arrived on the line.
@@ -172,8 +178,15 @@ impl MaceUart {
 
 impl Device for MaceUart {
     fn step(&self, _cycles: u64) {}
-    fn stop(&self) { self.timer.stop(); }
-    fn start(&self) { self.timer.start(); }
+    fn stop(&self) {
+        self.timer.stop();
+        self.host.lock().unwrap().take();
+    }
+    fn start(&self) {
+        self.timer.start();
+        let me = self.me.clone();
+        self.host.lock().unwrap().get_or_insert_with(|| host_io().add(move || me.upgrade().is_some_and(|u| u.pump())));
+    }
     fn is_running(&self) -> bool { true }
 
     fn register_commands(&self) -> Vec<(String, String)> {
@@ -242,7 +255,7 @@ impl BusDevice for MaceUart {
     // (mapbase 0x1f390000, regshift 8).
     // Reading the data or IIR register and writing IER can each move the
     // interrupt, so every access drives it again: nothing else does on an
-    // access (the service thread covers input arriving from the host).
+    // access (the host-IO thread covers input arriving from the host).
     fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.access_read(addr)) }
     fn read16(&self, addr: u64) -> BusRead16 { BusRead16::ok(self.access_read(addr) as u16) }
     fn write16(&self, addr: u64, val: u16) -> u32 { self.access_write(addr, val as u8) }
@@ -331,6 +344,19 @@ pub(crate) mod tests {
         dst.load_state(&src.save_state()).unwrap();
         assert_eq!(dst.timer.due(), dst.core().timeout_due());
         assert!(dst.timer.due().is_some(), "a restore sets the deadline again");
+    }
+
+    /// A byte the host types reaches the receive FIFO through the host-IO thread, with no pass from the service loop.
+    #[test]
+    fn host_input_reaches_the_fifo_through_the_host_io_thread() {
+        let tm = Arc::new(TimerManager::new());
+        let u = MaceUart::new(&tm);
+        let host = Arc::new(crate::dev::serial_host::CiSerialBackend::new());
+        u.set_backend(host.clone());
+        u.start();
+        host.push_host(b"x");
+        assert!(crate::test_board::until(|| u.pending_input() == 1));
+        u.stop();
     }
 
     struct Mace(Arc<MaceUart>);

@@ -96,11 +96,9 @@ impl Mace {
     }
 
     /// What time and the outside world have done since the last call: the
-    /// Ethernet's frames, the consoles' typing, audio and serial DMA.
+    /// Ethernet's frames, audio and serial DMA.
     pub fn service(&self) {
         self.mec.poll();
-        self.com0.pump();
-        self.com1.pump();
         self.audio.poll(&self.audio_io());
         if self.sdma.any_owned() {
             self.sdma.poll(&self.sdma_io());

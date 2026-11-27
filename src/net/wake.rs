@@ -148,6 +148,8 @@ pub struct HostIo {
     pub wake: Arc<Wake>,
     lines: Mutex<Vec<(usize, Pump)>>,
     next_id: AtomicUsize,
+    /// Pumps dropped by a pass: removed once the pass is over.
+    dropped: Mutex<Vec<usize>>,
     #[cfg(test)]
     passes: AtomicUsize,
 }
@@ -169,13 +171,13 @@ pub fn host_io() -> &'static HostIo {
 
 impl HostIo {
     fn start() -> &'static HostIo {
-        let io: &'static HostIo = Box::leak(Box::new(Self { wake: Wake::new(), lines: Mutex::new(Vec::new()), next_id: AtomicUsize::new(0), #[cfg(test)] passes: AtomicUsize::new(0) }));
+        let io: &'static HostIo = Box::leak(Box::new(Self { wake: Wake::new(), lines: Mutex::new(Vec::new()), next_id: AtomicUsize::new(0), dropped: Mutex::new(Vec::new()), #[cfg(test)] passes: AtomicUsize::new(0) }));
         std::thread::Builder::new().name("host-io".into()).spawn(move || io.run()).expect("spawn host-io thread");
         io
     }
 
     /// Run `pump` whenever the thread wakes. It runs under the lines' lock, so it must
-    /// not add a pump or drop a `HostPump`.
+    /// not add a pump. Dropping a `HostPump` from a pass is fine: it goes after the pass.
     pub fn add(&'static self, pump: impl FnMut() -> bool + Send + 'static) -> HostPump {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.lines.lock().push((id, Box::new(pump)));
@@ -197,7 +199,16 @@ impl HostIo {
             self.wake.consume();
             #[cfg(test)]
             self.passes.fetch_add(1, Ordering::Relaxed);
+            IN_PASS.with(|p| p.set(true));
             let moved = self.lines.lock().iter_mut().fold(false, |m, l| (l.1)() | m);
+            IN_PASS.with(|p| p.set(false));
+            let dropped = std::mem::take(&mut *self.dropped.lock());
+            if !dropped.is_empty() {
+                let mut lines = self.lines.lock();
+                let gone: Vec<_> = lines.extract_if(.., |l| dropped.contains(&l.0)).collect();
+                drop(lines);
+                drop(gone);
+            }
             // Level-triggered: a ready socket the pumps left alone twice running (a full input FIFO)
             // must not end every wait. Once is a guest that read the byte first. A failed wait counts too.
             let blocked = (!events.is_empty() || waited.is_err()) && !moved;
@@ -209,8 +220,17 @@ impl HostIo {
     }
 }
 
+thread_local! {
+    /// This thread is running the pumps, which hold the lock on them.
+    static IN_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Drop for HostPump {
     fn drop(&mut self) {
+        if IN_PASS.with(|p| p.get()) {
+            self.io.dropped.lock().push(self.id);
+            return;
+        }
         // Dropped after the guard: a closure's last reference may take `lines` again.
         let gone = {
             let mut lines = self.io.lines.lock();
@@ -340,6 +360,28 @@ mod tests {
         let before = io.passes.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(300));
         assert!(io.passes.load(Ordering::Relaxed) - before < 10, "spun with no pump");
+    }
+
+    /// A pump that drops a pump (the last reference to a device falling to the host-IO thread) does not deadlock the thread.
+    #[test]
+    fn a_pump_that_drops_a_pump_in_its_pass_does_not_stop_the_thread() {
+        let io = HostIo::start();
+        let mut inner = Some(io.add(|| false));
+        let _outer = io.add(move || {
+            inner.take();
+            false
+        });
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let _probe = io.add(move || n2.fetch_add(1, Ordering::SeqCst) == usize::MAX);
+        for _ in 0..50 {
+            io.wake.notify();
+            std::thread::sleep(Duration::from_millis(20));
+            if n.load(Ordering::SeqCst) > 1 && io.lines.lock().len() == 2 {
+                return;
+            }
+        }
+        panic!("the thread stopped, or the dropped pump was never removed");
     }
 
     /// A pump whose closure holds the last reference to something that drops a pump itself does not deadlock.
