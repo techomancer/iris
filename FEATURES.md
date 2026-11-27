@@ -18,8 +18,6 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 |---|---|---|
 | `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | `gputrace` |
 | `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [clanker/rex3/trace-and-recording.md](clanker/rex3/trace-and-recording.md). GR2, IMPACT, O2 and VPro annotated traces (`gr2 trace`, `mgras trace`, `re trace`, `vpro trace`); O2 engine recording (`re rec`). Off: no per-access check at all. Lightning-compatible. | — |
-| `developer_ip7` | CP0 Compare/timer calibration statistics and debug prints. | — |
-| `developerx` | Extended exception diagnostics; break on IBE/DBE/ADEL/ADES/TLB errors. | — |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible. | — |
 | `perfetto` | Perfetto trace recording (`--perfetto FILE`, monitor `perfetto`); see [docs/perfetto.md](docs/perfetto.md). Lightning-compatible. | — |
 | `rexdiag` | REX3 per-GO activity and dispatch counters. Default on; removable in a core build. | — |
@@ -761,7 +759,6 @@ mistaken for GUI settings.
 | `GR4_JIT_DISASM` | Any presence prints each IMPACT raster shader's machine code as it compiles. | [src/dev/mgras/rss_jit/compiler.rs](src/dev/mgras/rss_jit/compiler.rs) |
 | `IRIS_BAKE_HOOKS` | Any presence bakes callout hook addresses into JIT code (experimental). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_AUDIO_DUMP` | File to record what every sound card plays (HAL2, MACE audio, RAD1, ICE1724) at the card's own rate, before conversion. RAD1 and ICE1724 record only with `[audio]` enabled. The layout is in the module. | [src/dev/audio_dump.rs](src/dev/audio_dump.rs) |
-| `IRIS_BREAK_CPU` | 1 stops CPU after exception handling for diagnostic inspection. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_PPMEM_BACKEND` | `mach` backs guest RAM with Mach memory entries instead of POSIX shared memory (macOS), as the App Sandbox build does; for testing that path. | [src/ppmem/map_unix.rs](src/ppmem/map_unix.rs) |
 | `IRIS_CHD_DIFF_DIR` | Redirect CHD diff sidecars; GUI App Store sets a writable container directory. | [src/chd_disk.rs](src/chd_disk.rs) |
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
@@ -953,8 +950,6 @@ both the interpreter and jitv2.
 | Feature | What it does |
 |---|---|
 | `developer` | Undo buffer, execution trace, extra monitor commands; CPU starts paused. Use `--features developer`; `--profile developer` only selects build optimization/debug symbols. |
-| `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
-| `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
 | `vprodiag` | VPro texture packing check (`vpro status`, "texture packing"): every texture level the guest names is checked against the upload that wrote that memory. Off by default; works with `lightning` |
 | `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2, IMPACT, O2 and VPro annotated traces (`gr2 trace`, `mgras trace`, `re trace`, `vpro trace`); O2 engine recording (`re rec`). On with `developer`; opt in for plain and `lightning` builds |
