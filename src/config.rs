@@ -2982,7 +2982,7 @@ impl MachineConfig {
         cfg.fold_deprecated().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         // A written `devices = []` is a machine with no disks.
         let none = matches!(table.get("devices"), Some(toml::Value::Array(a)) if a.is_empty());
-        if !table.contains_key("scsi") && !none && !cfg.devices.iter().any(|d| d.device.scsi().is_some()) {
+        if !table.contains_key("scsi") && !none && cfg.devices.is_empty() {
             cfg.devices.splice(0..0, default_disks());
         }
         cfg.fold_machine_keys().map_err(<toml::de::Error as serde::de::Error>::custom)?;
@@ -3501,10 +3501,17 @@ impl MachineConfig {
     /// Settle where each device goes once the command line has picked the machine; `--scsiN` and `--cdromN` images replace
     /// what is at their slot.
     pub fn resolve_slots(&mut self) -> Result<(), String> {
-        legacy::gio_cards(self)?;
-        legacy::virtio_cards(self);
+        self.fold_cards()?;
         legacy::merge_shorthands(self);
         DevicePlacement::new(self).map(drop)
+    }
+
+    /// Turn the older card flags (`[ultra64]`, `graphics.heads = 2`, `test_device`, `[virtio_*]`) into `[[devices]]`
+    /// entries. A front end that reads a file itself calls this, so it sees what a run builds; a second fold adds nothing.
+    pub fn fold_cards(&mut self) -> Result<(), String> {
+        legacy::gio_cards(self)?;
+        legacy::virtio_cards(self);
+        Ok(())
     }
 
     /// The config with every slot settled, as the command line settles it: what a front end

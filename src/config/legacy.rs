@@ -349,6 +349,19 @@ mod tests {
         }
     }
 
+    /// A front end that folds the flags when it reads a file sees the cards, and the run's own fold finds
+    /// nothing left to add.
+    #[test]
+    fn folding_the_cards_twice_changes_nothing() {
+        let mut cfg = MachineConfig::from_toml_str("[graphics]\nheads = 2\n[virtio_serial]\nenabled = true\n").unwrap();
+        cfg.fold_cards().unwrap();
+        let names = |c: &MachineConfig| c.devices.iter().map(|d| d.device.spec().name).collect::<Vec<_>>();
+        let once = names(&cfg);
+        assert!(once.contains(&"newport") && once.contains(&"virtio_serial"), "{once:?}");
+        cfg.resolve_slots().unwrap();
+        assert_eq!(names(&cfg), once);
+    }
+
     /// A file with no disks gets the two defaults; one that names a disk gets
     /// exactly that one.
     #[test]
@@ -361,6 +374,19 @@ mod tests {
         assert!(MachineConfig::from_toml_str("[scsi]\n").unwrap().devices.iter().all(|d| d.device.scsi().is_none()), "an empty [scsi] is no disks");
         let text = toml::to_string(&MachineConfig { devices: vec![], ..MachineConfig::default() }).unwrap();
         assert!(MachineConfig::from_toml_str(&text).unwrap().devices.iter().all(|d| d.device.scsi().is_none()), "a machine saved with none reads back with none");
+    }
+
+    /// A file that names only cards still names its devices: the default disks do not come back, as
+    /// they would for a saved machine whose disks were all removed.
+    #[test]
+    fn a_file_with_only_cards_gets_no_default_disks() {
+        let card = "[machine]\nprofile = \"octane_ip30\"\n[[devices]]\ntype = \"nvme\"\npath = \"n.img\"\n";
+        let cfg = MachineConfig::from_toml_str(card).unwrap();
+        assert!(cfg.devices.iter().all(|d| d.device.scsi().is_none()), "no default disks beside the card");
+        let text = toml::to_string(&MachineConfig { devices: cfg.devices.clone(), ..cfg }).unwrap();
+        let back = MachineConfig::from_toml_str(&text).unwrap();
+        assert!(back.devices.iter().all(|d| d.device.scsi().is_none()), "saved and read back:\n{text}");
+        assert_eq!(back.devices.len(), 1);
     }
 
     fn slots(cfg: &MachineConfig) -> Vec<(String, &'static str)> {
