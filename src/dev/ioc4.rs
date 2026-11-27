@@ -816,6 +816,7 @@ impl Ioc4 {
     /// Wire the host end of serial port `port` (0 is the console): a TCP
     /// listener, a log tee, or nothing.
     pub fn set_serial_backend(&self, port: usize, backend: Arc<dyn SerialBackend>) {
+        self.sh.timers[0].manager().inspect(|tm| backend.bind_timers(tm));
         self.sh.st.lock().uart[port].set_backend(backend);
     }
 

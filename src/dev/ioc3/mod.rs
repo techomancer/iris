@@ -1045,6 +1045,7 @@ impl Ioc3 {
     /// listener, a log tee, or nothing.
     pub fn set_serial_backend(&self, port: usize, backend: Arc<dyn SerialBackend>) {
         if let Some(sio) = &self.sh.sio {
+            self.sh.timers[0].manager().inspect(|tm| backend.bind_timers(tm));
             sio.set_serial_backend(port, backend);
         }
     }

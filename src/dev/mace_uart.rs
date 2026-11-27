@@ -57,6 +57,7 @@ impl MaceUart {
 
     /// Wire the host end of the line: a TCP console, a log tee, or nothing.
     pub fn set_backend(&self, backend: Arc<dyn SerialBackend>) {
+        self.timer.manager().inspect(|tm| backend.bind_timers(tm));
         self.core().set_backend(backend);
     }
 

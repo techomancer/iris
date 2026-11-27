@@ -323,6 +323,11 @@ impl Timer {
         self.due().is_some()
     }
 
+    /// The manager this timer runs on, while it lives.
+    pub fn manager(&self) -> Option<Arc<TimerManager>> {
+        self.0.tm.upgrade()
+    }
+
     /// The machine clock, in nanoseconds.
     pub fn now(&self) -> u64 {
         self.0.clock.now()

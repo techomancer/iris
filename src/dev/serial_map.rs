@@ -57,6 +57,9 @@ impl SerialBackend for Mapped {
     fn modem_in(&self) -> ModemIn {
         self.inner.modem_in()
     }
+    fn bind_timers(&self, tm: &std::sync::Arc<crate::hptimer::TimerManager>) {
+        self.inner.bind_timers(tm)
+    }
     fn raw(&self) -> bool {
         self.inner.raw()
     }

@@ -5,28 +5,26 @@
 //! power from DTR and RTS, as a Spaceball does, is powered when the guest's
 //! driver raises them, as on the machine's own connector.
 //!
-//! A reader thread waits on the port and keeps what arrives, and polls the
-//! modem inputs every few milliseconds. Output is written straight away
-//! without blocking; what the port does not take waits for the UART's next
-//! poll (`flush`).
+//! The port joins the host-IO thread's poller for input and room to write. Modem inputs
+//! have no event to wait on, so a machine-clock timer polls them while DTR or RTS is raised.
 
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
 use crate::dev::serial_host::{LineConfig, ModemIn, ModemOut, SerialBackend};
-use crate::net::wake::host_io;
+use crate::hptimer::{Timer, TimerManager};
+use crate::net::wake::{host_io, HostPump};
 
 /// The most input kept for a guest that is not reading.
 const RX_CAP: usize = 64 * 1024;
-/// How long the reader waits on the port before polling the modem inputs again.
-const POLL_MS: i32 = 5;
+/// How often the modem inputs are polled while the guest has the lines raised, in machine ns.
+const MODEM_POLL_NS: u64 = 5_000_000;
 
-/// Modem-input bits as the reader thread stores them.
+/// Modem-input bits as the poll stores them.
 const IN_CTS: u8 = 1;
 const IN_DCD: u8 = 2;
 const IN_DSR: u8 = 4;
@@ -40,7 +38,12 @@ struct Shared {
     rx: Mutex<VecDeque<u8>>,
     tx: Mutex<VecDeque<u8>>,
     modem: AtomicU8,
-    running: AtomicBool,
+    /// The port in the host-IO poller, until it is gone.
+    watch: Mutex<Option<sys::Watch>>,
+    /// The poller is watching for room to write.
+    want_write: AtomicBool,
+    /// Polls the modem inputs; bound by the UART when the machine's timers exist.
+    modem_timer: OnceLock<Timer>,
     /// What the port was last set to, for the log and to skip repeats.
     line: Mutex<Option<LineConfig>>,
     out: Mutex<Option<ModemOut>>,
@@ -48,7 +51,8 @@ struct Shared {
 
 pub struct HostTty {
     shared: Arc<Shared>,
-    reader: Option<JoinHandle<()>>,
+    /// Reads the port into `rx` on the host-IO thread.
+    pump: Option<HostPump>,
 }
 
 #[cfg(unix)]
@@ -218,18 +222,24 @@ mod sys {
         )
     }
 
-    /// Wait up to `ms` for input; `Ok(true)` when some is there.
-    pub fn wait(fd: i32, ms: i32) -> io::Result<bool> {
-        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let r = unsafe { libc::poll(&mut p, 1, ms) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            return if e.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(e) };
+    /// The port as the poller sees it; `HostTty` closes it, after the poller has let go.
+    pub struct Fd(i32);
+
+    impl std::os::fd::AsFd for Fd {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            // SAFETY: the port stays open until `HostTty` drops its `Watch`.
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
         }
-        if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 && p.revents & libc::POLLIN == 0 {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "port gone"));
-        }
-        Ok(r > 0)
+    }
+
+    pub type Watch = crate::net::wake::Watched<Fd>;
+
+    pub fn watch(fd: i32) -> io::Result<Watch> {
+        crate::net::wake::Watched::new(Fd(fd), &host_io().wake, true, false)
+    }
+
+    pub fn watch_write(w: &mut Watch, on: bool) {
+        w.set_interest(true, on);
     }
 
     /// Non-blocking read; 0 when nothing is there.
@@ -265,7 +275,9 @@ mod sys {
     pub fn set_line(_: i32, _: LineConfig) -> io::Result<Option<u32>> { unsupported() }
     pub fn set_modem(_: i32, _: ModemOut) -> io::Result<()> { unsupported() }
     pub fn modem_in(_: i32) -> Option<u8> { None }
-    pub fn wait(_: i32, _: i32) -> io::Result<bool> { unsupported() }
+    pub type Watch = ();
+    pub fn watch(_: i32) -> io::Result<Watch> { unsupported() }
+    pub fn watch_write(_: &mut Watch, _: bool) {}
     pub fn read(_: i32, _: &mut [u8]) -> io::Result<usize> { unsupported() }
     pub fn write(_: i32, _: &[u8]) -> io::Result<usize> { unsupported() }
 }
@@ -292,56 +304,70 @@ impl HostTty {
             rx: Mutex::new(VecDeque::new()),
             tx: Mutex::new(VecDeque::new()),
             modem: AtomicU8::new(sys::modem_in(fd).unwrap_or(0)),
-            running: AtomicBool::new(true),
+            watch: Mutex::new(None),
+            want_write: AtomicBool::new(false),
+            modem_timer: OnceLock::new(),
             line: Mutex::new(None),
             out: Mutex::new(None),
         });
+        match sys::watch(fd) {
+            Ok(w) => *shared.watch.lock() = Some(w),
+            Err(e) => log::warn!("serial: {path}: not watched for input: {e}"),
+        }
         let s = shared.clone();
-        let reader = std::thread::Builder::new().name(format!("tty {path}")).spawn(move || s.read_loop()).inspect_err(|_| sys::close(fd))?;
-        Ok(Self { shared, reader: Some(reader) })
+        let pump = Some(host_io().add(move || s.read_in()));
+        Ok(Self { shared, pump })
     }
 }
 
 impl Shared {
-    fn read_loop(&self) {
+    /// Take what the port has into `rx`; whether any came. A gone port leaves the poller.
+    fn read_in(&self) -> bool {
+        if self.watch.lock().is_none() {
+            return false;
+        }
         let mut buf = [0u8; 256];
-        while self.running.load(Ordering::Relaxed) {
-            match sys::wait(self.fd, POLL_MS) {
-                Ok(true) => match sys::read(self.fd, &mut buf) {
-                    Ok(n) if n > 0 => {
-                        let mut rx = self.rx.lock();
-                        rx.extend(&buf[..n]);
-                        while rx.len() > RX_CAP {
-                            rx.pop_front();
-                        }
-                        host_io().wake.notify(); // the UART's pump takes it
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("serial: {}: {e}; the port is gone", self.path);
-                        break;
-                    }
-                },
-                Ok(false) => {}
-                Err(e) => {
-                    log::warn!("serial: {}: {e}; the port is gone", self.path);
-                    break;
+        match sys::read(self.fd, &mut buf) {
+            Ok(0) => false,
+            Ok(n) => {
+                let mut rx = self.rx.lock();
+                rx.extend(&buf[..n]);
+                while rx.len() > RX_CAP {
+                    rx.pop_front();
                 }
+                true
             }
-            if !self.tx.lock().is_empty() {
-                host_io().wake.notify(); // the port was full; the UART's pump retries
-            }
-            if self.tty {
-                if let Some(m) = sys::modem_in(self.fd) {
-                    if self.modem.swap(m, Ordering::Relaxed) != m {
-                        host_io().wake.notify();
-                    }
-                }
+            Err(e) => {
+                log::warn!("serial: {}: {e}; the port is gone", self.path);
+                self.watch.lock().take();
+                false
             }
         }
     }
 
+    /// Re-read the modem inputs, wake the UART's pump on a change, and keep polling while the lines are raised.
+    fn poll_modem(&self) {
+        if let Some(m) = sys::modem_in(self.fd) {
+            if self.modem.swap(m, Ordering::Relaxed) != m {
+                host_io().wake.notify();
+            }
+        }
+        if let (Some(t), Some(out)) = (self.modem_timer.get(), *self.out.lock()) {
+            t.set_due((out.dtr || out.rts).then(|| t.now() + MODEM_POLL_NS));
+        }
+    }
+
     fn write_out(&self, tx: &mut VecDeque<u8>) {
+        self.try_write(tx);
+        let held = !tx.is_empty();
+        if self.want_write.swap(held, Ordering::Relaxed) != held {
+            if let Some(w) = self.watch.lock().as_mut() {
+                sys::watch_write(w, held);
+            }
+        }
+    }
+
+    fn try_write(&self, tx: &mut VecDeque<u8>) {
         while !tx.is_empty() {
             let n = match sys::write(self.fd, tx.as_slices().0) {
                 Ok(n) => n,
@@ -404,10 +430,12 @@ impl SerialBackend for HostTty {
             return;
         }
         *last = Some(out);
+        drop(last);
         match sys::set_modem(self.shared.fd, out) {
             Ok(()) => log::info!("serial: {} DTR {} RTS {}{}", self.shared.path, on(out.dtr), on(out.rts), if out.brk { " break" } else { "" }),
             Err(e) => log::warn!("serial: {}: cannot set the modem lines: {e}", self.shared.path),
         }
+        self.shared.poll_modem();
     }
 
     fn modem_in(&self) -> ModemIn {
@@ -420,6 +448,14 @@ impl SerialBackend for HostTty {
 
     fn raw(&self) -> bool {
         true
+    }
+
+    fn bind_timers(&self, tm: &Arc<TimerManager>) {
+        self.shared.modem_timer.get_or_init(|| {
+            let t = Timer::new(tm, &Arc::downgrade(&self.shared), |s: &Shared, _| s.poll_modem());
+            t.start();
+            t
+        });
     }
 
     fn describe(&self) -> String {
@@ -448,10 +484,11 @@ fn on(b: bool) -> &'static str {
 
 impl Drop for HostTty {
     fn drop(&mut self) {
-        self.shared.running.store(false, Ordering::Relaxed);
-        if let Some(r) = self.reader.take() {
-            let _ = r.join();
+        if let Some(t) = self.shared.modem_timer.get() {
+            t.stop();
         }
+        self.pump.take();
+        self.shared.watch.lock().take();
         sys::close(self.shared.fd);
     }
 }
@@ -459,6 +496,57 @@ impl Drop for HostTty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pseudo-terminal pair: the master end's fd and the slave's path.
+    #[cfg(unix)]
+    fn pty() -> (std::fs::File, String) {
+        use std::os::fd::FromRawFd;
+        unsafe {
+            let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(m >= 0 && libc::grantpt(m) == 0 && libc::unlockpt(m) == 0);
+            let mut name = [0 as libc::c_char; 128];
+            assert_eq!(libc::ptsname_r(m, name.as_mut_ptr(), name.len()), 0);
+            (std::fs::File::from_raw_fd(m), std::ffi::CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned())
+        }
+    }
+
+    /// The slave as a port without `setup_tty`, which a pty cannot take (it has no modem lines to set).
+    #[cfg(unix)]
+    fn pty_port(slave: &str) -> HostTty {
+        let c = std::ffi::CString::new(slave).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK) };
+        assert!(fd >= 0);
+        HostTty::start(slave, fd, true).unwrap()
+    }
+
+    /// A byte arriving on the port reaches `recv_byte` with nothing polling it.
+    #[cfg(unix)]
+    #[test]
+    fn input_on_the_port_wakes_the_host_io_thread() {
+        use std::io::Write;
+        let (mut master, slave) = pty();
+        let tty = pty_port(&slave);
+        master.write_all(b"k\n").unwrap(); // canonical mode: the line ends it
+        assert!(crate::test_board::until(|| tty.recv_byte().is_ok_and(|b| b == b'k')));
+    }
+
+    /// The modem inputs are polled on the machine clock only while the guest has DTR or RTS raised.
+    #[cfg(unix)]
+    #[test]
+    fn the_modem_poll_runs_only_while_the_lines_are_raised() {
+        let (_master, slave) = pty();
+        let clock = crate::test_board::Stepped::new();
+        let tty = pty_port(&slave);
+        tty.bind_timers(&clock.tm);
+        let due = || tty.shared.modem_timer.get().unwrap().due();
+        assert_eq!(due(), None);
+        tty.set_modem(ModemOut { dtr: true, rts: false, brk: false });
+        assert!(due().is_some(), "raised: polling");
+        clock.step(MODEM_POLL_NS);
+        assert!(due().is_some(), "and it keeps going");
+        tty.set_modem(ModemOut::default());
+        assert_eq!(due(), None, "dropped: it stops");
+    }
 
     /// Against a real device, opt-in: `IRIS_TEST_TTY=/dev/ttyUSB0 cargo test
     /// --lib host_tty -- --ignored`. A Spaceball 5000 FLX (Magellan protocol)

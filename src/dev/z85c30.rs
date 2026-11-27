@@ -669,12 +669,14 @@ impl Z85c30 {
     /// Swap in an alternate backend for channel A (tty2 on Indy).
     /// Must be called before `start()`.
     pub fn set_backend_a(&self, backend: Arc<dyn SerialBackend>) {
+        self.rx[0].timer.manager().inspect(|tm| backend.bind_timers(tm));
         *self.backend_a.lock() = backend;
     }
 
     /// Swap in an alternate backend for channel B (tty1, the PROM/IRIX
     /// serial console on Indy). Same constraint as `set_backend_a`.
     pub fn set_backend_b(&self, backend: Arc<dyn SerialBackend>) {
+        self.rx[1].timer.manager().inspect(|tm| backend.bind_timers(tm));
         *self.backend_b.lock() = backend;
     }
 

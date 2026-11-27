@@ -29,6 +29,7 @@ use polling::AsSource;
 
 use crate::config::MachineConfig;
 use crate::dev::serial_log::SerialLog;
+use crate::hptimer::TimerManager;
 use crate::net::telnet::IAC;
 use crate::net::wake::{host_io, Watched};
 
@@ -112,6 +113,8 @@ pub trait SerialBackend: Send + Sync {
     fn modem_in(&self) -> ModemIn {
         ModemIn::IDLE
     }
+    /// The machine's timers, for a backend that polls the host on the machine clock.
+    fn bind_timers(&self, _tm: &Arc<TimerManager>) {}
     /// True for a line that carries a device's own bytes (a host serial port,
     /// an emulated peripheral), which the UART must pass through untouched.
     /// False for a console a person types at, where the UART may apply its
@@ -291,6 +294,9 @@ impl SerialBackend for TeeBackend {
     }
     fn modem_in(&self) -> ModemIn {
         self.inner.modem_in()
+    }
+    fn bind_timers(&self, tm: &Arc<TimerManager>) {
+        self.inner.bind_timers(tm);
     }
     fn raw(&self) -> bool {
         self.inner.raw()
