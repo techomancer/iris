@@ -345,17 +345,17 @@ fn origin2000(
     controller: Arc<ModuleManagement>,
     heartbeat: Arc<AtomicU64>,
 ) -> Result<BoardIo, String> {
-    const BASEIO_WIDGET: u8 = 8;
+    const ORIGIN2000_BASEIO_WIDGET: u8 = 8;
     let mut bridge = None;
     for (node, hub_widget) in nodes.iter().zip([9, 10]) {
         let first = bridge.is_none();
-        let xbow = build_crossbow(&[(node, hub_widget)], if first { 1 << BASEIO_WIDGET } else { 0 });
+        let xbow = build_crossbow(&[(node, hub_widget)], if first { 1 << ORIGIN2000_BASEIO_WIDGET } else { 0 });
         node.chip.io.connect_widget(0, xbow.clone());
         node.chip.io.connect_widget(hub_widget, xbow.attach_widget(hub_widget, node.chip.widget_port()));
         if first {
             let b = build_baseio(cfg, xbow.upstream(vec![node.chip.host_port(hub_widget)]), &[(BASEIO_RECORD, BASEIO_SERIAL)])?;
-            xbow.serve_bridge(BASEIO_WIDGET, &b);
-            node.chip.io.connect_widget(BASEIO_WIDGET, xbow.attach_widget(BASEIO_WIDGET, b.clone()));
+            xbow.serve_bridge(ORIGIN2000_BASEIO_WIDGET, &b);
+            node.chip.io.connect_widget(ORIGIN2000_BASEIO_WIDGET, xbow.attach_widget(ORIGIN2000_BASEIO_WIDGET, b.clone()));
             bridge = Some(b);
         }
     }
@@ -373,16 +373,16 @@ fn onyx2(
     controller: Arc<ModuleManagement>,
     heartbeat: Arc<AtomicU64>,
 ) -> Result<BoardIo, String> {
-    const BASEIO_WIDGET: u8 = 15;
+    const ONYX2_BASEIO_WIDGET: u8 = 15;
     const GRAPHICS_WIDGET: u8 = 8;
     let hubs: Vec<_> = nodes.iter().zip([10, 9]).collect();
     // Either Hub's processor reaches the BaseIO, and the Bridge's DMA and interrupts go to the Hub
     // at the guest's widget.
-    let xbow = build_crossbow(&hubs.iter().map(|&(n, w)| (n, w)).collect::<Vec<_>>(), 1 << BASEIO_WIDGET | 1 << GRAPHICS_WIDGET);
+    let xbow = build_crossbow(&hubs.iter().map(|&(n, w)| (n, w)).collect::<Vec<_>>(), 1 << ONYX2_BASEIO_WIDGET | 1 << GRAPHICS_WIDGET);
     let owner_widget = hubs[hubs.len() - 1].1;
     let upstream = || xbow.upstream(hubs.iter().map(|(n, w)| n.chip.host_port(*w)).collect());
     let bridge = build_baseio(cfg, upstream(), &[(BASEIO_G_RECORD, BASEIO_G_SERIAL), (MIO_RECORD, MIO_SERIAL)])?;
-    xbow.serve_bridge(BASEIO_WIDGET, &bridge);
+    xbow.serve_bridge(ONYX2_BASEIO_WIDGET, &bridge);
 
     let status = crate::status::MachineStatus::without_ticks(heartbeat.clone());
     let pipe = match cfg.graphics_board().kona() {
@@ -419,7 +419,7 @@ fn onyx2(
             None => Arc::new(Unmodelled::identified("graphics slot (a test widget)", TEST_WIDGET_ID)),
         };
         hub.io.connect_widget(GRAPHICS_WIDGET, xbow.attach_widget(GRAPHICS_WIDGET, slot));
-        hub.io.connect_widget(BASEIO_WIDGET, xbow.attach_widget(BASEIO_WIDGET, bridge.clone()));
+        hub.io.connect_widget(ONYX2_BASEIO_WIDGET, xbow.attach_widget(ONYX2_BASEIO_WIDGET, bridge.clone()));
         for &(n, w) in &hubs {
             hub.io.connect_widget(w, xbow.attach_widget(w, n.chip.widget_port()));
         }
