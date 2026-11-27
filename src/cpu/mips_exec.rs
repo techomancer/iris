@@ -5,7 +5,7 @@ use crate::cpu::mips_isa::*;
 use crate::traits::*;
 use crate::cpu::mips_tlb::*;
 use crate::cpu::mips_cache_v2::*;
-use crate::devlog::{LogModule, devlog_mask, devlog_is_active};
+use crate::devlog::{devlog_on, event, LogModule};
 use crate::cpu::mips_dis;
 use std::fmt::Write as FmtWrite;
 use crate::cpu::mips_dis::SymbolTable;
@@ -18,16 +18,18 @@ use std::time::Duration;
 use crate::exp::{self, Expr, RegTarget};
 use crate::snapshot::{get_field, u64_slice_to_toml, load_u64_slice, toml_u64, toml_u32, toml_bool, hex_u64, hex_u32};
 
-// LogModule::Mips bitmask categories
-pub const MIPS_LOG_INSN: u32 = 0x0001; // per-instruction disassembly trace
-pub const MIPS_LOG_TLB:  u32 = 0x0002; // TLB read/write/probe
-pub const MIPS_LOG_MEM:  u32 = 0x0004; // uncached memory accesses
-pub const MIPS_LOG_FPU:  u32 = 0x0008; // FP compare/condmove/convert operand+result trace
+/// The `mips.*` trace points: per-instruction disassembly, TLB ops, uncached accesses and FP
+/// operands and results.
+pub const EVENTS: &[&str] = &["insn", "tlb", "mem", "fpu"];
+pub const MIPS_LOG_INSN: u32 = event(EVENTS, "insn");
+pub const MIPS_LOG_TLB:  u32 = event(EVENTS, "tlb");
+pub const MIPS_LOG_MEM:  u32 = event(EVENTS, "mem");
+pub const MIPS_LOG_FPU:  u32 = event(EVENTS, "fpu");
 
 #[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
-    devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
+    devlog_on(LogModule::Mips, bit)
 }
 
 // Without `developer`, dlog_dev! is a no-op, so callers gate on this constant `false`

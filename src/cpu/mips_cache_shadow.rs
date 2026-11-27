@@ -48,13 +48,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
-    cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
+    cache_op_name, model, CACHE_LOG_HIT, CACHE_LOG_OP, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
     C_HINV, C_HWBINV, C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI,
     CACH_SD, CACH_SI,
 };
 use crate::ppmem::PpMemSpace;
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
-use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
+use crate::devlog::{devlog_on, LogModule};
 
 /// Shadow tag and data arrays for one cache.
 ///
@@ -187,11 +187,11 @@ const WAYS: usize = 2;
 ///
 /// This used to be `std::env::var_os("IRIS_SHADOW_CACHEOPS")`, uncached, six
 /// times per `cache_op` — a getenv on every CACHE instruction in every build.
-/// `devlog` costs two relaxed atomic loads and can be turned on, masked and
+/// `devlog` costs one relaxed atomic load and can be turned on, masked and
 /// redirected to a file while the machine runs.
 #[inline(always)]
 fn l2_op_log(bit: u32) -> bool {
-    devlog_is_active(LogModule::L2c) && (devlog_mask(LogModule::L2c) & bit) != 0
+    devlog_on(LogModule::L2c, bit)
 }
 
 /// A `MipsCache` whose contents are only ever observed through CACHE ops.
@@ -565,9 +565,7 @@ impl<
                 unsafe { *(base.add(a as usize) as *mut u64) = if r.is_ok() { r.data.rotate_left(32) } else { 0 } };
             }
         }
-        if l2_op_log(CACHE_LOG_OP) {
-            crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} holds its page (new: {new})");
-        }
+        crate::dlog!(LogModule::L2c, CACHE_LOG_OP, "shadow:   -> line {pa:#x} holds its page (new: {new})");
         let s = self.shadow(sel);
         s.held[idx] = true;
         if s.data.is_empty() {
@@ -612,9 +610,7 @@ impl<
         if gone {
             self.mark_foreign(sp, pa, false);
         }
-        if l2_op_log(CACHE_LOG_OP) {
-            crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} leaves (page released: {gone})");
-        }
+        crate::dlog!(LogModule::L2c, CACHE_LOG_OP, "shadow:   -> line {pa:#x} leaves (page released: {gone})");
     }
 
     /// ppmem puts `GEN_HELD` on its own generation counters. Where the cache's
@@ -785,9 +781,7 @@ impl<
             let raw = unsafe { *(base.add(a as usize) as *const u64) };
             let _ = self.downstream.write64(a, raw.rotate_left(32));
         }
-        if l2_op_log(CACHE_LOG_OP) {
-            crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} written back");
-        }
+        crate::dlog!(LogModule::L2c, CACHE_LOG_OP, "shadow:   -> line {pa:#x} written back");
     }
 
     /// A secondary line `[pa, pa + len)` that goes invalidates the primary

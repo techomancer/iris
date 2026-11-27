@@ -160,13 +160,10 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     // Register this connection with DevLog so log output is broadcast here.
     // Wrap in CrlfWriter so bare \n from log messages renders as CRLF on the
     // telnet client side.
-    let sink = crate::devlog::DEVLOG.get().map(|dl| {
-        let w: crate::devlog::DevLogWriter = Arc::new(Mutex::new(
-            BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap()))
-        ));
-        dl.add_sink(w.clone());
-        (dl, w)
-    });
+    let sink: crate::devlog::DevLogWriter = Arc::new(Mutex::new(
+        BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap()))
+    ));
+    crate::devlog::DEVLOG.add_sink(sink.clone());
 
     // Monitor is line-oriented: stay in NVT (passive telnet — strip inbound
     // IAC, decline whatever the client offers, but don't initiate). The
@@ -311,9 +308,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         let _ = write!(writer, "> ");
         let _ = writer.flush();
     }
-    if let Some((dl, w)) = sink {
-        dl.remove_sink(&w);
-    }
+    crate::devlog::DEVLOG.remove_sink(&sink);
     // Hang up. Closing our handles is not enough: a device may keep the
     // writer a command was given, whose handle keeps the connection open,
     // and the console client waits for it to close before it exits.
@@ -528,7 +523,6 @@ mod tests {
     #[test]
     fn quit_hangs_up_despite_the_log_sink() {
         use std::io::{Read, Write};
-        crate::devlog::init_devlog();
         let monitor = Arc::new(Monitor::new());
         monitor.clone().start_server("127.0.0.1:0".to_string());
         let addr = wait_for("bind", || monitor.bound_addr());
@@ -548,7 +542,6 @@ mod tests {
 
     fn converse_with(devices: Vec<Arc<dyn Device>>, input: &[u8]) -> String {
         use std::io::{Read, Write};
-        crate::devlog::init_devlog();
         let monitor = Arc::new(Monitor::new());
         for d in devices {
             monitor.register_device(d);

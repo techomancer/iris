@@ -635,7 +635,7 @@ in every build.
 | `log <module> mask <cat\|hex>` | Category mask |
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
-`log mips mask insn` then `log mips on` prints every instruction `run` and
+`log mips mask insn` prints every instruction `run` and
 `step` execute (`log mips file <path>` writes them to a file instead) **[DEV]**.
 A device's trace is its module: `log ps2 on`, `log scsi on`, `log rtc on`.
 `log net` traces packets, `log ioc` the 8254 timer, and `log phys` accesses
@@ -663,7 +663,7 @@ accesses, one counter read in 256 with the host's clock, and every
 interrupt vector raised or lowered, and on the Octane every access nothing
 answers. `o2audio` logs the O2's audio register accesses and codec writes.
 Mask categories: `pdma` —
-`hal enet scsi`; `mips` — `insn tlb mem fpu`; `l1i`/`l1d`/`l2c` — `hit
+one per HPC3 channel, `hal0`..`hal7`, `scsi0`, `scsi1`, `enet0`, `enet1`; `mips` — `insn tlb mem fpu`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
 every module also takes `on`/`all`, `off`/`none` or a hex mask.
 `bedrock` covers the devices of the Bedrock node (Fuel, Tezro, Origin 3200,

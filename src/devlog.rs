@@ -1,331 +1,152 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::Mutex;
 use crate::traits::Device;
 
-// ── LogModule ────────────────────────────────────────────────────────────────
+/// The bit of event `name` in a module's `EVENTS` table; a name the table lacks fails the build.
+pub const fn event(names: &[&str], name: &str) -> u32 {
+    let mut i = 0;
+    while i < names.len() {
+        if names[i].len() == name.len() {
+            let (a, b) = (names[i].as_bytes(), name.as_bytes());
+            let mut j = 0;
+            while j < a.len() && a[j] == b[j] { j += 1; }
+            if j == a.len() { return 1 << i; }
+        }
+        i += 1;
+    }
+    panic!("no such event")
+}
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(usize)]
-pub enum LogModule {
-    Net  = 0,
-    Hpc3 = 1,
-    Seeq = 2,
-    Hal2 = 3,
-    Mc   = 4,
-    Rex3 = 5,
-    Mips = 6,
-    Ioc  = 7,
-    Scsi = 8,
-    Pdma = 9,
-    Vino = 10,
-    Dcb  = 11,
-    Vc2  = 12,
-    Cmap  = 13,
-    Xmap  = 14,
-    Bt445  = 15,
-    Scc    = 16,
-    Ps2    = 17,
-    Rtc    = 18,
-    Eeprom = 19,
-    L1i    = 20,  // L1 instruction cache: fetch hit/miss, fill, cache ops
-    L1d    = 21,  // L1 data cache: read/write hit/miss, fill, cache ops
-    L2c    = 22,  // L2 unified cache: fill, writeback, invalidate, cache ops
-    Ultra  = 23,  // N64 dev board: shm reads/writes, interrupts, register traffic
+/// One module's trace state: a bit per named event (all clear is off) and its file sink.
+struct Point {
+    name:   &'static str,
+    events: &'static [&'static str],
+    on:     AtomicU32,
+    file:   Mutex<Option<(String, BufWriter<File>)>>,
+}
+
+impl Point {
+    const fn new(name: &'static str, events: &'static [&'static str]) -> Self {
+        Self { name, events, on: AtomicU32::new(0), file: Mutex::new(None) }
+    }
+}
+
+// Each module: its name, then its event names (none for a module that is simply on or off).
+macro_rules! catalogue {
+    ($($(#[$doc:meta])* $id:ident $name:literal $events:expr,)*) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        #[repr(usize)]
+        pub enum LogModule { $($(#[$doc])* $id,)* }
+
+        impl LogModule {
+            pub const ALL: &'static [LogModule] = &[$(LogModule::$id),*];
+        }
+
+        static POINTS: [Point; LogModule::ALL.len()] = [$(Point::new($name, $events)),*];
+    };
+}
+
+catalogue! {
+    Net "net" &[],
+    Hpc3 "hpc3" &[],
+    Seeq "seeq" &[],
+    Hal2 "hal2" &[],
+    Mc "mc" &[],
+    Rex3 "rex3" &[],
+    Mips "mips" crate::cpu::mips_exec::EVENTS,
+    Ioc "ioc" &[],
+    Scsi "scsi" &[],
+    Pdma "pdma" crate::dev::hpc3::PDMA_EVENTS,
+    Vino "vino" &[],
+    Dcb "dcb" &[],
+    Vc2 "vc2" &[],
+    Cmap "cmap" &[],
+    Xmap "xmap" &[],
+    Bt445 "bt445" &[],
+    Scc "scc" &[],
+    Ps2 "ps2" &[],
+    Rtc "rtc" &[],
+    Eeprom "eeprom" &[],
+    L1i "l1i" crate::cpu::mips_cache_v2::EVENTS,  // L1 instruction cache: fetch hit/miss, fill, cache ops
+    L1d "l1d" crate::cpu::mips_cache_v2::EVENTS,  // L1 data cache: read/write hit/miss, fill, cache ops
+    L2c "l2c" crate::cpu::mips_cache_v2::EVENTS,  // L2 unified cache: fill, writeback, invalidate, cache ops
+    Ultra "ultra" &[],  // N64 dev board: shm reads/writes, interrupts, register traffic
     /// Second WD33C93A (fullhouse/Indigo2 SCSI controller 1). Kept as a
     /// distinct module (rather than folding into `Scsi`) so it can be
     /// toggled independently of controller 0.
-    Scsi1  = 24,
+    Scsi1 "scsi1" &[],
     /// HPC3-side motherboard EEPROM (NVRAM/env vars/MAC @ words 0x7D-0x7F,
     /// `nveeprom` command). Kept distinct from `Eeprom` (MC-side CPU
     /// daughtercard chip, `eeprom` command) — the two are separate physical
     /// parts on real hardware, see machine.rs's `eeprom_mc`/`eeprom_hpc3`.
-    Nveeprom = 25,
+    Nveeprom "nveeprom" &[],
     /// GR2 (XZ / Extreme) graphics: HQ2, GE7, RE3, VC1, XMAP5, Bt457.
-    Gr2 = 26,
+    Gr2 "gr2" &[],
     /// The Octane's RAD1 PCI audio: rings, status DMA and register accesses
     /// the model does not support.
-    Rad1 = 27,
+    Rad1 "rad1" &[],
     /// The Octane's VPro (Odyssey) graphics board: guest accesses the
     /// model does not support.
-    Odyssey = 28,
-    Bedrock = 29,
+    Odyssey "odyssey" &[],
+    Bedrock "bedrock" &[],
     /// The IP27 node controller: guest accesses the model does not support.
-    Hub = 30,
+    Hub "hub" &[],
     /// PCI configuration cycles on every bus: who was addressed, what was
     /// read or written, and whether anything answered.
-    Pci = 31,
+    Pci "pci" &[],
     /// The Octane's Bridge ASIC: register and translation-table accesses,
     /// and transfers a function started that reached no memory.
-    Bridge = 32,
+    Bridge "bridge" &[],
     /// The Octane's HEART: processor-interface register accesses (not
     /// counter reads), interrupt vectors raised and lowered, and bus
     /// accesses nothing answers.
-    Heart = 33,
+    Heart "heart" &[],
     /// The NVM Express controller: register writes, controller state
-    /// changes, and the commands it runs (categories `NVME_LOG_*`).
-    Nvme = 34,
-    L1 = 35,
-    Usb = 36,
+    /// changes, and the commands it runs (events `state admin regs io`).
+    Nvme "nvme" crate::dev::nvme::EVENTS,
+    L1 "l1" &[],
+    Usb "usb" &[],
     /// The IP27 module controller (ELSC and the Origin 2000 module), its
     /// configuration NVRAM and its I2C controller: protocol surprises and
     /// refused commands.
-    Module = 37,
+    Module "module" &[],
     /// The InfiniteReality (KONA) graphics pipe's host interface: guest
     /// accesses and command words the model does not support.
-    Kona = 38,
+    Kona "kona" &[],
     /// The ICE1724 audio controller: accesses and values nothing
     /// establishes.
-    Ice1724 = 39,
+    Ice1724 "ice1724" &[],
     /// The physical bus: accesses that hit the black hole or a bus-error
     /// region, and in a developer build every access.
-    Phys = 40,
+    Phys "phys" &[],
     /// The O2's audio: every register access and codec operation.
-    O2Audio = 41,
+    O2Audio "o2audio" &[],
 }
-
-// Mask bits shared by L1i / L1d / L2c
-pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path; developer builds only)
-pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
-pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
-
-// Mask bits for Nvme
-pub const NVME_LOG_STATE: u32 = 0x1;  // CC writes, CSTS changes, resets, fatal errors
-pub const NVME_LOG_ADMIN: u32 = 0x2;  // admin doorbells, commands and completions
-pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the doorbells
-pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 42;
+    fn point(self) -> &'static Point { &POINTS[self as usize] }
+
+    pub fn name(self) -> &'static str { self.point().name }
+
+    pub fn events(self) -> &'static [&'static str] { self.point().events }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "net"  => Some(Self::Net),
-            "hpc3" => Some(Self::Hpc3),
-            "seeq" => Some(Self::Seeq),
-            "hal2" => Some(Self::Hal2),
-            "mc"   => Some(Self::Mc),
-            "rex3" => Some(Self::Rex3),
-            "mips" => Some(Self::Mips),
-            "ioc"  => Some(Self::Ioc),
-            "scsi" => Some(Self::Scsi),
-            "scsi1" => Some(Self::Scsi1),
-            "pdma" => Some(Self::Pdma),
-            "vino" => Some(Self::Vino),
-            "dcb"  => Some(Self::Dcb),
-            "vc2"  => Some(Self::Vc2),
-            "cmap"  => Some(Self::Cmap),
-            "xmap"  => Some(Self::Xmap),
-            "bt445" => Some(Self::Bt445),
-            "scc"    => Some(Self::Scc),
-            "ps2"    => Some(Self::Ps2),
-            "rtc"    => Some(Self::Rtc),
-            "eeprom" => Some(Self::Eeprom),
-            "nveeprom" => Some(Self::Nveeprom),
-            "l1i"    => Some(Self::L1i),
-            "l1d"    => Some(Self::L1d),
-            "l2c"    => Some(Self::L2c),
-            "ultra"  => Some(Self::Ultra),
-            "gr2"    => Some(Self::Gr2),
-            "rad1"   => Some(Self::Rad1),
-            "odyssey" => Some(Self::Odyssey),
-            "bedrock" => Some(Self::Bedrock),
-            "hub" => Some(Self::Hub),
-            "pci"    => Some(Self::Pci),
-            "bridge" => Some(Self::Bridge),
-            "heart"  => Some(Self::Heart),
-            "nvme"   => Some(Self::Nvme),
-            "l1" => Some(Self::L1),
-            "usb" => Some(Self::Usb),
-            "module" => Some(Self::Module),
-            "kona" => Some(Self::Kona),
-            "ice1724" => Some(Self::Ice1724),
-            "phys" => Some(Self::Phys),
-            "o2audio" => Some(Self::O2Audio),
-            _        => None,
-        }
+        Self::ALL.iter().copied().find(|m| m.name() == s)
     }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Net  => "net",
-            Self::Hpc3 => "hpc3",
-            Self::Seeq => "seeq",
-            Self::Hal2 => "hal2",
-            Self::Mc   => "mc",
-            Self::Rex3 => "rex3",
-            Self::Mips => "mips",
-            Self::Ioc  => "ioc",
-            Self::Scsi => "scsi",
-            Self::Scsi1 => "scsi1",
-            Self::Pdma => "pdma",
-            Self::Vino => "vino",
-            Self::Dcb  => "dcb",
-            Self::Vc2  => "vc2",
-            Self::Cmap  => "cmap",
-            Self::Xmap  => "xmap",
-            Self::Bt445  => "bt445",
-            Self::Scc    => "scc",
-            Self::Ps2    => "ps2",
-            Self::Rtc    => "rtc",
-            Self::Eeprom => "eeprom",
-            Self::Nveeprom => "nveeprom",
-            Self::L1i    => "l1i",
-            Self::L1d    => "l1d",
-            Self::L2c    => "l2c",
-            Self::Ultra  => "ultra",
-            Self::Gr2    => "gr2",
-            Self::Rad1   => "rad1",
-            Self::Odyssey => "odyssey",
-            Self::Bedrock => "bedrock",
-            Self::Hub => "hub",
-            Self::Pci    => "pci",
-            Self::Bridge => "bridge",
-            Self::Heart  => "heart",
-            Self::Nvme   => "nvme",
-            Self::L1 => "l1",
-            Self::Usb => "usb",
-            Self::Module => "module",
-            Self::Kona => "kona",
-            Self::Ice1724 => "ice1724",
-            Self::Phys => "phys",
-            Self::O2Audio => "o2audio",
-        }
-    }
-
-    pub fn all() -> &'static [LogModule] {
-        &[
-            Self::Net, Self::Hpc3, Self::Seeq, Self::Hal2, Self::Mc,
-            Self::Rex3, Self::Mips, Self::Ioc, Self::Scsi, Self::Pdma,
-            Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
-            Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
-            Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
-            Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
-            Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
-            Self::L1, Self::Usb, Self::Module, Self::Kona,
-            Self::Ice1724, Self::Phys, Self::O2Audio,
-        ]
-    }
-
-    /// Describe a mask value in human-readable terms for this module.
-    pub fn describe_mask(self, mask: u32) -> String {
-        if mask == 0 { return "none".to_string(); }
-        if mask == 0xFFFF_FFFF { return "all".to_string(); }
-        match self {
-            Self::Pdma => {
-                let mut parts = Vec::new();
-                if mask & 0x00FF != 0 { parts.push(format!("hal({:#04x})",  mask & 0x00FF)); }
-                if mask & 0x0300 != 0 { parts.push(format!("scsi({:#04x})", mask & 0x0300)); }
-                if mask & 0x0C00 != 0 { parts.push(format!("enet({:#04x})", mask & 0x0C00)); }
-                let rest = mask & !0x0FFF;
-                if rest != 0 { parts.push(format!("{:#010x}", rest)); }
-                if parts.is_empty() { format!("{:#010x}", mask) } else { parts.join("+") }
-            }
-            Self::Mips => {
-                let mut parts = Vec::new();
-                if mask & 0x0001 != 0 { parts.push("insn"); }
-                if mask & 0x0002 != 0 { parts.push("tlb"); }
-                if mask & 0x0004 != 0 { parts.push("mem"); }
-                if mask & 0x0008 != 0 { parts.push("fpu"); }
-                if mask & 0x0010 != 0 { parts.push("cp0"); }
-                let rest = mask & !0x001F;
-                let mut s = parts.join("+");
-                if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
-                if s.is_empty() { format!("{:#010x}", mask) } else { s }
-            }
-            Self::L1i | Self::L1d | Self::L2c => {
-                let mut parts = Vec::new();
-                if mask & CACHE_LOG_HIT  != 0 { parts.push("hit"); }
-                if mask & CACHE_LOG_MISS != 0 { parts.push("miss"); }
-                if mask & CACHE_LOG_OP   != 0 { parts.push("op"); }
-                let rest = mask & !(CACHE_LOG_HIT | CACHE_LOG_MISS | CACHE_LOG_OP);
-                let mut s = parts.join("+");
-                if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
-                if s.is_empty() { format!("{:#010x}", mask) } else { s }
-            }
-            Self::Nvme => {
-                let names = [(NVME_LOG_STATE, "state"), (NVME_LOG_ADMIN, "admin"), (NVME_LOG_REGS, "regs"), (NVME_LOG_IO, "io")];
-                let parts: Vec<&str> = names.iter().filter(|(b, _)| mask & b != 0).map(|(_, n)| *n).collect();
-                let rest = mask & !(NVME_LOG_STATE | NVME_LOG_ADMIN | NVME_LOG_REGS | NVME_LOG_IO);
-                let mut s = parts.join("+");
-                if rest != 0 { s.push_str(&format!("+{:#010x}", rest)); }
-                if s.is_empty() { format!("{:#010x}", mask) } else { s }
-            }
-            _ => format!("{:#010x}", mask),
-        }
-    }
-
-    /// Parse a category/mask string for this module.
-    /// Returns None if the string is not recognized as a category for this module
-    /// (caller should then try hex parse).
-    pub fn parse_mask(self, s: &str) -> Option<u32> {
-        match self {
-            Self::Pdma => match s {
-                "hal"  => Some(0x00FF),
-                "scsi" => Some(0x0300),
-                "enet" => Some(0x0C00),
-                "on" | "all"    => Some(0xFFFF_FFFF),
-                "off" | "none"  => Some(0x0000_0000),
-                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
-            },
-            Self::Mips => match s {
-                "insn" => Some(0x0001),
-                "tlb"  => Some(0x0002),
-                "mem"  => Some(0x0004),
-                "fpu"  => Some(0x0008),
-                "cp0"  => Some(0x0010),
-                "on" | "all"   => Some(0xFFFF_FFFF),
-                "off" | "none" => Some(0x0000_0000),
-                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
-            },
-            Self::L1i | Self::L1d | Self::L2c => match s {
-                "hit"  => Some(CACHE_LOG_HIT),
-                "miss" => Some(CACHE_LOG_MISS),
-                "op"   => Some(CACHE_LOG_OP),
-                "on" | "all"   => Some(0xFFFF_FFFF),
-                "off" | "none" => Some(0x0000_0000),
-                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
-            },
-            Self::Nvme => match s {
-                "state" => Some(NVME_LOG_STATE),
-                "admin" => Some(NVME_LOG_ADMIN),
-                "regs"  => Some(NVME_LOG_REGS),
-                "io"    => Some(NVME_LOG_IO),
-                "on" | "all"   => Some(0xFFFF_FFFF),
-                "off" | "none" => Some(0x0000_0000),
-                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
-            },
-            _ => match s {
-                "on" | "all"   => Some(0xFFFF_FFFF),
-                "off" | "none" => Some(0x0000_0000),
-                _ => u32::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
-            },
-        }
-    }
-}
-
-// ── ModuleLog ────────────────────────────────────────────────────────────────
-
-struct ModuleLog {
-    enabled:   AtomicBool,
-    /// Per-module bitmask. Meaning is module-defined. 0 = nothing, !0 = everything by default.
-    /// For Pdma: bit N = channel N enabled.
-    mask:      AtomicU32,
-    file_sink: Mutex<Option<BufWriter<File>>>,
-    file_path: Mutex<Option<String>>,
-}
-
-impl ModuleLog {
-    const fn new() -> Self {
-        Self {
-            enabled:   AtomicBool::new(false),
-            mask:      AtomicU32::new(0xFFFF_FFFF),
-            file_sink: Mutex::new(None),
-            file_path: Mutex::new(None),
-        }
+    /// A mask as the names of its events, `all`, or `-` when off.
+    fn describe(self, mask: u32) -> String {
+        if mask == 0 { return "-".to_string(); }
+        if mask == !0 { return "all".to_string(); }
+        let named = (1u32 << self.events().len()) - 1;
+        let mut parts: Vec<String> = self.events().iter().enumerate()
+            .filter(|(i, _)| mask >> i & 1 != 0).map(|(_, e)| e.to_string()).collect();
+        if mask & !named != 0 { parts.push(format!("{:#x}", mask & !named)); }
+        parts.join("+")
     }
 }
 
@@ -336,24 +157,16 @@ impl ModuleLog {
 pub type DevLogWriter = Arc<Mutex<dyn Write + Send>>;
 
 pub struct DevLog {
-    /// Fast-path gate: true if any module is enabled or any file sink is open.
-    /// Checked before taking any lock. When false, dlog! is a two-load no-op.
-    any_active: AtomicBool,
     /// All currently connected monitor clients (and any host sinks like stderr).
     /// Entries are pruned on write error.
     writers: Mutex<Vec<DevLogWriter>>,
-    modules: [ModuleLog; LogModule::COUNT],
 }
 
-impl DevLog {
-    fn new() -> Self {
-        Self {
-            any_active: AtomicBool::new(false),
-            writers: Mutex::new(Vec::new()),
-            modules: std::array::from_fn(|_| ModuleLog::new()),
-        }
-    }
+pub static DEVLOG: DevLog = DevLog { writers: Mutex::new(Vec::new()) };
 
+pub fn devlog() -> &'static DevLog { &DEVLOG }
+
+impl DevLog {
     /// Register a generic Write+Send sink (e.g. stderr for diagnostic runs).
     pub fn add_sink(&self, sink: DevLogWriter) {
         self.writers.lock().push(sink);
@@ -364,47 +177,33 @@ impl DevLog {
         self.writers.lock().retain(|w| !Arc::ptr_eq(w, sink));
     }
 
-    /// Enable a module. Output will go to all connected monitor clients.
+    /// Turn a module on, keeping the events already chosen; with none, all of them.
     pub fn enable(&self, m: LogModule) {
-        self.modules[m as usize].enabled.store(true, Ordering::Relaxed);
-        self.any_active.store(true, Ordering::Relaxed);
+        let _ = m.point().on.compare_exchange(0, !0, Ordering::Relaxed, Ordering::Relaxed);
     }
 
-    /// Disable a module. Also closes its file sink if open.
+    /// Turn a module off and close its file sink.
     pub fn disable(&self, m: LogModule) {
-        self.modules[m as usize].enabled.store(false, Ordering::Relaxed);
-        *self.modules[m as usize].file_sink.lock() = None;
-        *self.modules[m as usize].file_path.lock() = None;
-        self.recompute_any_active();
+        m.point().on.store(0, Ordering::Relaxed);
+        self.clear_file(m);
     }
 
-    /// Set the bitmask for a module and enable it.
+    /// Choose a module's events; a mask of 0 turns it off.
     pub fn set_mask(&self, m: LogModule, mask: u32) {
-        self.modules[m as usize].mask.store(mask, Ordering::Relaxed);
-        if mask != 0 {
-            self.modules[m as usize].enabled.store(true, Ordering::Relaxed);
-            self.any_active.store(true, Ordering::Relaxed);
-        } else {
-            self.modules[m as usize].enabled.store(false, Ordering::Relaxed);
-            self.recompute_any_active();
-        }
+        m.point().on.store(mask, Ordering::Relaxed);
     }
 
     /// Open a file sink for a module and enable it.
     pub fn set_file(&self, m: LogModule, path: &str) -> Result<(), String> {
         let file = File::create(path).map_err(|e| format!("Cannot open {}: {}", path, e))?;
-        *self.modules[m as usize].file_sink.lock() = Some(BufWriter::new(file));
-        *self.modules[m as usize].file_path.lock() = Some(path.to_string());
-        self.modules[m as usize].enabled.store(true, Ordering::Relaxed);
-        self.any_active.store(true, Ordering::Relaxed);
+        *m.point().file.lock() = Some((path.to_string(), BufWriter::new(file)));
+        self.enable(m);
         Ok(())
     }
 
     /// Close a module's file sink (output reverts to monitor broadcast).
     pub fn clear_file(&self, m: LogModule) {
-        *self.modules[m as usize].file_sink.lock() = None;
-        *self.modules[m as usize].file_path.lock() = None;
-        self.recompute_any_active();
+        *m.point().file.lock() = None;
     }
 
     /// Write a log message unconditionally — bypasses the module enabled flag.
@@ -419,82 +218,60 @@ impl DevLog {
         });
     }
 
-    /// Write a log message for a module. Called only when devlog_is_active() returned true.
+    /// Write a log message for a module that is on. Out of line, so the
+    /// formatting stays out of the hot function that logs.
+    #[cold]
+    #[inline(never)]
     pub fn write(&self, m: LogModule, args: fmt::Arguments) {
-        let ml = &self.modules[m as usize];
         let msg = fmt::format(args);
 
         // File sink takes priority — write there and return.
-        {
-            let mut sink = ml.file_sink.lock();
-            if let Some(ref mut f) = *sink {
-                let _ = writeln!(f, "[{}] {}", m.name(), msg);
-                let _ = f.flush();
-                return;
-            }
+        if let Some((_, f)) = &mut *m.point().file.lock() {
+            let _ = writeln!(f, "[{}] {}", m.name(), msg);
+            let _ = f.flush();
+            return;
         }
 
         // Broadcast to all connected monitor clients; prune dead connections.
-        let mut writers = self.writers.lock();
-        writers.retain(|w| {
+        self.writers.lock().retain(|w| {
             let mut guard = w.lock();
             write!(guard, "[{}] {}\n", m.name(), msg).is_ok() && guard.flush().is_ok()
         });
-        if writers.is_empty() {
-            self.recompute_any_active();
-        }
-    }
-
-    fn recompute_any_active(&self) {
-        let active = self.modules.iter().any(|ml| {
-            ml.enabled.load(Ordering::Relaxed) || ml.file_sink.lock().is_some()
-        });
-        self.any_active.store(active, Ordering::Relaxed);
     }
 }
 
-// ── Global singleton ─────────────────────────────────────────────────────────
-
-pub static DEVLOG: OnceLock<Arc<DevLog>> = OnceLock::new();
-
-/// Call once at startup (in Machine::new). Returns the Arc for registering with monitor.
-pub fn init_devlog() -> Arc<DevLog> {
-    let dl = Arc::new(DevLog::new());
-    let _ = DEVLOG.set(dl.clone());
-    dl
-}
-
-/// Access the global DevLog. Panics if init_devlog() was not called.
-pub fn devlog() -> &'static Arc<DevLog> {
-    DEVLOG.get().expect("DevLog not initialized")
-}
-
-/// Fast-path enabled check used by dlog! macro. Two atomic loads, no allocation.
+/// True if any event of the module is on. One relaxed load of a static.
 #[inline(always)]
 pub fn devlog_is_active(m: LogModule) -> bool {
-    let dl = match DEVLOG.get() { Some(d) => d, None => return false };
-    dl.any_active.load(Ordering::Relaxed)
-        && dl.modules[m as usize].enabled.load(Ordering::Relaxed)
+    m.point().on.load(Ordering::Relaxed) != 0
 }
 
-/// Read the bitmask for a module. Used by per-channel/per-bit log gating.
+/// The module's events that are on, as bits of its `EVENTS` table.
 #[inline(always)]
 pub fn devlog_mask(m: LogModule) -> u32 {
-    match DEVLOG.get() {
-        Some(dl) => dl.modules[m as usize].mask.load(Ordering::Relaxed),
-        None => 0,
-    }
+    m.point().on.load(Ordering::Relaxed)
+}
+
+/// True if the module's event `ev` (an `EVENTS` bit) is on.
+#[inline(always)]
+pub fn devlog_on(m: LogModule, ev: u32) -> bool {
+    devlog_mask(m) & ev != 0
 }
 
 // ── Macros ───────────────────────────────────────────────────────────────────
 
-/// Log to a module. Two atomic loads when idle — zero allocation, no lock.
-/// Output goes to all connected monitor clients or the module's file sink.
+/// Log to a module, or to one of its events (`dlog!(L1d, CACHE_LOG_MISS, ..)`). One relaxed
+/// load when off; output goes to the monitor clients or the module's file sink.
 #[macro_export]
 macro_rules! dlog {
+    ($mod:expr, $ev:ident, $($arg:tt)*) => {
+        if $crate::devlog::devlog_on($mod, $ev) {
+            $crate::devlog::DEVLOG.write($mod, format_args!($($arg)*));
+        }
+    };
     ($mod:expr, $($arg:tt)*) => {
         if $crate::devlog::devlog_is_active($mod) {
-            $crate::devlog::devlog().write($mod, format_args!($($arg)*));
+            $crate::devlog::DEVLOG.write($mod, format_args!($($arg)*));
         }
     };
 }
@@ -505,62 +282,59 @@ macro_rules! dlog {
 #[macro_export]
 macro_rules! dlog_unconditional {
     ($($arg:tt)*) => {
-        if let Some(dl) = $crate::devlog::DEVLOG.get() {
-            dl.write_unconditional(format_args!($($arg)*));
-        }
+        $crate::devlog::DEVLOG.write_unconditional(format_args!($($arg)*))
     };
 }
 
 /// Hot-path log. Compiles to nothing in non-developer (release) builds.
 #[macro_export]
 macro_rules! dlog_dev {
-    ($mod:expr, $($arg:tt)*) => {
+    ($($arg:tt)*) => {
         {
             #[cfg(feature = "developer")]
-            $crate::dlog!($mod, $($arg)*);
+            $crate::dlog!($($arg)*);
         }
     };
 }
 
 // ── Device impl for monitor `log` command ────────────────────────────────────
 
-impl Device for DevLog {
+/// The monitor's `log` command, over the global log state.
+pub struct LogDevice;
+
+impl Device for LogDevice {
     fn step(&self, _cycles: u64) {}
     fn stop(&self) {}
     fn start(&self) {}
     fn is_running(&self) -> bool { false }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        let modules: Vec<&str> = LogModule::all().iter().map(|m| m.name()).collect();
+        let modules: Vec<&str> = LogModule::ALL.iter().map(|m| m.name()).collect();
+        let events: String = LogModule::ALL.iter().filter(|m| !m.events().is_empty())
+            .map(|m| format!("\n             {} mask categories: {}", m.name(), m.events().join(" "))).collect();
         vec![(
             "log".to_string(),
             format!("[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
-             \x20             modules: {}\n\
-             \x20             pdma mask categories: hal enet scsi on/all off/none <hex>\n\
-             \x20             mips mask categories: insn tlb mem fpu cp0 on/all off/none <hex>\n\
-             \x20             l1i/l1d/l2c mask categories: hit miss op on/all off/none <hex>\n\
-             \x20             [DEV] = some of a module's messages appear only in a --features developer build", modules.join(" ")),
+             \x20             modules: {}{}\n\
+             \x20             every module also takes on/all, off/none or a hex mask\n\
+             \x20             [DEV] = some of a module's messages appear only in a --features developer build", modules.join(" "), events),
         )]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         if cmd != "log" { return Err(format!("Unknown command: {}", cmd)); }
         let arg0 = args.get(0).copied().unwrap_or("");
+        let dl = &DEVLOG;
 
         if arg0 == "status" {
-            writeln!(writer, "{:<8} {:>7}  {:<24}  file", "module", "enabled", "mask").map_err(|e| e.to_string())?;
+            writeln!(writer, "{:<8} {:<24}  file", "module", "events").map_err(|e| e.to_string())?;
             writeln!(writer, "{}", "-".repeat(60)).map_err(|e| e.to_string())?;
-            for &m in LogModule::all() {
-                let en   = self.modules[m as usize].enabled.load(Ordering::Relaxed);
-                let mask = self.modules[m as usize].mask.load(Ordering::Relaxed);
-                let path = self.modules[m as usize].file_path.lock().clone().unwrap_or_default();
-                let mask_str = if en { m.describe_mask(mask) } else { "-".to_string() };
-                writeln!(writer, "{:<8} {:>7}  {:<24}  {}",
-                    m.name(), if en { "on" } else { "off" }, mask_str, path)
+            for &m in LogModule::ALL {
+                let path = m.point().file.lock().as_ref().map(|(p, _)| p.clone()).unwrap_or_default();
+                writeln!(writer, "{:<8} {:<24}  {}", m.name(), m.describe(devlog_mask(m)), path)
                     .map_err(|e| e.to_string())?;
             }
-            let wcount = self.writers.lock().len();
-            writeln!(writer, "\nMonitor clients: {}", wcount).map_err(|e| e.to_string())?;
+            writeln!(writer, "\nMonitor clients: {}", dl.writers.lock().len()).map_err(|e| e.to_string())?;
             return Ok(());
         }
 
@@ -568,21 +342,22 @@ impl Device for DevLog {
         let arg2 = args.get(2).copied().unwrap_or("");
 
         let modules: Vec<LogModule> = if arg0 == "all" {
-            LogModule::all().to_vec()
+            LogModule::ALL.to_vec()
         } else {
             match LogModule::from_str(arg0) {
                 Some(m) => vec![m],
-                None => return Err(format!("Unknown module '{}'. Try: net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c all", arg0)),
+                None => return Err(format!("Unknown module '{}'. Try: {} all", arg0,
+                    LogModule::ALL.iter().map(|m| m.name()).collect::<Vec<_>>().join(" "))),
             }
         };
 
         match arg1 {
             "on" => {
-                for m in &modules { self.enable(*m); }
+                for m in &modules { dl.enable(*m); }
                 writeln!(writer, "log {} on", arg0).map_err(|e| e.to_string())?;
             }
             "off" => {
-                for m in &modules { self.disable(*m); }
+                for m in &modules { dl.disable(*m); }
                 writeln!(writer, "log {} off", arg0).map_err(|e| e.to_string())?;
             }
             "mask" => {
@@ -590,18 +365,22 @@ impl Device for DevLog {
                     return Err("Usage: log <module> mask <category|hex>".to_string());
                 }
                 for m in &modules {
-                    let mask = m.parse_mask(arg2)
-                        .ok_or_else(|| format!("Unknown mask '{}' for module {}", arg2, m.name()))?;
-                    self.set_mask(*m, mask);
+                    let mask = match arg2 {
+                        "on" | "all" => Some(!0),
+                        "off" | "none" => Some(0),
+                        _ => m.events().iter().position(|e| *e == arg2).map(|i| 1 << i)
+                            .or_else(|| u32::from_str_radix(arg2.trim_start_matches("0x"), 16).ok()),
+                    };
+                    dl.set_mask(*m, mask.ok_or_else(|| format!("Unknown mask '{}' for module {}", arg2, m.name()))?);
                 }
                 writeln!(writer, "log {} mask {}", arg0, arg2).map_err(|e| e.to_string())?;
             }
             "file" => {
                 if arg2 == "off" || arg2.is_empty() {
-                    for m in &modules { self.clear_file(*m); }
+                    for m in &modules { dl.clear_file(*m); }
                     writeln!(writer, "log {} file closed", arg0).map_err(|e| e.to_string())?;
                 } else {
-                    for m in &modules { self.set_file(*m, arg2)?; }
+                    for m in &modules { dl.set_file(*m, arg2)?; }
                     writeln!(writer, "log {} -> {}", arg0, arg2).map_err(|e| e.to_string())?;
                 }
             }
@@ -615,18 +394,12 @@ impl Device for DevLog {
 mod tests {
     use super::*;
 
-    /// Every module has a name that `from_str` takes back, `all` lists each
-    /// once and `COUNT` covers them: a category added to the enum but not
-    /// to one of the tables shows here.
+    /// Every module's name finds it again, and no two share one.
     #[test]
     fn every_module_name_round_trips() {
-        let all = LogModule::all();
-        assert_eq!(all.len(), LogModule::COUNT);
-        for (i, m) in all.iter().enumerate() {
+        for (i, m) in LogModule::ALL.iter().enumerate() {
             assert_eq!(LogModule::from_str(m.name()), Some(*m), "{}", m.name());
-            assert_eq!(*m as usize, all.iter().position(|o| o == m).unwrap());
-            assert!((*m as usize) < LogModule::COUNT, "{}", m.name());
-            assert!(all[..i].iter().all(|o| o != m), "{} is listed twice", m.name());
+            assert_eq!(*m as usize, i);
         }
         assert_eq!(LogModule::from_str("module"), Some(LogModule::Module));
         assert_eq!(LogModule::from_str("nothing"), None);
@@ -635,13 +408,21 @@ mod tests {
     /// The `log` command's help names every module `log` takes.
     #[test]
     fn the_log_help_names_every_module() {
-        use crate::traits::Device;
-        let help = DevLog::new().register_commands().remove(0).1;
+        let help = LogDevice.register_commands().remove(0).1;
         let listed = help.lines().find_map(|l| l.trim().strip_prefix("modules: ")).expect("a modules line");
         let listed: Vec<&str> = listed.split_whitespace().collect();
-        for m in LogModule::all() {
+        for m in LogModule::ALL {
             assert!(listed.contains(&m.name()), "{} is missing from the help", m.name());
         }
+    }
+
+    /// An event is its place in the module's table, and a mask names the events it holds.
+    #[test]
+    fn events_are_bits_by_name() {
+        assert_eq!(event(&["a", "bc", "b"], "b"), 4);
+        assert_eq!(LogModule::L1d.describe(event(LogModule::L1d.events(), "miss")), "miss");
+        assert_eq!(LogModule::L1d.describe(0), "-");
+        assert_eq!(LogModule::L1d.describe(!0), "all");
     }
 
     /// A monitor connection's log sink holds a handle on its socket. One left
@@ -652,8 +433,7 @@ mod tests {
     fn a_monitor_connection_takes_its_log_sink_away() {
         use std::io::{Read, Write};
         use std::net::TcpStream;
-        let dl = init_devlog();
-        let dl = DEVLOG.get().unwrap_or(&dl);
+        let dl = &DEVLOG;
         let monitor = Arc::new(crate::monitor::Monitor::new());
         monitor.clone().start_server("127.0.0.1:0".to_string());
         let addr = monitor.bound_addr().expect("bound");
