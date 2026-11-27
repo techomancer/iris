@@ -915,6 +915,10 @@ image) where the guest test suites showed they differed:
   the status footer says "No network" instead of a network light on a machine
   with networking off, and names a stream network.
 
+### Developer builds
+
+- The `debug_cache` feature is gone.
+
 ## October 2026
 
 ### Octane snapshots

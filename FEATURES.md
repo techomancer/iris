@@ -16,7 +16,6 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 
 | Feature | Purpose | Enables |
 |---|---|---|
-| `debug_cache` | Track a selected cache line through cache operations. | — |
 | `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | `gputrace` |
 | `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [clanker/rex3/trace-and-recording.md](clanker/rex3/trace-and-recording.md). GR2, IMPACT, O2 and VPro annotated traces (`gr2 trace`, `mgras trace`, `re trace`, `vpro trace`); O2 engine recording (`re rec`). Off: no per-access check at all. Lightning-compatible. | — |
 | `developer_ip7` | CP0 Compare/timer calibration statistics and debug prints. | — |
@@ -972,7 +971,6 @@ both the interpreter and jitv2.
 | `jitv2_opcodefusion` | jitv2 LUI+ORI/ADDIU and branch+NOP fusion (off by default; see "JIT compilers") |
 | `j2wp` | Compatibility alias for `jitv2`; whole-page compilation is the only implementation |
 | `hostcall` / `hostgl` | Private host-service syscalls / host OpenGL for IRIX programs; `hostgl` has macOS (CGL) and Linux (EGL) backends |
-| `debug_cache` | Track one cache line across all operations |
 | `tlbvmap` | The vmap TLB fast path; on by default |
 | `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`clanker/cpu/r5k-l1i-cache-bugs.md`) |
 
