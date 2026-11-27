@@ -37,6 +37,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The CPU `debug` command is gone: `log mips mask insn` and `log mips on`
   print each instruction `run` and `step` execute, and `log mips file PATH`
   writes them to a file.
+- `phys trace` and the physical `trace` alias are gone: `log phys on` logs
+  every physical bus access. That and the `hit` category of `log l1i` and
+  `log l1d` need a `developer` build; before, every build but `lightning` paid
+  a check per access for them.
 
 ### Serial ports
 

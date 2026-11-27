@@ -3919,7 +3919,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let ic_eidx = if self.ic.get_tag(set).matches_phys(phys_addr) {
                 #[cfg(feature = "developer")]
                 self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
-                #[cfg(not(feature = "lightning"))]
+                #[cfg(feature = "developer")]
                 if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
                     crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=0", virt_addr, phys_addr, set);
                 }
@@ -3928,7 +3928,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             } else if self.ic.get_tag(set | way1_base).matches_phys(phys_addr) {
                 #[cfg(feature = "developer")]
                 self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
-                #[cfg(not(feature = "lightning"))]
+                #[cfg(feature = "developer")]
                 if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
                     crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=1", virt_addr, phys_addr, set);
                 }
@@ -4052,7 +4052,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     return BusRead64 { status: r, data: 0 };
                 }
             }
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_idx);
             }
@@ -4074,7 +4074,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 return BusRead64 { status: way, data: 0 };
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_eidx);
             }
@@ -4117,7 +4117,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     return r;
                 }
             }
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_idx, val);
             }
@@ -4155,7 +4155,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 return way;
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_eidx, val);
             }
