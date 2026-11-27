@@ -10683,9 +10683,7 @@ pub struct MipsCpu<T: Tlb, C: CpuModel> {
     /// Where another thread holds this CPU still.
     park: Arc<crate::cpu::smp::ParkSlot>,
     pub fasttick_count: Arc<AtomicU64>,
-    debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
-    trace_file: Arc<Mutex<Option<std::io::BufWriter<std::fs::File>>>>,
     #[cfg(feature = "idle-pause")]
     idle_profile_on: Arc<AtomicBool>,
     #[cfg(feature = "idle-pause")]
@@ -10756,9 +10754,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             ppmem_bitmap_ptr,
             park,
             fasttick_count,
-            debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
-            trace_file: Arc::new(Mutex::new(None)),
             #[cfg(feature = "idle-pause")]
             idle_profile_on,
             #[cfg(feature = "idle-pause")]
