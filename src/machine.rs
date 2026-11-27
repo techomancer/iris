@@ -394,11 +394,15 @@ impl Machine {
             eeprom_mc.lock().set_cachsz(0);
         }
 
+        #[cfg(feature = "ci_clock")]
+        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
+        #[cfg(not(feature = "ci_clock"))]
+        let timer_manager = Arc::new(TimerManager::new());
         // 1. Create all devices first
         // Memory Controller
         let mc_banks: [u32; 4] = cfg.banks[..4].try_into().expect("the MC has four banks");
         let mc = MemoryController::new_for_profile(
-            eeprom_mc.clone(), guinness, mc_banks, cfg.machine.profile.ip28());
+            eeprom_mc.clone(), guinness, mc_banks, cfg.machine.profile.ip28(), timer_manager.clock().clone());
         // IP28: IRIX takes the CPU speed from the PROM's `cpufreq` (194, i.e.
         // a 195 MHz R10000) instead of measuring it, and times with it: UST
         // assumes Count at half that, and the RPSS cycle counter the MC clock
@@ -444,10 +448,6 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). The SCC's channels start wired to
         // nothing; each gets its host end below.
-        #[cfg(feature = "ci_clock")]
-        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
-        #[cfg(not(feature = "ci_clock"))]
-        let timer_manager = Arc::new(TimerManager::new());
         let ioc = Ioc::new_for_profile(&timer_manager, guinness, cfg.machine.profile.ip28());
         ioc.ps2().set_layout(cfg.keyboard);
 

@@ -57,8 +57,8 @@ struct MemoryControllerState {
     user_semaphores: [bool; 16],
     
     // Timer state
-    last_host_ticks: u64,
-    host_freq: u64,
+    clock: crate::clock::Clock,
+    last_ns: u64,
     /// The clock the refresh, watchdog and RPSS counters count (see
     /// `set_clock_hz`).
     clock_hz: u64,
@@ -120,7 +120,7 @@ pub struct MemoryController {
 impl MemoryController {
     /// An IP22/IP24 memory controller.
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, guinness: bool, ram_sizes: [u32; 4]) -> Self {
-        Self::new_for_profile(eeprom, guinness, ram_sizes, false)
+        Self::new_for_profile(eeprom, guinness, ram_sizes, false, crate::clock::Clock::new())
     }
 
     /// `ip28` selects the IP28 decodes: a 24-bit MEMCFG base shift and an MC
@@ -130,11 +130,11 @@ impl MemoryController {
         guinness: bool,
         ram_sizes: [u32; 4],
         ip28: bool,
+        clock: crate::clock::Clock,
     ) -> Self {
         let base_shift = if ip28 { 24 } else { 22 };
         let regs = Self::init_registers_for(guinness, base_shift);
-        let host_freq = crate::platform::get_host_tick_frequency();
-        let last_host_ticks = crate::platform::get_host_ticks();
+        let last_ns = clock.now();
 
         Self {
             state: Arc::new(Mutex::new(MemoryControllerState {
@@ -142,8 +142,8 @@ impl MemoryController {
                 eeprom,
                 sys_semaphore: false,
                 user_semaphores: [false; 16],
-                last_host_ticks,
-                host_freq,
+                clock,
+                last_ns,
                 clock_hz: DEFAULT_CLOCK_HZ,
                 cpu_cycle_acc: 0,
                 rpss_cycle_acc: 0,
@@ -586,23 +586,23 @@ impl MemoryController {
 
 impl MemoryControllerState {
     fn update_timers(&mut self) {
-        let now = crate::platform::get_host_ticks();
+        let now = self.clock.now();
         // A reading a few hundred ns behind the last (another socket's TSC) is no time passing.
-        let diff = match now.wrapping_sub(self.last_host_ticks) {
+        let diff = match now.wrapping_sub(self.last_ns) {
             d if d > u64::MAX / 2 => 0,
             d => d,
         };
         if diff > 0 {
-            self.last_host_ticks = now;
+            self.last_ns = now;
         }
 
         // Scale to cycles of the MC clock (`clock_hz`).
-        // cycles = (diff * clock_hz) / host_freq
+        // cycles = (diff * clock_hz) / 1e9
         // Use accumulator to maintain precision over many small updates
         // Use u128 to prevent overflow during multiplication
         let total_ticks = (diff as u128) * (self.clock_hz as u128) + (self.cpu_cycle_acc as u128);
-        let cpu_cycles = (total_ticks / (self.host_freq as u128)) as u64;
-        self.cpu_cycle_acc = (total_ticks % (self.host_freq as u128)) as u64;
+        let cpu_cycles = (total_ticks / 1_000_000_000) as u64;
+        self.cpu_cycle_acc = (total_ticks % 1_000_000_000) as u64;
 
         if cpu_cycles == 0 { return; }
 
@@ -1088,10 +1088,8 @@ impl Device for MemoryController {
 
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
-        // A stale anchor makes the first update_timers bill the guest for the
-        // pause. Catches every mc.stop()/start() pair; a CPU-only pause is
-        // still billed, since it never stops the MC.
-        self.state.lock().last_host_ticks = crate::platform::get_host_ticks();
+        // Don't bill the guest for the time since construction.
+        { let mut st = self.state.lock(); st.last_ns = st.clock.now(); }
         let mc = self.clone();
         self.threads.lock().push(thread::Builder::new().name("MC-DMA".to_string()).spawn(move || {
             mc.dma_worker();
@@ -1405,6 +1403,7 @@ impl Saveable for MemoryController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Clock;
 
     #[test]
     fn sysid_matches_guinness_profile() {
@@ -1482,12 +1481,29 @@ mod tests {
     #[test]
     fn a_reading_behind_the_last_is_no_time_passing() {
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
-        let mc = MemoryController::new(eeprom, true, [0u32; 4]);
-        let ahead = crate::platform::get_host_ticks() + 1_000_000;
+        let clock = Clock::stepped();
+        clock.step(2_000_000);
+        let mc = MemoryController::new_for_profile(eeprom, true, [0u32; 4], false, clock);
         let mut st = mc.state.lock();
-        st.last_host_ticks = ahead;
+        st.last_ns = 3_000_000;
         st.update_timers();
-        assert_eq!(st.last_host_ticks, ahead);
+        assert_eq!(st.last_ns, 3_000_000);
+    }
+
+    /// A stopped machine clock holds the counters.
+    #[test]
+    fn counters_hold_while_the_machine_clock_is_stopped() {
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let clock = Clock::new();
+        let mc = MemoryController::new_for_profile(eeprom, true, [0u32; 4], false, clock.clone());
+        let ref_ctr = || {
+            mc.state.lock().update_timers();
+            mc.state.lock().regs[(REG_REF_CTR / 4) as usize]
+        };
+        clock.stop();
+        let held = ref_ctr();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(ref_ctr(), held);
     }
 
     /// A restore into a machine whose PROM never ran must place the saved
@@ -1516,11 +1532,10 @@ mod tests {
     #[test]
     fn start_reanchors_timebase() {
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
-        let mc = MemoryController::new(eeprom, true, [0u32; 4]);
-
-        let freq = crate::platform::get_host_tick_frequency();
-        mc.state.lock().last_host_ticks =
-            crate::platform::get_host_ticks().wrapping_sub(freq * 100);
+        let clock = Clock::stepped();
+        clock.step(100_000_000_000);
+        let mc = MemoryController::new_for_profile(eeprom, true, [0u32; 4], false, clock);
+        mc.state.lock().last_ns = 0;
 
         mc.start();
         let rpss = mc.read32((MC_BASE + REG_RPSS_CTR) as u64).data;
@@ -1616,7 +1631,7 @@ mod tests {
     fn ip28_512_mb_banks_probe_and_decode() {
         use crate::ppmem::PpMemory;
         let mc = MemoryController::new_for_profile(
-            Arc::new(Mutex::new(Eeprom93c56::new())), false, [512, 512, 0, 0], true,
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [512, 512, 0, 0], true, Clock::new(),
         );
         // Real POST probes 0x3f20, then 0x7f20. With BNK clear,
         // the second subbank aliases the first; setting BNK exposes both.
@@ -1658,7 +1673,7 @@ mod tests {
         assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2800_0000, 128), Some(0x6728));
         assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2000_0000, 32), Some(0x6120));
         let mc = MemoryController::new_for_profile(
-            Arc::new(Mutex::new(Eeprom93c56::new())), false, [128, 128, 0, 0], true,
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [128, 128, 0, 0], true, Clock::new(),
         );
         // BNK clear: only the first subbank answers, every 64 MB.
         let (base, mask, limit, span) = mc.parse_memcfg(0x3f20_0000, 0)[0].unwrap();
