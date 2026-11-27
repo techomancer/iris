@@ -1168,7 +1168,7 @@ impl App {
                     ui.set_min_width(200.0);
                     let active = self.prefs.active_machine.clone();
                     let names: Vec<String> = self.prefs.machines.keys().cloned().collect();
-                    if names.is_empty() {
+                    if names.is_empty() && self.prefs.needs_edit.is_empty() {
                         ui.label(RichText::new(t!("menu-file-no-machines")).weak());
                     }
                     let mut want_switch: Option<String> = None;
@@ -1180,6 +1180,11 @@ impl App {
                             want_switch = Some(name);
                             ui.close();
                         }
+                    }
+                    // Files that do not read: listed, with the error on hover.
+                    for (name, error) in &self.prefs.needs_edit {
+                        ui.add_enabled(false, egui::Button::new(t!("menu-file-needs-edit", name = name.as_str())))
+                            .on_disabled_hover_text(error);
                     }
                     if let Some(n) = want_switch { self.switch_to(&n); }
                 });

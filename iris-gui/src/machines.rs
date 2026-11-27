@@ -231,18 +231,21 @@ pub fn save(root: &Path, name: &str, cfg: &mut MachineConfig) -> Result<(), Stri
     write(&config_path(root, name)?, &text)
 }
 
+/// The machines under `root`, those whose file does not read (name and why), and every error found.
 pub fn discover(
     root: &Path,
 ) -> (
     std::collections::BTreeMap<String, MachineConfig>,
+    std::collections::BTreeMap<String, String>,
     Vec<String>,
 ) {
     let mut machines = std::collections::BTreeMap::new();
+    let mut needs_edit = std::collections::BTreeMap::new();
     let mut errors = Vec::new();
     let entries = match std::fs::read_dir(root.join("machines")) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (machines, errors),
-        Err(e) => return (machines, vec![t!("machines-list-error", error = e.to_string())]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (machines, needs_edit, errors),
+        Err(e) => return (machines, needs_edit, vec![t!("machines-list-error", error = e.to_string())]),
     };
     for entry in entries {
         let entry = match entry {
@@ -275,10 +278,13 @@ pub fn discover(
                 }
                 Err(e) => errors.push(e),
             },
-            Err(e) => errors.push(e),
+            Err(e) => {
+                needs_edit.insert(name, e.clone());
+                errors.push(e);
+            }
         }
     }
-    (machines, errors)
+    (machines, needs_edit, errors)
 }
 
 /// Migrate battery-backed state into the machine folder, preserving existing
@@ -574,11 +580,13 @@ pub(crate) mod tests {
         let broken = directory(&root.0, "broken").unwrap();
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("broken.toml"), "unknown_setting = true").unwrap();
-        let (machines, errors) = discover(&root.0);
+        let (machines, needs_edit, errors) = discover(&root.0);
         assert_eq!(machines.keys().collect::<Vec<_>>(), vec!["indy"]);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("broken.toml"));
         assert!(errors[0].contains("unknown_setting"));
+        assert_eq!(needs_edit.keys().collect::<Vec<_>>(), vec!["broken"]);
+        assert_eq!(needs_edit["broken"], errors[0]);
         assert_eq!(
             std::fs::read_to_string(broken.join("broken.toml")).unwrap(),
             "unknown_setting = true"

@@ -67,6 +67,7 @@ menu-file = File
 menu-file-new-machine = New machine…
 menu-file-switch-machine = Switch machine
 menu-file-no-machines = No saved machines
+menu-file-needs-edit = { $name } (needs editing)
 menu-file-rename-machine = Rename machine…
 menu-file-rename-machine-disabled-tip = No machine is selected.
 menu-file-delete-machine = Delete machine

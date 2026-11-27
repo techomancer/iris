@@ -63,6 +63,9 @@ pub struct GuiSettings {
     /// Load/migration errors shown by the launcher and logged.
     #[serde(skip)]
     pub errors: Vec<String>,
+    /// Machines whose file does not read, with the error.
+    #[serde(skip)]
+    pub needs_edit: BTreeMap<String, String>,
     /// Protect the legacy JSON if any conversion or preference read failed.
     #[serde(skip)]
     migration_pending: bool,
@@ -82,6 +85,7 @@ impl Default for GuiSettings {
             disk_folders: Vec::new(),
             root: None,
             errors: Vec::new(),
+            needs_edit: BTreeMap::new(),
             migration_pending: false,
         }
     }
@@ -388,8 +392,9 @@ impl GuiSettings {
                 Err(e) => { s.migration_pending = true; s.errors.push(t!("settings-migration-failed", error = e)); }
             }
         }
-        let (machines, errors) = crate::machines::discover(&root);
+        let (machines, needs_edit, errors) = crate::machines::discover(&root);
         s.machines = machines;
+        s.needs_edit = needs_edit;
         s.errors.extend(errors);
         for e in &s.errors { log::error!("{e}"); }
         s
