@@ -1949,6 +1949,9 @@ impl Machine {
 
     /// Save full machine snapshot to `saves/<name>/`.
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        if self.board.virtio_9p.is_some() {
+            return Err("a virtio-9p share keeps the guest's open files, which a snapshot does not hold".into());
+        }
         self.stop();
 
         #[cfg(feature = "wgpu")]
@@ -2013,6 +2016,9 @@ impl Machine {
         }
         if let (Some(td), Some(at)) = (&self.board.testdev, self.gio_at("test_device")) {
             snap.write_state(&at.to_string(), &td.save_state()).map_err(|e| e.to_string())?;
+        }
+        if let (Some(v), Some(at)) = (&self.board.virtio, self.gio_at("virtio_serial")) {
+            snap.write_state(&at.to_string(), &v.core().save_state()).map_err(|e| e.to_string())?;
         }
         if let Some(rex3) = &self.board.rex3_head1 {
             #[cfg(feature = "wgpu")]
@@ -2296,6 +2302,10 @@ impl Machine {
             if let Ok(v) = snap.read_state(&at.to_string()) {
                 td.load_state(&v)?;
             }
+        }
+        if let (Some(v), Some(at)) = (&self.board.virtio, self.gio_at("virtio_serial")) {
+            let state = snap.read_state(&at.to_string()).map_err(|e| format!("{at}: {e}"))?;
+            v.core().load_state(&state).map_err(|e| format!("virtio_serial at {at}: {e}"))?;
         }
         if let Some(rex3) = &self.board.rex3_head1 {
             let head1_state = snap.read_state("rex3_head1");

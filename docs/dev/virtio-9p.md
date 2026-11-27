@@ -113,8 +113,8 @@ the guest should be able to act as.
 
 ## Limits
 
-- **No snapshot support yet**, as with virtio-serial: restoring a snapshot leaves
-  the device idle, and a guest must remount.
+- **Not saved**: a snapshot of a machine with a virtio-9p device is refused, since the
+  share holds the guest's open files.
 - Host calls happen on the device's service thread. A share on a very slow
   filesystem holds up the guest's next access to the device's registers.
 - Inode numbers come from the host, mixed with the device number so that a share

@@ -56,16 +56,6 @@ pub const REG_CONFIG: u64 = 0x100;
 
 pub struct VirtioMmio {
     core: VirtioCore,
-    /// Selector registers: the driver writes these, then reads or writes the
-    /// register they steer.
-    sel: parking_lot::Mutex<Selectors>,
-}
-
-#[derive(Default)]
-struct Selectors {
-    device_features: u32,
-    driver_features: u32,
-    queue: u32,
 }
 
 impl VirtioMmio {
@@ -74,7 +64,7 @@ impl VirtioMmio {
     pub fn new(core: VirtioCore, irq: IrqLine, mem: Arc<dyn GuestMemory>) -> Self {
         core.connect_dma(mem);
         core.connect_interrupt(irq);
-        Self { core, sel: Default::default() }
+        Self { core }
     }
 
     pub fn core(&self) -> &VirtioCore {
@@ -87,7 +77,7 @@ impl VirtioMmio {
 
     fn read_reg(&self, off: u64) -> u32 {
         let c = &self.core;
-        let s = self.sel.lock();
+        let s = c.sel();
         match off {
             REG_MAGIC => MAGIC,
             REG_VERSION => VERSION,
@@ -112,7 +102,7 @@ impl VirtioMmio {
 
     fn write_reg(&self, off: u64, val: u32) {
         let c = &self.core;
-        let mut s = self.sel.lock();
+        let mut s = c.sel();
         let q = s.queue as usize;
         match off {
             REG_DEVICE_FEATURES_SEL => s.device_features = val,
@@ -228,7 +218,6 @@ impl Device for VirtioMmio {
 
 impl Resettable for VirtioMmio {
     fn power_on(&self) {
-        *self.sel.lock() = Selectors::default();
         self.core.power_on();
     }
 }

@@ -58,14 +58,6 @@ fn cap(cfg_type: u8, next: u8, len: u8, offset: u32, length: u32, extra: Option<
 pub struct VirtioPci {
     core: VirtioCore,
     pci: PciFunctionState,
-    sel: parking_lot::Mutex<Selectors>,
-}
-
-#[derive(Default)]
-struct Selectors {
-    device_features: u32,
-    driver_features: u32,
-    queue: u16,
 }
 
 impl VirtioPci {
@@ -104,7 +96,7 @@ impl VirtioPci {
         // which no bridge carries to memory. Not required: a driver that
         // does not accept it is still taken.
         core.offer(super::F_ACCESS_PLATFORM);
-        Self { core, pci: PciFunctionState::new(pci), sel: Default::default() }
+        Self { core, pci: PciFunctionState::new(pci) }
     }
 
     pub fn core(&self) -> &VirtioCore {
@@ -113,7 +105,7 @@ impl VirtioPci {
 
     fn read_common(&self, off: u32) -> u32 {
         let c = &self.core;
-        let s = self.sel.lock();
+        let s = c.sel();
         let q = s.queue as usize;
         match off {
             0x00 => s.device_features,
@@ -146,7 +138,7 @@ impl VirtioPci {
     /// the `width`-byte number the device sees, not positioned in a dword.
     fn write_common(&self, off: u32, val: u32, width: usize) {
         let c = &self.core;
-        let mut s = self.sel.lock();
+        let mut s = c.sel();
         let q = s.queue as usize;
         let v = if width == 4 { val } else { val & ((1u32 << (width * 8)) - 1) };
         match (off, width) {
@@ -157,7 +149,7 @@ impl VirtioPci {
                 drop(s);
                 c.set_status(v as u8);
             }
-            (0x16, 2) => s.queue = v as u16,
+            (0x16, 2) => s.queue = v,
             (0x18, 2) => {
                 let n = if v <= super::queue::QUEUE_MAX as u32 { v as u16 } else { 0 };
                 c.with_queue(q, |qu| qu.size = n);
@@ -251,7 +243,6 @@ impl crate::traits::Device for VirtioPci {
 impl Resettable for VirtioPci {
     fn power_on(&self) {
         self.pci.config().reset();
-        *self.sel.lock() = Selectors::default();
         self.core.power_on();
     }
 }
@@ -389,6 +380,49 @@ mod tests {
         assert_eq!(r(ISR, 1), 1);
         assert!(!irq.level(), "reading the ISR clears it");
         assert_eq!(r(ISR, 1), 0);
+    }
+
+    /// A device saved after the driver sent one buffer, loaded into a fresh one, carries on
+    /// at the next ring slot: the second buffer is taken, the first not sent again.
+    #[test]
+    fn a_saved_queue_carries_on_where_the_driver_left_it() {
+        use crate::dev::virtio::GuestMemory;
+        use crate::traits::Saveable;
+        let (dev, mem, port, _irq) = rig();
+        let w = |dev: &VirtioPci, off: u32, v: u32, n: usize| dev.bar_write(0, off, v, n);
+        w(&dev, 0x14, 3, 1);
+        w(&dev, 0x08, 1, 4);
+        w(&dev, 0x0c, (F_VERSION_1 >> 32) as u32, 4);
+        w(&dev, 0x14, 0xb, 1);
+        w(&dev, 0x16, 1, 2);
+        for (off, v) in [(0x18, 8), (0x20, 0x1000), (0x28, 0x1200), (0x30, 0x1400), (0x1c, 1)] {
+            w(&dev, off, v, if off == 0x20 || off == 0x28 || off == 0x30 { 4 } else { 2 });
+        }
+        w(&dev, 0x14, 0xf, 1);
+        let send = |dev: &VirtioPci, mem: &VecMemory, slot: u16, data: &[u8]| {
+            let at = 0x1800 + 0x10 * slot as u64;
+            mem.write(at, data);
+            let mut d = [0u8; 16];
+            d[0..8].copy_from_slice(&at.to_le_bytes());
+            d[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            mem.write(0x1000 + 16 * slot as u64, &d);
+            mem.write(0x1204 + 2 * slot as u64, &slot.to_le_bytes());
+            mem.write(0x1202, &(slot + 1).to_le_bytes());
+            w(dev, NOTIFY + NOTIFY_MULTIPLIER, 1, 2);
+        };
+        send(&dev, &mem, 0, b"one");
+        assert_eq!(port.take_tx(), b"one");
+        let saved = dev.core().save_state();
+
+        let (fresh, mem2, port2, _) = rig();
+        fresh.power_on();
+        let mut ram = vec![0u8; 0x2_0000];
+        mem.read(0, &mut ram);
+        mem2.write(0, &ram);
+        fresh.core().load_state(&saved).unwrap();
+        assert_eq!(fresh.core().status(), 0xf, "the driver's status is back");
+        send(&fresh, &mem2, 1, b"two");
+        assert_eq!(port2.take_tx(), b"two", "the next buffer is taken, the first not sent again");
     }
 
     #[test]

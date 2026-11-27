@@ -1969,7 +1969,7 @@ mod snapshot_tests {
         nvme_in_a_slot(crate::dev::xio_pci::Kind::Shoehorn, None, false);
     }
 
-    /// Two NVMe cards and an audio card in one Octane: a snapshot keeps
+    /// Two NVMe cards, a virtio-serial and an audio card in one Octane: a snapshot keeps
     /// each where it was placed, with its disk, and takes them all back.
     #[test]
     fn several_cards_round_trip_a_machine_snapshot() {
@@ -1987,9 +1987,10 @@ mod snapshot_tests {
                 cfg.no_audio = true;
                 cfg.devices.push(crate::devices::ConfiguredDevice { name: Some("cage".into()), ..xio_board(crate::dev::xio_pci::Kind::Cage, None) });
                 cfg.devices.extend([nvme(1), nvme(2), crate::devices::ConfiguredDevice::new("cage/pci0/3", crate::devices::DeviceModel::Ice1724)]);
+                cfg.devices.push(crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"virtio_serial\"").unwrap()).unwrap());
             });
             let at = |s: &str| s.parse::<crate::slot_path::MachineSlotPath>().unwrap();
-            let want = [("nvme", "xio13/pci0/1"), ("nvme", "xio13/pci0/2"), ("ice1724", "xio13/pci0/3")];
+            let want = [("nvme", "xio13/pci0/1"), ("nvme", "xio13/pci0/2"), ("virtio_serial", "xio15/pci0/7"), ("ice1724", "xio13/pci0/3")];
             assert_eq!(m.cards.manifest(), want.map(|(t, a)| (t.to_string(), at(a))));
             let cards: Vec<_> = m.cards.nvme.iter().map(|c| c.nvme.clone()).collect();
             let io = |n: usize, cdb: Vec<u8>, data: Option<Vec<u8>>| {

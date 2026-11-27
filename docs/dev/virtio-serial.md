@@ -136,8 +136,8 @@ holds for virtio-9p on PCI.
 
 ## Limits
 
-- **No snapshot support yet**: a restored snapshot leaves the device idle and
-  a running driver has to reset it.
+- A snapshot keeps the device's registers, queue positions and port state. Control
+  messages waiting for the guest are not saved.
 - Host input is picked up by polling every 5 ms while there is traffic and
   50 ms when idle; a guest is not woken the instant a byte arrives.
 - The interrupt routing on the Indigo2 (the EXT_IO fan-out) follows the same

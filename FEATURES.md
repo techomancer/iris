@@ -422,10 +422,10 @@ entry to write instead.
 
 ### Snapshots
 
-A snapshot names every disk, overlay and card by its slot, so any number of NVMe and audio
+A snapshot names every disk, overlay and card by its slot, so any number of NVMe, virtio and audio
 cards work. Saving a machine writes each device's slot into the manifest; a restore refuses a device that
 sits at another slot in this machine and says which `at` keeps it, and one added to the config afterwards
-is refused too, since the saved bus has no slot for it. A snapshot of a machine with a virtio device is refused. Snapshots from before slots
+is refused too, since the saved bus has no slot for it. A virtio-9p share cannot be saved; the snapshot is refused. Snapshots from before slots
 (schema 10 and older) are refused.
 
 ### [network]

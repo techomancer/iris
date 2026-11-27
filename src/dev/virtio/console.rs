@@ -303,6 +303,16 @@ impl VirtioDevice for Console {
         }
     }
 
+    fn save_state(&self) -> Vec<u64> {
+        self.ports.iter().map(|p| p.ready as u64 | (p.guest_open as u64) << 1 | (p.host_open_sent as u64) << 2).collect()
+    }
+
+    fn load_state(&mut self, words: &[u64]) {
+        for (p, w) in self.ports.iter_mut().zip(words) {
+            (p.ready, p.guest_open, p.host_open_sent) = (w & 1 != 0, w & 2 != 0, w & 4 != 0);
+        }
+    }
+
     fn activate(&mut self, features: u64) {
         self.multiport = features & F_MULTIPORT != 0;
         // A plain console has no control channel to say the guest opened it.
