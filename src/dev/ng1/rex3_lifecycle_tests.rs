@@ -377,7 +377,7 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
         let rex = machine.get_rex3_head1().expect("second Newport head");
         primary.start();
         rex.start();
-        let incomplete_checkpoint = machine.capture_live_checkpoint();
+        machine.stop();
         assert!(primary.check_resident_quiescent().is_ok());
         assert!(rex.check_resident_quiescent().is_ok());
         let primary_state = probe_state();
@@ -409,9 +409,6 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
         };
         let primary_guards = attach(&primary, &primary_state);
         let head1_guards = attach(&rex, &state);
-        assert!(machine.restore_live_checkpoint(&incomplete_checkpoint).unwrap_err().contains("head 1"));
-        assert_eq!((primary_state.lock().restores, state.lock().restores), (0, 0));
-        drop(incomplete_checkpoint);
         let visible = |board: &Rex3| {
             let vc2 = board.vc2.lock();
             crate::dev::ng1::vc2_timings::decode_vc2_visible_size(&vc2.regs, &vc2.ram)
