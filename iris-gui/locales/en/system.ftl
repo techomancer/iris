@@ -9,7 +9,7 @@ safestop-writable-disk = { $disk } is read-write. Stopping while IRIX is running
 safestop-fc-disk = Fibre Channel { $id }
 # $id is a SCSI id, or controller:id on the second controller.
 safestop-scsi-disk = SCSI { $id }
-safestop-nvme-disk = NVMe
+safestop-nvme-disk = NVMe { $n }
 
 ## Machine folders
 

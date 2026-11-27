@@ -571,33 +571,28 @@ pub fn expansion(ui: &mut Ui, cfg: &mut MachineConfig) {
         }
         if nvme {
             ui.separator();
-            let card = |cfg: &MachineConfig| cfg.devices.iter().position(|d| matches!(d.device, DeviceModel::Nvme(_)));
-            let mut fitted = card(cfg).is_some();
-            if ui.checkbox(&mut fitted, t!("extra-nvme-fit")).changed() {
-                match card(cfg) {
-                    Some(i) => {
-                        let mut gone: Vec<usize> = behind(cfg, i).into_iter().chain([i]).collect();
-                        gone.sort_unstable();
-                        gone.into_iter().rev().for_each(|g| drop(cfg.devices.remove(g)));
+            let mut remove = None;
+            for i in 0..cfg.devices.len() {
+                if !matches!(cfg.devices[i].device, DeviceModel::Nvme(_)) {
+                    continue;
+                }
+                ui.push_id(("nvme", i), |ui| {
+                    ui.label(t!("extra-nvme"));
+                    let n = cfg.devices[i].device.nvme_mut().expect("an nvme entry");
+                    crate::config_ui::path_row_disk(ui, ("nvme_path", i), &mut n.path, crate::config_ui::Pick::OpenFile, &crate::config_ui::disk_filters());
+                    ui.checkbox(&mut n.overlay, t!("extra-overlay"));
+                    slot_choice(ui, cfg, i);
+                    if ui.button(t!("extra-remove")).clicked() {
+                        remove = Some(i);
                     }
-                    None => cfg.devices.push(ConfiguredDevice {
-                        at: None,
-                        ..ConfiguredDevice::new("", DeviceModel::Nvme(NvmeConfig { path: "disks/nvme.raw".into(), ..Default::default() }))
-                    }),
-                }
+                });
             }
-            if let Some(i) = card(cfg) {
-                ui.label(t!("extra-nvme"));
-                let n = cfg.devices[i].device.nvme_mut().expect("an nvme entry");
-                crate::config_ui::path_row_disk(ui, "nvme_path", &mut n.path, crate::config_ui::Pick::OpenFile, &crate::config_ui::disk_filters());
-                ui.checkbox(&mut n.overlay, t!("extra-overlay"));
-                let mut bridged = behind(cfg, i).is_some();
-                if ui.checkbox(&mut bridged, t!("extra-bridge")).changed() {
-                    set_bridge(cfg, i, bridged);
-                }
-                let i = card(cfg).expect("still there");
-                // A card behind a bridge moves with it.
-                slot_choice(ui, cfg, behind(cfg, i).unwrap_or(i));
+            if let Some(i) = remove {
+                cfg.devices.remove(i);
+            }
+            if ui.button(t!("extra-nvme-add")).clicked() {
+                let path = new_nvme_path(cfg);
+                cfg.devices.push(ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::Nvme(NvmeConfig { path, ..Default::default() })) });
             }
         }
         if fibre {
@@ -653,33 +648,14 @@ pub fn expansion(ui: &mut Ui, cfg: &mut MachineConfig) {
     });
 }
 
+/// An image path no NVMe card uses yet: two cards over one file would corrupt it.
+fn new_nvme_path(cfg: &MachineConfig) -> String {
+    let taken: Vec<&str> = cfg.nvmes().map(|n| n.path.as_str()).collect();
+    ["disks/nvme.raw".to_string()].into_iter().chain((2..).map(|n| format!("disks/nvme{n}.raw"))).find(|p| !taken.contains(&p.as_str())).expect("unbounded")
+}
+
 /// The local name the GUI gives the Fibre Channel card, so its loop's disks can name it.
 const LOOP_CARD: &str = "fibre_channel";
-
-/// The bridge the GUI puts a card behind.
-const CARD_BRIDGE: &str = "nvme_bridge";
-
-/// The `pci_bridge` entry card `i` sits behind, if it is behind the GUI's one.
-fn behind(cfg: &MachineConfig, i: usize) -> Option<usize> {
-    let first = cfg.devices[i].at.as_deref()?.strip_suffix("/pci0/0").filter(|n| *n == CARD_BRIDGE)?;
-    cfg.devices.iter().position(|d| d.name.as_deref() == Some(first))
-}
-
-/// Put card `i` behind a bridge in its slot, or back in the bridge's slot.
-fn set_bridge(cfg: &mut MachineConfig, i: usize, on: bool) {
-    match behind(cfg, i) {
-        Some(b) if !on => {
-            let bridge = cfg.devices.remove(b);
-            cfg.devices[if b < i { i - 1 } else { i }].at = bridge.at;
-        }
-        None if on => {
-            let at = cfg.devices[i].at.replace(format!("{CARD_BRIDGE}/pci0/0"));
-            let bridge = ConfiguredDevice { name: Some(CARD_BRIDGE.into()), at, ..ConfiguredDevice::new("", DeviceModel::PciBridge) };
-            cfg.devices.insert(i, bridge);
-        }
-        _ => {}
-    }
-}
 
 /// Where entry `i` goes: automatic, or a free slot of its family.
 fn slot_choice(ui: &mut Ui, cfg: &mut MachineConfig, i: usize) {
@@ -801,6 +777,16 @@ mod tests {
             switch(&mut cfg, p);
             cfg.validate()
                 .unwrap_or_else(|e| panic!("switch to {p:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn each_added_nvme_card_gets_its_own_image() {
+        let mut cfg = MachineConfig::default();
+        for want in ["disks/nvme.raw", "disks/nvme2.raw", "disks/nvme3.raw"] {
+            let path = new_nvme_path(&cfg);
+            assert_eq!(path, want);
+            cfg.devices.push(ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::Nvme(NvmeConfig { path, ..Default::default() })) });
         }
     }
 

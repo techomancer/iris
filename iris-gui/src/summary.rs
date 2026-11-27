@@ -21,7 +21,7 @@ pub enum Drive {
 }
 
 /// Every drive the machine will be started with, SCSI targets in (controller,
-/// id) order, then the NVMe card, then the Fibre Channel loop.
+/// id) order, then the NVMe cards, then the Fibre Channel loop.
 pub fn drives(cfg: &MachineConfig) -> Vec<Drive> {
     let mut out = Vec::new();
     for (key, i) in cfg.disks() {
@@ -35,9 +35,7 @@ pub fn drives(cfg: &MachineConfig) -> Vec<Drive> {
             Drive::Disk { id, path: d.path.clone() }
         });
     }
-    if let Some(n) = cfg.nvme() {
-        out.push(Drive::Nvme { path: n.path.clone() });
-    }
+    out.extend(cfg.nvmes().map(|n| Drive::Nvme { path: n.path.clone() }));
     for (id, i) in cfg.loop_disks() {
         out.push(Drive::FibreChannel { id, path: cfg.devices[i].device.scsi().map_or_else(String::new, |d| d.path.clone()) });
     }
@@ -123,7 +121,7 @@ pub fn missing_disks(cfg: &MachineConfig, readable: impl Fn(&str) -> bool) -> Ve
 /// The NVMe and Fibre Channel images the machine will open.
 pub fn expansion_paths(cfg: &MachineConfig) -> Vec<&str> {
     cfg.loop_disks().into_iter().filter_map(|(_, i)| cfg.devices[i].device.scsi().map(|d| d.path.as_str()))
-        .chain(cfg.nvme().map(|n| n.path.as_str()))
+        .chain(cfg.nvmes().map(|n| n.path.as_str()))
         .collect()
 }
 
@@ -233,6 +231,22 @@ mod tests {
         assert!(missing_disks(&cfg, none_readable).is_empty());
         assert_eq!(drives(&cfg), vec![Drive::FibreChannel { id: 0, path: "fc0.img".into() }]);
         assert_eq!(expansion_paths(&cfg), vec!["fc0.img"]);
+    }
+
+    #[test]
+    fn every_nvme_card_is_listed_and_checked() {
+        let cfg = parse(r#"
+            [machine]
+            profile = "octane_ip30"
+            [[devices]]
+            type = "nvme"
+            path = "a.img"
+            [[devices]]
+            type = "nvme"
+            path = "b.img"
+        "#);
+        assert_eq!(drives(&cfg), vec![Drive::Nvme { path: "a.img".into() }, Drive::Nvme { path: "b.img".into() }]);
+        assert_eq!(expansion_paths(&cfg), vec!["a.img", "b.img"]);
     }
 
     #[test]

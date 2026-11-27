@@ -6,7 +6,7 @@ use iris::config::MachineConfig;
 pub struct UnsafeReasons {
     /// Attached disks whose guest writes land directly in their base image
     /// (a plain read-write HDD), as named to the user: `SCSI 1` (`SCSI 1:3`
-    /// on controller 1), `Fibre Channel 1` or `NVMe`. Force-stopping
+    /// on controller 1), `Fibre Channel 1` or `NVMe 1`. Force-stopping
     /// mid-write can leave the filesystem on these inconsistent.
     pub writable_disks: Vec<String>,
 }
@@ -27,7 +27,7 @@ fn persists_to_base(path: &str, overlay: bool) -> bool {
 /// This is a config/status heuristic, not a guest shutdown acknowledgement:
 /// `cpu_halted` includes zero measured throughput. The machine's own disks
 /// are inspected: `[scsi.N]` (not on the IP35 brick machines, which have
-/// none), the disks on Fibre Channel loops and `[nvme]`. CD-ROMs, scratch, overlays,
+/// none), the disks on Fibre Channel loops and every NVMe card. CD-ROMs, scratch, overlays,
 /// DaynaPort and `.chd` names are excluded from the warning. The filename
 /// check does not distinguish an uncompressed CHD that writes in place from a
 /// compressed parent with a diff. See STORAGE.md for the actual persistence
@@ -52,8 +52,10 @@ pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
             r.writable_disks.push(t!("safestop-fc-disk", id = id));
         }
     }
-    if cfg.nvme().is_some_and(|n| persists_to_base(&n.path, n.overlay)) {
-        r.writable_disks.push(t!("safestop-nvme-disk"));
+    for (n, card) in cfg.nvmes().enumerate() {
+        if persists_to_base(&card.path, card.overlay) {
+            r.writable_disks.push(t!("safestop-nvme-disk", n = n + 1));
+        }
     }
     r
 }
@@ -106,6 +108,19 @@ mod tests {
         let r = evaluate(&running(false), &cfg);
         assert_eq!(r.writable_disks.len(), 1);
         assert!(r.writable_disks[0].contains("1:3"), "{:?}", r.writable_disks);
+    }
+
+    /// A second NVMe card is warned about like the first.
+    #[test]
+    fn every_nvme_card_is_checked() {
+        let card = |path: &str, overlay| iris::devices::ConfiguredDevice::new("", iris::devices::DeviceModel::Nvme(iris::config::NvmeConfig { path: path.into(), overlay, ..Default::default() }));
+        let mut cfg = MachineConfig::default();
+        cfg.devices.clear();
+        cfg.devices.push(card("a.raw", true));
+        cfg.devices.push(card("b.raw", false));
+        let r = evaluate(&running(false), &cfg);
+        assert_eq!(r.writable_disks.len(), 1);
+        assert!(r.writable_disks[0].contains('2'), "{:?}", r.writable_disks);
     }
 
     #[test]
