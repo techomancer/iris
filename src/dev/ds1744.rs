@@ -281,6 +281,20 @@ impl Ds1744 {
         })
     }
 
+    /// Run `f` on the RAM below the calendar, for a writer of the PROM's
+    /// environment (`baseio_nvram`); a change is saved to the file.
+    pub fn with_ram<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let mut st = self.st.lock();
+        let before = st.ram.clone();
+        let r = f(&mut st.ram);
+        if st.ram != before {
+            if let Err(e) = self.save_clock(&mut st) {
+                eprintln!("iris: DS1744 NVRAM: {e}");
+            }
+        }
+        r
+    }
+
     /// Save the calendar now, as a stop or shutdown does.
     pub fn flush(&self) -> Result<(), String> {
         let mut st = self.st.lock();

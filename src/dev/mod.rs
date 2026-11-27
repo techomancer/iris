@@ -81,6 +81,7 @@ pub mod seeq8003;
 pub mod sgi_nvram;
 pub mod ip30_nvram;
 pub mod o2_env;
+pub mod baseio_nvram;
 pub mod testdev;
 pub mod ultra64;
 pub mod vino;
