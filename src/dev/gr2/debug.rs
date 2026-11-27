@@ -486,15 +486,11 @@ impl Gr2 {
             }
             Some(path) => {
                 // Categories: hq, re3, cpu, or combinations like hq,cpu; default all.
-                let mut mask = 0;
-                for c in args.get(1).copied().unwrap_or("all").split(',') {
-                    mask |= match c {
-                        "hq" => TRACE_HQ,
-                        "re3" => TRACE_RE3,
-                        "cpu" => TRACE_CPU,
-                        _ => TRACE_HQ | TRACE_RE3 | TRACE_CPU,
-                    };
-                }
+                let classes = [("hq", TRACE_HQ), ("re3", TRACE_RE3), ("cpu", TRACE_CPU)];
+                let mask = match crate::devlog::select(args.get(1).copied().unwrap_or("all"), &classes, TRACE_HQ | TRACE_RE3 | TRACE_CPU) {
+                    Ok(m) => m,
+                    Err(e) => return writeln!(w, "gr2 trace: {e}"),
+                };
                 let f = match File::create(path) {
                     Ok(f) => f,
                     Err(e) => return writeln!(w, "cannot create {path}: {e}"),

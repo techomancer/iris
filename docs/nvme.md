@@ -88,15 +88,14 @@ fall (section 7.6.1).
 
 ## Tracing
 
-`log nvme on` in the monitor, or `IRIS_DEBUG_LOG=nvme` (`[debug] debug_log`)
+`log nvme on` in the monitor, or `--log nvme` (`[debug] log`)
 from power-on to stderr, traces what the host does to the controller and what
 it does back. Each line starts with `t=` and the microseconds since the
 controller was made; on the Octane HEART's counter runs on the same host
-clock. `log nvme mask` takes `state` (CC writes, CSTS changes, resets and
-fatal errors with their reason), `admin` and `io` (doorbells, commands and
-their completions) and `regs` (every register access below the doorbells),
-or a hex mask of 1, 2, 8 and 4 for those. `log nvme file PATH` writes to a
-file.
+clock. `log nvme.state on` and its siblings pick one event: `state` (CC writes,
+CSTS changes, resets and fatal errors with their reason), `admin` and `io`
+(doorbells, commands and their completions) and `regs` (every register access
+below the doorbells). `log nvme file PATH` writes to a file.
 
 ## Approximations
 

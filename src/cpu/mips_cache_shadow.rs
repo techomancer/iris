@@ -178,8 +178,8 @@ const WAYS: usize = 2;
 
 /// Is the shadow cache's operation trace on, at this level of detail?
 ///
-/// `log l2c mask op` traces the tag operations a diagnostic actually cares
-/// about; `log l2c mask op+hit` adds the data-array walk as well. That
+/// `log l2c.op on` traces the tag operations a diagnostic actually cares
+/// about; `log l2c.op,l2c.hit on` adds the data-array walk as well. That
 /// distinction is load-bearing rather than tidy: the IP28 PROM issues 65k+
 /// `Index_Store_Data` ops walking the array, and tracing all of them once
 /// slowed the guest so much a run never reached the test it was there to

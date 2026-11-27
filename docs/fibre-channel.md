@@ -82,7 +82,7 @@ and the comment in `src/dev/isp2200.rs` says so.
 - Fast-post and point-to-point are refused. Loop down is never reported.
 - Five mailbox commands come from IRIX alone and have no public definition, so
   their replies are made up to keep that guest on its success path
-  (`IRIS_DEBUG_LOG=scsi` marks each). Any other command the model does not
+  (`log scsi on` marks each). Any other command the model does not
   implement answers 0x4001.
 - The NVRAM image and its serial (hashed from the adapter's number) are
   invented, as are the firmware version and the checksum algorithm.

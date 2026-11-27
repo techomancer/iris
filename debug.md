@@ -622,20 +622,29 @@ a forced termination; a normal stop saves them automatically.
 
 ### Logging
 
-Per-module logging, printed to every monitor connection or to a file. Messages
-on hot paths are compiled in only in a developer build: that is most of the
-Indy and Indigo2 modules (`net hpc3 seeq hal2 mc rex3 pdma vino dcb cmap scc
-gr2`, much of `ioc` and `mips`) and part of `odyssey`. The other modules log
+Per-module logging, printed to every monitor connection or to a file. A trace
+point is `module.event`, as in `l1d.miss`; a module with no events is one point.
+Messages on hot paths are compiled in only in a developer build: that is most
+of the Indy and Indigo2 modules (`net hpc3 seeq hal2 mc rex3 pdma vino dcb cmap
+scc gr2`, much of `ioc` and `mips`) and part of `odyssey`. The other modules log
 in every build.
 
 | Command | Description |
 |---|---|
 | `log status` | Each module's state |
-| `log <module\|all> <on\|off>` | Enable / disable |
-| `log <module> mask <cat\|hex>` | Category mask |
+| `log <points> <on\|off>` | Enable / disable |
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
-`log mips mask insn` prints every instruction `run` and
+`<points>` is comma-separated globs over `module.event`, where a bare module is
+all its events, `all` is everything and a leading `-` removes: `heart`,
+`l1*.miss`, `heart,l1d.*,-l1d.hit`. The same patterns work as `--log` and
+`[debug] log` at startup, which print to stderr. The same grammar picks the
+classes of the `perfetto` categories, of the `rex`, `gr2`, `mgras`, `vpro` and
+O2 `trace` commands (`all,-jit`) and of the `exception` command (`bus,tlb`); a
+name that matches nothing is an error. The GUI applies `[debug] log` at Start
+and does not turn points off again at the next Start.
+
+`log mips.insn on` prints every instruction `run` and
 `step` execute (`log mips file <path>` writes them to a file instead) **[DEV]**.
 A device's trace is its module: `log ps2 on`, `log scsi on`, `log rtc on`.
 `log net` traces packets, `log ioc` the 8254 timer, and `log phys` accesses
@@ -662,14 +671,12 @@ and the HEART vector it sets or clears. `heart` logs HEART's register
 accesses, one counter read in 256 with the host's clock, and every
 interrupt vector raised or lowered, and on the Octane every access nothing
 answers. `o2audio` logs the O2's audio register accesses and codec writes.
-Mask categories: `pdma` —
-one per HPC3 channel, `hal0`..`hal7`, `scsi0`, `scsi1`, `enet0`, `enet1`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
-miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
-every module also takes `on`/`all`, `off`/`none` or a hex mask.
+Events: `pdma` — one per HPC3 channel, `hal0`..`hal7`, `scsi0`, `scsi1`,
+`enet0`, `enet1`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
+miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing)).
 `bedrock` covers the devices of the Bedrock node (Fuel, Tezro, Origin 3200,
 Onyx 3000), `l1` their L1 system controller and `usb` the OHCI USB controller. `ice1724` logs the Tezro's audio
 controller's accesses and values nothing establishes.
-`IRIS_DEBUG_LOG` or `[debug] debug_log` set the same thing at startup.
 
 ### Performance and locks
 

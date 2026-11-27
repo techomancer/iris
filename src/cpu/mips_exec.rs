@@ -7389,7 +7389,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if C::R10K_CACHE_OPS {
             self.cache.set_cache_ecc(self.core.cp0_ecc);
         }
-        // IP28 cache-error investigation (`log mips mask cp0`). Two kinds
+        // IP28 cache-error investigation (`log mips.cp0 on`). Two kinds
         // of op are worth seeing: one carrying non-zero check bits, which is a
         // guest staging a parity error on purpose, and any op from outside the
         // PROM — i.e. from a loaded diagnostic, which runs out of XKPHYS.
@@ -7765,7 +7765,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // DMTC0 - Doubleword Move To CP0 (MIPS III)
     /// IP28 bring-up: watch the cache-tag CP0 registers (26 ECC, 28 TagLo,
-    /// 29 TagHi) under `log mips mask cp0`. Only the R10000 model compiles
+    /// 29 TagHi) under `log mips.cp0 on`. Only the R10000 model compiles
     /// this in.
     ///
     /// The env-var form this replaced did an uncached `getenv` on every
@@ -7960,7 +7960,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // TLBWI - Write Indexed TLB Entry
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to the TLB entry indexed by CP0.Index
-    /// Report every TLB write, under `log mips mask tlb`.
+    /// Report every TLB write, under `log mips.tlb on`.
     ///
     /// `IRIS_IP28_TLBW=wired` additionally narrows it to writes below CP0
     /// Wired — the mappings a kernel means never to be evicted. That stays an
@@ -8238,7 +8238,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // *guarantees* the next access misses and therefore calls `translate_fn`.
         self.resync_privilege_state();
 
-        // `log mips mask cp0`. If the target's top half is already gone by
+        // `log mips.cp0 on`. If the target's top half is already gone by
         // the time we get here, the guest wrote a truncated EPC; if it is
         // intact and the next fetch is truncated anyway, the loss is
         // downstream of this.
