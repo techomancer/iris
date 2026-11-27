@@ -1660,7 +1660,7 @@ impl Workstation for Machine {
         states.extend(self.board.rex3.iter().map(|_| "rex3".to_string()));
         states.extend(self.board.rex3_head1.iter().map(|_| "rex3_head1".to_string()));
         let head1 = |f: &str| (f.to_string(), 0);
-        let boards = [self.board.mgras.is_some().then_some(("mgras", BoardList::Impact)), self.board.gr2.is_some().then_some(("gr2", BoardList::Gr2))];
+        let boards = [self.board.mgras.is_some().then_some(("mgras".to_string(), BoardList::Impact)), self.board.gr2.is_some().then_some(("gr2".to_string(), BoardList::Gr2))];
         crate::snapshot::Layout {
             disks: self.disks.clone(),
             slots: self.gio_slots.clone(),

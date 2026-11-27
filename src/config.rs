@@ -3633,8 +3633,8 @@ impl MachineConfig {
             return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
         let placement = DevicePlacement::new(self)?;
-        if placement.boards(false).count() > 1 {
-            // Octane dual head, Onyx2 and Onyx 3000 pipes are real; iris builds one board.
+        if self.machine.profile != MachineProfile::OctaneIp30 && placement.boards(false).count() > 1 {
+            // Onyx2 and Onyx 3000 pipes are real; iris builds one board.
             return Err(format!("iris builds one graphics board on the {}; `none` at graphics drops its default", placement.machine()));
         }
         if placement.heads().count() > 0 && board != Some(GraphicsBoard::Newport) {

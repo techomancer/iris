@@ -913,6 +913,7 @@ prebuf_ms = 20              # sound held before playing: the margin against a la
 # With no `at`, or `at = "graphics"`, the entry replaces the machine's own board (Indy, Indigo2: newport;
 # Octane: impact solid; Onyx 3000: kona ir3; none on the others). An entry at another slot adds to it.
 # `type = "none"` at the graphics slot leaves it empty: the Octane, Fuel, Tezro and Onyx2 then run on the serial console.
+# An Octane takes a second board of any family in any XIO slot, such as a vpro at slot_cd (SGI's Dual Head module) beside the first in slot_ab.
 # [[devices]]
 # type  = "vpro"
 # model = "v12"

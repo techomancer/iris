@@ -653,15 +653,15 @@ impl Image<'_> {
 
 /// A graphics board's state: its metadata, kept as `<state>.bin`, and its large named parts.
 pub struct Board {
-    pub state: &'static str,
+    pub state: String,
     pub list: BoardList,
     pub metadata: String,
     pub parts: Vec<(String, Vec<u32>)>,
 }
 
 impl Board {
-    pub fn new(state: &'static str, list: BoardList, (metadata, parts): (String, Vec<(String, Vec<u32>)>)) -> Self {
-        Self { state, list, metadata, parts }
+    pub fn new(state: impl Into<String>, list: BoardList, (metadata, parts): (String, Vec<(String, Vec<u32>)>)) -> Self {
+        Self { state: state.into(), list, metadata, parts }
     }
 }
 
@@ -696,7 +696,8 @@ pub struct Layout {
     /// Words in each `bank_chunks` list.
     pub memory: Vec<usize>,
     pub framebuffer: bool,
-    pub boards: Vec<(&'static str, BoardList)>,
+    /// A list holding several boards has each board's parts named `<state>/<part>`.
+    pub boards: Vec<(String, BoardList)>,
 }
 
 /// What the last load left for `parent` and `rollback`.
@@ -766,10 +767,12 @@ fn write<W: Workstation + ?Sized>(m: &W, saves: &Path, name: &str, parent: Optio
         chunks.framebuffer_chunks = Some((put(rgb, "framebuffer rgb")?, put(aux, "framebuffer aux")?));
     }
     for b in &image.boards {
-        snap.write_state(b.state, &Value::String(b.metadata.clone())).map_err(io)?;
+        snap.write_state(&b.state, &Value::String(b.metadata.clone())).map_err(io)?;
+        let several = image.boards.iter().filter(|o| o.list == b.list).count() > 1;
         for (part, words) in &b.parts {
             let hashes = put(words, &format!("{} {part}", b.list.label()))?;
-            b.list.of(&mut chunks).push(NamedChunk { name: part.clone(), words: words.len(), hashes });
+            let name = if several { format!("{}/{part}", b.state) } else { part.clone() };
+            b.list.of(&mut chunks).push(NamedChunk { name, words: words.len(), hashes });
         }
     }
     snap.write_chunks_manifest(&chunks).map_err(io)?;
@@ -826,23 +829,34 @@ pub fn read<W: Workstation + ?Sized>(m: &W, saves: &Path, name: &str) -> Result<
     for list in [BoardList::Impact, BoardList::Vpro, BoardList::Gr2] {
         let label = list.label();
         let saved = std::mem::take(list.of(&mut chunks));
-        match (want.boards.iter().find(|b| b.1 == list), saved.is_empty()) {
-            (Some(&(state, _)), false) => {
-                let metadata = snap.read_state(state).map_err(|e| format!("{state}: {e}"))?;
-                let metadata = metadata.as_str().ok_or_else(|| format!("{label} snapshot metadata is not a string"))?.to_string();
-                let mut parts = Vec::with_capacity(saved.len());
-                for p in &saved {
-                    let words = get(&p.hashes, &format!("{label} {}", p.name))?;
-                    if words.len() != p.words {
-                        return Err(format!("CAS {label} {} has {} words, expected {}", p.name, words.len(), p.words));
+        let wanted: Vec<_> = want.boards.iter().filter(|b| b.1 == list).map(|b| b.0.as_str()).collect();
+        match (wanted.as_slice(), saved.is_empty()) {
+            ([], true) => {}
+            ([], false) => return Err(format!("snapshot contains {label} state but this machine has no {label} board")),
+            (_, true) => return Err(format!("snapshot has no state for the configured {label} board")),
+            (states, false) => {
+                for &state in states {
+                    let metadata = snap.read_state(state).map_err(|e| format!("{state}: {e}"))?;
+                    let metadata = metadata.as_str().ok_or_else(|| format!("{label} snapshot metadata is not a string"))?.to_string();
+                    let prefix = format!("{state}/");
+                    let mut parts = Vec::with_capacity(saved.len());
+                    for p in &saved {
+                        let name = match states.len() {
+                            1 => p.name.as_str(),
+                            _ => match p.name.strip_prefix(&prefix) { Some(n) => n, None => continue },
+                        };
+                        let words = get(&p.hashes, &format!("{label} {name}"))?;
+                        if words.len() != p.words {
+                            return Err(format!("CAS {label} {name} has {} words, expected {}", words.len(), p.words));
+                        }
+                        parts.push((name.to_string(), words));
                     }
-                    parts.push((p.name.clone(), words));
+                    if parts.is_empty() {
+                        return Err(format!("snapshot has no state for the {label} board {state}"));
+                    }
+                    image.boards.push(Board { state: state.to_string(), list, metadata, parts });
                 }
-                image.boards.push(Board { state, list, metadata, parts });
             }
-            (Some(_), true) => return Err(format!("snapshot has no state for the configured {label} board")),
-            (None, false) => return Err(format!("snapshot contains {label} state but this machine has no {label} board")),
-            (None, true) => {}
         }
     }
     let overlays = snap.read_toml("cow.toml").map(|t| parse_cow_table(&t)).map_err(|e| format!("cow.toml: {e}"))?;
