@@ -36,54 +36,46 @@ use crate::ppmem::devmap::{entry_eq, Entry, SparseDeviceMap, PHYS_MASK, SLOTS, S
 /// bus-path access keep working whether or not the 4GB window was reserved.
 pub type RamBank = PpMemory;
 
-// Error device: a bus error for every access, optionally logged.
-struct ErrorBus {
-    debug: AtomicBool,
-}
+// Error device: a bus error for every access, logged under `log phys`.
+struct ErrorBus;
 
 impl ErrorBus {
     fn new() -> Self {
-        Self {
-            debug: AtomicBool::new(false),
-        }
-    }
-
-    fn set_debug(&self, val: bool) {
-        self.debug.store(val, Ordering::Relaxed);
+        Self
     }
 }
 
 impl BusDevice for ErrorBus {
     fn read8(&self, addr: u64) -> BusRead8 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read8 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read8 {:08x}", addr);
         BusRead8::err()
     }
     fn write8(&self, addr: u64, val: u8) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write8 {:08x} val {:02x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write8 {:08x} val {:02x}", addr, val);
         crate::traits::BUS_ERR
     }
     fn read16(&self, addr: u64) -> BusRead16 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read16 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read16 {:08x}", addr);
         BusRead16::err()
     }
     fn write16(&self, addr: u64, val: u16) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write16 {:08x} val {:04x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write16 {:08x} val {:04x}", addr, val);
         crate::traits::BUS_ERR
     }
     fn read32(&self, addr: u64) -> BusRead32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read32 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read32 {:08x}", addr);
         BusRead32::err()
     }
     fn write32(&self, addr: u64, val: u32) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write32 {:08x} val {:08x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write32 {:08x} val {:08x}", addr, val);
         crate::traits::BUS_ERR
     }
     fn read64(&self, addr: u64) -> BusRead64 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read64 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read64 {:08x}", addr);
         BusRead64::err()
     }
     fn write64(&self, addr: u64, val: u64) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write64 {:08x} val {:016x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write64 {:08x} val {:016x}", addr, val);
         crate::traits::BUS_ERR
     }
 }
@@ -492,7 +484,7 @@ impl Physical {
     }
 
     /// `base..end` reads as zero and ignores writes, logging both under
-    /// `phys hole on`.
+    /// `log phys on`.
     pub fn map_black_hole(&self, base: u64, end: u64) {
         let p: Entry = &self.black_hole;
         self.fill_range(base, end, p);
@@ -803,7 +795,7 @@ impl Device for Physical {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let cmds = vec![
-            ("phys".to_string(), "Physical Bus commands: mem, dis, map, trace, error <on|off>, hole <on|off>, bench".to_string()),
+            ("phys".to_string(), "Physical Bus commands: mem, dis, map, trace, bench".to_string()),
             ("mm".to_string(), "Alias for phys mem".to_string()),
             ("md".to_string(), "Alias for phys dis".to_string()),
             ("trace".to_string(), "Enable/disable tracing: trace <on|off>".to_string()),
@@ -872,30 +864,6 @@ impl Device for Physical {
                     writeln!(writer, "  {:#012x}-{:#012x} {}",
                         r.start << SLOT_SHIFT, (r.end << SLOT_SHIFT) - 1, name).unwrap();
                 }
-            }
-            "error" => {
-                if actual_args.is_empty() {
-                    return Err("Usage: error <on|off>".to_string());
-                }
-                let val = match actual_args[0] {
-                    "on" | "1" => true,
-                    "off" | "0" => false,
-                    _ => return Err("Usage: error <on|off>".to_string()),
-                };
-                self.error_bus.set_debug(val);
-                writeln!(writer, "Bus Error debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-            }
-            "hole" => {
-                if actual_args.is_empty() {
-                    return Err("Usage: hole <on|off>".to_string());
-                }
-                let val = match actual_args[0] {
-                    "on" | "1" => true,
-                    "off" | "0" => false,
-                    _ => return Err("Usage: hole <on|off>".to_string()),
-                };
-                self.black_hole.set_debug(val);
-                writeln!(writer, "Black Hole debug {}", if val { "enabled" } else { "disabled" }).unwrap();
             }
             "trace" => {
                 if actual_args.is_empty() {

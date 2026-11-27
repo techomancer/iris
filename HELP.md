@@ -284,7 +284,7 @@ To see what a client (IRIX `inst`, say) asks for, start iris with
 `IRIS_RSH_TRACE=1`. Each request is written to stderr when it arrives and again
 when it ends, with the bytes moved, the time taken, and whether it completed,
 was cut short by the guest, or never sent a whole request. This works in any
-build; the `net debug` logging needs a `developer` build.
+build; `log net on` needs a `developer` build.
 At startup iris prints `iris: rsh server ... serving DIR` when `rsh_dir` is on.
 Every guest connection to port 514 is also reported with where it went, so a
 trace with no requests means the guest never reached the built-in server (the
@@ -472,7 +472,7 @@ address on your LAN; the server answers there instead and the guest mounts
 ```
 net status           # show all NAT connections
 net status tcp       # TCP connections only
-net debug tcp on     # per-packet TCP trace
+log net on           # per-packet trace (developer build)
 seeq status          # Ethernet MAC / DMA state
 ```
 

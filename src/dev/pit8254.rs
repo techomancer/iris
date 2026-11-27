@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
+use crate::devlog::LogModule;
 use crate::hptimer::{Timer, TimerManager};
 use std::io::Write;
 
@@ -57,7 +58,6 @@ impl Channel {
 struct Slot {
     chan: Mutex<Channel>,
     callback: Option<Arc<dyn Fn() + Send + Sync>>,
-    debug: Arc<AtomicBool>,
     timer: Timer,
 }
 
@@ -76,8 +76,8 @@ impl Slot {
             chan.period_start = Some(due);
             self.timer.set_due(Some(due + period));
         }
-        if self.debug.load(Ordering::Relaxed) && idx != 2 {
-            println!("PIT: Channel {} expired", idx);
+        if idx != 2 {
+            dlog_dev!(LogModule::Ioc, "PIT: Channel {} expired", idx);
         }
         if let Some(cb) = &self.callback {
             cb();
@@ -89,7 +89,6 @@ impl Slot {
 pub struct Pit8254 {
     channels: [Arc<Slot>; 3],
     tm: Arc<TimerManager>,
-    debug: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     base_frequency: u32,
     /// Where the interrupt rate the guest programmed is published (see
@@ -99,19 +98,16 @@ pub struct Pit8254 {
 
 impl Pit8254 {
     pub fn new(tm: &Arc<TimerManager>, base_frequency: u32, cb0: Option<Arc<dyn Fn() + Send + Sync>>, cb1: Option<Arc<dyn Fn() + Send + Sync>>, cb2: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
-        let debug = Arc::new(AtomicBool::new(false));
         let slot = |idx: usize, callback: Option<Arc<dyn Fn() + Send + Sync>>| {
             Arc::new_cyclic(|me| Slot {
                 chan: Mutex::new(Channel::new(callback.is_some())),
                 callback,
-                debug: debug.clone(),
                 timer: Timer::new(tm, me, move |s: &Slot, due| s.fire(idx, due)),
             })
         };
         let pit = Self {
             channels: [slot(0, cb0), slot(1, cb1), slot(2, cb2)],
             tm: tm.clone(),
-            debug: debug.clone(),
             running: Arc::new(AtomicBool::new(false)),
             base_frequency,
             rate_sink: Arc::new(std::sync::OnceLock::new()),
@@ -392,9 +388,7 @@ impl Pit8254 {
             let changed = {
                 let mut chan = self.channels[i].chan.lock();
                 if chan.input_freq != freq {
-                    if self.debug.load(Ordering::Relaxed) {
-                        println!("PIT: Ch{} input freq updated to {} Hz (driven by Ch2)", i, freq);
-                    }
+                    dlog_dev!(LogModule::Ioc, "PIT: Ch{} input freq updated to {} Hz (driven by Ch2)", i, freq);
                     chan.input_freq = freq;
                     true
                 } else {
@@ -414,16 +408,12 @@ impl Pit8254 {
             2 => self.read_channel(2),
             _ => return BusRead8::err(),
         };
-        if self.debug.load(Ordering::Relaxed) {
-            println!("PIT: Read addr {} -> {:02x}", addr, val);
-        }
+        dlog_dev!(LogModule::Ioc, "PIT: Read addr {} -> {:02x}", addr, val);
         BusRead8::ok(val)
     }
 
     pub fn write(&self, addr: u32, val: u8) -> u32 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("PIT: Write addr {} val {:02x}", addr, val);
-        }
+        dlog_dev!(LogModule::Ioc, "PIT: Write addr {} val {:02x}", addr, val);
         match addr {
             0 => self.write_channel(0, val),
             1 => self.write_channel(1, val),
@@ -457,25 +447,15 @@ impl Device for Pit8254 {
     fn is_running(&self) -> bool { self.running.load(Ordering::Acquire) }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("pit".to_string(), "PIT commands: pit status | pit debug <on|off> [DEV]".to_string())]
+        vec![("pit".to_string(), "PIT commands: pit status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
         if cmd == "pit" {
             if args.is_empty() {
-                return Err("Usage: pit <debug|status> ...".to_string());
+                return Err("Usage: pit status".to_string());
             }
             match args[0] {
-                "debug" => {
-                    let val = match args.get(1).map(|s| *s) {
-                        Some("on") => true,
-                        Some("off") => false,
-                        _ => return Err("Usage: pit debug <on|off>".to_string()),
-                    };
-                    self.debug.store(val, Ordering::Relaxed);
-                    writeln!(writer, "PIT debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    Ok(())
-                }
                 "status" => {
                     writeln!(writer, "PIT Status:").unwrap();
                     for (i, slot) in self.channels.iter().enumerate() {
@@ -485,7 +465,7 @@ impl Device for Pit8254 {
                     }
                     Ok(())
                 }
-                _ => Err("Usage: pit <debug|status> ...".to_string()),
+                _ => Err("Usage: pit status".to_string()),
             }
         } else {
             Err("Command not found".to_string())

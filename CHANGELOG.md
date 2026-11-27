@@ -24,6 +24,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   `cmap`, `bt445` and `dcb`, and `eeprom on|off` and `nveeprom on|off`, are
   gone; `log <module> on` does the same (`log scsi1` for the second SCSI
   controller).
+- `pit debug`, `net debug`, `phys error` and `phys hole` are gone: `log ioc`,
+  `log net` and the new `log phys` replace them. The timer and packet traces
+  need a `developer` build.
 
 ### Serial ports
 

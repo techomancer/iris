@@ -257,9 +257,8 @@ impl NatEngine {
     /// Queue a frame for the guest. Nothing queued is ever dropped; it waits
     /// for room on the ring.
     pub(super) fn send(&mut self, frame: Vec<u8>) {
-        if self.ctl.dbg_tcp() {
-            log_frame("<<", &frame);
-        }
+        #[cfg(feature = "developer")]
+        log_frame("<<", &frame);
         self.to_guest.push_back(frame);
     }
 
@@ -304,7 +303,8 @@ impl NatEngine {
             self.maybe_adopt_gateway(a.sender_ip(), a.target_ip());
         }
         dlog_dev!(LogModule::Net, "NAT TX {}", packet::summary(frame));
-        if self.ctl.dbg_tcp() && ip.is_some() {
+        if ip.is_some() {
+            #[cfg(feature = "developer")]
             log_frame(">>", frame);
         }
         if let Some(a) = arp {
@@ -407,7 +407,8 @@ impl NetBackend for NatEngine {
     }
 }
 
-/// Log a frame in detail (the `net tcp` debug switch).
+/// Log a frame in detail under `log net`. Developer builds only: the parse is per packet.
+#[cfg(feature = "developer")]
 pub(super) fn log_frame(dir: &str, frame: &[u8]) {
     dlog_dev!(LogModule::Net, "  {} {}", dir, packet::summary(frame));
     let Some(t) = Ether::parse(frame).and_then(|e| e.ipv4()).and_then(|i| i.tcp()) else { return };

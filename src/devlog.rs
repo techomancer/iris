@@ -79,6 +79,9 @@ pub enum LogModule {
     /// The ICE1724 audio controller: accesses and values nothing
     /// establishes.
     Ice1724 = 39,
+    /// The physical bus: accesses that hit the black hole or a bus-error
+    /// region.
+    Phys = 40,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -93,7 +96,7 @@ pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the
 pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 41;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -137,6 +140,7 @@ impl LogModule {
             "module" => Some(Self::Module),
             "kona" => Some(Self::Kona),
             "ice1724" => Some(Self::Ice1724),
+            "phys" => Some(Self::Phys),
             _        => None,
         }
     }
@@ -183,6 +187,7 @@ impl LogModule {
             Self::Module => "module",
             Self::Kona => "kona",
             Self::Ice1724 => "ice1724",
+            Self::Phys => "phys",
         }
     }
 
@@ -196,7 +201,7 @@ impl LogModule {
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
             Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
             Self::L1, Self::Usb, Self::Module, Self::Kona,
-            Self::Ice1724,
+            Self::Ice1724, Self::Phys,
         ]
     }
 
@@ -340,33 +345,7 @@ impl DevLog {
         Self {
             any_active: AtomicBool::new(false),
             writers: Mutex::new(Vec::new()),
-            modules: [
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), // Bt445, Scc
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // Ps2, Rtc, Eeprom
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // L1i, L1d, L2c
-                ModuleLog::new(), // Ultra
-                ModuleLog::new(), // Scsi1
-                ModuleLog::new(), // Nveeprom
-                ModuleLog::new(), // Gr2
-                ModuleLog::new(), // Rad1
-                ModuleLog::new(), // Odyssey
-                ModuleLog::new(), // Bedrock
-                ModuleLog::new(), // Hub
-                ModuleLog::new(), // Pci
-                ModuleLog::new(), // Bridge
-                ModuleLog::new(), // Heart
-                ModuleLog::new(), // Nvme
-                ModuleLog::new(), // L1
-                ModuleLog::new(), // Usb
-                ModuleLog::new(), // Module
-                ModuleLog::new(), // Kona
-                ModuleLog::new(), // Ice1724
-            ],
+            modules: std::array::from_fn(|_| ModuleLog::new()),
         }
     }
 
