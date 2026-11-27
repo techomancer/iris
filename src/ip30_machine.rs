@@ -638,7 +638,7 @@ impl OctaneMachine {
         }
 
         let monitor = crate::monitor::Monitor::new();
-        monitor.register_device(crate::devlog::init_devlog());
+        monitor.register_device(Arc::new(crate::devlog::LogDevice));
         monitor.register_device(status.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         monitor.register_device(heart.clone());

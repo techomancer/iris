@@ -14,7 +14,7 @@ use crate::dev::l1::L1;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::serial_host::CiSerialBackend;
 use crate::dev::widths::{self, access_widths};
-use crate::devlog::{init_devlog, LogModule};
+use crate::devlog::{LogDevice, LogModule};
 use crate::gdb_stub::CpuDebug;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
@@ -814,7 +814,7 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Machine
             }
         }
         let monitor = Monitor::new();
-        monitor.register_device(init_devlog());
+        monitor.register_device(Arc::new(LogDevice));
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         if let Some(status) = &io.status {
             monitor.register_device(status.clone());

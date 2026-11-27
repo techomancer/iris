@@ -44,7 +44,7 @@ pub const STATUS_CU3: u32 = 1 << 31;    // Coprocessor 3 Usable
 /// *exception* was refuted by this tracer — DE is never cleared outside the
 /// PROM's own memory sizing.)
 ///
-/// Two relaxed atomic loads when off, and unlike the `IRIS_IP28_CACHEDIAG`
+/// One relaxed atomic load when off, and unlike the `IRIS_IP28_CACHEDIAG`
 /// environment variable this replaced it can be turned on, masked and
 /// redirected to a file part-way through a boot.
 #[inline(always)]
@@ -55,9 +55,7 @@ pub fn cachediag_on() -> bool {
 /// `log mips mask cp0` — CP0 register traffic.
 #[inline(always)]
 pub fn cp0_log() -> bool {
-    crate::devlog::devlog_is_active(crate::devlog::LogModule::Mips)
-        && (crate::devlog::devlog_mask(crate::devlog::LogModule::Mips)
-            & crate::cpu::mips_exec::MIPS_LOG_CP0) != 0
+    crate::devlog::devlog_on(crate::devlog::LogModule::Mips, crate::cpu::mips_exec::MIPS_LOG_CP0)
 }
 
 // CP0 Cause Register bit definitions
@@ -1622,20 +1620,15 @@ impl MipsCore {
     /// Write a GPR by index. Unconditionally re-zeros gpr\[0\] to avoid a branch.
     #[inline(always)]
     pub fn write_gpr(&mut self, reg: u32, value: u64) {
-        // IP28 bring-up: `IRIS_IP28_WATCHGPR=<n>` reports every write to that
-        // GPR with the PC that did it. One cached bool and a compare against a
-        // register number already in hand; unarmed it is a predictable branch.
-        #[cfg(debug_assertions)]
-        let _ = ();
+        // IP28 bring-up: `IRIS_IP28_WATCHGPR=<n>` reports every write to that GPR.
+        // Developer builds only: a release build would pay a check per write.
+        #[cfg(feature = "developer")]
         {
             static WATCH: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
             let watch = *WATCH.get_or_init(|| {
                 std::env::var("IRIS_IP28_WATCHGPR").ok().and_then(|v| v.trim().parse().ok())
             });
             if watch == Some(reg) {
-                // The register number is a parameter, so it stays an
-                // environment variable; only the output moves, so it can be
-                // redirected with `log mips file <path>`.
                 crate::dlog!(crate::devlog::LogModule::Mips,
                              "ip28gpr: ${reg} = {value:#018x} at pc={:#018x}", self.pc);
             }

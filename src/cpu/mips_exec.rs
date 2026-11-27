@@ -5,7 +5,7 @@ use crate::cpu::mips_isa::*;
 use crate::traits::*;
 use crate::cpu::mips_tlb::*;
 use crate::cpu::mips_cache_v2::*;
-use crate::devlog::{LogModule, devlog_mask, devlog_is_active};
+use crate::devlog::{devlog_on, event, LogModule};
 use crate::cpu::mips_dis;
 use std::fmt::Write as FmtWrite;
 use crate::cpu::mips_dis::SymbolTable;
@@ -18,13 +18,14 @@ use std::time::Duration;
 use crate::exp::{self, Expr, RegTarget};
 use crate::snapshot::{get_field, u64_slice_to_toml, load_u64_slice, toml_u64, toml_u32, toml_bool, hex_u64, hex_u32};
 
-// LogModule::Mips bitmask categories
-pub const MIPS_LOG_INSN: u32 = 0x0001; // per-instruction disassembly trace
-pub const MIPS_LOG_TLB:  u32 = 0x0002; // TLB read/write/probe
-pub const MIPS_LOG_MEM:  u32 = 0x0004; // uncached memory accesses
-pub const MIPS_LOG_FPU:  u32 = 0x0008; // FP compare/condmove/convert operand+result trace
-pub const MIPS_LOG_CP0:  u32 = 0x0010; // CP0 register traffic: EPC/EntryHi/XContext writes,
-                                       // ECC and CacheErr accesses, Status.DE transitions
+/// The `mips.*` trace points: per-instruction disassembly, TLB ops, uncached accesses, FP
+/// operands and results, and CP0 traffic (EPC/EntryHi/XContext, ECC and CacheErr, Status.DE).
+pub const EVENTS: &[&str] = &["insn", "tlb", "mem", "fpu", "cp0"];
+pub const MIPS_LOG_INSN: u32 = event(EVENTS, "insn");
+pub const MIPS_LOG_TLB:  u32 = event(EVENTS, "tlb");
+pub const MIPS_LOG_MEM:  u32 = event(EVENTS, "mem");
+pub const MIPS_LOG_FPU:  u32 = event(EVENTS, "fpu");
+pub const MIPS_LOG_CP0:  u32 = event(EVENTS, "cp0");
 
 /// Opt-in gate for the `developerx` Coprocessor-Unusable break (see the three
 /// `handle_exception*` wrappers). Off unless `IRIS_BREAK_CPU=1`.
@@ -42,18 +43,18 @@ fn cpu_unusable_break_enabled() -> bool {
 #[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
-    devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
+    devlog_on(LogModule::Mips, bit)
 }
 
 /// Like `mips_log`, but live in every build.
 ///
 /// The IP28 bring-up traces this gates were plain environment variables that
 /// worked in release, and the machines they diagnose are booted in release —
-/// so they keep that reach. The cost is two relaxed atomic loads, against the
+/// so they keep that reach. The cost is one relaxed atomic load, against the
 /// `getenv` per call some of them used to do.
 #[inline(always)]
 fn mips_log_always(bit: u32) -> bool {
-    devlog_is_active(LogModule::Mips) && (devlog_mask(LogModule::Mips) & bit) != 0
+    devlog_on(LogModule::Mips, bit)
 }
 
 // Without `developer`, dlog_dev! is a no-op, so callers gate on this constant `false`

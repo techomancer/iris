@@ -790,7 +790,7 @@ mistaken for GUI settings.
 | `IRIS_IP28_EXC_VADDR` | IP28 exception virtual-address trace filter. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_IP28_TLBW` | wired enables extra IP28 Wired/TLB-write tracing. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_IP28_WATCH` | IP28 physical-address/window access trace filter. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
-| `IRIS_IP28_WATCHGPR` | Guest GPR index whose writes are traced in IP28 bring-up. | [src/cpu/mips_core.rs](src/cpu/mips_core.rs) |
+| `IRIS_IP28_WATCHGPR` | Guest GPR index whose writes are traced in IP28 bring-up; `developer` builds only. | [src/cpu/mips_core.rs](src/cpu/mips_core.rs) |
 | `IRIS_IP32_RE_TRACE` | Number of O2 rendering-engine primitives to record for `o2 retrace PATH`. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `IRIS_IP32_RE_LAG_US` | Test aid: the O2 rendering engine waits this many microseconds before each memory transfer, as on a host that keeps its thread waiting. Used with `tools/prom-boot-loop.py` to check that the PROM still reaches its menu (see [TESTING.md](TESTING.md#repeated-prom-boots)). | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `IRIS_JIT_ARENA_FLUSH_MB` | Treat a code arena as full when it holds this many MiB, so the compile pool switches arenas and retires the oldest often. For testing the arena rotation. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
