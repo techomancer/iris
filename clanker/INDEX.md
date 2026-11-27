@@ -452,7 +452,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
 | [per-device-saveloadsave-round-trip-is-the-regression-net.md](snapshot/per-device-saveloadsave-round-trip-is-the-regression-net.md) | rule | Per-device save→load→save round-trip is the regression net |
-| [rollback-differs-per-machine.md](snapshot/rollback-differs-per-machine.md) | design | `iris-ci rollback` per machine: Indy captures a live checkpoint, O2 keeps the read snapshot, Octane rereads from disk; all reimport COW overlays |
+| [shared-save-load-and-rollback.md](snapshot/shared-save-load-and-rollback.md) | design | One snapshot save, load, CI restore and rollback for every machine: machines supply six `Workstation` hooks and the shared code does the rest; what stays per machine, risks to schema 11 |
 | [scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md](snapshot/scratch-scsi-volume-sgi-vh-layout-and-irix-raw-device-gotchas.md) | howto | Scratch SCSI volume - SGI VH layout and IRIX raw-device gotchas |
 | [snapshot-manifest-format-snapshottoml-schema-version1.md](snapshot/snapshot-manifest-format-snapshottoml-schema-version1.md) | history | Snapshot manifest format (snapshot.toml schema_version=1) |
 | [snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md](snapshot/snapshot-v2-device-state-is-postcard-encoded-binvalue-bin.md) | design | Snapshot v2 device state is postcard-encoded BinValue *.bin |

@@ -436,6 +436,17 @@ impl Saveable for Eeprom93c56 {
     }
 }
 
+/// How the machine holds it: the state of the chip behind the lock.
+impl Saveable for parking_lot::Mutex<Eeprom93c56> {
+    fn save_state(&self) -> toml::Value {
+        self.lock().save_state_owned()
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        self.lock().load_state_mut(v)
+    }
+}
+
 impl Eeprom93c56 {
     pub fn load_state_mut(&mut self, v: &toml::Value) -> Result<(), String> {
         if let Some(d) = get_field(v, "data") {

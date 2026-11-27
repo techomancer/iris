@@ -94,17 +94,6 @@ impl crate::irq::InterruptController for CpuIrq {
     }
 }
 
-/// Memory into the snapshot chunk store, bank after bank. Banks are whole
-/// chunks (32 or 128 MB), so the list is the one the memory as a single
-/// store gave, and older snapshots load.
-fn put_bank_words(store: &crate::chunk_store::ChunkStore, ram: &crate::dev::crime_mem::O2Memory) -> std::io::Result<Vec<crate::chunk_store::ChunkHash>> {
-    let mut hashes = Vec::new();
-    for words in ram.bank_words() {
-        hashes.extend(crate::chunk_store::put_words_as_chunks(store, words)?);
-    }
-    Ok(hashes)
-}
-
 pub struct O2Machine {
     /// Where this machine has memory.
     pub memory: Arc<crate::memory_map::MemoryMap>,
@@ -148,10 +137,8 @@ pub struct O2Machine {
     /// `Workstation::lifecycle`); never `Running`, which `status` reads from
     /// the CPU.
     lifecycle: crate::machine_state::GuestState,
-    /// The snapshot the CI socket's last `restore` loaded, by name and as it
-    /// was read and checked, for `rollback` to put back without reading it
-    /// again. Only the disks' overlays are read anew, from its directory.
-    last_restore: Option<(String, Box<O2Snapshot>)>,
+    /// The last snapshot loaded, for `parent` and `rollback`.
+    restored: crate::snapshot::Restored,
 }
 
 /// What an O2 snapshot's manifest names as its machine.
@@ -374,7 +361,7 @@ impl O2Machine {
             disks,
             flash_path: Some(cfg.nvram.clone()),
             scratch_path,
-            last_restore: None,
+            restored: Default::default(),
         })
     }
 
@@ -615,174 +602,6 @@ impl O2Machine {
         self.restart_peripherals();
     }
 
-    /// Save the machine to `saves/<name>/`, then run on, as the Indy does.
-    /// The format is the Indy's: device state, memory in the shared chunk
-    /// store (all of it as bank 0), the copy-on-write disks' changes; plus
-    /// the flash and the batch hook's place in the boot. Disks without
-    /// `overlay` are not in it: restoring then pairs saved memory with
-    /// whatever the disk holds by then.
-    pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
-        self.stop();
-        let saved = self.write_snapshot(name);
-        self.restart_peripherals();
-        self.cpu.clone().as_device().start();
-        saved?;
-        println!("Snapshot saved to saves/{name}");
-        Ok(())
-    }
-
-    /// The controllers' and NVMe cards' buses by slot, for a snapshot's overlays.
-    fn placed_disk_buses<'a>(controllers: &'a [Arc<crate::dev::aic7880::Aic7880>], cards: Option<&'a crate::devices::AttachedCards>) -> Vec<crate::snapshot::DiskBus<'a>> {
-        use crate::scsi_monitor::ScsiTargets;
-        let places = crate::topology::scsi_buses(&MachineProfile::O2Ip32.slots()).into_iter().map(|b| b.1);
-        crate::snapshot::disk_buses(places, controllers.iter().map(|c| c.scsi_bus()), cards)
-    }
-
-    fn manifest_devices(&self) -> Vec<(String, crate::slot_path::MachineSlotPath)> {
-        self.bus.cards.get().map(|c| c.manifest()).unwrap_or_default()
-    }
-
-    fn write_snapshot(&self, name: &str) -> Result<(), String> {
-        if let Some(why) = self.bus.cards.get().and_then(|c| c.snapshot_blocker()) {
-            return Err(why);
-        }
-        use crate::chunk_store::{put_words_as_chunks, ChunkStore};
-        use crate::snapshot::{ChunksManifest, Manifest, Snapshot};
-        use crate::traits::Saveable;
-        let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
-        snap.ensure_dir().map_err(|e| e.to_string())?;
-        let mut manifest = Manifest::for_current_save();
-        manifest.machine = Some(SNAPSHOT_MACHINE.into());
-        manifest.disks = self.disks.clone();
-        manifest.devices = self.manifest_devices();
-        manifest.nvram = self.flash_path.clone();
-        manifest.cpu_model = Some(self.cpu.model_name().to_string());
-        manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
-        snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
-        snap.write_state("cpu", &self.cpu.save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("o2", &self.bus.save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("boot", &self.boot.save()).map_err(|e| e.to_string())?;
-        if let Some(cards) = self.bus.cards.get().filter(|c| !c.is_empty()) {
-            snap.write_state("cards", &cards.save_state()).map_err(|e| e.to_string())?;
-        }
-        snap.write_bin("flash.bin", &self.bus.flash_bytes()).map_err(|e| e.to_string())?;
-        let store = ChunkStore::new("saves");
-        let mut chunks = ChunksManifest::default();
-        chunks.bank_chunks[0] = put_bank_words(&store, &self.bus.ram)
-            .map_err(|e| format!("CAS memory put: {e}"))?;
-        snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
-        let controllers = self.bus.scsi.lock().unwrap().clone();
-        crate::snapshot::export_overlays(&snap, &Self::placed_disk_buses(&controllers, self.bus.cards.get()))?;
-        Ok(())
-    }
-
-    /// Restore the machine from `saves/<name>/` and run it. Everything is
-    /// read and checked before the machine is touched, so a snapshot that
-    /// does not fit (another machine, CPU, build, memory or disk) leaves it
-    /// as it was.
-    pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
-        let snap = self.read_snapshot(name)?;
-        self.restore_from(&snap)?;
-        println!("Snapshot loaded from saves/{name}");
-        Ok(())
-    }
-
-    /// Put a read snapshot into the machine and run it.
-    fn restore_from(&mut self, snap: &O2Snapshot) -> Result<(), String> {
-        self.stop();
-        let applied = self.apply_snapshot(snap);
-        self.restart_peripherals();
-        applied?;
-        self.cpu.clone().as_device().start();
-        Ok(())
-    }
-
-    /// The CI socket's `restore`: load `saves/<name>/` and keep it, read and
-    /// checked, for `rollback`. What the guest printed before is dropped, so
-    /// the next command does not read stale output.
-    pub fn ci_restore(&mut self, name: &str) -> Result<(), String> {
-        if let Some(ci) = &self.ci_serial {
-            ci.reset();
-        }
-        let snap = self.read_snapshot(name)?;
-        self.restore_from(&snap)?;
-        self.last_restore = Some((name.to_string(), Box::new(snap)));
-        Ok(())
-    }
-
-    /// The CI socket's `rollback`: back to the state the last `ci_restore`
-    /// loaded. Memory and device state come from the copy kept then; the
-    /// disks' overlays are imported again from the snapshot's directory,
-    /// which the guest's writes since have not touched.
-    pub fn ci_rollback(&mut self) -> Result<(), String> {
-        let (name, snap) = self.last_restore.take().ok_or("no previous restore to roll back to")?;
-        if let Some(ci) = &self.ci_serial {
-            ci.reset();
-        }
-        let result = self.restore_from(&snap).map_err(|e| format!("rollback to {name}: {e}"));
-        self.last_restore = Some((name, snap));
-        result
-    }
-
-    fn read_snapshot(&self, name: &str) -> Result<O2Snapshot, String> {
-        use crate::chunk_store::{get_chunks_as_words, ChunkStore};
-        use crate::snapshot::Snapshot;
-        let snap = Snapshot::new(std::path::PathBuf::from("saves").join(name));
-        let m = snap.read_manifest()?.ok_or_else(|| format!("saves/{name}: no snapshot.toml"))?;
-        if m.machine.as_deref() != Some(SNAPSHOT_MACHINE) {
-            return Err(format!("snapshot {name} is not of an O2"));
-        }
-        if m.host_arch != std::env::consts::ARCH {
-            return Err(format!("snapshot host_arch '{}' does not match current host '{}'", m.host_arch, std::env::consts::ARCH));
-        }
-        crate::snapshot::check_schema(name, m.schema_version)?;
-        // As the Indy: build, CPU, disks and devices must match.
-        crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
-        crate::snapshot::check_slots(&m, &self.manifest_devices())?;
-        let state = |base: &str| snap.read_state(base).map_err(|e| format!("{base}: {e}"));
-        let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
-        let memory = get_chunks_as_words(&ChunkStore::new("saves"), &chunks.bank_chunks[0])
-            .map_err(|e| format!("CAS memory get: {e}"))?;
-        if memory.len() * 4 != self.bus.ram.len() {
-            return Err(format!("snapshot memory is {} MB, this O2 has {} MB",
-                memory.len() >> 18, self.bus.ram.len() >> 20));
-        }
-        let overlays = snap.read_toml("cow.toml").map(|t| crate::snapshot::parse_cow_table(&t)).unwrap_or_default();
-        let cards = match self.bus.cards.get().filter(|c| !c.is_empty()) {
-            Some(_) => state("cards")?,
-            None => toml::Value::Table(Default::default()),
-        };
-        Ok(O2Snapshot {
-            cpu: state("cpu")?,
-            bus: state("o2")?,
-            boot: state("boot")?,
-            cards,
-            flash: snap.read_bin("flash.bin").map_err(|e| format!("flash.bin: {e}"))?,
-            memory,
-            overlays,
-            dir: snap.dir,
-        })
-    }
-
-    /// Put a read snapshot into the stopped machine: the hardware as at
-    /// power-on first, so nothing the snapshot does not hold is left over.
-    fn apply_snapshot(&mut self, s: &O2Snapshot) -> Result<(), String> {
-        use crate::traits::{Resettable, Saveable};
-        Resettable::power_on(&*self.cpu);
-        self.bus.power_on();
-        self.cpu.load_state(&s.cpu)?;
-        self.bus.load_state(&s.bus)?;
-        if let Some(cards) = self.bus.cards.get() {
-            cards.load_state(&s.cards)?;
-        }
-        self.boot.load(&s.boot);
-        self.bus.set_flash(&s.flash)?;
-        self.bus.ram.restore_words(&s.memory)?;
-        let controllers = self.bus.scsi.lock().unwrap().clone();
-        crate::snapshot::import_overlays(&s.dir, &Self::placed_disk_buses(&controllers, self.bus.cards.get()), &s.overlays)?;
-        Ok(())
-    }
-
     /// The shared slot (see [`MachineSlot`]) for this machine, created on
     /// first use. Only once the machine is boxed: the slot records this
     /// address.
@@ -808,20 +627,6 @@ impl O2Machine {
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
         self.timer_manager.clone()
     }
-}
-
-/// A snapshot read and checked, ready to put into the machine.
-struct O2Snapshot {
-    cpu: toml::Value,
-    bus: toml::Value,
-    boot: toml::Value,
-    flash: Vec<u8>,
-    memory: Vec<u32>,
-    /// Every disk's copy-on-write sets, by the disk's slot.
-    overlays: crate::snapshot::OverlaySets,
-    /// The cards' state, by slot.
-    cards: toml::Value,
-    dir: std::path::PathBuf,
 }
 
 impl Drop for O2Machine {
@@ -914,10 +719,58 @@ impl Workstation for O2Machine {
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 
-    fn save_snapshot(&mut self, name: &str) -> Result<(), String> { O2Machine::save_snapshot(self, name) }
-    fn load_snapshot(&mut self, name: &str) -> Result<(), String> { O2Machine::load_snapshot(self, name) }
-    fn ci_restore(&mut self, name: &str) -> Result<(), String> { O2Machine::ci_restore(self, name) }
-    fn ci_rollback(&mut self) -> Result<(), String> { O2Machine::ci_rollback(self) }
+    fn snapshot_refusal(&self) -> Option<String> {
+        self.bus.cards.get().and_then(|c| c.snapshot_blocker())
+    }
+    fn snapshot_layout(&self) -> crate::snapshot::Layout {
+        let cards = self.bus.cards.get();
+        let mut states = vec!["cpu".to_string(), "o2".into(), "boot".into()];
+        states.extend(cards.filter(|c| !c.is_empty()).map(|_| "cards".to_string()));
+        crate::snapshot::Layout {
+            machine: Some(SNAPSHOT_MACHINE),
+            disks: self.disks.clone(),
+            slots: cards.map(|c| c.manifest()).unwrap_or_default(),
+            nvram: self.flash_path.clone(),
+            cpu: (self.cpu.model_name().into(), self.cpu.cache_kind().into()),
+            states,
+            files: vec![("flash.bin".into(), self.bus.flash_bytes().len())],
+            memory: vec![self.bus.ram.len() / 4],
+            ..Default::default()
+        }
+    }
+    fn capture(&self) -> Result<crate::snapshot::Image<'_>, String> {
+        use crate::traits::Saveable;
+        let mut states = vec![("cpu".to_string(), self.cpu.save_state()), ("o2".into(), self.bus.save_state()), ("boot".into(), self.boot.save())];
+        states.extend(self.bus.cards.get().filter(|c| !c.is_empty()).map(|c| ("cards".to_string(), c.save_state())));
+        Ok(crate::snapshot::Image {
+            states,
+            files: vec![("flash.bin".into(), self.bus.flash_bytes())],
+            memory: self.bus.ram.bank_words().into_iter().map(|w| (0, w.into())).collect(),
+            ..Default::default()
+        })
+    }
+    fn apply_image(&mut self, image: &crate::snapshot::Image) -> Result<(), String> {
+        use crate::traits::{Resettable, Saveable};
+        Resettable::power_on(&*self.cpu);
+        self.bus.power_on();
+        self.cpu.load_state(image.state("cpu")?)?;
+        self.bus.load_state(image.state("o2")?)?;
+        if let Some(cards) = self.bus.cards.get() {
+            cards.load_state(image.state("cards").unwrap_or(&toml::Value::Table(Default::default())))?;
+        }
+        self.boot.load(image.state("boot")?);
+        self.bus.set_flash(image.file("flash.bin")?)?;
+        self.bus.ram.restore_words(&image.memory[0].1)
+    }
+    fn with_disk_buses(&self, f: &mut dyn FnMut(&[crate::snapshot::DiskBus]) -> Result<(), String>) -> Result<(), String> {
+        use crate::scsi_monitor::ScsiTargets;
+        let controllers = self.bus.scsi.lock().unwrap().clone();
+        let places = crate::topology::scsi_buses(&MachineProfile::O2Ip32.slots()).into_iter().map(|b| b.1);
+        f(&crate::snapshot::disk_buses(places, controllers.iter().map(|c| c.scsi_bus()), self.bus.cards.get()))
+    }
+    fn snapshots(&mut self) -> Option<&mut crate::snapshot::Restored> {
+        Some(&mut self.restored)
+    }
 
     fn scratch_path(&self) -> Option<&std::path::Path> { self.scratch_path.as_deref() }
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
@@ -1266,6 +1119,7 @@ mod drop_tests {
     use super::*;
     use crate::config::{GraphicsBoard, MachineProfile};
     use crate::display_stop_tests::{big_stack, config, scratch};
+    use crate::workstation::Workstation;
 
     /// A dropped O2 frees its bus and with it the decode table: a process may
     /// have only 64, and a test binary builds many machines.
@@ -1390,6 +1244,9 @@ mod drop_tests {
             machine.stop();
             assert_eq!(read(&machine), (0x11, 0x11), "rolled back from {fill:#x}");
         }
+        machine.save_snapshot("o2-child").unwrap();
+        let child = crate::snapshot::Snapshot::new("saves/o2-child").read_manifest().unwrap().unwrap();
+        assert_eq!(child.parent.as_deref(), Some("o2-rollback"), "a save names the restore it followed");
         drop(machine);
     }
 
