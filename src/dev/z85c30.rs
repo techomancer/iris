@@ -8,10 +8,9 @@ use std::fs::OpenOptions;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
 use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
-use std::thread;
+use crate::net::wake::{host_io, HostPump};
 use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
@@ -481,18 +480,15 @@ pub struct Z85c30 {
     // so `Z85c30` stays `Clone` and the swap is thread-safe.
     backend_a: Arc<Mutex<Arc<dyn SerialBackend>>>,
     backend_b: Arc<Mutex<Arc<dyn SerialBackend>>>,
-    // In-process injection queue for channel B (tty1, the IRIX serial console).
-    // Bytes queued via `inject_b` are delivered to the guest by the channel-B
-    // RX thread ahead of any socket input, so a host action (e.g. the GUI's
-    // "Send IRIX halt") can type at the console without opening a loopback TCP
-    // client. Independent of whichever backend is installed.
-    inject_b: Arc<Mutex<VecDeque<u8>>>,
     // Bounded mirror of channel-B (IRIX serial console) guest output. Lets an
     // in-process reader — the GUI's network probe — scrape the console without
     // opening the 8881 TCP socket. Oldest bytes drop once full.
     console_buf: Arc<Mutex<VecDeque<u8>>>,
+    /// Each channel's receiver, paced on the machine clock.
+    rx: [Arc<Rx>; 2],
     running: Arc<AtomicBool>,
-    threads: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    /// The host-IO thread's passes over each channel, while running.
+    pumps: Arc<Mutex<Vec<HostPump>>>,
 }
 
 /// One channel's transmit path: the shift register's timer and where the
@@ -541,6 +537,81 @@ impl Tx {
     }
 }
 
+/// One channel's receive path: what the host typed waits here, and reaches the FIFO a character
+/// time apart on the machine clock.
+struct Rx {
+    channel: Arc<Mutex<Channel>>,
+    backend: Arc<Mutex<Arc<dyn SerialBackend>>>,
+    state: Mutex<RxState>,
+    timer: Timer,
+}
+
+struct RxState {
+    /// Taken from the host end, not yet in the FIFO; a full FIFO holds bytes here, not drops them.
+    held: VecDeque<u8>,
+    /// When the next character may arrive, in machine ns.
+    clock: u64,
+}
+
+/// A long paste stays in the host end until the held bytes drain.
+const RX_HOLD: usize = 1024;
+/// How long the receiver waits for room in a full FIFO before looking again, in machine ns.
+const RX_FULL_RETRY_NS: u64 = 1_000_000;
+
+impl Rx {
+    /// The host end's turn: write out its output, follow its modem lines, take what it typed.
+    fn pump(&self) -> bool {
+        let backend = self.backend.lock().clone();
+        backend.flush();
+        self.channel.lock().apply_modem_in(backend.modem_in());
+        let mut st = self.state.lock();
+        let before = st.held.len();
+        while st.held.len() < RX_HOLD {
+            let Ok(b) = backend.recv_byte() else { break };
+            st.held.push_back(b);
+        }
+        self.deliver(&mut st) | (st.held.len() > before)
+    }
+
+    /// Move held bytes into the FIFO a character time apart, and arm the timer for the next one.
+    fn deliver(&self, st: &mut RxState) -> bool {
+        // A device's bytes go to the guest as they are; only a console gets the ^E conversion.
+        let raw = self.backend.lock().raw();
+        let now = self.timer.now();
+        let (mut due, mut moved) = (None, false);
+        while let Some(&byte) = st.held.front() {
+            if st.clock > now {
+                due = Some(st.clock);
+                break;
+            }
+            let mut ch = self.channel.lock();
+            let rx_on = ch.regs[scc_regs::WR3 as usize] & wr3::RX_ENABLE != 0;
+            if rx_on && ch.rx_queue.len() >= 8 {
+                due = Some(now + RX_FULL_RETRY_NS);
+                break;
+            }
+            st.held.pop_front();
+            // With RX off the byte is dropped, as on the chip.
+            if !rx_on {
+                continue;
+            }
+            let byte = if byte == 0x05 && !raw { 0x04 } else { byte };
+            crate::dlog_dev!(LogModule::Scc, "SCC: RX({}) '{}' ({:02x})", ch.name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
+            ch.rx_queue.push_back(byte);
+            ch.status |= rr0::RX_CHAR_AVAILABLE;
+            ch.update_ip();
+            // A burst stays on its baud grid; a line idle for 100 ms starts afresh.
+            if now.saturating_sub(st.clock) > 100_000_000 {
+                st.clock = now;
+            }
+            st.clock += ch.tx_delay * 1000;
+            moved = true;
+        }
+        self.timer.set_due(due);
+        moved
+    }
+}
+
 /// Cap on the channel-B console mirror (`console_buf`). 64 KiB is far more than
 /// any single probe response; the buffer is drained on each read.
 const CONSOLE_TAP_CAP: usize = 64 * 1024;
@@ -574,23 +645,29 @@ impl Z85c30 {
                 timer: Timer::new(tm, me, |t: &Tx, _| t.finish()),
             })
         };
+        let rx = |channel: &Arc<Mutex<Channel>>, backend: &Arc<Mutex<Arc<dyn SerialBackend>>>| {
+            Arc::new_cyclic(|me| Rx {
+                channel: channel.clone(),
+                backend: backend.clone(),
+                state: Mutex::new(RxState { held: VecDeque::new(), clock: 0 }),
+                timer: Timer::new(tm, me, |r: &Rx, _| _ = r.deliver(&mut r.state.lock())),
+            })
+        };
         Self {
+            rx: [rx(&channel_a, &backend_a), rx(&channel_b, &backend_b)],
             tx: [tx("A", &channel_a, &backend_a, None), tx("B", &channel_b, &backend_b, Some(console_buf.clone()))],
             channel_a,
             channel_b,
             backend_a,
             backend_b,
-            inject_b: Arc::new(Mutex::new(VecDeque::new())),
             console_buf,
             running: Arc::new(AtomicBool::new(false)),
-            threads: Arc::new(Mutex::new(Vec::new())),
+            pumps: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Swap in an alternate backend for channel A (tty2 on Indy).
-    /// Must be called before `start()` — the running RX thread caches the
-    /// backend Arc at spawn time and will not observe the new one until
-    /// it is stopped and restarted.
+    /// Must be called before `start()`.
     pub fn set_backend_a(&self, backend: Arc<dyn SerialBackend>) {
         *self.backend_a.lock() = backend;
     }
@@ -615,7 +692,8 @@ impl Z85c30 {
     /// Used by the GUI's "Send IRIX halt" for a clean shutdown that doesn't
     /// depend on the serial server socket.
     pub fn inject_b(&self, data: &[u8]) {
-        self.inject_b.lock().extend(data.iter().copied());
+        self.rx[1].state.lock().held.extend(data);
+        host_io().wake.notify();
     }
 
     /// Drain and return the channel-B (IRIX serial console) output captured
@@ -769,7 +847,7 @@ impl Z85c30 {
         use crate::locks::{register_mutex, register_mutex_fn};
         register_mutex_fn("scc::channel_a", &self.channel_a, |c| c.is_locked());
         register_mutex_fn("scc::channel_b", &self.channel_b, |c| c.is_locked());
-        register_mutex("scc::threads", &self.threads);
+        register_mutex("scc::pumps", &self.pumps);
     }
 }
 
@@ -781,130 +859,27 @@ impl Device for Z85c30 {
         for t in &self.tx {
             t.timer.stop();
         }
-        let mut threads = self.threads.lock();
-        for t in threads.drain(..) {
-            let _ = t.join();
+        for r in &self.rx {
+            r.timer.stop();
         }
+        self.pumps.lock().clear();
     }
 
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
         }
-
         for t in &self.tx {
             t.timer.start();
         }
-        self.resend_lines();
-        let pairs = [
-            (self.channel_a.clone(), self.backend_a.lock().clone()),
-            (self.channel_b.clone(), self.backend_b.lock().clone()),
-        ];
-
-        let mut threads = self.threads.lock();
-
-        for (i, (channel_arc, backend)) in pairs.iter().enumerate() {
-            let ch_name = if i == 0 { "A" } else { "B" };
-            // RX Thread
-            let rx_channel = channel_arc.clone();
-            let rx_backend = backend.clone();
-            let running = self.running.clone();
-            // Only channel B (the IRIX serial console) accepts in-process
-            // injection; channel A has no queue.
-            let rx_inject = if i == 1 { Some(self.inject_b.clone()) } else { None };
-
-            threads.push(thread::Builder::new().name(format!("SCC-RX-{}", ch_name)).spawn(move || {
-                let mut last_rx_time = Instant::now();
-                // When the SCC's 8-byte rx_queue is full, hold the just-read
-                // byte here and retry on the next iteration instead of
-                // dropping it. This prevents loss when the host pushes a
-                // long line into CiSerialBackend faster than IRIX's tty
-                // driver clocks bytes off rx_queue. Without this hold, a
-                // ~30-char `dd if=/dev/rdsk/dks0d2s0 bs=512` arrives at
-                // the shell as `dd if=/d=512` (chars 9..24 dropped).
-                let mut pending: Option<u8> = None;
-                // A device's bytes go to the guest as they are; only a
-                // console gets the ^E conversion below.
-                let raw = rx_backend.raw();
-                let mut modem = ModemIn::IDLE;
-
-                while running.load(Ordering::Relaxed) {
-                    // This loop is the line's poll: it writes out queued output too.
-                    rx_backend.flush();
-                    let m = rx_backend.modem_in();
-                    if m != modem {
-                        modem = m;
-                        rx_channel.lock().apply_modem_in(m);
-                    }
-                    let mut byte = match pending.take() {
-                        Some(b) => b,
-                        // In-process injection (channel B) takes priority over
-                        // socket input, so a queued "halt\n" is delivered even
-                        // when no TCP client is attached.
-                        None => match rx_inject.as_ref().and_then(|q| q.lock().pop_front()) {
-                            Some(b) => b,
-                            None => match rx_backend.recv_byte() {
-                                Ok(b) => b,
-                                Err(_) => {
-                                    thread::sleep(Duration::from_millis(10));
-                                    continue;
-                                }
-                            },
-                        },
-                    };
-                    if byte == 0x05 && !raw {
-                        crate::dlog_dev!(LogModule::Scc, "SCC: Converting ^E to ^D (BREAK)");
-                        byte = 0x04;
-                    }
-
-                    let lock = &*rx_channel;
-                    let mut channel = lock.lock();
-
-                    let wr3 = channel.regs[scc_regs::WR3 as usize];
-                    let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
-                    let delay_micros = channel.tx_delay;
-                    let char_duration = Duration::from_micros(delay_micros);
-
-                    if !rx_enabled {
-                        // RX disabled — drop the byte (matches real hw with
-                        // RX off). Don't hold it in `pending` or we'd block
-                        // forever waiting for re-enable.
-                        drop(channel);
-                        continue;
-                    }
-
-                    if channel.rx_queue.len() >= 8 {
-                        // SCC FIFO full. Hold the byte and back off briefly
-                        // so the guest's tty driver gets a chance to drain
-                        // rx_queue. Don't drop — that's the bug this
-                        // section fixes.
-                        drop(channel);
-                        pending = Some(byte);
-                        thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-
-                    crate::dlog_dev!(LogModule::Scc, "SCC: RX({}) '{}' ({:02x})", channel.name, if byte.is_ascii_graphic() { byte as char } else { '.' }, byte);
-                    channel.rx_queue.push_back(byte);
-                    channel.status |= rr0::RX_CHAR_AVAILABLE;
-                    channel.update_ip();
-                    drop(channel);
-
-                    // Pacing — simulate baud-rate inter-character spacing.
-                    let now = Instant::now();
-                    if last_rx_time < now {
-                        if now.duration_since(last_rx_time) > Duration::from_millis(100) {
-                            last_rx_time = now;
-                        }
-                    }
-                    last_rx_time += char_duration;
-                    let wait = last_rx_time.saturating_duration_since(now);
-                    if !wait.is_zero() {
-                        thread::sleep(wait);
-                    }
-                }
-            }).unwrap());
+        for r in &self.rx {
+            r.timer.start();
         }
+        self.resend_lines();
+        *self.pumps.lock() = self.rx.iter().map(|r| {
+            let r = r.clone();
+            host_io().add(move || r.pump())
+        }).collect();
     }
 
     fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
@@ -955,7 +930,7 @@ impl Device for Z85c30 {
 impl Resettable for Z85c30 {
     /// Reset both SCC channels to power-on state.
     /// The backend TcpStream is NOT touched — the host console connection survives.
-    /// Threads keep running (they idle when tx_enabled / rx_enabled are off).
+    /// The receive pumps keep running (they drop input while rx is off).
     fn power_on(&self) {
         for (ch, t) in [(&self.channel_a, &self.tx[0]), (&self.channel_b, &self.tx[1])] {
             ch.lock().reset();
@@ -1026,6 +1001,8 @@ impl Saveable for Z85c30 {
 pub(crate) mod tests {
     use super::*;
     use crate::dev::serial_host::{CiSerialBackend, TcpSocketBackend};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     /// Two clients on one TCP serial console: both see every byte the guest
     /// sends, and what either types arrives, with telnet's own commands
@@ -1132,13 +1109,13 @@ pub(crate) mod tests {
     #[test]
     fn long_input_round_trips_without_loss() {
         use std::sync::Arc;
-        use std::time::{Duration, Instant};
 
-        let scc = Z85c30::new(None, &Arc::new(TimerManager::new()));
+        let tm = Arc::new(TimerManager::new());
+        let scc = Z85c30::new(None, &tm);
         let backend = Arc::new(CiSerialBackend::new());
         scc.set_backend_a(backend.clone());
 
-        // Enable RX on channel A so the rx thread queues bytes. tx_delay is
+        // Enable RX on channel A so the receiver queues bytes. tx_delay is
         // tx-direction baud-rate emulation; set a small value so the test
         // doesn't pay 19.2 kbaud-per-char latency.
         {
@@ -1152,7 +1129,7 @@ pub(crate) mod tests {
         let line = b"dd if=/dev/rdsk/dks0d2s0 of=/tmp/r.bin bs=512 count=1\r";
         backend.push_host(line);
 
-        // Drain rx_queue at ~20 kHz so the rx thread always has space to
+        // Drain rx_queue at ~20 kHz so the receiver always has space to
         // push pending bytes. Mirrors how IRIX's tty driver consumes
         // RR0::RX_CHAR_AVAILABLE.
         let mut received = Vec::with_capacity(line.len());
@@ -1428,13 +1405,45 @@ pub(crate) mod tests {
         probe.rx.lock().extend([0x05u8, 0x41]);
         scc.set_backend_a(probe.clone());
         wr_a(&scc, 3, 0xc1);
+        scc.channel_a.lock().tx_delay = 50;
         scc.start();
-        let until = Instant::now() + Duration::from_secs(5);
-        while scc.channel_a.lock().rx_queue.len() < 2 && Instant::now() < until {
-            thread::sleep(Duration::from_millis(5));
-        }
+        assert!(crate::test_board::until(|| scc.rx[0].timer.due().is_some()), "the first byte arrived");
+        clock.step(50_000);
         scc.stop();
         assert_eq!(scc.channel_a.lock().rx_queue.iter().copied().collect::<Vec<_>>(), [0x05, 0x41]);
+    }
+
+    /// Host input reaches the FIFO a character time apart on the machine clock, not on host time.
+    #[test]
+    fn receive_is_paced_by_a_timer_on_the_machine_clock() {
+        let clock = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &clock.tm);
+        let probe = LineProbe::new();
+        probe.rx.lock().extend([1u8, 2]);
+        scc.set_backend_a(probe.clone());
+        wr_a(&scc, 3, 0xc1);
+        scc.channel_a.lock().tx_delay = 50;
+        scc.start();
+        assert!(crate::test_board::until(|| scc.rx[0].timer.due().is_some()));
+        assert_eq!(scc.channel_a.lock().rx_queue.len(), 1);
+        clock.step(49_999);
+        assert_eq!(scc.channel_a.lock().rx_queue.len(), 1, "not before its time is up");
+        clock.step(1);
+        assert_eq!(scc.channel_a.lock().rx_queue.len(), 2);
+        scc.stop();
+    }
+
+    /// Bytes injected in-process reach channel B's FIFO with no host end attached.
+    #[test]
+    fn injected_bytes_reach_channel_b() {
+        let tm = Arc::new(TimerManager::new());
+        let scc = Z85c30::new(None, &tm);
+        scc.write_b_control(scc_regs::WR3);
+        scc.write_b_control(0xc1);
+        scc.start();
+        scc.inject_b(b"h");
+        assert!(crate::test_board::until(|| scc.channel_b.lock().rx_queue.len() == 1));
+        scc.stop();
     }
 
     #[test]
@@ -1491,6 +1500,7 @@ pub(crate) mod tests {
             self.0.read_b_control() & rr0::TX_BUFFER_EMPTY != 0
         }
         fn poll(&mut self) {
+            self.0.rx[1].pump();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
