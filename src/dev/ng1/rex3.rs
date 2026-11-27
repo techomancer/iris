@@ -3001,6 +3001,10 @@ impl Rex3 {
     // get subtly wrong.
 
     fn wake_gfifo_processor(&self) {
+        // ci_clock: no processor thread; the write runs its loop until the GFIFO is empty.
+        if cfg!(feature = "ci_clock") {
+            return self.register_processor();
+        }
         if !self.processor_parked.load(Ordering::Acquire) {
             return;
         }
@@ -3324,7 +3328,7 @@ impl Rex3 {
                         self.flush_resident_if_due();
                     }
                 }
-            } else if !lingered {
+            } else if !lingered && cfg!(not(feature = "ci_clock")) {
                 // Linger before going idle. A consumer that keeps pace with
                 // the producer reads the tail and each slot just after the
                 // producer writes them, so every push pays a cache-line
@@ -3357,6 +3361,9 @@ impl Rex3 {
                     //self.update_gfifo_irqs();
                 }
                 self.gfifo.flush_head();
+                if cfg!(feature = "ci_clock") {
+                    return;
+                }
                 // Nothing in the ring — back off. Spin-hint/yield while a burst
                 // might still be in flight; once emptiness is *sustained*
                 // (crossbeam's backoff completes), stop burning a host core on
@@ -4386,10 +4393,14 @@ impl Device for Rex3 {
         // arguments the compiled shader does instead of a `&Rex3`.
         unsafe { (*self.context.get()).host = rex3 as *const Rex3; }
 
-        *self.processor_thread.lock() = Some(thread::Builder::new().name(self.tag("REX3-Processor")).spawn(move || {
-            crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Processor);
-            rex3.register_processor()
-        }).unwrap());
+        // ci_clock: no processor thread; a push runs `register_processor` itself.
+        #[cfg(not(feature = "ci_clock"))]
+        {
+            *self.processor_thread.lock() = Some(thread::Builder::new().name(self.tag("REX3-Processor")).spawn(move || {
+                crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Processor);
+                rex3.register_processor()
+            }).unwrap());
+        }
 
         let shim = self.head_shim.get_or_init(|| Arc::new(Rex3Head(rex3)));
         let head: Arc<dyn crate::display::Head> = shim.clone();
@@ -4979,7 +4990,8 @@ impl Rex3 {
                     }
                     let dcb = self.dcb.lock();
                     if let Some(until) = dcb.backbusy_until {
-                        if std::time::Instant::now() < until { val |= STATUS_BACKBUSY; }
+                        // ci_clock: the board is always done by the time the CPU looks (inline engine).
+                        if cfg!(not(feature = "ci_clock")) && std::time::Instant::now() < until { val |= STATUS_BACKBUSY; }
                     }
                 }
                 BusRead32::ok(val & 0xFFFFF)

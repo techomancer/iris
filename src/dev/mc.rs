@@ -777,7 +777,7 @@ impl BusDevice for MemoryController {
         let mut state = self.state.lock();
         state.update_timers();
 
-        match offset as u32 {
+        let result = match offset as u32 {
             REG_CPUCTRL0 => {
                 if (val & (1 << 9)) != 0 {
                     // SIN: System INitialization — full power-cycle reset
@@ -1028,7 +1028,15 @@ impl BusDevice for MemoryController {
 
                 BUS_OK
             }
+        };
+        // ci_clock: a trigger runs its transfer before the access returns, with the MC unlocked
+        // for what it reaches. Approximation: RUN stays latched for one read, as the PROM expects.
+        #[cfg(feature = "ci_clock")]
+        if self.giodma.state.lock().run_real {
+            drop(state);
+            self.dma_worker();
         }
+        result
     }
 
     // MC is a 32-bit device - 8/16-bit accesses not supported
@@ -1090,6 +1098,10 @@ impl Device for MemoryController {
         if self.running.swap(true, Ordering::SeqCst) { return; }
         // Don't bill the guest for the time since construction.
         { let mut st = self.state.lock(); st.last_ns = st.clock.now(); }
+        // ci_clock: no thread; a trigger runs `dma_worker` itself.
+        if cfg!(feature = "ci_clock") {
+            return;
+        }
         let mc = self.clone();
         self.threads.lock().push(thread::Builder::new().name("MC-DMA".to_string()).spawn(move || {
             mc.dma_worker();

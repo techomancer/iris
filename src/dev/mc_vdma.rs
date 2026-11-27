@@ -1221,6 +1221,10 @@ impl MemoryController {
             // before the worker first waits (right after `start`) would
             // otherwise be lost, and the guest would poll RUNNING forever.
             while !state.run_real && self.dma_running() {
+                // ci_clock: called by the trigger, it returns once the transfer is done.
+                if cfg!(feature = "ci_clock") {
+                    return;
+                }
                 cvar.wait(&mut state);
             }
 
@@ -1943,6 +1947,34 @@ mod line_bulk_tests_support {
         mc
     }
 
+    /// Under `ci_clock` a trigger write runs its transfer before it returns: the next read of
+    /// DMA_RUN finds the engine idle with the transfer done.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_dma_run_latches_busy_for_one_read_with_the_transfer_done() {
+        use crate::dev::mc::*;
+        use crate::traits::{BusDevice, Device};
+        let sink = Arc::new(GioSink::new(true));
+        for i in 0..8u32 {
+            sink.mem.write8((0x2000 + i) as u64, pattern(i));
+        }
+        let mc = mc_with(sink.clone());
+        mc.start();
+        let reg = |r: u32| (MC_BASE + r) as u64;
+        mc.write32(reg(REG_DMA_MEMADR), 0x2000);
+        mc.write32(reg(REG_DMA_SIZE), (1 << 16) | 8);
+        mc.write32(reg(REG_DMA_STRIDE), 1 << 16);
+        mc.write32(reg(REG_DMA_GIO_ADR), 0x1f0f_0a30);
+        mc.write32(reg(REG_DMA_MODE), DMA_MODE_DIR);
+        mc.write32(reg(REG_DMA_STDMA), 1);
+        assert_eq!(mc.giodma().state.lock().memadr, 0x2008, "the 8 bytes were moved");
+        let run = mc.read32(reg(REG_DMA_RUN)).data;
+        assert_ne!(run & DMA_RUN_RUN, 0, "RUN latched for the first read: {run:#x}");
+        assert_ne!(run & DMA_CAUSE_COMPLETE, 0, "complete");
+        assert_eq!(mc.read32(reg(REG_DMA_RUN)).data & DMA_RUN_RUN, 0, "idle on the second read");
+        mc.stop();
+    }
+
     /// Distinct, non-zero byte per address so a skew or a dropped line shows as
     /// a wrong value rather than a coincidentally-equal one.
     pub(super) fn pattern(i: u32) -> u8 { ((i.wrapping_mul(31) ^ (i >> 5)) % 251 + 1) as u8 }
@@ -2414,6 +2446,8 @@ mod gio32_tests {
     /// The trigger lands before the worker thread exists, so the worker has
     /// nobody to notify it: it must see the pending run flag on its own
     /// instead of sleeping until a second trigger that never comes.
+    // The worker thread's wake-up: a ci_clock transfer runs inline and has no worker.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn a_trigger_written_before_the_worker_starts_still_runs() {
         polled_vdma(true);

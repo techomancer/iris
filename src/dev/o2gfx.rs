@@ -1807,6 +1807,10 @@ impl CrimeRe {
         if self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        // ci_clock: no thread; `cpu_write` runs the engine until the buffer is empty.
+        if cfg!(feature = "ci_clock") {
+            return;
+        }
         let worker = std::thread::Builder::new()
             .name("CRIME-RE".into())
             .spawn(move || {
@@ -1851,7 +1855,7 @@ impl CrimeRe {
                 }
                 // Stays set across sleeps, so an idle engine wakes only for
                 // the park backstop and goes straight back to sleep.
-                if self.quit.load(Relaxed) {
+                if self.quit.load(Relaxed) || cfg!(feature = "ci_clock") {
                     return;
                 }
                 let since = *idle_since.get_or_insert_with(std::time::Instant::now);
@@ -2050,6 +2054,9 @@ impl CrimeRe {
         }
         self.polled_busy.store(false, std::sync::atomic::Ordering::Relaxed);
         self.record(off, val, width);
+        #[cfg(feature = "ci_clock")]
+        self.run();
+        #[cfg(not(feature = "ci_clock"))]
         self.wake();
         BUS_OK
     }
@@ -4529,6 +4536,8 @@ mod tests {
     /// than one poll's wait. The first read after a write still answers
     /// busy without waiting long, so a driver that only checks for room
     /// keeps drawing while the engine works.
+    // The engine thread's back-pressure: a ci_clock engine runs inline and never answers busy.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn a_status_wait_loop_outlasts_an_engine_held_off_the_processor() {
         let re = Arc::new(CrimeRe::new(Arc::new(O2Memory::single(32 << 20))));
@@ -4595,9 +4604,34 @@ mod tests {
         assert_eq!(status, RE_STATUS_IDLE);
     }
 
+    /// Under `ci_clock` no thread draws: an MTE clear is done when the write that starts it
+    /// returns, so the status read that follows answers idle with the memory clear.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_an_mte_clear_is_done_before_the_status_read() {
+        let ram = Arc::new(O2Memory::single(32 << 20));
+        let addr = 0x0011_4000u32;
+        ram.write(addr as usize, &[0x55; 0x2000]);
+        let re = Arc::new(CrimeRe::new(ram.clone()));
+        re.start(re.clone(), |r| r);
+        assert!(re.worker.lock().unwrap().is_none(), "no engine thread");
+        let reg = |off: u32| (0x1500_0000 + off) as u64;
+        let page = addr >> 12;
+        let pair = ((1u64 << 31 | page as u64) << 32) | (1u64 << 31 | (page + 1) as u64);
+        assert_eq!(re.write64(reg(TLB_LINEAR_A + 8 * ((page & 31) >> 1)), pair), BUS_OK);
+        for (off, val) in [(MTE_DST0, addr), (MTE_DST1, addr + 0x1fff), (MTE_FG, 0), (MTE_BYTEMASK, 0xffff_ffff), (MTE_MODE | 0x800, 0x11)] {
+            assert_eq!(re.write32(reg(off), val), BUS_OK);
+        }
+        assert!(ram.bytes(addr as usize, 0x2000).iter().all(|&b| b == 0), "the clear is done");
+        let status = re.read32(reg(STATUS));
+        assert_eq!((status.status, status.data), (BUS_OK, RE_STATUS_IDLE), "read at once, answered idle");
+    }
+
     /// A full interface buffer holds the CPU's write back (BUS_BUSY) with
     /// nothing lost, and the status word shows the level as CRIME's 64
     /// entries would: what is queued below that, one entry past it.
+    // As above: no queue fills when the engine runs inline.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn a_full_interface_buffer_asks_the_cpu_to_retry() {
         let re = CrimeRe::new(Arc::new(O2Memory::single(32 << 20)));
