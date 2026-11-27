@@ -174,49 +174,6 @@ pub struct Machine {
 
 #[cfg(feature = "wgpu")]
 type ResidentCheckpoint = (toml::Value, (Vec<u32>, Vec<u32>));
-type MgrasCheckpoint = (String, Vec<(String, Vec<u32>)>);
-type Gr2Checkpoint = crate::dev::gr2::Gr2SnapshotParts;
-
-/// Full-machine in-memory checkpoint captured from *live* running state
-/// (not a named snapshot on disk). Used by the interactive monitor's `j2 trace <n>` /
-/// `j2 replay` (`SystemController::execute_command`) to get a real,
-/// byte-exact rewind point — including device state, not just CPU
-/// registers — for comparing an interpreter-only reference run against a
-/// real-JIT-dispatch run of the same instruction window.
-///
-/// Deliberately does **not** capture SCSI controller or COW-overlay dirty-
-/// sector state — there is no "just loaded from snapshot X" name to
-/// reference here (this captures live, mid-session state, not a disk
-/// snapshot restore), and building a live-capture equivalent of
-/// a snapshot's overlay handling is real, correctness-sensitive
-/// work (get it wrong and it's disk corruption, not just a debugging
-/// inconvenience) that early-boot PROM debugging — the actual motivating
-/// use case — doesn't need at all (PROM hasn't touched SCSI yet). Restoring
-/// a `LiveCheckpoint` taken after the guest has performed real disk I/O
-/// will silently leave SCSI/disk state at whatever it drifted to during the
-/// replayed window, not rewound — safe for CPU/JIT correctness comparisons
-/// (nothing here reads disk contents), unsafe to treat as a general
-/// save-state substitute once boot reaches real disk access.
-pub(crate) struct LiveCheckpoint {
-    bank_words: [Vec<u32>; 4],
-    framebuffers: Option<(Vec<u32>, Vec<u32>)>,
-    #[cfg(feature = "wgpu")]
-    resident_head1_framebuffers: Option<(Vec<u32>, Vec<u32>)>,
-    cpu: toml::Value,
-    mc: toml::Value,
-    ioc: toml::Value,
-    scc: toml::Value,
-    pit: toml::Value,
-    ps2: toml::Value,
-    rtc: toml::Value,
-    eeprom: toml::Value,
-    seeq: toml::Value,
-    hpc3: toml::Value,
-    rex3: Option<toml::Value>,
-    rex3_head1: Option<toml::Value>,
-    mgras: Option<MgrasCheckpoint>,
-    gr2: Option<Gr2Checkpoint>,
-}
 
 /// One Newport head's monitor commands under numbered names: `rex1`,
 /// `vc21`, `xmap1`, `cmap1`, `bt4451`, `dcb1`, `disp1` for the second head.
@@ -1469,183 +1426,18 @@ impl Machine {
             .transpose()
     }
 
-    #[cfg(feature = "wgpu")]
-    fn validate_resident_primary_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
-        if self.board.rex3.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
-            return Err("resident REX3 checkpoint requires registers and both planes".into());
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "wgpu")]
-    fn validate_resident_head1_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
-        if self.board.rex3_head1.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
-            return Err("resident REX3 head 1 checkpoint requires registers and both planes".into());
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "wgpu")]
-    fn restore_resident_head1_framebuffers(
-        &self,
-        has_registers: bool,
-        planes: Option<&(Vec<u32>, Vec<u32>)>,
-    ) -> Result<(), String> {
-        if let Some(rex) = self.board.rex3_head1.as_ref().filter(|rex| rex.resident_active()) {
-            if !has_registers {
-                return Err("resident REX3 head 1 checkpoint has no registers".into());
-            }
-            let (rgb, aux) = planes.ok_or("resident REX3 head 1 checkpoint has no planes")?;
-            rex.try_restore_framebuffers_inmem(rgb, aux)
-                .map_err(|error| format!("restore resident REX3 head 1 framebuffers: {error}"))?;
-        }
-        Ok(())
-    }
-
-    /// Capture a `LiveCheckpoint` from the machine's current running state —
-    /// see that struct's doc comment for how this differs from
-    /// `capture_rollback_checkpoint` (no SCSI/overlay capture; no on-disk
-    /// snapshot name involved at all). Leaves the whole machine stopped on
-    /// return (CPU and peripherals) — every real caller immediately follows
-    /// this with a `restore_live_checkpoint` call anyway (which restarts
-    /// peripherals itself, CPU staying parked for inline single-stepping —
-    /// see its own doc comment), so there's no need to restart anything
-    /// here just to have it stopped again a moment later.
-    pub(crate) fn capture_live_checkpoint(&mut self) -> LiveCheckpoint {
+    /// The machine as it is, for `j2 trace` and `j2 replay` to rewind to: SCSI registers, not
+    /// disk contents. Leaves it stopped, as the restore that follows wants.
+    pub(crate) fn capture_live_checkpoint(&mut self) -> crate::snapshot::Image<'static> {
         self.stop();
-
-        #[cfg(feature = "wgpu")]
-        let resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())
-            .unwrap_or_else(|error| panic!("REX3 {error}"));
-        #[cfg(feature = "wgpu")]
-        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())
-            .unwrap_or_else(|error| panic!("REX3 {error}"));
-        let cpu = self.cpu.save_state();
-        let mc = self.mc.save_state();
-        let ioc = self.hpc3.ioc().save_state();
-        let scc = self.hpc3.ioc().scc().save_state();
-        let pit = self.hpc3.ioc().pit().save_state();
-        let ps2 = self.hpc3.ioc().ps2().save_state();
-        let rtc = self.hpc3.rtc().save_state();
-        let eeprom = self.hpc3.eeprom().lock().save_state_owned();
-        let seeq = self.hpc3.seeq().save_state();
-        let hpc3 = self.hpc3.save_state();
-        let rex3 = self.board.rex3.as_ref().map(|r| {
-            #[cfg(feature = "wgpu")]
-            if let Some((state, _)) = &resident_primary { return state.clone(); }
-            r.save_state()
-        });
-        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| {
-            #[cfg(feature = "wgpu")]
-            if let Some((state, _)) = &resident_head1 { return state.clone(); }
-            r.save_state()
-        });
-        let mgras = self
-            .board
-            .mgras
-            .as_ref()
-            .map(|m| m.snapshot_parts())
-            .transpose()
-            .unwrap_or_else(|error| panic!("IMPACT {error}"));
-        let gr2 = self
-            .board
-            .gr2
-            .as_ref()
-            .map(|g| g.snapshot_parts())
-            .transpose()
-            .unwrap_or_else(|error| panic!("GR2 {error}"));
-
-        let bank_words: [Vec<u32>; 4] = [
-            self.board.phys.snapshot_bank_inmem(0),
-            self.board.phys.snapshot_bank_inmem(1),
-            self.board.phys.snapshot_bank_inmem(2),
-            self.board.phys.snapshot_bank_inmem(3),
-        ];
-
-        #[cfg(feature = "wgpu")]
-        let framebuffers = match resident_primary {
-            Some((_, planes)) => Some(planes),
-            None => self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem()),
-        };
-        #[cfg(not(feature = "wgpu"))]
-        let framebuffers = self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem());
-        #[cfg(feature = "wgpu")]
-        let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
-
-        // Deliberately NOT restart_peripherals()/cpu.start() here — see this
-        // function's own doc comment.
-
-        LiveCheckpoint {
-            bank_words,
-            framebuffers,
-            #[cfg(feature = "wgpu")]
-            resident_head1_framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, rex3, rex3_head1, mgras, gr2,
-        }
+        self.capture_image().unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// Restore a `LiveCheckpoint` captured by `capture_live_checkpoint`.
-    /// Does not touch SCSI controller state or disk contents at all — see
-    /// `LiveCheckpoint`'s doc comment. Leaves the CPU thread stopped on
-    /// return (so a caller doing its own inline single-stepping via
-    /// `cpu_step_one_inline_counting_instructions` doesn't race a
-    /// free-running CPU thread for the executor lock), but restarts
-    /// MC/HPC3/REX3 before returning — the full `self.stop()` below is only
-    /// needed transiently, to safely load device state without a live
-    /// device thread mutating it mid-load; there's no reason to leave
-    /// peripherals stopped after that's done, and every prior version of
-    /// this function that did was a real, repeatedly-hit bug (the rest of
-    /// the monitor console — symbol lookups, device register reads —
-    /// stayed unresponsive after every `jitcheck` for no reason).
-    pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
+    /// Put back a checkpoint of [`Machine::capture_live_checkpoint`]. The peripherals run on and
+    /// the CPU stays stopped, for the caller's inline single-stepping.
+    pub(crate) fn restore_live_checkpoint(&mut self, cp: &crate::snapshot::Image) -> Result<(), String> {
         self.stop();
-        self.event_tx.powered_on();
-        #[cfg(feature = "wgpu")]
-        self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
-        #[cfg(feature = "wgpu")]
-        self.validate_resident_head1_checkpoint(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.is_some())?;
-
-        self.cpu.load_state(&cp.cpu)?;
-        self.mc.load_state(&cp.mc)?;
-        self.hpc3.ioc().load_state(&cp.ioc)?;
-        self.hpc3.ioc().scc().load_state(&cp.scc)?;
-        self.hpc3.ioc().pit().load_state(&cp.pit)?;
-        self.hpc3.ioc().ps2().load_state(&cp.ps2)?;
-        self.hpc3.rtc().load_state(&cp.rtc)?;
-        self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
-        self.hpc3.seeq().load_state(&cp.seeq)?;
-        self.hpc3.load_state(&cp.hpc3)?;
-        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3, &cp.rex3) {
-            rex3.load_state(rex3_toml)?;
-        }
-        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3_head1, &cp.rex3_head1) {
-            rex3.load_state(rex3_toml)?;
-        }
-
-        for (i, words) in cp.bank_words.iter().enumerate() {
-            self.board.phys.restore_bank_inmem(i, words);
-        }
-        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
-            rex3.try_restore_framebuffers_inmem(rgb, aux)
-                .map_err(|error| format!("restore REX3 framebuffers: {error}"))?;
-        }
-        #[cfg(feature = "wgpu")]
-        self.restore_resident_head1_framebuffers(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.as_ref())?;
-        match (&self.board.mgras, &cp.mgras) {
-            (Some(mgras), Some((metadata, parts))) => mgras.restore_snapshot_parts(metadata, parts)?,
-            (Some(_), None) => return Err("live checkpoint has no state for the configured IMPACT board".into()),
-            (None, Some(_)) => return Err("live checkpoint contains IMPACT state but the machine has no IMPACT board".into()),
-            (None, None) => {}
-        }
-        match (&self.board.gr2, &cp.gr2) {
-            (Some(gr2), Some((metadata, parts))) => gr2.restore_snapshot_parts(metadata, parts)?,
-            (Some(_), None) => return Err("live checkpoint has no state for the configured GR2 board".into()),
-            (None, Some(_)) => return Err("live checkpoint contains GR2 state but the machine has no GR2 board".into()),
-            (None, None) => {}
-        }
-
-        // Peripherals back up; CPU deliberately left stopped — see this
-        // function's own doc comment.
+        self.apply_image(cp)?;
         self.restart_peripherals();
         Ok(())
     }
@@ -1904,10 +1696,12 @@ impl Workstation for Machine {
         if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &image.framebuffer) {
             rex3.try_restore_framebuffers_inmem(rgb, aux).map_err(|e| format!("restore REX3 framebuffers: {e}"))?;
         }
-        if let (Some(mgras), Some(b)) = (&self.board.mgras, image.board("mgras")) {
+        if let Some(mgras) = &self.board.mgras {
+            let b = image.board("mgras").ok_or("image has no state for the configured IMPACT board")?;
             mgras.restore_snapshot_parts(&b.metadata, &b.parts)?;
         }
-        if let (Some(gr2), Some(b)) = (&self.board.gr2, image.board("gr2")) {
+        if let Some(gr2) = &self.board.gr2 {
+            let b = image.board("gr2").ok_or("image has no state for the configured GR2 board")?;
             gr2.restore_snapshot_parts(&b.metadata, &b.parts)?;
         }
         Ok(())
@@ -2488,7 +2282,7 @@ mod gr2_checkpoint_tests {
             machine.stop();
 
             let mut missing = machine.capture_live_checkpoint();
-            missing.gr2 = None;
+            missing.boards.clear();
             assert!(machine
                 .restore_live_checkpoint(&missing)
                 .unwrap_err()

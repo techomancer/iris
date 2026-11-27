@@ -131,13 +131,10 @@ pub struct JitDeterminismReport {
 /// via Cranelift, on every dispatch, in-process — correct but very slow, and
 /// only ever compiled into a `jitv2_lockstep` build). This runs the
 /// interpreter-only reference pass and the real-JIT-dispatch pass as two
-/// genuinely separate full passes over the same starting `LiveCheckpoint`,
+/// genuinely separate full passes over the same starting checkpoint,
 /// comparing per-instruction, on any normal `jitv2` (non-lockstep) build —
 /// usable directly against a live, already-running, already-mid-boot
-/// machine (no named on-disk snapshot required — see `LiveCheckpoint`'s doc
-/// comment for what that does and doesn't capture: no SCSI/disk state, safe
-/// for early-boot PROM debugging, not a general save-state substitute once
-/// real disk I/O is in play).
+/// machine (no named on-disk snapshot required).
 ///
 /// Stops at the first *unskipped* divergence, full stop — no open-ended
 /// reconverge-and-keep-scanning-for-more. An earlier version of this
