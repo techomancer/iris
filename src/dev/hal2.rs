@@ -276,6 +276,8 @@ const CODEC_A: usize = 0;
 const CODEC_B: usize = 1;
 const AES_TX: usize = 2;
 const AES_RX: usize = 3;
+const DMA_EN: [u16; 4] = [DMA_EN_CODECA, DMA_EN_CODECB, DMA_EN_AES_TX, DMA_EN_AES_RX];
+const ARM: [fn(&Hal2); 4] = [Hal2::arm_codeca, Hal2::arm_codecb, Hal2::arm_aestx, Hal2::arm_aesrx];
 
 // ─── HAL2 register state ──────────────────────────────────────────────────────
 
@@ -323,6 +325,7 @@ impl Hal2State {
     fn codecb_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.codecb_ctrl[0]) }
     fn aestx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aestx_ctrl[0]) }
     fn aesrx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aesrx_ctrl[0]) }
+    fn channels(&self) -> [usize; 4] { [self.codeca_cfg().0, self.codecb_cfg().0, self.aestx_cfg().0, self.aesrx_cfg().0] }
 
     /// Combined output gain `(left_gain, right_gain)` in `0..=(32768 * 255)`,
     /// combining the CS4216 Codec A `MUTE` bit (IDR0 bit 10), 5-bit DAC
@@ -488,8 +491,6 @@ impl Hal2 {
     // ── Codec A output timer ──────────────────────────────────────────────────
 
     fn arm_codeca(&self) {
-        self.disarm(CODEC_A);
-
         let (dma_ch, mode, rate, pitch_rate) = {
             let s = self.state.lock();
             let (ch, clk, mode) = s.codeca_cfg();
@@ -576,19 +577,24 @@ impl Hal2 {
 
     /// Wake `engine` every `PACE_PERIOD` with a pacer counting `rate` frames a second on the machine clock.
     fn pace(&self, engine: usize, rate: u32, mut tick: impl FnMut(&mut Pacer) -> TimerReturn + Send + 'static) {
+        let mut timers = self.timers.lock();
+        if timers[engine].is_some() { return; }
         let mut pacer = Pacer::new(rate, self.tm.clock());
-        let id = self.tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || tick(&mut pacer));
-        self.timers.lock()[engine] = Some(id);
+        timers[engine] = Some(self.tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || tick(&mut pacer)));
     }
 
-    /// Stop `engine`'s timer and reset what it fed: codec A keeps its host
-    /// stream open, and the AES receive loopback is emptied.
-    fn disarm(&self, engine: usize) {
+    fn stop_timer(&self, engine: usize) {
         let id = self.timers.lock()[engine].take();
         if let Some(id) = id {
             self.tm.remove(id);
             crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, engine);
         }
+    }
+
+    /// Stop `engine`'s timer and reset what it fed: codec A keeps its host
+    /// stream open, and the AES receive loopback is emptied.
+    fn disarm(&self, engine: usize) {
+        self.stop_timer(engine);
         match engine {
             CODEC_A => self.ca_state.lock().reset_audio(),
             AES_RX => self.ar_state.lock().loopback.clear(),
@@ -596,11 +602,33 @@ impl Hal2 {
         }
     }
 
+    /// Enable `engine`: a fresh start, with a timer only while its channel is active.
+    fn enable(&self, engine: usize) {
+        self.disarm(engine);
+        let ch = self.state.lock().channels()[engine];
+        if self.dma_clients.get(ch).is_some_and(|c| c.is_active()) { ARM[engine](self); }
+    }
+
+    /// Wire each channel's start and stop to its engines' timers: a stopped channel moves nothing.
+    pub fn watch_dma(self: &Arc<Self>) {
+        for (ch, dma) in self.dma_clients.iter().enumerate() {
+            let me = Arc::downgrade(self);
+            dma.on_active_change(Box::new(move |active| if let Some(h) = me.upgrade() { h.dma_edge(ch, active) }));
+        }
+    }
+
+    /// Runs under the channel's lock: it takes `state`, `timers` and the timer manager,
+    /// none of which a thread holds while waiting for a channel, and never `ca_state`.
+    fn dma_edge(&self, ch: usize, active: bool) {
+        let (en, chans) = { let s = self.state.lock(); (s.dma_enable, s.channels()) };
+        for engine in (CODEC_A..=AES_RX).filter(|&e| en & DMA_EN[e] != 0 && chans[e] == ch) {
+            if active { ARM[engine](self); } else { self.stop_timer(engine); }
+        }
+    }
+
     // ── Codec B input (silence writer) timer ─────────────────────────────────
 
     fn arm_codecb(&self) {
-        self.disarm(CODEC_B);
-
         let (dma_ch, mode, rate) = {
             let s = self.state.lock();
             let (ch, clk, raw_mode) = s.codecb_cfg();
@@ -637,8 +665,6 @@ impl Hal2 {
     // ── AES TX drain timer (no host output) ──────────────────────────────────
 
     fn arm_aestx(&self) {
-        self.disarm(AES_TX);
-
         let (dma_ch, rate) = {
             let s = self.state.lock();
             let (ch, clk, _mode) = s.aestx_cfg();
@@ -666,8 +692,6 @@ impl Hal2 {
     // ── AES RX loopback write timer ───────────────────────────────────────────
 
     fn arm_aesrx(&self) {
-        self.disarm(AES_RX);
-
         let (dma_ch, rate) = {
             let s = self.state.lock();
             let (ch, clk, _mode) = s.aesrx_cfg();
@@ -700,7 +724,7 @@ impl Hal2 {
         if changed(DMA_EN_CODECA) {
             if enabled(DMA_EN_CODECA) {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A DMA enabled");
-                self.arm_codeca();
+                self.enable(CODEC_A);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A DMA disabled");
                 self.disarm(CODEC_A);
@@ -710,7 +734,7 @@ impl Hal2 {
         if changed(DMA_EN_CODECB) {
             if enabled(DMA_EN_CODECB) {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec B DMA enabled");
-                self.arm_codecb();
+                self.enable(CODEC_B);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec B DMA disabled");
                 self.disarm(CODEC_B);
@@ -720,7 +744,7 @@ impl Hal2 {
         if changed(DMA_EN_AES_TX) {
             if enabled(DMA_EN_AES_TX) {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES TX DMA enabled");
-                self.arm_aestx();
+                self.enable(AES_TX);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES TX DMA disabled");
                 self.disarm(AES_TX);
@@ -730,7 +754,7 @@ impl Hal2 {
         if changed(DMA_EN_AES_RX) {
             if enabled(DMA_EN_AES_RX) {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES RX DMA enabled");
-                self.arm_aesrx();
+                self.enable(AES_RX);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES RX DMA disabled");
                 self.disarm(AES_RX);
@@ -894,10 +918,10 @@ impl Hal2 {
                     if rearm {
                         drop(state);
                         match num {
-                            IAR_NUM_CODECA => self.arm_codeca(),
-                            IAR_NUM_CODECB => self.arm_codecb(),
-                            IAR_NUM_AES_TX => self.arm_aestx(),
-                            IAR_NUM_AES_RX => self.arm_aesrx(),
+                            IAR_NUM_CODECA => self.enable(CODEC_A),
+                            IAR_NUM_CODECB => self.enable(CODEC_B),
+                            IAR_NUM_AES_TX => self.enable(AES_TX),
+                            IAR_NUM_AES_RX => self.enable(AES_RX),
                             _ => {}
                         }
                         return;
@@ -954,16 +978,16 @@ impl Hal2 {
         // Codec A re-arms when the generator it selected is reprogrammed. It
         // no longer re-arms on a codec B change: its period is its own now.
         if (dma_enable & DMA_EN_CODECA) != 0 && ca_clk == bres_idx {
-            self.arm_codeca();
+            self.enable(CODEC_A);
         }
         if (dma_enable & DMA_EN_CODECB) != 0 && cb_clk == bres_idx {
-            self.arm_codecb();
+            self.enable(CODEC_B);
         }
         if (dma_enable & DMA_EN_AES_TX) != 0 && at_clk == bres_idx {
-            self.arm_aestx();
+            self.enable(AES_TX);
         }
         if (dma_enable & DMA_EN_AES_RX) != 0 && ar_clk == bres_idx {
-            self.arm_aesrx();
+            self.enable(AES_RX);
         }
     }
 
@@ -1189,6 +1213,57 @@ mod host_tests {
         fn write(&self, _val: u32, _eop: bool) -> DmaStatus {
             DmaStatus::ok()
         }
+    }
+
+    /// A channel the guest arms and stops by hand, telling its listener as HPC3 does.
+    #[derive(Default)]
+    struct Switch {
+        active: AtomicBool,
+        listener: Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
+    }
+
+    impl Switch {
+        fn set(&self, on: bool) {
+            let l = self.listener.lock();
+            self.active.store(on, Ordering::Relaxed);
+            if let Some(f) = l.as_ref() { f(on); }
+        }
+    }
+
+    impl DmaClient for Switch {
+        fn read(&self) -> Option<(u32, DmaStatus)> { None }
+        fn write(&self, _val: u32, _eop: bool) -> DmaStatus { DmaStatus::ok() }
+        fn is_active(&self) -> bool { self.active.load(Ordering::Relaxed) }
+        fn on_active_change(&self, f: Box<dyn Fn(bool) + Send + Sync>) { *self.listener.lock() = Some(f); }
+    }
+
+    /// An engine paces only while it is enabled and its channel is active, as on
+    /// an idle Indy where IRIX leaves the engines on over stopped channels.
+    #[test]
+    fn an_engine_paces_only_while_enabled_and_its_channel_is_active() {
+        let chans: Vec<Arc<Switch>> = (0..3).map(|_| Arc::default()).collect();
+        let h = Arc::new(Hal2::new(&Arc::new(TimerManager::new()), chans.iter().map(|c| c.clone() as Arc<dyn DmaClient>).collect()));
+        h.watch_dma();
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            let ctrl = |ch: u16| ch | 1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT;
+            (s.codeca_ctrl[0], s.codecb_ctrl[0], s.aestx_ctrl[0]) = (ctrl(0), ctrl(1), ctrl(2));
+            s.dma_enable = DMA_EN_CODECA | DMA_EN_CODECB | DMA_EN_AES_TX;
+        }
+        let timers = || h.timers.lock().map(|t| t.is_some());
+        h.apply_dma_enable(0, DMA_EN_CODECA | DMA_EN_CODECB | DMA_EN_AES_TX);
+        h.reclock_active(1);
+        assert_eq!(timers()[..3], [false; 3], "an engine paces over a stopped channel");
+
+        h.state.lock().dma_enable &= !DMA_EN_AES_TX;
+        h.apply_dma_enable(DMA_EN_AES_TX, 0);
+        chans.iter().for_each(|c| c.set(true));
+        assert_eq!(timers()[..3], [true, true, false], "arming a channel starts only its enabled engine");
+
+        chans[0].set(false);
+        assert_eq!(timers()[..3], [false, true, false], "stopping a channel stops its engine");
+        Device::stop(&*h);
     }
 
     /// Codec A's timer hands the recorder the frames it read, as read, at

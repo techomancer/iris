@@ -1394,6 +1394,7 @@ impl Hpc3 {
         };
 
         let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::with_audio(tm, dma_clients[0..8].to_vec(), audio))) };
+        if let Some(h) = &hal2 { h.watch_dma(); }
 
         Self {
             state,
@@ -2732,7 +2733,9 @@ mod tests {
 mod enet_rx_chain_tests {
     use super::*;
 
-    fn hpc3_for_test() -> Hpc3 {
+    fn hpc3_for_test() -> Hpc3 { hpc3_with_audio(false) }
+
+    fn hpc3_with_audio(audio: bool) -> Hpc3 {
         let tm = Arc::new(TimerManager::new());
         Hpc3::with_net(
             Arc::new(Mutex::new(Eeprom93c56::new())),
@@ -2740,7 +2743,7 @@ mod enet_rx_chain_tests {
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),
-            true,
+            !audio,
             AudioConfig::default(),
             String::new(),
             RtcOffset::default(),
@@ -3079,6 +3082,13 @@ mod enet_rx_chain_tests {
         hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), 0);
         assert_eq!(free.load(Ordering::SeqCst), 1, "the chip was reset under the channel lock, or not at all");
         hpc3.release();
+    }
+
+    /// The board wires HAL2 to its codec channels.
+    #[test]
+    fn a_board_with_audio_listens_to_its_codec_channels() {
+        let hpc3 = hpc3_with_audio(true);
+        assert!(hpc3.pdma_channels[..8].iter().all(|c| c.lock().armed.listener.get().is_some()));
     }
 
     /// A listener hears each start and stop of a channel once, and nothing when
