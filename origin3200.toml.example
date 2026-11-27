@@ -3,7 +3,7 @@
 # iris --config origin3200.toml
 # The IP35 PROM (6.210) is built in; `prom` overrides it with a raw payload or a
 # version-six container. No disk images are included.
-# Disks hang off the I-brick's Fibre Channel adapter, at xio15/pci0/1/lN, N the loop ID.
+# Disks hang off the I-brick's Fibre Channel adapter, at xio15/pci0/1/loopN, N the loop ID.
 
 # prom = "ignore/origin3200/ip35prom.payload.bin"
 nvram = "ignore/origin3200/nvram.bin"
@@ -29,7 +29,7 @@ mode = "off"
 
 [[devices]]
 type = "hdd"
-at = "xio15/pci0/1/l1"
+at = "xio15/pci0/1/loop1"
 path = "ignore/origin3200/system.raw"
 overlay = true
 

@@ -357,7 +357,7 @@ Origin 3200 settings apply when `machine.profile = "origin3200_ip35"`.
 
 `banks` is per C-brick and defaults to two 256 MiB banks; 256 and 512 MiB banks
 are accepted, in the matched pairs a lane of the memory controller holds. The I-brick's Fibre Channel
-adapter is always fitted; its disks are `hdd` devices at `xio15/pci0/1/lN`. A `[origin3200]` table is
+adapter is always fitted; its disks are `hdd` devices at `xio15/pci0/1/loopN`. A `[origin3200]` table is
 written to a saved config only when one of these keys is set. See the
 [Origin 3200 guide](docs/origin3200-ip35.md), which lists its limits.
 
@@ -406,7 +406,7 @@ takes; `--device [NAME:]TYPE[@SLOT][,KEY=VALUE]...` adds or replaces one from th
 | `cdrom` | a SCSI target | `path` (a file, or an `http://` or `https://` URL, [STORAGE.md](STORAGE.md#cd-rom-images-over-http); empty means an empty tray), `discs` (more changer images), `overlay` |
 | `daynaport` | a SCSI target | `mac` (`00:80:19:44:50:<target>` when unset), `subnet` (`192.168.10.0/24` when unset, separate from ec0's). Refused on the machines with built-in Ethernet only (the O2, the Origin 200, Origin 2000 and Onyx2, the Fuel and the Tezro) and with `network.mode = "stream"`. |
 | `nvme` | a PCI slot | `path` (raw or CHD, at most 2 TiB), `overlay`, `write_cache` (as for `hdd`). An NVM Express controller with one namespace; any number per machine; see [docs/nvme.md](docs/nvme.md). |
-| `qla2200` | a PCI slot | A QLogic ISP2200 Fibre Channel adapter; its disks are `hdd` entries at `CARD/lN`, N the loop ID 0 to 125. The Origin 3200 and Onyx 3000 have one fitted at `xio15/pci0/1`. See [docs/fibre-channel.md](docs/fibre-channel.md). |
+| `qla2200` | a PCI slot | A QLogic ISP2200 Fibre Channel adapter; its disks are `hdd` entries at `CARD/loopN`, N the loop ID 0 to 125. The Origin 3200 and Onyx 3000 have one fitted at `xio15/pci0/1`. See [docs/fibre-channel.md](docs/fibre-channel.md). |
 | `ice1724` | a PCI slot | The IC Ensemble ICE1724 audio card; plays as `[audio]` sets. |
 | `pci_cage`, `pci_shoehorn` | an Octane XIO slot (`xio9` to `xio13`; the cage at `xio13`, alias `pci_module`) | The PCI module (slots 1 to 3) and the single-slot XIO-to-PCI adapter; see [docs/pci.md](docs/pci.md#option-boards-in-xio-slots). |
 | `pci_bridge` | a PCI slot | A PCI-to-PCI bridge, with one slot behind it at `BRIDGE/pci0/0`. |

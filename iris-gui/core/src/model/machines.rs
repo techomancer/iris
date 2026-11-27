@@ -636,7 +636,7 @@ pub(crate) mod tests {
         let nvme = iris::config::NvmeConfig { path: dir.join("disk.raw").to_string_lossy().into_owned(), ..Default::default() };
         cfg.devices.push(iris::devices::ConfiguredDevice::new("pci_slot", iris::devices::DeviceModel::Nvme(nvme)));
         cfg.machine.profile = iris::config::MachineProfile::Origin3200Ip35;
-        cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/l1", iris::devices::DeviceModel::Scsi(iris::config::ScsiDeviceConfig {
+        cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/loop1", iris::devices::DeviceModel::Scsi(iris::config::ScsiDeviceConfig {
             path: dir.join("fc.raw").to_string_lossy().into_owned(), ..Default::default()
         })));
         cfg.virtio_serial.ports.push(iris::config::VirtioSerialPort {

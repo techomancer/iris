@@ -1814,7 +1814,7 @@ mod snapshot_tests {
             for id in [3u8, 9] {
                 let disk = dir.join(format!("loop{id}.raw"));
                 std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
-                let table = format!("type = \"hdd\"\nat = \"cage/pci0/{slot}/l{id}\"\npath = '{}'\noverlay = true", disk.display());
+                let table = format!("type = \"hdd\"\nat = \"cage/pci0/{slot}/loop{id}\"\npath = '{}'\noverlay = true", disk.display());
                 loop_disks.push(crate::devices::ConfiguredDevice::from_table(toml::from_str(&table).unwrap()).unwrap());
             }
             let mut m = machine_with(&prom, &dir, |cfg| {

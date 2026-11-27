@@ -47,7 +47,7 @@ Each hard disk has a `write_cache` setting in its `hdd` device. It is the
 WCE bit of the SCSI caching page: whether the disk may tell the guest a write
 is done before the write is on the host's disk. An `nvme` device (as the
 volatile write cache feature) and a Fibre Channel loop disk (an `hdd` at
-`CARD/lN`) take the same key. `--no-write-cache` sets it to `false` for every
+`CARD/loopN`) take the same key. `--no-write-cache` sets it to `false` for every
 `hdd` and `nvme` device.
 
 ```toml

@@ -17,7 +17,7 @@ const TAGS: &[(&str, bool)] = &[
     ("gio", true), // GIO expansion slot N
     ("c", true),   // channel N of a controller with more than one
     ("t", true),   // SCSI target N
-    ("l", true),   // Fibre Channel loop ID N
+    ("loop", true), // Fibre Channel loop ID N
     ("usb", true), // USB port N
     ("serial", true), // serial port N, numbered as IRIX's /dev/ttydN
 ];
@@ -46,7 +46,7 @@ impl PathStep {
     fn dev(n: u8) -> PathStep { PathStep { tag: BARE, n } }
     fn channel(n: u8) -> PathStep { PathStep::of("c", n) }
     fn target(n: u8) -> PathStep { PathStep::of("t", n) }
-    fn loop_id(n: u8) -> PathStep { PathStep::of("l", n) }
+    fn loop_id(n: u8) -> PathStep { PathStep::of("loop", n) }
     fn hpc3() -> PathStep { PathStep::of("hpc3", 0) }
     fn gio(n: u8) -> PathStep { PathStep::of("gio", n) }
     fn serial(n: u8) -> PathStep { PathStep::of("serial", n) }
@@ -166,7 +166,7 @@ mod tests {
     fn every_grammar_example_round_trips() {
         for s in [
             "hpc3/c0/t1", "hpc3/c1/t4", "gio0", "gfx", "pci0/1/t2", "pci0/3", "xio15/pci0/1/t2", "xio11",
-            "xio10/pci0/1/pci0/0", "node1/xio11", "xio15/pci0/1/c1/t2", "xio15/pci0/5/usb0", "xio15/pci0/1/l3",
+            "xio10/pci0/1/pci0/0", "node1/xio11", "xio15/pci0/1/c1/t2", "xio15/pci0/5/usb0", "xio15/pci0/1/loop3",
             "xio15/pci1/1", "xio15/pci0/0/f1",
         ] {
             assert_eq!(loc(s).to_string(), s);
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn bad_strings_are_errors() {
-        for s in ["", "/pci0", "pci", "pci0/", "t", "zz1", "pci256", "hpc30", "gfx1", "pci0//1", "t-1", "pci0x", "scsi0"] {
+        for s in ["", "/pci0", "pci", "pci0/", "t", "zz1", "pci256", "hpc30", "gfx1", "pci0//1", "t-1", "pci0x", "scsi0", "xio15/pci0/1/l3"] {
             assert!(s.parse::<MachineSlotPath>().is_err(), "{s:?} parsed");
         }
     }

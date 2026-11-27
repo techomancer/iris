@@ -86,7 +86,7 @@ pub(super) fn virtio_cards(cfg: &mut MachineConfig) {
 const DROPPED: &[(&str, &[&str], &str)] = &[
     ("xio_board", &[], "a `pci_cage` or `pci_shoehorn` [[devices]] entry at the XIO slot"),
     ("nvme", &[], "an `nvme` [[devices]] entry"),
-    ("fibre_channel", &[], "a `qla2200` [[devices]] entry, with its disks as `hdd` entries at CARD/lN"),
+    ("fibre_channel", &[], "a `qla2200` [[devices]] entry, with its disks as `hdd` entries at CARD/loopN"),
     ("audio_card", &[], "an `ice1724` [[devices]] entry"),
     ("audio", &["fuel", "tezro", "origin3200", "onyx3000"], "an `ice1724` [[devices]] entry"),
     ("node", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),

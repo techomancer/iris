@@ -331,14 +331,14 @@ mod tests {
         switch(&mut cfg, MachineProfile::OctaneIp30);
         cfg.devices.push(ConfiguredDevice { name: Some("cage".into()), ..ConfiguredDevice::new("shoebox", DeviceModel::XioBoard(Kind::Cage)) });
         cfg.devices.push(ConfiguredDevice { name: Some("fibre_channel".into()), ..ConfiguredDevice::new("cage/pci0", DeviceModel::Qla2200) });
-        cfg.devices.push(ConfiguredDevice::new("fibre_channel/l7", DeviceModel::Scsi(ScsiDeviceConfig { path: "fc.raw".into(), ..Default::default() })));
+        cfg.devices.push(ConfiguredDevice::new("fibre_channel/loop7", DeviceModel::Scsi(ScsiDeviceConfig { path: "fc.raw".into(), ..Default::default() })));
         assert_eq!(cfg.loop_disks().iter().map(|d| d.0).collect::<Vec<_>>(), [7]);
         for to in [MachineProfile::Origin3200Ip35, MachineProfile::Onyx3000Ip35] {
             let mut moved = cfg.clone();
             switch(&mut moved, to);
             moved.validate().unwrap();
             let kept = moved.devices.iter().filter(|d| d.device.scsi().is_some());
-            assert_eq!(kept.map(|d| d.at.clone()).collect::<Vec<_>>(), [Some("xio15/pci0/1/l7".to_string())]);
+            assert_eq!(kept.map(|d| d.at.clone()).collect::<Vec<_>>(), [Some("xio15/pci0/1/loop7".to_string())]);
             assert!(!moved.has_device("qla2200"));
         }
         switch(&mut cfg, MachineProfile::IndyIp24);

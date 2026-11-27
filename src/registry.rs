@@ -540,7 +540,7 @@ mod tests {
         }
         let cow = r#""hpc3/c0/t1" = [1]
 "xio13/pci0/1" = [2]
-"xio13/pci0/2/l5" = [3]"#;
+"xio13/pci0/2/loop5" = [3]"#;
         snap.write_toml("cow.toml", &toml::from_str::<toml::Value>(cow).unwrap()).unwrap();
         snap.write_manifest(&Manifest::for_current_save()).unwrap();
         snap.write_chunks_manifest(&ChunksManifest::default()).unwrap();

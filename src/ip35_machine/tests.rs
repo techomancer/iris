@@ -91,8 +91,8 @@ fn the_configuration_refuses_what_the_row_does_not_hold() {
         cfg.devices.push(ConfiguredDevice::new(at, DeviceModel::Scsi(ScsiDeviceConfig { path: "d.img".into(), ..Default::default() })));
         cfg
     };
-    loop_disk("xio15/pci0/1/l1").validate().unwrap();
-    assert!(refused(&loop_disk("xio15/pci0/1/l126")).contains("no slot xio15/pci0/1/l126"));
+    loop_disk("xio15/pci0/1/loop1").validate().unwrap();
+    assert!(refused(&loop_disk("xio15/pci0/1/loop126")).contains("no slot xio15/pci0/1/loop126"));
     let mut cfg = config(&dir, 1);
     let image = dir.join("n.img");
     std::fs::write(&image, vec![0u8; 1 << 20]).unwrap();
@@ -145,7 +145,7 @@ fn the_loop_has_the_configured_disks() {
     let image = dir.join("d.raw");
     std::fs::write(&image, vec![0u8; 1 << 20]).unwrap();
     let mut cfg = config(&dir, 1);
-    cfg.devices.push(ConfiguredDevice::new("xio15/pci0/1/l3", DeviceModel::Scsi(ScsiDeviceConfig { path: image.to_string_lossy().into_owned(), overlay: true, ..Default::default() })));
+    cfg.devices.push(ConfiguredDevice::new("xio15/pci0/1/loop3", DeviceModel::Scsi(ScsiDeviceConfig { path: image.to_string_lossy().into_owned(), overlay: true, ..Default::default() })));
     let attached = |m: &mut Machine<Bedrock, Flash>| {
         let mut attached = Vec::new();
         (m.io.disks)(&mut |buses| {

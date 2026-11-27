@@ -1340,7 +1340,7 @@ mod tests {
         sets.sort();
         let mut named: Vec<String> = sets.iter().map(|s| s.0.to_string()).collect();
         named.sort();
-        assert_eq!(named, ["hpc3/c0/t3", "hpc3/c1/t3", "xio13/pci0/1", "xio13/pci0/2/l9"]);
+        assert_eq!(named, ["hpc3/c0/t3", "hpc3/c1/t3", "xio13/pci0/1", "xio13/pci0/2/loop9"]);
         for f in ["hpc3/c0/scsi3.overlay", "hpc3/c1/scsi3.overlay", "xio13/pci0/1/scsi0.overlay", "xio13/pci0/2/scsi9.overlay"] {
             assert!(snap.dir.join(f).exists(), "{f}");
         }

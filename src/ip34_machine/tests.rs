@@ -175,7 +175,7 @@ fn a_fibre_channel_adapter_in_a_slot_is_built_with_its_loop() {
     let mut cfg = fuel_config(&dir);
     cfg.devices.extend([
         entry("type = \"qla2200\"\nat = \"xio15/pci0/2\"\nname = \"fc\""),
-        entry(&format!("type = \"hdd\"\nat = \"fc/l5\"\npath = {:?}", disk.to_string_lossy())),
+        entry(&format!("type = \"hdd\"\nat = \"fc/loop5\"\npath = {:?}", disk.to_string_lossy())),
     ]);
     with_machine(cfg, |m| {
         let id = |device: u64| m.nodes[0].chip.pio().read32(pio_widget(15, 0x2_0000 + (device << 12))).data;

@@ -502,7 +502,7 @@ pub fn expansion(ui: &mut Ui, cfg: &mut MachineConfig) {
                 if ui.button(t!("extra-add-disk")).clicked() {
                     let used: Vec<u8> = cfg.loop_disks().into_iter().map(|d| d.0).collect();
                     if let Some(id) = (0..=iris::dev::isp2200::LOOP_ID_MAX).find(|id| !used.contains(id)) {
-                        cfg.devices.push(ConfiguredDevice::new(&format!("{base}/l{id}"), DeviceModel::Scsi(Default::default())));
+                        cfg.devices.push(ConfiguredDevice::new(&format!("{base}/loop{id}"), DeviceModel::Scsi(Default::default())));
                     }
                 }
             }

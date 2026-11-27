@@ -154,7 +154,7 @@ impl NewMachineSpec {
             if !self.disk_path.is_empty() {
                 // On the I-brick's loop, at loop ID 1.
                 let disk = ScsiDeviceConfig { path: self.disk_path.clone(), ..Default::default() };
-                cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/l1", iris::devices::DeviceModel::Scsi(disk)));
+                cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/loop1", iris::devices::DeviceModel::Scsi(disk)));
             }
         } else {
             if !self.disk_path.is_empty() {

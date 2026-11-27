@@ -14,7 +14,7 @@ in; `prom` overrides it as on the [Fuel](fuel-ip34.md). `[machine]` takes `nodes
 [FEATURES.md](../FEATURES.md#origin3200). The `[origin3200]` table of older configs is still read. `banks` is per C-brick: left unset it
 is two 256 MiB banks. Banks of 256 or 512 MiB are accepted, up to eight, in pairs of one size.
 Graphics are `none`. The I-brick's Fibre Channel adapter takes its disks as `hdd` devices at
-`xio15/pci0/1/lN`, N the disk's loop ID (see [the Fibre Channel guide](fibre-channel.md)). [origin3200.toml.example](../origin3200.toml.example)
+`xio15/pci0/1/loopN`, N the disk's loop ID (see [the Fibre Channel guide](fibre-channel.md)). [origin3200.toml.example](../origin3200.toml.example)
 is a complete file.
 
 Each C-brick has its own L1; the first carries the console

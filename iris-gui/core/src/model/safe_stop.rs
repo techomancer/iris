@@ -92,7 +92,7 @@ mod tests {
     fn ip35_warns_for_its_fibre_channel_disks_not_the_scsi_map() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = iris::config::MachineProfile::Origin3200Ip35;
-        cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/l1", iris::devices::DeviceModel::Scsi(iris::config::ScsiDeviceConfig { path: "root.raw".into(), ..Default::default() })));
+        cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/loop1", iris::devices::DeviceModel::Scsi(iris::config::ScsiDeviceConfig { path: "root.raw".into(), ..Default::default() })));
         let r = evaluate(&running(false), &cfg);
         assert_eq!(r.writable_disks.len(), 1);
         assert!(r.writable_disks[0].contains('1'));
