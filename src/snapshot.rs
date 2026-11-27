@@ -864,12 +864,13 @@ pub fn restore<W: Workstation + ?Sized>(m: &mut W, kept: &Kept, run: bool) -> Re
     Ok(())
 }
 
-/// Load `saves/<name>/` and run; `keep` holds the image for `rollback`.
+/// Load `saves/<name>/` and run. The name is the parent of the next save and what `rollback`
+/// returns to; `keep` also holds the image, so that rollback need not read it again.
 fn load<W: Workstation + ?Sized>(m: &mut W, saves: &Path, name: &str, keep: bool) -> Result<(), String> {
     let kept = read(m, saves, name)?;
     restore(m, &kept, true)?;
-    if let Some(r) = m.snapshots().filter(|_| keep) {
-        *r = Restored { name: Some(name.into()), kept: Some(Box::new(kept)) };
+    if let Some(r) = m.snapshots() {
+        *r = Restored { name: Some(name.into()), kept: keep.then(|| Box::new(kept)) };
     }
     println!("Snapshot loaded from {}/{name}", saves.display());
     Ok(())
@@ -895,8 +896,11 @@ pub fn ci_rollback<W: Workstation + ?Sized>(m: &mut W, saves: &Path) -> Result<(
         ci.reset();
     }
     let r = m.snapshots().ok_or(crate::workstation::NOT_HERE)?;
-    let (Some(name), Some(kept)) = (r.name.clone(), r.kept.take()) else {
+    let Some(name) = r.name.clone() else {
         return Err("no previous restore to roll back to".into());
+    };
+    let Some(kept) = r.kept.take() else {
+        return ci_restore(m, saves, &name);
     };
     let result = restore(m, &kept, true).map_err(|e| format!("rollback to {name}: {e}"));
     if let Some(r) = m.snapshots() {

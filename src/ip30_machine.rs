@@ -2024,6 +2024,16 @@ mod snapshot_tests {
             crate::snapshot::save_in(&mut m, &saves, "child").unwrap();
             let child = Snapshot::new(saves.join("child")).read_manifest().unwrap().unwrap();
             assert_eq!(child.parent.as_deref(), Some("s"));
+            // A plain load makes its snapshot the next save's parent and the rollback target.
+            crate::snapshot::load_in(&mut m, &saves, "child").unwrap();
+            m.stop();
+            m.ram.restore_bank_words(&words).unwrap();
+            crate::snapshot::ci_rollback(&mut m, &saves).unwrap();
+            m.stop();
+            assert_eq!(digest(&m).1, memory_at_save);
+            crate::snapshot::save_in(&mut m, &saves, "grandchild").unwrap();
+            let grandchild = Snapshot::new(saves.join("grandchild")).read_manifest().unwrap().unwrap();
+            assert_eq!(grandchild.parent.as_deref(), Some("child"));
         }).unwrap().join().unwrap();
     }
 
