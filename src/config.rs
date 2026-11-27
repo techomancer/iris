@@ -3250,6 +3250,11 @@ impl MachineConfig {
         });
     }
 
+    /// Whether the machine has a second graphics head: a second Newport or a board beside the machine's own.
+    pub fn has_second_head(&self) -> bool {
+        self.dual_head() || self.devices.iter().any(|d| matches!(d.device, DeviceModel::Board(_)) && !Self::is_head(d) && !d.names_graphics(self.machine.profile))
+    }
+
     fn is_head(d: &ConfiguredDevice) -> bool {
         matches!(d.device, DeviceModel::Board(_)) && d.at.as_deref().is_some_and(|at| at.starts_with("gio"))
     }
@@ -5086,6 +5091,20 @@ mod export_tests {
             let e = cfg.resolve_slots().and_then(|_| cfg.validate()).err().unwrap_or_default();
             assert!(e.contains("Fibre Channel"), "{profile}: {e}");
         }
+    }
+
+    #[test]
+    fn a_second_head_is_a_second_newport_or_a_board_beside_the_main_one() {
+        let octane = |extra: &str| MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"octane_ip30\"\n{extra}")).unwrap();
+        let vpro = |at: &str| format!("[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n{at}");
+        assert!(!octane("").has_second_head());
+        assert!(!octane(&vpro("")).has_second_head(), "the main board, named without a slot");
+        assert!(!octane(&vpro("at = \"slot_ab\"\n")).has_second_head(), "the main board, named by its slot");
+        assert!(octane(&vpro("at = \"slot_cd\"\n")).has_second_head());
+        let mut indy = MachineConfig::default();
+        assert!(!indy.has_second_head());
+        indy.set_dual_head(true);
+        assert!(indy.has_second_head());
     }
 
     #[test]

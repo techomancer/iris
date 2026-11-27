@@ -144,7 +144,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   has them. `type = "none"` at `graphics` leaves the slot empty. `[graphics] board`, `heads`, `resolution` and
   `flash` and `--graphics` are refused with the entry to write; iris-gui reads them as entries.
 - An Octane takes a second graphics board in any XIO slot, as SGI's Dual Head module has it for the
-  Octane2: a `vpro` entry at `slot_cd` beside the first board in `slot_ab`.
+  Octane2: a `vpro` entry at `slot_cd` beside the first board in `slot_ab`. The CI socket's `screenshot`
+  takes `head=N`, and the GUI shows both heads side by side for any machine with a second head.
 
 ### Disks and cards by slot
 

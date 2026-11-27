@@ -1424,14 +1424,14 @@ impl App {
     /// Draw the live REX3 framebuffer as an egui image, scaled to fit
     /// the available area while preserving aspect ratio.
     fn framebuffer_panel(&mut self, ui: &mut egui::Ui) {
-        if self.app.config().dual_head() {
+        if self.app.config().has_second_head() {
             self.framebuffer_panel_dual(ui);
             return;
         }
         self.framebuffer_panel_single(ui);
     }
 
-    /// Dual Newport heads: side-by-side viewports (head 0 captures input).
+    /// Two heads: side-by-side viewports; clicking either captures input.
     fn framebuffer_panel_dual(&mut self, ui: &mut egui::Ui) {
         let max_scale = self.fb_max_scale(ui.ctx());
         let seq0 = self.app.session().handle().frame_sink.seq();
@@ -1446,7 +1446,7 @@ impl App {
         let mut capture_clicked = false;
         ui.columns(2, |cols| {
             cols[0].vertical(|ui| {
-                ui.label(RichText::new(t!("fb-head", head = 0)).small().weak());
+                ui.label(RichText::new(t!("fb-head", head = 1)).small().weak());
                 if seq0 > 0 {
                     if Self::upload_fb_texture(ui, &self.app.session().handle().frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb", max_scale) {
                         self.fb_took_frame = true;
@@ -1463,7 +1463,7 @@ impl App {
                 }
             });
             cols[1].vertical(|ui| {
-                ui.label(RichText::new(t!("fb-head", head = 1)).small().weak());
+                ui.label(RichText::new(t!("fb-head", head = 2)).small().weak());
                 if seq1 > 0 {
                     if Self::upload_fb_texture(
                         ui,
@@ -1476,7 +1476,11 @@ impl App {
                         self.fb_took_frame = true;
                     }
                     if let Some(tex) = &self.fb_tex_head1 {
-                        Self::paint_fb(ui, tex, max_scale);
+                        let (response, _) = Self::paint_fb(ui, tex, max_scale);
+                        if response.clicked() {
+                            response.request_focus();
+                            capture_clicked = true;
+                        }
                     }
                 } else {
                     ui.label(RichText::new(t!("fb-head-waiting")).weak());

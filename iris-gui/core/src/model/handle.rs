@@ -625,7 +625,7 @@ fn worker_loop(
                 let cfg_owned = *cfg;
                 let sink_for_machine = frame_sink.clone();
                 let sink_for_head1 = frame_sink_head1.clone();
-                let dual = cfg_owned.dual_head();
+                let dual = cfg_owned.has_second_head();
                 // Read before the closure moves the config into it.
                 let vnc_listen = cfg_owned.vnc.listen.clone();
                 let vnc_max_fps = cfg_owned.vnc.max_fps;
