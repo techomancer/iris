@@ -506,7 +506,7 @@ impl Ip32Bus {
     pub fn with_options(mem: O2Memory, prom: Vec<u8>, opts: Ip32Options, timers: &Arc<crate::hptimer::TimerManager>) -> Arc<Self> {
         let ram = Arc::new(mem);
         let phys = ram.phys().clone();
-        let ust = Arc::new(MaceUst::new());
+        let ust = Arc::new(MaceUst::new(timers.clock().clone()));
         let crime = Arc::new(Crime::new(ust.clone()));
         let mut bus = Self {
             phys: phys.clone(),

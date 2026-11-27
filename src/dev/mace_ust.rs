@@ -8,28 +8,23 @@ use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
 use std::io::Write;
 use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, hex_u64, toml_u64};
+use crate::clock::Clock;
 
 /// MACE's UST/MSC counter: unadjusted system time, free-running.
 ///
-/// Driven by executed instructions, not by reads.
-///
-/// Advancing on read was enough to stop delay loops hanging, but it makes
-/// duration meaningless: a loop that reads twice as often "takes" twice as
-/// long. Anything that decodes a *pulse width* — 1-Wire above all — needs
-/// elapsed time to mean something, so the harness advances this from its step
-/// count and the rate below fixes the relationship.
+/// It follows the machine clock, not reads or instruction counts: anything
+/// that decodes a *pulse width* (1-Wire above all) needs elapsed time to
+/// mean something.
 pub struct MaceUst {
-    ticks: AtomicU64,
-    /// When set, the clock is the host's: microseconds since this instant,
-    /// read live. The 1-Wire ID chip's slots are tens of microseconds, so a
-    /// clock stepped from another thread cannot time them.
-    host: std::sync::OnceLock<std::time::Instant>,
-    /// Added to the host clock, so a restored machine's time runs on from
-    /// where it was saved rather than from when this process started.
+    clock: Clock,
+    /// The clock's reading at power-on: the guest's time starts at zero.
+    t0: u64,
+    /// Added to the elapsed time, so a restored machine's time runs on from
+    /// where it was saved.
     base: std::sync::atomic::AtomicI64,
-    /// The guest's own view of time ([`MaceUst::guest_us`]), in host
-    /// microseconds: the host time at the last guest clock read, the host
-    /// time the guest clock has dropped (stalls during 1-Wire work), and
+    /// The guest's own view of time ([`MaceUst::guest_us`]), in
+    /// microseconds: the time at the last guest clock read, the time
+    /// the guest clock has dropped (stalls during 1-Wire work), and
     /// until when the 1-Wire bus counts as busy. Outside 1-Wire work a read
     /// is two loads and a store; `onewire` serialises the reads inside it,
     /// which only the PROM makes.
@@ -49,27 +44,14 @@ const GUEST_CLOCK_STEP_CAP_US: u64 = 8;
 /// How long after the last 1-Wire access the bus counts as busy.
 const ONEWIRE_BUSY_US: u64 = 5000;
 
-/// UST ticks per emulated instruction, as a fraction: `TICKS_NUM / TICKS_DEN`.
-///
-/// The PROM's delay loops are written in microseconds, and its 1-Wire slots
-/// are tens of microseconds, so a tick is taken to be 1 µs. At roughly 100
-/// emulated instructions per microsecond a bring-up run stays fast while pulse
-/// widths keep their proportions.
-pub const UST_TICKS_NUM: u64 = 1;
-
 /// Nanoseconds per count of MACE's UST counter.
 pub const MACE_UST_PERIOD_NS: u64 = 960;
-pub const UST_TICKS_DEN: u64 = 100;
-
-impl Default for MaceUst {
-    fn default() -> Self { Self::new() }
-}
 
 impl MaceUst {
-    pub fn new() -> Self {
+    pub fn new(clock: Clock) -> Self {
         Self {
-            ticks: AtomicU64::new(0),
-            host: std::sync::OnceLock::new(),
+            t0: clock.now(),
+            clock,
             base: std::sync::atomic::AtomicI64::new(0),
             last: AtomicU64::new(0),
             lost: AtomicU64::new(0),
@@ -78,20 +60,9 @@ impl MaceUst {
         }
     }
 
-    /// Run from the host clock from now on (a machine, not the harness).
-    pub fn use_host_clock(&self) {
-        let _ = self.host.set(std::time::Instant::now());
-    }
-
-    /// Set the clock to `us` microseconds, for a machine that keeps time by
-    /// the host clock rather than by instructions run.
-    pub fn set_us(&self, us: u64) {
-        self.ticks.store(us, Relaxed);
-    }
-
-    /// Advance the clock to match `instructions` executed so far.
-    pub fn advance_to(&self, instructions: u64) {
-        self.ticks.store(instructions * UST_TICKS_NUM / UST_TICKS_DEN, Relaxed);
+    /// Microseconds on the machine clock since power-on.
+    fn elapsed_us(&self) -> i64 {
+        (self.clock.now().saturating_sub(self.t0) / 1000) as i64
     }
 
     /// The counter as MACE presents it: one count per 960 ns (the 33.3 MHz
@@ -102,7 +73,7 @@ impl MaceUst {
         self.guest_us() * 1000 / MACE_UST_PERIOD_NS
     }
 
-    /// The time the guest reads (UST, CRIME's timer): the host's, less what
+    /// The time the guest reads (UST, CRIME's timer): the machine clock's, less what
     /// host stalls cost while the PROM was bit-banging 1-Wire. Then each step
     /// between two guest reads counts at most `GUEST_CLOCK_STEP_CAP_US`,
     /// so after a stall the PROM goes on spinning to its own deadline and
@@ -139,11 +110,7 @@ impl MaceUst {
     }
 
     pub fn now(&self) -> u64 {
-        match self.host.get() {
-            Some(t0) => (t0.elapsed().as_micros() as i64
-                + self.base.load(std::sync::atomic::Ordering::Relaxed)) as u64,
-            None => self.ticks.load(Relaxed),
-        }
+        (self.elapsed_us() + self.base.load(Relaxed)) as u64
     }
 }
 
@@ -166,8 +133,7 @@ impl Device for MaceUst {
                 // Read without advancing the guest clock (guest_us does).
                 let now = self.now();
                 let lost = self.lost.load(Relaxed);
-                writeln!(w, "UST: {} clock, now {now} us, guest {} us ({lost} us held out for 1-Wire), counter {:#x} ({} ns a count)",
-                    if self.host.get().is_some() { "host" } else { "instruction" },
+                writeln!(w, "UST: now {now} us, guest {} us ({lost} us held out for 1-Wire), counter {:#x} ({} ns a count)",
                     now - lost, (now - lost) * 1000 / MACE_UST_PERIOD_NS, MACE_UST_PERIOD_NS).ok();
                 Ok(())
             }
@@ -193,9 +159,7 @@ impl Saveable for MaceUst {
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
         let now = u("now");
-        self.ticks.store(now, Relaxed);
-        let elapsed = self.host.get().map_or(0, |t0| t0.elapsed().as_micros() as i64);
-        self.base.store(now as i64 - elapsed, std::sync::atomic::Ordering::Relaxed);
+        self.base.store(now as i64 - self.elapsed_us(), Relaxed);
         self.last.store(u("last"), Relaxed);
         self.lost.store(u("lost"), Relaxed);
         self.onewire_until.store(u("onewire_until"), Relaxed);
@@ -225,29 +189,33 @@ mod tests {
 
     #[test]
     fn save_load_round_trip() {
-        let src = MaceUst::new();
-        src.set_us(5_000_000);
+        let clock = Clock::stepped();
+        let src = MaceUst::new(clock.clone());
+        clock.step(5_000_000_000);
         src.last.store(4_999_000, Relaxed);
         src.lost.store(1234, Relaxed);
         src.onewire_until.store(5_003_000, Relaxed);
         let v1 = src.save_state();
 
-        let dst = MaceUst::new();
+        let dst = MaceUst::new(Clock::stepped());
         dst.load_state(&v1).expect("load_state");
         assert_eq!(v1, dst.save_state(), "MaceUst save_state mismatch after load_state round-trip");
     }
 
-    /// On the host clock, a restored machine's time carries on from the
-    /// saved value even though this process's clock started later.
+    /// A restored machine's time carries on from the saved value even though
+    /// the clock started at another reading.
     #[test]
-    fn a_restored_host_clock_runs_on_from_the_saved_time() {
-        let src = MaceUst::new();
-        src.set_us(7_000_000_000);
+    fn a_restored_clock_runs_on_from_the_saved_time() {
+        let src_clock = Clock::stepped();
+        let src = MaceUst::new(src_clock.clone());
+        src_clock.step(7_000_000_000_000);
         let v = src.save_state();
-        let dst = MaceUst::new();
-        dst.use_host_clock();
+        let clock = Clock::stepped();
+        clock.step(5_000);
+        let dst = MaceUst::new(clock.clone());
         dst.load_state(&v).expect("load_state");
-        let t = dst.now();
-        assert!((7_000_000_000..7_001_000_000).contains(&t), "restored clock at {t}");
+        assert_eq!(dst.now(), 7_000_000_000);
+        clock.step(3_000_000);
+        assert_eq!(dst.now(), 7_000_003_000);
     }
 }
