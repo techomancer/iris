@@ -47,7 +47,7 @@ use crate::dev::ds1744::{Ds1744, YearBase};
 use crate::clock::Clock;
 use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
-use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, L1};
+use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, DEFAULT_REVISION, L1};
 use crate::dev::pic::{Function, Pic, PIC_ROUTING};
 use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
 use crate::devlog::LogModule;
@@ -75,6 +75,9 @@ const SECOND_PIC_WIDGET: u8 = 11;
 const HOST_WIDGET: u8 = 10;
 /// The device the V12's packets name at Bedrock IO's inbound permission check.
 const INBOUND_DEVICE: u8 = 0;
+
+/// The L1's brick type for the Tezro.
+const L1_TYPE: u32 = 0x39;
 
 /// The IO9 PIC's bus 0: the IOC4, the TI bridge, the ISP12160 and the BCM5701.
 pub(crate) const IO9_BUS0_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
@@ -139,12 +142,16 @@ pub fn check_banks(banks: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
+/// The least memory in MiB: one processor, and two to four.
+const MIN_MIB_ONE_CPU: u32 = 512;
+const MIN_MIB_MULTI_CPU: u32 = 1024;
+
 /// One processor needs at least 512 MB of memory; two or four need at least 1 GB
 /// (the Tezro manuals, as the QEMU assembly layer records them).
 pub fn check_banks_for_cpus(banks: &[u32], cpus: usize) -> Result<(), String> {
     let needed = match cpus {
-        1 => 512,
-        2..=4 => 1024,
+        1 => MIN_MIB_ONE_CPU,
+        2..=4 => MIN_MIB_MULTI_CPU,
         _ => return Err(format!("{cpus} processors; a Tezro holds 1 to 4")),
     };
     let total: u32 = banks.iter().sum();
@@ -310,8 +317,8 @@ fn spec(
         processors: Population::populated_cpus(cpus)?,
         absent: "",
         l1: L1Config {
-            type_code: 0x39,
-            revision: Some([1, 48, 1]),
+            type_code: L1_TYPE,
+            revision: Some(DEFAULT_REVISION),
             mac,
             system_serial,
             port_speed_first: 1,

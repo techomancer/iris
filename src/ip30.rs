@@ -40,6 +40,8 @@ use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, BUS_ER
 pub const WIDGET_XBOW: u8 = 0x0;
 pub const WIDGET_HEART: u8 = 0x8;
 pub const WIDGET_BRIDGE: u8 = 0xf;
+/// The ports the Crossbow switches, 9 to 15.
+pub const SWITCHED_WIDGETS: Range<u8> = 9..16;
 
 /// HEART as the widgets address it: widget 8, taking an interrupt packet at
 /// offset 0x80 that names one of its 64 interrupt bits.
@@ -193,14 +195,14 @@ impl Ip30Bus {
     /// with `large`, its large window. Routed only while the link is alive;
     /// until `set_widget_link(w, true)` both windows bus-error.
     pub fn attach_widget(&self, w: u8, dev: Arc<dyn BusDevice>, large: bool) {
-        assert!((9..16).contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
+        assert!(SWITCHED_WIDGETS.contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
         self.widgets.lock()[w as usize] = Some((dev, large));
     }
 
     /// Put `dev` behind port `w`'s 2 GiB window, gated by the link as the
     /// small window is. Call before [`Self::init`].
     pub fn attach_long_window(&self, w: u8, dev: Arc<dyn BusDevice>) {
-        assert!((9..16).contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
+        assert!(SWITCHED_WIDGETS.contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
         self.long.lock()[w as usize] = Some(dev);
     }
 
@@ -208,14 +210,14 @@ impl Ip30Bus {
     /// small window is. Call before [`Self::init`]; a widget attached with
     /// its large window takes that window itself.
     pub fn attach_huge_window(&self, w: u8, dev: Arc<dyn BusDevice>) {
-        assert!((9..16).contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
+        assert!(SWITCHED_WIDGETS.contains(&w), "ip30: widget {w} is not a port the Crossbow switches");
         self.huge.lock()[w as usize] = Some(dev);
     }
 
     /// Fill the widget windows as each link stands (dead). Call once, after
     /// the devices are registered and before the CPU runs.
     pub fn init(&self) {
-        for w in 9..16 {
+        for w in SWITCHED_WIDGETS {
             self.set_widget_link(w, false);
         }
     }
@@ -232,7 +234,7 @@ impl Ip30Bus {
     /// callback lands here, outside the Crossbow's own lock. Ports other
     /// than 9 to 15 have no windows to switch.
     pub fn set_widget_link(&self, w: u8, alive: bool) {
-        if !(9..16).contains(&w) {
+        if !SWITCHED_WIDGETS.contains(&w) {
             return;
         }
         let widgets = self.widgets.lock();
@@ -266,7 +268,7 @@ impl Ip30Bus {
     /// whole (the Bridge's BAR runs): map them over the widget while
     /// its link is up, giving the runs it named before back to the widget.
     pub fn set_widget_runs(&self, w: u8, new: Vec<(Range<u64>, Arc<dyn BusDevice>)>) {
-        if !(9..16).contains(&w) {
+        if !SWITCHED_WIDGETS.contains(&w) {
             return;
         }
         let widgets = self.widgets.lock();

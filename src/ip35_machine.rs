@@ -80,7 +80,7 @@ pub const CPUS: &[&Part] = &[&parts::R12000_400_8M];
 /// the class the PROM derives from [`BOARD_ID`].
 const FIRMWARE: FirmwareRecord = FirmwareRecord {
     cpu_mode_word: parts::R12000_400_8M_SYSCLK_200.mode_word,
-    cpu_clock_hz: 400_000_000,
+    cpu_clock_hz: parts::R12000_400_8M_SYSCLK_200.part.mhz * 1_000_000,
     machine_type: 0,
     header: Header::Refreshed,
 };

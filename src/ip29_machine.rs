@@ -49,12 +49,15 @@ const HUB_HOST_WIDGET: u8 = 0xa;
 /// The IP29 System Board's Bridge revision.
 const BRIDGE_REVISION: u32 = 4;
 
+/// The System Board record's synthetic ROM serial.
+const SYSTEM_BOARD_SERIAL: u64 = 0x5145_4d55_4200;
+
 /// The Bridge's one-wire line carries the Origin 200's System Board record. The
 /// barcode and ROM serial are synthetic.
 fn board_record() -> w1::Bus {
     let mut bus = w1::Bus::new();
     let record = BoardRecord { barcode: "EMUN00", part: "030-1244-001", revision: "H", name: "IP29" };
-    bus.add(Box::new(board_record_part(&record, 0x5145_4d55_4200)));
+    bus.add(Box::new(board_record_part(&record, SYSTEM_BOARD_SERIAL)));
     bus
 }
 
