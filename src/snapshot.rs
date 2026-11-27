@@ -278,6 +278,15 @@ pub fn export_overlays(snap: &Snapshot, buses: &[DiskBus]) -> Result<(), String>
     snap.write_toml("cow.toml", &Value::Table(tbl)).map_err(|e| e.to_string())
 }
 
+/// Where `export_overlays` put the overlay of the disk at `at`, relative to the snapshot: in its bus's directory,
+/// named for its target or loop ID, or `scsi0.overlay` in the card's own directory for a card with one disk.
+pub fn overlay_file(at: &crate::slot_path::MachineSlotPath) -> String {
+    match at.target_id().or_else(|| at.loop_number()).zip(at.parent()) {
+        Some((id, bus)) => format!("{bus}/scsi{id}.overlay"),
+        None => format!("{at}/scsi0.overlay"),
+    }
+}
+
 /// What a `cow.toml` lists. Keys that are not slot paths are ignored.
 pub fn parse_cow_table(cow_toml: &Value) -> OverlaySets {
     let mut sets = Vec::new();
