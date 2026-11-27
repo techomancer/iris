@@ -691,7 +691,7 @@ impl OctaneMachine {
         }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
-        Self::connect_serial(cfg, &ioc3, ci_serial.as_ref());
+        Self::connect_serial(cfg, &ioc3, ci_serial.as_ref())?;
 
         // The Ethernet on the NAT gateway `[network]` describes.
         let (mut nat, mut frames) = (None, None);
@@ -785,12 +785,11 @@ impl OctaneMachine {
     /// IOC3's first port is the console: the CI socket's backend in CI
     /// mode, otherwise TCP on `serial_port_a`, either teed to `serial_log`.
     /// The second port serves TCP on `serial_port_b`.
-    fn connect_serial(cfg: &MachineConfig, ioc3: &Ioc3, ci: Option<&Arc<crate::dev::serial_host::CiSerialBackend>>) {
-        let (console, second) = crate::dev::serial_host::console_backends(cfg, "Octane", ci);
+    fn connect_serial(cfg: &MachineConfig, ioc3: &Ioc3, ci: Option<&Arc<crate::dev::serial_host::CiSerialBackend>>) -> Result<(), String> {
+        let (console, second) = crate::dev::serial_host::console_backends(cfg, "Octane", ["IOC3 A", "IOC3 B"], ci)?;
         ioc3.set_serial_backend(0, console);
-        if let Some(b) = second {
-            ioc3.set_serial_backend(1, b);
-        }
+        ioc3.set_serial_backend(1, second);
+        Ok(())
     }
 
     /// An Octane's processor `id` of `cpu_count` over cache type `C`.

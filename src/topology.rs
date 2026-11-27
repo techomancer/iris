@@ -24,6 +24,8 @@ pub enum DeviceFamily {
     Gio,
     Gfx,
     Virtio,
+    /// A device on a serial port: a host serial port, a MIDI synth or a host MIDI port.
+    Serial,
 }
 
 impl DeviceFamily {
@@ -36,6 +38,7 @@ impl DeviceFamily {
             DeviceFamily::Gio => "gio cards",
             DeviceFamily::Gfx => "a graphics board",
             DeviceFamily::Virtio => "virtio devices",
+            DeviceFamily::Serial => "serial devices",
         }
     }
 }
@@ -63,7 +66,8 @@ impl MachineSlotKind {
     /// Whether a device of `family` fits; a card fits an extra slot only when `named`.
     pub fn takes(&self, family: DeviceFamily, named: bool) -> bool {
         match self {
-            MachineSlotKind::Open(families) => families.contains(&family),
+            // A serial device goes only where it is named: left to choose, it would take the console.
+            MachineSlotKind::Open(families) => families.contains(&family) && (named || family != DeviceFamily::Serial),
             MachineSlotKind::Extra { .. } => family == DeviceFamily::Virtio || (named && family == DeviceFamily::Pci),
             _ => false,
         }
@@ -232,6 +236,10 @@ impl MachineProfile {
             P::FuelIp34 => crate::ip34_machine::slots(&mut s),
             P::TezroIp53 => crate::ip53_machine::slots(&mut s),
             P::Origin3200Ip35 | P::Onyx3000Ip35 => crate::ip35_machine::slots(&mut s, self == P::Onyx3000Ip35),
+        }
+        // The serial ports a device can take, by IRIX's /dev/ttydN.
+        for n in crate::dev::serial_dev::ports(self) {
+            open_slot(&mut s, &format!("serial{n}"), &[DeviceFamily::Serial], &[]);
         }
         s
     }
@@ -491,6 +499,10 @@ fn layout(machine: &str, mut slots: Vec<MachineSlot>, devices: &[ConfiguredDevic
             _ if waits => "its slot names itself through local names".to_string(),
             Some(Err(e)) => e,
             Some(Ok(base)) if !slots.iter().any(|s| s.path == base) => format!("the {machine} has no slot {at}"),
+            None if d.device.spec().family == DeviceFamily::Serial => {
+                let ports: Vec<String> = slots.iter().filter(|s| s.path.serial_port().is_some()).map(|s| format!("\"{}\"", s.path)).collect();
+                format!("needs an at: the {machine}'s serial ports are {}", ports.join(", "))
+            }
             base => {
                 let on = base.map_or(format!("the {machine}"), |b| b.expect("checked above").to_string());
                 format!("no free slot for {} on {on}", d.device.spec().family.label())
@@ -845,6 +857,8 @@ mod tests {
             vec!["gfx", "-", "-", "a graphics board"],
             vec!["gio1", "-", "-", "virtio devices"],
             vec!["gio0", "-", "-", "gio cards, virtio devices"],
+            vec!["serial1", "-", "-", "serial devices"],
+            vec!["serial2", "-", "-", "serial devices"],
         ]);
     }
 

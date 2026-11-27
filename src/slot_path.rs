@@ -19,6 +19,7 @@ const TAGS: &[(&str, bool)] = &[
     ("t", true),   // SCSI target N
     ("l", true),   // Fibre Channel loop ID N
     ("usb", true), // USB port N
+    ("serial", true), // serial port N, numbered as IRIX's /dev/ttydN
 ];
 
 const BARE: u8 = 3;
@@ -48,6 +49,7 @@ impl PathStep {
     fn loop_id(n: u8) -> PathStep { PathStep::of("l", n) }
     fn hpc3() -> PathStep { PathStep::of("hpc3", 0) }
     fn gio(n: u8) -> PathStep { PathStep::of("gio", n) }
+    fn serial(n: u8) -> PathStep { PathStep::of("serial", n) }
     fn number(self) -> u8 { self.n }
     fn is_target(self) -> bool { self.same_tag(PathStep::target(0)) }
     fn is_loop(self) -> bool { self.same_tag(PathStep::loop_id(0)) }
@@ -108,6 +110,8 @@ impl MachineSlotPath {
     pub fn target_id(&self) -> Option<u8> { self.last_if(PathStep::is_target) }
     pub fn loop_number(&self) -> Option<u8> { self.last_if(PathStep::is_loop) }
     pub fn gio_slot(&self) -> Option<u8> { self.last_if(|h| h.same_tag(PathStep::gio(0))) }
+    /// N of a serial port path `serialN`, IRIX's `/dev/ttydN`.
+    pub fn serial_port(&self) -> Option<u8> { self.last_if(|h| h.same_tag(PathStep::serial(0))) }
     fn last_if(&self, f: impl Fn(PathStep) -> bool) -> Option<u8> {
         self.0.last().copied().filter(|&h| f(h)).map(PathStep::number)
     }

@@ -16,7 +16,7 @@ use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::devlog::LogModule;
-use crate::dev::serial_host::{NullBackend, SerialBackend};
+use crate::dev::serial_host::{LineConfig, ModemIn, ModemOut, NullBackend, Parity, SerialBackend};
 
 pub mod scc_regs {
     pub const WR0: u8 = 0; // Command/Pointer
@@ -114,9 +114,29 @@ pub mod wr5 {
 pub mod wr14 {
     pub const BRG_ENABLE: u8 = 1 << 0;
     pub const BRG_SOURCE_PCLK: u8 = 1 << 1;
-    pub const LOCAL_LOOPBACK: u8 = 1 << 3;
-    pub const AUTO_ECHO: u8 = 1 << 4;
+    pub const AUTO_ECHO: u8 = 1 << 3;
+    pub const LOCAL_LOOPBACK: u8 = 1 << 4;
 }
+
+// Bit definitions for Register WR11 (Clock Mode): the transmit clock source.
+pub mod wr11 {
+    pub const TX_CLOCK_SHIFT: u8 = 3;
+    pub const CLOCK_RTXC: u8 = 0;
+    pub const CLOCK_TRXC: u8 = 1;
+    pub const CLOCK_BRG: u8 = 2;
+}
+
+// Bit definitions for Register WR15 (External/Status interrupt enables).
+pub mod wr15 {
+    pub const DCD_IE: u8 = 1 << 3;
+    pub const CTS_IE: u8 = 1 << 5;
+}
+
+/// The SCC's bus clock (PCLK), which the baud-rate generator may count.
+pub const PCLK_HZ: u32 = 10_000_000;
+/// The clock on the RTxC pins (3.672 MHz on the Indy and Indigo2), which IRIX
+/// feeds the baud-rate generator from.
+pub const RTXC_HZ: u32 = 3_672_000;
 
 pub struct Channel {
     pub regs: [u8; 16],
@@ -136,6 +156,14 @@ pub struct Channel {
     tx_shift: Option<u8>,
     /// When the last character finishes, in machine ns, so a burst is paced back to back.
     tx_clock: u64,
+    /// The modem inputs as last seen, so a change can raise the
+    /// external/status interrupt and a reset keeps showing the levels.
+    modem_in: ModemIn,
+    /// An external/status interrupt is latched (cleared by the Reset
+    /// Ext/Status Interrupts command).
+    ext_pending: bool,
+    /// The line state the backend was last told.
+    line_sent: Option<(LineConfig, ModemOut)>,
 }
 
 impl Channel {
@@ -154,9 +182,88 @@ impl Channel {
             tx_int_pending: false,
             tx_shift: None,
             tx_clock: 0,
+            modem_in: ModemIn::IDLE,
+            ext_pending: false,
+            line_sent: None,
         };
         c.update_tx_delay();
         c
+    }
+
+    /// RR0's DCD and CTS bits for these input levels.
+    fn modem_bits(m: ModemIn) -> u8 {
+        (if m.dcd { rr0::DCD_STATE } else { 0 }) | (if m.cts { rr0::CTS_STATE } else { 0 })
+    }
+
+    /// The backend's modem inputs: shown in RR0, and a change in an input
+    /// WR15 watches latches the external/status interrupt.
+    pub fn apply_modem_in(&mut self, m: ModemIn) {
+        if m == self.modem_in {
+            return;
+        }
+        let changed = Self::modem_bits(m) ^ Self::modem_bits(self.modem_in);
+        self.modem_in = m;
+        self.status = (self.status & !(rr0::DCD_STATE | rr0::CTS_STATE)) | Self::modem_bits(m);
+        let wr15 = self.regs[scc_regs::WR15 as usize];
+        let watched = (if wr15 & wr15::DCD_IE != 0 { rr0::DCD_STATE } else { 0 }) | (if wr15 & wr15::CTS_IE != 0 { rr0::CTS_STATE } else { 0 });
+        if changed & watched != 0 {
+            self.ext_pending = true;
+        }
+        self.update_ip();
+    }
+
+    /// The line's rate and framing and the modem outputs, as the registers
+    /// set them. The rate follows WR11's transmit clock: the baud-rate
+    /// generator (fed from PCLK or RTxC per WR14), the RTxC pin directly, or
+    /// the TRxC pin, an external clock whose rate is unknown here.
+    pub fn line_state(&self) -> (LineConfig, ModemOut) {
+        let r = &self.regs;
+        let wr4 = r[scc_regs::WR4 as usize];
+        let wr5 = r[scc_regs::WR5 as usize];
+        let wr14 = r[scc_regs::WR14 as usize];
+        let mult: u32 = match (wr4 >> wr4::CLOCK_MODE_SHIFT) & 3 {
+            0 => 1,
+            1 => 16,
+            2 => 32,
+            _ => 64,
+        };
+        let tc = ((r[scc_regs::WR13 as usize] as u32) << 8) | r[scc_regs::WR12 as usize] as u32;
+        // WR4's stop-bit field at 0 is a synchronous mode (and the state after
+        // reset): no asynchronous rate to give a host port.
+        let async_mode = (wr4 >> 2) & 3 != 0;
+        let baud = match (r[scc_regs::WR11 as usize] >> wr11::TX_CLOCK_SHIFT) & 3 {
+            _ if !async_mode => None,
+            wr11::CLOCK_BRG if wr14 & wr14::BRG_ENABLE != 0 => {
+                let src = if wr14 & wr14::BRG_SOURCE_PCLK != 0 { PCLK_HZ } else { RTXC_HZ };
+                Some(src / (2 * (tc + 2) * mult))
+            }
+            wr11::CLOCK_RTXC => Some(RTXC_HZ / mult),
+            _ => None,
+        };
+        let data_bits = match (r[scc_regs::WR3 as usize] >> 6) & 3 {
+            0 => 5,
+            1 => 7,
+            2 => 6,
+            _ => 8,
+        };
+        let parity = match wr4 & 3 {
+            1 => Parity::Odd,
+            3 => Parity::Even,
+            _ => Parity::None,
+        };
+        let stop_bits = if (wr4 >> 2) & 3 >= 2 { 2 } else { 1 };
+        let out = ModemOut { dtr: wr5 & wr5::DTR != 0, rts: wr5 & wr5::RTS != 0, brk: wr5 & wr5::SEND_BREAK != 0 };
+        (LineConfig { baud, data_bits, parity, stop_bits }, out)
+    }
+
+    /// The line state if it differs from what the backend was last told.
+    fn line_change(&mut self) -> Option<(LineConfig, ModemOut)> {
+        let now = self.line_state();
+        if self.line_sent == Some(now) {
+            return None;
+        }
+        self.line_sent = Some(now);
+        Some(now)
     }
 
     fn update_tx_delay(&mut self) {
@@ -181,9 +288,11 @@ impl Channel {
     pub fn reset(&mut self) {
         self.tx_shift = None;
         self.reg_ptr = 0;
-        self.status = rr0::TX_BUFFER_EMPTY;
+        // The modem inputs are pins, not register state: a reset keeps showing them.
+        self.status = rr0::TX_BUFFER_EMPTY | Self::modem_bits(self.modem_in);
         self.regs.fill(0);
         self.tx_int_pending = false;
+        self.ext_pending = false;
         self.update_ip();
         self.update_tx_delay();
     }
@@ -260,6 +369,7 @@ impl Channel {
                 0 => {}, // Null
                 1 => {}, // Point High (handled above)
                 2 => { // Reset Ext/Status Interrupts
+                    self.ext_pending = false;
                 },
                 3 => self.reset(), // Channel Reset
                 4 => { // Enable Interrupt on Next Rx Character
@@ -283,6 +393,11 @@ impl Channel {
     pub fn get_ip(&self) -> u8 {
         let wr1 = self.regs[1];
         let mut ip = 0;
+
+        // External/Status interrupt (bit 0 in the local IP group).
+        if (wr1 & wr1::EXT_INT_EN) != 0 && self.ext_pending {
+            ip |= 1 << 0;
+        }
 
         // Rx Interrupt (Bit 2 in local IP group)
         // Check if Rx Interrupts enabled (WR1 bits 4,3 != 00)
@@ -532,13 +647,19 @@ impl Z85c30 {
         a.read_control() 
     }
     pub fn write_a_control(&self, val: u8) { 
-        let mut a = self.channel_a.lock();
-        let mut b = self.channel_b.lock();
-        
-        let update = a.write_control(val);
-        self.tx[0].kick(&mut a, false);
-        if let Some(wr2) = update {
-            b.regs[2] = wr2;
+        let change = {
+            let mut a = self.channel_a.lock();
+            let mut b = self.channel_b.lock();
+
+            let update = a.write_control(val);
+            self.tx[0].kick(&mut a, false);
+            if let Some(wr2) = update {
+                b.regs[2] = wr2;
+            }
+            a.line_change()
+        };
+        if let Some(line) = change {
+            Self::send_line(&self.backend_a, "A", line);
         }
     }
     pub fn read_a_data(&self) -> u8 { self.channel_a.lock().read_data() }
@@ -565,13 +686,42 @@ impl Z85c30 {
         b.read_control() 
     }
     pub fn write_b_control(&self, val: u8) { 
-        let mut a = self.channel_a.lock();
-        let mut b = self.channel_b.lock();
-        
-        let update = b.write_control(val);
-        self.tx[1].kick(&mut b, false);
-        if let Some(wr2) = update {
-            a.regs[2] = wr2;
+        let change = {
+            let mut a = self.channel_a.lock();
+            let mut b = self.channel_b.lock();
+
+            let update = b.write_control(val);
+            self.tx[1].kick(&mut b, false);
+            if let Some(wr2) = update {
+                a.regs[2] = wr2;
+            }
+            b.line_change()
+        };
+        if let Some(line) = change {
+            Self::send_line(&self.backend_b, "B", line);
+        }
+    }
+
+    /// Tell a channel's backend its line state, with no channel lock held:
+    /// a host serial port reprograms itself, which is a system call.
+    fn send_line(backend: &Mutex<Arc<dyn SerialBackend>>, name: &str, (line, out): (LineConfig, ModemOut)) {
+        crate::dlog_dev!(LogModule::Scc, "SCC({}): line {} DTR={} RTS={} BRK={}", name, line, out.dtr, out.rts, out.brk);
+        let b = backend.lock().clone();
+        b.set_line(line);
+        b.set_modem(out);
+    }
+
+    /// Tell both backends the current line state whatever they were told
+    /// before: at start, and after a snapshot is loaded.
+    fn resend_lines(&self) {
+        for (ch, backend, name) in [(&self.channel_a, &self.backend_a, "A"), (&self.channel_b, &self.backend_b, "B")] {
+            let line = {
+                let mut c = ch.lock();
+                let now = c.line_state();
+                c.line_sent = Some(now);
+                now
+            };
+            Self::send_line(backend, name, line);
         }
     }
     pub fn read_b_data(&self) -> u8 { self.channel_b.lock().read_data() }
@@ -645,6 +795,7 @@ impl Device for Z85c30 {
         for t in &self.tx {
             t.timer.start();
         }
+        self.resend_lines();
         let pairs = [
             (self.channel_a.clone(), self.backend_a.lock().clone()),
             (self.channel_b.clone(), self.backend_b.lock().clone()),
@@ -672,10 +823,19 @@ impl Device for Z85c30 {
                 // ~30-char `dd if=/dev/rdsk/dks0d2s0 bs=512` arrives at
                 // the shell as `dd if=/d=512` (chars 9..24 dropped).
                 let mut pending: Option<u8> = None;
+                // A device's bytes go to the guest as they are; only a
+                // console gets the ^E conversion below.
+                let raw = rx_backend.raw();
+                let mut modem = ModemIn::IDLE;
 
                 while running.load(Ordering::Relaxed) {
                     // This loop is the line's poll: it writes out queued output too.
                     rx_backend.flush();
+                    let m = rx_backend.modem_in();
+                    if m != modem {
+                        modem = m;
+                        rx_channel.lock().apply_modem_in(m);
+                    }
                     let mut byte = match pending.take() {
                         Some(b) => b,
                         // In-process injection (channel B) takes priority over
@@ -692,7 +852,7 @@ impl Device for Z85c30 {
                             },
                         },
                     };
-                    if byte == 0x05 {
+                    if byte == 0x05 && !raw {
                         crate::dlog_dev!(LogModule::Scc, "SCC: Converting ^E to ^D (BREAK)");
                         byte = 0x04;
                     }
@@ -824,6 +984,9 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     // returns 0 without touching it, so a guest polling RR0 spins forever.
     ch.status &= !rr0::RX_CHAR_AVAILABLE;
     ch.status |= rr0::TX_BUFFER_EMPTY;
+    // DCD and CTS are the host end's pins now, not what the snapshot saw.
+    ch.status = (ch.status & !(rr0::DCD_STATE | rr0::CTS_STATE)) | Channel::modem_bits(ch.modem_in);
+    ch.ext_pending = false;
     // notify_tx_empty is the only setter and its character went out with tx_queue.
     // Gated on WR5 as well because the TX thread only ever latches while
     // TX_ENABLE is set, so a latch without it is a state the model cannot reach.
@@ -853,6 +1016,8 @@ impl Saveable for Z85c30 {
             channel_from_toml(cb, &mut self.channel_b.lock());
             self.tx[1].timer.set_due(None);
         }
+        // The host end keeps its own state through a load: tell it the restored line.
+        self.resend_lines();
         Ok(())
     }
 }
@@ -923,8 +1088,9 @@ pub(crate) mod tests {
     /// TCP ports.
     ///
     /// The `status` fixtures below are already normalized against empty FIFOs
-    /// (`TX_BUFFER_EMPTY` set, `RX_CHAR_AVAILABLE` clear) because restore is
-    /// deliberately not an identity on that field; do not "fix" them back.
+    /// (`TX_BUFFER_EMPTY` set, `RX_CHAR_AVAILABLE` clear) and carry DCD and
+    /// CTS as the idle host end shows them, because restore is deliberately
+    /// not an identity on that field; do not "fix" them back.
     #[test]
     fn save_load_round_trip() {
         let src = Z85c30::new(None, &Arc::new(TimerManager::new()));
@@ -935,7 +1101,7 @@ pub(crate) mod tests {
             ch.regs[3]  = 0xc1;
             ch.regs[5]  = 0xea;
             ch.reg_ptr  = 7;
-            ch.status   = 0x44;
+            ch.status   = 0x6c;
         }
         {
             let mut ch = src.channel_b.lock();
@@ -943,7 +1109,7 @@ pub(crate) mod tests {
             ch.regs[2]  = 0x10;
             ch.regs[15] = 0x05;
             ch.reg_ptr  = 3;
-            ch.status   = 0x84;
+            ch.status   = 0xac;
         }
         let v1 = src.save_state();
 
@@ -1129,6 +1295,148 @@ pub(crate) mod tests {
     /// A character leaves the shift register when the machine clock reaches
     /// the end of its time on the line, paced back to back with the next; a
     /// stop keeps the deadline, and a load drops the character in flight.
+    /// A host end that records the line state it is told and shows the
+    /// modem inputs a test sets: a stand-in for a host serial port.
+    struct LineProbe {
+        lines: Mutex<Vec<LineConfig>>,
+        outs: Mutex<Vec<ModemOut>>,
+        input: Mutex<ModemIn>,
+        rx: Mutex<VecDeque<u8>>,
+    }
+
+    impl LineProbe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { lines: Mutex::new(vec![]), outs: Mutex::new(vec![]), input: Mutex::new(ModemIn::IDLE), rx: Mutex::new(VecDeque::new()) })
+        }
+    }
+
+    impl SerialBackend for LineProbe {
+        fn send_byte(&self, _: u8) {}
+        fn recv_byte(&self) -> io::Result<u8> {
+            self.rx.lock().pop_front().ok_or_else(|| io::ErrorKind::WouldBlock.into())
+        }
+        fn set_line(&self, l: LineConfig) {
+            self.lines.lock().push(l);
+        }
+        fn set_modem(&self, o: ModemOut) {
+            self.outs.lock().push(o);
+        }
+        fn modem_in(&self) -> ModemIn {
+            *self.input.lock()
+        }
+        fn raw(&self) -> bool {
+            true
+        }
+    }
+
+    fn wr_a(scc: &Z85c30, reg: u8, val: u8) {
+        if reg >= 8 {
+            scc.write_a_control(0x08 | (reg - 8));
+        } else {
+            scc.write_a_control(reg);
+        }
+        scc.write_a_control(val);
+    }
+
+    /// IRIX's 9600 8N1 setup: the baud-rate generator fed from the 3.672 MHz
+    /// RTxC clock, x16, time constant 10. The rate it gives is 9562, which
+    /// a host port rounds to 9600.
+    #[test]
+    fn line_state_follows_the_clock_irix_programs() {
+        let clock = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &clock.tm);
+        for (reg, val) in [(4, 0x44), (3, 0xc1), (5, 0xea), (11, 0x50), (12, 10), (13, 0), (14, 0x01)] {
+            wr_a(&scc, reg, val);
+        }
+        assert_eq!(Z85c30::new(None, &clock.tm).channel_a.lock().line_state().0.baud, None, "after reset: sync mode, no rate");
+        let (line, out) = scc.channel_a.lock().line_state();
+        assert_eq!(line, LineConfig { baud: Some(9562), data_bits: 8, parity: Parity::None, stop_bits: 1 });
+        assert_eq!(out, ModemOut { dtr: true, rts: true, brk: false });
+        // The generator off: no rate the emulator can name.
+        wr_a(&scc, 14, 0x00);
+        assert_eq!(scc.channel_a.lock().line_state().0.baud, None);
+        // A Macintosh MIDI interface: the TRxC pin, x32, an external clock.
+        wr_a(&scc, 11, 0x28);
+        wr_a(&scc, 4, 0x84);
+        assert_eq!(scc.channel_a.lock().line_state().0.baud, None);
+        // The generator from PCLK: 10 MHz / (2 * 34 * 16) = 9191.
+        for (reg, val) in [(11, 0x50), (4, 0x44), (12, 32), (14, 0x03)] {
+            wr_a(&scc, reg, val);
+        }
+        assert_eq!(scc.channel_a.lock().line_state().0.baud, Some(9191));
+        // Odd parity, two stop bits, 7 bits.
+        wr_a(&scc, 4, 0x4d);
+        wr_a(&scc, 3, 0x41);
+        let line = scc.channel_a.lock().line_state().0;
+        assert_eq!((line.data_bits, line.parity, line.stop_bits), (7, Parity::Odd, 2));
+    }
+
+    /// Register writes reach the backend, each change once, and start()
+    /// tells it the state it begins in.
+    #[test]
+    fn the_backend_hears_the_guests_line_and_modem_lines() {
+        let clock = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &clock.tm);
+        let probe = LineProbe::new();
+        scc.set_backend_a(probe.clone());
+        scc.start();
+        assert_eq!(probe.outs.lock().last().copied(), Some(ModemOut::default()), "start: DTR and RTS low, as after reset");
+        let told = probe.outs.lock().len();
+        wr_a(&scc, 5, 0x82);
+        assert_eq!(probe.outs.lock().last().copied(), Some(ModemOut { dtr: true, rts: true, brk: false }));
+        assert_eq!(probe.outs.lock().len(), told + 1);
+        wr_a(&scc, 5, 0x82);
+        assert_eq!(probe.outs.lock().len(), told + 1, "an unchanged write tells nothing");
+        wr_a(&scc, 5, 0x92);
+        assert!(probe.outs.lock().last().unwrap().brk, "break");
+        for (reg, val) in [(4, 0x44), (11, 0x50), (12, 10), (14, 0x01)] {
+            wr_a(&scc, reg, val);
+        }
+        assert_eq!(probe.lines.lock().last().unwrap().baud, Some(9562));
+        scc.stop();
+    }
+
+    /// CTS and DCD come from the backend: RR0 shows them, and a change WR15
+    /// watches raises the external/status interrupt until the guest resets it.
+    #[test]
+    fn modem_inputs_show_in_rr0_and_interrupt() {
+        let clock = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &clock.tm);
+        wr_a(&scc, 15, wr15::CTS_IE);
+        wr_a(&scc, 1, wr1::EXT_INT_EN);
+        let mut a = scc.channel_a.lock();
+        assert_ne!(a.status & rr0::CTS_STATE, 0);
+        a.apply_modem_in(ModemIn { cts: false, ..ModemIn::IDLE });
+        assert_eq!(a.status & rr0::CTS_STATE, 0, "CTS dropped");
+        assert_eq!(a.get_ip() & 1, 1, "external/status interrupt");
+        a.write_control(0x10); // Reset Ext/Status Interrupts
+        assert_eq!(a.get_ip() & 1, 0);
+        a.apply_modem_in(ModemIn { cts: false, dcd: false, ..ModemIn::IDLE });
+        assert_eq!(a.status & rr0::DCD_STATE, 0, "DCD shows");
+        assert_eq!(a.get_ip() & 1, 0, "WR15 does not watch DCD");
+        a.write_control(0x18); // Channel Reset
+        assert_eq!(a.status & (rr0::CTS_STATE | rr0::DCD_STATE), 0, "a reset keeps showing the pins");
+    }
+
+    /// A device's bytes reach the guest unchanged: 0x05 is a console's ^E
+    /// only on a line a person types at.
+    #[test]
+    fn a_raw_line_passes_0x05_through() {
+        let clock = crate::test_board::Stepped::new();
+        let scc = Z85c30::new(None, &clock.tm);
+        let probe = LineProbe::new();
+        probe.rx.lock().extend([0x05u8, 0x41]);
+        scc.set_backend_a(probe.clone());
+        wr_a(&scc, 3, 0xc1);
+        scc.start();
+        let until = Instant::now() + Duration::from_secs(5);
+        while scc.channel_a.lock().rx_queue.len() < 2 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        scc.stop();
+        assert_eq!(scc.channel_a.lock().rx_queue.iter().copied().collect::<Vec<_>>(), [0x05, 0x41]);
+    }
+
     #[test]
     fn transmit_is_paced_by_a_timer_on_the_machine_clock() {
         let clock = crate::test_board::Stepped::new();

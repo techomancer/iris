@@ -515,6 +515,8 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 
 | Note | Kind | Title |
 |---|---|---|
+| [midi-on-a-serial-port.md](irix/midi-on-a-serial-port.md) | howto | Testing MIDI in a guest: `startmidi -p rs232` on RS-232 ports, a minimal libmd sender, checking the synth with `serial` and `IRIS_MIDI_CAPTURE` |
+| [b9600-is-a-number-not-a-cflag-bit.md](irix/b9600-is-a-number-not-a-cflag-bit.md) | rule | IRIX 6.5's `B9600` is 9600: OR-ing it into `c_cflag` sets PARENB and HUPCL; use `cfsetospeed` |
 | [telnet-lines-are-cut-at-256.md](irix/telnet-lines-are-cut-at-256.md) | rule | A command line sent over telnet is cut at 256 characters (tty canonical mode): keep `irix-sh.py run` commands short or push a script; some images' xdm grabs the server until a console login |
 | [backgrounded-shutdown-dies-with-its-telnet-session.md](irix/backgrounded-shutdown-dies-with-its-telnet-session.md) | rule | `shutdown ... &` over irix-sh.py dies with the telnet session when the guest is busy, so it looks like a hang; run it in the foreground or under `nohup` |
 | [cdrom-changer-eject-no-mediad-remount.md](irix/cdrom-changer-eject-no-mediad-remount.md) | open | CD changer `cdrom-eject` does not trigger a `mediad` remount |
@@ -566,6 +568,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [display-refresh-common-layer.md](plans/display-refresh-common-layer.md) | plan | Issue #742: one refresh thread for all boards, guest-programmed refresh rate, vblank/compose/present callbacks, heads and host monitors, stereo (SBS, display glasses); survey of today's six display threads and of each board's timing, stereo and dual-head hardware |
 | [wgpu-ui.md](plans/wgpu-ui.md) | plan | The iris window on wgpu: a presenter in `src/wgpu`, the board's device shared, VPro frames presented with no readback, then Newport's compositor in WGSL |
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
+| [serial-peripherals.md](plans/serial-peripherals.md) | plan | Peripherals on guest serial ports: host serial passthrough, MIDI (Linux rawmidi bridge, rustysynth), Spaceball (hidraw) and Wacom (libinput) emulated from USB devices or passed through raw; interim `[midi]`/`[wacom]`/`[spaceball]` config; UART line-state plumbing and the SCC/16550 clock bugs found on the way; `[[devices]]` serial family after #871/#872 |
 | [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
 | [kona-tile-handoff-race.md](plans/kona-tile-handoff-race.md) | open | KONA tile scheduler strands a job when a tile changes hands (tail store `Release` / load `Acquire` in a store-then-load hand-over): `a_tiled_run_is_bit_exact_with_the_inline_one` hangs on Apple silicon and is ignored; stuck-state dump, cause, candidate two-line `SeqCst` fix with measurements |

@@ -183,6 +183,7 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
             DeviceModel::Nvme(n) => visit(&mut n.path),
             DeviceModel::TestDevice(t) => t.dump.iter_mut().for_each(&mut visit),
             DeviceModel::Virtio9p(v) => visit(&mut v.path),
+            DeviceModel::Serial(s) => visit(&mut s.path),
             DeviceModel::VirtioSerial(v) => v.ports.iter_mut().filter_map(|p| p.socket.as_mut()).for_each(&mut visit),
             DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Newport | DeviceModel::Graphics => {}
         }

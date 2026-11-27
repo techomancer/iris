@@ -35,9 +35,10 @@ use crate::snapshot::{field, field_bytes, field_u8, StateTable};
 pub(super) const MCR_AFE: u8 = 0x20;
 pub(super) const LSR_TEST_MASK: u8 = 0x7f;
 pub(super) const MSR_TEST_MASK: u8 = 0x0f;
-/// The reference clock of the UART crystal: the pre-divider divides it, and
-/// the divisor latch divides the result by 16 again.
-pub(super) const UART_CRYSTAL_HZ: u32 = 22_118_400;
+/// The UART's reference clock: the pre-divider divides it in half steps, and
+/// the divisor latch divides the result by 16 again. IRIX computes its
+/// divisors for 22 MHz.
+pub(super) const UART_CRYSTAL_HZ: u32 = 22_000_000;
 
 /// A 16550 as IOC3 has it: the shared core (`ns16550.rs`) with the chip's
 /// own additions around it. Transmit is instantaneous (the byte goes to the
@@ -111,10 +112,11 @@ impl Uart {
             com_reg::MSR => self.msr_test = v & MSR_TEST_MASK,
             com_reg::SCR => {
                 // Scratch writes with the divisor latch up program the clock
-                // pre-divider; twice the divide wanted. 0 and 1 mean nothing.
-                if self.core.dlab() && v / 2 != 0 {
+                // pre-divider; twice the divide wanted, so odd values are half
+                // steps (11 divides by 5.5). 0 and 1 mean nothing.
+                if self.core.dlab() && v >= 2 {
                     self.predivider = v;
-                    self.core.set_baudbase(UART_CRYSTAL_HZ / (v / 2) as u32 / 16);
+                    self.core.set_baudbase((2 * UART_CRYSTAL_HZ as u64 / v as u64 / 16) as u32);
                 }
             }
             _ => {}
@@ -141,6 +143,9 @@ impl Uart {
     fn load_state(&mut self, v: &toml::Value) -> Result<(), String> {
         self.core.load_state(field(v, "core")?);
         self.predivider = field_u8(v, "predivider")?;
+        if self.predivider >= 2 {
+            self.core.set_baudbase((2 * UART_CRYSTAL_HZ as u64 / self.predivider as u64 / 16) as u32);
+        }
         self.mcr_afe = field_u8(v, "mcr_afe")?;
         self.lsr_test = field_u8(v, "lsr_test")?;
         self.msr_test = field_u8(v, "msr_test")?;

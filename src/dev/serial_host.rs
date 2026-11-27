@@ -30,9 +30,98 @@ use crate::config::MachineConfig;
 use crate::dev::serial_log::SerialLog;
 use crate::net::telnet::IAC;
 
+/// Parity of a serial line's characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Parity {
+    #[default]
+    None,
+    Odd,
+    Even,
+}
+
+/// How the guest has framed and clocked a serial line, as its UART registers say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineConfig {
+    /// Bits per second, or `None` when the UART is clocked from a pin whose
+    /// rate the emulator cannot see (an external clock, as a Macintosh MIDI
+    /// interface supplies).
+    pub baud: Option<u32>,
+    /// 5 to 8.
+    pub data_bits: u8,
+    pub parity: Parity,
+    /// 1 or 2 (1.5 is reported as 2).
+    pub stop_bits: u8,
+}
+
+impl Default for LineConfig {
+    fn default() -> Self {
+        Self { baud: Some(9600), data_bits: 8, parity: Parity::None, stop_bits: 1 }
+    }
+}
+
+impl std::fmt::Display for LineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.baud {
+            Some(b) => write!(f, "{b}")?,
+            None => write!(f, "ext-clock")?,
+        }
+        let p = match self.parity {
+            Parity::None => 'N',
+            Parity::Odd => 'O',
+            Parity::Even => 'E',
+        };
+        write!(f, " {}{}{}", self.data_bits, p, self.stop_bits)
+    }
+}
+
+/// The modem-control outputs the guest drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModemOut {
+    pub dtr: bool,
+    pub rts: bool,
+    /// Sending a break (the line held at space).
+    pub brk: bool,
+}
+
+/// The modem-status inputs the guest reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModemIn {
+    pub cts: bool,
+    pub dcd: bool,
+    pub dsr: bool,
+    pub ri: bool,
+}
+
+impl ModemIn {
+    /// What a line with nothing that drives the inputs shows: a socket or a
+    /// log is always "connected and clear to send".
+    pub const IDLE: ModemIn = ModemIn { cts: true, dcd: true, dsr: true, ri: false };
+}
+
 pub trait SerialBackend: Send + Sync {
     /// Send a byte. Never blocks and never refuses.
     fn send_byte(&self, byte: u8);
+    /// The guest changed the line's rate or framing. A backend wired to a
+    /// real port programs the port to match; others ignore it.
+    fn set_line(&self, _line: LineConfig) {}
+    /// The guest changed DTR, RTS or break.
+    fn set_modem(&self, _out: ModemOut) {}
+    /// The modem-status inputs, polled from the UART's receive loop.
+    fn modem_in(&self) -> ModemIn {
+        ModemIn::IDLE
+    }
+    /// True for a line that carries a device's own bytes (a host serial port,
+    /// an emulated peripheral), which the UART must pass through untouched.
+    /// False for a console a person types at, where the UART may apply its
+    /// console conveniences.
+    fn raw(&self) -> bool {
+        false
+    }
+    /// What the host end is, for the monitor's `serial`: where it listens and
+    /// who is connected, or the device and the line it is set to.
+    fn describe(&self) -> String {
+        "a host end".into()
+    }
     /// Write out what socket clients have queued, one write each. The UART's
     /// receive thread or service loop calls it every poll.
     fn flush(&self) {}
@@ -164,6 +253,9 @@ pub(crate) struct NullBackend;
 
 impl SerialBackend for NullBackend {
     fn send_byte(&self, _byte: u8) {}
+    fn describe(&self) -> String {
+        "nothing".into()
+    }
     fn recv_byte(&self) -> io::Result<u8> {
         Err(io::Error::new(io::ErrorKind::WouldBlock, "null"))
     }
@@ -188,6 +280,21 @@ impl SerialBackend for TeeBackend {
     fn send_byte(&self, byte: u8) {
         self.log.write(&[byte]);
         self.inner.send_byte(byte);
+    }
+    fn set_line(&self, line: LineConfig) {
+        self.inner.set_line(line);
+    }
+    fn set_modem(&self, out: ModemOut) {
+        self.inner.set_modem(out);
+    }
+    fn modem_in(&self) -> ModemIn {
+        self.inner.modem_in()
+    }
+    fn raw(&self) -> bool {
+        self.inner.raw()
+    }
+    fn describe(&self) -> String {
+        format!("{}; log {}", self.inner.describe(), self.log.name())
     }
     fn flush(&self) {
         self.inner.flush();
@@ -234,6 +341,8 @@ pub(crate) trait Listen: Send + Sync {
     const MAX: usize;
     /// Take one waiting client, non-blocking.
     fn accept(&self) -> io::Result<Self::Stream>;
+    /// Where it listens, for the monitor.
+    fn describe_addr(&self) -> String;
 }
 
 impl Listen for TcpListener {
@@ -250,6 +359,10 @@ impl Listen for TcpListener {
         // interaction. Set it on accept, before any byte is written.
         let _ = socket.set_nodelay(true);
         Ok(socket)
+    }
+
+    fn describe_addr(&self) -> String {
+        self.local_addr().map_or_else(|_| "tcp ?".into(), |a| format!("tcp {a}"))
     }
 }
 
@@ -270,6 +383,10 @@ impl Listen for UnixLine {
         let (socket, _) = self.listener.accept()?;
         socket.set_nonblocking(true)?;
         Ok(socket)
+    }
+
+    fn describe_addr(&self) -> String {
+        format!("unix {}", self.path.display())
     }
 }
 
@@ -318,6 +435,19 @@ impl SerialBackend for FanoutBackend {
         for b in &self.0 {
             b.send_byte(byte);
         }
+    }
+    fn set_line(&self, line: LineConfig) {
+        for b in &self.0 {
+            b.set_line(line);
+        }
+    }
+    fn set_modem(&self, out: ModemOut) {
+        for b in &self.0 {
+            b.set_modem(out);
+        }
+    }
+    fn describe(&self) -> String {
+        self.0.iter().map(|b| b.describe()).collect::<Vec<_>>().join(" + ")
     }
     fn flush(&self) {
         for b in &self.0 {
@@ -432,6 +562,11 @@ impl<L: Listen> SerialBackend for SocketBackend<L> {
     fn dropped(&self) -> u64 {
         let live: u64 = self.conns.lock().iter().map(|c| c.queue.dropped()).sum();
         self.dropped.load(Ordering::Relaxed) + live
+    }
+
+    fn describe(&self) -> String {
+        let n = self.conns.lock().len();
+        format!("{}, {n} client{}", self.listener.describe_addr(), if n == 1 { "" } else { "s" })
     }
 
     fn recv_byte(&self) -> io::Result<u8> {
@@ -623,6 +758,12 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 impl SerialBackend for CiSerialBackend {
+    fn describe(&self) -> String {
+        match self.log.lock().as_ref() {
+            Some(log) => format!("CI control socket; log {}", log.name()),
+            None => "CI control socket".into(),
+        }
+    }
     fn send_byte(&self, byte: u8) {
         self.guest_to_host.lock().push(byte);
         if let Some(log) = self.log.lock().as_ref() {
@@ -759,48 +900,67 @@ pub fn serial_line(
     }
 }
 
-/// The host ends of a machine's two serial ports: `(console, second)`.
+/// The host ends of a machine's two serial ports: `(console, second)`,
+/// each in the monitor's `serial` map under the board's names for them
+/// (`ports`, as `["IOC3 A", "IOC3 B"]`).
 ///
 /// The console is the CI backend in CI mode, otherwise TCP on
 /// `serial_port_a` (nothing, if the port is taken), either teed to
 /// `serial_log`. The second port serves TCP on `serial_port_b`, teed to
-/// `serial_log_b`, or is `None` when nothing could serve it, so the caller
-/// leaves it unwired. In CI mode neither port is served on TCP, so several
-/// `--ci` instances coexist. Each also takes a Unix socket, `serial_socket_a` and
-/// `serial_socket_b`.
+/// `serial_log_b`, or nothing when nothing could serve it. In CI mode neither
+/// port is served on TCP, so several `--ci` instances coexist. Each also
+/// takes a Unix socket, `serial_socket_a` and `serial_socket_b`. A
+/// `[hostserial]`, `[spaceball]` or `[wacom]` section takes its port instead.
 pub fn console_backends(
     cfg: &MachineConfig,
     tag: &str,
+    ports: [&str; 2],
     ci: Option<&Arc<CiSerialBackend>>,
-) -> (Arc<dyn SerialBackend>, Option<Arc<dyn SerialBackend>>) {
+) -> Result<(Arc<dyn SerialBackend>, Arc<dyn SerialBackend>), String> {
     let [port_a, port_b] = cfg.serial_ports();
     let log = open_log(cfg, tag);
     let label = format!("{tag} serial port 1");
-    let (console, _) = serial_line(
-        &SerialLine {
-            label: &label,
-            tcp_port: Some(port_a),
-            tcp_setting: "serial_port_a",
-            socket: cfg.serial_socket_a.as_deref(),
-            socket_setting: "serial_socket_a",
-        },
-        log,
-        ci,
-    );
+    let console = match crate::dev::serial_dev::peripheral(cfg, 1, log.clone())? {
+        Some(b) => {
+            log::warn!("{tag}: serial1 is the console port; the PROM and IRIX console now go to the peripheral");
+            b
+        }
+        None => {
+            serial_line(
+                &SerialLine {
+                    label: &label,
+                    tcp_port: Some(port_a),
+                    tcp_setting: "serial_port_a",
+                    socket: cfg.serial_socket_a.as_deref(),
+                    socket_setting: "serial_socket_a",
+                },
+                log,
+                ci,
+            )
+            .0
+        }
+    };
+    let console = crate::dev::serial_map::mapped(tag, ports[0], Some(1), true, cfg, console);
     let label = format!("{tag} serial port 2");
     let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label);
-    let (second, served) = serial_line(
-        &SerialLine {
-            label: &label,
-            tcp_port: ci.is_none().then_some(port_b),
-            tcp_setting: "serial_port_b",
-            socket: cfg.serial_socket_b.as_deref(),
-            socket_setting: "serial_socket_b",
-        },
-        log,
-        None,
-    );
-    (console, served.then_some(second))
+    let second = match crate::dev::serial_dev::peripheral(cfg, 2, log.clone())? {
+        Some(b) => b,
+        None => {
+            let (second, served) = serial_line(
+                &SerialLine {
+                    label: &label,
+                    tcp_port: ci.is_none().then_some(port_b),
+                    tcp_setting: "serial_port_b",
+                    socket: cfg.serial_socket_b.as_deref(),
+                    socket_setting: "serial_socket_b",
+                },
+                log,
+                None,
+            );
+            if served { second } else { null_serial_backend() }
+        }
+    };
+    Ok((console, crate::dev::serial_map::mapped(tag, ports[1], Some(2), false, cfg, second)))
 }
 
 #[cfg(test)]
@@ -823,20 +983,20 @@ pub(crate) mod tests {
         cfg.serial_port_b = Some(0);
 
         let ci = Arc::new(CiSerialBackend::new());
-        let (console, second) = console_backends(&cfg, "Test", Some(&ci));
+        let (console, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], Some(&ci)).unwrap();
         console.send_byte(b'c');
         assert_eq!(ci.drain_guest(), b"c");
         assert_eq!(std::fs::read(&log).unwrap(), b"stalec", "added to what was there");
         drop(console);
         cfg.serial_log_overwrite = true;
-        let (console, _) = console_backends(&cfg, "Test", Some(&ci));
+        let (console, _) = console_backends(&cfg, "Test", ["port 1", "port 2"], Some(&ci)).unwrap();
         console.send_byte(b'c');
         assert_eq!(std::fs::read(&log).unwrap(), b"c", "started over");
-        assert!(second.is_none(), "CI mode serves no TCP port, so the second port stays unwired");
+        assert_eq!(second.describe(), "nothing", "CI mode serves no TCP port, so the second port is wired to nothing");
 
         drop(console);
-        let (console, second) = console_backends(&cfg, "Test", None);
-        assert!(second.is_some());
+        let (console, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], None).unwrap();
+        assert!(second.describe().starts_with("tcp 127.0.0.1:"), "{}", second.describe());
         console.send_byte(b't');
         assert_eq!(std::fs::read(&log).unwrap(), b"t");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1019,7 +1179,7 @@ pub(crate) mod tests {
         cfg.serial_socket_a = Some(sock.to_string_lossy().into_owned());
 
         let ci = Arc::new(CiSerialBackend::new());
-        let (console, _) = console_backends(&cfg, "Test", Some(&ci));
+        let (console, _) = console_backends(&cfg, "Test", ["port 1", "port 2"], Some(&ci)).unwrap();
         let mut client = UnixStream::connect(&sock).unwrap();
         let _ = console.recv_byte();
         console.send_byte(b'k');
@@ -1044,7 +1204,7 @@ pub(crate) mod tests {
     }
 
     /// The second port has its own log and socket; with neither TCP nor a
-    /// socket to serve it, it is left unwired.
+    /// socket to serve it, it is wired to nothing.
     #[cfg(unix)]
     #[test]
     fn the_second_port_has_its_own_socket_and_log() {
@@ -1055,13 +1215,13 @@ pub(crate) mod tests {
         let mut cfg = MachineConfig::default();
         cfg.serial_port_a = Some(0);
         cfg.serial_port_b = Some(busy.local_addr().unwrap().port());
-        let (_, second) = console_backends(&cfg, "Test", None);
-        assert!(second.is_none(), "a taken port with no socket leaves the port unwired");
+        let (_, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], None).unwrap();
+        assert_eq!(second.describe(), "nothing", "a taken port with no socket leaves the port wired to nothing");
 
         cfg.serial_socket_b = Some(sock.to_string_lossy().into_owned());
         cfg.serial_log_b = Some(log_path.to_string_lossy().into_owned());
-        let (_, second) = console_backends(&cfg, "Test", None);
-        let second = second.expect("the socket serves the port");
+        let (_, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], None).unwrap();
+        assert!(second.describe().starts_with("unix "), "the socket serves the port");
         let mut client = UnixStream::connect(&sock).unwrap();
         let _ = second.recv_byte();
         second.send_byte(b'b');
