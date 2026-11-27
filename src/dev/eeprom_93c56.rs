@@ -125,10 +125,7 @@ impl Eeprom93c56 {
     /// and leaves any existing guest settings alone. This is not a CPU EEPROM
     /// image. Returns true if it wrote anything.
     pub fn initialize_if_erased(&mut self, rev: u8) -> bool {
-        let mut block = [0u8; 256];
-        for (pair, word) in block.chunks_exact_mut(2).zip(&self.data) {
-            pair.copy_from_slice(&word.to_be_bytes());
-        }
+        let mut block = self.block();
         if !crate::dev::sgi_nvram::is_erased(&block, 0xFF) {
             return false;
         }
@@ -137,6 +134,27 @@ impl Eeprom93c56 {
             *word = u16::from_be_bytes([pair[0], pair[1]]);
         }
         true
+    }
+
+    fn block(&self) -> [u8; 256] {
+        let mut block = [0u8; 256];
+        for (pair, word) in block.chunks_exact_mut(2).zip(&self.data) {
+            pair.copy_from_slice(&word.to_be_bytes());
+        }
+        block
+    }
+
+    /// Store `console=d` in the settings block (see `sgi_nvram`).
+    pub fn set_console_serial(&mut self, rev: u8) {
+        let mut block = self.block();
+        crate::dev::sgi_nvram::set_console_serial(&mut block, rev);
+        for (word, pair) in self.data.iter_mut().zip(block.chunks_exact(2)) {
+            *word = u16::from_be_bytes([pair[0], pair[1]]);
+        }
+    }
+
+    pub fn console_is_serial(&self, rev: u8) -> bool {
+        crate::dev::sgi_nvram::console_is_serial(&self.block(), rev)
     }
 
     /// Load the full 128-word array from `filename` (raw big-endian bytes,
@@ -535,6 +553,16 @@ mod tests {
         assert_eq!(ee.data[0x7d..], [0x0800, 0x6912, 0x3456]);
         let bytes: Vec<u8> = ee.data.iter().flat_map(|w| w.to_be_bytes()).collect();
         assert_eq!(bytes[0], crate::dev::sgi_nvram::checksum(bytes.as_slice().try_into().unwrap()));
+    }
+
+    #[test]
+    fn erased_ip28_takes_console_d_and_keeps_its_mac() {
+        let mut ee = Eeprom93c56::new();
+        ee.backdoor_set_mac([8, 0, 0x69, 0x12, 0x34, 0x56]);
+        assert!(!ee.console_is_serial(crate::dev::sgi_nvram::REV_IP28));
+        ee.set_console_serial(crate::dev::sgi_nvram::REV_IP28);
+        assert!(ee.console_is_serial(crate::dev::sgi_nvram::REV_IP28));
+        assert_eq!(ee.data[0x7d..], [0x0800, 0x6912, 0x3456]);
     }
 
     fn send_bits(eeprom: &mut Eeprom93c56, bits: u32, count: u32) {
