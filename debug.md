@@ -583,7 +583,7 @@ devices are [listed below](#sgi-o2-ip32).
 | `rtc status` / `rtc dump` | RTC registers (and any `[rtc_offset]`) / NVRAM bytes |
 | `rtc save [file]` | Save the RTC NVRAM |
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
-| `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
+| `pit status` | 8254 timer state |
 | `audio status` | Every sound card's frames moved and skipped (stale, dry, ring full) and its host stream, or `No audio device.` |
 | `ice1724 [status]` | The ICE1724 audio card (an `ice1724` device; Tezro, Fuel, Origin 3200, Onyx 3000): the interrupt line (high or low, for how long, rises), the interrupt status and mask registers, the engine start, pause and FIFO-error bits, the pending timer, per engine whether it runs, its buffer address, size, position, interrupt interval, frames moved, times its interrupt fired and latched, and when the guest last read its position; frame and converter counts, PCI command and status |
 | `ice1724 regs` | Hex dump of the controller (CCS, BAR0) and multi-channel (MT, BAR1) registers |
@@ -609,7 +609,6 @@ a forced termination; a normal stop saves them automatically.
 | `seeq status` | SEEQ 8003 ethernet state |
 | `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
 | `net interfaces` | Host interfaces available for PCAP |
-| `net debug <tcp\|udp\|icmp> <on\|off>` | Per-packet trace **[DEV]** |
 
 `IRIS_TFTP_TRACE` and `IRIS_RSH_TRACE` log the TFTP and rsh services
 ([FEATURES.md](FEATURES.md#environment-and-diagnostic-controls)).
@@ -622,8 +621,6 @@ a forced termination; a normal stop saves them automatically.
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
 | `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane, Fuel) |
 | `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses. In a developer build `trace` is the CPU's instruction trace, so use `phys trace` |
-| `phys error <on\|off>` | Stop on bus errors |
-| `phys hole <on\|off>` | Stop on accesses to unmapped addresses |
 | `phys bench` / `bench` | Memory write benchmark: fills the first fully mapped 64 MB of RAM (overwrites it) |
 
 ### Logging
@@ -642,11 +639,13 @@ in every build.
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
 A device's trace is its module: `log ps2 on`, `log scsi on`, `log rtc on`.
+`log net` traces packets, `log ioc` the 8254 timer, and `log phys` accesses
+that reach the black hole or a bus-error region.
 
 Modules (`help` lists them too): `net hpc3 seeq hal2 mc rex3 mips ioc scsi
 pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c ultra scsi1
 nveeprom gr2 rad1 odyssey bedrock hub pci bridge heart nvme l1 usb module kona
-ice1724`. `scsi1` is the Indigo2's second SCSI controller, `nveeprom` its NVRAM
+ice1724 phys`. `scsi1` is the Indigo2's second SCSI controller, `nveeprom` its NVRAM
 EEPROM, `ultra` the N64 development board, `gr2` the GR2 board, `rad1` the RAD1
 audio of the Octane and the Onyx2's MediaIO card, `odyssey` the VPro and `kona`
 the InfiniteReality pipe. `hub`

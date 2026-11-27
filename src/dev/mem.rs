@@ -2,7 +2,7 @@
 use std::cell::UnsafeCell;
 #[cfg(test)]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 #[cfg(all(test, feature = "jitv2"))]
 use std::sync::atomic::AtomicU64;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, BUS_OK, BUS_ERR};
@@ -400,72 +400,48 @@ impl BusDevice for Arc<Memory> {
 ///
 /// Swallows writes and returns all 1s on reads.
 /// That is typical for regular machines like PC.
-pub struct BlackHoleRegion {
-    debug: AtomicBool,
-}
+pub struct BlackHoleRegion;
 
 impl BlackHoleRegion {
     pub fn new() -> Self {
-        Self {
-            debug: AtomicBool::new(false),
-        }
-    }
-
-    pub fn set_debug(&self, val: bool) {
-        self.debug.store(val, Ordering::Relaxed);
+        Self
     }
 }
 
 impl BusDevice for BlackHoleRegion {
     fn read8(&self, addr: u64) -> BusRead8 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Read8 {:08x}", addr);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Read8 {:08x}", addr);
         BusRead8::ok(0xFF)
     }
     fn write8(&self, addr: u64, val: u8) -> u32 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Write8 {:08x} val {:02x}", addr, val);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Write8 {:08x} val {:02x}", addr, val);
         BUS_OK
     }
 
     fn read16(&self, addr: u64) -> BusRead16 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Read16 {:08x}", addr);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Read16 {:08x}", addr);
         BusRead16::ok(0xFFFF)
     }
     fn write16(&self, addr: u64, val: u16) -> u32 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Write16 {:08x} val {:04x}", addr, val);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Write16 {:08x} val {:04x}", addr, val);
         BUS_OK
     }
 
     fn read32(&self, addr: u64) -> BusRead32 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Read32 {:08x}", addr);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Read32 {:08x}", addr);
         BusRead32::ok(0xFFFFFFFF)
     }
     fn write32(&self, addr: u64, val: u32) -> u32 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Write32 {:08x} val {:08x}", addr, val);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Write32 {:08x} val {:08x}", addr, val);
         BUS_OK
     }
 
     fn read64(&self, addr: u64) -> BusRead64 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Read64 {:08x}", addr);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Read64 {:08x}", addr);
         BusRead64::ok(0xFFFFFFFFFFFFFFFF)
     }
     fn write64(&self, addr: u64, val: u64) -> u32 {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BlackHole: Write64 {:08x} val {:016x}", addr, val);
-        }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BlackHole: Write64 {:08x} val {:016x}", addr, val);
         BUS_OK
     }
 }
