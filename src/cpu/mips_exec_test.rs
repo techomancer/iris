@@ -2348,6 +2348,47 @@ mod tests {
         assert_ne!((pending as u32 | exec.core.cp0_cause) & crate::cpu::mips_core::CAUSE_IP7, 0, "IP7 must be pending");
     }
 
+    /// Spin a CPU on a counting manager with one timer due after 1 us of its instructions;
+    /// says which thread ran the timer, if any did.
+    #[cfg(feature = "ci_clock")]
+    fn ci_clock_timer_thread(cpu_id: u8) -> Option<String> {
+        let (mut exec, mem) = create_executor();
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.cpu_id = cpu_id;
+        let tm = Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting()));
+        exec.core.set_timer_manager(tm.clone());
+        let ran = Arc::new(parking_lot::Mutex::new(None));
+        let by = ran.clone();
+        tm.add_one_shot(std::time::Duration::from_micros(1), move || {
+            *by.lock() = Some(std::thread::current().name().unwrap_or("").to_string());
+            crate::hptimer::TimerReturn::Delete
+        });
+        let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+        tm.clock().set_cpu_cycles(cpu.cycles_ptr());
+        crate::traits::Device::start(&*cpu);
+        // Run until the CPU is far past the deadline, not for a fixed host time.
+        assert!(crate::test_board::until(|| cpu.cycles_ptr().get() > 1_000_000));
+        crate::traits::Device::stop(&*cpu);
+        assert!(cpu.cycles_ptr().get() > 1_000, "the CPU ran far past the deadline");
+        let by = ran.lock().take();
+        by
+    }
+
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_cpu_zero_runs_the_timers_its_instructions_reach() {
+        let by = ci_clock_timer_thread(0).expect("the timer ran");
+        assert_ne!(by, "hptimer", "run by the CPU, not the host timer thread");
+    }
+
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_another_cpu_leaves_the_timers_to_cpu_zero() {
+        assert_eq!(ci_clock_timer_thread(1), None);
+    }
+
     #[test]
     fn test_eret() {
         let (mut exec, _) = create_executor();

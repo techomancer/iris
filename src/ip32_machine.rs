@@ -42,6 +42,8 @@ use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
 const PROM_VA: std::ops::Range<u32> = 0xbfc0_0000..0xbfc8_0000;
+/// How often the service thread, or under ci_clock the timers, looks after the devices while CRIME is interrupting.
+const SERVICE_POLL: Duration = Duration::from_micros(100);
 
 /// Whether `pc` is in the firmware the PROM copies into RAM, at its KSEG0
 /// address or its KSEG1 alias (0xa100_0000, uncached): it runs from both.
@@ -213,8 +215,23 @@ impl O2Machine {
             rtc_file: Some(format!("{}.rtc", cfg.nvram).into()),
             rtc_offset: cfg.rtc_offset,
         };
+        #[cfg(feature = "ci_clock")]
+        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
+        #[cfg(not(feature = "ci_clock"))]
         let timer_manager = Arc::new(TimerManager::new());
         let bus = Ip32Bus::with_options(mem, prom, opts, &timer_manager);
+        // The service pass runs from the timers, on the CPU's instructions, not from the O2-Service thread.
+        #[cfg(feature = "ci_clock")]
+        {
+            use crate::hptimer::TimerReturn;
+            let bus = Arc::downgrade(&bus);
+            timer_manager.add_recurring(timer_manager.now() + SERVICE_POLL, SERVICE_POLL, move || {
+                bus.upgrade().map_or(TimerReturn::Delete, |b| {
+                    b.service();
+                    TimerReturn::Continue
+                })
+            });
+        }
         // MACE audio plays through the host unless audio is off.
         if !cfg.no_audio {
             bus.mace.audio.enable_output(cfg.audio.clone());
@@ -312,6 +329,8 @@ impl O2Machine {
         let status = crate::status::MachineStatus::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
         status.set_scsi_wide(true);
         status.set_cpu_cycles(cpu.cycles_ptr());
+        #[cfg(feature = "ci_clock")]
+        timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
         // The O2's clock is CP0 Compare: publish the rate it programs.
         cpu.publish_tick_rate(status.cpu(0).tick_rate());
@@ -493,7 +512,6 @@ impl O2Machine {
         // asynchronous input (a typed key, a frame from the network) —
         // and while any of that is flowing, its interrupts keep the poll
         // at 100 µs anyway.
-        const SERVICE_POLL: Duration = Duration::from_micros(100);
         const SERVICE_POLL_IDLE: Duration = Duration::from_millis(2);
         let mut poll = SERVICE_POLL;
         while running.load(Ordering::Relaxed) {
@@ -510,8 +528,12 @@ impl O2Machine {
                 }
             }
             // Frames from the network, and any line that changed without a
-            // register access (a disk finishing, a key from the window).
+            // register access (a disk finishing, a key from the window). Under ci_clock
+            // the timers do this pass.
+            #[cfg(not(feature = "ci_clock"))]
             let interrupting = bus.service();
+            #[cfg(feature = "ci_clock")]
+            let interrupting = false;
             poll = if interrupting { SERVICE_POLL } else {
                 (poll * 2).min(SERVICE_POLL_IDLE)
             };
@@ -1255,6 +1277,18 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+    }
+
+    /// The O2's timers run on its CPU's instructions, as the Indy's do.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_the_o2_machine_clock_counts_instructions() {
+        let dir = scratch("o2-counting");
+        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        assert!(machine.timer_manager.clock().counts());
+        drop(machine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The installer's `ip32prom.image` is the flash behind a 256-byte

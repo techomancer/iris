@@ -11534,6 +11534,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::MipsCpu);
             }
             let mut guard = executor.lock();
+            // ci_clock: CPU 0 runs the timers its instruction clock has reached (`TimerManager::run_due`).
+            #[cfg(feature = "ci_clock")]
+            let timers = guard.core.timer_mgr.clone().filter(|tm| cpu_id == 0 && tm.clock().counts());
 
             // A freshly spawned OS thread has its own host FPU rounding-mode
             // state, independent of whatever thread ran the CPU previously —
@@ -11676,6 +11679,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 if let Some(mut hook) = guard.batch_hook.take() {
                     hook(&mut guard);
                     guard.batch_hook = Some(hook);
+                }
+                // Callbacks run with the executor unlocked, so one that needs it cannot deadlock.
+                #[cfg(feature = "ci_clock")]
+                if let Some(tm) = &timers {
+                    drop(guard);
+                    tm.run_due();
+                    guard = executor.lock();
                 }
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() {
