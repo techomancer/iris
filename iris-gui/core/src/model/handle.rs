@@ -642,7 +642,7 @@ fn worker_loop(
                             Some(new_capture_renderer(sink_for_machine));
                     }
                     if dual {
-                        if let Some(display) = m.get_display_head1() {
+                        if let Some(display) = m.display(1) {
                             *display.renderer_slot().lock() =
                                 Some(new_capture_renderer(sink_for_head1));
                         }

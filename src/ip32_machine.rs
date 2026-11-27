@@ -704,7 +704,7 @@ impl Workstation for O2Machine {
     fn lifecycle(&self) -> crate::machine_state::GuestState { self.lifecycle }
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.lifecycle = state; }
 
-    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Some(O2Machine::get_display(self)) }
+    fn display(&self, n: usize) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { (n == 0).then(|| O2Machine::get_display(self)) }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { O2Machine::get_ps2(self) }
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_timer_manager(&self) -> Arc<TimerManager> { O2Machine::get_timer_manager(self) }

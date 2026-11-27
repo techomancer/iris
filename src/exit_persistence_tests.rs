@@ -748,7 +748,7 @@ impl Workstation for Probe {
     fn monitor(&self) -> &std::sync::Arc<crate::monitor::Monitor> { self.0.monitor() }
     fn lifecycle(&self) -> crate::machine_state::GuestState { self.0.lifecycle() }
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.0.set_lifecycle(state) }
-    fn get_display(&self) -> Option<std::sync::Arc<dyn crate::gfx_display::GfxDisplay>> { self.0.get_display() }
+    fn display(&self, n: usize) -> Option<std::sync::Arc<dyn crate::gfx_display::GfxDisplay>> { self.0.display(n) }
     fn get_ps2(&self) -> std::sync::Arc<crate::dev::ps2::Ps2Controller> { self.0.get_ps2() }
     fn register_monitor_device(&self, device: std::sync::Arc<dyn crate::traits::Device>) { self.0.register_monitor_device(device) }
     fn get_timer_manager(&self) -> std::sync::Arc<crate::hptimer::TimerManager> { self.0.get_timer_manager() }

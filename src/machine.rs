@@ -1216,9 +1216,13 @@ impl Machine {
         self.board.gr2.clone()
     }
 
-    /// The second head's display (Newport dual-head only).
-    pub fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        self.board.rex3_head1.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
+    /// Head `n`'s display: head 1 is the second Newport.
+    pub fn display(&self, n: usize) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
+        match n {
+            0 => self.get_display(),
+            1 => self.board.rex3_head1.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>),
+            _ => None,
+        }
     }
 
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
@@ -1635,8 +1639,7 @@ impl Workstation for Machine {
         }
     }
 
-    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display(self) }
-    fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display_head1(self) }
+    fn display(&self, n: usize) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::display(self, n) }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { Machine::get_ps2(self) }
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_timer_manager(&self) -> Arc<TimerManager> { Machine::get_timer_manager(self) }

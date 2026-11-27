@@ -242,11 +242,11 @@ pub trait Workstation: Send {
 
     // ---- host interfaces ----
 
+    /// The display of graphics head `n`, or None when the machine has no such head.
+    fn display(&self, n: usize) -> Option<Arc<dyn GfxDisplay>>;
     /// The display of the first graphics head, or None when headless.
-    fn get_display(&self) -> Option<Arc<dyn GfxDisplay>>;
-    /// The second head's display, on machines that can have one.
-    fn get_display_head1(&self) -> Option<Arc<dyn GfxDisplay>> {
-        None
+    fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
+        self.display(0)
     }
     /// The keyboard and mouse the host window types into.
     fn get_ps2(&self) -> Arc<Ps2Controller>;

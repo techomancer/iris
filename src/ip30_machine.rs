@@ -1117,7 +1117,8 @@ impl Workstation for OctaneMachine {
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) {
         self.lifecycle = state;
     }
-    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
+    fn display(&self, n: usize) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
+        if n > 0 { return None; }
         match &self.vpro {
             Some(v) => Some(v.display()),
             None => self.gfx.as_ref().map(|g| g.display()),

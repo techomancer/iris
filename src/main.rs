@@ -225,8 +225,9 @@ fn main() {
                 return;
             }
         };
-        if let Some(head1) = machine.get_display_head1() {
-            if let Err(error) = ui.add_head(head1, &event_loop) {
+        let more_heads: Vec<_> = (1..).map_while(|n| machine.display(n)).collect();
+        for head in more_heads {
+            if let Err(error) = ui.add_head(head, &event_loop) {
                 eprintln!("iris: cannot initialize the secondary graphics window: {error}");
                 iris::workstation::exit_process("secondary graphics initialization failure", 1, || {
                     iris::workstation::stop_and_flush(&mut *machine, "secondary graphics initialization failure")
