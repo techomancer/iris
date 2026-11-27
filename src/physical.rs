@@ -646,16 +646,6 @@ impl Physical {
         &self.banks
     }
 
-    /// Save a bank's contents to a binary file.
-    pub fn save_bank(&self, bank: usize, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        self.banks[bank].save_bin(path)
-    }
-
-    /// Load a bank's contents from a binary file.
-    pub fn load_bank(&self, bank: usize, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        self.banks[bank].load_bin(path)
-    }
-
     /// Reset all banks to zero (power-on state).
     pub fn reset_memory(&self) {
         use crate::traits::Resettable;

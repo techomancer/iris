@@ -661,7 +661,6 @@ impl O2Machine {
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
         manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
-        let sv = manifest.schema_version;
         snap.write_state("cpu", &self.cpu.save_state()).map_err(|e| e.to_string())?;
         snap.write_state("o2", &self.bus.save_state()).map_err(|e| e.to_string())?;
         snap.write_state("boot", &self.boot.save()).map_err(|e| e.to_string())?;
@@ -742,7 +741,6 @@ impl O2Machine {
         // As the Indy: build, CPU, disks and devices must match.
         crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         crate::snapshot::check_slots(&m, &self.manifest_devices())?;
-        let sv = m.schema_version;
         let state = |base: &str| snap.read_state(base).map_err(|e| format!("{base}: {e}"));
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
         let memory = get_chunks_as_words(&ChunkStore::new("saves"), &chunks.bank_chunks[0])

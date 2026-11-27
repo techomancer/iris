@@ -12,8 +12,8 @@
 //!
 //! Byte-for-byte identical to `Memory`: u32 words in native host order, with
 //! 64-bit accesses stored `rotate_left(32)`. This is not incidental — it is
-//! what lets `PpMemory` substitute for `Memory` without touching snapshots,
-//! `save_bin`/`load_bin`, or any of the sub-word access paths. Endianness
+//! what lets `PpMemory` substitute for `Memory` without touching snapshots
+//! or any of the sub-word access paths. Endianness
 //! still lives only at The Edge (HACKING.md); nothing here byte-swaps.
 //!
 //! # What is and isn't here
@@ -361,31 +361,6 @@ impl PpMemory {
         for i in 0..self.gen_count() {
             unsafe { (*self.gen_base.add(i)).fetch_add(1, Ordering::Release) };
         }
-    }
-
-    /// Save bank contents to a raw binary file, big-endian words — byte-for-byte
-    /// the same format `Memory::save_bin` writes.
-    pub fn save_bin(&self, path: impl AsRef<std::path::Path>) -> io::Result<()> {
-        let words = self.as_words();
-        let mut bytes = Vec::with_capacity(words.len() * 4);
-        for &w in words {
-            bytes.extend_from_slice(&w.to_be_bytes());
-        }
-        std::fs::write(path, &bytes)
-    }
-
-    /// Load bank contents from a file written by [`PpMemory::save_bin`].
-    pub fn load_bin(&self, path: impl AsRef<std::path::Path>) -> io::Result<()> {
-        let bytes = std::fs::read(path)?;
-        let words = self.as_words_mut();
-        let n = (bytes.len() / 4).min(words.len());
-        for i in 0..n {
-            let b = &bytes[i * 4..(i + 1) * 4];
-            words[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        }
-        #[cfg(feature = "jitv2")]
-        self.bump_gen_all();
-        Ok(())
     }
 
     /// Clone the bank's words in native endian, for the in-memory rollback
@@ -1802,31 +1777,6 @@ mod tests {
         m.power_on();
         assert_eq!(m.read32(0x1000).data, 0);
         assert_eq!(m.read32(0x20_0000).data, 0);
-    }
-
-    #[test]
-    fn save_load_bin_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("ppmem-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bank.bin");
-
-        let a = PpMemory::new(8);
-        for i in 0..64u32 {
-            a.write32(i as u64 * 4, 0x1234_0000 + i);
-        }
-        a.save_bin(&path).unwrap();
-
-        let b = PpMemory::new(8);
-        b.load_bin(&path).unwrap();
-        for i in 0..64u32 {
-            assert_eq!(b.read32(i as u64 * 4).data, 0x1234_0000 + i, "word {i}");
-        }
-        // Format must be interchangeable with Memory's.
-        let c = crate::dev::mem::Memory::new(8);
-        c.load_bin(&path).unwrap();
-        assert_eq!(c.read32(0).data, b.read32(0).data);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The headline capability: an undersized bank repeats across its slot,
