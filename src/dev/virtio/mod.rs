@@ -190,6 +190,11 @@ pub trait VirtioDevice: Send {
     /// connected) or time to retry; called after every `notify` and whenever
     /// the [`Waker`] fires.
     fn poll(&mut self, cx: &mut Cx);
+    /// State beyond the queues, as words, for a snapshot.
+    fn save_state(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    fn load_state(&mut self, _words: &[u64]) {}
 }
 
 /// What host threads call to make the core service its device.
@@ -230,8 +235,17 @@ struct Inner {
     notified: u64,
 }
 
+/// Registers the driver writes to pick which one the next access reaches.
+#[derive(Default)]
+pub struct Selectors {
+    pub device_features: u32,
+    pub driver_features: u32,
+    pub queue: u32,
+}
+
 struct Shared {
     inner: Mutex<Inner>,
+    sel: Mutex<Selectors>,
     device_id: u32,
     /// Offered features. Set before the device is attached; a transport
     /// may add its own bits ([`VirtioCore::offer`]).
@@ -272,6 +286,7 @@ impl VirtioCore {
                     config_gen: 0,
                     notified: 0,
                 }),
+                sel: Mutex::default(),
                 device_id,
                 device_features: AtomicU64::new(device_features),
                 mem: OnceLock::new(),
@@ -301,6 +316,11 @@ impl VirtioCore {
     /// bits, added before any driver reads the features.
     pub fn offer(&self, bits: u64) {
         self.sh.device_features.fetch_or(bits, Ordering::Relaxed);
+    }
+
+    /// The transport's selector registers.
+    pub fn sel(&self) -> parking_lot::MutexGuard<'_, Selectors> {
+        self.sh.sel.lock()
     }
 
     pub fn device_id(&self) -> u32 {
@@ -384,6 +404,7 @@ impl VirtioCore {
             Self::reset_locked(&mut g);
             g.config_gen = 0;
         }
+        *self.sh.sel.lock() = Selectors::default();
         self.sync_irq();
     }
 
@@ -549,6 +570,44 @@ impl VirtioCore {
 
     pub fn is_running(&self) -> bool {
         self.sh.running.load(Ordering::Acquire)
+    }
+}
+
+/// The rings are in guest RAM, which a snapshot keeps; this is the rest.
+impl crate::traits::Saveable for VirtioCore {
+    fn save_state(&self) -> toml::Value {
+        let s = self.sh.sel.lock();
+        let g = self.sh.inner.lock();
+        let regs = [g.status as u64, g.driver_features, g.isr as u64, s.device_features as u64, s.driver_features as u64, s.queue as u64];
+        let q: Vec<u64> = g.queues.iter().flat_map(|q| [q.size as u64, q.ready as u64, q.desc, q.avail, q.used, q.last_avail as u64, q.used_idx as u64]).collect();
+        crate::snapshot::StateTable::new().u64s("regs", &regs).u64s("queues", &q).u64s("device", &g.dev.save_state()).build()
+    }
+
+    /// Into a device after power-on.
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        use crate::snapshot::{field_u64_vec, field_u64s};
+        let [status, features, isr, device_features, driver_features, queue] = field_u64s(v, "regs")?;
+        let q = field_u64_vec(v, "queues")?;
+        {
+            let mut s = self.sh.sel.lock();
+            let mut g = self.sh.inner.lock();
+            if q.len() != 7 * g.queues.len() {
+                return Err(format!("{} queue words saved, the device has {} queues", q.len(), g.queues.len()));
+            }
+            for (qu, w) in g.queues.iter_mut().zip(q.chunks_exact(7)) {
+                *qu = Queue { size: w[0] as u16, ready: w[1] != 0, desc: w[2], avail: w[3], used: w[4], last_avail: w[5] as u16, used_idx: w[6] as u16 };
+            }
+            *s = Selectors { device_features: device_features as u32, driver_features: driver_features as u32, queue: queue as u32 };
+            (g.status, g.driver_features, g.isr) = (status as u8, features, isr as u32);
+            // Kicks sent before the save may not have been served.
+            g.notified = u64::MAX;
+            if g.status & STATUS_DRIVER_OK != 0 {
+                g.dev.activate(features);
+            }
+            g.dev.load_state(&field_u64_vec(v, "device")?);
+        }
+        self.sync_irq();
+        Ok(())
     }
 }
 

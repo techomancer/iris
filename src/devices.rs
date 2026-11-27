@@ -350,7 +350,8 @@ impl AttachedCards {
 
     /// Why a snapshot cannot hold these cards now, if it cannot.
     pub fn snapshot_blocker(&self) -> Option<String> {
-        self.virtio.first().map(|(at, _)| format!("the virtio device at {at} has no saved state yet"))
+        let nine_p = self.virtio.iter().find(|(_, v)| v.core().device_id() != crate::dev::virtio::console::DEVICE_ID);
+        nine_p.map(|(at, _)| format!("the virtio-9p share at {at} keeps the guest's open files, which a snapshot does not hold"))
     }
 
     /// Each card's state under its slot.
@@ -362,6 +363,9 @@ impl AttachedCards {
         }
         for f in &self.fibre {
             t.insert(f.at.to_string(), f.fc.save_state());
+        }
+        for (at, v) in &self.virtio {
+            t.insert(at.to_string(), v.core().save_state());
         }
         for (at, a) in &self.audio {
             t.insert(at.to_string(), a.save_state());
@@ -378,6 +382,9 @@ impl AttachedCards {
         }
         for f in &self.fibre {
             f.fc.load_state(state(&f.at)?).map_err(|e| format!("qla2200 at {}: {e}", f.at))?;
+        }
+        for (at, v) in &self.virtio {
+            v.core().load_state(state(at)?).map_err(|e| format!("virtio at {at}: {e}"))?;
         }
         for (at, d) in &self.audio {
             d.load_state(state(at)?).map_err(|e| format!("ice1724 at {at}: {e}"))?;

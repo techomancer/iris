@@ -137,11 +137,11 @@ interrupt pin, so nothing takes it. A virtio entry with no `at` takes them in th
   guest with a 9P2000.L driver mounts by its `tag`. `owners = "passthrough"`
   with `uid_map` and `gid_map` shows the host's owners instead of one
   configured `uid` and `gid`. It needs a Unix host. See
-  [virtio-9p.md](dev/virtio-9p.md).
+  [virtio-9p.md](dev/virtio-9p.md). A snapshot is refused while one is present.
 - A `virtio_serial` device puts a multiport console on the Bridge,
   its ports served on host TCP ports or Unix sockets. See
-  [virtio-serial.md](dev/virtio-serial.md). A snapshot is refused while one is
-  present.
+  [virtio-serial.md](dev/virtio-serial.md). A snapshot keeps it. Bytes the
+  host had not yet delivered are not saved.
 
 ## Console, keyboard and mouse
 

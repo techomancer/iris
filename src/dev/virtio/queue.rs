@@ -85,9 +85,9 @@ pub struct Queue {
     pub avail: u64,
     pub used: u64,
     /// Next available-ring entry to take.
-    last_avail: u16,
+    pub(super) last_avail: u16,
     /// Value of the used ring's `idx` the device has published.
-    used_idx: u16,
+    pub(super) used_idx: u16,
 }
 
 impl Queue {
