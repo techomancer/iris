@@ -577,7 +577,7 @@ impl Hal2 {
     /// Wake `engine` every `PACE_PERIOD` with a pacer counting `rate` frames a second on the machine clock.
     fn pace(&self, engine: usize, rate: u32, mut tick: impl FnMut(&mut Pacer) -> TimerReturn + Send + 'static) {
         let mut pacer = Pacer::new(rate, self.tm.clock());
-        let id = self.tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || tick(&mut pacer));
+        let id = self.tm.add_recurring(self.tm.now() + PACE_PERIOD, PACE_PERIOD, move || tick(&mut pacer));
         self.timers.lock()[engine] = Some(id);
     }
 

@@ -596,7 +596,7 @@ mod tests {
     fn offset_shifts_seeded_time() {
         let off = RtcOffset { years: -18, days: -3, ..Default::default() };
         let rtc = Ds1x86::new(8192, "test_rtc_offset_missing.bin".to_string(), off, Clock::new());
-        let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let host = battery_clock::unix_now();
         let want = off.apply(host);
         let d = rtc.data.lock();
         let got = rtc.regs_to_centiseconds(&d.regs, 0) as i64 / 100;
@@ -646,9 +646,7 @@ mod tests {
 
     /// A date the guest sets survives a relaunch, still running, from the
     /// reference beside the file, and wins over `[rtc_offset]`; the file
-    /// stays the chip's 8192 bytes. Host time runs the clock here, which a
-    /// `ci_clock` build does not use.
-    #[cfg(not(feature = "ci_clock"))]
+    /// stays the chip's 8192 bytes.
     #[test]
     fn a_set_date_survives_a_relaunch() {
         let path = std::env::temp_dir().join(format!("ds1x86-clock-{}", std::process::id()));
@@ -672,7 +670,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
         assert_eq!(&std::fs::read(&clock).unwrap()[..8], b"DS138RF1");
         let set = 1_086_116_430;
-        let again = Ds1x86::new(8192, path.clone(), RtcOffset { years: -5, ..Default::default() }, Clock::new());
+        let again = Ds1x86::new(8192, path.clone(), RtcOffset { years: -5, ..Default::default() }, Clock::stepped());
         assert_eq!(again.read(100).data, 0x5a);
         let t = now(&again);
         assert!((set + 3599..=set + 3601).contains(&t), "2004-06-01 20:00:30, got {}", format_unix_utc(t));
@@ -692,7 +690,7 @@ mod tests {
         let off = RtcOffset { years: -5, ..Default::default() };
         let rtc = Ds1x86::new(8192, path.clone(), off, Clock::new());
         assert_eq!(rtc.read(100).data, 0x5a);
-        let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let host = battery_clock::unix_now();
         assert!((now(&rtc) - off.apply(host)).abs() <= 2);
         std::fs::remove_file(&path).ok();
     }

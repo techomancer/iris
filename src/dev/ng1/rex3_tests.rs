@@ -8191,6 +8191,8 @@ fn test_gfifo_back_to_back_batches_stay_separate() {
     }).expect("spawn").join().expect("test thread panicked");
 }
 
+// The GFIFO must hold what is written; a ci_clock REX3 processes each entry inline.
+#[cfg(not(feature = "ci_clock"))]
 #[test]
 fn resident_dma_bulk_busy_is_all_or_nothing() {
     let rex = &make_rex3_unstarted();
@@ -9820,6 +9822,8 @@ fn register_traffic_is_clean_and_draws_publish_selected_plane() {
 }
 
 #[cfg(not(feature = "rex-dirty-upload"))]
+// The GFIFO must hold what is written; a ci_clock REX3 processes each entry inline.
+#[cfg(not(feature = "ci_clock"))]
 #[test]
 fn legacy_gfifo_register_traffic_marks_framebuffer_dirty() {
     let rex = &make_rex3_unstarted();
@@ -9830,6 +9834,31 @@ fn legacy_gfifo_register_traffic_marks_framebuffer_dirty() {
     assert!(rex.fb_dirty.swap(false, Ordering::Acquire));
 }
 
+/// Under `ci_clock` the GFIFO is carried out as it is written: STATUS reads idle with nothing
+/// queued after a draw.
+#[cfg(feature = "ci_clock")]
+#[test]
+fn ci_clock_status_reads_idle_after_a_draw() {
+    let rex = &make_rex3_reset();
+    assert!(rex.processor_thread.lock().is_none(), "no processor thread");
+    reg(rex, REX3_COLORRED, 0x0012_3400);
+    reg(rex, REX3_COLORRED, 0x0056_7800);
+    let status = rex.read32(set_addr(REX3_STATUS)).data;
+    assert_eq!(status & (STATUS_GFXBUSY | STATUS_GFIFOLEVEL_MASK), 0, "idle at once, nothing queued");
+}
+
+/// A DCB command raises BACKBUSY for 1 ms of host time; an inline engine is done before the CPU looks.
+#[cfg(feature = "ci_clock")]
+#[test]
+fn ci_clock_backbusy_is_never_reported() {
+    let rex = &make_rex3_reset();
+    // DCB address 12 raises BACKBUSY.
+    w32(rex, set_addr(REX3_DCBMODE), 12 << DCBMODE_DCBADDR_SHIFT);
+    w32(rex, set_addr(REX3_DCBDATA0), 0);
+    assert!(rex.dcb.lock().backbusy_until.is_some(), "the command armed BACKBUSY");
+    assert_eq!(rex.read32(set_addr(REX3_STATUS)).data & STATUS_BACKBUSY, 0);
+}
+
 /// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
 /// 32, and STATUS reports only the last 32 slots of it.
 ///
@@ -9838,6 +9867,8 @@ fn legacy_gfifo_register_traffic_marks_framebuffer_dirty() {
 /// `GFIFO_DEPTH - GFIFO_HW_DEPTH`, then counts up to 31 at the brim; and
 /// overflow is back-pressure (BUS_BUSY, the write is refused and retried)
 /// rather than the hardware's silent drop at level 32.
+// The GFIFO must hold what is written; a ci_clock REX3 processes each entry inline.
+#[cfg(not(feature = "ci_clock"))]
 #[test]
 fn status_reports_only_the_last_32_fifo_slots() {
     let rex = &make_rex3_unstarted();
@@ -9903,6 +9934,8 @@ fn status_reports_only_the_last_32_fifo_slots() {
 ///
 /// This is a documented divergence (docs/dev/rex3.md); if the interrupt is
 /// ever wired up, this test is the reminder to change the documentation too.
+// The GFIFO must hold what is written; a ci_clock REX3 processes each entry inline.
+#[cfg(not(feature = "ci_clock"))]
 #[test]
 fn fifo_threshold_interrupt_stays_clear() {
     let rex = &make_rex3_unstarted();

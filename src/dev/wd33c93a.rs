@@ -387,6 +387,10 @@ pub struct Wd33c93a {
     /// Defer SCSI status interrupts: clear CIP, spin 1000 cycles, then assert INT.
     /// Required for OpenBSD/NetBSD so wd33c93_loop exits before INT fires.
     deferred_int: Arc<AtomicBool>,
+    /// ci_clock: raises a deferred interrupt 10000 cycles (100 us) of machine time after the
+    /// command, on the CPU thread, in place of the worker's spin.
+    #[cfg(feature = "ci_clock")]
+    irq_timer: std::sync::OnceLock<crate::hptimer::Timer>,
 }
 
 impl Wd33c93a {
@@ -443,6 +447,37 @@ impl Wd33c93a {
             heartbeat,
             cpu_cycles: Cell::new(crate::cpu::mips_core::CyclesPtr::dangling()),
             deferred_int: deferred_int_arc,
+            #[cfg(feature = "ci_clock")]
+            irq_timer: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// ci_clock: run the chip on the CPU thread. Commands run when they are written, and a
+    /// deferred interrupt comes from a timer on the machine clock.
+    #[cfg(feature = "ci_clock")]
+    pub fn use_timers(&self, timers: &Arc<crate::hptimer::TimerManager>) {
+        let timer = crate::hptimer::Timer::new(timers, &Arc::downgrade(&self.state), |state: &Mutex<Wd33c93aState>, _| {
+            state.lock().update_irq();
+        });
+        let _ = self.irq_timer.set(timer);
+    }
+
+    /// Let the worker know there is work: wake it, or under ci_clock do the work now.
+    #[cfg(feature = "ci_clock")]
+    fn run_pending(&self, st: &mut Wd33c93aState) {
+        if let Some(cmd_reg) = st.pending_command.take() {
+            st.process_wd_command(cmd_reg, self.dma.as_deref());
+            crate::status::scsi_blink(&self.heartbeat, st.target_id as u32);
+        }
+        let Some(deferred) = st.irq_fifo.front().map(|e| e.2) else { return };
+        match self.irq_timer.get() {
+            Some(timer) if deferred && st.deferred_int.load(Ordering::Relaxed) => {
+                st.update_asr(asr::CIP | asr::DBR, 0);
+                timer.set_due(Some(timer.now() + 10_000 * crate::cpu::mips_core::NS_PER_GUEST_CYCLE));
+            }
+            _ => {
+                st.update_irq();
+            }
         }
     }
 
@@ -766,7 +801,10 @@ impl Wd33c93a {
                             dlog!(state.log_module(), "WD33C93A({}): PIO xfer complete phase=0x{:02x}, waking worker ({} bytes)", state.id, cmd_phase, state.fifo.len());
                             state.update_asr(asr::DBR, 0);
                             state.pending_command = Some(state.regs[regs::COMMAND as usize]);
+                            #[cfg(feature = "ci_clock")]
+                            self.run_pending(&mut state);
                             drop(state);
+                            #[cfg(not(feature = "ci_clock"))]
                             self.cond.notify_one();
                             return BUS_OK;
                         }
@@ -839,6 +877,9 @@ impl Wd33c93a {
                 }
 
                 state.pending_command = Some(val);
+                #[cfg(feature = "ci_clock")]
+                self.run_pending(&mut state);
+                #[cfg(not(feature = "ci_clock"))]
                 self.cond.notify_one();
                 // COMMAND register does not auto-increment
             } else if ar != regs::AUX_STATUS_DIRECT {
@@ -872,6 +913,10 @@ impl Device for Wd33c93a {
         if let Some(t) = self.thread.lock().take() {
             let _ = t.join();
         }
+        #[cfg(feature = "ci_clock")]
+        if let Some(timer) = self.irq_timer.get() {
+            timer.stop();
+        }
         // Any DaynaPort target owns a backend thread of its own; stop it too
         // (after the worker is joined, so nothing is mid-command).
         self.bus.for_each(|_, dev| dev.stop());
@@ -881,6 +926,14 @@ impl Device for Wd33c93a {
         // Re-arm any DaynaPort backend a previous stop() shut down. No-op on
         // first boot — add_daynaport() already started them.
         self.bus.for_each(|_, dev| dev.start());
+        #[cfg(feature = "ci_clock")]
+        if let Some(timer) = self.irq_timer.get() {
+            timer.start();
+        }
+        // ci_clock: no worker thread; `run_pending` does its work.
+        if cfg!(feature = "ci_clock") {
+            return;
+        }
         let state = self.state.clone();
         let cond = self.cond.clone();
         let running = self.running.clone();
@@ -2099,11 +2152,41 @@ mod tests {
         Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)))
     }
 
+    /// Under `ci_clock` no worker runs: a command is carried out by the write that gives it, and
+    /// a deferred interrupt comes 10000 cycles (100 us) of machine time later.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_a_command_completes_when_written_and_a_deferred_interrupt_follows_later() {
+        let (tm, step) = crate::test_board::counting();
+        let wd = make_scsi();
+        wd.use_timers(&tm);
+        wd.start();
+        wd.write(0, regs::COMMAND);
+        wd.write(1, cmd::RESET);
+        assert!(wd.state.lock().pending_command.is_none(), "taken at once, by no worker");
+        assert_eq!(wd.read(0).data & asr::INT, asr::INT, "the reset interrupt is up when the write returns");
+        // A deferred status interrupt: CIP and DBR drop now, INT comes after the delay.
+        {
+            let mut st = wd.state.lock();
+            st.irq_fifo.push_back((scsi_status::RESET, None, true));
+            st.set_asr(asr::CIP | asr::DBR);
+            wd.run_pending(&mut st);
+            assert_eq!(st.asr & (asr::INT | asr::CIP | asr::DBR), 0);
+        }
+        step(99_990);
+        assert_eq!(wd.read(0).data & asr::INT, 0, "an instruction early");
+        step(10);
+        assert_eq!(wd.read(0).data & asr::INT, asr::INT);
+        wd.stop();
+    }
+
     /// A command written before the worker first waits is still run. The
     /// worker takes the state lock when it starts; a COMMAND write and its
     /// notify that land first used to be lost, because the worker then waited
     /// without looking at `pending_command` and slept until some later write.
     /// Hold the lock across `start()` so the write is guaranteed to come first.
+    // The worker thread's wait: a ci_clock controller runs each command inline and has no worker.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn a_command_written_before_the_worker_waits_is_not_lost() {
         let wd = make_scsi();

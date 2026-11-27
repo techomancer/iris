@@ -109,16 +109,27 @@ pub fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     crate::nv_storage::save(name, bytes)
 }
 
-/// Host Unix time in whole seconds.
+/// Where every clock starts under `ci_clock`: 2026-01-01T00:00:00Z, so two runs agree whenever
+/// they are made.
+pub const CI_EPOCH: i64 = 1_767_225_600;
+
+/// Host Unix time in whole seconds. Under `ci_clock` it is `CI_EPOCH`.
 pub fn unix_now() -> i64 {
+    if cfg!(feature = "ci_clock") {
+        return CI_EPOCH;
+    }
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
 /// Host time in whole seconds since 1970, and a reading of `clock` to count them from: where the
 /// host's second began, or 0 while the clock is younger than the subsecond part. Under `ci_clock`
-/// there is no host second to align to: it is now.
+/// there is no host second to align to: it is `CI_EPOCH` and now.
 pub fn host_second(clock: &crate::clock::Clock) -> (i64, u64) {
-    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let since = if cfg!(feature = "ci_clock") {
+        std::time::Duration::from_secs(CI_EPOCH as u64)
+    } else {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+    };
     #[cfg(not(feature = "ci_clock"))]
     let at = clock.now().saturating_sub(u64::from(since.subsec_nanos()));
     #[cfg(feature = "ci_clock")]
@@ -176,6 +187,17 @@ mod tests {
         assert_eq!(decode(&[0; 24], b"DS168RF1", true), None, "zeros");
         let m = encode(b"M48TREF1", 5, None);
         assert_eq!(decode(&m, b"M48TREF1", false), Some(Reference { saved_at: 5, seconds: None }));
+    }
+
+    /// Clocks made at different host times read the same date, and `[rtc_offset]` counts from it.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_clocks_start_at_the_fixed_date() {
+        let first = host_second(&crate::clock::Clock::stepped()).0;
+        assert_eq!(first, 1_767_225_600, "2026-01-01T00:00:00Z");
+        let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert_ne!(host, first, "the host's date is not the fixed one");
+        assert_eq!(unix_now() + seed(&RtcOffset { hours: 2, ..Default::default() }), first + 7200);
     }
 
     #[test]

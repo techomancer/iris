@@ -874,6 +874,10 @@ impl DmaClient for PdmaClientImpl {
         self.channel.lock().dma_read()
     }
     fn read_ahead_of_poll(&self) -> Option<u64> {
+        // ci_clock: the 50 ms window below is host time.
+        if cfg!(feature = "ci_clock") {
+            return None;
+        }
         let c = self.channel.lock();
         // A guest that has not read CBP for a while is not steering by it.
         match c.last_poll {
@@ -2476,6 +2480,15 @@ impl Saveable for Hpc3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-ahead cap's 50 ms window is host time, which a ci_clock run does not use.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_no_dma_read_ahead_cap_follows_host_time() {
+        let channel = Arc::new(Mutex::new(PdmaChannel::new(0, Arc::new(AtomicU32::new(0)))));
+        channel.lock().last_poll = Some(std::time::Instant::now());
+        assert_eq!(PdmaClientImpl::new(channel).read_ahead_of_poll(), None);
+    }
 
     /// INTSTAT as a controller: each SCSI channel's chip and DMA bits are
     /// ORed onto its IOC line; a chip-INT ack also settles the paired PDMA

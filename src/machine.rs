@@ -443,6 +443,9 @@ impl Machine {
         // What every graphics board's status bar reads; the CPU feeds its
         // fetch counters and the cycle counter is wired in below.
         let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick_count.clone());
+        // The refresh runs on the machine's instructions, not on its own thread.
+        #[cfg(feature = "ci_clock")]
+        status.refresh().set_timers(timer_manager.clone());
         let [decoded_count, l1i_hit_count, l1i_fetch_count, uncached_fetch_count] = status.fetch_counters();
         let (fatal_tx, fatal_rx) = mpsc::channel::<MachineFatal>();
 
@@ -973,6 +976,10 @@ impl Machine {
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
         #[cfg(feature = "ci_clock")]
         timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
+        #[cfg(feature = "ci_clock")]
+        for scsi in std::iter::once(hpc3.scsi()).chain(hpc3.scsi1()) {
+            scsi.use_timers(&timer_manager);
+        }
 
         // Inject the CPU/self handles jitv2's compile-thread worker needs to
         // pause the CPU around its own memory-growth flush (see

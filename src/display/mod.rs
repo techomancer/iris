@@ -465,7 +465,7 @@ impl HeadHandle {
 
     /// Now, on the clock [`beam`](Self::beam) takes.
     pub fn now_ns(&self) -> u64 {
-        self.refresh.upgrade().map_or(0, |s| (s.clock)())
+        self.refresh.upgrade().map_or(0, |s| s.now())
     }
 
     /// Ask for the next frame in `screen().rgba` and a PNG of it.
@@ -486,8 +486,8 @@ impl HeadHandle {
     /// Run one frame of this head now, on the calling thread, as the refresh
     /// thread does at a retrace: capture, compose, present, and serve the
     /// frame and screenshot requests. For tests of a head that is not
-    /// started.
-    #[cfg(test)]
+    /// started, and a counting refresh's requested frame.
+    #[cfg(any(test, feature = "ci_clock"))]
     pub(crate) fn frame_now(&self) {
         if let Some(head) = self.board() {
             self.frame_now_as(&*head);
@@ -496,7 +496,7 @@ impl HeadHandle {
 
     /// As [`frame_now`](Self::frame_now), with `head` standing in for the
     /// board (a test that composes with its own display object).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ci_clock"))]
     pub(crate) fn frame_now_as(&self, head: &dyn Head) {
         let Some(shared) = self.refresh.upgrade() else { return };
         let mut slots = shared.slots.lock();
@@ -510,6 +510,11 @@ impl HeadHandle {
     pub fn request_frame(&self) {
         self.frame_request.request();
         self.kick();
+        // A counting refresh has no retrace while the CPU is stopped: compose the frame here.
+        #[cfg(feature = "ci_clock")]
+        if self.refresh.upgrade().is_some_and(|s| s.spawn.is_some() && !s.threaded()) {
+            self.frame_now();
+        }
     }
 
     pub fn frame_pending(&self) -> bool {
@@ -638,7 +643,20 @@ impl Refresh {
     /// thread, each one's timer scheduling the next, so they keep their
     /// times while this thread composes. Without it the thread delivers
     /// them itself between its other deadlines.
+    ///
+    /// On a clock that counts instructions the timers also run the schedule, from the CPU, and
+    /// no thread starts: a one-shot steps it, and polls every millisecond while no head runs.
     pub fn set_timers(&self, timers: Arc<crate::hptimer::TimerManager>) {
+        #[cfg(feature = "ci_clock")]
+        if timers.clock().counts() {
+            let shared = Arc::downgrade(&self.shared);
+            timers.add_one_shot(Duration::ZERO, move || {
+                use crate::hptimer::TimerReturn;
+                let Some(shared) = shared.upgrade() else { return TimerReturn::Delete };
+                let wait = shared.step().map_or(Duration::from_millis(1), |next| Duration::from_nanos(next.saturating_sub(shared.now())));
+                TimerReturn::RescheduleOneShot(wait)
+            });
+        }
         let _ = self.shared.timers.set(timers);
     }
 
@@ -741,7 +759,22 @@ impl Shared {
         })
     }
 
+    /// The refresh's time: the machine clock when it counts instructions, else `clock`.
+    #[inline(always)]
+    fn now(&self) -> u64 {
+        #[cfg(feature = "ci_clock")]
+        if let Some(t) = self.timers.get().filter(|t| t.clock().counts()) {
+            return t.clock().now();
+        }
+        (self.clock)()
+    }
+
     fn threaded(&self) -> bool {
+        // ci_clock: on a counting clock the timers run the schedule, from the CPU.
+        #[cfg(feature = "ci_clock")]
+        if self.timers.get().is_some_and(|t| t.clock().counts()) {
+            return false;
+        }
         self.spawn.is_some()
     }
 
@@ -752,6 +785,10 @@ impl Shared {
     }
 
     fn ensure_thread(self: &Arc<Self>) {
+        #[cfg(feature = "ci_clock")]
+        if !self.threaded() {
+            return;
+        }
         let Some(spawn) = self.spawn else { return };
         let mut thread = self.thread.lock();
         if thread.is_none() {
@@ -840,7 +877,7 @@ impl Slot {
         (chain.field, chain.start_ns, chain.done) = (field, start_ns, 0);
         (chain.h_total, chain.pixel_clock_hz) = (self.timing.h_total, self.timing.pixel_clock_hz);
         let Some(timers) = shared.timers.get() else { return };
-        let now = (shared.clock)();
+        let now = shared.now();
         let Some(at) = chain.run(head, now) else { return };
         let (handle, generation) = (Arc::downgrade(handle), chain.generation);
         chain.timer = Some(timers.add_one_shot(Duration::from_nanos(at - now), move || {
@@ -851,7 +888,7 @@ impl Slot {
             if chain.generation != generation {
                 return TimerReturn::Delete;
             }
-            let now = (shared.clock)();
+            let now = shared.now();
             match chain.run(&*head, now) {
                 Some(at) => TimerReturn::RescheduleOneShot(Duration::from_nanos(at - now)),
                 None => {
@@ -912,7 +949,7 @@ impl Slot {
             self.release(handle);
             return None;
         };
-        let now = (shared.clock)();
+        let now = shared.now();
         if !self.armed {
             self.armed = true;
             self.in_blank = false;
@@ -923,7 +960,7 @@ impl Slot {
         }
 
         loop {
-            let now = (shared.clock)();
+            let now = shared.now();
             let fields = self.timing.fields as u64;
             let field = (self.field % fields) as u32;
             if !self.in_blank {
@@ -957,14 +994,14 @@ impl Slot {
                 head.vblank_start(field, start);
                 // A field that begins late (the last frame overran) has
                 // its lines as late: they keep their place in it.
-                self.begin_lines(shared, handle, &*head, field, (shared.clock)().max(start));
+                self.begin_lines(shared, handle, &*head, field, shared.now().max(start));
                 handle.retraces.fetch_add(1, Ordering::Relaxed);
                 self.in_blank = true;
                 // The blank lasts its length from when it really began: a
                 // retrace delivered late (the last frame overran) still
                 // gives the guest the whole blank to service it before the
                 // frame is captured.
-                self.blank_end_ns = (shared.clock)().max(start) + self.timing.blank_ns();
+                self.blank_end_ns = shared.now().max(start) + self.timing.blank_ns();
             }
             let end = self.blank_end_ns;
             if now < end {
@@ -981,7 +1018,7 @@ impl Slot {
                 self.frame(shared, handle, &*head);
                 // Back to the thread after a frame, so a head that is slow
                 // to compose does not hold up the others' retraces.
-                return Some(self.field_time(self.field).min((shared.clock)()));
+                return Some(self.field_time(self.field).min(shared.now()));
             }
         }
     }
@@ -991,7 +1028,7 @@ impl Slot {
     }
 
     fn frame(&mut self, shared: &Shared, h: &HeadHandle, head: &dyn Head) {
-        let now = (shared.clock)();
+        let now = shared.now();
         // The requests this frame serves: those made before it began.
         let (shot, frame_ticket) = (h.screenshot.taken(), h.frame_request.taken());
         let readback = Self::readback_wanted(h);

@@ -209,6 +209,51 @@ fn with_timers_a_line_does_not_wait_for_the_thread() {
     assert!(said("a start0") < said("a line100.0") && said("a line100.0") < said("a line300.0"), "{:?}", log.lock());
 }
 
+/// On a clock that counts instructions the schedule has no thread: a retrace and a line come at
+/// the machine times the timing gives, when the timers run, and a stop waits for no thread.
+#[cfg(feature = "ci_clock")]
+#[test]
+fn ci_clock_a_counting_refresh_runs_from_the_machine_clock_without_a_thread() {
+    let (tm, step) = crate::test_board::counting();
+    let refresh = Refresh::new();
+    refresh.set_timers(tm);
+    let log = Log::default();
+    let head = TestHead::new("a", &log);
+    let as_head: Arc<dyn Head> = head.clone();
+    let handle = refresh.add_head(Arc::downgrade(&as_head), MachineStatus::detached());
+    // Line 100 of 1066 is 1.6 ms into the field.
+    handle.set_line_events(&[100]);
+    handle.start();
+    assert!(refresh.shared.thread.lock().is_none(), "no refresh thread");
+    step(0);
+    step(HZ60_NS - MS);
+    assert!(log.lock().is_empty(), "nothing before the first retrace: {:?}", log.lock());
+    step(2 * MS);
+    assert_eq!(log.lock()[0], "a start0");
+    assert!(!log.lock().iter().any(|l| l == "a line100.0"));
+    step(2 * MS);
+    assert!(log.lock().iter().any(|l| l == "a line100.0"), "{:?}", log.lock());
+    handle.stop();
+}
+
+/// With the machine clock held, a requested frame is composed at once and no retrace is raised.
+#[cfg(feature = "ci_clock")]
+#[test]
+fn ci_clock_a_counting_refresh_composes_a_requested_frame_with_the_clock_held() {
+    let (tm, _step) = crate::test_board::counting();
+    let refresh = Refresh::new();
+    refresh.set_timers(tm);
+    let log = Log::default();
+    let head = TestHead::new("a", &log);
+    let as_head: Arc<dyn Head> = head.clone();
+    let handle = refresh.add_head(Arc::downgrade(&as_head), MachineStatus::detached());
+    handle.start();
+    handle.request_frame();
+    assert!(!handle.frame_pending(), "{:?}", log.lock());
+    assert_eq!(head.composes.load(Ordering::SeqCst), 1);
+    assert!(!log.lock().iter().any(|l| l.contains("start")), "no retrace: {:?}", log.lock());
+}
+
 #[test]
 fn the_blank_lasts_its_lines() {
     let rig = Rig::new();

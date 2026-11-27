@@ -8137,7 +8137,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // held an idle OpenBSD O2 on the WAIT for good with its clock
         // interrupt pending. So the masked case polls once per dispatch and
         // completes when an interrupt the IM bits pass is pending.
-        if !self.core.interrupts_enabled() {
+        // ci_clock retries even with interrupts enabled: the stall below runs no steps, so no
+        // deadline would be checked and no instruction counted while it waited.
+        if cfg!(feature = "ci_clock") || !self.core.interrupts_enabled() {
             if self.wait_wake_pending() {
                 return self.handle_exec_complete();
             }
@@ -8150,9 +8152,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let stall_start = std::time::Instant::now();
         let mut issued: u64 = 0;
         loop {
-            // ci_clock has no timer thread and no step runs while this stalls.
-            #[cfg(feature = "ci_clock")]
-            self.core.fire_compare_if_due();
             let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
             if pending & (SOFT_RESET_BIT | crate::cpu::smp::HOST_PARK_BIT) != 0 {
                 break;
@@ -11535,6 +11534,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::MipsCpu);
             }
             let mut guard = executor.lock();
+            // ci_clock: CPU 0 runs the timers its instruction clock has reached (`TimerManager::run_due`).
+            #[cfg(feature = "ci_clock")]
+            let timers = guard.core.timer_mgr.clone().filter(|tm| cpu_id == 0 && tm.clock().counts());
 
             // A freshly spawned OS thread has its own host FPU rounding-mode
             // state, independent of whatever thread ran the CPU previously —
@@ -11677,6 +11679,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 if let Some(mut hook) = guard.batch_hook.take() {
                     hook(&mut guard);
                     guard.batch_hook = Some(hook);
+                }
+                // Callbacks run with the executor unlocked, so one that needs it cannot deadlock.
+                #[cfg(feature = "ci_clock")]
+                if let Some(tm) = &timers {
+                    drop(guard);
+                    tm.run_due();
+                    guard = executor.lock();
                 }
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() {

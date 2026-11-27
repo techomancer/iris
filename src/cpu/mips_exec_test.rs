@@ -2209,6 +2209,7 @@ mod tests {
     /// The stall moves the cycle counter at the pacing rate so cycle readers
     /// see time pass, but it retires nothing: the MIPS figure must not count
     /// it, or an idle guest sitting in WAIT reads about 100 MIPS.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn test_wait_stall_is_not_retired() {
         let (mut exec, _) = create_executor();
@@ -2245,6 +2246,7 @@ mod tests {
     /// A soft reset must escape the stall even when interrupts are enabled but
     /// nothing is pending — otherwise a reset could not break into an idle
     /// guest.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn test_wait_breaks_out_on_soft_reset() {
         let (mut exec, _) = create_executor();
@@ -2286,41 +2288,105 @@ mod tests {
         assert_eq!(exec.core.read_gpr(2), 7, "released, the instruction runs");
     }
 
-    /// Under `ci_clock` a WAIT stall runs no steps, so the stall must raise
-    /// IP7 when it passes the Compare deadline. A soft reset after 1 s stops
-    /// a regression instead of hanging.
+    /// A Compare the deadline check delivers is one tick: the handler's Count
+    /// read that follows must not deliver it again.
     #[cfg(feature = "ci_clock")]
     #[test]
-    fn ci_clock_wait_wakes_on_the_compare_deadline() {
-        let (mut exec, _) = create_executor();
-        exec.core.pc = 0xFFFF_FFFF_8000_1000;
+    fn ci_clock_compare_counts_one_tick() {
+        use std::sync::atomic::Ordering;
+        let mut core = crate::cpu::mips_core::MipsCore::default();
+        core.set_count_hz(90_000_000);
+        core.write_cp0(11, 900);
+        core.hot.cycles += 2_000;
+        core.fire_compare_if_due();
+        assert_ne!(core.hot.interrupts.load(Ordering::SeqCst) & crate::cpu::mips_core::CAUSE_IP7 as u64, 0);
+        core.count_now();
+        assert_eq!(core.fasttick_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// A 90 MHz Count read every other instruction, as a calibration loop does, still runs at
+    /// 90 MHz, not one tick a cycle.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_count_read_often_keeps_its_rate() {
+        let mut core = crate::cpu::mips_core::MipsCore::default();
+        core.set_count_hz(90_000_000);
+        for _ in 0..500_000 {
+            core.hot.cycles += 2;
+            core.count_now();
+        }
+        assert_eq!(core.count_now(), 900_000, "10 ms of instructions");
+    }
+
+    /// Under `ci_clock` a WAIT with interrupts enabled retries once per dispatch, so the Compare
+    /// deadline is checked and time counted while it waits.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_wait_retries_until_the_compare_deadline() {
+        let (mut exec, mem) = create_executor();
+        let wait_pc = 0xFFFF_FFFF_8000_1000u64;
+        mem.set_word(0x1000, (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT);
+        mem.set_word(0x1004, 0);
+        exec.core.pc = wait_pc;
         exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE
             | (1 << (crate::cpu::mips_core::STATUS_IM_SHIFT + 7));
         exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
-        let deadline = exec.core.hot.cycles + 100_000; // 1 ms of stall at 10 ns/cycle
-        exec.core.count_fire_cycle = deadline;
-
-        struct Irq(*const std::sync::atomic::AtomicU64);
-        unsafe impl Send for Irq {}
-        let irq = Irq(exec.interrupts_ptr());
-        let (done, stop) = std::sync::mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            let irq = irq;
-            if stop.recv_timeout(std::time::Duration::from_secs(1)).is_err() {
-                // SAFETY: the executor outlives this thread, which is joined below.
-                unsafe { &*irq.0 }.fetch_or(crate::cpu::mips_exec::SOFT_RESET_BIT, std::sync::atomic::Ordering::SeqCst);
-            }
-        });
-        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
-        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
-        let _ = done.send(());
-        watchdog.join().unwrap();
-
-        let pending = exec.core.hot.interrupts.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(pending & crate::cpu::mips_exec::SOFT_RESET_BIT, 0,
-            "the stall ran 1 s past a 1 ms Compare deadline");
-        assert_ne!(pending & crate::cpu::mips_core::CAUSE_IP7 as u64, 0, "IP7 must be pending");
+        // 1 ms of stall at 10 ns/cycle, armed as the guest arms it.
+        let count = exec.core.count_now();
+        exec.core.write_cp0(11, count.wrapping_add((exec.core.count_hz / 1000) as u32) as u64);
+        let deadline = exec.core.count_fire_cycle;
+        assert!(deadline <= exec.core.hot.cycles + 100_000);
+        let mut steps = 0u64;
+        while exec.core.pc == wait_pc && steps < 1_000_000 {
+            exec.step_int();
+            steps += 1;
+        }
+        assert_ne!(exec.core.pc, wait_pc, "the WAIT never ended");
         assert!(exec.core.hot.cycles >= deadline);
+        assert!(steps >= deadline - 100, "{steps} dispatches reached cycle {deadline}: the stall skipped time");
+        let pending = exec.core.hot.interrupts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!((pending as u32 | exec.core.cp0_cause) & crate::cpu::mips_core::CAUSE_IP7, 0, "IP7 must be pending");
+    }
+
+    /// Spin a CPU on a counting manager with one timer due after 1 us of its instructions;
+    /// says which thread ran the timer, if any did.
+    #[cfg(feature = "ci_clock")]
+    fn ci_clock_timer_thread(cpu_id: u8) -> Option<String> {
+        let (mut exec, mem) = create_executor();
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.cpu_id = cpu_id;
+        let tm = Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting()));
+        exec.core.set_timer_manager(tm.clone());
+        let ran = Arc::new(parking_lot::Mutex::new(None));
+        let by = ran.clone();
+        tm.add_one_shot(std::time::Duration::from_micros(1), move || {
+            *by.lock() = Some(std::thread::current().name().unwrap_or("").to_string());
+            crate::hptimer::TimerReturn::Delete
+        });
+        let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+        tm.clock().set_cpu_cycles(cpu.cycles_ptr());
+        crate::traits::Device::start(&*cpu);
+        // Run until the CPU is far past the deadline, not for a fixed host time.
+        assert!(crate::test_board::until(|| cpu.cycles_ptr().get() > 1_000_000));
+        crate::traits::Device::stop(&*cpu);
+        assert!(cpu.cycles_ptr().get() > 1_000, "the CPU ran far past the deadline");
+        let by = ran.lock().take();
+        by
+    }
+
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_cpu_zero_runs_the_timers_its_instructions_reach() {
+        let by = ci_clock_timer_thread(0).expect("the timer ran");
+        assert_ne!(by, "hptimer", "run by the CPU, not the host timer thread");
+    }
+
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_another_cpu_leaves_the_timers_to_cpu_zero() {
+        assert_eq!(ci_clock_timer_thread(1), None);
     }
 
     #[test]
@@ -8179,7 +8245,8 @@ mod tests {
         mem.set_word(0x1004, 0);
         exec.core.pc = 0xffff_ffff_8000_1000;
         exec.core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        exec.core.count_fire_cycle = 100;
+        let count = exec.core.count_now();
+        exec.core.write_cp0(11, count.wrapping_add(33) as u64); // 1 us at 33 MHz: 100 cycles
 
         // A failed run spins in compiled code for good; the park bit, which
         // compiled code does see, gets it out so the test fails instead.

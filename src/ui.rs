@@ -1303,7 +1303,7 @@ impl Ui {
             let ps2   = ps2.clone();
             let delta = mouse_delta.clone();
             timer_manager.add_recurring(
-                Instant::now() + Duration::from_millis(10),
+                timer_manager.now() + Duration::from_millis(10),
                 Duration::from_millis(10),
                 move || {
                     Self::flush_mouse_delta(&ps2, &delta, true);

@@ -55,6 +55,15 @@ impl Clock {
         let _ = self.0.cycles.as_ref().map(|o| o.set(cycles));
     }
 
+    /// Whether the clock counts the CPU's instructions (ci_clock): its timers then run on the CPU thread.
+    #[inline]
+    pub fn counts(&self) -> bool {
+        #[cfg(feature = "ci_clock")]
+        return self.0.cycles.is_some();
+        #[cfg(not(feature = "ci_clock"))]
+        false
+    }
+
     pub fn now(&self) -> u64 {
         if self.0.stopped.load(Acquire) {
             return self.0.held.load(Relaxed);
