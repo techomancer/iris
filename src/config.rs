@@ -2975,7 +2975,7 @@ impl MachineConfig {
     /// Parse a config file's text, remembering whether it listed `banks`, and
     /// folding in the spellings older versions wrote.
     fn parse_toml(text: &str) -> Result<Self, toml::de::Error> {
-        let mut cfg = toml::from_str::<Self>(text)?;
+        let mut cfg = toml::from_str::<Self>(text).map_err(|e| legacy::name_replacement(e, text))?;
         let table = toml::from_str::<toml::Table>(text)?;
         cfg.banks_set = table.contains_key("banks");
         cfg.jitv2_threads_set = table.get("jitv2").and_then(|j| j.get("threads")).is_some();
