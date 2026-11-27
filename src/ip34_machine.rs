@@ -29,7 +29,7 @@ use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
 use crate::ip35::node::NodeSpec;
 use crate::ip35::serial::connect_serial_ports;
 use crate::sn::BoardIo;
-use crate::pci::{DevFn, PCI_INTA};
+use crate::pci::DevFn;
 use crate::topology::MachineSlotKind;
 use crate::sn::NodeBoard;
 use crate::traits::Resettable;
@@ -98,15 +98,13 @@ const SCSI_DEVICE: u8 = 1;
 pub(crate) const HEAD_E_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::PCI_SLOT, None), (2, MachineSlotKind::PCI_SLOT, None)];
 
 /// Head F's bus: the base I/O (ISP12160 at 1, IOC3 at 4, USB at 5), the two
-/// slots of the 33 MHz bus at 2 and 3 (inferred, as head E's) and two extra slots.
+/// slots of the 33 MHz bus at 2 and 3 (inferred, as head E's).
 pub(crate) const HEAD_F_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
         (SCSI_DEVICE, MachineSlotKind::Fixed("isp12160"), None),
         (2, MachineSlotKind::PCI_SLOT, None),
         (3, MachineSlotKind::PCI_SLOT, None),
         (4, MachineSlotKind::Fixed("ioc3"), None),
         (5, MachineSlotKind::Fixed("ohci"), None),
-        (6, MachineSlotKind::Extra { pin: PCI_INTA }, None),
-        (7, MachineSlotKind::Extra { pin: PCI_INTA }, None),
     ];
 
 /// The Fuel's slots.

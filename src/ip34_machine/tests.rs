@@ -156,22 +156,6 @@ fn the_fuel_takes_the_audio_card_in_a_slot() {
     assert!(id.is_none_or(|id| id == u32::MAX) && !report, "empty without the key");
 }
 
-/// virtio takes head F's extra slots, 6 then 7, never a slot; a real slot refuses it.
-#[test]
-fn virtio_takes_the_extra_rows_of_head_f() {
-    let dir = TempPath::dir("fuel-virtio");
-    let entry = |text: &str| crate::devices::ConfiguredDevice::from_table(toml::from_str(text).unwrap()).unwrap();
-    let mut cfg = fuel_config(&dir);
-    cfg.devices.extend([entry("type = \"virtio_serial\""), entry("type = \"virtio_serial\"")]);
-    with_machine(cfg, |m| {
-        let id = |device: u64| m.nodes[0].chip.pio().read32(pio_widget(15, 0x2_0000 + (device << 12))).data;
-        assert_eq!((id(6), id(7), id(2)), (0x1043_1af4, 0x1043_1af4, u32::MAX));
-    });
-    let mut cfg = fuel_config(&dir);
-    cfg.devices.push(entry("type = \"virtio_serial\"\nat = \"xio15/pci0/2\""));
-    assert!(cfg.validate().unwrap_err().contains("xio15/pci0/2 does not take a virtio_serial"));
-}
-
 /// The check agrees with the constructor: an NVMe card is refused before the machine is built.
 #[test]
 fn an_nvme_card_is_refused_by_the_check() {

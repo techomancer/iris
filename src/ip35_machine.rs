@@ -57,7 +57,6 @@ use crate::dev::kona::{Kona, KonaConfig};
 use crate::dev::l1::{AttachedBrick, BoardIdentity, ComputeNode, L1Config, L1};
 use crate::dev::timekeeper::Timekeeper;
 use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET, PCI_ROUTING};
-use crate::pci::{PCI_INTA};
 use crate::hptimer::TimerManager;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::presence::PresenceHold;
@@ -182,7 +181,7 @@ fn pimm_mask(processors: Population) -> u8 {
 /// Head E's bus, "Bus 2": two slots at 1 and 2, the device numbers inferred.
 pub(crate) const HEAD_E_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, MachineSlotKind::PCI_SLOT, Some("bus2-slot1")), (2, MachineSlotKind::PCI_SLOT, Some("bus2-slot2"))];
 
-/// Head F's bus, "Bus 1": the Fibre Channel adapter at 1, the IOC3 at 4, USB at 5, slots at 2 and 3 (inferred) and one extra slot.
+/// Head F's bus, "Bus 1": the Fibre Channel adapter at 1, the IOC3 at 4, USB at 5, slots at 2 and 3 (inferred).
 /// Device 0 is none: its INTA is the IOC3's SuperIO interrupt.
 pub(crate) const HEAD_F_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
         (1, MachineSlotKind::Fixed("qla2200"), None),
@@ -191,7 +190,6 @@ pub(crate) const HEAD_F_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
         (4, MachineSlotKind::Fixed("ioc3"), None),
         (5, MachineSlotKind::Fixed("ohci"), None),
         (6, MachineSlotKind::Fixed("ieee1394"), None),
-        (7, MachineSlotKind::Extra { pin: PCI_INTA }, None),
     ];
 
 /// The I-brick's Fibre Channel adapter, device 1 of head F.

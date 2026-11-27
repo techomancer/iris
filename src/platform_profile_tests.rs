@@ -56,8 +56,19 @@ mod tests {
 
     #[test]
     fn virtio_serial_validates_where_it_has_a_home() {
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::OctaneIp30] {
             virtio_cfg(p).validate().unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        }
+    }
+
+    /// The O2, Fuel, Origin 3200 and Onyx 3000 have no spare slot for virtio.
+    #[test]
+    fn virtio_serial_is_refused_where_the_board_has_no_spare_slot() {
+        for p in [MachineProfile::O2Ip32, MachineProfile::FuelIp34, MachineProfile::Origin3200Ip35, MachineProfile::Onyx3000Ip35] {
+            let mut cfg = minimal_cfg();
+            cfg.machine.profile = p;
+            cfg.virtio_serial.enabled = true;
+            assert!(cfg.resolve_slots().unwrap_err().contains("virtio"), "{p:?}");
         }
     }
 
