@@ -637,7 +637,7 @@ mod ppmem_tests {
         use crate::dev::eeprom_93c56::Eeprom93c56;
         use parking_lot::Mutex;
         let mc = MemoryController::new_for_profile(
-            Arc::new(Mutex::new(Eeprom93c56::new())), false, [512, 512, 0, 0], true,
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [512, 512, 0, 0], true, crate::clock::Clock::new(),
         );
         let addrs = mc.parse_memcfg(0x7f20_7f40, 0);
         let banks = [RamBank::new(512), RamBank::new(512), RamBank::new(1), RamBank::new(1)];
@@ -681,7 +681,7 @@ mod ppmem_tests {
         use parking_lot::Mutex;
         const MB: u32 = 1 << 20;
         let mc = MemoryController::new_for_profile(
-            Arc::new(Mutex::new(Eeprom93c56::new())), false, [128, 128, 0, 0], true,
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [128, 128, 0, 0], true, crate::clock::Clock::new(),
         );
         let phys = Physical::new(vec![RamBank::new(128), RamBank::new(128), RamBank::new(1), RamBank::new(1)]);
         let mut outside = Vec::new();
