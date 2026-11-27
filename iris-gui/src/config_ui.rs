@@ -824,6 +824,8 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
     let mut to_delete: Option<u8> = None;
     // Every SCSI target the machine's slot list has, by controller.
     let buses = iris::topology::scsi_buses(&cfg.machine.profile.slots());
+    // Placed once for the frame: attaching adds an entry at the end, and a removal waits until after the loop.
+    let placed = cfg.disks();
     for (controller, _, ids) in &buses {
         let controller = *controller;
         if buses.len() > 1 {
@@ -833,7 +835,8 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
         for &id in ids {
             ui.separator();
             let key = iris::config::scsi_slot(controller, id);
-            let exists = cfg.disk(key).is_some();
+            let at = placed.iter().find(|d| d.0 == key).map(|d| d.1);
+            let exists = at.is_some();
             ui.horizontal(|ui| {
                 if controller == 0 {
                     ui.strong(t!("config-scsi-id", id = id));
@@ -851,7 +854,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     });
                 }
             });
-            if let Some(dev) = cfg.disk_mut(key).filter(|_| exists) {
+            if let Some(dev) = at.and_then(|i| cfg.devices[i].device.scsi_mut()) {
                 // A DaynaPort has no image, no media and no overlay — it is an
                 // Ethernet adapter on the SCSI bus. Show its own short form
                 // instead of the storage rows below.
