@@ -983,6 +983,9 @@ pub struct MipsCore {
     /// stay deterministic).
     #[cfg(feature = "ci_clock")]
     pub(crate) count_anchor_cycle: u64,
+    /// ci_clock: the part of a Count tick the anchor has run, in ns times Hz.
+    #[cfg(feature = "ci_clock")]
+    pub(crate) count_frac: u64,
     /// ci_clock: `hot.cycles` value at which IP7 fires (checked in step()'s
     /// preamble instead of an hptimer). u64::MAX = disarmed.
     #[cfg(feature = "ci_clock")]
@@ -1505,6 +1508,8 @@ impl MipsCore {
             #[cfg(feature = "ci_clock")]
             count_anchor_cycle: 0,
             #[cfg(feature = "ci_clock")]
+            count_frac: 0,
+            #[cfg(feature = "ci_clock")]
             count_fire_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
             ip7_writes: 0,
@@ -1562,6 +1567,7 @@ impl MipsCore {
             #[cfg(feature = "ci_clock")]
             {
                 self.count_anchor_cycle = 0;
+                self.count_frac = 0;
                 self.count_fire_cycle = u64::MAX;
             }
             self.disarm_compare_timer();
@@ -1819,13 +1825,22 @@ impl MipsCore {
         let elapsed_ns = cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
         #[cfg(not(feature = "ci_clock"))]
         let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
-        let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
+        #[cfg_attr(not(feature = "ci_clock"), allow(unused_mut))]
+        let mut acc = elapsed_ns as u128 * self.count_hz as u128;
+        #[cfg(feature = "ci_clock")]
+        {
+            acc += self.count_frac as u128;
+            // A tick is not a whole number of cycles: keep the remainder exactly.
+            self.count_anchor_cycle = cycles;
+            self.count_frac = (acc % 1_000_000_000) as u64;
+        }
+        let ticks = (acc / 1_000_000_000) as u64;
         if ticks != 0 {
-            let consumed_ns = ((ticks as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
-            #[cfg(feature = "ci_clock")]
-            { self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / NS_PER_GUEST_CYCLE); }
             #[cfg(not(feature = "ci_clock"))]
-            { self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns); }
+            {
+                let consumed_ns = ((ticks as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
+                self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns);
+            }
             let before = self.cp0_count as u32;
             let after = before.wrapping_add(ticks as u32);
             self.cp0_count = after as u64;
@@ -1902,7 +1917,11 @@ impl MipsCore {
         let elapsed_ns = self.hot.cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
         #[cfg(not(feature = "ci_clock"))]
         let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
-        let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
+        #[cfg(feature = "ci_clock")]
+        let frac = self.count_frac as u128;
+        #[cfg(not(feature = "ci_clock"))]
+        let frac = 0;
+        let ticks = ((elapsed_ns as u128 * self.count_hz as u128 + frac) / 1_000_000_000) as u64;
         (self.cp0_count as u32).wrapping_add(ticks as u32)
     }
 
@@ -2047,9 +2066,8 @@ impl MipsCore {
             // normally a Compare write re-arms much sooner.
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
             self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
-            self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
-            crate::pf_level!(crate::perfetto::events::IP7_LEVEL[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], crate::perfetto::events::IP7_COMPARE[self.cpu_id as usize % crate::perfetto::events::IP7_CPUS], true);
-            self.fasttick_count.fetch_add(1, Ordering::Relaxed);
+            // Claim the armed ticket, as the host timer does, so a Count read crossing Compare does not deliver it again.
+            claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count, self.cpu_id);
         }
     }
 
@@ -2077,7 +2095,10 @@ impl MipsCore {
     pub fn reanchor_count_and_reschedule(&mut self) {
         self.count_read_cycle = self.hot.cycles;
         #[cfg(feature = "ci_clock")]
-        { self.count_anchor_cycle = self.hot.cycles; }
+        {
+            self.count_anchor_cycle = self.hot.cycles;
+            self.count_frac = 0;
+        }
         #[cfg(not(feature = "ci_clock"))]
         { self.count_anchor_instant = std::time::Instant::now(); }
         self.schedule_compare_timer();

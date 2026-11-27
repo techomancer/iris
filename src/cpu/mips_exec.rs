@@ -8137,7 +8137,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // held an idle OpenBSD O2 on the WAIT for good with its clock
         // interrupt pending. So the masked case polls once per dispatch and
         // completes when an interrupt the IM bits pass is pending.
-        if !self.core.interrupts_enabled() {
+        // ci_clock retries even with interrupts enabled: the stall below runs no steps, so no
+        // deadline would be checked and no instruction counted while it waited.
+        if cfg!(feature = "ci_clock") || !self.core.interrupts_enabled() {
             if self.wait_wake_pending() {
                 return self.handle_exec_complete();
             }
@@ -8150,9 +8152,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let stall_start = std::time::Instant::now();
         let mut issued: u64 = 0;
         loop {
-            // ci_clock has no timer thread and no step runs while this stalls.
-            #[cfg(feature = "ci_clock")]
-            self.core.fire_compare_if_due();
             let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
             if pending & (SOFT_RESET_BIT | crate::cpu::smp::HOST_PARK_BIT) != 0 {
                 break;
