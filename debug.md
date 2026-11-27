@@ -30,7 +30,7 @@ What you can inspect depends on how iris was built:
 |---|---|
 | plain `--release` | Everything in this document except the **[DEV]** items. Breakpoints and the traceback work. |
 | `lightning` (official releases) | Strips breakpoint checks and the traceback buffer for speed: breakpoints and `dt` do nothing. Inspection commands still work. |
-| `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`debug`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
+| `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`log mips`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
 | `--features gputrace` | Graphics traces and recordings (`rex/gr2/mgras/vpro trace`, `rex/mgras rec`) without the rest of `developer`; works with `lightning`. `vpro rec` needs no feature. |
 | `--features jitv2` | The `j2` commands. `jitv2_lockstep` checks every JIT instruction against the interpreter. |
 | `--features perfetto` | Perfetto timeline traces ([docs/perfetto.md](docs/perfetto.md)). |
@@ -278,7 +278,6 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 | `undo on` / `undo off` | Enable / disable the undo buffer, which records stores to the machine's RAM **[DEV]** |
 | `undo [n]` / `u` | Step back `n` instructions, reversing register and memory changes **[DEV]** |
 | `undo clear` / `undo resize <n>` | Clear / resize the undo history **[DEV]** |
-| `debug <on\|off\|file <path>>` | Print every executed instruction, or write them to a file **[DEV]** |
 | `trace start <path>` / `trace stop` / `trace status` | Record full per-instruction architectural state to a file **[DEV]** |
 | `idleprof <on\|off\|report [n]\|stats>` | Sample the PC to find idle and spin loops (`idle-pause` builds); `stats` prints park counters |
 | `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks that ended on their time bound with no line pending — on a multiprocessor after a slice with every CPU idle, to poll the run queue; on a uniprocessor after 100 ms with no interrupt (a PROM or standalone tool polling with every board source disabled), after which it parks 1 ms at a time until a line wakes it again; `alone`: idle-looking windows not parked because no other CPU was in the same loop; `probes`: batches jitv2 ran interpreted to look inside a compiled loop; `known_parks`: parks decided from a learned compiled exit signature; `learned`: probe runs whose signature was learned; `wake_kick`: parks ended because another CPU asked this one to poll; `kicks`: such requests; then interrupt wakes by Cause.IP line and by CPU), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
@@ -637,6 +636,8 @@ in every build.
 | `log <module> mask <cat\|hex>` | Category mask |
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
+`log mips mask insn` then `log mips on` prints every instruction `run` and
+`step` execute (`log mips file <path>` writes them to a file instead) **[DEV]**.
 A device's trace is its module: `log ps2 on`, `log scsi on`, `log rtc on`.
 `log net` traces packets, `log ioc` the 8254 timer, and `log phys` accesses
 that reach the black hole or a bus-error region.

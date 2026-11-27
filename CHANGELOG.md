@@ -34,6 +34,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   launch; `log` output goes to monitor clients, or to a file with
   `log <module> file PATH`. `IRIS_IP32_HOT` is gone too; its counters were
   never shown anywhere.
+- The CPU `debug` command is gone: `log mips mask insn` and `log mips on`
+  print each instruction `run` and `step` execute, and `log mips file PATH`
+  writes them to a file.
 
 ### Serial ports
 
