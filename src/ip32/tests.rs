@@ -102,7 +102,7 @@ fn a_key_from_the_host_interrupts_without_a_poll() {
 
 #[test]
 fn crime_is_a_64_bit_register_file() {
-    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped())));
     c.write64((CRIME_BASE + crime_reg::MEM_BANK_CTRL0) as u64, 0x0123_4567_89ab_cdef);
     assert_eq!(
         c.read64((CRIME_BASE + crime_reg::MEM_BANK_CTRL0) as u64).data,
@@ -114,7 +114,7 @@ fn crime_is_a_64_bit_register_file() {
 #[test]
 fn crime_save_load_round_trip() {
     use crate::traits::Saveable;
-    let src = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let src = Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped())));
     src.write64((CRIME_BASE + crime_reg::INTMASK) as u64, 0x0000_ff00);
     src.write64((CRIME_BASE + crime_reg::SOFTINT) as u64, 0x0000_0100);
     crate::irq::InterruptController::set_line(&src, 9, true);
@@ -123,7 +123,7 @@ fn crime_save_load_round_trip() {
     src.set_revision(0xa1);
     let v1 = src.save_state();
 
-    let dst = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let dst = Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped())));
     dst.load_state(&v1).expect("load_state");
     assert_eq!(v1, dst.save_state(), "Crime save_state mismatch after load_state round-trip");
     assert!(dst.interrupting(), "a pending, unmasked interrupt is still pending");
@@ -135,7 +135,7 @@ fn crime_space_load_restores_the_memory_banks() {
     use crate::traits::Saveable;
     let make = || {
         let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::with_total(256).unwrap());
-        let crime = std::sync::Arc::new(Crime::new(std::sync::Arc::new(MaceUst::new())));
+        let crime = std::sync::Arc::new(Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped()))));
         (crate::dev::crime::CrimeSpace::new(crime, ram.clone()), ram)
     };
     let (src, src_ram) = make();
@@ -196,7 +196,10 @@ fn a_bus_saves_and_loads_whole() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut flash = vec![0u8; PROM_SIZE as usize];
     flash[0x100] = 0x42;
-    let src = Ip32Bus::new(16 << 20, flash);
+    // A clock that stands still, or the UST moves between the two saves.
+    let board = crate::test_board::Stepped::new();
+    let bus = |prom| Ip32Bus::with_options(O2Memory::single(16 << 20), prom, Ip32Options::default(), &board.tm);
+    let src = bus(flash);
     src.write64((CRIME_BASE + crime_reg::INTMASK) as u64, 0x00ff);
     src.write32((GBE_BASE + 0x50000 + 4 * 3) as u64, 0x0011_2233);
     src.mace.com0.feed(b"x");
@@ -205,7 +208,7 @@ fn a_bus_saves_and_loads_whole() {
     let v1 = src.save_state();
     src.save_raw(&dir).unwrap();
 
-    let dst = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
+    let dst = bus(vec![0u8; PROM_SIZE as usize]);
     dst.load_raw(&dir).unwrap();
     dst.load_state(&v1).expect("load_state");
     let v2 = dst.save_state();
@@ -231,7 +234,7 @@ fn a_snapshot_with_the_old_stack_page_is_refused() {
 /// the bit reads back clear, as the hardware clears it.
 #[test]
 fn crime_cold_reset_is_requested_once() {
-    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped())));
     assert!(!c.take_reset_request());
     c.write64((CRIME_BASE + crime_reg::CONTROL) as u64, 0x0200 | crime_reg::CONTROL_COLD_RESET);
     assert!(c.take_reset_request(), "the write asks for a reset");
@@ -243,7 +246,7 @@ fn crime_cold_reset_is_requested_once() {
 /// anything else, so zero is the one answer guaranteed to be wrong.
 #[test]
 fn revision_does_not_read_as_zero() {
-    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped())));
     assert_ne!(c.read64((CRIME_BASE + crime_reg::REVISION) as u64).data, 0);
 }
 
@@ -254,10 +257,11 @@ fn revision_does_not_read_as_zero() {
 /// was supposed to be, and makes the two clocks disagree.
 #[test]
 fn the_time_counter_tracks_the_clock_and_can_be_reset() {
-    let ust = std::sync::Arc::new(MaceUst::new());
+    let clock = crate::clock::Clock::stepped();
+    let ust = std::sync::Arc::new(MaceUst::new(clock.clone()));
     let c = Crime::new(ust.clone());
 
-    ust.advance_to(1_000 * UST_TICKS_DEN as u64);
+    clock.step(1_000_000);
     let a = c.read64((CRIME_BASE + crime_reg::TIME) as u64).data;
     assert!(a >= 1_000 * CRIME_TICKS_PER_3_US / 3, "counter must follow the clock, got {a}");
     assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, a,
@@ -266,7 +270,7 @@ fn the_time_counter_tracks_the_clock_and_can_be_reset() {
     // Zero it, wait 300us, and it must read 300us worth of ticks.
     c.write64((CRIME_BASE + crime_reg::TIME) as u64, 0);
     assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, 0, "a write sets the counter");
-    ust.advance_to(1_300 * UST_TICKS_DEN as u64);
+    clock.step(300_000);
     let d = c.read64((CRIME_BASE + crime_reg::TIME) as u64).data;
     assert_eq!(d, 100 * CRIME_TICKS_PER_3_US,
                "300us must be 100 * {CRIME_TICKS_PER_3_US} ticks, got {d}");
@@ -278,17 +282,17 @@ fn the_time_counter_tracks_the_clock_and_can_be_reset() {
 /// 252.5 MHz and printed as 255.
 #[test]
 fn the_time_counter_runs_at_66_67_mhz() {
-    let ust = std::sync::Arc::new(MaceUst::new());
-    let c = Crime::new(ust.clone());
+    let clock = crate::clock::Clock::stepped();
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new(clock.clone())));
     c.write64((CRIME_BASE + crime_reg::TIME) as u64, 0);
-    ust.advance_to(3_000 * UST_TICKS_DEN as u64);
+    clock.step(3_000_000);
     assert_eq!(c.read64((CRIME_BASE + crime_reg::TIME) as u64).data, 200_000, "3 ms of a 66.67 MHz clock");
 }
 
 #[test]
 #[cfg(not(feature = "lightning"))]
 fn the_interrupt_log_records_only_while_on() {
-    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped())));
     let mask = (CRIME_BASE + crime_reg::INTMASK) as u64;
     c.write64(mask, 1);
     assert_eq!(c.irqlog_text(), "", "off until asked for");
@@ -305,7 +309,7 @@ fn the_interrupt_log_records_only_while_on() {
 #[test]
 #[cfg(not(feature = "lightning"))]
 fn every_touched_register_is_recorded_once_per_direction() {
-    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new(crate::clock::Clock::stepped())));
     c.write64((CRIME_BASE + crime_reg::MEM_CONTROL) as u64, 1);
     c.write64((CRIME_BASE + crime_reg::MEM_CONTROL) as u64, 2);
     let _ = c.read64((CRIME_BASE + crime_reg::MEM_CONTROL) as u64);
