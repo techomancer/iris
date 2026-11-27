@@ -226,7 +226,7 @@ The monitor (`monitor_port`) has, besides the usual CPU and device commands:
   `heart unsupported`: HEART registers a guest touched that are not modelled.
 - `scsi notes`: what the ISP1040 driver did that the model noted.
 
-`IRIS_IP30_TRACE=1` prints failed accesses and unsupported HEART registers as
+`log heart on` logs failed accesses and unsupported HEART registers as
 they happen.
 
 ## Threads

@@ -27,6 +27,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `pit debug`, `net debug`, `phys error` and `phys hole` are gone: `log ioc`,
   `log net` and the new `log phys` replace them. The timer and packet traces
   need a `developer` build.
+- `IRIS_IP30_TRACE`, `IRIS_IP32_MEC_TRACE`, `IRIS_O2_AUDIO_TRACE`,
+  `IRIS_RSH_TRACE` and `IRIS_TFTP_TRACE` are gone: `log heart`, `log net` and
+  `log o2audio` show the same events (`log heart` also logs every HEART
+  register access and interrupt edge). The old traces wrote to stderr from
+  launch; `log` output goes to monitor clients, or to a file with
+  `log <module> file PATH`. `IRIS_IP32_HOT` is gone too; its counters were
+  never shown anywhere.
 
 ### Serial ports
 

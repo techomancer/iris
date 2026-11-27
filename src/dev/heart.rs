@@ -324,9 +324,7 @@ impl Heart {
         }
         let mut u = self.unsupported.lock();
         if !u.iter().any(|&(o, s, w)| o == off && s as usize == size && w == write) {
-            if trace() {
-                eprintln!("ip30: HEART: unsupported {size}-byte {} at {off:#x}", if write { "write" } else { "read" });
-            }
+            crate::dlog!(LogModule::Heart, "heart: unsupported {size}-byte {} at {off:#x}", if write { "write" } else { "read" });
             u.push((off, size as u8, write));
             if u.len() == 64 {
                 self.unsupported_full.store(true, Ordering::Relaxed);
@@ -493,9 +491,7 @@ impl Heart {
                     // ECC generation and forced writes plant errors in
                     // memory, which this model does not do.
                     if val & (MODE_ECC_GENERATE | MODE_ECC_DOUBLE | MODE_ECC_FORCE_WRITE) != 0 {
-                        if trace() {
-                            eprintln!("ip30: HEART: mode {val:#x} asks for ECC error injection");
-                        }
+                        crate::dlog!(LogModule::Heart, "heart: mode {val:#x} asks for ECC error injection");
                         drop(r);
                         self.note(off, size, true);
                         r = self.regs.lock();
@@ -732,11 +728,6 @@ impl crate::traits::Resettable for Heart {
         drop(r);
         self.memcfg_changed(banks);
     }
-}
-
-fn trace() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("IRIS_IP30_TRACE").is_some())
 }
 
 /// HEART has no thread. Its counter holds while the machine is stopped

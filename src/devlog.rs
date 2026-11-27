@@ -62,7 +62,8 @@ pub enum LogModule {
     /// and transfers a function started that reached no memory.
     Bridge = 32,
     /// The Octane's HEART: processor-interface register accesses (not
-    /// counter reads) and interrupt vectors raised and lowered.
+    /// counter reads), interrupt vectors raised and lowered, and bus
+    /// accesses nothing answers.
     Heart = 33,
     /// The NVM Express controller: register writes, controller state
     /// changes, and the commands it runs (categories `NVME_LOG_*`).
@@ -82,6 +83,8 @@ pub enum LogModule {
     /// The physical bus: accesses that hit the black hole or a bus-error
     /// region.
     Phys = 40,
+    /// The O2's audio: every register access and codec operation.
+    O2Audio = 41,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -96,7 +99,7 @@ pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the
 pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 41;
+    pub const COUNT: usize = 42;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -141,6 +144,7 @@ impl LogModule {
             "kona" => Some(Self::Kona),
             "ice1724" => Some(Self::Ice1724),
             "phys" => Some(Self::Phys),
+            "o2audio" => Some(Self::O2Audio),
             _        => None,
         }
     }
@@ -188,6 +192,7 @@ impl LogModule {
             Self::Kona => "kona",
             Self::Ice1724 => "ice1724",
             Self::Phys => "phys",
+            Self::O2Audio => "o2audio",
         }
     }
 
@@ -201,7 +206,7 @@ impl LogModule {
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
             Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
             Self::L1, Self::Usb, Self::Module, Self::Kona,
-            Self::Ice1724, Self::Phys,
+            Self::Ice1724, Self::Phys, Self::O2Audio,
         ]
     }
 
