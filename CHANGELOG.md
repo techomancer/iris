@@ -918,6 +918,7 @@ image) where the guest test suites showed they differed:
 ### Developer builds
 
 - The `debug_cache` feature is gone.
+- The `developer_ip7` and `developerx` features and `IRIS_BREAK_CPU` are gone.
 
 ## October 2026
 

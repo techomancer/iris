@@ -987,12 +987,6 @@ pub struct MipsCore {
     /// preamble instead of an hptimer). u64::MAX = disarmed.
     #[cfg(feature = "ci_clock")]
     pub count_fire_cycle: u64,
-    /// developer_ip7: total CP0 Compare writes seen, and how many of those
-    /// landed behind Count (which arms a full-wrap ~2^32 wait).
-    #[cfg(feature = "developer_ip7")]
-    pub ip7_writes: u64,
-    #[cfg(feature = "developer_ip7")]
-    pub ip7_past_writes: u64,
     /// Interrupt exceptions this CPU has taken for a line other than the CP0
     /// timer (IP7) alone. The idle parker reads it to tell whether the CPU
     /// ran a device or inter-processor handler since its last park: on a
@@ -1034,20 +1028,6 @@ pub struct MipsCore {
     /// Bumping the sequence at the top of the Compare write invalidates any
     /// such in-flight callback by construction rather than by timing.
     pub(crate) ip7_seq_shared: Arc<AtomicU64>,
-    /// developer_ip7: Compare writes classified as a pure acknowledgement.
-    #[cfg(feature = "developer_ip7")]
-    pub ip7_acks: u64,
-    /// developer_ip7: Compare writes whose deadline we had already overrun,
-    /// so IP7 was asserted immediately.
-    #[cfg(feature = "developer_ip7")]
-    pub ip7_late_fires: u64,
-    /// developer_ip7: times `count_now` materialized a Count advance that
-    /// stepped over Compare and raised IP7 at the crossing.
-    #[cfg(feature = "developer_ip7")]
-    pub ip7_cross_fires: u64,
-    /// developer_ip7: number of Status writes that flipped the IM7 mask bit.
-    #[cfg(feature = "developer_ip7")]
-    pub ip7_mask_changes: u64,
 
     /// Data-side micro-TLB: `[NUTLB_READ | NUTLB_WRITE][NUM_NUTLB_ENTRIES]`,
     /// direct-mapped on VA[12+NUTLB_BITS-1:12]. Replaces the nanotlb's
@@ -1506,23 +1486,11 @@ impl MipsCore {
             count_anchor_cycle: 0,
             #[cfg(feature = "ci_clock")]
             count_fire_cycle: u64::MAX,
-            #[cfg(feature = "developer_ip7")]
-            ip7_writes: 0,
-            #[cfg(feature = "developer_ip7")]
-            ip7_past_writes: 0,
             irqs_taken: 0,
             count_last_guest_read: 0,
             count_write_samples: false,
             ip7_seq: 0,
             ip7_seq_shared: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "developer_ip7")]
-            ip7_acks: 0,
-            #[cfg(feature = "developer_ip7")]
-            ip7_late_fires: 0,
-            #[cfg(feature = "developer_ip7")]
-            ip7_cross_fires: 0,
-            #[cfg(feature = "developer_ip7")]
-            ip7_mask_changes: 0,
             // 16 KiB of zeroes. `NuTlbEntry: Copy` so this is a const-promoted
             // memset, not 512 separate initializations.
             nutlb: [[NuTlbEntry::default(); NUM_NUTLB_ENTRIES]; 2],
@@ -1713,14 +1681,8 @@ impl MipsCore {
             19 => self.cp0_watchhi as u64,
             20 => self.cp0_xcontext,
             21 => self.cp0_framemask as u64,
-            25 => {
-                // PerfCnt: R4400 has no performance counters. Log any probe so
-                // a guest expecting them (and routing their overflow onto the
-                // timer IP) is visible rather than silently reading 0.
-                #[cfg(feature = "developer_ip7")]
-                eprintln!("[ip7] MFC0 PerfCnt (reg 25) read -> 0");
-                0
-            }
+            // PerfCnt: no performance counters are implemented.
+            25 => 0,
             26 => {
                 if cachediag_on() {
                     eprintln!("ip28cd: MFC0 ECC -> {:#010x} pc={:#018x}",
@@ -1868,23 +1830,13 @@ impl MipsCore {
             if deliver_crossing && dist_to_compare != 0 && (dist_to_compare as u64) <= ticks {
                 // Same ticket the armed one-shot holds: whichever of us gets
                 // here first delivers, the other is a no-op.
-                let won = claim_ip7(
+                claim_ip7(
                     &self.ip7_seq_shared,
                     self.ip7_seq,
                     &self.hot.interrupts,
                     &self.fasttick_count,
                     self.cpu_id,
                 );
-                #[cfg(feature = "developer_ip7")]
-                if won {
-                    self.ip7_cross_fires += 1;
-                    if self.ip7_cross_fires <= 40 {
-                        eprintln!("[ip7] CROSS count {:#010x}->{:#010x} passed compare {:#010x} ticket={} (cross={})",
-                            before, after, self.cp0_compare as u32, self.ip7_seq, self.ip7_cross_fires);
-                    }
-                }
-                #[cfg(not(feature = "developer_ip7"))]
-                let _ = won;
             }
         }
         self.count_read_cycle = cycles;
@@ -2276,56 +2228,18 @@ impl MipsCore {
                 let since_last_read = compare_u32.wrapping_sub(last_read);
                 let missed = since_last_read != 0
                     && since_last_read <= count_before.wrapping_sub(last_read);
-                if !in_future {
-                    if compare_u32 == last_read || !missed {
-                        // Case 1 (pure ack) or 3 (parked far away). IP7
-                        // stays cleared above.
-                        #[cfg(feature = "developer_ip7")]
-                        { self.ip7_acks += 1; }
-                    } else {
-                        // Case 2: missed deadline -- assert immediately,
-                        // consuming this write's own fresh ticket.
-                        let won = claim_ip7(
-                            &self.ip7_seq_shared,
-                            ticket,
-                            &self.hot.interrupts,
-                            &self.fasttick_count,
-                            self.cpu_id,
-                        );
-                        #[cfg(feature = "developer_ip7")]
-                        if won { self.ip7_late_fires += 1; }
-                        #[cfg(not(feature = "developer_ip7"))]
-                        let _ = won;
-                    }
+                // Case 1 (pure ack) and 3 (parked far away) leave IP7 cleared.
+                if !in_future && compare_u32 != last_read && missed {
+                    // Case 2: missed deadline -- assert immediately,
+                    // consuming this write's own fresh ticket.
+                    claim_ip7(
+                        &self.ip7_seq_shared,
+                        ticket,
+                        &self.hot.interrupts,
+                        &self.fasttick_count,
+                        self.cpu_id,
+                    );
                 }
-
-                let new_delta = (self.cp0_compare as u32).wrapping_sub(self.cp0_count as u32);
-                #[cfg(feature = "developer_ip7")]
-                {
-                    let signed = new_delta as i32;
-                    self.ip7_writes += 1;
-                    if signed <= 0 { self.ip7_past_writes += 1; }
-                    if self.ip7_writes <= 200 || signed <= 0 {
-                        eprintln!(
-                            "[ip7] MTC0 Compare #{:<5} lastread={:#010x} count={:#010x} compare={:#010x} delta={:>8} {} fired={} ack={} late={} cross={}",
-                            self.ip7_writes,
-                            self.count_last_guest_read,
-                            count_before,
-                            self.cp0_compare as u32,
-                            signed,
-                            if in_future { "FUTURE " }
-                            else if compare_u32 == last_read { "ACK    " }
-                            else if !missed { "PARKED " }
-                            else { "LATE!  " },
-                            self.fasttick_count.load(Ordering::Relaxed),
-                            self.ip7_acks,
-                            self.ip7_late_fires,
-                            self.ip7_cross_fires,
-                        );
-                    }
-                }
-                #[cfg(not(feature = "developer_ip7"))]
-                let _ = new_delta;
 
                 // Cases 2 and 4 are deadlines: they set the clock's rate.
                 if in_future || (compare_u32 != last_read && missed) {
@@ -2353,20 +2267,6 @@ impl MipsCore {
                 // mips_cpu_irq_controller masks IM7 on interrupt entry
                 // (irq_ack) and unmasks on EOI; if the unmask never comes, no
                 // further timer interrupt can ever be delivered.
-                #[cfg(feature = "developer_ip7")]
-                {
-                    const IM7: u32 = 1 << 15;
-                    if (old ^ self.cp0_status) & IM7 != 0 {
-                        self.ip7_mask_changes += 1;
-                        if self.ip7_mask_changes <= 60 {
-                            eprintln!(
-                                "[ip7] Status IM7 {}  status {:#010x} -> {:#010x}  epc={:#018x} cause={:#010x}",
-                                if self.cp0_status & IM7 != 0 { "SET  " } else { "CLEAR" },
-                                old, self.cp0_status, self.cp0_epc, self.cp0_cause,
-                            );
-                        }
-                    }
-                }
                 if let Some((cb, ctx)) = self.status_changed_cb {
                     cb(ctx, old, self.cp0_status);
                 }
@@ -2421,10 +2321,6 @@ impl MipsCore {
             // (R10000 UM v2.0 p. 260). Other parts have no register 21 and ignore
             // the write.
             21 => self.cp0_framemask = value as u32 & self.framemask_mask,
-            25 => {
-                #[cfg(feature = "developer_ip7")]
-                eprintln!("[ip7] MTC0 PerfCnt (reg 25) write {:#018x} (ignored)", value);
-            }
             26 => {
                 if cachediag_on() {
                     eprintln!("ip28cd: MTC0 ECC = {:#010x} (was {:#010x}) pc={:#018x}",
