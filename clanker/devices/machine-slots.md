@@ -44,7 +44,7 @@ disagrees fails the build, so the list cannot drift from the hardware.
 with a warning: keys 1 to 15 are targets on `controller` (default 0), a key
 of 16 or more is `16 * controller + id`, and each becomes `at = "scsiC/tN"`, so
 it lands on whatever machine the command line picks. `--scsiN` and `--cdromN`
-replace the image of the entry at their slot. Disc changers and snapshots
+replace the image of the entry at their slot. Disc changers
 still key by `16 * controller + id` where they must; `scsi_target` and
 `scsi_target_slot` convert.
 

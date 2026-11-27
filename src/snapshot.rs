@@ -73,10 +73,6 @@ use toml::Value;
 /// controller and target id, so each side refuses the other schema.
 pub const SCHEMA_VERSION: u32 = 11;
 
-/// The oldest schema this build reads. Raise this when a change makes an older
-/// snapshot unreadable.
-pub const OLDEST_SCHEMA: u32 = 11;
-
 const MANIFEST_FILE: &str = "snapshot.toml";
 
 pub struct Snapshot {
@@ -164,13 +160,10 @@ pub fn enabled_features() -> Vec<String> {
     f
 }
 
-/// Refuse a snapshot of a schema this build cannot read: older than
-/// `OLDEST_SCHEMA` or newer than `SCHEMA_VERSION`. The Indy's loader reads
-/// older ones itself.
+/// Refuse a snapshot of any schema but the current one.
 pub fn check_schema(name: &str, found: u32) -> Result<(), String> {
-    if !(OLDEST_SCHEMA..=SCHEMA_VERSION).contains(&found) {
-        let reads = if OLDEST_SCHEMA == SCHEMA_VERSION { format!("schema {SCHEMA_VERSION}") } else { format!("schemas {OLDEST_SCHEMA} to {SCHEMA_VERSION}") };
-        return Err(format!("snapshot {name} is schema {found}; this build reads {reads}"));
+    if found != SCHEMA_VERSION {
+        return Err(format!("snapshot {name} is schema {found}; this build reads schema {SCHEMA_VERSION}"));
     }
     Ok(())
 }
@@ -982,16 +975,13 @@ impl StateTable {
 mod tests {
     use super::*;
 
-    /// A snapshot of a schema outside what this build reads is refused with the
-    /// range named; the oldest it reads and the current one load.
+    /// Only the current schema loads; an older or newer one is refused with the schema this build reads.
     #[test]
-    fn check_schema_names_the_range_it_reads() {
-        let older = OLDEST_SCHEMA - 1;
-        let e = check_schema("old", older).unwrap_err();
-        assert!(e.contains(&format!("schema {older}")) && e.contains(&format!("reads schema {SCHEMA_VERSION}")), "{e}");
+    fn check_schema_names_the_schema_it_reads() {
+        let e = check_schema("old", SCHEMA_VERSION - 1).unwrap_err();
+        assert!(e.contains(&format!("schema {}", SCHEMA_VERSION - 1)) && e.contains(&format!("reads schema {SCHEMA_VERSION}")), "{e}");
         assert!(check_schema("newer", SCHEMA_VERSION + 1).is_err());
         assert!(check_schema("current", SCHEMA_VERSION).is_ok());
-        assert!(check_schema("oldest", OLDEST_SCHEMA).is_ok());
     }
 
     /// The current layout round-trips, and a cut-short file is refused.

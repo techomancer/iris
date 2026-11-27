@@ -4077,10 +4077,6 @@ impl Rex3 {
         exit
     }
 
-    pub fn save_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        self.save_framebuffers_named(dir, "rex3")
-    }
-
     /// Save RGB/aux planes with a custom filename prefix (e.g. `rex3_head1`).
     pub fn save_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
         #[cfg(feature = "wgpu")]
@@ -4155,10 +4151,6 @@ impl Rex3 {
     pub fn restore_framebuffers_inmem(&self, rgb: &[u32], aux: &[u32]) {
         self.try_restore_framebuffers_inmem(rgb, aux)
             .unwrap_or_else(|error| panic!("REX3 {error}"));
-    }
-
-    pub fn load_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        self.load_framebuffers_named(dir, "rex3")
     }
 
     /// Dump the full 2048x1024 VRAM for offline inspection: raw rgb/aux/did

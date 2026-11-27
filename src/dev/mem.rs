@@ -107,31 +107,6 @@ impl Memory {
         &mut *self.data.get()
     }
 
-    /// Save memory contents to a raw binary file.
-    /// Words are stored as big-endian bytes matching the MIPS memory layout.
-    pub fn save_bin(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        let data = unsafe { self.data() };
-        // Convert each u32 word to big-endian bytes
-        let mut bytes = Vec::with_capacity(data.len() * 4);
-        for &word in data.iter() {
-            bytes.extend_from_slice(&word.to_be_bytes());
-        }
-        std::fs::write(path, &bytes)
-    }
-
-    /// Load memory contents from a raw binary file saved by save_bin().
-    pub fn load_bin(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        let bytes = std::fs::read(path)?;
-        let data = unsafe { self.data() };
-        let words = bytes.len() / 4;
-        let count = words.min(data.len());
-        for i in 0..count {
-            let b = &bytes[i * 4..(i + 1) * 4];
-            data[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        }
-        Ok(())
-    }
-
     /// Clone the bank's word buffer in native endian. Used by the in-memory
     /// rollback checkpoint to capture state without touching disk. Caller
     /// should ensure the CPU/peripheral threads are stopped to avoid a

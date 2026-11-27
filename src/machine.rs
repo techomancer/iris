@@ -1984,11 +1984,7 @@ impl Machine {
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
         manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
-        let sv = manifest.schema_version;
 
-        // Device state — schema_version=2 writes *.bin (postcard-encoded
-        // BinValue tree); legacy writes *.toml. write_state encapsulates the
-        // choice so this orchestrator stays format-agnostic.
         snap.write_state("cpu",    &self.cpu.save_state()).map_err(|e| e.to_string())?;
         snap.write_state("mc",     &self.mc.save_state()).map_err(|e| e.to_string())?;
         snap.write_state("ioc",    &self.hpc3.ioc().save_state()).map_err(|e| e.to_string())?;
@@ -2004,9 +2000,7 @@ impl Machine {
         snap.write_state("seeq",   &self.hpc3.seeq().save_state()).map_err(|e| e.to_string())?;
         snap.write_state("hpc3",   &self.hpc3.save_state()).map_err(|e| e.to_string())?;
 
-        // REX3 (optional — absent in headless config). Framebuffers are
-        // included in the chunks manifest below for v3+; v2 wrote them as
-        // standalone .bin files.
+        // REX3 (optional — absent in headless config). Its framebuffers go in the chunks manifest below.
         if let Some(rex3) = &self.board.rex3 {
             #[cfg(feature = "wgpu")]
             let resident_state = resident_primary.as_ref().map(|(state, _)| state);
@@ -2016,17 +2010,6 @@ impl Machine {
                 Some(state) => snap.write_state("rex3", state),
                 None => snap.write_state("rex3", &rex3.save_state()),
             }.map_err(|e| e.to_string())?;
-            if sv < 3 {
-                #[cfg(feature = "wgpu")]
-                if let Some((_, (rgb, aux))) = &resident_primary {
-                    Rex3::write_captured_resident_framebuffers(&snap.dir, "rex3", rgb, aux)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
-                }
-                #[cfg(not(feature = "wgpu"))]
-                rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
-            }
         }
         if let (Some(td), Some(at)) = (&self.board.testdev, self.gio_at("test_device")) {
             snap.write_state(&at.to_string(), &td.save_state()).map_err(|e| e.to_string())?;
@@ -2040,9 +2023,8 @@ impl Machine {
                 Some(state) => snap.write_state("rex3_head1", state),
                 None => snap.write_state("rex3_head1", &rex3.save_state()),
             }.map_err(|e| e.to_string())?;
-            // The v3 chunk manifest covers only the primary head. Keep the
-            // second head in the existing named-plane format in every raster
-            // mode so overwriting a snapshot cannot retain stale resident planes.
+            // The chunk manifest covers only the primary head. Keep the second head in named planes in every
+            // raster mode so overwriting a snapshot cannot retain stale resident planes.
             let dir = &snap.dir;
             #[cfg(feature = "wgpu")]
             if let Some((_, (rgb, aux))) = &resident_head1 {
@@ -2063,50 +2045,42 @@ impl Machine {
             snap.write_state("mgras", &toml::Value::String(metadata.clone())).map_err(|e| e.to_string())?;
         }
 
-        // Bulk memory: v3+ goes to the content-addressable chunk store
-        // shared across all snapshots in `saves/.cas/`. v2 (legacy) writes
-        // raw bank{N}.bin files. Chunk hashes go in chunks.bin so load can
-        // walk the right chunks back out.
-        if sv >= 3 {
-            let store = ChunkStore::new("saves");
-            let mut chunks = ChunksManifest::default();
-            for i in 0..4 {
-                let words = self.board.phys.snapshot_bank_inmem(i);
-                chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
-                    .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
-            }
-            if let Some(rex3) = &self.board.rex3 {
-                #[cfg(feature = "wgpu")]
-                let planes = resident_primary.take().map(|(_, planes)| planes);
-                #[cfg(not(feature = "wgpu"))]
-                let planes: Option<(Vec<u32>, Vec<u32>)> = None;
-                let (rgb, aux) = planes.unwrap_or_else(|| rex3.snapshot_framebuffers_inmem());
-                let rgb_chunks = put_words_as_chunks(&store, &rgb)
-                    .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
-                let aux_chunks = put_words_as_chunks(&store, &aux)
-                    .map_err(|e| format!("CAS rex3 aux put: {}", e))?;
-                chunks.framebuffer_chunks = Some((rgb_chunks, aux_chunks));
-            }
-            if let Some((_, parts)) = mgras_snapshot {
-                for (name, words) in parts {
-                    let hashes = put_words_as_chunks(&store, &words)
-                        .map_err(|e| format!("CAS IMPACT {name} put: {e}"))?;
-                    chunks.mgras_chunks.push(MgrasChunk { name, words: words.len(), hashes });
-                }
-            }
-            if let Some((_, parts)) = gr2_snapshot {
-                for (name, words) in parts {
-                    let hashes = put_words_as_chunks(&store, &words)
-                        .map_err(|e| format!("CAS GR2 {name} put: {e}"))?;
-                    chunks.gr2_chunks.push(Gr2Chunk { name, words: words.len(), hashes });
-                }
-            }
-            snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
-        } else {
-            for i in 0..4 {
-                self.board.phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+        // Bulk memory goes to the content-addressable chunk store shared across all snapshots in `saves/.cas/`;
+        // the chunk hashes go in chunks.bin so load can walk the right chunks back out.
+        let store = ChunkStore::new("saves");
+        let mut chunks = ChunksManifest::default();
+        for i in 0..4 {
+            let words = self.board.phys.snapshot_bank_inmem(i);
+            chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
+                .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
+        }
+        if let Some(rex3) = &self.board.rex3 {
+            #[cfg(feature = "wgpu")]
+            let planes = resident_primary.take().map(|(_, planes)| planes);
+            #[cfg(not(feature = "wgpu"))]
+            let planes: Option<(Vec<u32>, Vec<u32>)> = None;
+            let (rgb, aux) = planes.unwrap_or_else(|| rex3.snapshot_framebuffers_inmem());
+            let rgb_chunks = put_words_as_chunks(&store, &rgb)
+                .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
+            let aux_chunks = put_words_as_chunks(&store, &aux)
+                .map_err(|e| format!("CAS rex3 aux put: {}", e))?;
+            chunks.framebuffer_chunks = Some((rgb_chunks, aux_chunks));
+        }
+        if let Some((_, parts)) = mgras_snapshot {
+            for (name, words) in parts {
+                let hashes = put_words_as_chunks(&store, &words)
+                    .map_err(|e| format!("CAS IMPACT {name} put: {e}"))?;
+                chunks.mgras_chunks.push(MgrasChunk { name, words: words.len(), hashes });
             }
         }
+        if let Some((_, parts)) = gr2_snapshot {
+            for (name, words) in parts {
+                let hashes = put_words_as_chunks(&store, &words)
+                    .map_err(|e| format!("CAS GR2 {name} put: {e}"))?;
+                chunks.gr2_chunks.push(Gr2Chunk { name, words: words.len(), hashes });
+            }
+        }
+        snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
 
         // Each disk's copy-on-write overlay, by slot, with the dirty sectors in
         // `cow.toml`: the filesystem state stays consistent with the captured RAM.
@@ -2186,7 +2160,7 @@ impl Machine {
         // (no snapshot.toml) are accepted with a warning. Cross-arch loads are
         // refused — FPU bit-layout differs between aarch64 and x86_64 and we
         // don't have migration plumbing yet.
-        let schema_version = match snap.read_manifest()? {
+        match snap.read_manifest()? {
             Some(m) => {
                 if let Some(other) = &m.machine {
                     return Err(format!("snapshot {name} is of another machine ({other})"));
@@ -2268,14 +2242,10 @@ impl Machine {
                         return Err(format!("{}\n(set IRIS_SNAPSHOT_SKIP_CHECK=1 to override)", msg));
                     }
                 }
-
-                m.schema_version
             }
             None => return Err(format!("saves/{name}: no snapshot.toml")),
-        };
+        }
 
-        // Device state — read_state picks <base>.bin (v2+) or <base>.toml
-        // (legacy). v2 also falls back to .toml if .bin is absent.
         let cpu = snap.read_state("cpu").map_err(|e| e.to_string())?;
         self.cpu.load_state(&cpu)?;
 
@@ -2321,9 +2291,6 @@ impl Machine {
         if let Some(rex3) = &self.board.rex3 {
             let rex3_v = snap.read_state("rex3").map_err(|e| e.to_string())?;
             rex3.load_state(&rex3_v)?;
-            if schema_version < 3 {
-                rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
-            }
         }
         if let (Some(td), Some(at)) = (&self.board.testdev, self.gio_at("test_device")) {
             if let Ok(v) = snap.read_state(&at.to_string()) {
@@ -2345,109 +2312,93 @@ impl Machine {
                 let named_planes_present = rgb_path.try_exists().map_err(|e| e.to_string())?
                     || aux_path.try_exists().map_err(|e| e.to_string())?;
                 #[cfg(feature = "wgpu")]
-                let load_planes = schema_version < 3 || rex3.resident_active() || named_planes_present;
+                let load_planes = rex3.resident_active() || named_planes_present;
                 #[cfg(not(feature = "wgpu"))]
-                let load_planes = schema_version < 3 || named_planes_present;
+                let load_planes = named_planes_present;
                 if load_planes {
                     rex3.load_framebuffers_named(&snap.dir, "rex3_head1").map_err(|e| e.to_string())?;
                 }
             }
         }
-        let gr2_metadata = if schema_version >= 10 && self.board.gr2.is_some() {
+        let gr2_metadata = if self.board.gr2.is_some() {
             let value = snap.read_state("gr2").map_err(|e| e.to_string())?;
             Some(value.as_str().ok_or("GR2 snapshot metadata is not a string")?.to_string())
         } else {
-            if schema_version < 10 {
-                if let Some(gr2) = &self.board.gr2 {
-                    if let Ok(gr2_v) = snap.read_state("gr2") {
-                        gr2.load_state(&gr2_v)?;
-                    }
-                }
-            }
             None
         };
-        let mgras_metadata = if schema_version >= 8 && self.board.mgras.is_some() {
+        let mgras_metadata = if self.board.mgras.is_some() {
             let value = snap.read_state("mgras").map_err(|e| e.to_string())?;
             Some(value.as_str().ok_or("mgras snapshot metadata is not a string")?.to_string())
         } else {
             None
         };
 
-        // Bulk memory: v3+ comes from the content-addressable chunk store
-        // shared across snapshots; v2 reads raw bank{N}.bin files.
-        if schema_version >= 3 {
-            let store = ChunkStore::new("saves");
-            let chunks = snap.read_chunks_manifest()
-                .map_err(|e| format!("read chunks.bin: {}", e))?;
-            #[cfg(feature = "wgpu")]
-            self.validate_resident_primary_checkpoint(true, chunks.framebuffer_chunks.is_some())?;
-            for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
-                if hashes.is_empty() { continue; }
-                let words = get_chunks_as_words(&store, hashes)
-                    .map_err(|e| format!("CAS bank{} get: {}", i, e))?;
-                self.board.phys.restore_bank_inmem(i, &words);
-            }
-            if let (Some(rex3), Some((rgb_h, aux_h))) = (&self.board.rex3, &chunks.framebuffer_chunks) {
-                let rgb = get_chunks_as_words(&store, rgb_h)
-                    .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
-                let aux = get_chunks_as_words(&store, aux_h)
-                    .map_err(|e| format!("CAS rex3 aux get: {}", e))?;
-                rex3.try_restore_framebuffers_inmem(&rgb, &aux)
-                    .map_err(|error| format!("restore REX3 framebuffer chunks: {error}"))?;
-            }
-            match (&self.board.mgras, mgras_metadata.as_deref(), chunks.mgras_chunks.is_empty()) {
-                (Some(mgras), Some(metadata), false) => {
-                    let mut parts = Vec::with_capacity(chunks.mgras_chunks.len());
-                    for part in &chunks.mgras_chunks {
-                        let words = get_chunks_as_words(&store, &part.hashes)
-                            .map_err(|e| format!("CAS IMPACT {} get: {e}", part.name))?;
-                        if words.len() != part.words {
-                            return Err(format!(
-                                "CAS IMPACT {} has {} words, expected {}",
-                                part.name,
-                                words.len(),
-                                part.words
-                            ));
-                        }
-                        parts.push((part.name.clone(), words));
+        // Bulk memory comes from the content-addressable chunk store shared across snapshots.
+        let store = ChunkStore::new("saves");
+        let chunks = snap.read_chunks_manifest()
+            .map_err(|e| format!("read chunks.bin: {}", e))?;
+        #[cfg(feature = "wgpu")]
+        self.validate_resident_primary_checkpoint(true, chunks.framebuffer_chunks.is_some())?;
+        for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
+            if hashes.is_empty() { continue; }
+            let words = get_chunks_as_words(&store, hashes)
+                .map_err(|e| format!("CAS bank{} get: {}", i, e))?;
+            self.board.phys.restore_bank_inmem(i, &words);
+        }
+        if let (Some(rex3), Some((rgb_h, aux_h))) = (&self.board.rex3, &chunks.framebuffer_chunks) {
+            let rgb = get_chunks_as_words(&store, rgb_h)
+                .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
+            let aux = get_chunks_as_words(&store, aux_h)
+                .map_err(|e| format!("CAS rex3 aux get: {}", e))?;
+            rex3.try_restore_framebuffers_inmem(&rgb, &aux)
+                .map_err(|error| format!("restore REX3 framebuffer chunks: {error}"))?;
+        }
+        match (&self.board.mgras, mgras_metadata.as_deref(), chunks.mgras_chunks.is_empty()) {
+            (Some(mgras), Some(metadata), false) => {
+                let mut parts = Vec::with_capacity(chunks.mgras_chunks.len());
+                for part in &chunks.mgras_chunks {
+                    let words = get_chunks_as_words(&store, &part.hashes)
+                        .map_err(|e| format!("CAS IMPACT {} get: {e}", part.name))?;
+                    if words.len() != part.words {
+                        return Err(format!(
+                            "CAS IMPACT {} has {} words, expected {}",
+                            part.name,
+                            words.len(),
+                            part.words
+                        ));
                     }
-                    mgras.restore_snapshot_parts(metadata, &parts)?;
+                    parts.push((part.name.clone(), words));
                 }
-                (Some(_), Some(_), true) => return Err("snapshot has IMPACT metadata but no IMPACT chunks".into()),
-                (Some(_), None, false) => return Err("snapshot has IMPACT chunks but no IMPACT metadata".into()),
-                (None, _, false) => return Err("snapshot contains IMPACT state but this machine has no IMPACT board".into()),
-                _ => {}
+                mgras.restore_snapshot_parts(metadata, &parts)?;
             }
-            if schema_version >= 10 {
-                match (&self.board.gr2, gr2_metadata.as_deref(), chunks.gr2_chunks.is_empty()) {
-                    (Some(gr2), Some(metadata), false) => {
-                        let mut parts = Vec::with_capacity(chunks.gr2_chunks.len());
-                        for part in &chunks.gr2_chunks {
-                            let words = get_chunks_as_words(&store, &part.hashes)
-                                .map_err(|e| format!("CAS GR2 {} get: {e}", part.name))?;
-                            if words.len() != part.words {
-                                return Err(format!(
-                                    "CAS GR2 {} has {} words, expected {}",
-                                    part.name,
-                                    words.len(),
-                                    part.words
-                                ));
-                            }
-                            parts.push((part.name.clone(), words));
-                        }
-                        gr2.restore_snapshot_parts(metadata, &parts)?;
+            (Some(_), Some(_), true) => return Err("snapshot has IMPACT metadata but no IMPACT chunks".into()),
+            (Some(_), None, false) => return Err("snapshot has IMPACT chunks but no IMPACT metadata".into()),
+            (None, _, false) => return Err("snapshot contains IMPACT state but this machine has no IMPACT board".into()),
+            _ => {}
+        }
+        match (&self.board.gr2, gr2_metadata.as_deref(), chunks.gr2_chunks.is_empty()) {
+            (Some(gr2), Some(metadata), false) => {
+                let mut parts = Vec::with_capacity(chunks.gr2_chunks.len());
+                for part in &chunks.gr2_chunks {
+                    let words = get_chunks_as_words(&store, &part.hashes)
+                        .map_err(|e| format!("CAS GR2 {} get: {e}", part.name))?;
+                    if words.len() != part.words {
+                        return Err(format!(
+                            "CAS GR2 {} has {} words, expected {}",
+                            part.name,
+                            words.len(),
+                            part.words
+                        ));
                     }
-                    (Some(_), Some(_), true) => return Err("snapshot has GR2 metadata but no GR2 chunks".into()),
-                    (Some(_), None, false) => return Err("snapshot has GR2 chunks but no GR2 metadata".into()),
-                    (Some(_), None, true) => return Err("snapshot has no state for the configured GR2 board".into()),
-                    (None, _, false) => return Err("snapshot contains GR2 state but this machine has no GR2 board".into()),
-                    _ => {}
+                    parts.push((part.name.clone(), words));
                 }
+                gr2.restore_snapshot_parts(metadata, &parts)?;
             }
-        } else {
-            for i in 0..4 {
-                self.board.phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
-            }
+            (Some(_), Some(_), true) => return Err("snapshot has GR2 metadata but no GR2 chunks".into()),
+            (Some(_), None, false) => return Err("snapshot has GR2 chunks but no GR2 metadata".into()),
+            (Some(_), None, true) => return Err("snapshot has no state for the configured GR2 board".into()),
+            (None, _, false) => return Err("snapshot contains GR2 state but this machine has no GR2 board".into()),
+            _ => {}
         }
 
         let sets = snap.read_toml("cow.toml").map(|t| crate::snapshot::parse_cow_table(&t)).map_err(|e| format!("cow.toml: {e}"))?;

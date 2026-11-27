@@ -1126,7 +1126,6 @@ impl OctaneMachine {
         manifest.cpu_model = Some(cpu.model_name().to_string());
         manifest.cpu_cache = Some(cpu.cache_kind().to_string());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
-        let sv = manifest.schema_version;
         let io = |e: std::io::Error| e.to_string();
         snap.write_state("cpu", &cpu.save_state()).map_err(io)?;
         snap.write_state("octane", &self.save_board()).map_err(io)?;
@@ -1215,7 +1214,6 @@ impl OctaneMachine {
         // As the Indy and the O2: build, CPU, disks and devices must match.
         crate::snapshot::check_provenance(&m, cpu.model_name(), cpu.cache_kind(), &self.disks)?;
         crate::snapshot::check_slots(&m, &self.cards.manifest())?;
-        let sv = m.schema_version;
         let state = |base: &str| snap.read_state(base).map_err(|e| format!("{base}: {e}"));
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
         let memory = get_chunks_as_words(&ChunkStore::new(saves), &chunks.bank_chunks[0])
@@ -1233,7 +1231,7 @@ impl OctaneMachine {
         }
         let cards = if self.cards.is_empty() { toml::Value::Table(Default::default()) } else { state("cards")? };
         let impact = match (&self.gfx, chunks.mgras_chunks.is_empty()) {
-            (Some(_), false) if sv >= 8 => {
+            (Some(_), false) => {
                 let metadata = state("impact")?
                     .as_str()
                     .ok_or("impact snapshot metadata is not a string")?
@@ -1255,13 +1253,12 @@ impl OctaneMachine {
                 }
                 Some((metadata, parts))
             }
-            (Some(_), true) if sv >= 8 => return Err("snapshot has no state for the configured IMPACT board".into()),
-            (Some(_), _) => return Err("snapshot schema predates Octane IMPACT state".into()),
+            (Some(_), true) => return Err("snapshot has no state for the configured IMPACT board".into()),
             (None, false) => return Err("snapshot contains IMPACT state but this Octane has no IMPACT board".into()),
             (None, true) => None,
         };
         let vpro = match (&self.vpro, chunks.odyssey_chunks.is_empty()) {
-            (Some(_), false) if sv >= 9 => {
+            (Some(_), false) => {
                 let metadata = state("vpro")?
                     .as_str()
                     .ok_or("VPro snapshot metadata is not a string")?
@@ -1283,10 +1280,9 @@ impl OctaneMachine {
                 }
                 Some((metadata, parts))
             }
-            (Some(_), true) if sv >= 9 => {
+            (Some(_), true) => {
                 return Err("snapshot has no state for the configured VPro board".into())
             }
-            (Some(_), _) => return Err("snapshot schema predates Octane VPro state".into()),
             (None, false) => {
                 return Err("snapshot contains VPro state but this Octane has no VPro board".into())
             }

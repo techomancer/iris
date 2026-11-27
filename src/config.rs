@@ -104,7 +104,7 @@ pub struct ScsiDeviceConfig {
     pub size_mb: Option<u32>,
 }
 
-/// The snapshot manifest's disk number for `id` on `controller`: the id
+/// The disk number the GUI and the disc changer use for `id` on `controller`: the id
 /// itself on controller 0, 16 + id on controller 1. Sixteen slots per
 /// controller, as SCSI ids go.
 pub fn scsi_slot(controller: u8, id: u8) -> u8 {

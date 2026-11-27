@@ -12,8 +12,8 @@
 //!
 //! ```text
 //!   GET  <base>/snapshots/<name>/snapshot.toml      ← manifest, schema_version
-//!   GET  <base>/snapshots/<name>/cpu.bin            ← v2+ device state
-//!   GET  <base>/snapshots/<name>/chunks.bin         ← v3+ CAS hash list
+//!   GET  <base>/snapshots/<name>/cpu.bin            ← device state
+//!   GET  <base>/snapshots/<name>/chunks.bin         ← CAS hash list
 //!   GET  <base>/snapshots/<name>/cow.toml           ← per-disk dirty sectors, by slot path
 //!   GET  <base>/snapshots/<name>/hpc3/c0/scsi1.overlay ← a disk's overlay bytes, in its bus's directory
 //!   GET  <base>/cas/<hex2>/<hex62>.chunk            ← content-addressed RAM chunk
@@ -66,8 +66,7 @@ pub fn pull(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
     let snap_dir = saves_dir.join(name);
     std::fs::create_dir_all(&snap_dir).map_err(|e| format!("create {}: {}", snap_dir.display(), e))?;
 
-    // 1. Manifest first — tells us schema_version, which gates which other
-    //    files exist.
+    // 1. Manifest first.
     let manifest_url = format!("{}/snapshots/{}/snapshot.toml", base, name);
     let manifest_bytes = http_get(&manifest_url).map_err(|e| format!("fetch manifest: {}", e))?;
     std::fs::write(snap_dir.join("snapshot.toml"), &manifest_bytes)
@@ -76,19 +75,17 @@ pub fn pull(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
     report.bytes_transferred += manifest_bytes.len() as u64;
 
     let snap_local = Snapshot::new(&snap_dir);
-    let manifest = snap_local
+    snap_local
         .read_manifest()
         .map_err(|e| format!("parse manifest: {}", e))?
         .ok_or_else(|| "manifest missing or unparseable".to_string())?;
-    let sv = manifest.schema_version;
 
-    // 2. Per-device state. v3+ uses .bin (postcard); v1 used .toml. v0 has no
-    //    manifest so we don't get here.
+    // 2. Per-device state (postcard).
     let device_bases = [
         "cpu", "mc", "ioc", "scc", "pit", "ps2", "rtc",
         "eeprom", "scsi", "seeq", "hpc3", "rex3",
     ];
-    let suffix = if sv >= 2 { "bin" } else { "toml" };
+    let suffix = "bin";
     for base_name in device_bases {
         let url = format!("{}/snapshots/{}/{}.{}", base, name, base_name, suffix);
         match http_get(&url) {
@@ -127,45 +124,43 @@ pub fn pull(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
         }
     }
 
-    // 4. v3+: fetch chunks.bin, then any chunk hashes the local store doesn't
+    // 4. Fetch chunks.bin, then any chunk hashes the local store doesn't
     //    already have.
-    if sv >= 3 {
-        let chunks_url = format!("{}/snapshots/{}/chunks.bin", base, name);
-        let chunks_bytes = http_get(&chunks_url).map_err(|e| format!("fetch chunks.bin: {}", e))?;
-        let chunks = ChunksManifest::from_bytes(&chunks_bytes)
-            .map_err(|e| format!("parse chunks.bin: {}", e))?;
-        std::fs::write(snap_dir.join("chunks.bin"), &chunks_bytes)
-            .map_err(|e| format!("write chunks.bin: {}", e))?;
-        report.files_transferred += 1;
-        report.bytes_transferred += chunks_bytes.len() as u64;
+    let chunks_url = format!("{}/snapshots/{}/chunks.bin", base, name);
+    let chunks_bytes = http_get(&chunks_url).map_err(|e| format!("fetch chunks.bin: {}", e))?;
+    let chunks = ChunksManifest::from_bytes(&chunks_bytes)
+        .map_err(|e| format!("parse chunks.bin: {}", e))?;
+    std::fs::write(snap_dir.join("chunks.bin"), &chunks_bytes)
+        .map_err(|e| format!("write chunks.bin: {}", e))?;
+    report.files_transferred += 1;
+    report.bytes_transferred += chunks_bytes.len() as u64;
 
-        let store = ChunkStore::new(saves_dir);
-        let mut seen: std::collections::HashSet<ChunkHash> = std::collections::HashSet::new();
-        for hash in chunks.referenced_hashes() {
-            if !seen.insert(*hash) {
-                continue;
-            }
-            if store.has(hash) {
-                report.chunks_skipped += 1;
-                continue;
-            }
-            let url = format!("{}/cas/{}/{}.chunk", base, hex2_of(hash), hex62_of(hash));
-            let bytes = http_get(&url).map_err(|e| format!("fetch chunk {}: {}", hex_of(hash), e))?;
-            // Validate the server gave us the right content.
-            let actual: ChunkHash = blake3::hash(&bytes).into();
-            if &actual != hash {
-                return Err(format!(
-                    "chunk hash mismatch for {}: got {}",
-                    hex_of(hash),
-                    hex_of(&actual)
-                ));
-            }
-            store
-                .put(&bytes)
-                .map_err(|e| format!("store chunk {}: {}", hex_of(hash), e))?;
-            report.chunks_fetched += 1;
-            report.bytes_transferred += bytes.len() as u64;
+    let store = ChunkStore::new(saves_dir);
+    let mut seen: std::collections::HashSet<ChunkHash> = std::collections::HashSet::new();
+    for hash in chunks.referenced_hashes() {
+        if !seen.insert(*hash) {
+            continue;
         }
+        if store.has(hash) {
+            report.chunks_skipped += 1;
+            continue;
+        }
+        let url = format!("{}/cas/{}/{}.chunk", base, hex2_of(hash), hex62_of(hash));
+        let bytes = http_get(&url).map_err(|e| format!("fetch chunk {}: {}", hex_of(hash), e))?;
+        // Validate the server gave us the right content.
+        let actual: ChunkHash = blake3::hash(&bytes).into();
+        if &actual != hash {
+            return Err(format!(
+                "chunk hash mismatch for {}: got {}",
+                hex_of(hash),
+                hex_of(&actual)
+            ));
+        }
+        store
+            .put(&bytes)
+            .map_err(|e| format!("store chunk {}: {}", hex_of(hash), e))?;
+        report.chunks_fetched += 1;
+        report.bytes_transferred += bytes.len() as u64;
     }
 
     Ok(report)
@@ -186,37 +181,34 @@ pub fn push(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
         return Err(format!("push: snapshot '{}' not found", name));
     }
     let snap_local = Snapshot::new(&snap_dir);
-    let manifest = snap_local
+    snap_local
         .read_manifest()
         .map_err(|e| format!("read manifest: {}", e))?
-        .ok_or_else(|| "manifest missing — only v1+ snapshots can be pushed".to_string())?;
-    let sv = manifest.schema_version;
+        .ok_or_else(|| "manifest missing".to_string())?;
 
-    // 1. Chunks first (v3+). Manifest goes last so the snapshot only becomes
+    // 1. Chunks first. Manifest goes last so the snapshot only becomes
     //    visible to pullers once all its chunks are in place.
-    if sv >= 3 {
-        let chunks_path = snap_dir.join("chunks.bin");
-        let chunks_bytes = std::fs::read(&chunks_path).map_err(|e| format!("read chunks.bin: {}", e))?;
-        let chunks = ChunksManifest::from_bytes(&chunks_bytes)
-            .map_err(|e| format!("parse chunks.bin: {}", e))?;
-        let store = ChunkStore::new(saves_dir);
-        let mut seen: std::collections::HashSet<ChunkHash> = std::collections::HashSet::new();
-        for hash in chunks.referenced_hashes() {
-            if !seen.insert(*hash) {
-                continue;
-            }
-            let url = format!("{}/cas/{}/{}.chunk", base, hex2_of(hash), hex62_of(hash));
-            if http_head(&url).unwrap_or(false) {
-                report.chunks_skipped += 1;
-                continue;
-            }
-            let bytes = store
-                .get(hash)
-                .map_err(|e| format!("read chunk {}: {}", hex_of(hash), e))?;
-            http_put(&url, &bytes).map_err(|e| format!("PUT chunk {}: {}", hex_of(hash), e))?;
-            report.chunks_fetched += 1;
-            report.bytes_transferred += bytes.len() as u64;
+    let chunks_path = snap_dir.join("chunks.bin");
+    let chunks_bytes = std::fs::read(&chunks_path).map_err(|e| format!("read chunks.bin: {}", e))?;
+    let chunks = ChunksManifest::from_bytes(&chunks_bytes)
+        .map_err(|e| format!("parse chunks.bin: {}", e))?;
+    let store = ChunkStore::new(saves_dir);
+    let mut seen: std::collections::HashSet<ChunkHash> = std::collections::HashSet::new();
+    for hash in chunks.referenced_hashes() {
+        if !seen.insert(*hash) {
+            continue;
         }
+        let url = format!("{}/cas/{}/{}.chunk", base, hex2_of(hash), hex62_of(hash));
+        if http_head(&url).unwrap_or(false) {
+            report.chunks_skipped += 1;
+            continue;
+        }
+        let bytes = store
+            .get(hash)
+            .map_err(|e| format!("read chunk {}: {}", hex_of(hash), e))?;
+        http_put(&url, &bytes).map_err(|e| format!("PUT chunk {}: {}", hex_of(hash), e))?;
+        report.chunks_fetched += 1;
+        report.bytes_transferred += bytes.len() as u64;
     }
 
     // 2. Per-device state.
@@ -224,7 +216,7 @@ pub fn push(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
         "cpu", "mc", "ioc", "scc", "pit", "ps2", "rtc",
         "eeprom", "scsi", "seeq", "hpc3", "rex3",
     ];
-    let suffix = if sv >= 2 { "bin" } else { "toml" };
+    let suffix = "bin";
     for base_name in device_bases {
         let p = snap_dir.join(format!("{}.{}", base_name, suffix));
         if !p.exists() {
@@ -260,16 +252,14 @@ pub fn push(base_url: &str, name: &str, saves_dir: &Path) -> Result<TransferRepo
         report.bytes_transferred += cow_bytes.len() as u64;
     }
 
-    // 4. chunks.bin (v3+) — uploaded BEFORE manifest because pullers fetch
+    // 4. chunks.bin — uploaded BEFORE manifest because pullers fetch
     //    it after manifest and would otherwise race a concurrent push.
-    if sv >= 3 {
-        let chunks_bytes = std::fs::read(snap_dir.join("chunks.bin"))
-            .map_err(|e| format!("read chunks.bin: {}", e))?;
-        let url = format!("{}/snapshots/{}/chunks.bin", base, name);
-        http_put(&url, &chunks_bytes).map_err(|e| format!("PUT chunks.bin: {}", e))?;
-        report.files_transferred += 1;
-        report.bytes_transferred += chunks_bytes.len() as u64;
-    }
+    let chunks_bytes = std::fs::read(snap_dir.join("chunks.bin"))
+        .map_err(|e| format!("read chunks.bin: {}", e))?;
+    let url = format!("{}/snapshots/{}/chunks.bin", base, name);
+    http_put(&url, &chunks_bytes).map_err(|e| format!("PUT chunks.bin: {}", e))?;
+    report.files_transferred += 1;
+    report.bytes_transferred += chunks_bytes.len() as u64;
 
     // 5. Manifest LAST (commit point).
     let manifest_bytes = std::fs::read(snap_dir.join("snapshot.toml"))
