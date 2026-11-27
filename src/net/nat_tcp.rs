@@ -125,7 +125,7 @@ impl NatEngine {
         let ends = Endpoints { guest_mac: client_mac, guest_ip: src_ip, guest_port: syn.sport(),
                                remote_ip: dst_ip, remote_port: dport };
         let to_gw = dst_ip == self.config.gateway_ip;
-        if dport == RSH_PORT && super::rsh::trace_enabled() {
+        if dport == RSH_PORT {
             // Where did this guest rsh go? "No trace from the built-in server"
             // usually means it never got the connection.
             let verdict = if to_gw && self.config.rsh_dir.is_some() {
@@ -135,7 +135,7 @@ impl NatEngine {
             } else {
                 "relayed to that address: it is not the gateway"
             };
-            eprintln!("iris: rsh: guest {}:{} -> {}:{}: {}", src_ip, syn.sport(), dst_ip, dport, verdict);
+            dlog!(LogModule::Net, "rsh: guest {}:{} -> {}:{}: {}", src_ip, syn.sport(), dst_ip, dport, verdict);
         }
         let backend = if to_gw && dport == TIME_PORT {
             Backend::Service(ServiceConn::new(Box::new(TimeService(super::services::rfc868_time()))))
@@ -200,10 +200,8 @@ impl NatEngine {
         };
         dlog_dev!(LogModule::Net, "NAT TCP side connection {}:{} → guest {}:{}",
                   main.remote_ip, sport, main.guest_ip, side.guest_port);
-        if super::rsh::trace_enabled() {
-            eprintln!("iris: rsh: connecting back to guest {}:{} (stderr) from {}:{}",
-                      main.guest_ip, side.guest_port, main.remote_ip, sport);
-        }
+        dlog!(LogModule::Net, "rsh: connecting back to guest {}:{} (stderr) from {}:{}",
+              main.guest_ip, side.guest_port, main.remote_ip, sport);
         let ends = Endpoints { guest_port: side.guest_port, remote_port: sport, ..main };
         let conn = TcpConn::open(ends, Backend::Service(ServiceConn::new(side.service)));
         let syn = conn.syn(self.config.gateway_mac);

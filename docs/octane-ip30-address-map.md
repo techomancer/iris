@@ -516,6 +516,6 @@ what the PROM insists on along the way, are in
 | OpenBSD/sgi (ISC): `sgi/ip30.h`, `ip30_machdep.c`, `xbow/xbow.c`, `widget.h`, `xheart.c`, `xheartreg.h`, `xbridge.c`, `xbridgereg.h`, `pci/iocreg.h`, `dev/dsrtc.c` | the window arithmetic, the probe order, HEART's interrupt handling and counter, the Bridge's PCI spaces in the large window, DMA constraints, where the RTC and NICs are |
 | Linux: `arch/mips/sgi-ip30/*`, `include/asm/sgi/heart.h`, `asm/xtalk/xwidget.h`, `asm/pci/bridge.h`, `arch/mips/pci/pci-xtalk-bridge.c`, `asm/sn/ioc3.h` | the HEART structure, the interrupt levels and pins, the Bridge setup sequence, DMA addressing, the IOC3's PCI quirks, the console address |
 | SGI Crossbow ASIC specification 12.0, Bridge ASIC specification 4.0, Xbridge 0.5 (`docs/datasheets/octane/*.pdf`, scans) | the chips' own descriptions, for anything the headers leave unexplained |
-| PROM 4.17 under IRIS (`IRIS_IP30_TRACE=1`) and `hinv`, `/hw` on snorlax | what the PROM programs and in what order; the widget and PCI population |
+| PROM 4.17 under IRIS (`log heart on`) and `hinv`, `/hw` on snorlax | what the PROM programs and in what order; the widget and PCI population |
 
 No leaked IRIX source was used.

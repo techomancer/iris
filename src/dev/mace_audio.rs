@@ -80,10 +80,9 @@ mod ad1843 {
     pub const POWER: usize = 28;
 }
 
-/// The trace: every register access and codec operation, on stderr.
+/// The trace under `log o2audio`: every register access and codec operation.
 fn tracing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("IRIS_O2_AUDIO_TRACE").is_some())
+    crate::devlog::devlog_is_active(crate::devlog::LogModule::O2Audio)
 }
 
 #[derive(Clone, Copy)]
@@ -373,9 +372,7 @@ impl MaceAudio {
                 }
             }
         };
-        if tracing() {
-            eprintln!("o2audio: read  {off:#04x} = {v:#x}");
-        }
+        crate::dlog!(crate::devlog::LogModule::O2Audio, "o2audio: read  {off:#04x} = {v:#x}");
         v
     }
 
@@ -383,9 +380,7 @@ impl MaceAudio {
     pub fn write(&self, addr: u32, val: u64) {
         let mut st = self.st.lock();
         let off = addr & 0x78;
-        if tracing() {
-            eprintln!("o2audio: write {off:#04x} = {val:#x}");
-        }
+        crate::dlog!(crate::devlog::LogModule::O2Audio, "o2audio: write {off:#04x} = {val:#x}");
         match off {
             0x00 => {
                 // Bit 0 is the codec reset; the volume latches clear by
@@ -403,9 +398,7 @@ impl MaceAudio {
                     let reg = ((val >> 17) & 31) as usize;
                     if val & (1 << 16) == 0 {
                         st.codec[reg] = val as u16;
-                        if tracing() {
-                            eprintln!("o2audio: codec reg {reg:2} <- {:#06x} ({})", val as u16, val as u16);
-                        }
+                        crate::dlog!(crate::devlog::LogModule::O2Audio, "o2audio: codec reg {reg:2} <- {:#06x} ({})", val as u16, val as u16);
                     } else {
                         st.status_in = st.codec_read(reg) as u64;
                     }
@@ -590,12 +583,12 @@ impl MaceAudio {
                 *last = Some(Instant::now());
                 let h = [0, 1].map(|k| self.heard[k].swap(0, Ordering::Relaxed));
                 if h != [0, 0] {
-                    eprintln!("o2audio: non-zero pairs played: out1 {} out2 {}", h[0], h[1]);
+                    crate::dlog!(crate::devlog::LogModule::O2Audio, "o2audio: non-zero pairs played: out1 {} out2 {}", h[0], h[1]);
                 }
                 let g = [0, 1].map(|k| self.gaps[k].swap(0, Ordering::Relaxed));
                 let gi = [0, 1].map(|k| self.gap_items[k].swap(0, Ordering::Relaxed));
                 if g != [0, 0] {
-                    eprintln!("o2audio: ring ran dry: out1 {} ({} items) out2 {} ({} items)", g[0], gi[0], g[1], gi[1]);
+                    crate::dlog!(crate::devlog::LogModule::O2Audio, "o2audio: ring ran dry: out1 {} ({} items) out2 {} ({} items)", g[0], gi[0], g[1], gi[1]);
                 }
             }
         }

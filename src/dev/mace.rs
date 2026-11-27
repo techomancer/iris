@@ -138,17 +138,14 @@ impl Mace {
         (MACE_SDMA..MACE_SDMA + MACE_SDMA_SIZE).contains(&addr)
     }
 
-    /// A serial DMA register, read. Counted with MACE's other offsets, so a
-    /// guest polling one shows up where every other hot register does.
+    /// A serial DMA register, read.
     fn sdma_read(&self, addr: u32) -> u64 {
         self.regs.r();
-        self.regs.hit(addr, false);
         self.sdma.read(addr)
     }
 
     fn sdma_write(&self, addr: u32, val: u64) -> u32 {
         self.regs.w();
-        self.regs.hit(addr, true);
         self.sdma.write(addr, val, &self.sdma_io());
         // A pointer or control write moves the levels, and may hand the port
         // back to (or take it from) the 16550's own interrupt.
@@ -161,7 +158,6 @@ impl Mace {
     /// not as of the last service tick.
     fn isa_reading(&self, addr: u32) {
         self.regs.r();
-        self.regs.hit(addr, false);
         if self.sdma.any_owned() {
             self.sdma.update_irq();
         }
@@ -483,7 +479,6 @@ impl BusDevice for Mace {
         }
         if MaceIsa::contains(a) {
             self.regs.w();
-            self.regs.hit(a, true);
             let r = BusDevice::write8(&*self.isa, addr, val);
             self.isa_wrote(a);
             return r;
@@ -523,7 +518,6 @@ impl BusDevice for Mace {
         }
         if MaceIsa::contains(a) {
             self.regs.w();
-            self.regs.hit(a, true);
             let r = BusDevice::write16(&*self.isa, addr, val);
             self.isa_wrote(a);
             return r;
@@ -576,7 +570,6 @@ impl BusDevice for Mace {
         }
         if MaceIsa::contains(a) {
             self.regs.w();
-            self.regs.hit(a, true);
             let r = BusDevice::write32(&*self.isa, addr, val);
             self.isa_wrote(a);
             return r;
@@ -626,7 +619,6 @@ impl BusDevice for Mace {
         }
         if MaceIsa::contains(a) {
             self.regs.w();
-            self.regs.hit(a, true);
             let r = BusDevice::write64(&*self.isa, addr, val);
             self.isa_wrote(a);
             return r;

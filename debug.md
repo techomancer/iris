@@ -610,8 +610,7 @@ a forced termination; a normal stop saves them automatically.
 | `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
 | `net interfaces` | Host interfaces available for PCAP |
 
-`IRIS_TFTP_TRACE` and `IRIS_RSH_TRACE` log the TFTP and rsh services
-([FEATURES.md](FEATURES.md#environment-and-diagnostic-controls)).
+`log net` also logs the built-in TFTP and rsh services.
 
 ### Physical bus
 
@@ -645,7 +644,7 @@ that reach the black hole or a bus-error region.
 Modules (`help` lists them too): `net hpc3 seeq hal2 mc rex3 mips ioc scsi
 pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c ultra scsi1
 nveeprom gr2 rad1 odyssey bedrock hub pci bridge heart nvme l1 usb module kona
-ice1724 phys`. `scsi1` is the Indigo2's second SCSI controller, `nveeprom` its NVRAM
+ice1724 phys o2audio`. `scsi1` is the Indigo2's second SCSI controller, `nveeprom` its NVRAM
 EEPROM, `ultra` the N64 development board, `gr2` the GR2 board, `rad1` the RAD1
 audio of the Octane and the Onyx2's MediaIO card, `odyssey` the VPro and `kona`
 the InfiniteReality pipe. `hub`
@@ -659,7 +658,9 @@ register and translation-table accesses by name, and any transfer a PCI
 function started that reached no memory, and each interrupt pin's edges
 and the HEART vector it sets or clears. `heart` logs HEART's register
 accesses, one counter read in 256 with the host's clock, and every
-interrupt vector raised or lowered. Mask categories: `pdma` —
+interrupt vector raised or lowered, and on the Octane every access nothing
+answers. `o2audio` logs the O2's audio register accesses and codec writes.
+Mask categories: `pdma` —
 `hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
 every module also takes `on`/`all`, `off`/`none` or a hex mask.
