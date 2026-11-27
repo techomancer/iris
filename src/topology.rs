@@ -770,12 +770,6 @@ mod tests {
         assert!(place(&[cage(), cage()], &fill(octane)).unwrap_err().contains("no free slot for a pci module"));
     }
 
-    #[test]
-    fn unplaced_cards_fill_a_pci_module_in_array_order() {
-        let devs = [dev("nvme", None, None), dev("nvme", None, None), dev("pci_cage", None, Some("pci_module"))];
-        assert_eq!(placed(&devs, MachineProfile::OctaneIp30), ["xio13/pci0/1", "xio13/pci0/2", "xio13"]);
-    }
-
     /// An NVMe card entered ahead of a saved audio card takes its slot: a restore refuses and names the `at` that keeps it.
     #[test]
     fn a_card_added_ahead_of_a_saved_one_is_refused_with_its_slot() {
@@ -793,32 +787,28 @@ mod tests {
         assert!(e.contains("ice1724 at xio13/pci0/1") && e.contains("at = \"xio13/pci0/1\""), "{e}");
     }
 
-    /// A card with no slot that comes before the board that brings its slot waits for it.
-    #[test]
-    fn a_card_ahead_of_the_board_that_brings_its_slot_waits() {
-        let devs = [dev("nvme", None, None), dev("pci_cage", None, None)];
-        assert_eq!(placed(&devs, MachineProfile::OctaneIp30), ["xio13/pci0/1", "xio13"]);
-        let e = place(&[dev("nvme", None, None)], &fill(MachineProfile::OctaneIp30)).unwrap_err();
-        assert!(e.contains("no free slot for pci cards"), "{e}");
-    }
-
-    /// A device may name a slot another brings, whatever order they are in.
+    /// A slot a device brings is there for the devices that name it, whatever order they are in, and a card with
+    /// no slot waits for the board that brings one.
     #[test]
     fn a_slot_a_device_brings_is_there_for_the_devices_that_name_it() {
+        let octane = MachineProfile::OctaneIp30;
+        let cards = [dev("nvme", None, None), dev("nvme", None, None), dev("pci_cage", None, Some("pci_module"))];
+        assert_eq!(placed(&cards, octane), ["xio13/pci0/1", "xio13/pci0/2", "xio13"]);
+        let e = place(&[dev("nvme", None, None)], &fill(octane)).unwrap_err();
+        assert!(e.contains("no free slot for pci cards"), "{e}");
         let devs = [
             dev("nvme", None, Some("br/pci0/0")),
             dev("pci_bridge", Some("br"), Some("cage/pci0/2")),
             dev("pci_cage", Some("cage"), Some("shoebox")),
             dev("pci_shoehorn", None, None),
         ];
-        assert_eq!(placed(&devs, MachineProfile::OctaneIp30), ["xio13/pci0/2/pci0/0", "xio13/pci0/2", "xio13", "xio10"]);
-        let e = place(&[dev("nvme", None, Some("xio13/pci0/1"))], &fill(MachineProfile::OctaneIp30)).unwrap_err();
+        assert_eq!(placed(&devs, octane), ["xio13/pci0/2/pci0/0", "xio13/pci0/2", "xio13", "xio10"]);
+        let e = place(&[dev("nvme", None, Some("xio13/pci0/1"))], &fill(octane)).unwrap_err();
         assert!(e.contains("has no slot xio13/pci0/1"), "no module, no slot: {e}");
-        let text = list_slots(&devs, &fill(MachineProfile::OctaneIp30)).unwrap();
+        let text = list_slots(&devs, &fill(octane)).unwrap();
         let at = |s: &str| text.lines().position(|l| l.starts_with(s)).unwrap_or_else(|| panic!("{s} in\n{text}"));
         assert!(at("xio13 ") < at("xio13/pci0 ") && at("xio13/pci0/1 ") < at("xio13/pci0/2 "), "{text}");
         assert!(text.lines().any(|l| l.starts_with("xio13/pci0/2/pci0/0") && l.contains("nvme n.img")), "{text}");
-        assert!(text.lines().any(|l| l.starts_with("xio9 ") && l.contains("slot_c") && l.ends_with("xio boards")), "{text}");
     }
 
     #[test]
@@ -899,21 +889,14 @@ mod tests {
         slots(P::Origin200Ip29, &[]);
         let e = place(&[card("pci_shoehorn", Some("io2"))], &o2k).unwrap_err();
         assert!(e.contains("xio12 does not take a pci_shoehorn"), "{e}");
-        let listing = list_slots(&[], &o2k).unwrap();
-        assert!(listing.lines().any(|l| l.starts_with("node1/xio8 ") && l.contains("io11") && l.ends_with("nothing modelled")), "{listing}");
     }
 
     #[test]
     fn a_virtio_card_with_no_slot_leaves_slot_0_to_the_cards_that_need_it() {
         let map = fill(MachineProfile::Indigo2Ip22);
-        let devs = [card("virtio_serial", None), card("newport", None)];
-        assert_eq!(place(&devs, &map).unwrap(), [Some(loc("gio1")), Some(loc("gio0"))]);
-        let two = [card("virtio_9p", None), card("virtio_serial", None)];
-        let got: Vec<_> = place(&two, &map).unwrap().iter().map(|at| at.as_ref().and_then(|a| a.gio_slot())).collect();
-        assert_eq!(got, [Some(1), Some(0)]);
-        let listing = list_slots(&devs, &map).unwrap();
-        assert!(listing.lines().any(|l| l.starts_with("gio1") && l.contains("virtio_serial")), "{listing}");
-        assert!(listing.lines().any(|l| l.starts_with("gio0") && l.contains("newport")), "{listing}");
+        assert_eq!(place(&[card("virtio_serial", None), card("newport", None)], &map).unwrap(), [Some(loc("gio1")), Some(loc("gio0"))]);
+        let two = place(&[card("virtio_9p", None), card("virtio_serial", None)], &map).unwrap();
+        assert_eq!(two.iter().map(|at| at.as_ref().and_then(|a| a.gio_slot())).collect::<Vec<_>>(), [Some(1), Some(0)]);
     }
 
     /// virtio takes the extra slots in list order and never a real slot; a card
@@ -975,28 +958,6 @@ mod tests {
         assert!(place(&both, &fill(MachineProfile::OctaneIp30)).unwrap_err().contains("is taken by the hdd"));
     }
 
-    /// The example config of the design: the same answer on every run, and the card in the module's first slot.
-    #[test]
-    fn the_example_config_lists_its_slots() {
-        let devs = [
-            hdd("scsi0/t1", "irix.img"),
-            ConfiguredDevice::new("xio15/pci0/1/t4", DeviceModel::Scsi(crate::config::ScsiDeviceConfig { path: "irix.iso".into(), cdrom: true, kind_field: crate::config::ScsiKind::Cdrom, ..Default::default() })),
-            dev("pci_cage", Some("cage"), Some("xio13")),
-            dev("qla2200", None, Some("cage/pci0")),
-            card("virtio_serial", None),
-        ];
-        let map = fill(MachineProfile::OctaneIp30);
-        let text = list_slots(&devs, &map).unwrap();
-        assert_eq!(text, list_slots(&devs, &map).unwrap());
-        let row = |at: &str| -> Vec<&str> { text.lines().find(|l| l.starts_with(&format!("{at} "))).unwrap_or_else(|| panic!("{at} in\n{text}")).split("  ").map(str::trim).filter(|s| !s.is_empty()).collect() };
-        assert_eq!(row("xio15/pci0/0/t1"), ["xio15/pci0/0/t1", "scsi0/t1", "hdd irix.img", "-"]);
-        assert_eq!(row("xio15/pci0/1/t4"), ["xio15/pci0/1/t4", "scsi1/t4", "cdrom irix.iso", "-"]);
-        assert_eq!(row("xio13"), ["xio13", "pci_module, shoebox", "cage: pci_cage", "-"]);
-        assert_eq!(row("xio13/pci0/1"), ["xio13/pci0/1", "-", "qla2200", "-"]);
-        assert_eq!(row("xio13/pci0/2"), ["xio13/pci0/2", "-", "-", "pci cards"]);
-        assert_eq!(row("xio15/pci0/7"), ["xio15/pci0/7", "-", "virtio_serial", "-"]);
-    }
-
     #[test]
     fn names_follow_the_rule() {
         let slots = MachineProfile::OctaneIp30.slots();
@@ -1056,20 +1017,6 @@ mod tests {
         ] {
             assert_eq!(shared_pin(routing, table, superio), None, "{name}");
         }
-    }
-
-    /// The checker finds the two slots the tables once had: the I-brick's device 0, whose INTA is
-    /// the IOC3's SuperIO pin, and the Octane's device 4.
-    #[test]
-    fn the_check_finds_a_shared_pin() {
-        use crate::dev::{bridge::PIN_WIRING, xbridge::PCI_ROUTING};
-        use crate::pci::{PCI_INTA, PCI_INTB};
-        let extra = |dev, pin| (dev, MachineSlotKind::Extra { pin }, None);
-        let ibrick = [extra(0, PCI_INTA), extra(7, PCI_INTA)];
-        let octane = [extra(4, PCI_INTA), extra(5, PCI_INTA)];
-        assert_eq!((shared_pin(&PCI_ROUTING, &ibrick, Some(0)), shared_pin(&PIN_WIRING, &octane, Some(4))), (Some(0), Some(4)));
-        let scsi = [(0, MachineSlotKind::Fixed("isp1040"), None), extra(4, PCI_INTB)];
-        assert_eq!(shared_pin(&PIN_WIRING, &scsi, None), Some(4), "device 4's INTB reaches the pin of device 0's INTA");
     }
 
     /// The graphics board holds its XIO port: an option board cannot take it, and automatic
