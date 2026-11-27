@@ -928,7 +928,7 @@ cache = false               # reuse compiled pages across runs (opt-in)
 [debug]
 no_idle = false             # disable idle park (idle-pause builds); IRIS_NO_IDLE
 gui_gl_capture = false      # iris-gui GL capture path; IRIS_GUI_GL
-# debug_log = "scsi,net"    # devlog module spec; IRIS_DEBUG_LOG
+# log = "scsi,l1d.*,-l1d.hit"  # trace points to turn on at startup, as for the monitor's log
 ```
 
 On a CD-ROM, hybrid ISO9660 discs (e.g. Hot Mix 19) may not automount under
@@ -1067,6 +1067,7 @@ Automation and debugging
   --jitv2-threads <N>         jitv2 compile-pool threads (default: one per guest CPU, at most 4,
                               capped by the host's usable CPUs)
   --jitv2-compile <MODE>      async (default) or sync (compile on the CPU thread; one CPU only)
+  --log <POINTS>              Turn trace points on from startup, e.g. heart,l1d.*,-l1d.hit (to stderr)
   --perfetto <FILE>           Record a Perfetto trace from startup (--features perfetto);
                               --perfetto-cats and --perfetto-clock as for the monitor's perfetto start
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry

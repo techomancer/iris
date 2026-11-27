@@ -6,7 +6,7 @@ Indigo2 (IP22 fullhouse) boots IRIX with no Ethernet MAC set, even after
 adding a backdoor that writes `08:00:69:...` into `Eeprom93c56` words
 `0x7D-0x7F` at machine construction (before the CPU ever runs). `nveeprom
 dump` after boot showed the backdoor value was gone/never took effect, and
-`IRIS_DEBUG_LOG=nveeprom` (enabled before CPU start) showed **zero**
+`--log nveeprom` (enabled before CPU start) showed **zero**
 read/write log lines during boot — looked like PROM never touched the chip.
 
 ## Root cause

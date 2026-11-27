@@ -101,15 +101,9 @@ impl Default for O2Trace {
 }
 
 /// Parse a trace category list: `re,cpu,gbe,crime,irq` or `all`.
-pub fn trace_mask(s: &str) -> u32 {
-    s.split(',').fold(0, |m, w| m | match w {
-        "re" => TRACE_RE,
-        "cpu" => TRACE_CPU,
-        "gbe" => TRACE_GBE,
-        "crime" => TRACE_CRIME,
-        "irq" => TRACE_IRQ,
-        _ => TRACE_ALL,
-    })
+pub fn trace_mask(s: &str) -> Result<u32, String> {
+    let classes = [("re", TRACE_RE), ("cpu", TRACE_CPU), ("gbe", TRACE_GBE), ("crime", TRACE_CRIME), ("irq", TRACE_IRQ)];
+    crate::devlog::select(s, &classes, TRACE_ALL)
 }
 
 impl O2Trace {
@@ -247,7 +241,7 @@ impl O2Trace {
                 None => writeln!(w, "trace not active"),
             }),
             [path, rest @ ..] => {
-                let mask = trace_mask(rest.first().copied().unwrap_or("all"));
+                let mask = trace_mask(rest.first().copied().unwrap_or("all")).map_err(|e| format!("trace: {e}"))?;
                 self.start(path, mask).map_err(|e| format!("trace {path}: {e}"))?;
                 e(writeln!(w, "tracing to {path} (mask {mask:#x})"))
             }

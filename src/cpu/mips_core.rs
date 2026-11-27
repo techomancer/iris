@@ -28,7 +28,7 @@ pub const STATUS_CU1: u32 = 1 << 29;    // Coprocessor 1 (FPU) Usable
 pub const STATUS_CU2: u32 = 1 << 30;    // Coprocessor 2 Usable
 pub const STATUS_CU3: u32 = 1 << 31;    // Coprocessor 3 Usable
 
-/// Is CP0 register tracing on? `log mips mask cp0` on the monitor.
+/// Is CP0 register tracing on? `log mips.cp0 on` on the monitor.
 ///
 /// Traces everything the cache-error machinery touches — CP0 ECC (26) and
 /// CacheErr (27) accesses, Status.DE transitions, and CACHE ops.
@@ -52,7 +52,7 @@ pub fn cachediag_on() -> bool {
     cp0_log()
 }
 
-/// `log mips mask cp0` — CP0 register traffic.
+/// `log mips.cp0 on` — CP0 register traffic.
 #[inline(always)]
 pub fn cp0_log() -> bool {
     crate::devlog::devlog_on(crate::devlog::LogModule::Mips, crate::cpu::mips_exec::MIPS_LOG_CP0)
@@ -2190,7 +2190,7 @@ impl MipsCore {
                 self.reanchor_count_and_reschedule();
             }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
-                // `log mips mask cp0` shows what the guest wrote against
+                // `log mips.cp0 on` shows what the guest wrote against
                 // what survives the mask: the model's VPN2 width, 40 bits or the
                 // R10000 family's 44.
                 if cp0_log() && (value & !self.entryhi_mask) != 0 {
@@ -2373,7 +2373,7 @@ impl MipsCore {
             14 => {
                 // A guest write of a 32-bit value here is where a 64-bit
                 // return address would lose its top half, so the ERET that
-                // follows lands at a truncated PC. `log mips mask cp0`.
+                // follows lands at a truncated PC. `log mips.cp0 on`.
                 if cp0_log() {
                     crate::dlog!(crate::devlog::LogModule::Mips,
                         "ip28epc: write EPC={value:#018x} (was {:#018x}) from pc={:#018x}",
@@ -2402,7 +2402,7 @@ impl MipsCore {
                 // IP28 bring-up: IRIX's XTLB refill handler builds the page
                 // table base itself and expects XContext's PTEBase to be
                 // zero, so anything landing in bits [63:33] becomes a wild
-                // pointer inside the handler. `log mips mask cp0`.
+                // pointer inside the handler. `log mips.cp0 on`.
                 if cp0_log() {
                     crate::dlog!(crate::devlog::LogModule::Mips,
                         "ip28xctx: write {value:#018x} (ptebase={:#018x}) pc={:#018x}",
