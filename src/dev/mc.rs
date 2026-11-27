@@ -1100,7 +1100,7 @@ impl Device for MemoryController {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
             ("mc".to_string(), "Memory Controller commands: mc dma, mc dma xlate [vaddr] [w], mc regs, mc vdma <on|off>".to_string()),
-            ("eeprom".to_string(), "CPU/MC EEPROM commands (93C56 @ 0x1fa00030, CPU boot config incl. CACHSZ_REG @ word 0x11 — NOT the NVRAM/MAC chip, see `nveeprom`): eeprom <on|off> | eeprom dump | eeprom r <word> | eeprom w <word> <val>".to_string()),
+            ("eeprom".to_string(), "CPU/MC EEPROM commands (93C56 @ 0x1fa00030, CPU boot config incl. CACHSZ_REG @ word 0x11 — NOT the NVRAM/MAC chip, see `nveeprom`): eeprom dump | eeprom r <word> | eeprom w <word> <val>".to_string()),
         ]
     }
 
@@ -1247,15 +1247,9 @@ impl Device for MemoryController {
             }
             "eeprom" => {
                 if args.is_empty() {
-                    return Err("Usage: eeprom <on|off|dump|r|w> ...".to_string());
+                    return Err("Usage: eeprom <dump|r|w> ...".to_string());
                 }
                 match args[0] {
-                    "on" | "1" | "off" | "0" => {
-                        let debug = matches!(args[0], "on" | "1");
-                        let state = self.state.lock();
-                        state.eeprom.lock().set_debug(debug);
-                        writeln!(writer, "EEPROM debug {}", if debug { "enabled" } else { "disabled" }).unwrap();
-                    }
                     "dump" => {
                         let state = self.state.lock();
                         let eeprom = state.eeprom.lock();
@@ -1294,7 +1288,7 @@ impl Device for MemoryController {
                         state.eeprom.lock().set_word(addr, val);
                         writeln!(writer, "{:02X}: {:04X}", addr, val).unwrap();
                     }
-                    _ => return Err("Usage: eeprom <on|off|dump|r|w> ...".to_string()),
+                    _ => return Err("Usage: eeprom <dump|r|w> ...".to_string()),
                 }
             }
             _ => return Err(format!("Unknown MC command: {}", cmd)),

@@ -55,8 +55,8 @@ Read `debug.md` for the commands; this skill is the workflow. Use the
   serial console (port 8881) or the PROM's text console for them.
 - Everything the kernel printed is kept in its console ring: `putbuf` reads
   it at any time, including after a hang.
-- The IRIS side has its own traces: `scsi debug on`, `scsi wdt`, `log scsi
-  on`, `pdma dump on`, `net debug ...` (most need `developer`). Run them at
+- The IRIS side has its own traces: `log scsi on` (`log scsi1` for the
+  second controller), `scsi wdt`, `pdma dump on`, `log net on` (most need `developer`). Run them at
   the same time as the guest-side breakpoints so the two timelines can be
   matched.
 

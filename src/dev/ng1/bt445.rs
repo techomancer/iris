@@ -172,8 +172,6 @@ pub struct Bt445 {
     // CRS 6 setup/PLL registers (indexed by sub-addr, 0x00–0x0F)
     pub setup: [u8; 0x10],
 
-    pub debug: bool,
-
     // Set when palette/overlay/cursor change — disp.rs copies on dirty
     pub dirty: bool,
 }
@@ -191,7 +189,6 @@ impl Bt445 {
             cmd0:         0x43, // bit6=1 (ovl color0 disable), bit1=1, bit0=1 (both ovl planes enabled)
             rgb_ctrl:     [0; 0x28],
             setup:        [0; 0x10],
-            debug:        false,
             dirty:        true,
         };
         // Apply datasheet reset values to rgb_ctrl (CRS 5)

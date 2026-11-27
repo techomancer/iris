@@ -35,6 +35,6 @@ startup path no longer has the initialization-order problem recorded here.
 Devlog output requires a `developer` build; ordinary `log` warnings use the
 CLI's `env_logger` backend.
 
-Use the monitor instead (`Monitor listening on 127.0.0.1:8888`): `scsi debug on`,
+Use the monitor instead (`Monitor listening on 127.0.0.1:8888`): `log scsi on`,
 `scsi regs`, `scsi wdt`. `scsi regs` in particular is how the WD33C93A constants
 in `cpu-tests/harness/scsilog.c` were derived from the PROM's own driver.

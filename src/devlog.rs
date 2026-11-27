@@ -36,10 +36,8 @@ pub enum LogModule {
     L2c    = 22,  // L2 unified cache: fill, writeback, invalidate, cache ops
     Ultra  = 23,  // N64 dev board: shm reads/writes, interrupts, register traffic
     /// Second WD33C93A (fullhouse/Indigo2 SCSI controller 1). Kept as a
-    /// distinct module (rather than folding into `Scsi`) so `scsi1 debug`
-    /// can be toggled independently of controller 0's `scsi debug`; bare
-    /// `scsi debug` toggles both — see wd33c93a.rs's `scsi`/`scsi1` command
-    /// handling.
+    /// distinct module (rather than folding into `Scsi`) so it can be
+    /// toggled independently of controller 0.
     Scsi1  = 24,
     /// HPC3-side motherboard EEPROM (NVRAM/env vars/MAC @ words 0x7D-0x7F,
     /// `nveeprom` command). Kept distinct from `Eeprom` (MC-side CPU

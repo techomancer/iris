@@ -1409,7 +1409,7 @@ impl Device for Vino {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![(
             "vino".to_string(),
-            "vino debug <on|off> | vino status".to_string(),
+            "vino status".to_string(),
         )]
     }
 
@@ -1418,25 +1418,11 @@ impl Device for Vino {
         let arg0 = args.get(0).copied().unwrap_or("");
 
         match arg0 {
-            "debug" => {
-                let arg1 = args.get(1).copied().unwrap_or("");
-                match arg1 {
-                    "on" => {
-                        crate::devlog::devlog().enable(LogModule::Vino);
-                        writeln!(writer, "VINO debug on").map_err(|e| e.to_string())?;
-                    }
-                    "off" => {
-                        crate::devlog::devlog().disable(LogModule::Vino);
-                        writeln!(writer, "VINO debug off").map_err(|e| e.to_string())?;
-                    }
-                    _ => return Err("Usage: vino debug <on|off>".to_string()),
-                }
-            }
             "status" => {
                 let st = self.state.lock();
                 let log = devlog_is_active(LogModule::Vino);
 
-                writeln!(writer, "VINO Status  (debug {})", if log { "on" } else { "off" })
+                writeln!(writer, "VINO Status  (log {})", if log { "on" } else { "off" })
                     .map_err(|e| e.to_string())?;
 
                 let d0_status = self.source_d0.lock()
@@ -1494,7 +1480,7 @@ impl Device for Vino {
                         .map_err(|e| e.to_string())?;
                 }
             }
-            _ => return Err("Usage: vino debug <on|off> | vino status".to_string()),
+            _ => return Err("Usage: vino status".to_string()),
         }
         Ok(())
     }

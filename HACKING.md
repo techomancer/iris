@@ -104,7 +104,7 @@ section of [STORAGE.md](STORAGE.md) and the `block_node.rs` module docs: read
 them before writing a backend or changing a flush. `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
 subcommands and the run-time disc changes once, over the bus a controller hands
 out through `ScsiTargets::scsi_bus`; chip-specific subcommands (`regs`; the
-WD's `wdt`, `defer`, `debug`) stay with the chip, and `DiscChanger` is
+WD's `wdt`, `defer`) stay with the chip, and `DiscChanger` is
 implemented once for every `ScsiTargets`. Configuration is shared the same
 way: `scsi::attach_from_config` walks the SCSI `[[devices]]` entries for every machine,
 each at a slot in the slot list (`scsi0/t1`), and
