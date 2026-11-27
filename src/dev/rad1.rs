@@ -36,7 +36,7 @@
 //!   capture times them, the rate is inferred from the record layout.
 //! * UST ticks every 960 ns, a selected board policy; the physical rate is
 //!   unmeasured.
-//! * The sample clock, UST and status schedule run on host wall time, less
+//! * The sample clock, UST, output pump and status schedule run on the machine clock, less
 //!   the time the machine was stopped; they are not tied to the emulated
 //!   CPU's progress.
 //! * Hold-up approximation, an emulator policy with no hardware
@@ -75,14 +75,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::config::AudioConfig;
 use crate::dev::audio_dump::AudioDump;
 use crate::dev::host_pcm::{CardClock, Sink, PCM_CHANNELS};
 use crate::devlog::LogModule;
 use crate::host_audio::{Meter, Output, Skip};
-use crate::hptimer::{Timer, TimerId, TimerManager, TimerReturn};
+use crate::hptimer::{Timer, TimerManager};
 use crate::snapshot::{field, field_bool, field_u32, field_u32s, field_u64, field_u64_vec, field_u64s, field_u8, StateTable};
 use crate::traits::{Device, Saveable};
 use crate::pci::{Bar, PciConfig, PciFunction, PciFunctionState};
@@ -123,7 +123,7 @@ const FREQ_AES_SUB: u64 = 48000 / 192;
 /// Ring bytes moved per DMA access; a whole number of frames of any type.
 const CHUNK_BYTES: u64 = 1024;
 /// How often the pump moves output frames to the host.
-const PUMP_MS: u64 = 10;
+const PUMP_NS: u64 = 10_000_000;
 const POS_FIELD_MASK: u32 = 0x3fff;
 const UST_LATCH_MASK: u32 = 0x3_ffff;
 
@@ -346,9 +346,8 @@ struct State {
     status_done: u64,
     status_cursor: u32,
     status_slots: u32,
-    /// The recurring timer pumping the analog output while it runs with
-    /// host audio enabled.
-    audio_timer: Option<TimerId>,
+    /// The output pump is armed: the analog output runs with host audio enabled.
+    pumping: bool,
     /// When `Inner::status` is due, in machine nanoseconds.
     status_due: Option<u64>,
 }
@@ -380,7 +379,7 @@ impl State {
             status_done: 0,
             status_cursor: 0,
             status_slots: 0,
-            audio_timer: None,
+            pumping: false,
             status_due: None,
         }
     }
@@ -640,9 +639,10 @@ pub struct Inner {
     /// The sample clock, its stops and hold-ups, and the timer bookkeeping
     /// shared with other audio cards; reached through `Deref`.
     clock: CardClock,
-    timers: Arc<TimerManager>,
     /// The next status completion, in machine nanoseconds.
     status: Timer,
+    /// The next output pump tick, in machine nanoseconds.
+    pump: Timer,
     /// `[audio]` settings once host output is enabled; `None` (tests,
     /// `no_audio`) keeps the output channel running silently.
     audio_cfg: Mutex<Option<AudioConfig>>,
@@ -690,8 +690,8 @@ impl Inner {
             )),
             state: Mutex::new(State::new(0, ust_free_running)),
             clock: CardClock::new(tm.clock().clone()),
-            timers: tm.clone(),
             status: Timer::new(tm, &me, |i: &Inner, due| i.status_timer_tick(due)),
+            pump: Timer::new(tm, &me, |i: &Inner, due| i.pump_tick(due)),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
             meter: Meter::new(if ust_free_running { "RAD1 (MediaIO)" } else { "RAD1" }, &["analog in", "analog out"]),
@@ -711,7 +711,7 @@ impl Inner {
     /// runs, so a host slow to open or to take its first samples is ready
     /// before the guest plays.
     ///
-    /// The card's clock runs on wall time: frames falling due faster than
+    /// The card's clock runs on the machine clock: frames falling due faster than
     /// the host stream takes them are dropped. The stream opens whether or
     /// not the host has a sound device at that moment, and follows one
     /// that appears later.
@@ -721,40 +721,30 @@ impl Inner {
         self.arm_audio(&mut s);
     }
 
-    /// Whether timers may be armed: started.
-    fn timers_live(&self) -> Option<&Arc<TimerManager>> {
-        self.armed.load(Ordering::SeqCst).then_some(&self.timers)
-    }
-
     /// Run the output pump exactly while the analog output channel runs with
     /// host audio enabled. Called with the state lock held after anything
     /// that can start or stop the channel.
     fn arm_audio(&self, s: &mut State) {
-        let want = s.chan[CH_OUT].running && self.audio_cfg.lock().is_some();
-        match (want, s.audio_timer) {
-            (true, None) => {
-                let Some(tm) = self.timers_live() else { return };
-                let me = self.me.clone();
-                let period = Duration::from_millis(PUMP_MS);
-                s.audio_timer = Some(tm.add_recurring(Instant::now() + period, period, move || {
-                    let Some(i) = me.upgrade() else { return TimerReturn::Delete };
-                    i.pump()
-                }));
+        let want = s.chan[CH_OUT].running && self.audio_cfg.lock().is_some() && self.armed.load(Ordering::SeqCst);
+        match (want, s.pumping) {
+            (true, false) => {
+                s.pumping = true;
+                self.pump.set_due(Some(self.pump.now() + PUMP_NS));
             }
-            (false, Some(id)) => {
-                s.audio_timer = None;
-                self.timers.remove(id);
+            (false, true) => {
+                s.pumping = false;
+                self.pump.set_due(None);
             }
             _ => {}
         }
     }
 
-    /// One tick of the output timer: move the frames the sample clock has
-    /// produced, and end the timer when the channel has stopped.
-    fn pump(&self) -> TimerReturn {
+    /// One tick of the output pump: move the frames the sample clock has
+    /// produced, and end the pump when the channel has stopped.
+    fn pump_tick(&self, due: u64) {
         let _pass = self.tick_pass.lock();
         if !self.armed.load(Ordering::SeqCst) {
-            return TimerReturn::Continue;
+            return;
         }
         // Status completions move the output while they run; a pump read
         // inside a hold-up would keep the late completion from absorbing it.
@@ -764,10 +754,10 @@ impl Inner {
             self.sync_chan(&mut s, CH_OUT, now);
         }
         if s.chan[CH_OUT].running {
-            TimerReturn::Continue
+            // From the deadline, so the cadence keeps its grid; never into the past.
+            self.pump.set_due(Some((due + PUMP_NS).max(self.pump.now())));
         } else {
-            s.audio_timer = None;
-            TimerReturn::Delete
+            s.pumping = false;
         }
     }
 
@@ -802,6 +792,7 @@ impl Inner {
     /// this returns no timer callback is under way.
     fn pause(&self) {
         self.disarm();
+        self.pump.stop();
         self.status.stop();
         drop(self.tick_pass.lock());
     }
@@ -816,16 +807,15 @@ impl Inner {
         if s.status_running {
             self.arm_status(&mut s);
         }
+        self.pump.start();
         self.status.start();
     }
 
     /// Remove the output pump; it comes back with [`Inner::resume`].
     fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
-        let mut s = self.state.lock();
-        if let Some(id) = s.audio_timer.take() {
-            self.timers.remove(id);
-        }
+        self.state.lock().pumping = false;
+        self.pump.set_due(None);
     }
 
     /// Back to the power-on state.
@@ -833,9 +823,7 @@ impl Inner {
         let now = self.now();
         let mut s = self.state.lock();
         let gen = s.status_gen + 1;
-        if let Some(id) = s.audio_timer.take() {
-            self.timers.remove(id);
-        }
+        self.pump.set_due(None);
         self.status.set_due(None);
         *s = State::new(now, self.ust_free_running);
         s.status_gen = gen;
@@ -1656,13 +1644,13 @@ impl Saveable for Rad1 {
             status_slots: field_u32(v, "status_slots")?,
             // The card is stopped: its timers were removed, and come back
             // when it starts.
-            audio_timer: None,
+            pumping: false,
             status_due: None,
         };
         loaded.check()?;
         {
             let mut s = i.state.lock();
-            if s.audio_timer.is_some() || i.armed.load(Ordering::SeqCst) {
+            if s.pumping || i.armed.load(Ordering::SeqCst) {
                 return Err("RAD1 loaded while its timers run".into());
             }
             *s = loaded;
