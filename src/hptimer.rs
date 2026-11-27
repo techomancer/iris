@@ -902,22 +902,25 @@ mod timer_tests {
 
     #[test]
     fn a_deadline_that_did_not_move_or_moved_later_keeps_its_host_timer() {
+        // An hour out: the manual host timer's real delay is the stepped distance, so a near
+        // deadline would let it run and drop its id mid-test.
+        const T: u64 = 3_600_000_000_000;
         let (d, clock) = dev();
         d.timer.start();
-        d.timer.set_due(Some(1_000));
+        d.timer.set_due(Some(T + 1_000));
         let id = d.timer.0.state.lock().id;
         assert!(id.is_some());
-        d.timer.set_due(Some(1_000));
+        d.timer.set_due(Some(T + 1_000));
         assert_eq!(d.timer.0.state.lock().id, id);
-        d.timer.set_due(Some(5_000));
+        d.timer.set_due(Some(T + 5_000));
         assert_eq!(d.timer.0.state.lock().id, id);
-        clock.step(1_000);
+        clock.step(T + 1_000);
         assert!(fired(&d).is_empty(), "fired at the deadline it moved away from");
         clock.step(4_000);
-        assert_eq!(fired(&d), [5_000]);
-        d.timer.set_due(Some(9_000));
+        assert_eq!(fired(&d), [T + 5_000]);
+        d.timer.set_due(Some(T + 9_000));
         let id = d.timer.0.state.lock().id;
-        d.timer.set_due(Some(6_000));
+        d.timer.set_due(Some(T + 6_000));
         assert_ne!(d.timer.0.state.lock().id, id);
     }
 
