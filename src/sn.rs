@@ -972,11 +972,8 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Worksta
         self.io.display.clone()
     }
     // The chips and node memory keep no saved state, so a snapshot would not restore the machine.
-    fn save_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(format!("snapshots of the {} are not supported yet: the node chips and node memory have no saved state", self.name))
-    }
-    fn load_snapshot(&mut self, _name: &str) -> Result<(), String> {
-        Err(format!("snapshots of the {} are not supported yet: the node chips and node memory have no saved state", self.name))
+    fn snapshot_refusal(&self) -> Option<String> {
+        Some(format!("snapshots of the {} are not supported yet: the node chips and node memory have no saved state", self.name))
     }
     fn register_monitor_device(&self, device: Arc<dyn Device>) {
         self.monitor.register_device(device);

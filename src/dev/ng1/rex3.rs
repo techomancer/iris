@@ -1953,7 +1953,7 @@ impl Rex3 {
     }
 
     #[cfg(feature = "wgpu")]
-    fn resident_fault(&self) -> Option<crate::dev::ng1::wgpu::resident::ResidentError> {
+    pub(crate) fn resident_fault(&self) -> Option<crate::dev::ng1::wgpu::resident::ResidentError> {
         match &*self.raster.lock() {
             RasterMode::Resident(raster) => raster.fault().cloned(),
             _ => None,
