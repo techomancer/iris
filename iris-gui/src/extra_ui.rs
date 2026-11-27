@@ -769,7 +769,7 @@ fn complete_editor(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     });
 }
 fn parse_complete(text: &str) -> Result<MachineConfig, String> {
-    let cfg = MachineConfig::from_toml_str(text).map_err(|e| e.to_string())?;
+    let cfg = crate::machines::parse(text)?;
     cfg.validate()?;
     Ok(cfg)
 }
