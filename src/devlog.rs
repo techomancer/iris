@@ -134,20 +134,63 @@ impl LogModule {
 
     pub fn events(self) -> &'static [&'static str] { self.point().events }
 
-    pub fn from_str(s: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|m| m.name() == s)
-    }
-
-    /// A mask as the names of its events, `all`, or `-` when off.
+    /// A mask as the names of its events (`on` for a module with none), or `-` when off.
     fn describe(self, mask: u32) -> String {
         if mask == 0 { return "-".to_string(); }
-        if mask == !0 { return "all".to_string(); }
-        let named = (1u32 << self.events().len()) - 1;
-        let mut parts: Vec<String> = self.events().iter().enumerate()
-            .filter(|(i, _)| mask >> i & 1 != 0).map(|(_, e)| e.to_string()).collect();
-        if mask & !named != 0 { parts.push(format!("{:#x}", mask & !named)); }
-        parts.join("+")
+        if self.events().is_empty() { return "on".to_string(); }
+        let named: Vec<&str> = self.events().iter().enumerate().filter(|(i, _)| mask >> i & 1 != 0).map(|(_, e)| *e).collect();
+        if named.len() == self.events().len() { "all".to_string() } else { named.join("+") }
     }
+}
+
+/// True if `s` matches `p`, where `*` in `p` stands for any run of characters.
+fn glob(p: &str, s: &str) -> bool {
+    match p.split_once('*') {
+        None => p == s,
+        Some((head, rest)) => s.strip_prefix(head)
+            .is_some_and(|s| (0..=s.len()).any(|i| s.is_char_boundary(i) && glob(rest, &s[i..]))),
+    }
+}
+
+/// The bits of `names` a glob matches.
+fn matching(p: &str, names: &[(&str, u32)]) -> u32 {
+    names.iter().filter(|(n, _)| glob(p, n)).fold(0, |b, (_, x)| b | x)
+}
+
+/// The one pattern grammar for names with a bit each: comma-separated globs, `all` for the set
+/// `all`, a leading `-` to remove. A term matching nothing is an error.
+pub fn select(pattern: &str, names: &[(&str, u32)], all: u32) -> Result<u32, String> {
+    let mut mask = 0;
+    for term in pattern.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let (neg, body) = term.strip_prefix('-').map_or((false, term), |t| (true, t));
+        let bits = if body == "all" { all } else { matching(body, names) };
+        if bits == 0 {
+            return Err(format!("'{term}' matches nothing (have: all, {})", names.iter().map(|n| n.0).collect::<Vec<_>>().join(", ")));
+        }
+        if neg { mask &= !bits } else { mask |= bits }
+    }
+    Ok(mask)
+}
+
+/// The points a pattern selects, as a mask per module: globs over `module.event`.
+/// A module with no events is one point.
+fn parse(pattern: &str) -> Result<Vec<(LogModule, u32)>, String> {
+    let mut sel = vec![0u32; LogModule::ALL.len()];
+    for term in pattern.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let (neg, body) = term.strip_prefix('-').map_or((false, term), |t| (true, t));
+        let (mp, ep) = if body == "all" { ("*", "*") } else { body.split_once('.').unwrap_or((body, "*")) };
+        let mut hit = false;
+        for &m in LogModule::ALL {
+            let events: Vec<(&str, u32)> = m.events().iter().enumerate().map(|(i, e)| (*e, 1 << i)).collect();
+            let bits = if !glob(mp, m.name()) { 0 }
+                else if events.is_empty() { (ep == "*") as u32 }
+                else { matching(ep, &events) };
+            hit |= bits != 0;
+            if neg { sel[m as usize] &= !bits } else { sel[m as usize] |= bits }
+        }
+        if !hit { return Err(format!("No trace point matches '{term}'. Try `help log`")); }
+    }
+    Ok(LogModule::ALL.iter().map(|&m| (m, sel[m as usize])).filter(|&(_, b)| b != 0).collect())
 }
 
 // ── DevLog ───────────────────────────────────────────────────────────────────
@@ -177,27 +220,33 @@ impl DevLog {
         self.writers.lock().retain(|w| !Arc::ptr_eq(w, sink));
     }
 
-    /// Turn a module on, keeping the events already chosen; with none, all of them.
-    pub fn enable(&self, m: LogModule) {
-        let _ = m.point().on.compare_exchange(0, !0, Ordering::Relaxed, Ordering::Relaxed);
+    /// Turn the points a pattern names on or off; returns the modules it reached. A module
+    /// left with none on also closes its file sink.
+    pub fn select(&self, pattern: &str, on: bool) -> Result<Vec<LogModule>, String> {
+        let sel = parse(pattern)?;
+        for &(m, bits) in &sel {
+            if on {
+                m.point().on.fetch_or(bits, Ordering::Relaxed);
+            } else if m.point().on.fetch_and(!bits, Ordering::Relaxed) & !bits == 0 {
+                self.clear_file(m);
+            }
+        }
+        Ok(sel.into_iter().map(|(m, _)| m).collect())
     }
 
-    /// Turn a module off and close its file sink.
-    pub fn disable(&self, m: LogModule) {
-        m.point().on.store(0, Ordering::Relaxed);
-        self.clear_file(m);
+    /// Turn on what `pattern` names, with output to stderr as well as the monitor.
+    pub fn start(&self, pattern: &str) -> Result<(), String> {
+        if pattern.is_empty() { return Ok(()); }
+        self.select(pattern, true)?;
+        static STDERR: std::sync::Once = std::sync::Once::new();
+        STDERR.call_once(|| self.add_sink(Arc::new(Mutex::new(std::io::stderr()))));
+        Ok(())
     }
 
-    /// Choose a module's events; a mask of 0 turns it off.
-    pub fn set_mask(&self, m: LogModule, mask: u32) {
-        m.point().on.store(mask, Ordering::Relaxed);
-    }
-
-    /// Open a file sink for a module and enable it.
+    /// Open a file sink for a module.
     pub fn set_file(&self, m: LogModule, path: &str) -> Result<(), String> {
         let file = File::create(path).map_err(|e| format!("Cannot open {}: {}", path, e))?;
         *m.point().file.lock() = Some((path.to_string(), BufWriter::new(file)));
-        self.enable(m);
         Ok(())
     }
 
@@ -311,12 +360,13 @@ impl Device for LogDevice {
     fn register_commands(&self) -> Vec<(String, String)> {
         let modules: Vec<&str> = LogModule::ALL.iter().map(|m| m.name()).collect();
         let events: String = LogModule::ALL.iter().filter(|m| !m.events().is_empty())
-            .map(|m| format!("\n             {} mask categories: {}", m.name(), m.events().join(" "))).collect();
+            .map(|m| format!("\n             {} events: {}", m.name(), m.events().join(" "))).collect();
         vec![(
             "log".to_string(),
-            format!("[DEV] log <module|all> <on|off>  |  log <module> mask <cat|hex>  |  log <module> file <path|off>  |  log status\n\
+            format!("[DEV] log <points> <on|off>  |  log <points> file <path|off>  |  log status\n\
+             \x20             points: comma-separated globs over module.event, a bare module for all its events,\n\
+             \x20             all for everything, a leading - to remove: heart,l1d.*,-l1d.hit\n\
              \x20             modules: {}{}\n\
-             \x20             every module also takes on/all, off/none or a hex mask\n\
              \x20             [DEV] = some of a module's messages appear only in a --features developer build", modules.join(" "), events),
         )]
     }
@@ -338,54 +388,22 @@ impl Device for LogDevice {
             return Ok(());
         }
 
-        let arg1 = args.get(1).copied().unwrap_or("");
         let arg2 = args.get(2).copied().unwrap_or("");
-
-        let modules: Vec<LogModule> = if arg0 == "all" {
-            LogModule::ALL.to_vec()
-        } else {
-            match LogModule::from_str(arg0) {
-                Some(m) => vec![m],
-                None => return Err(format!("Unknown module '{}'. Try: {} all", arg0,
-                    LogModule::ALL.iter().map(|m| m.name()).collect::<Vec<_>>().join(" "))),
-            }
-        };
-
-        match arg1 {
-            "on" => {
-                for m in &modules { dl.enable(*m); }
-                writeln!(writer, "log {} on", arg0).map_err(|e| e.to_string())?;
-            }
-            "off" => {
-                for m in &modules { dl.disable(*m); }
-                writeln!(writer, "log {} off", arg0).map_err(|e| e.to_string())?;
-            }
-            "mask" => {
-                if arg2.is_empty() {
-                    return Err("Usage: log <module> mask <category|hex>".to_string());
-                }
-                for m in &modules {
-                    let mask = match arg2 {
-                        "on" | "all" => Some(!0),
-                        "off" | "none" => Some(0),
-                        _ => m.events().iter().position(|e| *e == arg2).map(|i| 1 << i)
-                            .or_else(|| u32::from_str_radix(arg2.trim_start_matches("0x"), 16).ok()),
-                    };
-                    dl.set_mask(*m, mask.ok_or_else(|| format!("Unknown mask '{}' for module {}", arg2, m.name()))?);
-                }
-                writeln!(writer, "log {} mask {}", arg0, arg2).map_err(|e| e.to_string())?;
+        match args.get(1).copied().unwrap_or("") {
+            "on" => { dl.select(arg0, true)?; }
+            "off" => { dl.select(arg0, false)?; }
+            "file" if arg2 == "off" || arg2.is_empty() => {
+                for (m, _) in parse(arg0)? { dl.clear_file(m); }
             }
             "file" => {
-                if arg2 == "off" || arg2.is_empty() {
-                    for m in &modules { dl.clear_file(*m); }
-                    writeln!(writer, "log {} file closed", arg0).map_err(|e| e.to_string())?;
-                } else {
-                    for m in &modules { dl.set_file(*m, arg2)?; }
-                    writeln!(writer, "log {} -> {}", arg0, arg2).map_err(|e| e.to_string())?;
+                if parse(arg0)?.len() != 1 {
+                    return Err("log file takes one module".to_string());
                 }
+                for m in dl.select(arg0, true)? { dl.set_file(m, arg2)?; }
             }
-            _ => return Err("Usage: log <module|all> <on|off|mask <cat|hex>|file <path>>  |  log status".to_string()),
+            _ => return Err("Usage: log <points> <on|off|file <path|off>>  |  log status".to_string()),
         }
+        writeln!(writer, "log {}", args.join(" ")).map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -394,15 +412,17 @@ impl Device for LogDevice {
 mod tests {
     use super::*;
 
-    /// Every module's name finds it again, and no two share one.
+    fn picked(pattern: &str) -> Vec<(&'static str, u32)> {
+        parse(pattern).unwrap().into_iter().map(|(m, b)| (m.name(), b)).collect()
+    }
+
+    /// Every module's name selects that module alone, and no two share one.
     #[test]
-    fn every_module_name_round_trips() {
+    fn every_module_name_selects_itself() {
         for (i, m) in LogModule::ALL.iter().enumerate() {
-            assert_eq!(LogModule::from_str(m.name()), Some(*m), "{}", m.name());
             assert_eq!(*m as usize, i);
+            assert_eq!(picked(m.name()).iter().map(|p| p.0).collect::<Vec<_>>(), [m.name()]);
         }
-        assert_eq!(LogModule::from_str("module"), Some(LogModule::Module));
-        assert_eq!(LogModule::from_str("nothing"), None);
     }
 
     /// The `log` command's help names every module `log` takes.
@@ -422,7 +442,63 @@ mod tests {
         assert_eq!(event(&["a", "bc", "b"], "b"), 4);
         assert_eq!(LogModule::L1d.describe(event(LogModule::L1d.events(), "miss")), "miss");
         assert_eq!(LogModule::L1d.describe(0), "-");
-        assert_eq!(LogModule::L1d.describe(!0), "all");
+        assert_eq!(LogModule::L1d.describe(0b111), "all");
+        assert_eq!(LogModule::Heart.describe(1), "on");
+    }
+
+    /// The one pattern grammar: globs over `module.event`, `-` to remove, errors for a miss.
+    #[test]
+    fn a_pattern_selects_points_by_glob_and_minus() {
+        assert_eq!(picked("heart"), [("heart", 1)]);
+        assert_eq!(picked("l1d.miss"), [("l1d", 2)]);
+        assert_eq!(picked("l1*.hit,-l1i.*"), [("l1d", 1)]);
+        assert_eq!(picked("pdma.enet*"), [("pdma", 0b1100_0000_0000)]);
+        assert_eq!(picked("all").len(), LogModule::ALL.len());
+        assert_eq!(picked("net, -net"), []);
+        assert!(parse("heart.irq").is_err(), "heart has no events");
+        assert!(parse("nope").is_err());
+    }
+
+    /// `select` turns points on and off, one at a time.
+    #[test]
+    fn select_turns_points_on_and_off() {
+        let dl = &DEVLOG;
+        dl.select("pdma.hal0,pdma.enet1", true).unwrap();
+        assert_eq!(devlog_mask(LogModule::Pdma), 1 | 1 << 11);
+        dl.select("pdma.hal0", false).unwrap();
+        assert!(devlog_on(LogModule::Pdma, 1 << 11) && !devlog_on(LogModule::Pdma, 1));
+        dl.select("pdma", false).unwrap();
+        assert!(!devlog_is_active(LogModule::Pdma));
+    }
+
+    /// Every pattern the docs show (`--log P`, `log = "P"`, `log P on|off`) parses.
+    #[test]
+    fn the_documented_patterns_parse() {
+        let mut seen = 0;
+        for doc in [include_str!("../debug.md"), include_str!("../HELP.md"), include_str!("../FEATURES.md")] {
+            for line in doc.lines() {
+                let mut found = Vec::new();
+                if let Some((_, r)) = line.split_once("--log ") { found.extend(r.split_whitespace().next()); }
+                if let Some(r) = line.trim_start_matches("# ").strip_prefix("log = \"") { found.extend(r.split('"').next()); }
+                for (r, _) in line.match_indices("`log ") {
+                    let t = line[r + 5..].split(|c: char| c == ' ' || c == '`').next().unwrap_or("");
+                    if line[r + 5 + t.len()..].starts_with(" on") || line[r + 5 + t.len()..].starts_with(" off") { found.push(t); }
+                }
+                for p in found.into_iter().filter(|p| !p.starts_with('<')) {
+                    let p = p.trim_matches(|c| c == '`' || c == ',');
+                    assert!(parse(p).is_ok(), "{p:?}: {:?}", parse(p));
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen >= 4, "found only {seen} patterns");
+    }
+
+    /// One file cannot take two modules: their writers would overwrite each other.
+    #[test]
+    fn a_file_takes_one_module() {
+        let r = LogDevice.execute_command("log", &["net,heart", "file", "/nonexistent/x"], Box::new(std::io::sink()));
+        assert!(r.unwrap_err().contains("one module"));
     }
 
     /// A monitor connection's log sink holds a handle on its socket. One left

@@ -1652,57 +1652,21 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                     _ => return Err("Usage: exception <class|code|all> <on|off>".to_string()),
                 };
 
-                let mut mask = self.exception_mask.load(Ordering::Relaxed);
-                let set_bit = |m: &mut u32, bit: u32, val: bool| {
-                    if val { *m |= 1 << bit; } else { *m &= !(1 << bit); }
+                let b = |codes: &[u32]| codes.iter().fold(0, |m, c| m | 1 << c);
+                let classes = [
+                    ("int", b(&[EXC_INT])), ("tlb", b(&[EXC_MOD, EXC_TLBL, EXC_TLBS])),
+                    ("addr", b(&[EXC_ADEL, EXC_ADES])), ("bus", b(&[EXC_IBE, EXC_DBE])),
+                    ("sys", b(&[EXC_SYS, EXC_BP])), ("ri", b(&[EXC_RI, EXC_CPU])),
+                    ("arith", b(&[EXC_OV, EXC_TR, EXC_FPE])), ("watch", b(&[EXC_WATCH])),
+                    ("vce", b(&[EXC_VCEI, EXC_VCED])),
+                ];
+                let bits = match target.parse::<u32>() {
+                    Ok(code) if code < 32 => 1 << code,
+                    Ok(_) => return Err("Invalid exception code".to_string()),
+                    Err(_) => crate::devlog::select(target, &classes, !0)?,
                 };
-
-                match target {
-                    "all" => mask = if enable { 0xFFFFFFFF } else { 0 },
-                    "int" => set_bit(&mut mask, EXC_INT, enable),
-                    "tlb" => {
-                        set_bit(&mut mask, EXC_MOD, enable);
-                        set_bit(&mut mask, EXC_TLBL, enable);
-                        set_bit(&mut mask, EXC_TLBS, enable);
-                    },
-                    "addr" => {
-                        set_bit(&mut mask, EXC_ADEL, enable);
-                        set_bit(&mut mask, EXC_ADES, enable);
-                    },
-                    "bus" => {
-                        set_bit(&mut mask, EXC_IBE, enable);
-                        set_bit(&mut mask, EXC_DBE, enable);
-                    },
-                    "sys" => {
-                        set_bit(&mut mask, EXC_SYS, enable);
-                        set_bit(&mut mask, EXC_BP, enable);
-                    },
-                    "ri" => {
-                        set_bit(&mut mask, EXC_RI, enable);
-                        set_bit(&mut mask, EXC_CPU, enable);
-                    },
-                    "arith" => {
-                        set_bit(&mut mask, EXC_OV, enable);
-                        set_bit(&mut mask, EXC_TR, enable);
-                        set_bit(&mut mask, EXC_FPE, enable);
-                    },
-                    "watch" => set_bit(&mut mask, EXC_WATCH, enable),
-                    "vce" => {
-                        set_bit(&mut mask, EXC_VCEI, enable);
-                        set_bit(&mut mask, EXC_VCED, enable);
-                    },
-                    s => {
-                        if let Ok(code) = s.parse::<u32>() {
-                            if code < 32 {
-                                set_bit(&mut mask, code, enable);
-                            } else {
-                                return Err("Invalid exception code".to_string());
-                            }
-                        } else {
-                            return Err("Unknown exception class or code".to_string());
-                        }
-                    }
-                }
+                let old = self.exception_mask.load(Ordering::Relaxed);
+                let mask = if enable { old | bits } else { old & !bits };
                 self.exception_mask.store(mask, Ordering::Relaxed);
                 writeln!(writer, "Exception mask set to {:08x}", mask).unwrap();
                 Ok(())

@@ -35,7 +35,7 @@
 //! * The vendor and device numbers are the ones QEMU's emulated controller
 //!   already uses.
 //!
-//! `log nvme` (or `IRIS_DEBUG_LOG=nvme`) traces what the host does to the
+//! `log nvme` (or `--log nvme`) traces what the host does to the
 //! controller and what it does back, each line stamped with host time since
 //! the controller was made: `state` (CC writes, CSTS changes, resets, fatal
 //! errors), `admin`, `io` (doorbells, commands, completions) and `regs`

@@ -252,7 +252,7 @@ impl Mgras {
                 });
             }
             ["trace", path, rest @ ..] => {
-                let mask = trace_mask(rest.first().copied().unwrap_or("all"));
+                let mask = trace_mask(rest.first().copied().unwrap_or("all")).map_err(|e| format!("mgras trace: {e}"))?;
                 self.start_trace(path, mask).map_err(|e| format!("mgras trace {path}: {e}"))?;
                 return e(writeln!(w, "tracing to {path} (mask {mask:#x})"));
             }
@@ -649,14 +649,9 @@ impl Mgras {
     }
 }
 
-pub(super) fn trace_mask(spec: &str) -> u32 {
-    spec.split(',').fold(0, |m, c| m | match c {
-        "hq" => TRACE_HQ,
-        "rss" => TRACE_RSS,
-        "cpu" => TRACE_CPU,
-        "tex" => TRACE_TEX,
-        _ => TRACE_ALL,
-    })
+pub(super) fn trace_mask(spec: &str) -> Result<u32, String> {
+    let classes = [("hq", TRACE_HQ), ("rss", TRACE_RSS), ("cpu", TRACE_CPU), ("tex", TRACE_TEX)];
+    crate::devlog::select(spec, &classes, TRACE_ALL)
 }
 
 fn help(w: &mut dyn Write) -> std::io::Result<()> {

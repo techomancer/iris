@@ -54,13 +54,7 @@ const CLASSES: [(&str, u32); 4] = [("fifo", TRACE_FIFO), ("draw", TRACE_DRAW), (
 
 /// `all`, or a comma list of class names.
 pub(super) fn trace_mask(spec: &str) -> Result<u32, String> {
-    if spec == "all" {
-        return Ok(TRACE_ALL);
-    }
-    spec.split(',').try_fold(0, |m, c| match CLASSES.iter().find(|(n, _)| *n == c) {
-        Some((_, bit)) => Ok(m | bit),
-        None => Err(format!("unknown trace class '{c}' (fifo, draw, cpu, dma, all)")),
-    })
+    crate::devlog::select(spec, &CLASSES, TRACE_ALL)
 }
 
 fn mask_names(mask: u32) -> String {
@@ -565,6 +559,7 @@ mod tests {
         assert_eq!(trace_mask("all"), Ok(TRACE_ALL));
         assert_eq!(trace_mask("fifo,cpu"), Ok(TRACE_FIFO | TRACE_CPU));
         assert!(trace_mask("hq").is_err());
+        assert_eq!(trace_mask("all,-dma"), Ok(TRACE_ALL & !TRACE_DMA));
         assert_eq!(mask_names(TRACE_DRAW | TRACE_DMA), "draw,dma");
     }
 

@@ -512,7 +512,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `debug.gui_gl_capture` | `false` | GUI GL compositor capture path (IRIS_GUI_GL). |
 | `debug.no_idle` | `false` | Suppress idle parking (IRIS_NO_IDLE); useful with idle-pause builds. |
-| `debug.debug_log` | `""` | Device log specification (IRIS_DEBUG_LOG); developer instrumentation required. |
+| `debug.log` | `""` | Trace points to turn on at startup (`--log`), as for the monitor's `log`: `heart,l1d.*,-l1d.hit`. Some points need a `developer` build. Was `debug_log`, still read. |
 
 ### [perf]
 
@@ -763,7 +763,6 @@ mistaken for GUI settings.
 | `IRIS_CHD_DIFF_DIR` | Redirect CHD diff sidecars; GUI App Store sets a writable container directory. | [src/chd_disk.rs](src/chd_disk.rs) |
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
 | `IRIS_CRASH_SELFTEST` | Standalone crash diagnostic self-test selector; deliberately crashes. | [src/main.rs](src/main.rs) |
-| `IRIS_DEBUG_LOG` | Device log specification; applied to developer devlog after machine creation. | [src/main.rs](src/main.rs) |
 | `IRIS_DISPLAY_VERIFY` | 1 checks the boards' "nothing changed" verdicts: a frame IMPACT or VPro would have left standing is composed anyway and compared with the one on screen; a difference is reported on stderr, with a count every 600 checks. For development; it composes every frame. | [src/display/verify.rs](src/display/verify.rs) |
 | `IRIS_ENTRY_PREAMBLE` | 0 turns off jitv2's interrupt check at an externally dispatched entry word (on by default; `j2 entrypre`). | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_GPRCACHE` | Guest registers a JIT v2 function with a loop keeps in host registers, 0 to 31 (`j2 gprcache`; default 6, 10 on AArch64). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
@@ -898,7 +897,7 @@ tests, and subprocesses the tests start. A normal run never needs them.
 | `WGPU_TEST_BACKEND` | wgpu backend for the ignored common-layer GPU tests (default `auto`). | [src/wgpu/tests/mod.rs](src/wgpu/tests/mod.rs) |
 
 `RUST_LOG` configures the host Rust logger (errors only when unset);
-`IRIS_DEBUG_LOG` configures device logging. Standard host variables (`HOME`,
+`--log` configures device logging. Standard host variables (`HOME`,
 `XDG_CACHE_HOME`, `LOCALAPPDATA`, `TMPDIR`, `PATH`, `USER`, `DISPLAY`,
 `WAYLAND_DISPLAY`, `APPIMAGE`, `PROCESSOR_IDENTIFIER`, `SystemRoot`) affect
 platform paths/launch behavior, not guest hardware; `TMPDIR` also places the
