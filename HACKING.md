@@ -379,10 +379,10 @@ Every device that has real work to do runs on its own thread:
 | `iris-audio <backend>` | host audio output (`pulse`, `wasapi`, `coreaudio`, `file`, `null`), in the `iris-audio` crate; the sound cards write frames to it through `src/host_audio.rs` |
 | `CRIME-RE`, `O2-Service` | O2: the rendering engine; the service loop (device polls, saving the PROM's flash after a `setenv`) |
 | `NVMe` | the NVMe card's queues and disk I/O (O2 and Octane, when fitted) |
-| `virtio`, `virtio-console` | the virtio devices' queues (virtio-9p, virtio-serial) and a console port's host pump |
+| `virtio` | the virtio devices' queues (virtio-9p, virtio-serial) |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `ISP12160-0` | Fuel SCSI request ring for both ISP12160 channels |
-| `host-io` | host console input: waits until a console socket is readable, then runs the pumps of the IOC3, IOC4 and L1 serial ports. A UART queuing output for a console client wakes it too, to write the output out. One thread for all of them |
+| `host-io` | host console input: waits until a console socket is readable, then runs the pumps of the IOC3, IOC4 and L1 serial ports and of virtio-serial ports. A UART queuing output for a console client wakes it too, to write the output out. One thread for all of them |
 | `IOC3-NVRAM` | the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
 | `bcm5701-rx`, `bcm5701-net` | Tezro BCM5701 receive pump and network backend |
 | `ioc3-eth-rx`, `ioc3-eth-net` | IOC3 ethernet receive pump (every machine with an IOC3); the network backend |
