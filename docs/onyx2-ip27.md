@@ -45,7 +45,7 @@ A disk installed on an Onyx2 boots; the machine cannot install without a pipe.
   10.
 - The BaseIO-G carries the MediaIO daughtercard: a second IOC3 at PCI device 6
   and the RAD1 audio chip at device 7, with the daughtercard's own board
-  record. The MediaIO's serial ports have no host backend, and the host's keys
+  record. The MediaIO's serial ports are `serial3` and `serial4` (the case prints `tty_3` and `tty_4`), with no listener unless a `serial` device names them, and the host's keys
   and pointer go to the board IOC3's controller only.
 - The module controller, the cable and the node windows are the
   [Origin 2000 deskside's](origin2000-ip27.md), with its limits.

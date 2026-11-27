@@ -207,11 +207,15 @@ impl ModuleController for ModuleManagement {
 /// The MediaIO daughtercard on the BaseIO-G's Bridge: an IOC3 with both serial ports, PS/2 and
 /// parallel but no Ethernet, clock or one-wire part. The RAD1 raises no interrupt (its driver
 /// registers none).
-fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Bridge, io: &mut BoardIo) {
+fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Bridge, io: &mut BoardIo) -> Result<(), String> {
     let pci = bridge.bus();
     let mio = Arc::new(Ioc3::new(timers, &crate::dev::ioc3::MIO, [0; 6], ByteBus::None));
     pci.attach(DevFn { device: MEDIAIO_IOC3_DEVICE, function: 0 }, mio.clone());
     mio.connect_superio(pci);
+    let name = cfg.machine.profile.product_name().unwrap_or_default();
+    let serial = |board, n| crate::dev::serial_dev::connect(cfg, name, board, n, None, None);
+    mio.set_serial_backend(0, serial("MediaIO IOC3 A", 3)?);
+    mio.set_serial_backend(1, serial("MediaIO IOC3 B", 4)?);
     mio.register_locks();
     io.devices.push(mio.clone());
     io.monitor.push(mio.ps2());
@@ -229,6 +233,7 @@ fn attach_mediaio(timers: &Arc<TimerManager>, cfg: &MachineConfig, bridge: &Brid
         mio.power_on();
         rad.reset();
     });
+    Ok(())
 }
 
 /// The module controller: one for the module, in front of every node's
@@ -427,7 +432,7 @@ fn onyx2(
     }
     let pci_bridge = bridge.clone();
     let mut io = pci_devices(timers, cfg, bridge, &crate::dev::ioc3::BASEIO6G, controller, heartbeat)?;
-    attach_mediaio(timers, cfg, &pci_bridge, &mut io);
+    attach_mediaio(timers, cfg, &pci_bridge, &mut io)?;
     status.set_scsi_wide(true);
     io.status = Some(status);
     if let Some(p) = pipe {

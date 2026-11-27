@@ -497,7 +497,8 @@ install, in the order it first sees them, so the same machine can show
 `ttyd1`/`ttyd2` on one install and `ttyd5`/`ttyd6` on another. Where the case
 prints no number (an I-brick's single SERIAL), the ports are numbered from 1 in
 chip order. The Indy and Indigo2's `serial1` is SCC channel B, which is why it
-listens on 8881. `--list-slots` shows each port and what is attached. The L1 console of
+listens on 8881; the Onyx2's `serial3` and `serial4` (printed `tty_3` and
+`tty_4`) are its MediaIO card's and have no listener by default. `--list-slots` shows each port and what is attached. The L1 console of
 the Fuel, Tezro, Origin 3200 and Onyx 3000 is not a serial port: `l1_port` and
 `l1_log` set its host end, and `machine.console = "l1"` names it as the console.
 
