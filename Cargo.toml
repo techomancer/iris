@@ -12,8 +12,6 @@ edition = "2021"
 default-run = "iris"
 
 [features]
-# Uncomment to enable cache debug tracking (tracks specific cache line across all operations)
-debug_cache = []
 developer = ["gputrace"]
 # Graphics bus taps: REX3 annotated trace (`rex trace`) and replayable
 # recording (`rex rec`, src/dev/ng1/rex3_rec.rs), and the GR2 and IMPACT
