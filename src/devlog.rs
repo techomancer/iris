@@ -81,14 +81,14 @@ pub enum LogModule {
     /// establishes.
     Ice1724 = 39,
     /// The physical bus: accesses that hit the black hole or a bus-error
-    /// region.
+    /// region, and in a developer build every access.
     Phys = 40,
     /// The O2's audio: every register access and codec operation.
     O2Audio = 41,
 }
 
 // Mask bits shared by L1i / L1d / L2c
-pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path — verbose)
+pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path; developer builds only)
 pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 

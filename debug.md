@@ -618,7 +618,6 @@ a forced termination; a normal stop saves them automatically.
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
 | `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane, Fuel) |
-| `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses. In a developer build `trace` is the CPU's instruction trace, so use `phys trace` |
 | `phys bench` / `bench` | Memory write benchmark: fills the first fully mapped 64 MB of RAM (overwrites it) |
 
 ### Logging
@@ -640,7 +639,9 @@ in every build.
 `step` execute (`log mips file <path>` writes them to a file instead) **[DEV]**.
 A device's trace is its module: `log ps2 on`, `log scsi on`, `log rtc on`.
 `log net` traces packets, `log ioc` the 8254 timer, and `log phys` accesses
-that reach the black hole or a bus-error region.
+that reach the black hole or a bus-error region and, in a developer build,
+every physical bus access. The `hit` category of `l1i` and `l1d` also needs a
+developer build.
 
 Modules (`help` lists them too): `net hpc3 seeq hal2 mc rex3 mips ioc scsi
 pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c ultra scsi1
