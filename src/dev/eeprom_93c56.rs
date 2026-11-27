@@ -43,9 +43,8 @@ pub struct Eeprom93c56 {
     /// Which devlog module this instance's chip activity logs under. Real
     /// IP22 hardware has two separate 93-series EEPROM chips (MC-side CPU
     /// daughtercard, HPC3-side motherboard) modeled as two `Eeprom93c56`
-    /// instances — this lets `eeprom debug`/`nveeprom debug` (and
-    /// `IRIS_DEBUG_LOG`) target them independently instead of both logging
-    /// under one shared module.
+    /// instances — this lets `log eeprom` and `log nveeprom` target
+    /// them independently.
     log_module: LogModule,
 
     /// On-disk path this instance is persisted to, if any (mirrors
@@ -151,11 +150,6 @@ impl Eeprom93c56 {
             self.data[i] = u16::from_be_bytes([chunk[0], chunk[1]]);
         }
         Ok(())
-    }
-
-    pub fn set_debug(&mut self, debug: bool) {
-        if debug { crate::devlog::devlog().enable(self.log_module); }
-        else      { crate::devlog::devlog().disable(self.log_module); }
     }
 
     fn dump(&self) {

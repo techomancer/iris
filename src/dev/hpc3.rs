@@ -1532,7 +1532,7 @@ impl Device for Hpc3 {
         cmds.push(("pdma".to_string(), "PDMA commands: pdma status | pdma chain <addr> | pdma dump <on|off|hal|scsi|enet|MASK> [DEV]".to_string()));
         cmds.extend(self.ioc.register_commands());
         cmds.extend(self.rtc.register_commands());
-        cmds.push(("nveeprom".to_string(), "NVRAM EEPROM commands (93CS56 @ 0x1fbb0008, stores env vars + MAC @ words 0x7D-0x7F — NOT the CPU/MC chip, see `eeprom`): nveeprom <on|off> | nveeprom dump | nveeprom r <word> | nveeprom w <word> <val> | nveeprom save [file]".to_string()));
+        cmds.push(("nveeprom".to_string(), "NVRAM EEPROM commands (93CS56 @ 0x1fbb0008, stores env vars + MAC @ words 0x7D-0x7F — NOT the CPU/MC chip, see `eeprom`): nveeprom dump | nveeprom r <word> | nveeprom w <word> <val> | nveeprom save [file]".to_string()));
         cmds.extend(self.seeq.register_commands());
         cmds.extend(self.scsi_dev.register_commands());
         // "scsi"/"cow" above already cover controller 0; scsi0 is an
@@ -1671,15 +1671,9 @@ impl Device for Hpc3 {
         }
         if cmd == "nveeprom" {
             if args.is_empty() {
-                return Err("Usage: nveeprom <on|off|dump|r|w|save> ...".to_string());
+                return Err("Usage: nveeprom <dump|r|w|save> ...".to_string());
             }
             match args[0] {
-                "on" | "1" | "off" | "0" => {
-                    let debug = matches!(args[0], "on" | "1");
-                    self.eeprom.lock().set_debug(debug);
-                    writeln!(writer, "NVRAM EEPROM debug {}", if debug { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
                 "dump" => {
                     let eeprom = self.eeprom.lock();
                     for (i, chunk) in eeprom.get_data().chunks(8).enumerate() {
@@ -1732,7 +1726,7 @@ impl Device for Hpc3 {
                         Err(e) => return Err(format!("Failed to save NVRAM EEPROM: {}", e)),
                     }
                 }
-                _ => return Err("Usage: nveeprom <on|off|dump|r|w|save> ...".to_string()),
+                _ => return Err("Usage: nveeprom <dump|r|w|save> ...".to_string()),
             }
         }
         Err("Command not found".to_string())

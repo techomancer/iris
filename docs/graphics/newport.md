@@ -216,7 +216,7 @@ The `rex` family:
 - `rex status`, `rex diag`, `rex fbdump [DIR]`
 - `rex jit on|off|status|list`, `rex jit disable|enable <dm0> <dm1> [cm]` (only with `rex-jit`)
 - `rex shaders list`
-- `rex debug on|off [DEV]`, `rex cmap on|off`
+- `rex cmap on|off`
 - `rex trace <file> [gfifo,cpu|all]`, `rex trace off|flush`
 - `rex rec <file>`, `rex rec mark|off`
 
@@ -224,7 +224,7 @@ The `rex` family:
 turns on. A `developer` build also has `block debug` and `draw debug`.
 
 The device commands: `vc2 status|ramdump`, `xmap status|dump`,
-`cmap status|dump`, `bt445 status|identity`, `dcb debug`, `disp status|debug|compositor`.
+`cmap status|dump`, `bt445 status|identity`, `disp status|debug|compositor`.
 
 ## Tests and benchmarks
 

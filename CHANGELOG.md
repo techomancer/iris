@@ -18,6 +18,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - A failed snapshot load leaves the machine stopped, on every machine, and a snapshot of
   another machine, CPU, disk or memory size is refused before anything is touched.
 
+### Tracing cleanup
+
+- The `debug` commands of `rtc`, `ps2`, `vino`, `scsi`, `rex`, `vc2`, `xmap`,
+  `cmap`, `bt445` and `dcb`, and `eeprom on|off` and `nveeprom on|off`, are
+  gone; `log <module> on` does the same (`log scsi1` for the second SCSI
+  controller).
+
 ### Serial ports
 
 - A serial port can carry a device in place of its socket, on every machine:

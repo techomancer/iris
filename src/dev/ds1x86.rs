@@ -393,25 +393,15 @@ impl Device for Ds1x86 {
     fn is_running(&self) -> bool { true }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("rtc".to_string(), "RTC commands: rtc status | rtc save [file] | rtc debug <on|off> | rtc dump | rtc r <offset> | rtc w <offset> <val> [DEV]".to_string())]
+        vec![("rtc".to_string(), "RTC commands: rtc status | rtc save [file] | rtc dump | rtc r <offset> | rtc w <offset> <val> [DEV]".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn IoWrite + Send>) -> Result<(), String> {
         if cmd == "rtc" {
             if args.is_empty() {
-                return Err("Usage: rtc <debug|status|save|dump|r|w> ...".to_string());
+                return Err("Usage: rtc <status|save|dump|r|w> ...".to_string());
             }
             match args[0] {
-                "debug" => {
-                    let val = match args.get(1).map(|s| *s) {
-                        Some("on") => true,
-                        Some("off") => false,
-                        _ => return Err("Usage: rtc debug <on|off>".to_string()),
-                    };
-                    if val { crate::devlog::devlog().enable(LogModule::Rtc); } else { crate::devlog::devlog().disable(LogModule::Rtc); }
-                    writeln!(writer, "RTC debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
                 "status" => {
                     let mut data = self.data.lock();
                     if (data.regs[CMD_REG_OFFSET] & TE_BIT) != 0 {
@@ -475,7 +465,7 @@ impl Device for Ds1x86 {
                     writeln!(writer, "{:04X}: {:02X}", offset, val).unwrap();
                     return Ok(());
                 }
-                _ => return Err("Usage: rtc <debug|status|save|dump|r|w> ...".to_string()),
+                _ => return Err("Usage: rtc <status|save|dump|r|w> ...".to_string()),
             }
         }
         Err("Command not found".to_string())

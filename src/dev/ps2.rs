@@ -1145,21 +1145,11 @@ impl Device for Ps2Controller {
     fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 esc | ps2 key <shift|ctrl|alt> <down|up> | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 type <ascii> | ps2 enter | ps2 esc | ps2 key <shift|ctrl|alt> <down|up> | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
         if cmd == "ps2" {
-            if !args.is_empty() && args[0] == "debug" {
-                let val = match args.get(1).map(|s| *s) {
-                    Some("on") => true,
-                    Some("off") => false,
-                    _ => return Err("Usage: ps2 debug <on|off>".to_string()),
-                };
-                if val { crate::devlog::devlog().enable(LogModule::Ps2); } else { crate::devlog::devlog().disable(LogModule::Ps2); }
-                writeln!(writer, "PS/2 debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                return Ok(());
-            }
             if !args.is_empty() && args[0] == "type" {
                 let text = args[1..].join(" ");
                 let mut n = 0usize;
@@ -1236,7 +1226,7 @@ impl Device for Ps2Controller {
                     s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 esc | ps2 key <shift|ctrl|alt> <down|up> | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string());
+            return Err("Usage: ps2 type <ascii> | ps2 enter | ps2 esc | ps2 key <shift|ctrl|alt> <down|up> | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string());
         }
         Err("Command not found".to_string())
     }
