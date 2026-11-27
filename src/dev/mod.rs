@@ -79,6 +79,7 @@ pub mod ps2;
 pub mod saa7191;
 pub mod seeq8003;
 pub mod sgi_nvram;
+pub mod ip30_nvram;
 pub mod testdev;
 pub mod ultra64;
 pub mod vino;
