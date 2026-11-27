@@ -76,7 +76,6 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
-use std::time::Duration;
 
 pub use self::board::{ByteBusPart, Cells, Ioc3Board, BASEIO, BASEIO6G, IO7, IP29, IP30, IP34, IP34_NO_PS2, MIO};
 pub use self::dma::Ioc3Dma;
@@ -97,6 +96,7 @@ use crate::dev::serial_host::SerialBackend;
 use crate::irq::{IrqLevel, IrqLine, IrqMutex};
 use crate::pci::{Bar, BoardIrq, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::hptimer::{Timer, TimerManager};
+use crate::net::wake::{host_io, HostPump};
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable, Saveable};
 use crate::snapshot::{field, field_bool, field_u32, field_u64, field_u8, field_u8s, StateTable};
 
@@ -478,9 +478,6 @@ impl Core {
 // The device
 // ---------------------------------------------------------------------------
 
-/// How long a serial receive thread sleeps when its backend has nothing:
-/// `SerialBackend` has no blocking read to wait on.
-const RX_IDLE: Duration = Duration::from_millis(2);
 /// The interrupt output can ask for a transition every few microseconds; a
 /// timer never re-arms sooner than this, and the catch-up that follows applies
 /// every transition due in the meantime.
@@ -639,24 +636,14 @@ impl Shared {
         self.arm();
     }
 
-    /// Feed host input from serial backend `port` into its FIFO until the
-    /// chip stops.
-    fn rx_loop(me: Weak<Shared>, port: usize) {
-        loop {
-            {
-                let Some(sh) = me.upgrade() else { return };
-                if !sh.running.load(Ordering::SeqCst) {
-                    return;
-                }
-                // Under `gate`, so a reset cannot fall between pump and latch.
-                let _gate = sh.gate.lock();
-                if let Some(s) = &sh.serial[port] {
-                    s.pump();
-                }
-                sh.after();
-            }
-            std::thread::park_timeout(RX_IDLE);
-        }
+    /// Feed host input from serial backend `port` into its FIFO; whether any arrived.
+    fn rx_pass(me: &Weak<Shared>, port: usize) -> bool {
+        let Some(sh) = me.upgrade() else { return false };
+        // Under `gate`, so a reset cannot fall between pump and latch.
+        let _gate = sh.gate.lock();
+        let moved = sh.serial[port].as_ref().is_some_and(|s| s.pump());
+        sh.after();
+        moved
     }
 
     fn eth(&self) -> Option<&Arc<Ioc3Eth>> {
@@ -979,8 +966,8 @@ impl Shared {
 pub struct Ioc3 {
     sh: Arc<Shared>,
     timekeeper: Option<Arc<crate::dev::timekeeper::Timekeeper>>,
-    /// The serial receive threads, joined in `stop`.
-    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The serial receive pumps, removed in `stop`.
+    pumps: Mutex<Vec<HostPump>>,
 }
 
 impl Ioc3 {
@@ -1045,7 +1032,7 @@ impl Ioc3 {
                 board,
             }
         });
-        Ioc3 { sh, timekeeper, threads: Mutex::new(Vec::new()) }
+        Ioc3 { sh, timekeeper, pumps: Mutex::new(Vec::new()) }
     }
 
     /// Replace the MicroLAN wire the chip builds for itself (the station
@@ -1165,19 +1152,13 @@ impl Device for Ioc3 {
         if let Some(e) = &self.sh.eth {
             Device::start(&**e);
         }
-        let mut threads = self.threads.lock();
-        for (p, s) in self.sh.serial.iter().enumerate() {
-            if s.is_some() {
+        *self.pumps.lock() = (0..2)
+            .filter(|&p| self.sh.serial[p].is_some())
+            .map(|p| {
                 let me = self.sh.me.clone();
-                threads.push(
-                    std::thread::Builder::new()
-                        .name(format!("IOC3-RX-{}", ["A", "B"][p]))
-                        .spawn(move || Shared::rx_loop(me, p))
-                        .expect("spawn ioc3 receive thread"),
-                );
-            }
-        }
-        drop(threads);
+                host_io().add(move || Shared::rx_pass(&me, p))
+            })
+            .collect();
         if let Some(r) = &self.sh.rtc {
             Device::start(&**r);
         }
@@ -1193,14 +1174,7 @@ impl Device for Ioc3 {
             return;
         }
         self.sh.timers.iter().for_each(Timer::stop);
-        let mut threads = self.threads.lock();
-        for t in threads.iter() {
-            t.thread().unpark();
-        }
-        for t in threads.drain(..) {
-            let _ = t.join();
-        }
-        drop(threads);
+        self.pumps.lock().clear();
         if let Some(k) = &self.sh.kbd {
             Device::stop(&**k.ps2());
         }

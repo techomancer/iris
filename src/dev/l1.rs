@@ -13,6 +13,7 @@ use crate::dev::serial_host::{null_serial_backend, SerialBackend};
 use crate::devlog::LogModule;
 use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
+use crate::net::wake::{host_io, HostPump};
 use crate::traits::{BusDevice, BusRead64, Device, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -85,7 +86,7 @@ impl SerialBackend for ProtocolBackend {
 /// 64-bit accesses decode, values in the low eight bits.
 pub struct L1 {
     shared: Arc<Shared>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pump: Mutex<Option<HostPump>>,
 }
 
 impl std::ops::Deref for L1 {
@@ -95,7 +96,7 @@ impl std::ops::Deref for L1 {
     }
 }
 
-/// What the serial worker and the receive-timeout timer share with the device.
+/// What the serial pump and the receive-timeout timer share with the device.
 pub struct Shared {
     // UART RX takes UART -> protocol queue. Model replies take state -> protocol
     // queue. No path holds the protocol queue while acquiring either lock.
@@ -108,7 +109,6 @@ pub struct Shared {
     irq: Arc<Mutex<IrqLine>>,
     handler: Arc<Mutex<Option<EventHandler>>>,
     running: Arc<AtomicBool>,
-    wake: Arc<(Mutex<()>, parking_lot::Condvar)>,
     /// The UART's receive timeout, on the machine clock.
     rx_timer: Timer,
 }
@@ -160,13 +160,12 @@ impl L1 {
             irq: Arc::new(Mutex::new(IrqLine::unconnected())),
             handler: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
-            wake: Arc::new((Mutex::new(()), parking_lot::Condvar::new())),
             rx_timer: Timer::new(tm, me, |s: &Shared, _| {
                 s.service_protocol_uart();
                 s.flush();
             }),
         });
-        Ok(Self { shared, worker: Mutex::new(None) })
+        Ok(Self { shared, pump: Mutex::new(None) })
     }
 
     /// Install the separate host-side L1 console connection.
@@ -232,15 +231,20 @@ impl L1 {
         }
     }
 
-    pub fn poll_serial(&self) {
+    /// Whether it took any input.
+    pub fn poll_serial(&self) -> bool {
         let backend = self.backend.lock().clone();
         backend.flush();
+        let mut moved = false;
         for _ in 0..256 {
             if self.state.lock().queue.lock().len() > 4088 {
                 break;
             }
             match backend.recv_byte() {
-                Ok(byte) => self.receive_console(&[byte]),
+                Ok(byte) => {
+                    self.receive_console(&[byte]);
+                    moved = true;
+                }
                 Err(error) => {
                     if error.kind() != io::ErrorKind::WouldBlock {
                         log::debug!("L1 serial input: {error}");
@@ -249,6 +253,7 @@ impl L1 {
                 }
             }
         }
+        moved
     }
 
     /// Parse guest transmit only after the UART lock is released. The UART
@@ -367,46 +372,20 @@ impl Resettable for L1 {
 }
 impl Device for L1 {
     fn start(&self) {
-        let mut worker = self.worker.lock();
-        if worker.is_some() {
+        let mut pump = self.pump.lock();
+        if pump.is_some() {
             return;
         }
         self.running.store(true, Ordering::Release);
         self.rx_timer.start();
-        let device = Self { shared: self.shared.clone(), worker: Mutex::new(None) };
-        *worker = Some(
-            std::thread::Builder::new()
-                .name("l1-serial".into())
-                .spawn(move || {
-                    while device.is_running() {
-                        device.poll_serial();
-                        let mut guard = device.wake.0.lock();
-                        if device.is_running() {
-                            device
-                                .wake
-                                .1
-                                .wait_for(&mut guard, std::time::Duration::from_millis(2));
-                        }
-                    }
-                })
-                .expect("start L1 serial worker"),
-        );
+        let device = Self { shared: self.shared.clone(), pump: Mutex::new(None) };
+        *pump = Some(host_io().add(move || device.poll_serial()));
     }
 
     fn stop(&self) {
-        let mut slot = self.worker.lock();
-        {
-            let _guard = self.wake.0.lock();
-            self.running.store(false, Ordering::Release);
-            self.wake.1.notify_all();
-        }
-        let worker = slot.take();
+        self.running.store(false, Ordering::Release);
         self.rx_timer.stop();
-        if let Some(worker) = worker {
-            if worker.thread().id() != std::thread::current().id() {
-                let _ = worker.join();
-            }
-        }
+        self.pump.lock().take();
     }
 
     fn is_running(&self) -> bool {

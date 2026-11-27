@@ -25,10 +25,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+use polling::AsSource;
 
 use crate::config::MachineConfig;
 use crate::dev::serial_log::SerialLog;
 use crate::net::telnet::IAC;
+use crate::net::wake::{host_io, Watched};
 
 /// Parity of a serial line's characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -333,7 +335,7 @@ pub(crate) fn bind_unix_socket(path: &Path) -> io::Result<UnixListener> {
 
 /// A listening socket and what its clients are.
 pub(crate) trait Listen: Send + Sync {
-    type Stream: Read + Write + Send;
+    type Stream: Read + Write + Send + AsSource;
     /// Whether clients speak telnet (offered character mode, output escaped)
     /// or raw bytes.
     const TELNET: bool;
@@ -345,7 +347,7 @@ pub(crate) trait Listen: Send + Sync {
     fn describe_addr(&self) -> String;
 }
 
-impl Listen for TcpListener {
+impl Listen for Watched<TcpListener> {
     type Stream = TcpStream;
     const TELNET: bool = true;
     const MAX: usize = usize::MAX;
@@ -370,7 +372,7 @@ impl Listen for TcpListener {
 #[cfg(unix)]
 pub(crate) struct UnixLine {
     path: std::path::PathBuf,
-    listener: UnixListener,
+    listener: Watched<UnixListener>,
 }
 
 #[cfg(unix)]
@@ -399,12 +401,22 @@ impl Drop for UnixLine {
 }
 
 /// One socket client.
-struct Conn<S> {
-    stream: S,
+struct Conn<S: AsSource> {
+    /// Joined to the host-IO thread's poller, so input wakes it.
+    stream: Watched<S>,
     /// Set for a telnet client.
     telnet: Option<crate::net::telnet::TelnetFilter>,
     /// Output and telnet replies, in order, that the socket has not taken.
     queue: ClientQueue,
+}
+
+impl<S: AsSource + Write> Conn<S> {
+    /// One flush pass; while output is left, the host-IO thread retries when the socket can take more.
+    fn flush(&mut self) -> io::Result<()> {
+        let r = self.queue.flush(&mut self.stream);
+        self.stream.set_interest(true, self.queue.queued());
+        r
+    }
 }
 
 /// A serial line served on a listening socket. Every connected client (up to
@@ -419,7 +431,7 @@ pub(crate) struct SocketBackend<L: Listen> {
     dropped: AtomicU64,
 }
 
-pub(crate) type TcpSocketBackend = SocketBackend<TcpListener>;
+pub(crate) type TcpSocketBackend = SocketBackend<Watched<TcpListener>>;
 /// A Unix socket line: raw bytes, no telnet, one client at a time (the next
 /// waits in the listen queue until the first hangs up), for scripts.
 #[cfg(unix)]
@@ -481,6 +493,7 @@ impl<L: Listen> SocketBackend<L> {
     fn accept_waiting(&self, conns: &mut Vec<Conn<L::Stream>>) {
         while conns.len() < L::MAX {
             let Ok(stream) = self.listener.accept() else { break };
+            let Ok(stream) = Watched::new(stream, &host_io().wake, true, false) else { continue };
             let mut c = Conn {
                 stream,
                 telnet: L::TELNET.then(crate::net::telnet::TelnetFilter::new),
@@ -495,7 +508,7 @@ impl<L: Listen> SocketBackend<L> {
     /// Write out what every client has queued; one that has gone is dropped.
     fn flush_all(&self, conns: &mut Vec<Conn<L::Stream>>) {
         conns.retain_mut(|c| {
-            let kept = c.queue.flush(&mut c.stream).is_ok();
+            let kept = c.flush().is_ok();
             if !kept {
                 self.dropped.fetch_add(c.queue.dropped(), Ordering::Relaxed);
             }
@@ -504,7 +517,7 @@ impl<L: Listen> SocketBackend<L> {
     }
 }
 
-impl SocketBackend<TcpListener> {
+impl SocketBackend<Watched<TcpListener>> {
     /// Bind a TCP serial backend. Returns `None` (rather than panicking) if the
     /// port can't be bound — most commonly because a stale emulator process from
     /// an earlier crash is still holding it. Callers fall back to a NullBackend
@@ -523,6 +536,10 @@ impl SocketBackend<TcpListener> {
             return None;
         }
         let port = listener.local_addr().map(|a| crate::ports::register("tcp", a, "serial port")).ok();
+        // Joined to the host-IO thread's poller, so a connecting client wakes it.
+        let listener = Watched::new(listener, &host_io().wake, true, false)
+            .inspect_err(|e| log::warn!("serial TCP backend disabled: {e}"))
+            .ok()?;
         Some(Self::with(listener, port))
     }
 }
@@ -534,6 +551,7 @@ impl SocketBackend<UnixLine> {
         let path = path.as_ref().to_path_buf();
         let listener = bind_unix_socket(&path)?;
         listener.set_nonblocking(true)?;
+        let listener = Watched::new(listener, &host_io().wake, true, false)?;
         crate::workstation::remove_at_exit(&path);
         let port = crate::ports::register("unix", path.display(), "serial port");
         Ok(Self::with(UnixLine { path, listener }, Some(port)))
@@ -547,6 +565,9 @@ impl<L: Listen> SerialBackend for SocketBackend<L> {
         let pair = [IAC, byte];
         let unit = if L::TELNET && byte == IAC { &pair[..] } else { &pair[1..] };
         for c in self.conns.lock().iter_mut() {
+            if !c.queue.queued() {
+                host_io().wake.notify(); // the host-IO thread writes it out
+            }
             c.queue.push(unit);
         }
     }
@@ -593,7 +614,7 @@ impl<L: Listen> SerialBackend for SocketBackend<L> {
                                 if !reply.is_empty() {
                                     c.queue.push(&reply);
                                     // Nothing else flushes it while the guest is idle.
-                                    let _ = c.queue.flush(&mut c.stream);
+                                    let _ = c.flush();
                                 }
                                 data
                             }
@@ -689,6 +710,7 @@ impl CiSerialBackend {
     pub fn push_host(&self, data: &[u8]) {
         let mut q = self.host_to_guest.lock();
         q.extend(data.iter().copied());
+        host_io().wake.notify();
     }
 
     /// Drain everything the guest has produced since the last call. Empties
@@ -966,6 +988,45 @@ pub fn console_backends(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A byte typed at a TCP console reaches a pump, so the socket woke the host-IO thread.
+    #[test]
+    fn a_byte_typed_at_a_tcp_console_wakes_the_host_io_thread() {
+        let (b, port) = tcp_serial_backend(0).unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ = b.recv_byte(); // accepts the client
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b2 = b.clone();
+        let _pump = host_io().add(move || b2.recv_byte().is_ok_and(|x| tx.send(x).is_ok()));
+        client.write_all(b"x").unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), b'x');
+    }
+
+    /// Output the guest queues reaches a client with nothing polling, and what a stalled client left
+    /// behind follows once it reads, with no more output to prompt it.
+    #[test]
+    fn queued_output_is_written_out_by_the_host_io_thread() {
+        use socket2::{Domain, SockRef, Socket, Type};
+        let b = Arc::new(TcpSocketBackend::new(("127.0.0.1", 0)).unwrap());
+        let c = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        c.set_recv_buffer_size(4096).unwrap();
+        c.connect(&b.listener.local_addr().unwrap().into()).unwrap();
+        let mut client: TcpStream = c.into();
+        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let _ = b.recv_byte();
+        SockRef::from(&*b.conns.lock()[0].stream).set_send_buffer_size(4096).unwrap();
+        let b2 = b.clone();
+        let _pump = host_io().add(move || {
+            b2.flush();
+            false
+        });
+        let sent: Vec<u8> = (0..CLIENT_BACKLOG / 2).map(|i| (i % 200) as u8).collect();
+        let head = crate::net::telnet::TelnetFilter::initial_handshake().len();
+        sent.iter().for_each(|&x| b.send_byte(x));
+        let mut got = vec![0; head + sent.len()];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(got[head..], sent[..]);
+    }
 
     /// The console is the CI backend in CI mode and TCP otherwise, either
     /// teed to the same log, and the second port comes up on its own outside
@@ -1383,7 +1444,7 @@ pub(crate) mod tests {
         let slow_end = slow.local_addr().unwrap();
         for c in b.conns.lock().iter() {
             if c.stream.peer_addr().unwrap() == slow_end {
-                SockRef::from(&c.stream).set_send_buffer_size(4096).unwrap();
+                SockRef::from(&*c.stream).set_send_buffer_size(4096).unwrap();
             }
         }
         let dir = temp_dir("stall");

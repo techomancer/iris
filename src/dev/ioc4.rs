@@ -75,7 +75,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
 
 use parking_lot::{Mutex, MutexGuard};
 
@@ -89,6 +88,7 @@ use crate::dev::ns16550::Ns16550;
 use crate::dev::serial_host::SerialBackend;
 use crate::hptimer::{Timer, TimerManager};
 use crate::irq::IrqLine;
+use crate::net::wake::{host_io, HostPump};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::traits::{BusDevice, Device, Resettable};
 
@@ -636,10 +636,6 @@ impl SerialDmaHost for Ioc4SerialDmaHost<'_> {
 // The device
 // ---------------------------------------------------------------------------
 
-/// How long a serial receive thread sleeps when its backend has nothing:
-/// `SerialBackend` has no blocking read to wait on.
-const RX_IDLE: Duration = Duration::from_millis(2);
-
 /// The deadlines the chip keeps on the machine clock, one timer slot each.
 const K_RX: usize = 0;
 const K_TX_DELAY: usize = PORTS;
@@ -742,23 +738,16 @@ impl Shared {
         });
     }
 
-    /// Feed host input from serial backend `port` into its FIFO until the
-    /// chip stops.
-    fn rx_loop(me: Weak<Shared>, port: usize) {
-        loop {
-            {
-                let Some(sh) = me.upgrade() else { return };
-                if !sh.running.load(Ordering::SeqCst) {
-                    return;
-                }
-                sh.with_st(|st| {
-                    if st.uart[port].pump() {
-                        st.uart_changed(port);
-                    }
-                });
+    /// Feed host input from serial backend `port` into its FIFO; whether any arrived.
+    fn rx_pass(me: &Weak<Shared>, port: usize) -> bool {
+        let Some(sh) = me.upgrade() else { return false };
+        sh.with_st(|st| {
+            let moved = st.uart[port].pump();
+            if moved {
+                st.uart_changed(port);
             }
-            std::thread::park_timeout(RX_IDLE);
-        }
+            moved
+        })
     }
 
     /// One synchronous pass of what the receive threads and timers do.
@@ -783,8 +772,8 @@ pub struct Ioc4 {
     sh: Arc<Shared>,
     /// The DS1744 on byte-bus select 0, when the board has one.
     clock: OnceLock<Arc<Ds1744>>,
-    /// The serial receive threads, joined in `stop`.
-    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The serial receive pumps, removed in `stop`.
+    pumps: Mutex<Vec<HostPump>>,
 }
 
 impl Ioc4 {
@@ -814,7 +803,7 @@ impl Ioc4 {
                 running: AtomicBool::new(false),
             }
         });
-        Ioc4 { sh, clock: OnceLock::new(), threads: Mutex::new(Vec::new()) }
+        Ioc4 { sh, clock: OnceLock::new(), pumps: Mutex::new(Vec::new()) }
     }
 
     /// Attach the timekeeping SRAM on byte-bus select 0. Its 32 KiB fill the
@@ -871,43 +860,31 @@ impl Ioc4 {
 impl Device for Ioc4 {
     fn step(&self, _cycles: u64) {}
 
-    /// Start the serial receive threads and arm the timers for any deadline
+    /// Start the serial receive pumps and arm the timers for any deadline
     /// the chip already holds.
     fn start(&self) {
         if self.sh.running.swap(true, Ordering::SeqCst) {
             return;
         }
         Device::start(&*self.sh.st.lock().ps2);
-        let mut threads = self.threads.lock();
-        for p in 0..PORTS {
-            let me = self.sh.me.clone();
-            threads.push(
-                std::thread::Builder::new()
-                    .name(format!("IOC4-RX-{p}"))
-                    .spawn(move || Shared::rx_loop(me, p))
-                    .expect("spawn ioc4 receive thread"),
-            );
-        }
-        drop(threads);
+        *self.pumps.lock() = (0..PORTS)
+            .map(|p| {
+                let me = self.sh.me.clone();
+                host_io().add(move || Shared::rx_pass(&me, p))
+            })
+            .collect();
         self.sh.arm(self.sh.st.lock());
         self.sh.timers.iter().for_each(Timer::start);
     }
 
-    /// Remove the timers, wait out a callback in flight and join the threads.
+    /// Remove the timers and the pumps, waiting out a callback in flight.
     /// Nothing touches memory or the line afterwards, until `start`.
     fn stop(&self) {
         if !self.sh.running.swap(false, Ordering::SeqCst) {
             return;
         }
         self.sh.timers.iter().for_each(Timer::stop);
-        let mut threads = self.threads.lock();
-        for t in threads.iter() {
-            t.thread().unpark();
-        }
-        for t in threads.drain(..) {
-            let _ = t.join();
-        }
-        drop(threads);
+        self.pumps.lock().clear();
         Device::stop(&*self.sh.st.lock().ps2);
     }
 

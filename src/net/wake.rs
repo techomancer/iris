@@ -8,14 +8,14 @@
 //! A notify is never lost: it sets a flag that the next wait consumes, so a
 //! signal sent while the other side was busy still ends its next wait at once.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
-use polling::{AsSource, Event, PollMode, Poller};
+use polling::{AsSource, Event, Events, PollMode, Poller};
 
 pub struct Wake {
     lock: Mutex<()>,
@@ -133,6 +133,93 @@ impl<S: AsSource> Drop for Watched<S> {
     }
 }
 
+impl<S: AsSource + Read> Read for Watched<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.sock.read(buf) }
+}
+
+impl<S: AsSource + Write> Write for Watched<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.sock.write(buf) }
+    fn flush(&mut self) -> io::Result<()> { self.sock.flush() }
+}
+
+/// One thread that runs every console pump when a [`Watched`] socket is ready or on `notify`,
+/// in place of a timer-polling thread per console.
+pub struct HostIo {
+    pub wake: Arc<Wake>,
+    lines: Mutex<Vec<(usize, Pump)>>,
+    next_id: AtomicUsize,
+    #[cfg(test)]
+    passes: AtomicUsize,
+}
+
+/// A pump returns whether it moved input.
+type Pump = Box<dyn FnMut() -> bool + Send>;
+
+/// Dropping it removes the pump, after any pass that is running it.
+pub struct HostPump {
+    io: &'static HostIo,
+    id: usize,
+}
+
+/// The process-wide host-IO thread.
+pub fn host_io() -> &'static HostIo {
+    static IO: OnceLock<&'static HostIo> = OnceLock::new();
+    IO.get_or_init(HostIo::start)
+}
+
+impl HostIo {
+    fn start() -> &'static HostIo {
+        let io: &'static HostIo = Box::leak(Box::new(Self { wake: Wake::new(), lines: Mutex::new(Vec::new()), next_id: AtomicUsize::new(0), #[cfg(test)] passes: AtomicUsize::new(0) }));
+        std::thread::Builder::new().name("host-io".into()).spawn(move || io.run()).expect("spawn host-io thread");
+        io
+    }
+
+    /// Run `pump` whenever the thread wakes. It runs under the lines' lock, so it must
+    /// not add a pump or drop a `HostPump`.
+    pub fn add(&'static self, pump: impl FnMut() -> bool + Send + 'static) -> HostPump {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.lines.lock().push((id, Box::new(pump)));
+        self.wake.notify();
+        HostPump { io: self, id }
+    }
+
+    fn run(&self) {
+        let mut events = Events::new();
+        let mut stuck = false;
+        loop {
+            // With no pump (a stopped machine) nobody reads the ready sockets, so only a notify may wake us.
+            if self.lines.lock().is_empty() {
+                self.wake.wait(Duration::from_secs(3600));
+                continue;
+            }
+            events.clear();
+            let waited = self.wake.poller.wait(&mut events, None);
+            self.wake.consume();
+            #[cfg(test)]
+            self.passes.fetch_add(1, Ordering::Relaxed);
+            let moved = self.lines.lock().iter_mut().fold(false, |m, l| (l.1)() | m);
+            // Level-triggered: a ready socket the pumps left alone twice running (a full input FIFO)
+            // must not end every wait. Once is a guest that read the byte first. A failed wait counts too.
+            let blocked = (!events.is_empty() || waited.is_err()) && !moved;
+            if blocked && stuck {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            stuck = blocked;
+        }
+    }
+}
+
+impl Drop for HostPump {
+    fn drop(&mut self) {
+        // Dropped after the guard: a closure's last reference may take `lines` again.
+        let gone = {
+            let mut lines = self.io.lines.lock();
+            lines.iter().position(|l| l.0 == self.id).map(|i| lines.remove(i))
+        };
+        drop(gone);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +298,89 @@ mod tests {
         let t0 = Instant::now();
         w.poller().wait(&mut events, Some(Duration::from_millis(50))).unwrap();
         assert!(t0.elapsed() >= Duration::from_millis(45), "woken again: {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn with_nothing_ready_no_pump_runs() {
+        let io = HostIo::start();
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let _pump = io.add(move || n2.fetch_add(1, Ordering::SeqCst) == usize::MAX);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(n.load(Ordering::SeqCst) <= 1, "woke with nothing to do");
+    }
+
+    #[test]
+    fn a_socket_the_pump_leaves_unread_does_not_spin_the_thread() {
+        let io = HostIo::start();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        let _w = Watched::new(s, &io.wake, true, false).unwrap();
+        c.write_all(b"x").unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let _pump = io.add(move || n2.fetch_add(1, Ordering::SeqCst) == usize::MAX);
+        std::thread::sleep(Duration::from_millis(300));
+        // One pass per pause (about 150); a spin would run tens of thousands.
+        assert!(n.load(Ordering::SeqCst) < 1000, "{} passes", n.load(Ordering::SeqCst));
+    }
+
+    /// With every pump gone, a ready socket nobody reads must not wake the thread.
+    #[test]
+    fn a_ready_socket_with_no_pump_does_not_wake_the_thread() {
+        let io = HostIo::start();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        let _w = Watched::new(s, &io.wake, true, false).unwrap();
+        io.add(|| false);
+        c.write_all(b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let before = io.passes.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(io.passes.load(Ordering::Relaxed) - before < 10, "spun with no pump");
+    }
+
+    /// A pump whose closure holds the last reference to something that drops a pump itself does not deadlock.
+    #[test]
+    fn a_pump_dropped_with_a_closure_that_drops_a_pump_does_not_deadlock() {
+        let io = HostIo::start();
+        let inner = io.add(|| false);
+        let outer = io.add(move || {
+            let _keep = &inner;
+            false
+        });
+        drop(outer);
+    }
+
+    #[test]
+    fn dropping_a_pump_waits_for_the_pass_running_it_and_none_follows() {
+        let io = HostIo::start();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let pump = io.add(move || {
+            if n2.fetch_add(1, Ordering::SeqCst) == 0 {
+                entered_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            }
+            false
+        });
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        let h = std::thread::spawn(move || {
+            drop(pump);
+            done2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!done.load(Ordering::SeqCst), "dropped under a running pass");
+        go.send(()).unwrap();
+        h.join().unwrap();
+        io.wake.notify();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(n.load(Ordering::SeqCst), 1, "ran after it was dropped");
     }
 }

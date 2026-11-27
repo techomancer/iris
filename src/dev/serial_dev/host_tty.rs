@@ -19,6 +19,7 @@ use std::thread::JoinHandle;
 use parking_lot::Mutex;
 
 use crate::dev::serial_host::{LineConfig, ModemIn, ModemOut, SerialBackend};
+use crate::net::wake::host_io;
 
 /// The most input kept for a guest that is not reading.
 const RX_CAP: usize = 64 * 1024;
@@ -313,6 +314,7 @@ impl Shared {
                         while rx.len() > RX_CAP {
                             rx.pop_front();
                         }
+                        host_io().wake.notify(); // the UART's pump takes it
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -326,9 +328,14 @@ impl Shared {
                     break;
                 }
             }
+            if !self.tx.lock().is_empty() {
+                host_io().wake.notify(); // the port was full; the UART's pump retries
+            }
             if self.tty {
                 if let Some(m) = sys::modem_in(self.fd) {
-                    self.modem.store(m, Ordering::Relaxed);
+                    if self.modem.swap(m, Ordering::Relaxed) != m {
+                        host_io().wake.notify();
+                    }
                 }
             }
         }
