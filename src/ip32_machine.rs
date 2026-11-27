@@ -1392,21 +1392,17 @@ mod drop_tests {
         drop(machine);
     }
 
-    /// A virtio entry with no slot takes device 4, the board's extra slot, and an audio
-    /// card the option slot; a snapshot is refused while the virtio device has no saved state.
+    /// An audio card with no slot takes the option slot.
     #[test]
-    fn virtio_and_audio_cards_are_attached_in_their_slots() {
-        let dir = scratch("o2-virtio");
+    fn an_audio_card_takes_the_option_slot() {
+        let dir = scratch("o2-audio");
         let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
         cfg.no_audio = true;
-        cfg.devices.push(crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"virtio_serial\"").unwrap()).unwrap());
         cfg.devices.push(crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"ice1724\"").unwrap()).unwrap());
-        let mut machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
-        let id = |device| machine.bus.mace.pci.bus().config_read(crate::pci::DevFn { device, function: 0 }, 0, 4);
-        assert_eq!((id(4), id(3)), (Some(0x1043_1af4), Some(0x1724_1412)), "virtio-serial in device 4, audio in the option slot");
-        assert_eq!(machine.bus.cards.get().map(|c| (c.virtio.len(), c.audio.len())), Some((1, 1)));
-        let e = machine.save_snapshot("o2-virtio").unwrap_err();
-        assert!(e.contains("virtio device at pci0/4"), "{e}");
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        let at = crate::pci::DevFn { device: crate::dev::mace_pci::IP32_OPTION_SLOT, function: 0 };
+        assert_eq!(machine.bus.mace.pci.bus().config_read(at, 0, 4), Some(0x1724_1412));
+        assert_eq!(machine.bus.cards.get().unwrap().manifest().len(), 1);
         drop(machine);
     }
 

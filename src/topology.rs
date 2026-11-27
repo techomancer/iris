@@ -1044,16 +1044,11 @@ mod tests {
     /// interrupt, or the card in it would be told of that part's interrupts.
     #[test]
     fn no_extra_slot_shares_a_pin_with_a_built_in_part() {
-        use crate::dev::{bridge::PIN_WIRING, xbridge::PCI_ROUTING, xio_pci::{CAGE_SLOTS, SHOEHORN_SLOTS}};
-        use crate::{ip30_machine, ip32, ip34_machine, ip35_machine, ip53_machine};
+        use crate::dev::{bridge::PIN_WIRING, xio_pci::{CAGE_SLOTS, SHOEHORN_SLOTS}};
+        use crate::{ip30_machine, ip53_machine};
         let superio = |pin: u8| Some(pin);
         for (name, routing, table, superio) in [
             ("Octane", &PIN_WIRING, ip30_machine::SYSTEM_SLOTS, superio(crate::dev::ioc3::IP30.superio_pin)),
-            ("O2", &ip32::PCI0_ROUTING, ip32::PCI0_SLOTS, None),
-            ("Fuel head E", &PCI_ROUTING, ip34_machine::HEAD_E_SLOTS, None),
-            ("Fuel head F", &PCI_ROUTING, ip34_machine::HEAD_F_SLOTS, superio(crate::dev::ioc3::IP34.superio_pin)),
-            ("I-brick head E", &PCI_ROUTING, ip35_machine::HEAD_E_SLOTS, None),
-            ("I-brick head F", &PCI_ROUTING, ip35_machine::HEAD_F_SLOTS, superio(crate::dev::ioc3::IO7.superio_pin)),
             ("IO9 bus 0", &crate::dev::pic::PIC_ROUTING, ip53_machine::IO9_BUS0_SLOTS, None),
             ("IO9 bus 1", &crate::dev::pic::PIC_ROUTING, ip53_machine::IO9_BUS1_SLOTS, None),
             ("shoehorn", &PIN_WIRING, SHOEHORN_SLOTS, None),

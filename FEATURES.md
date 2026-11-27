@@ -407,8 +407,7 @@ takes; `--device [NAME:]TYPE[@SLOT][,KEY=VALUE]...` adds or replaces one from th
 | `graphics` | a graphics port or slot (`gfx`, `xio11`, `node1/xio8`) | Where the board goes; which board it is stays `[graphics] board`. Left out, the machine places it. |
 
 virtio devices take only the spare slots a board has for them, never a real slot (the Octane's Bridge
-devices 7, 5, 4 and 6, the O2's PCI device 4, the Fuel's and I-brick's second bus, the Tezro's IO9 bus
-1); `at` can name any slot. A snapshot records each device at its slot: see [Snapshots](#snapshots).
+devices 7, 5 and 6, the Tezro's IO9 bus 1); `at` can name any slot. A snapshot records each device at its slot: see [Snapshots](#snapshots).
 
 #### Old keys
 

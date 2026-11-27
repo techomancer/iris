@@ -113,11 +113,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   `[machine] audio_card`, the `audio` flags of the Fuel, Tezro, Origin 3200
   and Onyx 3000 sections, `[graphics] node` and `widget`, and `bridge_slot`
   are no longer read: they are unknown fields. Write the entry instead.
-- virtio-serial and virtio-9p now work on the O2 (PCI device 4), the Fuel,
-  the Origin 3200 and the Onyx 3000 (extra slots on the second bus), as well
-  as the Octane and Tezro. They take a spare slot, never a slot a real card
-  could use.
-  The first virtio device takes the first spare slot, so a lone virtio-9p
+- virtio devices take a spare slot, never a slot a real card could use. The
+  first virtio device takes the first spare slot, so a lone virtio-9p
   is in Octane slot 7 (was 5) and Tezro device 1 (was 2), and a CD-ROM with
   no `at` takes the first free target, t1, not 4. Name `at` to keep the old
   place.

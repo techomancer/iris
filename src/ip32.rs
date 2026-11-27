@@ -138,7 +138,8 @@ pub static PCI0_ROUTING: IntxRouting = IntxRouting {
         (2, [Some(9), None, None, None]),                // external SCSI
         (3, [Some(10), Some(13), Some(14), Some(15)]),   // INTB-D shared
         // The specification routes device 4; no O2 board populates it. Using
-        // it for virtio is iris's choice of a spare number, not hardware use.
+        // it for virtio-serial is iris's choice of a spare number, not
+        // hardware use.
         (4, [Some(11), None, None, None]),
     ],
     board_irqs: &[],
@@ -149,7 +150,6 @@ pub(crate) const PCI0_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
     (IP32_SCSI_SLOT, MachineSlotKind::ScsiBus { part: "aic7880", ids: 7 }, None),
     (IP32_SCSI_SLOT_B, MachineSlotKind::ScsiBus { part: "aic7880", ids: 7 }, None),
     (IP32_OPTION_SLOT, MachineSlotKind::PCI_SLOT, Some("pci_slot")),
-    (4, MachineSlotKind::Extra { pin: PCI_INTA }, None),
 ];
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;

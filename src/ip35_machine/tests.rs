@@ -52,22 +52,6 @@ fn the_audio_card_sits_in_the_ibrick_slot_it_is_placed_in() {
     }
 }
 
-/// virtio takes head F's one extra slot, device 7, on either product; device 0 is the IOC3's SuperIO pin.
-#[test]
-fn virtio_takes_the_extra_rows_of_the_ibricks_head_f() {
-    let dir = TempPath::dir("o3k-virtio");
-    for mut cfg in [config(&dir, 1), onyx_config(&dir, GraphicsBoard::Ir3)] {
-        let entry = || crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"virtio_serial\"").unwrap()).unwrap();
-        cfg.devices.push(entry());
-        with_machine(cfg, |m| {
-            let id = |device: u64| m.nodes[0].chip.pio().read32(widget(u64::from(HEAD_F), 0x2_0000 + (device << 12)));
-            assert_eq!(id(7).data, 0x1043_1af4);
-            assert_ne!(id(0).data, 0x1043_1af4, "device 0 is no extra slot");
-            assert_ne!(id(2).data, 0x1043_1af4, "a slot stays free for a card");
-        });
-    }
-}
-
 /// A processor's thread is a processor of the node it runs on and of no
 /// other: the second node's chip numbers the machine's CPU 1 its own
 /// processor 0, and takes the first node's thread for no processor.
