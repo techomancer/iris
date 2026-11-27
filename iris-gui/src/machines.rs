@@ -64,9 +64,16 @@ pub fn config_path(root: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(directory(root, name)?.join(format!("{name}.toml")))
 }
 
+/// A machine's TOML, with the older card flags read as the cards they become, as a run builds them.
+pub fn parse(text: &str) -> Result<MachineConfig, String> {
+    let mut cfg = MachineConfig::from_toml_str(text).map_err(|e| e.to_string())?;
+    cfg.fold_cards()?;
+    Ok(cfg)
+}
+
 pub fn read(path: &Path) -> Result<MachineConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|e| file_error(path, e))?;
-    MachineConfig::from_toml_str(&text).map_err(|e| file_error(path, e))
+    parse(&text).map_err(|e| file_error(path, e))
 }
 
 /// The TOML a machine is saved as. Keys the config left to the machine are
@@ -533,6 +540,27 @@ pub(crate) mod tests {
         let back = read(&config_path(&root.0, "fixed").unwrap()).unwrap();
         assert!(back.jitv2_threads_set);
         assert_eq!(back.jitv2.threads, 2);
+    }
+
+    /// The GUI sees the older card flags as the cards they become, so its checkboxes, its second-head
+    /// panel and its slot check agree with what Start builds.
+    #[test]
+    fn older_card_flags_read_as_cards() {
+        let root = TempRoot::new("older-cards");
+        for (text, card) in [
+            ("[ultra64]\nenabled = true\n", "ultra64"),
+            ("[graphics]\nheads = 2\n", "newport"),
+            ("test_device = true\n", "test_device"),
+            ("[virtio_serial]\nenabled = true\n", "virtio_serial"),
+            ("[virtio_9p]\nenabled = true\npath = \"/share\"\n", "virtio_9p"),
+        ] {
+            let dir = directory(&root.0, "indy").unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(config_path(&root.0, "indy").unwrap(), text).unwrap();
+            let cfg = read(&config_path(&root.0, "indy").unwrap()).unwrap();
+            assert!(cfg.has_device(card), "{card}");
+            assert!(to_toml(&cfg).unwrap().contains(&format!("type = \"{card}\"")), "{card}: saved as the card");
+        }
     }
 
     #[test]
