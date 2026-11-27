@@ -34,6 +34,48 @@ fn port(ui: &mut Ui, label: &str, value: &mut Option<u16>) {
         }
     });
 }
+/// The port that serves CI and the console window, from the ones the machine has; the first is its own.
+fn console_port(ui: &mut Ui, cfg: &mut MachineConfig) {
+    let names = iris::dev::serial_dev::consoles(cfg.machine.profile);
+    ui.horizontal(|ui| {
+        ui.label(t!("extra-console-select"));
+        ComboBox::from_id_salt("console_port").selected_text(cfg.machine.console.as_deref().unwrap_or(&names[0])).show_ui(ui, |ui| {
+            for (i, name) in names.iter().enumerate() {
+                if ui.selectable_label(cfg.machine.console.as_deref().unwrap_or(&names[0]) == name, name).clicked() {
+                    cfg.machine.console = (i != 0).then(|| name.clone());
+                }
+            }
+        });
+    });
+}
+/// Each serial port's Unix socket and log file; its TCP port is under Host ports.
+fn serial_ends(ui: &mut Ui, cfg: &mut MachineConfig) {
+    use iris::dev::serial_dev::{SerialDeviceConfig, SerialKind};
+    for (n, default) in iris::dev::serial_dev::ports(cfg.machine.profile) {
+        let at = format!("serial{n}");
+        let entry = cfg.devices.iter().position(|d| d.at.as_deref() == Some(&at));
+        let mut line = match entry.map(|i| &cfg.devices[i].device) {
+            None => SerialDeviceConfig { kind: SerialKind::Line, backend: default.map(|p| format!("tcp:{p}")).into_iter().collect(), ..Default::default() },
+            Some(DeviceModel::Serial(s)) if s.kind == SerialKind::Line => s.clone(),
+            Some(_) => continue,
+        };
+        let mut changed = false;
+        for (kind, label) in [("unix", t!("extra-serial-socket", line = at.clone())), ("log", t!("extra-serial-log", line = at.clone()))] {
+            let old = line.end(kind).map(str::to_string);
+            let mut value = old.clone();
+            text(ui, &label, &mut value);
+            if value != old {
+                line.set_end(kind, value.as_deref());
+                changed = true;
+            }
+        }
+        match (changed, entry) {
+            (false, _) => {}
+            (true, Some(i)) => cfg.devices[i].device = DeviceModel::Serial(line),
+            (true, None) => cfg.devices.push(ConfiguredDevice::new(&at, DeviceModel::Serial(line))),
+        }
+    }
+}
 /// A labelled picker over `choices`, each shown by its configuration spelling.
 fn choice<T: serde::Serialize + serde::de::DeserializeOwned + Copy>(
     ui: &mut Ui,
@@ -110,10 +152,8 @@ pub fn show(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
             text(ui, &t!("extra-graphics-flash"), &mut cfg.graphics.flash);
         });
         ui.collapsing(t!("extra-connections"), |ui| {
-            text(ui, &t!("extra-socket-a"), &mut cfg.serial_socket_a);
-            text(ui, &t!("extra-socket-b"), &mut cfg.serial_socket_b);
-            text(ui, &t!("extra-log-a"), &mut cfg.serial_log_a);
-            text(ui, &t!("extra-log-b"), &mut cfg.serial_log_b);
+            console_port(ui, cfg);
+            serial_ends(ui, cfg);
             choice(
                 ui,
                 &t!("extra-log-timestamps"),
@@ -197,13 +237,6 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
             MachineProfile::FuelIp34 => {
                 let s = &mut cfg.fuel;
                 text(ui, &t!("extra-flash"), &mut s.flash);
-                choice(
-                    ui,
-                    &t!("extra-console-select"),
-                    "fuel_console",
-                    &mut s.console,
-                    &[Ip35Console::L1, Ip35Console::Ioc3A, Ip35Console::Ioc3B],
-                );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
@@ -214,23 +247,8 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
             MachineProfile::TezroIp53 => {
                 let s = &mut cfg.tezro;
                 text(ui, &t!("extra-flash"), &mut s.flash);
-                choice(
-                    ui,
-                    &t!("extra-console-select"),
-                    "tezro_console",
-                    &mut s.console,
-                    &[
-                        TezroConsole::L1,
-                        TezroConsole::Ioc4A,
-                        TezroConsole::Ioc4B,
-                        TezroConsole::Ioc4C,
-                        TezroConsole::Ioc4D,
-                    ],
-                );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
-                port(ui, &t!("extra-port-c"), &mut s.serial_port_c);
-                port(ui, &t!("extra-port-d"), &mut s.serial_port_d);
             }
             MachineProfile::Origin3200Ip35 => {
                 let s = &mut cfg.origin3200;
@@ -242,17 +260,6 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                     }
                 });
                 text(ui, &t!("extra-flash"), &mut s.flash);
-                choice(
-                    ui,
-                    &t!("extra-console-select"),
-                    "origin_console",
-                    &mut s.console,
-                    &[
-                        Ip35Console::L1,
-                        Ip35Console::Ioc3A,
-                        Ip35Console::Ioc3B,
-                    ],
-                );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);
@@ -268,17 +275,6 @@ fn platform(ui: &mut Ui, cfg: &mut MachineConfig) {
                     }
                 });
                 text(ui, &t!("extra-flash"), &mut s.flash);
-                choice(
-                    ui,
-                    &t!("extra-console-select"),
-                    "onyx_console",
-                    &mut s.console,
-                    &[
-                        Ip35Console::L1,
-                        Ip35Console::Ioc3A,
-                        Ip35Console::Ioc3B,
-                    ],
-                );
                 port(ui, &t!("extra-l1-port"), &mut s.l1_port);
                 text(ui, &t!("extra-l1-log"), &mut s.l1_log);
                 text(ui, &t!("extra-l1-revision"), &mut s.l1_revision);

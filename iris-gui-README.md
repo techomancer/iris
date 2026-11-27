@@ -545,10 +545,11 @@ On Windows, `iris::crash_diag` records otherwise-silent deaths (e.g.
 
 ### Single instance and TCP ports
 
-iris binds the monitor (`8888`) and two serial listeners (`8880` channel A,
-`8881` channel B / ttyd1) on loopback, so two emulators can't share a host
-unless their configs give them other ports (`monitor_port`, `serial_port_a`,
-`serial_port_b`; the serial console window follows `serial_port_b`). On
+iris binds the monitor (`8888`) and the serial listeners (`8880` and `8881`, the
+L1 on `8882` where there is one) on loopback, so two emulators can't share a host
+unless their configs give them other ports (`monitor_port` and the `serial`
+devices' `tcp:` backends, which the Host ports settings edit; the serial console
+window follows `machine.console`). On
 startup iris-gui terminates a still-running previous instance (Unix; tracked
 with a pidfile) to reclaim those ports. A crashed instance needs no cleanup —
 the OS frees its ports.
@@ -574,8 +575,7 @@ These cases are treated as safe:
 - **CHD** (`*.chd`) — writes go to a `.diff.chd` sidecar; the base CHD is
   never modified.
 
-"Send IRIX halt" uses the machine's channel B port (`serial_port_b`, default
-`8881`) and writes `halt\n`. This requires a guest shell ready to accept it.
+"Send IRIX halt" uses the machine's console port and writes `halt\n`. This requires a guest shell ready to accept it.
 
 ### NVRAM persistence
 

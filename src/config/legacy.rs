@@ -92,7 +92,40 @@ const DROPPED: &[(&str, &[&str], &str)] = &[
     ("node", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
     ("widget", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
     ("bridge_slot", &[], "the `at` of the virtio [[devices]] entry"),
+    ("console", &["fuel", "tezro", "origin3200", "onyx3000"], "`console = \"serial1\"`, `\"serial2\"` or `\"l1\"` under [machine]"),
+    ("serial_port_c", &[], "nothing: the Tezro's case has two serial ports, serial1 and serial2"),
+    ("serial_port_d", &[], "nothing: the Tezro's case has two serial ports, serial1 and serial2"),
 ];
+
+/// The serial keys a `serial` [[devices]] entry replaced: the UART channel the key named, and the backend kind its value
+/// becomes.
+const SERIAL_KEYS: &[(&str, &[&str], char, &str)] = &[
+    ("serial_port_a", &[], 'a', "tcp"),
+    ("serial_port_b", &[], 'b', "tcp"),
+    ("serial_socket_a", &[], 'a', "unix"),
+    ("serial_socket_b", &[], 'b', "unix"),
+    ("serial_log_a", &[], 'a', "log"),
+    ("serial_log_b", &[], 'b', "log"),
+    ("serial_port", &["o2"], 'a', "tcp"),
+];
+
+/// The slot of a machine's UART channel `a` or `b`: the one that listened on 8880 or 8881 by default.
+fn serial_slot(profile: MachineProfile, channel: char) -> String {
+    let default = Some(if channel == 'a' { 8880 } else { 8881 });
+    let n = crate::dev::serial_dev::ports(profile).iter().find(|p| p.1 == default).map_or(0, |p| p.0);
+    format!("serial{n}")
+}
+
+/// The `[[devices]]` text that stands in for a serial key with `value`.
+fn serial_entry(profile: MachineProfile, key: &(&str, &[&str], char, &str), value: &str) -> String {
+    format!("a `serial` [[devices]] entry:\n[[devices]]\ntype = \"serial\"\nat = \"{}\"\nbackend = \"{}:{value}\"", serial_slot(profile, key.2), key.3)
+}
+
+/// The `[machine] profile` a config text names.
+fn profile_in(text: &str) -> Option<MachineProfile> {
+    let named = text.parse::<toml::Table>().ok()?;
+    MachineProfile::from_name(named.get("machine")?.get("profile")?.as_str()?).ok()
+}
 
 /// A parse error for a dropped key, with what to write instead; any other error as it was.
 pub(super) fn name_replacement(e: toml::de::Error, text: &str) -> toml::de::Error {
@@ -102,10 +135,39 @@ pub(super) fn name_replacement(e: toml::de::Error, text: &str) -> toml::de::Erro
         let header = before.lines().rev().find_map(|l| l.trim().strip_prefix('['))?;
         header.trim_start_matches('[').split(']').next()
     };
-    match key.and_then(|k| DROPPED.iter().find(|d| d.0 == k && (d.1.is_empty() || section().is_some_and(|s| d.1.contains(&s))))) {
-        Some((key, _, instead)) => <toml::de::Error as serde::de::Error>::custom(format!("{e}\n`{key}` is no longer read: write {instead}")),
+    let here = |sections: &[&str]| sections.is_empty() || section().is_some_and(|s| sections.contains(&s));
+    let serial = key.and_then(|k| SERIAL_KEYS.iter().find(|d| d.0 == k && here(d.1))).map(|d| {
+        let value = text.get(e.span().map_or(0, |s| s.start)..).and_then(|t| t.lines().next()?.split_once('=')).map_or("VALUE", |v| v.1.trim().trim_matches('"'));
+        let profile = if d.1 == ["o2"] { MachineProfile::O2Ip32 } else { profile_in(text).unwrap_or_default() };
+        (d.0, serial_entry(profile, d, value))
+    });
+    let dropped = key.and_then(|k| DROPPED.iter().find(|d| d.0 == k && here(d.1))).map(|d| (d.0, d.2.to_string()));
+    match serial.or(dropped) {
+        Some((key, instead)) => <toml::de::Error as serde::de::Error>::custom(format!("{e}\n`{key}` is no longer read: write {instead}")),
         None => e,
     }
+}
+
+/// The first removed serial flag in `args`, with the `--device` that replaces it.
+pub(super) fn removed_flag(args: impl IntoIterator<Item = String>) -> Option<String> {
+    let args: Vec<String> = args.into_iter().collect();
+    let value = |flag: &str| args.iter().enumerate().find_map(|(i, a)| a.strip_prefix(&format!("{flag}=")).or_else(|| (a == flag).then(|| args.get(i + 1))?.map(String::as_str)));
+    // The machine that would run: `--machine` or `--ip22`, else the config file's.
+    let profile = if args.iter().any(|a| a == "--ip22") {
+        MachineProfile::Indigo2Ip22
+    } else if let Some(m) = value("--machine") {
+        MachineProfile::from_name(m).unwrap_or_default()
+    } else {
+        std::fs::read_to_string(value("--config").unwrap_or(super::DEFAULT_CONFIG)).ok().and_then(|t| profile_in(&t)).unwrap_or_default()
+    };
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let (flag, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)));
+        let Some(d) = SERIAL_KEYS.iter().find(|d| d.1.is_empty() && flag.strip_prefix("--") == Some(&d.0.replace('_', "-"))) else { continue };
+        let value = inline.or_else(|| rest.next().map(String::as_str)).unwrap_or("VALUE");
+        return Some(format!("{flag} is no longer read: write --device serial@{},backend={}:{value}", serial_slot(profile, d.2), d.3));
+    }
+    None
 }
 
 /// A bare drive id (`16 * controller + id`), the only way older versions
@@ -165,10 +227,6 @@ pub(super) fn fold(cfg: &mut MachineConfig) -> Result<(), String> {
             cfg.devices.push(ConfiguredDevice::new(&format!("scsi{}/t{}", d.bus, d.id), DeviceModel::Scsi(dev)));
         }
         moved.push("o2.disks -> [[devices]]");
-    }
-    if let Some(port) = cfg.o2.serial_port.take() {
-        if cfg.serial_port_a.is_none() { cfg.serial_port_a = Some(port); }
-        moved.push("o2.serial_port -> serial_port_a");
     }
     if let Some(log) = cfg.o2.serial_log.take() {
         if cfg.serial_log.is_none() { cfg.serial_log = Some(log); }

@@ -23,9 +23,9 @@ fn boot(profile: MachineProfile, cpu: &str, quiet: usize, edit: fn(&mut MachineC
             cfg.no_audio = false;
             cfg.audio.host = AudioHost::Null;
             crate::test_temp::nvram_in(&mut cfg, &dir);
-            let held: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
-            let port = |i: usize| Some(held[i].local_addr().unwrap().port());
-            (cfg.monitor_port, cfg.serial_port_a, cfg.serial_port_b) = (port(0), port(1), port(2));
+            let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            cfg.monitor_port = Some(held.local_addr().unwrap().port());
+            crate::dev::serial_host::tests::free_ports(&mut cfg);
             edit(&mut cfg);
             let mut m = crate::workstation::build(cfg).expect("machine builds");
             m.start();

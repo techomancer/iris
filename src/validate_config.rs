@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config::{MachineConfig, MachineProfile, ScsiKind, DEFAULT_PROM};
+use crate::dev::serial_host::End;
+use crate::devices::DeviceModel;
 
 fn missing_file(what: &str, path: &str, problems: &mut Vec<String>) {
     match std::fs::metadata(path) {
@@ -95,33 +97,42 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
         }
     }
 
-    let outputs = [("serial_log", &cfg.serial_log), ("serial_log_a", &cfg.serial_log_a), ("serial_log_b", &cfg.serial_log_b)];
-    let sockets = [("serial_socket_a", &cfg.serial_socket_a), ("serial_socket_b", &cfg.serial_socket_b)];
-    for (what, path) in outputs.into_iter().chain(sockets) {
-        if let Some(path) = path {
-            missing_parent(what, path, &mut problems);
-        }
+    if let Some(path) = &cfg.serial_log {
+        missing_parent("serial_log", path, &mut problems);
     }
 
     // TCP ports iris listens on. A port two of them share leaves the second
     // without its listener (a console or the monitor), which a run only says
-    // on stderr.
-    let [a, b] = cfg.serial_ports();
-    let mut ports = vec![("serial_port_a", a), ("serial_port_b", b), ("monitor_port", cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT))];
+    // on stderr. A serial line's Unix sockets and logs need a directory, and each socket one line.
+    let mut ports = vec![("monitor_port".to_string(), cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT))];
     if let Some(gdb) = cfg.gdb_port {
-        ports.push(("gdb_port", gdb));
+        ports.push(("gdb_port".into(), gdb));
     }
-    // The listeners a board adds. Defaults match the machines' own.
-    let l1 = |p: Option<u16>| ("machine.l1_port", p.unwrap_or(8882));
+    let l1 = |p: Option<u16>| ("machine.l1_port".to_string(), p.unwrap_or(8882));
     match cfg.machine.profile {
         MachineProfile::FuelIp34 => ports.push(l1(cfg.fuel.l1_port)),
-        MachineProfile::TezroIp53 => ports.extend([
-            l1(cfg.tezro.l1_port),
-            ("machine.serial_port_c", cfg.tezro.serial_port_c.unwrap_or(8883)),
-            ("machine.serial_port_d", cfg.tezro.serial_port_d.unwrap_or(8884)),
-        ]),
+        MachineProfile::TezroIp53 => ports.push(l1(cfg.tezro.l1_port)),
         MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35 => ports.push(l1(cfg.ip35_section().l1_port)),
         _ => {}
+    }
+    let mut sockets: BTreeMap<String, String> = BTreeMap::new();
+    for (d, at) in placement.placed() {
+        let DeviceModel::Serial(line) = &d.device else { continue };
+        let what = format!("serial at {at}");
+        // Under `--ci` no default end listens on its port (the console has none, the others take any free one).
+        for end in crate::dev::serial_host::ends(&line.backend).unwrap_or_default() {
+            match end {
+                End::Tcp(port) if !(d.default && cfg.ci) => ports.push((what.clone(), port)),
+                End::Unix(path) => {
+                    missing_parent(&what, &path, &mut problems);
+                    if let Some(other) = sockets.insert(path.clone(), what.clone()) {
+                        problems.push(format!("{what} and {other} both name {path}"));
+                    }
+                }
+                End::Log(path) => missing_parent(&what, &path, &mut problems),
+                End::Tcp(_) => {}
+            }
+        }
     }
     let virtio = cfg.devices.iter().find_map(|d| match &d.device {
         crate::devices::DeviceModel::VirtioSerial(v) => Some(v),
@@ -130,15 +141,15 @@ pub fn problems(cfg: &MachineConfig) -> Vec<String> {
     if virtio.enabled {
         let default = [crate::dev::virtio::console::DEFAULT_TCP_PORT];
         let tcp = virtio.ports.iter().filter_map(|p| p.tcp_port);
-        ports.extend(if virtio.ports.is_empty() { default.to_vec() } else { tcp.collect() }.into_iter().map(|p| ("virtio_serial tcp_port", p)));
+        ports.extend(if virtio.ports.is_empty() { default.to_vec() } else { tcp.collect() }.into_iter().map(|p| ("virtio_serial tcp_port".to_string(), p)));
     }
-    ports.extend(cfg.port_forward.iter().filter(|f| f.proto == crate::config::ForwardProto::Tcp).map(|f| ("port_forward host_port", f.host_port)));
-    let mut seen: BTreeMap<u16, &str> = BTreeMap::new();
+    ports.extend(cfg.port_forward.iter().filter(|f| f.proto == crate::config::ForwardProto::Tcp).map(|f| ("port_forward host_port".to_string(), f.host_port)));
+    let mut seen: BTreeMap<u16, String> = BTreeMap::new();
     for (setting, port) in ports {
         if port == 0 {
             continue;
         }
-        if let Some(other) = seen.insert(port, setting) {
+        if let Some(other) = seen.insert(port, setting.clone()) {
             problems.push(format!("{setting} and {other} both use port {port}"));
         }
     }
@@ -249,7 +260,7 @@ mod tests {
             "hdd at xio15/pci0/0/t2: a disk needs a path",
             "serial_log ",
             "directory ",
-            "monitor_port and serial_port_a both use port 8880",
+            "serial at serial1 and monitor_port both use port 8880",
         ] {
             assert!(all.contains(want), "no {want:?} in:\n{all}");
         }
@@ -257,23 +268,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A board's L1 port and a Tezro's extra serial ports are listeners too.
+    /// A serial entry's TCP port, even a default one, joins the clash check, and each Unix socket has one line.
     #[test]
-    fn the_board_ports_join_the_clash_check() {
-        let mut cfg = MachineConfig::default();
-        cfg.devices.clear();
-        cfg.machine.profile = MachineProfile::FuelIp34;
-        cfg.fuel.l1_port = Some(8880);
-        assert!(problems(&cfg).iter().any(|p| p == "machine.l1_port and serial_port_a both use port 8880"), "{:?}", problems(&cfg));
-        cfg.machine.profile = MachineProfile::TezroIp53;
+    fn the_serial_ports_join_the_clash_check() {
+        let load = |text: &str| MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"tezro_ip53\"\nl1_port = 8880\n{text}")).unwrap();
+        let mut cfg = load("");
+        assert!(problems(&cfg).iter().any(|p| p == "serial at serial1 and machine.l1_port both use port 8880"), "{:?}", problems(&cfg));
         cfg.tezro.l1_port = None;
-        cfg.tezro.serial_port_c = Some(8881);
-        assert!(problems(&cfg).iter().any(|p| p == "machine.serial_port_c and serial_port_b both use port 8881"), "{:?}", problems(&cfg));
-        cfg.tezro.serial_port_c = None;
         assert!(!problems(&cfg).iter().any(|p| p.contains("both use port")), "{:?}", problems(&cfg));
+        cfg.ci = true;
+        cfg.monitor_port = Some(8881);
+        assert!(!problems(&cfg).iter().any(|p| p.contains("both use port")), "under --ci no default end listens: {:?}", problems(&cfg));
+        cfg.ci = false;
+        cfg.monitor_port = None;
         cfg.virtio_serial.enabled = true;
-        cfg.serial_port_a = Some(8890);
-        assert!(problems(&cfg).iter().any(|p| p == "virtio_serial tcp_port and serial_port_a both use port 8890"), "{:?}", problems(&cfg));
+        cfg.devices.push(crate::devices::ConfiguredDevice::from_arg("serial@serial1,backend=tcp:8890").unwrap());
+        assert!(problems(&cfg).iter().any(|p| p.starts_with("virtio_serial tcp_port and serial at")), "{:?}", problems(&cfg));
+        cfg.devices = ["serial@serial1", "serial@serial2"].map(|d| crate::devices::ConfiguredDevice::from_arg(&format!("{d},backend=unix:/nowhere/x.sock")).unwrap()).into();
+        let all = problems(&cfg).join("\n");
+        assert!(all.contains("both name /nowhere/x.sock") && all.contains("directory /nowhere does not exist"), "{all}");
     }
 
     /// A `prom` the user names must be there, on every machine; "(embedded)" and the

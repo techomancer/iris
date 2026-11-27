@@ -6,6 +6,7 @@
 use super::app::AppController;
 use super::debug::{build_features, monitor_port};
 use crate::model::netplan;
+use crate::model::serial_console::console_port;
 
 /// One line of a help page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +133,7 @@ impl AppController {
                     Strong(t!("help-network-serial-heading")),
                     Text(t!(
                         "help-network-serial",
-                        serial = cfg.serial_ports()[1].to_string(),
+                        serial = console_port(cfg).map_or("-".into(), |p| p.to_string()),
                         monitor = monitor_port(cfg).to_string()
                     )),
                     Strong(t!("help-privacy")),

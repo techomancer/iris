@@ -30,8 +30,7 @@ no_audio = true
 prom = "prom.bin"
 banks = [$bank, 0, 0, 0]
 monitor_port = $port
-serial_port_a = $((port + 1))
-serial_port_b = $((port + 2))
+devices = [ { type = "serial", at = "serial1", backend = "tcp:$((port + 1))" }, { type = "serial", at = "serial2", backend = "tcp:$((port + 2))" } ]
 scsi = {}
 [machine]
 profile = "$profile"

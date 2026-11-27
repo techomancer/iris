@@ -144,8 +144,6 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
         &mut cfg.tezro.flash, &mut cfg.tezro.l1_log,
         &mut cfg.origin3200.flash, &mut cfg.origin3200.l1_log,
         &mut cfg.onyx3000.flash, &mut cfg.onyx3000.l1_log,
-        &mut cfg.serial_log_a, &mut cfg.serial_log_b,
-        &mut cfg.serial_socket_a, &mut cfg.serial_socket_b,
         &mut cfg.vnc.password_file,
     ] {
         if let Some(path) = path { visit(path); }
@@ -184,7 +182,16 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
             DeviceModel::Nvme(n) => visit(&mut n.path),
             DeviceModel::TestDevice(t) => t.dump.iter_mut().for_each(&mut visit),
             DeviceModel::Virtio9p(v) => visit(&mut v.path),
-            DeviceModel::Serial(s) => visit(&mut s.path),
+            DeviceModel::Serial(s) => {
+                visit(&mut s.path);
+                for end in &mut s.backend {
+                    if let Some((kind, path)) = end.split_once(':').filter(|(k, _)| matches!(*k, "unix" | "log")) {
+                        let mut path = path.to_string();
+                        visit(&mut path);
+                        *end = format!("{kind}:{path}");
+                    }
+                }
+            }
             DeviceModel::VirtioSerial(v) => v.ports.iter_mut().filter_map(|p| p.socket.as_mut()).for_each(&mut visit),
             DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Newport | DeviceModel::Graphics => {}
         }

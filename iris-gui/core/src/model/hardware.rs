@@ -117,13 +117,10 @@ pub fn switch_profile(cfg: &mut MachineConfig, from: MachineProfile) {
     if mc_machine(p) && cfg.network.mode == NetMode::Off {
         cfg.network.mode = NetMode::Nat;
     }
-    // The console's own channel is logged by `serial_log`.
-    if matches!(p, MachineProfile::OctaneIp30 | MachineProfile::O2Ip32) {
-        cfg.serial_log_a = None;
-    }
-    if mc_machine(p) {
-        cfg.serial_log_b = None;
-    }
+    // A serial entry stays only where the new machine has its port.
+    let ports: Vec<String> = iris::dev::serial_dev::ports(p).iter().map(|port| format!("serial{}", port.0)).collect();
+    cfg.devices.retain(|d| !matches!(d.device, DeviceModel::Serial(_)) || d.at.as_ref().is_some_and(|at| ports.contains(at)));
+    cfg.machine.console = None;
 }
 
 /// Whether a Fibre Channel adapter goes in one of the machine's PCI slots: not
@@ -274,7 +271,6 @@ mod tests {
                         cfg.devices.push(ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::XioBoard(Kind::Cage)) });
                         cfg.devices.push(nvme());
                         cfg.devices.push(ConfiguredDevice { name: Some("fibre_channel".into()), at: None, ..ConfiguredDevice::new("", DeviceModel::Qla2200) });
-                        cfg.serial_log_b = Some("b.log".into());
                         cfg.set_disk(iris::config::scsi_slot(1, 12), ScsiDeviceConfig { path: "w.raw".into(), ..Default::default() });
                     }
                     MachineProfile::TezroIp53 => {
@@ -285,7 +281,6 @@ mod tests {
                     }
                     _ => {
                         cfg.devices.push(nvme());
-                        cfg.serial_log_b = Some("b.log".into());
                     }
                 }
                 cfg.validate().unwrap_or_else(|e| panic!("populated {from:?}: {e}"));

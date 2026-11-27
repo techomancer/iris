@@ -4,8 +4,7 @@
 //! A [`SerialBackend`] is a TCP console, a Unix-socket console, the in-process CI backend, a file
 //! tee, or nothing. Every machine's UARTs (the Indy's and Indigo2's Z85C30,
 //! the O2's MACE 16550s, the IOC3's and IOC4's ports, the L1 console) take
-//! one, and [`console_backends`] picks them for the machines whose consoles
-//! are configured the same way.
+//! one, which [`open_line`] makes from the ends a port is configured with.
 //!
 //! A backend never refuses a byte and never makes a UART wait. The log tee
 //! and the CI capture take every byte first; each socket client then has its
@@ -820,157 +819,105 @@ pub fn open_log_at(cfg: &MachineConfig, path: Option<&str>, tag: &str) -> Option
 /// Returns `None` when the socket cannot be made, with the reason on stderr,
 /// as a TCP port that is taken does.
 #[cfg(unix)]
-pub fn unix_serial_backend(path: &str, label: &str, setting: &str) -> Option<Arc<dyn SerialBackend>> {
+pub fn unix_serial_backend(path: &str, label: &str) -> Option<Arc<dyn SerialBackend>> {
     match UnixSocketBackend::new(path) {
         Ok(b) => {
             eprintln!("iris: {label} on socket {path}");
             Some(Arc::new(b))
         }
         Err(e) => {
-            eprintln!("iris: {label}: socket {path}: {e} ({setting})");
+            eprintln!("iris: {label}: socket {path}: {e}");
             None
         }
     }
 }
 
 #[cfg(not(unix))]
-pub fn unix_serial_backend(path: &str, label: &str, setting: &str) -> Option<Arc<dyn SerialBackend>> {
-    eprintln!("iris: {label}: socket {path}: Unix sockets need a Unix host ({setting})");
+pub fn unix_serial_backend(path: &str, label: &str) -> Option<Arc<dyn SerialBackend>> {
+    eprintln!("iris: {label}: socket {path}: Unix sockets need a Unix host");
     None
 }
 
-/// Where one serial line is served on the host.
-pub struct SerialLine<'a> {
-    /// Names the line in messages, e.g. "Octane serial port 1".
-    pub label: &'a str,
-    /// The TCP port, or `None` for a line with no listener.
-    pub tcp_port: Option<u16>,
-    /// The setting that chose `tcp_port`, for the message when it is taken.
-    pub tcp_setting: &'a str,
-    /// A Unix socket to serve the line on as well, from the `socket_setting`
-    /// key.
-    pub socket: Option<&'a str>,
-    pub socket_setting: &'a str,
+/// One host end of a serial line, as a `backend` string names it.
+pub(crate) enum End {
+    Tcp(u16),
+    Unix(String),
+    Log(String),
 }
 
-/// Wire one serial line: TCP on `tcp_port` plus the Unix socket when one is
-/// set, teed to `log`. The line that carries the CI control socket's console
-/// (`ci`) is not served on TCP (so several `--ci` instances coexist); with a
-/// socket, its output goes to both the control socket's buffer and the
-/// socket, and either may type. Returns the backend, and whether a host end
-/// could be made; without one the backend only logs.
-pub fn serial_line(
-    line: &SerialLine,
-    log: Option<Arc<SerialLog>>,
-    ci: Option<&Arc<CiSerialBackend>>,
-) -> (Arc<dyn SerialBackend>, bool) {
-    let socket = line.socket.and_then(|path| unix_serial_backend(path, line.label, line.socket_setting));
-    if let Some(ci) = ci {
-        if let Some(log) = log {
-            ci.set_log(log);
+/// Read a line's `backend` strings: `tcp:PORT` (telnet on 127.0.0.1, 0 takes any free port), `unix:PATH` (raw) or
+/// `log:PATH` (a transcript).
+pub(crate) fn ends(backend: &[String]) -> Result<Vec<End>, String> {
+    backend
+        .iter()
+        .map(|b| match crate::backend::split(b)? {
+            ("tcp", port) => port.parse().map(End::Tcp).map_err(|_| format!("backend \"{b}\": {port} is not a TCP port")),
+            ("unix", path) => Ok(End::Unix(path.into())),
+            ("log", path) => Ok(End::Log(path.into())),
+            (kind, _) => Err(format!("backend \"{b}\": a serial line takes tcp, unix or log, not {kind}")),
+        })
+        .collect()
+}
+
+/// What the console port has besides its ends: under `--ci` the in-process backend, and `serial_log`.
+pub(crate) struct Console<'a> {
+    pub ci: Option<&'a Arc<CiSerialBackend>>,
+    pub log: Option<Arc<SerialLog>>,
+}
+
+/// Open the host `ends` of one port. The CI backend stands in for the console's `default` TCP end; a `default` end on any
+/// other port takes any free port under `--ci`, so parallel runs never collide.
+pub(crate) fn open_line(cfg: &MachineConfig, label: &str, ends: &[End], default: bool, console: Option<Console>) -> Arc<dyn SerialBackend> {
+    let (ci, console_log) = console.map_or((None, None), |c| (c.ci, c.log));
+    let mut backends: Vec<Arc<dyn SerialBackend>> = ci.iter().map(|c| (*c).clone() as _).collect();
+    let mut logs = Vec::new();
+    for end in ends {
+        match end {
+            End::Tcp(_) if default && ci.is_some() => {}
+            End::Tcp(port) => match tcp_serial_backend(if cfg.ci && default { 0 } else { *port }) {
+                Some((b, p)) => {
+                    eprintln!("iris: {label} on 127.0.0.1:{p}");
+                    backends.push(b);
+                }
+                None => eprintln!("iris: {label}: port {port} unavailable; is another iris using it?"),
+            },
+            End::Unix(path) => backends.extend(unix_serial_backend(path, label)),
+            End::Log(path) => logs.extend(open_log_at(cfg, Some(path), label)),
         }
-        return match socket {
-            Some(socket) => (Arc::new(FanoutBackend(vec![ci.clone(), socket])), true),
-            None => (ci.clone(), true),
-        };
     }
-    let mut ends: Vec<Arc<dyn SerialBackend>> = Vec::new();
-    if let Some(port) = line.tcp_port {
-        match tcp_serial_backend(port) {
-            Some((b, p)) => {
-                eprintln!("iris: {} on 127.0.0.1:{p}", line.label);
-                ends.push(b);
-            }
-            None => eprintln!(
-                "iris: {}: port {port} unavailable; is another iris using it? ({})",
-                line.label, line.tcp_setting
-            ),
-        }
+    match (ci, console_log) {
+        (Some(ci), Some(log)) => ci.set_log(log),
+        (_, log) => logs.extend(log),
     }
-    ends.extend(socket);
-    let served = !ends.is_empty();
-    let backend: Arc<dyn SerialBackend> = match ends.len() {
+    let mut backend: Arc<dyn SerialBackend> = match backends.len() {
         0 => null_serial_backend(),
-        1 => ends.remove(0),
-        _ => Arc::new(FanoutBackend(ends)),
+        1 => backends.remove(0),
+        _ => Arc::new(FanoutBackend(backends)),
     };
-    match log {
-        Some(log) => (Arc::new(TeeBackend::new(backend, log)), served),
-        None => (backend, served),
+    for log in logs {
+        backend = Arc::new(TeeBackend::new(backend, log));
     }
-}
-
-/// The host ends of a machine's two serial ports: `(console, second)`,
-/// each in the monitor's `serial` map under the board's names for them
-/// (`ports`, as `["IOC3 A", "IOC3 B"]`).
-///
-/// The console is the CI backend in CI mode, otherwise TCP on
-/// `serial_port_a` (nothing, if the port is taken), either teed to
-/// `serial_log`. The second port serves TCP on `serial_port_b`, teed to
-/// `serial_log_b`, or nothing when nothing could serve it. In CI mode neither
-/// port is served on TCP, so several `--ci` instances coexist. Each also
-/// takes a Unix socket, `serial_socket_a` and `serial_socket_b`. A
-/// `[hostserial]`, `[spaceball]` or `[wacom]` section takes its port instead.
-pub fn console_backends(
-    cfg: &MachineConfig,
-    tag: &str,
-    ports: [&str; 2],
-    ci: Option<&Arc<CiSerialBackend>>,
-) -> Result<(Arc<dyn SerialBackend>, Arc<dyn SerialBackend>), String> {
-    let [port_a, port_b] = cfg.serial_ports();
-    let log = open_log(cfg, tag);
-    let label = format!("{tag} serial port 1");
-    let console = match crate::dev::serial_dev::peripheral(cfg, 1, log.clone())? {
-        Some(b) => {
-            log::warn!("{tag}: serial1 is the console port; the PROM and IRIX console now go to the peripheral");
-            b
-        }
-        None => {
-            serial_line(
-                &SerialLine {
-                    label: &label,
-                    tcp_port: Some(port_a),
-                    tcp_setting: "serial_port_a",
-                    socket: cfg.serial_socket_a.as_deref(),
-                    socket_setting: "serial_socket_a",
-                },
-                log,
-                ci,
-            )
-            .0
-        }
-    };
-    let console = crate::dev::serial_map::mapped(tag, ports[0], Some(1), true, cfg, console);
-    let label = format!("{tag} serial port 2");
-    let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label);
-    let second = match crate::dev::serial_dev::peripheral(cfg, 2, log.clone())? {
-        Some(b) => b,
-        None => {
-            let (second, served) = serial_line(
-                &SerialLine {
-                    label: &label,
-                    tcp_port: ci.is_none().then_some(port_b),
-                    tcp_setting: "serial_port_b",
-                    socket: cfg.serial_socket_b.as_deref(),
-                    socket_setting: "serial_socket_b",
-                },
-                log,
-                None,
-            );
-            if served { second } else { null_serial_backend() }
-        }
-    };
-    Ok((console, crate::dev::serial_map::mapped(tag, ports[1], Some(2), false, cfg, second)))
+    backend
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    /// The console is the CI backend in CI mode and TCP otherwise, either
-    /// teed to the same log, and the second port comes up on its own outside
-    /// CI mode only. The log adds to what is there, or starts over with
-    /// `serial_log_overwrite`.
+    /// Give every port that listens by default any free host port, so tests running side by side do not collide.
+    pub(crate) fn free_ports(cfg: &mut MachineConfig) {
+        for (n, _) in crate::dev::serial_dev::ports(cfg.machine.profile).iter().filter(|p| p.1.is_some()) {
+            cfg.devices.push(crate::devices::ConfiguredDevice::from_arg(&format!("serial@serial{n},backend=tcp:0")).unwrap());
+        }
+    }
+
+    /// `ends` of a port, as a test names them.
+    fn line(cfg: &MachineConfig, backend: &[&str], default: bool, console: Option<Console>) -> Arc<dyn SerialBackend> {
+        open_line(cfg, "Test", &ends(&backend.iter().map(|b| b.to_string()).collect::<Vec<_>>()).unwrap(), default, console)
+    }
+
+    /// The console is the CI backend under CI and TCP otherwise, either teed to the same log, which adds to the file or
+    /// starts over with `serial_log_overwrite`. Any other port's default listener takes a free port under CI.
     #[test]
     fn the_console_is_ci_or_tcp_and_both_log_the_same_bytes() {
         let dir = std::env::temp_dir().join(format!("iris-serial-host-{}", std::process::id()));
@@ -979,26 +926,24 @@ pub(crate) mod tests {
         std::fs::write(&log, "stale").unwrap();
         let mut cfg = MachineConfig::default();
         cfg.serial_log = Some(log.to_string_lossy().into_owned());
-        cfg.serial_port_a = Some(0);
-        cfg.serial_port_b = Some(0);
+        cfg.ci = true;
 
         let ci = Arc::new(CiSerialBackend::new());
-        let (console, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], Some(&ci)).unwrap();
-        console.send_byte(b'c');
+        let console = |cfg: &MachineConfig, ci| line(cfg, &["tcp:8880"], true, Some(Console { ci, log: open_log(cfg, "Test") }));
+        let b = console(&cfg, Some(&ci));
+        b.send_byte(b'c');
         assert_eq!(ci.drain_guest(), b"c");
         assert_eq!(std::fs::read(&log).unwrap(), b"stalec", "added to what was there");
-        drop(console);
+        drop(b);
         cfg.serial_log_overwrite = true;
-        let (console, _) = console_backends(&cfg, "Test", ["port 1", "port 2"], Some(&ci)).unwrap();
-        console.send_byte(b'c');
+        console(&cfg, Some(&ci)).send_byte(b'c');
         assert_eq!(std::fs::read(&log).unwrap(), b"c", "started over");
-        assert_eq!(second.describe(), "nothing", "CI mode serves no TCP port, so the second port is wired to nothing");
+        let second = line(&cfg, &["tcp:8881"], true, None).describe();
+        assert!(second.starts_with("tcp 127.0.0.1:") && !second.contains(":8881"), "{second}");
 
-        drop(console);
-        let (console, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], None).unwrap();
-        assert!(second.describe().starts_with("tcp 127.0.0.1:"), "{}", second.describe());
-        console.send_byte(b't');
-        assert_eq!(std::fs::read(&log).unwrap(), b"t");
+        cfg.ci = false;
+        let b = console(&cfg, None);
+        assert!(b.describe().contains("127.0.0.1:8880"), "{}", b.describe());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1009,28 +954,14 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("iris-serial-host-line-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let log_path = dir.join("tcp.log");
-        let log = SerialLog::create(&log_path, Default::default()).unwrap();
-        let (backend, served) = serial_line(
-            &SerialLine { label: "Test", tcp_port: Some(0), tcp_setting: "port", socket: None, socket_setting: "socket" },
-            Some(log),
-            None,
-        );
-        assert!(served);
-        backend.send_byte(b't');
-        assert_eq!(std::fs::read(&log_path).unwrap(), b"t");
-
-        let log_path = dir.join("none.log");
-        let log = SerialLog::create(&log_path, Default::default()).unwrap();
-        let (backend, served) = serial_line(
-            &SerialLine { label: "Test", tcp_port: None, tcp_setting: "port", socket: None, socket_setting: "socket" },
-            Some(log),
-            None,
-        );
-        assert!(!served);
-        backend.send_byte(b'n');
-        assert_eq!(std::fs::read(&log_path).unwrap(), b"n");
-        assert!(backend.recv_byte().is_err());
+        let cfg = MachineConfig::default();
+        for (backend, name) in [(&["tcp:0"][..], "tcp"), (&[][..], "none")] {
+            let log_path = dir.join(format!("{name}.log"));
+            let log = SerialLog::create(&log_path, Default::default()).unwrap();
+            let b = line(&cfg, backend, false, Some(Console { ci: None, log: Some(log) }));
+            b.send_byte(b't');
+            assert_eq!(std::fs::read(&log_path).unwrap(), b"t", "{name}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1108,13 +1039,8 @@ pub(crate) mod tests {
         let sock = dir.join("console.sock");
         let log_path = dir.join("console.log");
         let log = SerialLog::create(&log_path, Default::default()).unwrap();
-        let path = sock.to_string_lossy().into_owned();
-        let (backend, served) = serial_line(
-            &SerialLine { label: "Test", tcp_port: Some(0), tcp_setting: "port", socket: Some(&path), socket_setting: "socket" },
-            Some(log),
-            None,
-        );
-        assert!(served);
+        let unix = format!("unix:{}", sock.display());
+        let backend = line(&MachineConfig::default(), &["tcp:0", &unix], false, Some(Console { ci: None, log: Some(log) }));
 
         let mut client = UnixStream::connect(&sock).unwrap();
         // The socket accepts on the guest's receive poll.
@@ -1173,13 +1099,11 @@ pub(crate) mod tests {
         let sock = dir.join("console.sock");
         let log_path = dir.join("console.log");
         let mut cfg = MachineConfig::default();
-        cfg.serial_log = Some(log_path.to_string_lossy().into_owned());
-        cfg.serial_port_a = Some(0);
-        cfg.serial_port_b = Some(0);
-        cfg.serial_socket_a = Some(sock.to_string_lossy().into_owned());
-
+        cfg.ci = true;
         let ci = Arc::new(CiSerialBackend::new());
-        let (console, _) = console_backends(&cfg, "Test", ["port 1", "port 2"], Some(&ci)).unwrap();
+        let log = SerialLog::create(&log_path, Default::default()).unwrap();
+        let unix = format!("unix:{}", sock.display());
+        let console = line(&cfg, &["tcp:0", &unix], false, Some(Console { ci: Some(&ci), log: Some(log) }));
         let mut client = UnixStream::connect(&sock).unwrap();
         let _ = console.recv_byte();
         console.send_byte(b'k');
@@ -1203,24 +1127,20 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The second port has its own log and socket; with neither TCP nor a
-    /// socket to serve it, it is wired to nothing.
+    /// A port's log and socket ends serve it as the console's do; a TCP port that is taken leaves it wired to nothing.
     #[cfg(unix)]
     #[test]
-    fn the_second_port_has_its_own_socket_and_log() {
+    fn a_ports_socket_and_log_ends_serve_it() {
         let dir = temp_dir("second");
         let sock = dir.join("b.sock");
         let log_path = dir.join("b.log");
         let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let mut cfg = MachineConfig::default();
-        cfg.serial_port_a = Some(0);
-        cfg.serial_port_b = Some(busy.local_addr().unwrap().port());
-        let (_, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], None).unwrap();
-        assert_eq!(second.describe(), "nothing", "a taken port with no socket leaves the port wired to nothing");
+        let cfg = MachineConfig::default();
+        let taken = format!("tcp:{}", busy.local_addr().unwrap().port());
+        assert_eq!(line(&cfg, &[&taken], false, None).describe(), "nothing", "a taken port with no socket leaves the port wired to nothing");
 
-        cfg.serial_socket_b = Some(sock.to_string_lossy().into_owned());
-        cfg.serial_log_b = Some(log_path.to_string_lossy().into_owned());
-        let (_, second) = console_backends(&cfg, "Test", ["port 1", "port 2"], None).unwrap();
+        let ends = [format!("unix:{}", sock.display()), format!("log:{}", log_path.display())];
+        let second = line(&cfg, &[&ends[0], &ends[1]], false, None);
         assert!(second.describe().starts_with("unix "), "the socket serves the port");
         let mut client = UnixStream::connect(&sock).unwrap();
         let _ = second.recv_byte();

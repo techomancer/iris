@@ -53,8 +53,7 @@ def config(iso: Path, cpu: str, sock: str, port: int) -> str:
     return f"""# Written by tools/netbsd-cd-boot.py.
 headless = true
 monitor_port = {port}
-serial_port_a = {port + 1}
-serial_port_b = {port + 2}
+devices = [ {{ type = "serial", at = "serial2", backend = "tcp:{port + 1}" }}, {{ type = "serial", at = "serial1", backend = "tcp:{port + 2}" }} ]
 nvram = "nvram.bin"
 serial_log = "serial.log"
 serial_log_overwrite = true

@@ -25,8 +25,7 @@ pub(crate) fn headless(dir: &std::path::Path, profile: crate::config::MachinePro
     cfg.headless = true;
     cfg.network.mode = crate::config::NetMode::Off;
     cfg.monitor_port = Some(0);
-    cfg.serial_port_a = Some(0);
-    cfg.serial_port_b = Some(0);
+    crate::dev::serial_host::tests::free_ports(&mut cfg);
     cfg
 }
 

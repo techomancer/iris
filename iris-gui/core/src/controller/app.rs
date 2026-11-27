@@ -1538,8 +1538,6 @@ mod tests {
         crate::model::hardware::clear_disks(&mut cfg);
         cfg.headless = true;
         cfg.monitor_port = Some(0);
-        cfg.serial_port_a = Some(0);
-        cfg.serial_port_b = Some(0);
         prefs.save_machine("indy", &mut cfg).unwrap();
         prefs.active_machine = Some("indy".into());
         prefs.save().unwrap();

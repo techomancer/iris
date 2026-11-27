@@ -779,13 +779,11 @@ impl OctaneMachine {
             .collect()
     }
 
-    /// IOC3's first port is the console: the CI socket's backend in CI
-    /// mode, otherwise TCP on `serial_port_a`, either teed to `serial_log`.
-    /// The second port serves TCP on `serial_port_b`.
+    /// IOC3's first port is the console unless `machine.console` names the second.
     fn connect_serial(cfg: &MachineConfig, ioc3: &Ioc3, ci: Option<&Arc<crate::dev::serial_host::CiSerialBackend>>) -> Result<(), String> {
-        let (console, second) = crate::dev::serial_host::console_backends(cfg, "Octane", ["IOC3 A", "IOC3 B"], ci)?;
-        ioc3.set_serial_backend(0, console);
-        ioc3.set_serial_backend(1, second);
+        let serial = |board, n| crate::dev::serial_dev::connect(cfg, "Octane", board, n, ci, None);
+        ioc3.set_serial_backend(0, serial("IOC3 A", 1)?);
+        ioc3.set_serial_backend(1, serial("IOC3 B", 2)?);
         Ok(())
     }
 
@@ -1526,16 +1524,14 @@ mod snapshot_tests {
         // Not CI mode: its overlays share one path per process, and the
         // tests run in parallel; this way each sits beside its own disk.
         cfg.network.mode = crate::config::NetMode::Off;
-        let held: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
-        let port = |i: usize| Some(held[i].local_addr().unwrap().port());
-        cfg.monitor_port = port(0);
-        cfg.serial_port_a = port(1);
-        cfg.serial_port_b = port(2);
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        cfg.monitor_port = Some(held.local_addr().unwrap().port());
         let disk = dir.join("disk.raw");
         if !disk.exists() {
             std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
         }
         cfg.devices.clear();
+        crate::dev::serial_host::tests::free_ports(&mut cfg);
         cfg.set_disk(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
         edit(&mut cfg);
         OctaneMachine::new(&cfg).expect("an Octane")

@@ -604,7 +604,7 @@ a forced termination; a normal stop saves them automatically.
 | Command | Description |
 |---|---|
 | `ports` | Every host socket iris is listening on, with what it is for: the monitor, port forwards (TCP and UDP), VNC, the GDB stub, the CI socket, serial and virtio console sockets |
-| `serial` / `serial map` | Every serial port of the machine, on every machine: its IRIX name (`ttydN`, `-` when IRIX makes no device for it), the part and port on the board (`SCC channel B`, `IOC4 0`, `L1`), which is the console, and what is connected now: TCP and Unix sockets with their client counts, the CI socket, the serial log, or a serial device (`hostserial` with the rate and framing it is set to and its modem lines, `midi_synth` with the messages and notes it has played, `midi_raw`) |
+| `serial` / `serial map` | Every serial port of the machine, on every machine: its name (`serialN`, `-` for the L1), the part and port on the board (`SCC channel B`, `IOC4 0`, `L1`), which is the console, and what is connected now: TCP and Unix sockets with their client counts, the CI socket, the serial log, or a serial device (`hostserial` with the rate and framing it is set to and its modem lines, `midi_synth` with the messages and notes it has played, `midi_raw`) |
 | `seeq status` | SEEQ 8003 ethernet state |
 | `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
 | `net interfaces` | Host interfaces available for PCAP |

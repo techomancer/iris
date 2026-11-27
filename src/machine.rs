@@ -358,60 +358,13 @@ impl Machine {
         let ioc = Ioc::new_for_profile(&timer_manager, guinness, cfg.machine.profile.ip28());
         ioc.ps2().set_layout(cfg.keyboard);
 
-        // One sink for both serial paths, so the CI and TCP logs are the same
-        // bytes (timestamps included). Opened once, before any peripheral
-        // `start()` clones the current backend Arc into the RX/TX threads.
+        // Channel B is serial1, the console; channel A is serial2. The log is opened here so a stop can flush it.
         let tag = if guinness { "Indy" } else { "Indigo2" };
         let serial_log = crate::dev::serial_host::open_log(&cfg, tag);
-
-        // Channel B (tty1) is the SGI serial console: in CI mode the
-        // in-process backend the control socket drives directly, otherwise
-        // TCP on `serial_port_b`, either teed to `serial_log`. Channel A
-        // (tty2) serves TCP on `serial_port_a` outside CI mode, so several
-        // `--ci` instances can run side by side.
-        let [port_a, port_b] = cfg.serial_ports();
         let ci_serial = ci_enabled.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
-        // A `[hostserial]`, `[spaceball]` or `[wacom]` section takes its port instead of the
-        // socket: serial1 (ttyd1) is channel B, serial2 (ttyd2) channel A.
-        let peripheral = |n: u8, log| crate::dev::serial_dev::peripheral(&cfg, n, log);
-        let label = format!("{tag} serial channel B");
-        let console = if let Some(b) = peripheral(1, serial_log.clone())? {
-            log::warn!("{tag}: serial1 is the console port; the PROM and IRIX console now go to the peripheral");
-            b
-        } else {
-            let (console, _) = crate::dev::serial_host::serial_line(
-                &crate::dev::serial_host::SerialLine {
-                    label: &label,
-                    tcp_port: Some(port_b),
-                    tcp_setting: "serial_port_b",
-                    socket: cfg.serial_socket_b.as_deref(),
-                    socket_setting: "serial_socket_b",
-                },
-                serial_log.clone(),
-                ci_serial.as_ref(),
-            );
-            console
-        };
-        ioc.scc().set_backend_b(crate::dev::serial_map::mapped(tag, "SCC channel B", Some(1), true, &cfg, console));
-        let label = format!("{tag} serial channel A");
-        let log_a = crate::dev::serial_host::open_log_at(&cfg, cfg.serial_log_a.as_deref(), &label);
-        let channel_a = if let Some(b) = peripheral(2, log_a.clone())? {
-            b
-        } else {
-            let (channel_a, _) = crate::dev::serial_host::serial_line(
-                &crate::dev::serial_host::SerialLine {
-                    label: &label,
-                    tcp_port: (!ci_enabled).then_some(port_a),
-                    tcp_setting: "serial_port_a",
-                    socket: cfg.serial_socket_a.as_deref(),
-                    socket_setting: "serial_socket_a",
-                },
-                log_a,
-                None,
-            );
-            channel_a
-        };
-        ioc.scc().set_backend_a(crate::dev::serial_map::mapped(tag, "SCC channel A", Some(2), false, &cfg, channel_a));
+        let serial = |board, n| crate::dev::serial_dev::connect(&cfg, tag, board, n, ci_serial.as_ref(), serial_log.as_ref());
+        ioc.scc().set_backend_b(serial("SCC channel B", 1)?);
+        ioc.scc().set_backend_a(serial("SCC channel A", 2)?);
         ioc.set_heartbeat(heartbeat.clone());
         ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).board_tick_rate());
         // Attach SCSI devices from config, each at its slot in the slot
@@ -1886,8 +1839,7 @@ mod controller_lifetime_tests {
                     let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
                     nvram_in(&mut cfg, &dir);
                     cfg.serial_log = Some(log);
-                    cfg.serial_port_a = Some(0);
-                    cfg.serial_port_b = Some(0);
+                    crate::dev::serial_host::tests::free_ports(&mut cfg);
                     cfg.serial_log_overwrite = overwrite;
                     Box::new(Machine::new(cfg))
                 })

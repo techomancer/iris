@@ -245,8 +245,7 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
             cfg.tezro.flash = Some(dir.file("flash").display().to_string());
             // The IOC4 ports the CI console does not take listen on TCP: any
             // free port, as for the monitor.
-            (cfg.serial_port_a, cfg.serial_port_b) = (Some(0), Some(0));
-            (cfg.tezro.serial_port_c, cfg.tezro.serial_port_d) = (Some(0), Some(0));
+            crate::dev::serial_host::tests::free_ports(&mut cfg);
         }
         _ => {}
     }

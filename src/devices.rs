@@ -122,6 +122,7 @@ pub const DEVICE_TYPES: &[DeviceTypeSpec] = &[
         parse: |_, o| options(o).map(|v: Virtio9pConfig| DeviceModel::Virtio9p(Virtio9pConfig { enabled: true, ..v })),
         slots: None,
     },
+    DeviceTypeSpec { name: "serial", family: DeviceFamily::Serial, keys: &["backend"], parse: serial_device, slots: None },
     DeviceTypeSpec { name: "hostserial", family: DeviceFamily::Serial, keys: &["path"], parse: serial_device, slots: None },
     DeviceTypeSpec { name: "midi_synth", family: DeviceFamily::Serial, keys: &["path", "gain"], parse: serial_device, slots: None },
     DeviceTypeSpec { name: "midi_raw", family: DeviceFamily::Serial, keys: &["path"], parse: serial_device, slots: None },
@@ -212,6 +213,7 @@ impl DeviceModel {
             DeviceModel::Scsi(ScsiDeviceConfig { path, .. }) | DeviceModel::Nvme(NvmeConfig { path, .. }) | DeviceModel::Serial(SerialDeviceConfig { path, .. }) if !path.is_empty() => {
                 format!("{} {path}", self.spec().name)
             }
+            DeviceModel::Serial(s) if !s.backend.is_empty() => format!("serial {}", s.backend.join(" ")),
             _ => self.spec().name.to_string(),
         }
     }
@@ -287,8 +289,17 @@ impl ConfiguredDevice {
         at.map(|a| t.insert("at".into(), a.into()));
         for kv in parts {
             let (k, v) = kv.split_once('=').ok_or_else(|| format!("--device {arg}: `{kv}` is not KEY=VALUE"))?;
-            let value = toml::from_str::<toml::Table>(&format!("v = {v}")).ok().and_then(|mut t| t.remove("v"));
-            t.insert(k.into(), value.unwrap_or_else(|| v.into()));
+            let value = toml::from_str::<toml::Table>(&format!("v = {v}")).ok().and_then(|mut t| t.remove("v")).unwrap_or_else(|| v.into());
+            // `backend=` repeats, one host end each, or takes a list.
+            if k == "backend" {
+                let list = t.entry(k).or_insert_with(|| toml::Value::Array(Vec::new())).as_array_mut().expect("a list");
+                match value {
+                    toml::Value::Array(ends) => list.extend(ends),
+                    end => list.push(end),
+                }
+            } else {
+                t.insert(k.into(), value);
+            }
         }
         ConfiguredDevice::from_table(t).map_err(|e| format!("--device {arg}: {e}"))
     }

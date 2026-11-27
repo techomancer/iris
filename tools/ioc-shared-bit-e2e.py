@@ -73,8 +73,7 @@ def config(base):
 ci = true
 ci_socket = "tcp:127.0.0.1:{base + 1}"
 monitor_port = {base}
-serial_port_a = {base + 3}
-serial_port_b = {base + 4}
+devices = [ {{ type = "serial", at = "serial2", backend = "tcp:{base + 3}" }}, {{ type = "serial", at = "serial1", backend = "tcp:{base + 4}" }} ]
 no_audio = true
 banks = [128, 0, 0, 0]
 nvram = "nvram.bin"

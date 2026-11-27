@@ -1,5 +1,7 @@
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, Ui};
 use iris::build_features;
+use iris::dev::serial_dev::{SerialDeviceConfig, SerialKind};
+use iris::devices::{ConfiguredDevice, DeviceModel};
 use iris::cpu::parts::Part;
 use std::path::Path;
 use iris::config::{AudioHost, CacheModel,
@@ -393,7 +395,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, &any_filters());
         ui.end_row();
 
-        // `serial_log_overwrite`: every log (`serial_log`, `serial_log_a/_b`)
+        // `serial_log_overwrite`: every log (`serial_log` and a line's `log:` ends)
         // is added to by default; this starts them over each run.
         ui.label("");
         ui.checkbox(&mut cfg.serial_log_overwrite, t!("config-serial-log-overwrite"))
@@ -447,29 +449,44 @@ pub fn monitor_port(cfg: &MachineConfig) -> u16 {
     iris_gui_core::controller::debug::monitor_port(cfg)
 }
 
-/// `monitor_port`, `serial_port_a`, `serial_port_b`: the loopback TCP ports of
-/// the monitor console and the two serial channels. Two machines running at
-/// once (this app and a CLI `iris`, say) need different ones. Read at Start.
+/// `monitor_port` and each serial port's TCP listener (its `serial` entry's `tcp:` end, else the default): loopback ports that
+/// two machines running at once (this app and a CLI `iris`, say) need different. Read at Start.
 fn show_host_ports(ui: &mut Ui, cfg: &mut MachineConfig) {
     ui.separator();
     ui.heading(t!("config-host-ports"));
-    let [def_a, def_b] = iris::dev::z85c30::DEFAULT_PORTS;
+    let mut ports = vec![monitor_port(cfg)];
     Grid::new("host_ports_grid").num_columns(2).striped(true).show(ui, |ui| {
         port_row(ui, t!("config-port-monitor"), t!("config-port-monitor-tip"),
                  &mut cfg.monitor_port, iris::monitor::DEFAULT_PORT);
-        // The console is channel B on the Indy and Indigo2 and channel A on
-        // the other machines (whose L1, where fitted, is in Advanced).
-        if crate::extra_ui::mc_machine(cfg.machine.profile) {
-            port_row(ui, t!("config-port-serial1"), t!("config-port-serial1-tip"),
-                     &mut cfg.serial_port_b, def_b);
-            port_row(ui, t!("config-port-serial2"), t!("config-port-serial2-tip"), &mut cfg.serial_port_a, def_a);
-        } else {
-            port_row(ui, t!("config-port-serial1"), t!("config-port-serial1-tip"),
-                     &mut cfg.serial_port_a, def_a);
-            port_row(ui, t!("config-port-serial2"), t!("config-port-serial2-tip"), &mut cfg.serial_port_b, def_b);
+        for (n, default) in iris::dev::serial_dev::ports(cfg.machine.profile).iter().filter_map(|p| Some((p.0, p.1?))) {
+            let at = format!("serial{n}");
+            let entry = cfg.devices.iter().position(|d| d.at.as_deref() == Some(&at));
+            let mut port = match entry.map(|i| &cfg.devices[i].device) {
+                None => None,
+                // An entry with no `tcp:` end listens on no port.
+                Some(DeviceModel::Serial(s)) if s.kind == SerialKind::Line => match s.tcp_port() {
+                    Some(p) => Some(p),
+                    None => continue,
+                },
+                Some(_) => continue,
+            };
+            let before = port;
+            port_row(ui, t!("config-port-serial", line = at.clone()), t!("config-port-serial-tip"), &mut port, default);
+            // The default is written out too: an entry with no `tcp:` end would leave the port unplugged.
+            let listen = port.unwrap_or(default);
+            ports.push(listen);
+            if port == before {
+                continue;
+            }
+            match entry {
+                Some(i) => if let DeviceModel::Serial(s) = &mut cfg.devices[i].device { s.set_tcp_port(Some(listen)) },
+                None => {
+                    let line = SerialDeviceConfig { kind: SerialKind::Line, backend: vec![format!("tcp:{listen}")], ..Default::default() };
+                    cfg.devices.push(ConfiguredDevice::new(&at, DeviceModel::Serial(line)));
+                }
+            }
         }
     });
-    let mut ports = vec![monitor_port(cfg), cfg.serial_ports()[0], cfg.serial_ports()[1]];
     if let Some(g) = cfg.gdb_port { ports.push(g); }
     let mut sorted = ports.clone();
     sorted.sort_unstable();

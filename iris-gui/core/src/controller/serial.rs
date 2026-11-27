@@ -76,7 +76,7 @@ impl SerialConsoleController {
 
     pub(crate) fn apply(&mut self, action: SerialAction, cfg: &iris::config::MachineConfig, notify: Arc<dyn Notify>) {
         match action {
-            SerialAction::Open => self.console = Some(SerialConsole::connect(console_port(cfg), notify)),
+            SerialAction::Open => self.console = console_port(cfg).map(|port| SerialConsole::connect(port, notify)),
             SerialAction::Close => self.console = None,
             SerialAction::SendLine(line) => {
                 if let Some(c) = &self.console {
@@ -101,7 +101,7 @@ impl SerialConsoleController {
     /// A new machine started: an open console reconnects to its listener.
     pub(crate) fn reconnect(&mut self, cfg: &iris::config::MachineConfig, notify: Arc<dyn Notify>) {
         if self.console.is_some() {
-            self.console = Some(SerialConsole::connect(console_port(cfg), notify));
+            self.console = console_port(cfg).map(|port| SerialConsole::connect(port, notify));
         }
     }
 }

@@ -4,8 +4,8 @@ Status: **in progress**, 2026-11-27. Done: Phase 1 line state on every
 UART (Z85C30 and the 16550 core: O2 MACE with the TI prescaler, IOC3 with
 half-step prescaler at 22 MHz, IOC4, L1 untouched). Devices are
 `[[devices]]` types in `DeviceFamily::Serial` at slots `serialN` (a numbered
-`serial` slot-path step, N = IRIX ttydN, declared for every machine from
-`serial_dev::ports`; `at` required, the family only goes where named):
+`serial` slot-path step, N = the number printed on the case, declared for
+every machine from `serial_dev::ports`; `at` required, the family only goes where named):
 `hostserial` (raw host tty, `host_tty.rs`, termios, Linux/macOS),
 `midi_synth` (rustysynth, own iris-audio stream, 5 ms blocks, `gain` times
 master volume 0.5), `midi_raw` (`HostTty::open_midi`: a non-tty rawmidi node
@@ -14,9 +14,11 @@ passes bytes, a tty is set up as hostserial). The interim `[hostserial]`,
 Verified: IP24 Spaceball 5000 FLX with IRIX's Magellan driver and the
 confidence test (user, 2026-11-26), Octane the same day, Tezro midi_synth
 (startmidi -p rs232 on ttyd3, libmd scale) and midi_raw on a CH345 cable
-playing a Roland MT-90s (user). Tezro: ttyd1 is the L1 console, ttyd3/ttyd4
-are IOC4 ports 0/1 (probed). Fuel and Origin 3000 assume IOC3 A/B =
-ttyd1/ttyd2, not probed. Not done: SCC pacing (still 2.7x fast), rawmidi on
+playing a Roland MT-90s (user). Tezro: the DB9s labelled 1 and 2 are IOC4
+ports 0/1, serial1/serial2 (IRIX showed them as ttyd3/ttyd4; probed). Fuel and
+Origin 3000 assume IOC3 A/B = ttyd1/ttyd2, not probed. Ports are named by the
+case's number because IRIX assigns ttyd numbers per install, in the order it
+first sees each port. Not done: SCC pacing (still 2.7x fast), rawmidi on
 Windows/macOS, the event-driven `wacom` and `spaceball` types (host tablet
 events, host 6DOF device), each `type` with `at = "serialN"` and no path.
 
@@ -66,7 +68,7 @@ Decisions (user, 2026-11-26):
   (commands it sends, baud it sets, packet length it expects). The user is
   also looking for an SGI example Wacom driver.
 - How the module is attached (the `idev` interface, `/usr/lib/X11/input/config`,
-  `xsetdev`, or a `streams` push on `ttydN`) and how the X server then uses
+  `xsetdev`, or a `streams` push on the port's `/dev/ttydN`) and how the X server then uses
   it is still to be learned; it decides what a guest test looks like.
 - MIDI: IRIX drives a Mac-style interface through `startmidi`; see
   `docs/peripherals/midi.md` for the clocking the guest programs.
@@ -240,7 +242,7 @@ own against the doc tables. Rules:
 ```toml
 [[devices]]
 type = "midi_synth"     # hostserial | midi_synth | midi_raw; later wacom, spaceball
-at = "serial2"          # IRIX's /dev/ttyd2; required
+at = "serial2"          # the number on the case; required
 path = "GeneralUser.sf2"
 gain = 2.0              # midi_synth only
 ```

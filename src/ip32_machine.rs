@@ -223,14 +223,11 @@ impl O2Machine {
             kits.iter().map(|k| format!("{k}")).collect::<Vec<_>>().join("+"),
             if cfg.headless { "serial console" } else { "graphics console" }
         );
-        // The console UART's host end: in CI mode the in-process backend
-        // the CI socket types into, otherwise TCP on `serial_port_a` (as the
-        // Indy's channel A), either teed to `serial_log` when one is set. The
-        // second port serves TCP on `serial_port_b`.
+        // The first UART is the console unless `machine.console` names the second.
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
-        let (console, second) = crate::dev::serial_host::console_backends(cfg, "O2", ["MACE UART 0", "MACE UART 1"], ci_serial.as_ref())?;
-        bus.mace.com0.set_backend(console);
-        bus.mace.com1.set_backend(second);
+        let serial = |board, n| crate::dev::serial_dev::connect(cfg, "O2", board, n, ci_serial.as_ref(), None);
+        bus.mace.com0.set_backend(serial("MACE UART 0", 1)?);
+        bus.mace.com1.set_backend(serial("MACE UART 1", 2)?);
         // The Ethernet on the NAT gateway `[network]` describes (`mode =
         // "off"` leaves it unplugged; validate refuses pcap here for now).
         let (mut nat, mut frames) = (None, None);

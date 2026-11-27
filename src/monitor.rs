@@ -265,7 +265,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
                 let cmds: Vec<_> = devs.iter().flat_map(|d| d.register_commands()).collect();
                 let _ = writeln!(writer, "{:12} - {}", "watch", WATCH_HELP);
                 let _ = writeln!(writer, "{:12} - {}", "ports", "ports: the host sockets iris listens on (monitor, telnet and other port forwards, VNC, GDB, CI, serial and virtio sockets)");
-                let _ = writeln!(writer, "{:12} - {}", "serial", "serial [map]: each serial port, its IRIX name (ttydN), the console, and what it is connected to (sockets and clients, CI, log, a host serial port and its line); serial status: the SCC's registers (Indy, Indigo2)");
+                let _ = writeln!(writer, "{:12} - {}", "serial", "serial [map]: each serial port, its name (serialN), the console, and what it is connected to (sockets and clients, CI, log, a host serial port and its line); serial status: the SCC's registers (Indy, Indigo2)");
                 if !cmds.iter().any(|(c, _)| c == "audio") {
                     let _ = writeln!(writer, "{:12} - {}", "audio", "audio status: each sound card's frames moved and skipped, and its host stream");
                 }

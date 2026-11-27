@@ -110,7 +110,7 @@ no_audio = true
 banks = [128, 128, 0, 0]
 nvram = "{work}/nvram.bin"
 monitor_port = {a.monitor_port}
-serial_socket_b = "{sock}"
+devices = [ {{ type = "serial", at = "serial1", backend = "unix:{sock}" }} ]
 [machine]
 profile = "indy_ip24"
 cpu = "r4400_150"

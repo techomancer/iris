@@ -831,7 +831,7 @@ impl App {
                     self.run_app(AppAction::Session(SessionAction::Screenshot));
                     ui.close();
                 }
-                if ui.add_enabled(running, egui::Button::new(t!("menu-machine-serial-console")))
+                if ui.add_enabled(running && serial_console::console_port(&self.app.config()).is_some(), egui::Button::new(t!("menu-machine-serial-console")))
                     .tip(t!("menu-machine-serial-console-tip"))
                     .clicked()
                 {
@@ -1013,8 +1013,9 @@ impl App {
                     self.open_camera_test();
                     ui.close();
                 }
-                if ui.add_enabled(running, egui::Button::new(t!("menu-help-serial-console")))
-                    .tip(t!("menu-help-serial-console-tip", port = serial_console::console_port(&self.app.config()).to_string()))
+                let console = serial_console::console_port(&self.app.config());
+                if ui.add_enabled(running && console.is_some(), egui::Button::new(t!("menu-help-serial-console")))
+                    .tip(t!("menu-help-serial-console-tip", port = console.map_or("-".into(), |p| p.to_string())))
                     .on_disabled_hover_text(t!("menu-help-start-first-tip"))
                     .clicked()
                 {
@@ -2081,7 +2082,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(RichText::new(t!("help-network-serial-heading")).strong());
                     ui.label(t!("help-network-serial",
-                        serial = self.app.config().serial_ports()[1].to_string(),
+                        serial = serial_console::console_port(&self.app.config()).map_or("-".into(), |p| p.to_string()),
                         monitor = config_ui::monitor_port(&self.app.config()).to_string()));
                     ui.add_space(6.0);
                     ui.label(RichText::new(t!("help-privacy")).strong());
@@ -2877,8 +2878,6 @@ mod machine_storage_integration {
         cfg.devices.clear();
         cfg.headless = true;
         cfg.monitor_port = Some(0);
-        cfg.serial_port_a = Some(0);
-        cfg.serial_port_b = Some(0);
         cfg.ci_socket = "control.sock".into();
         prefs.save_machine("alpha", &mut cfg).unwrap();
         prefs.save_machine("beta", &mut cfg).unwrap();

@@ -182,7 +182,7 @@ pub(crate) fn slot_alias<'a>(slots: &'a [MachineSlot], name: &str) -> Option<&'a
     slots.iter().find(|s| s.aliases.iter().any(|a| a == name)).map(|s| &s.path)
 }
 
-fn machine_name(profile: MachineProfile) -> &'static str {
+pub(crate) fn machine_name(profile: MachineProfile) -> &'static str {
     profile.product_name().unwrap_or(profile.label())
 }
 
@@ -237,8 +237,8 @@ impl MachineProfile {
             P::TezroIp53 => crate::ip53_machine::slots(&mut s),
             P::Origin3200Ip35 | P::Onyx3000Ip35 => crate::ip35_machine::slots(&mut s, self == P::Onyx3000Ip35),
         }
-        // The serial ports a device can take, by IRIX's /dev/ttydN.
-        for n in crate::dev::serial_dev::ports(self) {
+        // The serial ports a device can take, by the number on the case.
+        for (n, _) in crate::dev::serial_dev::ports(self) {
             open_slot(&mut s, &format!("serial{n}"), &[DeviceFamily::Serial], &[]);
         }
         s
@@ -277,6 +277,11 @@ impl DevicePlacement {
             let first = || slots.iter().find(|s| s.kind.takes(DeviceFamily::Gfx, false)).map(|s| s.path.to_string());
             let at = (cfg.machine.profile == MachineProfile::Onyx3000Ip35).then(|| crate::ip35_machine::default_at(cfg)).flatten().or_else(first);
             devices.push(ConfiguredDevice { at, ..ConfiguredDevice::new("", DeviceModel::Graphics) });
+        }
+        // A port no entry takes keeps its default listener.
+        for (n, tcp) in crate::dev::serial_dev::ports(cfg.machine.profile).iter().filter_map(|p| Some((p.0, p.1?))) {
+            let line = crate::dev::serial_dev::SerialDeviceConfig { kind: crate::dev::serial_dev::SerialKind::Line, backend: vec![format!("tcp:{tcp}")], ..Default::default() };
+            devices.push(ConfiguredDevice { default: true, ..ConfiguredDevice::new(&format!("serial{n}"), DeviceModel::Serial(line)) });
         }
         let (slots, at) = layout(machine, slots, &devices);
         DevicePlacement { slots, machine, devices, at, pci: HashMap::new() }
@@ -857,8 +862,8 @@ mod tests {
             vec!["gfx", "-", "-", "a graphics board"],
             vec!["gio1", "-", "-", "virtio devices"],
             vec!["gio0", "-", "-", "gio cards, virtio devices"],
-            vec!["serial1", "-", "-", "serial devices"],
-            vec!["serial2", "-", "-", "serial devices"],
+            vec!["serial1", "-", "serial tcp:8881 (default)", "-"],
+            vec!["serial2", "-", "serial tcp:8880 (default)", "-"],
         ]);
     }
 

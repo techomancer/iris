@@ -23,8 +23,8 @@ selects `machine.profile = "fuel_ip34"`. The machine always runs its one R14000 
 `machine.cpu` may name it or be left out, and any other value is
 refused. The sample sets `banks = [256, 256]`, `headless = true`,
 `no_audio = true` and serial ports 18880 and 18881. `[machine]` also
-selects the boot-flash backing file, the console (`l1`, `ioc3_a` or
-`ioc3_b`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
+selects the boot-flash backing file, the console (`l1`, `serial1` or
+`serial2`) and the L1's TCP port and log; [FEATURES.md](../FEATURES.md#fuel)
 lists its keys.
 
 An `ice1724` device fits an audio card: the IC Ensemble ICE1724 with
