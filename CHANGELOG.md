@@ -42,6 +42,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   `log l1d` need a `developer` build; before, every build but `lightning` paid
   a check per access for them.
 
+### Console
+
+- `headless` now means no window and `console=d` stored in the guest's NVRAM,
+  the same on every machine, so the PROM and IRIX use the serial console. It
+  no longer removes the Newport or the O2's keyboard; leave graphics out with
+  `[graphics] board = "none"`, which the Indy and Indigo2 now accept. iris-gui
+  loses its "Headless mode" checkbox. A saved config with `headless = true`
+  now writes `console=d` into its NVRAM file at the next start, and iris says
+  so on startup.
+
 ### Serial ports
 
 - A serial port can carry a device in place of its socket, on every machine:

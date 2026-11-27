@@ -722,3 +722,14 @@ fn a_reset_ends_the_fuels_clock_write() {
         assert_eq!(pio.read8(control).data & 0x80, 0, "the write latch survived the reset");
     });
 }
+
+/// `headless` stores console=d in the Fuel's and the Origin 3200's base I/O store.
+#[test]
+fn headless_stores_console_d() {
+    let dir = TempPath::dir("fuel-headless");
+    with_machine(fuel_config(&dir), |_| ());
+    assert!(crate::sn::tests::baseio_console_is_serial(&dir), "Fuel");
+    let dir = TempPath::dir("origin3200-headless");
+    with_machine(crate::ip35::test_support::config(&dir, 1), |_| ());
+    assert!(crate::sn::tests::baseio_console_is_serial(&dir), "Origin 3200");
+}

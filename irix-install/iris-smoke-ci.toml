@@ -1,4 +1,5 @@
 # Ephemeral CI smoke config (generated for Phase 3 verification).
+# No window; console=d goes into the NVRAM. Graphics stay fitted.
 headless = true
 ci = true
 ci_socket = "127.0.0.1:19851"

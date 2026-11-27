@@ -154,7 +154,7 @@ pub struct Machine {
     nvram_path: String,
     /// Host-forced Newport resolution from `[graphics] resolution` at construction.
     display_resolution: crate::dev::ng1::vc2_timings::NewportResolution,
-    /// Whether Newport is active (not headless and Newport is selected).
+    /// Whether Newport is the selected graphics board.
     newport_active: bool,
     /// Indigo2 IP22 fullhouse layout (`!guinness`).
     fullhouse: bool,
@@ -276,7 +276,7 @@ impl Machine {
         #[cfg(feature = "jitv2")]
         let jitv2_compile = cfg.jitv2.compile;
         let display_resolution = cfg.graphics.resolution;
-        let newport_active = !cfg.headless && cfg.graphics_board() == GraphicsBoard::Newport;
+        let newport_active = cfg.graphics_board() == GraphicsBoard::Newport;
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let cfg_cpu_model = cfg.cpu_part().expect("validate() accepted the cpu");
 
@@ -446,11 +446,15 @@ impl Machine {
         if guinness {
             hpc3.rtc().backdoor_set_mac_if_blank(cfg.network().mac);
             hpc3.rtc().initialize_nvram_if_erased(crate::dev::sgi_nvram::REV_IP22);
+            let (rtc, rev) = (hpc3.rtc(), crate::dev::sgi_nvram::REV_IP22);
+            crate::nv_storage::apply_headless_console(cfg.headless, "Indy", &cfg.nvram, rtc.console_is_serial(rev), || rtc.set_console_serial(rev));
         } else {
             let mut eeprom = eeprom_hpc3.lock();
             eeprom.backdoor_set_mac_if_blank(cfg.network().mac);
             let rev = if cfg.machine.profile.ip28() { crate::dev::sgi_nvram::REV_IP28 } else { crate::dev::sgi_nvram::REV_IP22 };
             eeprom.initialize_if_erased(rev);
+            let serial = eeprom.console_is_serial(rev);
+            crate::nv_storage::apply_headless_console(cfg.headless, "Indigo2", &cfg.nveeprom, serial, || eeprom.set_console_serial(rev));
         }
 
         // A DaynaPort is built where the gateway is, by Hpc3; a target that
@@ -512,8 +516,8 @@ impl Machine {
                 crate::dev::ng1::rex3::ResidentDisplayMode::ReadbackCompatibility,
         };
 
-        // REX3 Graphics — Newport only; skipped in headless mode or when non-Newport board selected.
-        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
+        // REX3 Graphics — Newport only; skipped when another board, or none, is selected.
+        let rex3: Option<Arc<Rex3>> = if cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
             None
         } else {
             let r = Rex3::new(status.clone());
@@ -534,7 +538,7 @@ impl Machine {
             Some(r)
         };
 
-        let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || !gio.iter().any(|c| matches!(c.1, Card::Newport)) {
+        let rex3_head1: Option<Arc<Rex3>> = if !gio.iter().any(|c| matches!(c.1, Card::Newport)) {
             None
         } else {
             let r = Rex3::new(status.clone());
@@ -567,8 +571,7 @@ impl Machine {
             Some(r)
         };
 
-        // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
-        // selecting the board is explicit, and the PROM needs it to probe.
+        // GR2 (XZ / Extreme) in the GIO gfx slot, when the board is selected.
         let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
             crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Elan | crate::config::GraphicsBoard::Extreme => {
                 use crate::config::GraphicsBoard;
@@ -2164,7 +2167,7 @@ mod stop_order_tests {
         let mut machine = big_stack(move || {
             let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
             crate::test_temp::nvram_in(&mut cfg, &nv);
-            cfg.headless = false;
+            cfg.graphics.board = Some(GraphicsBoard::Newport);
             Box::new(Machine::new(cfg))
         });
         let hpc3 = machine.hpc3.clone();
@@ -2371,12 +2374,12 @@ mod gr2_checkpoint_tests {
                 .contains("running board"));
             extreme.stop();
 
-            let mut newport = Box::new(Machine::new(config(&path, GraphicsBoard::Newport)));
-            assert!(newport
+            let mut bare = Box::new(Machine::new(config(&path, GraphicsBoard::None)));
+            assert!(bare
                 .load_snapshot_paused("gr2-m15")
                 .unwrap_err()
                 .contains("machine has no GR2 board"));
-            newport.stop();
+            bare.stop();
         });
     }
 }
@@ -2515,10 +2518,13 @@ mod virtio_tests {
     #[cfg(unix)]
     #[test]
     fn ip28_has_both_devices_in_their_slots() {
+        let nv = crate::test_temp::TempPath::dir("virtio-both-nv");
+        let nv_dir = nv.to_path_buf();
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(|| {
+            .spawn(move || {
                 let mut cfg = MachineConfig::default();
+                crate::test_temp::nvram_in(&mut cfg, &nv_dir);
                 cfg.devices.clear();
                 cfg.headless = true;
                 cfg.machine.profile = MachineProfile::Indigo2Ip28;
@@ -2559,5 +2565,41 @@ mod virtio_tests {
         };
         let both = "[virtio_serial]\nenabled = true\n[virtio_9p]\nenabled = true\npath = \"/tmp\"\n";
         assert_eq!(places(both).unwrap(), ["xio15/pci0/7", "xio15/pci0/5"]);
+    }
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use crate::display_stop_tests::{big_stack, scratch};
+
+    fn build(dir: &std::path::Path, profile: MachineProfile, headless: bool) -> Box<Machine> {
+        let nv = dir.to_path_buf();
+        big_stack(move || {
+            let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &parts::R4400_150);
+            crate::test_temp::nvram_in(&mut cfg, &nv);
+            cfg.machine.profile = profile;
+            cfg.headless = headless;
+            cfg.graphics.board = Some(GraphicsBoard::Newport);
+            Box::new(Machine::new(cfg))
+        })
+    }
+
+    #[test]
+    fn headless_indy_keeps_its_newport_and_stores_console_d() {
+        let dir = scratch("headless-indy");
+        let m = build(&dir, MachineProfile::IndyIp24, true);
+        assert!(m.board.rex3.is_some(), "headless does not drop the Newport");
+        assert!(m.hpc3.rtc().console_is_serial(crate::dev::sgi_nvram::REV_IP22));
+        let dir = scratch("windowed-indy");
+        assert!(!build(&dir, MachineProfile::IndyIp24, false).hpc3.rtc().console_is_serial(crate::dev::sgi_nvram::REV_IP22));
+    }
+
+    #[test]
+    fn headless_indigo2_keeps_its_newport_and_stores_console_d() {
+        let dir = scratch("headless-indigo2");
+        let m = build(&dir, MachineProfile::Indigo2Ip22, true);
+        assert!(m.board.rex3.is_some());
+        assert!(m.hpc3.eeprom().lock().console_is_serial(crate::dev::sgi_nvram::REV_IP22));
     }
 }

@@ -196,7 +196,7 @@ fn main() {
     let show_window = !headless && !no_board && !(ci_enabled && !ci_display);
     if !show_window {
         if headless {
-            eprintln!("iris: running headless (no REX3, no window)");
+            eprintln!("iris: running headless (no window)");
         } else if no_board {
             eprintln!("iris: no graphics board attached: running on the serial console, no window");
         } else if ci_enabled {

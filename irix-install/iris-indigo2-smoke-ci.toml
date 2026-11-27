@@ -3,6 +3,7 @@
 # Use: iris.exe --config irix-install/iris-indigo2-smoke-ci.toml
 # Verify: monitor mc status → SYSID 00000010; ioc status → sys_id=11
 
+# No window; console=d goes into the EEPROM. Graphics stay fitted.
 headless = true
 ci = true
 ci_socket = "127.0.0.1:19851"

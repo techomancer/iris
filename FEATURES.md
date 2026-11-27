@@ -236,12 +236,12 @@ the first `[section]`, because TOML tables continue until the next header.
 | `nveeprom` | `"nveeprom.bin"` | Indigo2 motherboard EEPROM file. GUI paths are relative to the selected machine folder. |
 | `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (two banks on the Fuel, eight on the Tezro and the IP35 brick machines, four elsewhere; entries beyond the profile's bank count must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
-| `headless` | `false` | Suppress the standalone window. Newport is not fitted; O2 uses a serial console. Other graphics boards can remain fitted. Audio is independent. |
+| `headless` | `false` | No window, and `console=d` stored in the guest's NVRAM (byte for byte what the PROM's `setenv console d` writes, checksum included), so the PROM and IRIX use the serial console on every machine. It changes no hardware: graphics boards and input stay as configured, and `[graphics] board = "none"` leaves the graphics out. The setting persists in the NVRAM file: a later run without `headless` keeps the serial console and prints one line saying so. A snapshot restore brings its own console setting back. Audio is independent. |
 | `no_audio` | `false` | Disable host audio output. The Indy and Indigo2 then have no HAL2; the O2's MACE audio, the Octane's and Onyx2's RAD1 and the Tezro's ICE1724 stay fitted and run silently. |
 | `keyboard` | `ansi` | Physical shape of the host keyboard: `ansi` (US, `\|` above Enter), `iso` (European) or `jis` (Japanese 106/109; use it with the PROM's `keybd` set to Japanese). It decides which SGI key the host's ambiguous key left of Enter sends; the guest applies the character layout. `--keyboard` overrides. |
 | `gdb_port` | `unset` | Start the GDB TCP stub; debugging is unavailable in lightning builds. |
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
-| `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
+| `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when `console=d`. |
 | `serial_port_b` | `8881 when unset` | SCC channel B listener (tty1/console); the O2's second serial port. GUI halt uses this port. |
 | `serial_socket_a` | `unset` | Also serve serial channel A on this Unix socket (raw bytes, one client at a time). |
 | `serial_socket_b` | `unset` | Likewise for channel B. With `ci` the console stays readable through `serial-read` and `wait-serial` as well. |
@@ -563,7 +563,7 @@ its environment; the DS1687's RAM goes beside it in `<nvram>.rtc`, the
 Octane's 512-byte image, and its clock in `<nvram>.rtc.clock`), `banks`
 (the kit in each of the four DIMM pairs: 32, 64,
 128 or 256 MB, largest first), `serial_port_a`/`serial_port_b`/`serial_log`,
-`headless` (serial console instead of the graphics console and keyboard),
+`headless` (no window; `console=d` in the flash environment),
 `[clock] fixed_mhz` (CP0 Count; the CPU runs at twice it, so 90 MHz is a
 180 MHz O2), `[network]` including `mac` and `mode = "off"` for an unplugged
 Ethernet, `[[port_forward]]`, `nat_subnet`, `[nfs]` and `[[devices]]`
@@ -649,7 +649,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--device SPEC` | Place a device: `[NAME:]TYPE[@SLOT][,KEY=VALUE]...`, as a `[[devices]]` entry (`hdd@scsi0/t1,path=irix65.raw`; a value is read as TOML when it parses as one). A named one replaces the file's device of that name. |
 | `--list-slots` | Print every slot on the machine, its aliases, what is in it and what it takes, then exit. |
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
-| `--headless` | Suppress the standalone window (platform-specific graphics/console behavior, as `headless`; audio unaffected) |
+| `--headless` | No window and `console=d` in the guest's NVRAM, as `headless`; hardware and audio unaffected |
 | `--noaudio` | Disable host audio output, as `no_audio`; graphics is unaffected |
 | `--audio-host <HOST>` | Host audio system: `default`, `pulse`, `wasapi`, `coreaudio` or `null` (overrides `[audio] host`) |
 | `--nfs-dir` | Enable NFS share: path to the directory to export (enables NFS) |
@@ -680,7 +680,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--rsh-dir` | Let the guest `rsh <gateway> cat\|dd\|ls\|echo\|pwd` against this directory, read-only, through a built-in rsh server at the gateway (TCP 514). Nothing is executed on the host. Off when unset. |
 | `--perfetto FILE` | Record a Perfetto trace from startup (`perfetto` builds). `--perfetto-cats LIST` (default `all`) and `--perfetto-clock host\|guest` (default `host`) select what and on which timeline. See [docs/perfetto.md](docs/perfetto.md). |
 | `--load-elf` | Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the CPU starts and set PC to its entry point, instead of booting the PROM. For bare-metal test binaries; see also the monitor's `loadelf`. |
-| `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active unless --headless is explicitly set. |
+| `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active. |
 | `--ci-socket` | Override the default control-socket path (`iris.sock` in `$TMPDIR`, else `/tmp`; `iris-ci` finds it there only under the same `TMPDIR`). |
 | `--ci-display` | With --ci, keep the Newport window visible for interactive test development (deferred rendering at 10–15 fps). |
 | `--serial-log` | Write every byte the guest emits on its serial console to this file, as `serial_log`. Useful for live tailing during an install. |

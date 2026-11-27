@@ -29,7 +29,7 @@ timeout "$TIMEOUT" "$IRIS" \
     --config run/bare.toml \
     --load-elf "$ELF" \
     --test-device \
-    --headless --noaudio \
+    --noaudio \
     "$@" 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 

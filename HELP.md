@@ -701,8 +701,8 @@ WireGuard) instead of relying on it.
 
 It works with every graphics board through the common display interface, with
 the normal window open or under `--ci` with no window. A graphics board must be
-fitted and producing frames: a serial-only machine, or an Indy or Indigo2
-whose Newport `--headless` removed, has no screen to serve. The window, the
+fitted and producing frames: a machine with `[graphics] board = "none"` has no
+screen to serve. The window, the
 monitor and any number of viewers can type and click at the same time.
 
 **iris-gui** serves the screen too: set **Serve on** in the Performance tab
@@ -757,7 +757,7 @@ nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
-headless = false            # no window; drops Newport, the O2 boots on its serial console (audio unaffected)
+headless = false            # no window, and console=d stored in the guest's NVRAM (hardware and audio unaffected)
 no_audio = false            # no sound device output (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
 vsync = false               # true = wait for the host monitor's vertical sync
@@ -1032,7 +1032,7 @@ Display and audio
   --renderer <RENDERER>       gl (default) or wgpu (builds with the wgpu feature)
   --raster <UNIT>             VPro, IMPACT: cpu (default) or wgpu
   --keyboard <LAYOUT>         Host keyboard: ansi (default), iso or jis
-  --headless                  No window; drops Newport (other boards stay fitted), O2 uses serial
+  --headless                  No window; stores console=d in the NVRAM (serial console), hardware unchanged
   --noaudio                   Disable sound device output (graphics unaffected)
   --audio-host HOST           Host audio: default, pulse, wasapi, coreaudio or null
 
@@ -1095,7 +1095,10 @@ iris --device cdrom@scsi0/t4,path=irix65.iso
 # Point to a config file in another directory
 iris --config /opt/iris/my_machine.toml
 
-# Headless — no window, suitable for Docker/CI (audio still active)
+# Headless — no window, serial console, suitable for Docker/CI (audio still active).
+# It writes console=d into the NVRAM file, so a later run with a window keeps the
+# serial console until the guest runs `setenv console g`. A restored snapshot
+# brings its own console setting back. To leave graphics out, set `[graphics] board = "none"`.
 iris --headless
 
 # Headless with audio also disabled (lightest possible server mode)

@@ -451,7 +451,7 @@ mod resident_gate_tests {
     fn resident_board_loss_reaches_machine_with_the_event_queue_full() {
         with_big_stack(|| {
             let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &crate::cpu::parts::R4400_150);
-            cfg.headless = false;
+            cfg.graphics.board = Some(crate::config::GraphicsBoard::Newport);
             // This test must not load or overwrite a user's battery-backed state.
             cfg.nvram.clear();
             cfg.nveeprom.clear();

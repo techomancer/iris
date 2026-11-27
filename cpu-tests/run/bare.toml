@@ -8,11 +8,13 @@
 # well under 8 MB, so this is far more than it needs.
 
 banks = [128, 128, 0, 0]
-headless = true
 no_audio = true
 
 [machine]
 profile = "indy_ip24"
+
+[graphics]
+board = "none"
 
 # No SCSI at all. The `scsi` key must be present-but-empty: when it is
 # missing entirely, serde falls back to default_scsi(), which attaches

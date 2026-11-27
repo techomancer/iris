@@ -614,7 +614,7 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = crate::extra_ui::mc_machine(cfg.machine.profile) && cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
+    let newport = crate::extra_ui::mc_machine(cfg.machine.profile) && cfg.graphics_board() == GraphicsBoard::Newport;
     ui.horizontal(|ui| {
         let label = ui.label(t!("config-resolution"));
         if !newport {
@@ -722,10 +722,6 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                     ui.selectable_value(&mut cfg.scale, s, t!("config-scale-factor", scale = s));
                 }
             });
-        ui.end_row();
-
-        ui.label(t!("config-headless"));
-        ui.checkbox(&mut cfg.headless, "");
         ui.end_row();
 
         ui.label(t!("config-no-audio"));

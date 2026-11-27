@@ -451,7 +451,14 @@ impl Test {
         let _ = std::fs::remove_file(self.out.join("nvram.bin"));
         self.start_iris(&format!("iris-seed-{console}.log"), &["--headless"])?;
         let _ = send(&self.opts, "start", json!({}));
-        if self.prom_wait("Option?", MENU_WAIT).is_none() {
+        // With console=d the PROM autoboots: press Esc at its countdown until the menu comes.
+        let deadline = Instant::now() + Duration::from_secs(MENU_WAIT);
+        let mut menu = false;
+        while !menu && Instant::now() < deadline {
+            let _ = send(&self.opts, "serial-send", json!({"data": "\x1b"}));
+            menu = self.prom_wait("Option?", 2).is_some();
+        }
+        if !menu {
             self.prom_stopped();
             return Err(self.abort("phase A: PROM menu never appeared on serial".into()));
         }

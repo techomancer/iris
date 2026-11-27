@@ -99,10 +99,14 @@ for _ in $(seq 300); do [ -S "$sock" ] && break; kill -0 "$pid" 2>/dev/null || b
 ci status --wait-ready 60 >/dev/null || { fail "iris did not come up (see $work/iris.log)"; exit 1; }
 ci start >/dev/null || { fail "iris-ci start"; exit 1; }
 
-# Reach the command monitor from the maintenance menu.
-if ! ci serial-wait --timeout 120 "Option?" >/dev/null; then
-    fail "the PROM never showed its maintenance menu"; exit 1
-fi
+# Reach the command monitor from the maintenance menu: headless stores
+# console=d, so the PROM autoboots unless Esc interrupts its countdown.
+menu=
+for _ in $(seq 60); do
+    ci serial-send $'\e' >/dev/null
+    ci serial-wait --timeout 2 "Option?" >/dev/null && { menu=1; break; }
+done
+[ -n "$menu" ] || { fail "the PROM never showed its maintenance menu"; exit 1; }
 ci serial-send "5" >/dev/null
 ci serial-wait --timeout 60 "> " >/dev/null || { fail "no command monitor prompt"; exit 1; }
 

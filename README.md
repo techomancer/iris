@@ -261,8 +261,7 @@ is incomplete; that guide states the limits.
 ### CI control socket and `iris-ci`
 
 Use [STORAGE.md](STORAGE.md#ci-control-socket-and-iris-ci) for Unix/TCP setup,
-commands, serial capture, and scripts. `--ci` keeps offscreen graphics alive
-unless `--headless` is explicitly selected.
+commands, serial capture, and scripts. `--ci` keeps offscreen graphics alive.
 
 ### Scratch volume — file injection without networking
 

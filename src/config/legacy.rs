@@ -38,7 +38,7 @@ pub(super) fn gio_cards(cfg: &mut MachineConfig) -> Result<(), String> {
     }
     let mut cards: Vec<(&str, DeviceModel)> = Vec::new();
     let mut moved: Vec<&str> = Vec::new();
-    if cfg.graphics.heads == 2 && !cfg.headless {
+    if cfg.graphics.heads == 2 {
         cards.push(("gio0", DeviceModel::Newport));
         moved.push("graphics.heads = 2 -> newport");
     }
@@ -454,9 +454,9 @@ mod tests {
         assert_eq!(cfg.validate().unwrap_err(), e);
         let mut cfg = MachineConfig::from_toml_str("test_device = true\n[graphics]\nheads = 2\n").unwrap();
         assert!(cfg.resolve_slots().unwrap_err().contains("gio0 is taken by the newport"));
-        // Without a window there is no second head to take the slot.
+        // `headless` leaves the second head where it is.
         let mut cfg = MachineConfig::from_toml_str("test_device = true\nheadless = true\n[graphics]\nheads = 2\n").unwrap();
-        cfg.resolve_slots().unwrap();
+        assert!(cfg.resolve_slots().unwrap_err().contains("gio0 is taken by the newport"));
     }
 
     #[test]

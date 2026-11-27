@@ -146,8 +146,8 @@ fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str, older: Op
             "headless = true\nno_audio = true\nprom = \"prom.bin\"\nbanks = {banks}\n\
              monitor_port = 0\nserial_port_a = 0\nserial_port_b = 0\nscsi = {{}}\n\
              [machine]\nprofile = \"{profile}\"\ncache = \"{cache}\"\n{}",
-            // Only the Octane has a graphics board to leave out.
-            if profile == "octane_ip30" { "[graphics]\nboard = \"none\"\n" } else { "" }
+            // The O2's display is part of the machine; the others leave theirs out.
+            if profile != "o2_ip32" { "[graphics]\nboard = \"none\"\n" } else { "" }
         ),
     )
     .unwrap();

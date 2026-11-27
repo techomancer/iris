@@ -10,10 +10,12 @@
 # it always is here.
 
 banks = [128, 128, 0, 0]
-headless = true
 no_audio = true
 
 [machine]
 profile = "indy_ip24"
+
+[graphics]
+board = "none"
 
 [scsi]

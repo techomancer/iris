@@ -4,7 +4,6 @@ ov-spec = { $model } ({ $board })
 ov-processor = Processor
 ov-memory = Memory
 ov-graphics = Graphics
-ov-headless = None (serial console)
 ov-prom = PROM
 ov-prom-builtin = Built-in PROM
 ov-scsi = SCSI { $id }

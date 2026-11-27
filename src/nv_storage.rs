@@ -34,6 +34,17 @@ pub(crate) fn save(filename: &str, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// `headless` stores `console=d` through `set` and says where; without it, a
+/// store that has `console=d` gets a line saying why the PROM uses the serial port.
+pub(crate) fn apply_headless_console(headless: bool, machine: &str, path: &str, serial: bool, set: impl FnOnce()) {
+    if headless && !serial {
+        set();
+        eprintln!("iris: {machine}: headless stored console=d in {path} (setenv console g to change)");
+    } else if !headless && serial {
+        eprintln!("iris: {machine} NVRAM {path} has console=d: the PROM uses the serial console (setenv console g to change)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

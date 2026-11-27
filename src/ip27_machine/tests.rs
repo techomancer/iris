@@ -646,3 +646,13 @@ fn pipe_dma_rate() {
         println!("pipe DMA through the Hub: {best:.1} MiB/s");
     });
 }
+
+#[test]
+fn headless_stores_console_d() {
+    big_stack(|| {
+        for profile in [ORIGIN_2000_PROFILE, ONYX2_PROFILE] {
+            let (dir, _m) = built(profile, "headless", 1);
+            assert!(crate::sn::tests::baseio_console_is_serial(&dir), "{profile:?}");
+        }
+    });
+}

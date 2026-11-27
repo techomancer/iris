@@ -2,9 +2,10 @@
 # All paths are relative to the directory you run iris from.
 # Command-line flags override any value set here.
 
-# Run without a window. On the Indy and Indigo2 this leaves out Newport (REX3);
-# other graphics boards stay fitted, and the O2 boots on its serial console.
-# Independent of audio. Can also be set with the --headless command-line flag.
+# Run without a window, and store console=d in the guest's NVRAM so the PROM and
+# IRIX use the serial console. Hardware is unchanged: to leave graphics out, set
+# [graphics] board = "none". Independent of audio. Can also be set with the
+# --headless command-line flag.
 headless = false
 
 # No sound to the host. On the Indy and Indigo2 HAL2 is left out; the other

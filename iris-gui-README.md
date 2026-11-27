@@ -197,7 +197,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 | **Disks** | SCSI devices on every controller the machine has (two on the Indigo2, O2, Octane, SN0, Fuel and Tezro; ids up to 15 on wide buses): image paths, CD-ROM discs, COW overlay, write cache, scratch volume, DaynaPort; Fibre Channel storage on IP35 brick machines |
 | **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder and rsh install folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
-| **Display** | Display resolution, window scale, headless, audio on/off, host audio system and buffering, speaker count (Tezro), recording to a WAV file instead of the sound card, keyboard shape (ANSI/ISO/JIS) |
+| **Display** | Display resolution, window scale, audio on/off, host audio system and buffering, speaker count (Tezro), recording to a WAV file instead of the sound card, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
 | **Performance** | Thread affinity and per-thread core pinning, processor count, jitv2 compile threads (automatic or fixed) and persistent code cache, VNC server and its password file. See [Performance](#performance) |
 | **Debug** | Build features (including the REX3, GR2 and IMPACT graphics JITs and jitv2), GDB stub port, Perfetto trace Start/Stop (`perfetto` builds), capture renderer, idle park, devlog spec. Hidden in lightning builds |

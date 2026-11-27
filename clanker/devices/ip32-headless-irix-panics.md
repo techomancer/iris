@@ -3,7 +3,7 @@
 Status: fixed (2026-10-26). Also hit with the graphics console and less
 than 1 GB.
 
-**Symptom.** `headless = true` (no PS/2 keyboard, serial console) with the
+**Symptom.** `headless = true` (then: no PS/2 keyboard, serial console; now `headless` keeps the keyboard and stores `console=d`) with the
 IRIX 6.5.22 disk: the PROM menu comes up on serial, "1) Start System"
 loads the kernel, and right after the banner:
 

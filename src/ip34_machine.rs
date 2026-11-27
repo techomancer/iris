@@ -15,6 +15,7 @@
 
 use crate::config::{GraphicsBoard, MachineConfig};
 use crate::cpu::parts::{self, Part};
+use crate::dev::baseio_nvram;
 use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::clock::Clock;
@@ -132,6 +133,8 @@ fn build_baseio(
 ) -> Result<BoardIo, String> {
     // IRIX on the Fuel counts the Timekeeper's year cell from 1968.
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), YearBase::From(1968), timers.clock().clone())?);
+    let (serial, layout) = (timekeeper.with_ram(|r| baseio_nvram::console_is_serial(r)), baseio_nvram::Layout::Ip35 { graphics_default: true });
+    crate::nv_storage::apply_headless_console(cfg.headless, "Fuel", &cfg.nvram, serial, || timekeeper.with_ram(|r| baseio_nvram::set_console_serial(r, layout)));
     let pci = xbridge.bus(HEAD_F);
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
     let (ioc3, serial) = attach_ioc3(timers, cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());

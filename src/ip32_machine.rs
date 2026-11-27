@@ -179,9 +179,7 @@ impl O2Machine {
         let kits = cfg.o2_kits();
         let mem = O2Memory::from_kits(&kits)?;
         // The PROM's flash, and so its environment, lives in `nvram`.
-        // `[network] mac` is the address in the 1-Wire ID chip. `headless`:
-        // no keyboard, so the PROM and the OS take the serial console, as on
-        // an O2 booted without one. The GBE stays: it is part of every O2.
+        // `[network] mac` is the address in the 1-Wire ID chip.
         let mac = match cfg.network.mac.as_deref() {
             Some(mac) => Some(crate::config::parse_mac(mac).map_err(|e| format!("network.mac: {e}"))?),
             None => None,
@@ -194,7 +192,7 @@ impl O2Machine {
         let opts = Ip32Options {
             scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
-            keyboard: (!cfg.headless).then_some(o2.mouse),
+            keyboard: Some(o2.mouse),
             mac,
             // Beside the flash, as the clock reference is beside its image.
             rtc_file: Some(format!("{}.rtc", cfg.nvram).into()),
@@ -202,6 +200,13 @@ impl O2Machine {
         };
         let timer_manager = Arc::new(TimerManager::new());
         let bus = Ip32Bus::with_options(mem, prom, opts, &timer_manager);
+        let serial = bus.flash.with_bytes(|f| crate::dev::o2_env::console_is_serial(f));
+        crate::nv_storage::apply_headless_console(cfg.headless, "O2", &cfg.nvram, serial, || {
+            match bus.flash.with_bytes(|f| crate::dev::o2_env::set_console_serial(f)) {
+                Ok(()) => bus.save_flash(),
+                Err(e) => eprintln!("iris: O2: could not store console=d: {e}"),
+            }
+        });
         // MACE audio plays through the host unless audio is off.
         if !cfg.no_audio {
             bus.mace.audio.enable_output(cfg.audio.clone());
@@ -218,10 +223,9 @@ impl O2Machine {
         let _ = bus.cards.set(cards);
         let scratch_path = attached.scratch;
         eprintln!(
-            "iris: O2 with {} MB ({}), {}",
+            "iris: O2 with {} MB ({})",
             kits.iter().sum::<u32>(),
-            kits.iter().map(|k| format!("{k}")).collect::<Vec<_>>().join("+"),
-            if cfg.headless { "serial console" } else { "graphics console" }
+            kits.iter().map(|k| format!("{k}")).collect::<Vec<_>>().join("+")
         );
         // The console UART's host end: in CI mode the in-process backend
         // the CI socket types into, otherwise TCP on `serial_port_a` (as the
@@ -1131,6 +1135,17 @@ mod drop_tests {
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
         assert_eq!(phys.strong_count(), 0, "the bus outlives its machine");
+    }
+
+    /// `headless` stores console=d in the flash's env segment and leaves the keyboard plugged in.
+    #[test]
+    fn headless_stores_console_d_and_keeps_the_keyboard() {
+        let dir = scratch("o2-headless");
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        cfg.headless = true;
+        let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
+        assert!(crate::dev::o2_env::console_is_serial(&machine.bus.flash_bytes()));
+        assert!(machine.bus.mace.ps2.devices().is_some());
     }
 
     /// The installer's `ip32prom.image` is the flash behind a 256-byte

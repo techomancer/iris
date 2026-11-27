@@ -118,7 +118,6 @@ fn run_guest(
         .arg("--config").arg(&config)
         .arg("--load-elf").arg(&elf)
         .arg("--test-device")
-        .arg("--headless")
         .arg("--noaudio");
     for e in extra { cmd.arg(e); }
 

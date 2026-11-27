@@ -75,7 +75,6 @@ pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) 
     };
     let cpu = profile.cpus()[0];
     let mut cfg = crate::bench_runner::bench_config([mb, 0, 0, 0], cpu);
-    cfg.headless = false;
     cfg.machine.profile = profile;
     cfg.monitor_port = Some(0);
     cfg.nvram = dir.join("nvram").to_string_lossy().into_owned();

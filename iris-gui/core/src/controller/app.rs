@@ -1536,7 +1536,7 @@ mod tests {
         let mut cfg = MachineConfig::default();
         cfg.banks = iris::config::banks_from4([8, 8, 0, 0]);
         crate::model::hardware::clear_disks(&mut cfg);
-        cfg.headless = true;
+        cfg.graphics.board = Some(iris::config::GraphicsBoard::None);
         cfg.monitor_port = Some(0);
         cfg.serial_port_a = Some(0);
         cfg.serial_port_b = Some(0);

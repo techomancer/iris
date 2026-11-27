@@ -439,6 +439,8 @@ impl OctaneMachine {
         if let Err(e) = rtc.set_nvram_file(&cfg.nvram) {
             eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
         }
+        let serial = rtc.with_env_store(|s| crate::dev::ip30_nvram::console_is_serial(s));
+        crate::nv_storage::apply_headless_console(cfg.headless, "Octane", &cfg.nvram, serial, || rtc.with_env_store(crate::dev::ip30_nvram::set_console_serial));
         let ioc3 = Arc::new(Ioc3::new(&timer_manager, &ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
         ioc3.set_microlan(identity.ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
@@ -1539,6 +1541,17 @@ mod snapshot_tests {
         cfg.set_disk(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
         edit(&mut cfg);
         OctaneMachine::new(&cfg).expect("an Octane")
+    }
+
+    /// `headless` stores console=d in the DS1685's environment store; a windowed run leaves it.
+    #[test]
+    fn headless_stores_console_d() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let (dir, windowed) = (scratch("headless-console"), scratch("windowed-console"));
+            let serial = |m: &OctaneMachine| m.rtc.with_env_store(|s| crate::dev::ip30_nvram::console_is_serial(s));
+            assert!(serial(&machine(&empty_prom(&dir), &dir)));
+            assert!(!serial(&machine_with(&empty_prom(&windowed), &windowed, |cfg| cfg.headless = false)));
+        }).unwrap().join().unwrap();
     }
 
     /// The monitor answers `audio status` on the Octane for RAD1, which the

@@ -242,7 +242,7 @@ pub trait Workstation: Send {
 
     // ---- host interfaces ----
 
-    /// The display of the first graphics head, or None when headless.
+    /// The display of the first graphics head, or None when no board is fitted.
     fn get_display(&self) -> Option<Arc<dyn GfxDisplay>>;
     /// The second head's display, on machines that can have one.
     fn get_display_head1(&self) -> Option<Arc<dyn GfxDisplay>> {

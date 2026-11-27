@@ -84,7 +84,7 @@ impl VncServer {
         input: Arc<HostInput>, listen: &str, max_fps: Option<u32>, name: &str, password: Option<auth::Password>,
     ) -> Result<VncServer, String> {
         let display = input.display().cloned()
-            .ok_or("VNC needs a display: this machine runs without one (--headless, or no graphics board)")?;
+            .ok_or("VNC needs a display: this machine runs without one (no graphics board)")?;
         let listen = if listen.parse::<u16>().is_ok() { format!("127.0.0.1:{listen}") } else { listen.to_string() };
         let listener = TcpListener::bind(&listen).map_err(|e| format!("VNC: bind {listen}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
