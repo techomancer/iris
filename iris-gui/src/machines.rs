@@ -472,7 +472,7 @@ pub(crate) mod tests {
         let back = read(&config_path(&root.0, "tezro").unwrap()).unwrap();
         assert_eq!(back.tezro.flash.as_deref(), Some("flash.bin"));
         assert_eq!(back.origin2000.io_prom.as_deref(), Some("io6prom.img"));
-        assert_eq!(back.nvme().unwrap().path, "disk.raw");
+        assert_eq!(back.nvmes().next().unwrap().path, "disk.raw");
         assert_eq!(back.loop_disks().iter().map(|d| back.devices[d.1].device.scsi().unwrap().path.as_str()).collect::<Vec<_>>(), ["fc.raw"]);
         assert_eq!(back.virtio_serial.ports[0].socket.as_deref(), Some("port.sock"));
     }

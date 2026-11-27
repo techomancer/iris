@@ -3453,9 +3453,9 @@ impl MachineConfig {
         DevicePlacement::lenient(self, &self.devices).loop_disks(None)
     }
 
-    /// The NVMe card's options, if the machine has one.
-    pub fn nvme(&self) -> Option<&NvmeConfig> {
-        self.devices.iter().find_map(|d| match &d.device {
+    /// Every NVMe card's options.
+    pub fn nvmes(&self) -> impl Iterator<Item = &NvmeConfig> {
+        self.devices.iter().filter_map(|d| match &d.device {
             DeviceModel::Nvme(n) => Some(n),
             _ => None,
         })
@@ -3760,6 +3760,10 @@ impl MachineConfig {
         }
         if self.has_device("nvme") {
             self.machine.profile.refuse_nvme()?;
+            let mut images = std::collections::HashSet::new();
+            if let Some(n) = self.nvmes().filter(|n| !n.path.is_empty()).find(|n| !images.insert(n.path.as_str())) {
+                return Err(format!("[[devices]] nvme: two cards use the image {}", n.path));
+            }
         }
         if self.has_device("qla2200") && matches!(self.machine.profile, MachineProfile::O2Ip32 | MachineProfile::Origin3200Ip35 | MachineProfile::Onyx3000Ip35) {
             return Err(format!("[[devices]] qla2200: the {} cannot take a Fibre Channel adapter", placement.machine()));
@@ -4692,20 +4696,33 @@ mod export_tests {
         assert!(on.disk(1).unwrap().write_cache && on.disk(2).unwrap().write_cache, "no flag, no change");
         let off = Cli::parse_from(["iris", "--no-write-cache"]).apply(cfg);
         assert!(!off.disk(1).unwrap().write_cache && !off.disk(2).unwrap().write_cache);
-        assert!(on.nvme().unwrap().write_cache, "the NVMe default");
-        assert!(!off.nvme().unwrap().write_cache, "NVMe too");
+        assert!(on.nvmes().next().unwrap().write_cache, "the NVMe default");
+        assert!(!off.nvmes().next().unwrap().write_cache, "NVMe too");
     }
 
     #[test]
     fn nvme_write_cache_defaults_on_and_round_trips() {
         let nvme = |extra: &str| MachineConfig::from_toml_str(&format!("[[devices]]\ntype = \"nvme\"\npath = \"a.raw\"\n{extra}")).expect("parse");
-        assert!(nvme("").nvme().unwrap().write_cache, "the default");
+        assert!(nvme("").nvmes().next().unwrap().write_cache, "the default");
         assert!(NvmeConfig::default().write_cache, "the default in code");
         let off = nvme("write_cache = false\n");
-        assert!(!off.nvme().unwrap().write_cache);
+        assert!(!off.nvmes().next().unwrap().write_cache);
         let s = toml::to_string_pretty(&off).expect("serialize");
         let back = MachineConfig::from_toml_str(&s).expect("deserialize");
-        assert!(!back.nvme().unwrap().write_cache, "survives export:\n{s}");
+        assert!(!back.nvmes().next().unwrap().write_cache, "survives export:\n{s}");
+    }
+
+    /// Two NVMe cards over one image would write over each other.
+    #[test]
+    fn two_nvme_cards_cannot_share_an_image() {
+        let cards = |a: &str, b: &str| MachineConfig::from_toml_str(&format!(
+            "[machine]\nprofile = \"octane_ip30\"\n[[devices]]\ntype = \"pci_cage\"\nname = \"cage\"\nat = \"pci_module\"\n\
+             [[devices]]\ntype = \"nvme\"\nat = \"cage/pci0/1\"\npath = \"{a}\"\n\
+             [[devices]]\ntype = \"nvme\"\nat = \"cage/pci0/2\"\npath = \"{b}\"\n"
+        )).unwrap().validate();
+        cards("a.raw", "b.raw").expect("two images");
+        let e = cards("a.raw", "a.raw").unwrap_err();
+        assert!(e.contains("nvme") && e.contains("a.raw"), "{e}");
     }
 
     #[test]
