@@ -663,7 +663,10 @@ fn the_clock_stands_still_while_paused() {
 /// A card on the real clock with the machine's timers, started, and a
 /// status ring programmed; the schedule is not started yet.
 fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
-    let tm = Arc::new(TimerManager::new());
+    timed_card_on(Arc::new(TimerManager::new()))
+}
+
+fn timed_card_on(tm: Arc<TimerManager>) -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
     let (r, ram) = dma_card_on(tm.clone());
     Device::start(&r);
     wr(&r, 0x500, 0x30_0000);
@@ -685,7 +688,6 @@ fn a_status_completion_fires_from_the_timer_with_no_guest_access() {
     let (r, ram, _tm) = timed_card();
     // 3300 units of the 33 MHz status clock: 100 us.
     wr(&r, 0x5c, 0x40003 | (3300 << 2));
-    assert!(r.status.is_armed());
     assert!(wait_done(&r, 2), "completions arrive unprompted");
     assert_eq!(word(&ram, 0x30_0000 + SLOT_STRIDE + SLOT_DONE_OFFSET), SLOT_DONE_WORD);
     Device::stop(&r);
@@ -711,7 +713,8 @@ fn stopping_ends_the_status_timer_and_starting_resumes_it() {
 /// Stopping the status engine removes its timer.
 #[test]
 fn stopping_the_status_engine_removes_its_timer() {
-    let (r, _ram, _tm) = timed_card();
+    // Stepped clock: a real timer clears `is_armed` while its callback runs.
+    let (r, _ram, _tm) = timed_card_on(stepped());
     wr(&r, 0x5c, 0x40003 | (3300 << 2));
     assert!(r.status.is_armed());
     wr(&r, 0x5c, STATUS_STOP);
