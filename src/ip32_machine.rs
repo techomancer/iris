@@ -311,7 +311,7 @@ impl O2Machine {
         // The shared monitor, as the other machines have it: the CPU's
         // commands (registers, breakpoints, memory) and the O2's devices'.
         let monitor = crate::monitor::Monitor::new();
-        monitor.register_device(crate::devlog::init_devlog());
+        monitor.register_device(Arc::new(crate::devlog::LogDevice));
         monitor.register_device(status.clone());
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
         monitor.register_device(bus.clone());
