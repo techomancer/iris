@@ -421,6 +421,11 @@ pub trait DmaClient: Send + Sync {
         std::thread::sleep(timeout.min(std::time::Duration::from_micros(100)));
         false
     }
+    /// Whether the channel is running now. Default: always.
+    fn is_active(&self) -> bool { true }
+    /// Call `f(active)` on each change of the channel's active state. HPC3 calls it with
+    /// the channel's lock held, so `f` may take only locks no one holds while taking that one.
+    fn on_active_change(&self, _f: Box<dyn Fn(bool) + Send + Sync>) {}
 }
 
 /// What a receive channel can take now. The emulator's host side uses it to

@@ -339,6 +339,8 @@ impl InterruptController for Hpc3Interrupts {
 struct ArmSignal {
     gen: Mutex<u64>,
     cv: parking_lot::Condvar,
+    /// Told of every change of ACTIVE, under the channel lock (`DmaClient::on_active_change`).
+    listener: OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
 }
 
 impl ArmSignal {
@@ -347,6 +349,12 @@ impl ArmSignal {
     fn notify(&self) {
         *self.gen.lock() += 1;
         self.cv.notify_all();
+    }
+
+    /// Wake waiters on a rise, and tell the listener of either change.
+    fn changed(&self, active: bool) {
+        if active { self.notify(); }
+        if let Some(f) = self.listener.get() { f(active); }
     }
 
     /// Sleep until the generation is no longer `seen` or `deadline` passes.
@@ -476,7 +484,7 @@ fn start_transaction(&mut self) {
             let rising = !self.is_active();
             self.ctrl |= self.active_mask;
             // A device thread may be waiting for this (see `ArmSignal`).
-            if rising { self.armed.notify(); }
+            if rising { self.armed.changed(true); }
         } else {
             if self.is_active() {
                 if self.log_active() {
@@ -484,8 +492,9 @@ fn start_transaction(&mut self) {
                         self.id, self.bytes_transferred, self.ctrl);
                 }
                 crate::pf_end!(crate::perfetto::events::PDMA_ACTIVE[self.id]);
+                self.ctrl &= !self.active_mask;
+                self.armed.changed(false);
             }
-            self.ctrl &= !self.active_mask;
         }
     }
 
@@ -894,6 +903,8 @@ impl DmaClient for PdmaClientImpl {
         self.armed.wait_past(seen, deadline);
         self.channel.lock().is_active()
     }
+    fn is_active(&self) -> bool { self.channel.lock().is_active() }
+    fn on_active_change(&self, f: Box<dyn Fn(bool) + Send + Sync>) { let _ = self.armed.listener.set(f); }
     fn rx_room(&self) -> RxRoom {
         let mut c = self.channel.lock();
         if c.id == HPC3_PDMA_CHAN_ENET_RX as usize { c.rx_room() } else { RxRoom::Room }
@@ -3068,6 +3079,25 @@ mod enet_rx_chain_tests {
         hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), 0);
         assert_eq!(free.load(Ordering::SeqCst), 1, "the chip was reset under the channel lock, or not at all");
         hpc3.release();
+    }
+
+    /// A listener hears each start and stop of a channel once, and nothing when
+    /// the guest arms a channel that is already running.
+    #[test]
+    fn a_listener_hears_a_scsi_channel_start_and_stop() {
+        let (hpc3, _ram) = one_descriptor(0);
+        let dma = PdmaClientImpl::new(hpc3.pdma_channels[8].clone());
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let h = heard.clone();
+        dma.on_active_change(Box::new(move |active| h.lock().push(active)));
+        assert!(!dma.is_active());
+        hpc3.write32(reg(SCSI0_BASE + SCSI_NBDP), 0x100);
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), SCSI_CTRL_ACTIVE);
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), SCSI_CTRL_ACTIVE);
+        assert!(dma.is_active());
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), 0);
+        assert!(!dma.is_active());
+        assert_eq!(*heard.lock(), [true, false]);
     }
 
     /// An already active channel does not wait; one nobody arms waits out
