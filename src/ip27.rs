@@ -410,11 +410,9 @@ pub(crate) fn pci_devices(
     ioc3.connect_superio(pci);
 
     let console = cfg.ci.then(|| Arc::new(CiSerialBackend::new()));
-    let (port_a, port_b) = crate::dev::serial_host::console_backends(cfg, name, console.as_ref());
+    let (port_a, port_b) = crate::dev::serial_host::console_backends(cfg, name, ["IOC3 A", "IOC3 B"], console.as_ref())?;
     ioc3.set_serial_backend(0, port_a);
-    if let Some(b) = port_b {
-        ioc3.set_serial_backend(1, b);
-    }
+    ioc3.set_serial_backend(1, port_b);
 
     bridge.register_locks();
     ioc3.register_locks();

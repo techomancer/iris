@@ -55,7 +55,10 @@ impl Monitor {
     pub fn command_names(&self) -> Vec<String> {
         let devs = self.devices.lock();
         let own = devs.iter().flat_map(|d| d.register_commands()).map(|(name, _)| name);
-        own.chain(["help", "quit", "exit", "watch", "ports"].map(String::from)).collect()
+        let mut names: Vec<String> = own.chain(["help", "quit", "exit", "watch", "ports", "serial"].map(String::from)).collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn register_device(&self, device: Arc<dyn Device>) {
@@ -243,6 +246,14 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             let _ = writer.flush();
             continue;
         }
+        // `serial` and `serial map`: every serial port and what it is
+        // connected to. Other `serial` subcommands (the Indy's `serial
+        // status`) go to the devices that offer them.
+        if cmd == "serial" && (args.is_empty() || args == ["map"]) {
+            let _ = write!(writer, "{}> ", crate::dev::serial_map::report());
+            let _ = writer.flush();
+            continue;
+        }
         
         if cmd == "help" {
             is_help = true;
@@ -254,11 +265,13 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
                 let cmds: Vec<_> = devs.iter().flat_map(|d| d.register_commands()).collect();
                 let _ = writeln!(writer, "{:12} - {}", "watch", WATCH_HELP);
                 let _ = writeln!(writer, "{:12} - {}", "ports", "ports: the host sockets iris listens on (monitor, telnet and other port forwards, VNC, GDB, CI, serial and virtio sockets)");
+                let _ = writeln!(writer, "{:12} - {}", "serial", "serial [map]: each serial port, its IRIX name (ttydN), the console, and what it is connected to (sockets and clients, CI, log, a host serial port and its line); serial status: the SCC's registers (Indy, Indigo2)");
                 if !cmds.iter().any(|(c, _)| c == "audio") {
                     let _ = writeln!(writer, "{:12} - {}", "audio", "audio status: each sound card's frames moved and skipped, and its host stream");
                 }
                 // Several devices may offer one command (`pci`, one per host): list it once.
                 let mut seen = std::collections::HashSet::new();
+                seen.insert("serial".to_string());
                 for (c, h) in cmds {
                     if seen.insert(c.clone()) {
                         let _ = writeln!(writer, "{:12} - {}", c, h);

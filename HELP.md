@@ -517,6 +517,78 @@ socket's `serial-read` and `wait-serial`, and either side may type.
 socat - UNIX-CONNECT:/tmp/octane-console.sock
 ```
 
+### A device on a serial port
+
+A serial port can carry a device in place of its socket: a real serial
+device on a host port, such as a Spaceball, a serial Wacom tablet or a MIDI
+interface on a USB adapter, or a MIDI interface the guest plays music
+through. Each is a `[[devices]]` entry at the port:
+
+```toml
+[[devices]]
+type = "hostserial"
+at = "serial2"          # IRIX's /dev/ttyd2
+path = "/dev/ttyUSB0"
+```
+
+`at` names the port the way IRIX does: `serialN` is `/dev/ttydN`, and a
+serial device always names its port. Most machines have `serial1` and
+`serial2`; on the Indy and Indigo2, `serial1` is SCC channel B, the console,
+and `serial2` channel A. The Tezro's are `serial3` and `serial4`, the IOC4's
+first two ports (its `ttyd1` is the L1 console, and IRIX makes no devices for
+the IOC4's other two ports). `iris --list-slots` shows them. A port with a
+device serves no TCP or Unix socket; its serial log, if set, still records
+what the guest sends.
+
+`hostserial` passes a host serial port through. The host port follows the
+guest: the rate, data bits, parity and stop bits the guest's driver
+programs, its DTR, RTS and break, and the device's CTS, DCD, DSR and RI come
+back to the guest. A device that draws its power from DTR and RTS, as the
+Spaceball 5000 FLX does, stays off until the guest opens the port, as on the
+machine's own connector. A rate within 2% of a standard one is rounded to it
+(an Indy's 9600 is really 9562); other rates, such as MIDI's 31250, are set
+exactly on Linux. iris opens the port exclusively; a port another program
+holds (spacenavd, ModemManager) is an error at start. Host serial ports work
+on Linux and macOS so far. See `docs/peripherals/` for the devices'
+protocols.
+
+### MIDI
+
+Two device types give the guest a MIDI interface on a serial port.
+`midi_synth` plays what the guest sends on the host's audio through a
+General MIDI SoundFont (`.sf2`, such as GeneralUser GS), with no MIDI
+hardware at all:
+
+```toml
+[[devices]]
+type = "midi_synth"
+at = "serial3"          # IRIX's /dev/ttyd3 (the Tezro's first IOC4 port)
+path = "GeneralUser-GS.sf2"
+gain = 2.0              # optional
+```
+
+`gain` sets how loud the synth plays (`gain = 2.0` is twice as loud). The
+default is the synth's own level, which leaves room for a whole General MIDI
+song: a single line of notes sounds quiet at it, and a loud song with a high
+gain clips. The synth plays as an output stream of its own, beside the
+machine's sound; when `[audio] file` records the machine to a WAV, the synth
+writes its own file beside it (`out.wav` and `out-midi.wav`). It plays
+channel messages and resets on GM System On, GS Reset and System Reset; it
+sends nothing back. `no_audio` mutes it.
+
+`midi_raw` passes the port through to a real MIDI device on the host
+instead. `path` names a raw MIDI port, on Linux `/dev/snd/midiC1D0` (or its
+older name `/dev/midi1`; `amidi -l` lists them), which takes and gives the
+MIDI bytes as they are, so a USB MIDI cable or a USB keyboard becomes the
+guest's MIDI in and out. A host serial port with a MIDI interface on it
+(`/dev/ttyUSB0`) works too, set up as `hostserial` does.
+
+In the guest, start MIDI on the port as on the real machine, from the
+System Manager's serial device panel or with `startmidi`; a plain RS-232
+port needs `-p rs232` (`startmidi -n synth -d /dev/ttyd3 -p rs232`), and the
+interface then shows in `startmidi`'s list for MIDI programs to use.
+`serial` in the monitor counts the messages and notes the synth has played.
+
 ### Connect to a serial port
 
 ```bash
@@ -530,7 +602,8 @@ nc 127.0.0.1 8881
 ### Monitor command
 
 ```
-serial status    # dump SCC channel A/B register and FIFO state
+serial           # every serial port: IRIX name, board port, console, what is connected
+serial status    # dump SCC channel A/B register and FIFO state (Indy, Indigo2)
 ```
 
 ---

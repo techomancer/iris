@@ -16,8 +16,11 @@ use crate::ip32::*;
 use crate::irq::IrqLine;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, Saveable, BUS_OK};
 
-/// The TL16PIR552's crystal over 16: 1.8432 MHz.
+/// The TL16PIR552's reference over 16 until the guest programs the prescaler.
 const BAUDBASE: u32 = 115200;
+/// The clock MACE gives the TL16PIR552, which its prescaler divides: 22 MHz.
+/// IRIX picks a divide of 3 (7.33 MHz) for the ordinary rates.
+const UART_CLOCK_HZ: u32 = 22_000_000;
 
 pub struct MaceUart {
     core: Mutex<Ns16550>,
@@ -37,7 +40,8 @@ impl MaceUart {
     /// A UART answering monitor commands as `name`.
     pub fn named(name: &'static str, tm: &Arc<TimerManager>) -> Arc<Self> {
         Arc::new_cyclic(|me| {
-            let core = Ns16550::new(BAUDBASE, tm.clock().clone());
+            let mut core = Ns16550::new(BAUDBASE, tm.clock().clone());
+            core.set_ti_prescaler(UART_CLOCK_HZ);
             Self { core: Mutex::new(core), name, irq: OnceLock::new(), timer: Timer::new(tm, me, |u: &Self, _| u.pump()) }
         })
     }

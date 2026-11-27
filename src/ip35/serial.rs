@@ -17,6 +17,9 @@ pub(crate) struct SerialPort {
     pub ci: Arc<CiSerialBackend>,
     pub log: Option<String>,
     pub socket: Option<(String, &'static str)>,
+    /// The IRIX port it is (N of ttydN), which a `[hostserial]`,
+    /// `[spaceball]` or `[wacom]` section names as `serialN`; none for the L1.
+    pub ttyd: Option<u8>,
     pub connect: Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync>,
 }
 
@@ -34,6 +37,13 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
         let tag = format!("{name} {}", port.label);
         let console_mark = if index == console { " (console)" } else { "" };
         let log = open_log(&log_config, &tag);
+        if let Some(b) = port.ttyd.map(|n| crate::dev::serial_dev::peripheral(cfg, n, log.clone())).transpose()?.flatten() {
+            if index == console {
+                log::warn!("{tag}: this is the console port; the console now goes to the peripheral");
+            }
+            (port.connect)(crate::dev::serial_map::mapped(name, port.label, port.ttyd, index == console, cfg, b));
+            continue;
+        }
         let line = SerialLine {
             label: &format!("{tag}{console_mark}"),
             tcp_port: Some(port.port),
@@ -42,7 +52,7 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
             socket_setting: port.socket.as_ref().map_or("", |(_, setting)| setting),
         };
         let (backend, _) = serial_line(&line, log, (cfg.ci && index == console).then_some(&port.ci));
-        (port.connect)(backend);
+        (port.connect)(crate::dev::serial_map::mapped(name, port.label, port.ttyd, index == console, cfg, backend));
     }
     Ok(())
 }

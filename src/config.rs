@@ -3525,6 +3525,7 @@ impl MachineConfig {
         self.validate_ip27_sections()?;
         self.cpu_part()?;
         self.machine.profile.accepts_cpus(self.machine.cpus())?;
+        crate::dev::serial_dev::validate(self)?;
         let board = self.graphics_board();
         if board != GraphicsBoard::Newport {
             let name = board.as_str();

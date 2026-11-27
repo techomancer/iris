@@ -13,6 +13,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Serial ports
+
+- A serial port can carry a device in place of its socket, on every machine:
+  `[[devices]]` entries at `serialN` (IRIX's `/dev/ttydN`). `hostserial`
+  passes a host serial port through with the guest's rate, framing and modem
+  lines, so a Spaceball works with IRIX's Magellan driver as on the
+  machine's own connector.
+- `midi_synth` gives a guest a MIDI interface that plays on a General MIDI
+  SoundFont synth, and `midi_raw` one that passes through to a host MIDI
+  port (Linux `/dev/snd/midiC*D*`: a USB MIDI cable or keyboard). Tested on
+  the Tezro with IRIX's `startmidi`.
+- The O2's and the IOC3 machines' UARTs now run at the clock rate IRIX
+  programs through their prescaler, including the half steps MIDI's 31250
+  needs.
+
 ### IndyCam
 
 - The host camera works with cameras that offer only MJPEG, NV12, RGB or gray

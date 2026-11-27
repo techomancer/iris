@@ -348,7 +348,11 @@ fn the_scratch_register_programs_the_predivider_under_dlab() {
     r.w8(reg::SERIAL_A + 7, 6);
     assert_eq!(r.r8(reg::SERIAL_A + 7), 6, "reads back what was written");
     assert_eq!(r.c.predivider(0), 6);
-    assert_eq!(r.c.baudbase(0), 22_118_400 / 3 / 16, "the divisor's clock follows it");
+    assert_eq!(r.c.baudbase(0), 22_000_000 / 3 / 16, "the divisor's clock follows it");
+    // An odd value is a half step: 11 divides by 5.5.
+    r.w8(reg::SERIAL_A + 7, 11);
+    assert_eq!(r.c.baudbase(0), 250_000);
+    r.w8(reg::SERIAL_A + 7, 6);
     // Written 0 or 1 means nothing.
     r.w8(reg::SERIAL_A + 7, 1);
     assert_eq!(r.c.predivider(0), 6);

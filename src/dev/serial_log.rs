@@ -42,6 +42,8 @@ struct Inner {
 /// CI and TCP paths write through one sink.
 pub struct SerialLog {
     timestamps: SerialLogTimestamps,
+    /// The file it writes, or `stdout`, for the monitor.
+    name: String,
     inner: Mutex<Inner>,
 }
 
@@ -49,22 +51,27 @@ impl SerialLog {
     /// Open for append: an existing transcript is preserved.
     pub fn open(path: &Path, timestamps: SerialLogTimestamps) -> io::Result<std::sync::Arc<Self>> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self::with_writer(Box::new(file), timestamps))
+        Ok(Self::with_writer(Box::new(file), timestamps, path.display().to_string()))
     }
 
     /// Create or truncate: one boot's transcript, for callers that tail it.
     pub fn create(path: &Path, timestamps: SerialLogTimestamps) -> io::Result<std::sync::Arc<Self>> {
         let file = File::create(path)?;
-        Ok(Self::with_writer(Box::new(file), timestamps))
+        Ok(Self::with_writer(Box::new(file), timestamps, path.display().to_string()))
     }
 
     /// Standard output, for a container whose log collector reads it.
     pub fn stdout(timestamps: SerialLogTimestamps) -> std::sync::Arc<Self> {
-        Self::with_writer(Box::new(io::stdout()), timestamps)
+        Self::with_writer(Box::new(io::stdout()), timestamps, "stdout".into())
     }
 
-    fn with_writer(file: Box<dyn Write + Send>, timestamps: SerialLogTimestamps) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { timestamps, inner: Mutex::new(Inner { file, pending: Vec::new() }) })
+    fn with_writer(file: Box<dyn Write + Send>, timestamps: SerialLogTimestamps, name: String) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { timestamps, name, inner: Mutex::new(Inner { file, pending: Vec::new() }) })
+    }
+
+    /// The file it writes, or `stdout`.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn timestamps(&self) -> SerialLogTimestamps {

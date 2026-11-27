@@ -57,21 +57,26 @@
 //!   QEMU returns the last character again.
 //! * Modem status changes in loopback latch the delta bits, as the part's
 //!   datasheet has them and MAME's `ins8250` does; QEMU's loopback read returns
-//!   the levels alone. The
-//!   levels outside loopback are fixed at carrier, DSR and CTS asserted;
-//!   there is no real modem to poll.
-//! * Not ported: break detection and set-break, the transmit FIFO (there is
-//!   nothing to queue), the live modem-line polling of a host serial port,
-//!   and the host baud-rate control.
-//! * The TI part's extra register at the scratch position with the divisor
-//!   latch set is not modelled: there it is the scratch register.
+//!   the levels alone. Outside loopback the levels are the backend's
+//!   [`SerialBackend::modem_in`] (a socket shows carrier, DSR and CTS
+//!   asserted), polled with the input.
+//! * The host end is told the line: rate, framing, DTR, RTS and break go to
+//!   [`SerialBackend::set_line`] / [`SerialBackend::set_modem`] when the guest
+//!   changes them, so a host serial port behind it follows. In loopback the
+//!   outputs go inactive, as on the part.
+//! * Not ported: break detection and the transmit FIFO (there is nothing to
+//!   queue).
+//! * The TI part's clock prescaler (the scratch register's place with the
+//!   divisor latch set) is modelled when the shell asks for it
+//!   ([`Ns16550::set_ti_prescaler`]); otherwise that place is the scratch
+//!   register.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clock::Clock;
-use crate::dev::serial_host::{null_serial_backend, SerialBackend};
+use crate::dev::serial_host::{null_serial_backend, LineConfig, ModemIn, ModemOut, Parity, SerialBackend};
 use crate::snapshot::{get_field, hex_u8, toml_bool, toml_u32, toml_u8};
 
 /// The receive FIFO's depth.
@@ -93,6 +98,10 @@ pub mod com_reg {
     pub const SCR: u32 = 7;
 
     pub const LCR_DLAB: u8 = 0x80;
+    /// LCR bit 6: set break, the line held at space.
+    pub const LCR_SB: u8 = 0x40;
+    /// LCR bit 4: even parity (with LCR_PEN).
+    pub const LCR_EPS: u8 = 0x10;
     pub const LCR_PEN: u8 = 0x08;
     pub const LCR_NSTB: u8 = 0x04;
     pub const LCR_WLS: u8 = 0x03;
@@ -157,9 +166,6 @@ use com_reg::*;
 /// A character time is ten bit times at the reset divisor of 9600 baud.
 const RESET_CHAR_TIME: Duration = Duration::from_nanos(1_000_000_000 / 9600 * 10);
 
-/// The modem inputs of a port with nothing plugged in: carrier, data set
-/// ready and clear to send asserted.
-const MSR_IDLE_LEVELS: u8 = MSR_DCD | MSR_DSR | MSR_CTS;
 
 pub struct Ns16550 {
     backend: Arc<dyn SerialBackend>,
@@ -191,6 +197,14 @@ pub struct Ns16550 {
     sent: u64,
     /// Output may be waiting in the backend, so a poll has a flush to do.
     unflushed: bool,
+    /// The backend's modem inputs as last polled.
+    modem_in: ModemIn,
+    /// The line state the backend was last told.
+    line_sent: Option<(LineConfig, ModemOut)>,
+    /// The TI part's prescaler: its input clock in Hz when modelled, and the
+    /// register (twice the divide wanted).
+    ti_clock: Option<u32>,
+    prescaler: u8,
 }
 
 impl Ns16550 {
@@ -221,9 +235,68 @@ impl Ns16550 {
             out: VecDeque::new(),
             sent: 0,
             unflushed: false,
+            modem_in: ModemIn::IDLE,
+            line_sent: None,
+            ti_clock: None,
+            prescaler: 0,
         };
         s.reset();
         s
+    }
+
+    /// Model the TI TL16C550-family clock prescaler: with the divisor latch
+    /// set, the scratch register's place holds twice the divide applied to
+    /// `input_hz` (six bits, so 1 to 31.5 in half steps; 0 and 1 leave the
+    /// clock alone), and the divisor divides what is left over 16.
+    pub fn set_ti_prescaler(&mut self, input_hz: u32) {
+        self.ti_clock = Some(input_hz);
+    }
+
+    pub fn prescaler(&self) -> u8 {
+        self.prescaler
+    }
+
+    fn write_prescaler(&mut self, val: u8) {
+        let Some(hz) = self.ti_clock else { return };
+        self.prescaler = val & 0x3f;
+        if self.prescaler >= 2 {
+            self.baudbase = (2 * hz as u64 / self.prescaler as u64 / 16) as u32;
+            self.update_parameters();
+        }
+    }
+
+    /// The modem inputs as MSR's level bits.
+    fn modem_levels(m: ModemIn) -> u8 {
+        (if m.cts { MSR_CTS } else { 0 }) | (if m.dsr { MSR_DSR } else { 0 }) | (if m.ri { MSR_RI } else { 0 }) | (if m.dcd { MSR_DCD } else { 0 })
+    }
+
+    /// The line's rate and framing and the modem outputs, as the registers
+    /// set them. In loopback the outputs are inactive on the pins.
+    pub fn line_state(&self) -> (LineConfig, ModemOut) {
+        let baud = (self.divider != 0).then(|| self.baudbase / self.divider as u32);
+        let parity = match (self.lcr & LCR_PEN != 0, self.lcr & LCR_EPS != 0) {
+            (false, _) => Parity::None,
+            (true, false) => Parity::Odd,
+            (true, true) => Parity::Even,
+        };
+        let line = LineConfig { baud, data_bits: (self.lcr & LCR_WLS) + 5, parity, stop_bits: if self.lcr & LCR_NSTB != 0 { 2 } else { 1 } };
+        let out = if self.loopback() {
+            ModemOut::default()
+        } else {
+            ModemOut { dtr: self.mcr & MCR_DTR != 0, rts: self.mcr & MCR_RTS != 0, brk: self.lcr & LCR_SB != 0 }
+        };
+        (line, out)
+    }
+
+    /// Tell the backend the line state if it changed.
+    fn sync_line(&mut self) {
+        let now = self.line_state();
+        if self.line_sent == Some(now) {
+            return;
+        }
+        self.line_sent = Some(now);
+        self.backend.set_line(now.0);
+        self.backend.set_modem(now.1);
     }
 
     /// Reset to 9600 baud, 8N1, the FIFOs off and empty, the
@@ -235,7 +308,8 @@ impl Ns16550 {
         self.iir = IIR_NONE;
         self.lcr = 0;
         self.lsr = LSR_TEMT | LSR_THRE;
-        self.msr = MSR_IDLE_LEVELS;
+        // The inputs are pins, not register state.
+        self.msr = Self::modem_levels(self.modem_in);
         self.divider = 0x0c;
         self.mcr = MCR_OUT2;
         self.scr = 0;
@@ -246,10 +320,25 @@ impl Ns16550 {
         self.timeout_at = None;
         self.recv_fifo.clear();
         self.thr_ipending = false;
+        self.prescaler = 0;
+        self.sync_line();
     }
 
+    /// Wire the host end; it is told the line state at once.
     pub fn set_backend(&mut self, backend: Arc<dyn SerialBackend>) {
         self.backend = backend;
+        self.line_sent = None;
+        self.sync_line();
+        self.poll_modem();
+    }
+
+    /// Take the backend's modem inputs; a change shows in MSR with its delta.
+    fn poll_modem(&mut self) {
+        let m = self.backend.modem_in();
+        if m != self.modem_in {
+            self.modem_in = m;
+            self.update_modem_levels();
+        }
     }
 
     /// Change the reference clock the divisor divides (the IOC3 derives it
@@ -364,6 +453,7 @@ impl Ns16550 {
         let speed = if self.divider == 0 { 3500.0 } else { self.baudbase as f64 / self.divider as f64 };
         let speed = if speed > 0.0 { speed } else { 3500.0 };
         self.char_transmit_time = Duration::from_nanos((1e9 / speed * frame as f64) as u64);
+        self.sync_line();
     }
 
     // ----- the register file -----
@@ -419,6 +509,7 @@ impl Ns16550 {
                 }
                 ret
             }
+            _ if self.dlab() && self.ti_clock.is_some() => self.prescaler,
             _ => self.scr,
         }
     }
@@ -461,10 +552,12 @@ impl Ns16550 {
             MCR => {
                 self.mcr = val & 0x1f;
                 self.update_modem_levels();
+                self.sync_line();
             }
             // Line and modem status are read-only; the IOC3 shell has test
             // writes of its own.
             LSR | MSR => {}
+            _ if self.dlab() && self.ti_clock.is_some() => self.write_prescaler(val),
             _ => self.scr = val,
         }
     }
@@ -507,7 +600,7 @@ impl Ns16550 {
         let new = if self.loopback() {
             ((self.mcr & (MCR_OUT1 | MCR_OUT2)) << 4) | ((self.mcr & MCR_RTS) << 3) | ((self.mcr & MCR_DTR) << 5)
         } else {
-            MSR_IDLE_LEVELS
+            Self::modem_levels(self.modem_in)
         };
         let old = self.msr & 0xf0;
         // CTS, DSR and carrier changes latch straight; ring only on its
@@ -620,6 +713,7 @@ impl Ns16550 {
     /// Write out what the host end has queued and take what it has typed; whether anything
     /// arrived. The service loop and status and data reads call it.
     pub fn pump(&mut self) -> bool {
+        self.poll_modem();
         if self.unflushed {
             self.backend.flush();
             self.unflushed = self.backend.queued();
@@ -731,6 +825,9 @@ impl Ns16550 {
         ] {
             t.insert(k.into(), hex_u8(v));
         }
+        if self.ti_clock.is_some() {
+            t.insert("prescaler".into(), hex_u8(self.prescaler));
+        }
         t.insert("thr_ipending".into(), toml::Value::Boolean(self.thr_ipending));
         t.insert("timeout_ipending".into(), toml::Value::Boolean(self.timeout_ipending));
         t.insert("recv_fifo".into(), toml::Value::Array(self.recv_fifo.iter().map(|&b| hex_u8(b)).collect()));
@@ -766,6 +863,20 @@ impl Ns16550 {
             0xc0 => 14,
             _ => 1,
         };
+        if let Some(hz) = self.ti_clock {
+            self.prescaler = 0;
+            self.baudbase = match b("prescaler") {
+                p @ 2.. => {
+                    self.prescaler = p;
+                    (2 * hz as u64 / p as u64 / 16) as u32
+                }
+                _ => self.baudbase,
+            };
+        }
+        // The modem levels are the host end's pins now, not what was saved.
+        self.msr = Self::modem_levels(self.modem_in);
+        // The host end keeps its own state through a load: tell it the restored line.
+        self.line_sent = None;
         self.update_parameters();
         // The timeout restarts from the load.
         self.timeout_at = (!self.recv_fifo.is_empty() && !self.timeout_ipending).then(|| self.timeout_from_now());
@@ -808,6 +919,101 @@ mod tests {
         u.write(MCR, MCR_LOOP);
         u.read(MSR);
         u
+    }
+
+    /// A host end that records the line state it is told and shows the
+    /// modem inputs a test sets: a stand-in for a host serial port.
+    struct LineProbe {
+        lines: Mutex<Vec<LineConfig>>,
+        outs: Mutex<Vec<ModemOut>>,
+        input: Mutex<ModemIn>,
+    }
+
+    impl SerialBackend for LineProbe {
+        fn send_byte(&self, _: u8) {}
+        fn recv_byte(&self) -> io::Result<u8> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+        fn set_line(&self, l: LineConfig) {
+            self.lines.lock().unwrap().push(l);
+        }
+        fn set_modem(&self, o: ModemOut) {
+            self.outs.lock().unwrap().push(o);
+        }
+        fn modem_in(&self) -> ModemIn {
+            *self.input.lock().unwrap()
+        }
+    }
+
+    fn probed(baudbase: u32) -> (Ns16550, Arc<LineProbe>) {
+        let p = Arc::new(LineProbe { lines: Mutex::new(vec![]), outs: Mutex::new(vec![]), input: Mutex::new(ModemIn::IDLE) });
+        let mut u = Ns16550::new(baudbase, Clock::stepped());
+        u.set_backend(p.clone());
+        (u, p)
+    }
+
+    /// The divisor, LCR and MCR reach the backend: rate, framing, DTR, RTS
+    /// and break; in loopback the outputs go inactive.
+    #[test]
+    fn the_backend_hears_the_guests_line_and_modem_lines() {
+        let (mut u, p) = probed(115200);
+        assert_eq!(p.lines.lock().unwrap().last().copied(), Some(LineConfig { baud: Some(9600), data_bits: 5, parity: Parity::None, stop_bits: 1 }), "reset: divisor 12, LCR 0");
+        u.write(LCR, LCR_DLAB);
+        u.write(THR, 12 * 4);
+        u.write(LCR, 0x1b); // 8 bits, even parity
+        assert_eq!(p.lines.lock().unwrap().last().copied(), Some(LineConfig { baud: Some(2400), data_bits: 8, parity: Parity::Even, stop_bits: 1 }));
+        u.write(MCR, MCR_DTR | MCR_RTS | MCR_OUT2);
+        assert_eq!(p.outs.lock().unwrap().last().copied(), Some(ModemOut { dtr: true, rts: true, brk: false }));
+        u.write(LCR, 0x1b | LCR_SB);
+        assert!(p.outs.lock().unwrap().last().unwrap().brk, "break");
+        u.write(MCR, MCR_DTR | MCR_RTS | MCR_LOOP);
+        assert_eq!(p.outs.lock().unwrap().last().copied(), Some(ModemOut::default()), "loopback: the pins go inactive");
+        let told = p.outs.lock().unwrap().len();
+        u.write(MCR, MCR_DTR | MCR_RTS | MCR_LOOP);
+        assert_eq!(p.outs.lock().unwrap().len(), told, "an unchanged write tells nothing");
+    }
+
+    /// The backend's inputs are MSR's levels; a change latches its delta.
+    #[test]
+    fn modem_inputs_show_in_msr_with_their_deltas() {
+        let (mut u, p) = probed(115200);
+        assert_eq!(u.read(MSR) & 0xf0, MSR_CTS | MSR_DSR | MSR_DCD);
+        *p.input.lock().unwrap() = ModemIn { cts: false, dcd: false, dsr: true, ri: false };
+        u.pump();
+        let msr = u.read(MSR);
+        assert_eq!(msr & 0xf0, MSR_DSR, "CTS and carrier dropped");
+        assert_eq!(msr & MSR_ANY_DELTA, MSR_DCTS | MSR_DDCD);
+        assert_eq!(u.read(MSR) & MSR_ANY_DELTA, 0, "reading cleared the deltas");
+        u.reset();
+        assert_eq!(u.read(MSR) & 0xf0, MSR_DSR, "a reset keeps showing the pins");
+    }
+
+    /// The TI prescaler: with the divisor latch set, the scratch place holds
+    /// twice the divide of the input clock. IRIX's O2 settings give 9600
+    /// (divide 3, divisor 48) and MIDI's 31250 (divide 5.5, divisor 8).
+    #[test]
+    fn the_ti_prescaler_sets_the_clock_the_divisor_divides() {
+        let (mut u, p) = probed(115200);
+        u.set_ti_prescaler(22_000_000);
+        u.write(LCR, LCR_DLAB);
+        u.write(SCR, 6);
+        u.write(THR, 48);
+        u.write(IER, 0);
+        assert_eq!(u.read(SCR), 6, "reads back under DLAB");
+        u.write(LCR, 0x03);
+        assert_eq!(p.lines.lock().unwrap().last().unwrap().baud, Some(9548));
+        u.write(SCR, 0x5a);
+        assert_eq!(u.read(SCR), 0x5a, "without DLAB it is the scratch register");
+        u.write(LCR, LCR_DLAB);
+        u.write(SCR, 11);
+        u.write(THR, 8);
+        u.write(LCR, 0x03);
+        assert_eq!(p.lines.lock().unwrap().last().unwrap().baud, Some(31250));
+        let saved = u.save_state();
+        let (mut v, _) = probed(115200);
+        v.set_ti_prescaler(22_000_000);
+        v.load_state(&saved);
+        assert_eq!((v.prescaler(), v.baudbase()), (11, 250_000), "a load restores the clock");
     }
 
     #[test]

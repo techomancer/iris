@@ -113,6 +113,7 @@ pub(crate) fn attach_ioc3(
             ci: serial[0].clone(),
             log: l1_log,
             socket: None,
+            ttyd: None,
             connect: Box::new(move |backend| l1.set_serial_backend(backend)),
         },
         SerialPort {
@@ -122,6 +123,7 @@ pub(crate) fn attach_ioc3(
             ci: serial[1].clone(),
             log: cfg.serial_log_a.clone(),
             socket: cfg.serial_socket_a.clone().map(|p| (p, "serial_socket_a")),
+            ttyd: Some(1),
             connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
         },
         SerialPort {
@@ -131,6 +133,7 @@ pub(crate) fn attach_ioc3(
             ci: serial[2].clone(),
             log: cfg.serial_log_b.clone(),
             socket: cfg.serial_socket_b.clone().map(|p| (p, "serial_socket_b")),
+            ttyd: Some(2),
             connect: Box::new(move |backend| ioc3_b.set_serial_backend(1, backend)),
         },
     ];

@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use std::sync::Arc;
 
+use crate::dev::serial_dev::{SerialDeviceConfig, SerialKind};
 use crate::config::{MachineConfig, NvmeConfig, ScsiDeviceConfig, ScsiKind, Virtio9pConfig, VirtioSerialConfig};
 use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::isp2200::{card::Loop, Isp2200};
@@ -40,6 +41,8 @@ pub enum DeviceModel {
     Graphics,
     VirtioSerial(VirtioSerialConfig),
     Virtio9p(Virtio9pConfig),
+    /// A device on a serial port: `hostserial`, `midi_synth` or `midi_raw`, by its kind.
+    Serial(SerialDeviceConfig),
 }
 
 /// What the test device's run-configuration register publishes and where its
@@ -119,7 +122,17 @@ pub const DEVICE_TYPES: &[DeviceTypeSpec] = &[
         parse: |_, o| options(o).map(|v: Virtio9pConfig| DeviceModel::Virtio9p(Virtio9pConfig { enabled: true, ..v })),
         slots: None,
     },
+    DeviceTypeSpec { name: "hostserial", family: DeviceFamily::Serial, keys: &["path"], parse: serial_device, slots: None },
+    DeviceTypeSpec { name: "midi_synth", family: DeviceFamily::Serial, keys: &["path", "gain"], parse: serial_device, slots: None },
+    DeviceTypeSpec { name: "midi_raw", family: DeviceFamily::Serial, keys: &["path"], parse: serial_device, slots: None },
 ];
+
+fn serial_device(t: &DeviceTypeSpec, opts: toml::Table) -> Result<DeviceModel, String> {
+    let kind = SerialKind::from_name(t.name).expect("a serial type");
+    let dev = SerialDeviceConfig { kind, ..options(opts)? };
+    dev.check()?;
+    Ok(DeviceModel::Serial(dev))
+}
 
 fn nvme(_: &DeviceTypeSpec, opts: toml::Table) -> Result<DeviceModel, String> {
     let cfg: NvmeConfig = toml::Value::Table(opts).try_into().map_err(|e: toml::de::Error| e.message().to_string())?;
@@ -167,6 +180,7 @@ impl DeviceModel {
             DeviceModel::Graphics => "graphics",
             DeviceModel::VirtioSerial(_) => "virtio_serial",
             DeviceModel::Virtio9p(_) => "virtio_9p",
+            DeviceModel::Serial(d) => d.kind.name(),
         };
         DEVICE_TYPES.iter().find(|t| t.name == name).expect("every variant has a type")
     }
@@ -195,7 +209,7 @@ impl DeviceModel {
     /// What `--list-slots` says is there.
     pub fn summary(&self) -> String {
         match self {
-            DeviceModel::Scsi(ScsiDeviceConfig { path, .. }) | DeviceModel::Nvme(NvmeConfig { path, .. }) if !path.is_empty() => {
+            DeviceModel::Scsi(ScsiDeviceConfig { path, .. }) | DeviceModel::Nvme(NvmeConfig { path, .. }) | DeviceModel::Serial(SerialDeviceConfig { path, .. }) if !path.is_empty() => {
                 format!("{} {path}", self.spec().name)
             }
             _ => self.spec().name.to_string(),
@@ -216,6 +230,7 @@ impl DeviceModel {
             DeviceModel::TestDevice(d) => changed(d, keys),
             DeviceModel::VirtioSerial(d) => changed(d, keys),
             DeviceModel::Virtio9p(d) => changed(d, keys),
+            DeviceModel::Serial(d) => changed(d, keys),
             DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Newport | DeviceModel::Graphics => toml::Table::new(),
         }
     }

@@ -241,11 +241,9 @@ impl O2Machine {
         // Indy's channel A), either teed to `serial_log` when one is set. The
         // second port serves TCP on `serial_port_b`.
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
-        let (console, second) = crate::dev::serial_host::console_backends(cfg, "O2", ci_serial.as_ref());
+        let (console, second) = crate::dev::serial_host::console_backends(cfg, "O2", ["MACE UART 0", "MACE UART 1"], ci_serial.as_ref())?;
         bus.mace.com0.set_backend(console);
-        if let Some(b) = second {
-            bus.mace.com1.set_backend(b);
-        }
+        bus.mace.com1.set_backend(second);
         // The Ethernet on the NAT gateway `[network]` describes (`mode =
         // "off"` leaves it unplugged; validate refuses pcap here for now).
         let (mut nat, mut frames) = (None, None);
