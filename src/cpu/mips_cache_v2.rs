@@ -9,11 +9,18 @@
 use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
 use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, toml_u64, hex_u32, hex_u64};
 use crate::cpu::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE, FLAG_NOT_DECODED, FLAG_IMM_IS_NEXT, EXEC_CACHE_ERR};
-use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_MISS, CACHE_LOG_OP, devlog_is_active, devlog_mask};
+use crate::devlog::{event, LogModule};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::cell::{Cell, UnsafeCell};
 use bitfield::bitfield;
+
+/// The `l1i.*`, `l1d.*` and `l2c.*` trace points: `hit` (hot path; developer builds only),
+/// `miss` (misses and fills) and `op` (CACHE instruction operations).
+pub const EVENTS: &[&str] = &["hit", "miss", "op"];
+pub const CACHE_LOG_HIT: u32 = event(EVENTS, "hit");
+pub const CACHE_LOG_MISS: u32 = event(EVENTS, "miss");
+pub const CACHE_LOG_OP: u32 = event(EVENTS, "op");
 
 /// tcache, switchable at run time: `$tc` while the cache is transparent,
 /// `$real` (the cache holds the data) otherwise. Without the `tcache` feature
@@ -1599,29 +1606,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// index in its secondary tags but resolves a mismatch in hardware.
     const HAS_VCE: bool = MODEL == model::R4400;
 
-    /// IP28 bring-up watch: physical window to trace, from IRIS_IP28_WATCH.
-    /// Folds to a constant `None` on every model but the R10000, so the
-    /// non-IP28 hot path keeps no trace of this.
-    #[inline(always)]
-    fn ip28_watch() -> Option<u64> {
-        if !Self::R10K_CACHE_OPS { return None; }
-        static W: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        *W.get_or_init(|| {
-            std::env::var("IRIS_IP28_WATCH").ok().and_then(|v| {
-                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
-            })
-        })
-    }
-
-    #[inline(always)]
-    fn ip28_trace(&self, what: &str, addr: u64, val: u64) {
-        if let Some(w) = Self::ip28_watch() {
-            if (addr & !0x7f) == (w & !0x7f) {
-                eprintln!("ip28watch: {what:<18} addr={addr:#018x} val={val:#018x}");
-            }
-        }
-    }
-
     // Logical L2 size; 0 means the model has no secondary cache.
     pub const L2_SIZE: usize = if HAS_L2 { L2_CACHE_SIZE } else { 0 };
 
@@ -2630,9 +2614,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             } else {
                 // L2 miss — fill from memory into L2 first.
                 #[cfg(not(feature = "lightning"))]
-                if devlog_is_active(LogModule::L2c) && devlog_mask(LogModule::L2c) & CACHE_LOG_MISS != 0 {
-                    crate::dlog!(LogModule::L2c, "fill virt={:#x} phys={:#x} idx={}", index_addr, phys_addr, self.l2.get_index(phys_addr));
-                }
+                crate::dlog!(LogModule::L2c, CACHE_LOG_MISS, "fill virt={:#x} phys={:#x} idx={}", index_addr, phys_addr, self.l2.get_index(phys_addr));
                 if !self.fill_l2_line_for(phys_addr, index_addr, true) {
                     return exec_exception_const(EXC_IBE);
                 }
@@ -2640,9 +2622,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
 
         #[cfg(not(feature = "lightning"))]
-        if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_MISS != 0 {
-            crate::dlog!(LogModule::L1i, "fill virt={:#x} phys={:#x} eidx={}", index_addr, phys_addr, ic_eidx);
-        }
+        crate::dlog!(LogModule::L1i, CACHE_LOG_MISS, "fill virt={:#x} phys={:#x} eidx={}", index_addr, phys_addr, ic_eidx);
 
         // 2-way only: populate this way's ic_instrs slot from L2, or memory if L2 is off.
         if Self::IS_R5K {
@@ -2818,9 +2798,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             Ok(true)
         } else {
             #[cfg(not(feature = "lightning"))]
-            if devlog_is_active(LogModule::L2c) && devlog_mask(LogModule::L2c) & CACHE_LOG_MISS != 0 {
-                crate::dlog!(LogModule::L2c, "fill virt={:#x} phys={:#x} idx={}", virt_addr, phys_addr, l2_idx);
-            }
+            crate::dlog!(LogModule::L2c, CACHE_LOG_MISS, "fill virt={:#x} phys={:#x} idx={}", virt_addr, phys_addr, l2_idx);
             if !self.fill_l2_line(phys_addr, virt_addr) {
                 return Err(BUS_ERR);
             }
@@ -3134,9 +3112,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 true
             } else {
                 #[cfg(not(feature = "lightning"))]
-                if devlog_is_active(LogModule::L2c) && devlog_mask(LogModule::L2c) & CACHE_LOG_MISS != 0 {
-                    crate::dlog!(LogModule::L2c, "fill virt={:#x} phys={:#x} idx={}", virt_addr, phys_addr, l2_idx);
-                }
+                crate::dlog!(LogModule::L2c, CACHE_LOG_MISS, "fill virt={:#x} phys={:#x} idx={}", virt_addr, phys_addr, l2_idx);
                 if !self.fill_l2_line(phys_addr, virt_addr) { return BUS_ERR; }
                 true
             }
@@ -3144,9 +3120,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             false // L2 disabled: copy direct from memory below
         });
         #[cfg(not(feature = "lightning"))]
-        if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_MISS != 0 {
-            crate::dlog!(LogModule::L1d, "fill virt={:#x} phys={:#x} eidx={}", virt_addr, phys_addr, dc_idx);
-        }
+        crate::dlog!(LogModule::L1d, CACHE_LOG_MISS, "fill virt={:#x} phys={:#x} eidx={}", virt_addr, phys_addr, dc_idx);
 
         let dc_data = self.dc.data_mut();
         let dc_start_chunk = dc_idx << Self::DC_CHUNKS_PER_LINE_SHIFT;
@@ -3655,18 +3629,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 #[cfg(feature = "developer")]
                 self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "developer")]
-                if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
-                    crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=0", virt_addr, phys_addr, set);
-                }
+                crate::dlog!(LogModule::L1i, CACHE_LOG_HIT, "hit virt={:#x} phys={:#x} set={} way=0", virt_addr, phys_addr, set);
                 unsafe { Self::lru_set(self.ic_lru.get(), set, 1); } // way0 MRU → way1 is LRU
                 set
             } else if self.ic.get_tag(set | way1_base).matches_phys(phys_addr) {
                 #[cfg(feature = "developer")]
                 self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "developer")]
-                if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
-                    crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=1", virt_addr, phys_addr, set);
-                }
+                crate::dlog!(LogModule::L1i, CACHE_LOG_HIT, "hit virt={:#x} phys={:#x} set={} way=1", virt_addr, phys_addr, set);
                 unsafe { Self::lru_set(self.ic_lru.get(), set, 0); } // way1 MRU → way0 is LRU
                 set | way1_base
             } else {
@@ -3732,7 +3702,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
-        self.ip28_trace("read", phys_addr, 0);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
 
         // R4K (1-way): way is always 0, dc_eidx == get_index(virt_addr), da == virt_addr.
@@ -3748,9 +3717,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 }
             }
             #[cfg(feature = "developer")]
-            if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
-                crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_idx);
-            }
+            crate::dlog!(LogModule::L1d, CACHE_LOG_HIT, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_idx);
             // tcache: the cache stores no data — read RAM (window or bus).
             let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr), self.dc.dc_read::<SIZE>(virt_addr));
             return BusRead64::ok(result);
@@ -3765,9 +3732,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
             #[cfg(feature = "developer")]
-            if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
-                crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_eidx);
-            }
+            crate::dlog!(LogModule::L1d, CACHE_LOG_HIT, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_eidx);
             // tcache: the cache stores no data — read RAM (window or bus).
             let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr), {
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
@@ -3778,7 +3743,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
-        self.ip28_trace("write", phys_addr, val);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
 
         // R4K (1-way): way always 0, dc_eidx == get_index(virt_addr), da == virt_addr.
@@ -3796,9 +3760,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 }
             }
             #[cfg(feature = "developer")]
-            if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
-                crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_idx, val);
-            }
+            crate::dlog!(LogModule::L1d, CACHE_LOG_HIT, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_idx, val);
             tc_or!(self, {
                 // The cache stores no data — the write goes to RAM.
                 self.tc_write::<SIZE>(phys_addr, val);
@@ -3834,9 +3796,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
             #[cfg(feature = "developer")]
-            if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
-                crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_eidx, val);
-            }
+            crate::dlog!(LogModule::L1d, CACHE_LOG_HIT, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_eidx, val);
             tc_or!(self, {
                 self.tc_write::<SIZE>(phys_addr, val);
                 self.tc_invalidate_l2_code(phys_addr);
@@ -3898,19 +3858,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
-        if Self::R10K_CACHE_OPS && std::env::var_os("IRIS_IP28_CACHEOPS").is_some() {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static SEEN: AtomicU32 = AtomicU32::new(0);
-            let bit = 1u32 << (cache_op & 0x1F);
-            let all = matches!(std::env::var("IRIS_IP28_CACHEOPS").as_deref(), Ok("all"));
-            if all || SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-                eprintln!("ip28: op {} raw={:#04x} va={:#018x} arg={:#018x}",
-                          cache_op_name(cache_op), cache_op, virt_addr, phys_addr);
-            }
-        }
-        if Self::ip28_watch().is_some() {
-            self.ip28_trace(cache_op_name(cache_op), virt_addr, phys_addr);
-        }
         // R10000 ops 5/6/7 are not the R4000 hit operations that share these
         // encodings — see C_R10K_ISD. Handled before the shared decode below.
         if Self::R10K_CACHE_OPS {
@@ -3963,9 +3910,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         #[cfg(not(feature = "lightning"))]
         {
             let log_mod = if is_icache { LogModule::L1i } else if is_l2 { LogModule::L2c } else { LogModule::L1d };
-            if devlog_is_active(log_mod) && devlog_mask(log_mod) & CACHE_LOG_OP != 0 {
-                crate::dlog!(log_mod, "{} virt={:#x} phys={:#x}", cache_op_name(cache_op), virt_addr, phys_addr);
-            }
+            crate::dlog!(log_mod, CACHE_LOG_OP, "{} virt={:#x} phys={:#x}", cache_op_name(cache_op), virt_addr, phys_addr);
         }
 
         // L1I and L1D are virtually indexed; L2 is physically indexed.
@@ -4039,10 +3984,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     // L2 TagLo format:
                     //   [31:13] physical tag   [12:10] state   [9:7] PIdx
                     let tag: L2Tag = self.l2.get_tag(idx);
-                    if MODEL == model::R10000 {
-                        eprintln!("ip28: C_ILT(SD) idx={idx:#x} ptag={:#x} cs={:#x} pidx={:#x}",
-                                  tag.ptag(), tag.cs(), tag.pidx());
-                    }
                     let state = match tag.cs() {
                         L2_CS_INVALID => 0,
                         L2_CS_CLEAN_EXCLUSIVE => 4,

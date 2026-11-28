@@ -389,7 +389,7 @@ apparent "skip" of the `0x...0` slot is what MAME does too).
 - `vinograb.c` (VL one-frame grab), `mempeek.c` (`/dev/mem` physical reader) —
   both in repo root, stream to `/var/tmp` and `cc` on the guest.
 - Build iris with `--features chd,camera,lightning,developer` and run with
-  `IRIS_DEBUG_LOG=vino,mc` to trace register access + MC errors.
+  `--log vino,mc` to trace register access + MC errors.
 - `/tmp` is wiped on boot — put guest test binaries in `/var/tmp`.
 - root's shell is now `/bin/sh` on the klindert disk (POSIX redirects work).
 

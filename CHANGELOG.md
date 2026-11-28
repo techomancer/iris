@@ -54,13 +54,29 @@ hashes are given where a change is easiest to understand by reading the commit.
   launch; `log` output goes to monitor clients, or to a file with
   `log <module> file PATH`. `IRIS_IP32_HOT` is gone too; its counters were
   never shown anywhere.
-- The CPU `debug` command is gone: `log mips mask insn` and `log mips on`
-  print each instruction `run` and `step` execute, and `log mips file PATH`
-  writes them to a file.
+- The CPU `debug` command is gone: `log mips.insn on` prints each instruction
+  `run` and `step` execute, and `log mips file PATH` writes them to a file.
 - `phys trace` and the physical `trace` alias are gone: `log phys on` logs
   every physical bus access. That and the `hit` category of `log l1i` and
   `log l1d` need a `developer` build; before, every build but `lightning` paid
   a check per access for them.
+- The `IRIS_IP28_*` bring-up variables (cache ops, watch window, exception
+  address, TLB writes, GPR watch) and the `cp0` category of `log mips` are
+  gone, as is the stderr line printed on every R10000 secondary-cache
+  Index_Load_Tag. Only the TLB-write trace has a replacement:
+  `log mips.tlb on` in a `developer` build. Cache ops, the watch window
+  and the exception address have none.
+  `bp add ADDR if REG==VAL` breaks at a PC on a register value, but nothing
+  reports every write to a register, so it replaces `IRIS_IP28_WATCHGPR`
+  only in part.
+- One pattern names trace points everywhere: `log heart,l1d.*,-l1d.hit on`,
+  `--log PATTERN` and `[debug] log`. `IRIS_DEBUG_LOG` and `[debug] debug_log`
+  are replaced by `--log` and `[debug] log` (the old key still loads), and
+  `log MODULE mask CATEGORY|HEX` by `log MODULE.CATEGORY on`; the `pdma`
+  categories are now one per channel (`pdma.hal0`, `pdma.enet*`). The Perfetto
+  categories, the `rex`, `gr2`, `mgras`, `vpro` and O2 `trace` class lists and
+  the `exception` command take the same patterns; a name matching nothing is an
+  error, where the `rex`, `gr2`, `mgras` and O2 lists used to select everything.
 
 ### Serial ports
 

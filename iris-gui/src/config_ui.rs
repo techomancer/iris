@@ -1875,7 +1875,7 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         ui.checkbox(&mut cfg.debug.no_idle, "");
         ui.end_row();
         ui.label(t!("config-debug-log"));
-        ui.add(TextEdit::singleline(&mut cfg.debug.debug_log).hint_text(t!("config-debug-log-hint")).desired_width(280.0));
+        ui.add(TextEdit::singleline(&mut cfg.debug.log).hint_text(t!("config-debug-log-hint")).desired_width(280.0));
         ui.end_row();
     });
     ui.separator();

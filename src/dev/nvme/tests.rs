@@ -332,17 +332,15 @@ fn a_failed_enable_is_counted_with_its_reason_across_the_reset() {
 /// commands, each with a timestamp.
 #[test]
 fn the_trace_records_cc_writes_ready_and_commands() {
-    use crate::devlog::{devlog, init_devlog, LogModule, NVME_LOG_ADMIN, NVME_LOG_STATE};
+    use crate::devlog::devlog;
     let path = std::env::temp_dir().join(format!("iris-nvme-trace-{}", std::process::id()));
-    init_devlog();
     devlog().set_file(LogModule::Nvme, path.to_str().unwrap()).unwrap();
-    devlog().set_mask(LogModule::Nvme, NVME_LOG_STATE | NVME_LOG_ADMIN);
+    devlog().select("nvme.state,nvme.admin", true).unwrap();
     let mut r = Rig::new();
     r.enable();
     Rig::ok(r.admin(admin::IDENTIFY, 0, [1, 0, 0, 0, 0, 0], DATA, 0));
     r.w(REG_CC, 0);
-    devlog().set_mask(LogModule::Nvme, u32::MAX);
-    devlog().disable(LogModule::Nvme);
+    devlog().select("nvme", false).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     // Other tests' controllers may write here too; look for this one's lines.

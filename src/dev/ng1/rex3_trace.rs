@@ -122,12 +122,8 @@ pub(crate) fn dcb_target(mode: u32) -> String {
 }
 
 /// Parse a trace category list: `gfifo,cpu` or `all`.
-pub fn trace_mask(s: &str) -> u32 {
-    s.split(',').fold(0, |m, w| m | match w {
-        "gfifo" | "gf" => TRACE_GFIFO,
-        "cpu" | "dma" => TRACE_CPU,
-        _ => TRACE_ALL,
-    })
+pub fn trace_mask(s: &str) -> Result<u32, String> {
+    crate::devlog::select(s, &[("gfifo", TRACE_GFIFO), ("gf", TRACE_GFIFO), ("cpu", TRACE_CPU), ("dma", TRACE_CPU)], TRACE_ALL)
 }
 
 impl Rex3 {
@@ -273,7 +269,7 @@ impl Rex3 {
                 None => writeln!(w, "trace not active"),
             }),
             [path, rest @ ..] => {
-                let mask = trace_mask(rest.first().copied().unwrap_or("all"));
+                let mask = trace_mask(rest.first().copied().unwrap_or("all")).map_err(|e| format!("rex trace: {e}"))?;
                 self.start_trace(path, mask).map_err(|e| format!("rex trace: cannot create {path}: {e}"))?;
                 e(writeln!(w, "tracing to {path} (mask {mask:#x})"))
             }
