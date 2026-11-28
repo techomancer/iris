@@ -1146,15 +1146,21 @@ impl BlockNode for ChdNode {
         self.bytes
     }
 
+    /// The guest reads whole sectors. Anything else (a front-end browsing
+    /// the disk asks for bytes) reads the sectors around the range and
+    /// keeps the part asked for.
     fn read(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         self.ensure_open()?;
         let ss = self.sector_size;
-        if offset % ss != 0 || (buf.len() as u64) % ss != 0 {
-            return Err(invalid("CHD reads must be sector-aligned"));
-        }
         check_range(self.hd().size(), offset, buf.len() as u64)?;
-        let data = self.hd_mut().read_blocks(offset / ss, buf.len() / (ss as usize), ss)?;
-        buf.copy_from_slice(&data);
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let first = offset / ss;
+        let end = (offset + buf.len() as u64).div_ceil(ss);
+        let data = self.hd_mut().read_blocks(first, (end - first) as usize, ss)?;
+        let skip = (offset - first * ss) as usize;
+        buf.copy_from_slice(&data[skip..skip + buf.len()]);
         Ok(())
     }
 
@@ -1752,6 +1758,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A read that starts or ends inside a sector gets exactly the bytes asked
+    /// for, from the diff where the guest wrote and from the base elsewhere.
+    #[test]
+    fn chd_reads_any_byte_range() {
+        let dir = TempPath::dir("blocknode");
+        let data: Vec<u8> = (0..256 * 1024).map(|i| (i * 7 % 251) as u8).collect();
+        let base = compressed_chd_of(&dir, data.clone());
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        node.write(3 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
+        let mut want = data.clone();
+        want[3 * SECTOR_BYTES..4 * SECTOR_BYTES].fill(0x5A);
+        for (at, len) in [(0usize, 1usize), (1, 511), (100, 2000), (3 * 512 - 7, 520), (4095, 2), (want.len() - 3, 3)] {
+            let mut got = vec![0u8; len];
+            node.read(at as u64, &mut got).unwrap();
+            assert_eq!(got, want[at..at + len], "{len} bytes at {at}");
+        }
+        node.read(want.len() as u64, &mut []).unwrap();
+        assert!(node.read(want.len() as u64 - 1, &mut [0u8; 2]).is_err(), "past the end");
     }
 
     /// The 4-byte map entry of hunk `hunk` as the CHD file on the disk has it.

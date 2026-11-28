@@ -11,7 +11,8 @@ still builds only the standalone `iris` CLI — the GUI's dependencies
 build when you ask for `-p iris-gui`.
 
 Pre-built installers (Windows, macOS, Linux AppImage/deb/rpm) come out of the
-Release workflow, and a sandboxed build ships on the Mac App Store.
+Release workflow. The Mac App Store build is the native Mac app (see
+[The macOS app](#the-macos-app)), sandboxed; the egui app is not built for it.
 
 On Linux the file choosers (every 📁 and "Browse…" button) come from the
 desktop: IRIS asks the XDG desktop portal (`xdg-desktop-portal` plus a backend
@@ -60,12 +61,11 @@ emulation will be noticeably slow.
 | `perfetto` | Perfetto trace recording; the Debug tab gains Start/Stop for a `.pftrace` (see `docs/perfetto.md`) |
 | `wgpu` | Experimental GPU-authoritative raster backends in the embedded core. Newport requires explicit `newport_mode = "readback"` because iris-gui has no same-device direct presenter yet |
 | `bundled` | Distributed build: hides source-checkout tools such as premiere preparation. Machine TOML storage is shared by source, Release, and App Store builds. Set by the Release workflow |
-| `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |
 
 DaynaPort, Ultra64, IP28/R10000, and the graphics board models are built in.
 The `chd`, `camera`, `daynaport`, `ultra64`, `ip28`, `ppmem`, `mips4`, and
 `r5k` features have been removed. Ultra64 needs the external gopher64 emulator
-and is hidden in App Store builds.
+and is not in the Mac App Store build.
 
 Core features that change how the executor is built pass straight through to
 iris:
@@ -172,7 +172,7 @@ light for the internal network, or "No network" on a machine with
 
 | Menu | Contents |
 | --- | --- |
-| **File** | New machine… / Switch to machine / Rename current… / Delete current machine / Prepare for premiere… (source builds) / Disk folder access (App Store) / Quit |
+| **File** | New machine… / Switch to machine / Rename current… / Delete current machine / Prepare for premiere… (source builds) / Quit |
 | **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (modules supported by the selected profile, applies at next Start) / Save and Restore state / Screenshot… / Serial console… |
 | **Memory** | Total presets, plus per-bank submenus |
 | **SCSI** | Per-ID submenus for SCSI IDs 1–7 on the first controller (the drives a disc can be loaded into while the machine runs) with context-appropriate actions; other controllers and wide-bus IDs are in the Disks tab. Not shown on the Origin 3200 and Onyx 3000, whose disks are on Fibre Channel. Also per-disk **Commit changes to disk** / **Discard changes** for COW overlays and CHD diffs while stopped |
@@ -201,7 +201,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
 | **Performance** | Thread affinity and per-thread core pinning, processor count, jitv2 compile threads (automatic or fixed) and persistent code cache, VNC server and its password file. See [Performance](#performance) |
 | **Debug** | Build features (including the REX3, GR2 and IMPACT graphics JITs and jitv2), GDB stub port, Perfetto trace Start/Stop (`perfetto` builds), capture renderer, idle park, devlog spec. Hidden in lightning builds |
-| **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral. Hidden in App Store builds |
+| **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral |
 | **Advanced** | Platform flash files and console selection, node/C-brick counts, L1 settings, the Fuel's USB keyboard and mouse, the Tezro's audio card, and the expansion each machine has room for: XIO PCI boards (Octane), NVMe (O2, Octane), Fibre Channel disks (Octane, IP35), virtio serial ports and a virtio-9p host folder share (Indy, Indigo2, Octane, Tezro; the share needs a Unix host); renderer/raster settings, serial sockets/logs, stream Ethernet, JIT compile mode and diagnostics; a complete TOML editor with validation |
 | **Benchmark** | The bare-metal benchmark suite, run in-process on a headless machine (see `bench/README.md`) |
 
@@ -279,7 +279,7 @@ position**, so IRIX's own `keybd` layout applies on top.
 | --- | --- |
 | **Ctrl+Alt** (macOS: **Option+Command**) | Release capture |
 | **Ctrl+Alt+Esc** | Release capture (fallback) |
-| **F11** | Toggle fullscreen |
+| **F11** (the Mac app: **Ctrl+Cmd+F**) | Toggle fullscreen |
 | **Ctrl+Alt+F11** | Send F11 to IRIX |
 | **Ctrl/Cmd+F12** | Pick a disc and load it into the first CD-ROM drive |
 | **Ctrl/Cmd + =**, **−**, **0** | Zoom UI in / out / reset |
@@ -300,6 +300,106 @@ helper that shows the exact `mount` command for the NFS share (including the
 PCAP-mode NFS IP).
 
 ---
+
+### The macOS app
+
+`IRIS.app` in the macOS downloads is the native front end, written with
+AppKit instead of egui. It needs macOS 11 or later. It is what the macOS
+packages ship (the dmg and zip of each release and nightly). Dragged into
+Applications, it replaces an older download's egui IRIS.app and finds the
+same machines. The egui app still builds from source on macOS
+(`scripts/dist/macos-bundle.sh`) and shares the same machines, settings and
+preferences, so use one or the other at a time. The Mac app has the library, the summary
+page, the guest display (Metal), the machine settings, the new-machine
+window, saved states, the serial console, Check Networking, the benchmark,
+the camera test and Preferences, with SF Symbols and the system's light and
+dark appearance. The machine settings include Video In (the Indy's camera)
+and Performance (thread pinning, the JIT, the VNC server).
+
+The library is a sidebar, as in Finder, with its button next to the window
+buttons. After it, the machine capsule shows the machine's picture, name and
+model; a click lists every machine to switch to, and New Machine. The toolbar follows the machine: a stopped machine offers
+New, Duplicate, Delete, Browse Files, Settings and Start; a running one Save
+State, Screenshot, Discs (only with a CD-ROM drive), the serial console, and
+the power buttons as VMware has them: **Shut Down** with **Power Off** in its
+menu, **Restart** with **Reset** in its menu. Shut Down and Restart type
+IRIX's `shutdown` on the serial console, so a shell must be logged in there.
+Power Off stops the machine at once and Reset stops it and starts it again;
+both ask first while IRIX is busy. When IRIX powers off, the machine stops by
+itself a moment later.
+
+The menu shortcuts follow the Mac's own: **Ctrl+Cmd+S** shows or hides the
+library, **Ctrl+Cmd+F** enters full screen (F11 is Show Desktop on a Mac),
+and **Option+Cmd+C** opens the serial console. Shut Down and Detach Display
+have no shortcut, so neither happens by accident.
+
+A stopped machine's page shows its last screen with a large Start button,
+sized so the whole page fits the window, then **Details** (the hardware, with **Edit
+Settings…**) or **Saved States**: a timeline of the machine's saved states,
+each with the screen it was saved at. Each library row has its own Start
+button, and a right-click on a row offers Start, Settings, Browse Files,
+Duplicate, Rename, Delete and Show in Finder. The status bar shows the speed
+and the disk and network lights; it says when a machine is stopping or
+applying disk changes, and how to release the mouse while it is captured.
+
+The guest display is at **Actual Size** by default (View menu or
+Preferences): one guest pixel to a point, sharp, black around it in a larger
+window and scrollable in a smaller one. **Scale to Fit** keeps the aspect
+ratio and **Stretch** fills the window; scaled, it is smoothed only at
+fractional sizes. Full screen (the window's green button) hides the toolbar
+and menu bar until the pointer reaches the top, puts the library away and
+slides the status bar down to a thin line, bringing it back when the pointer
+reaches the bottom edge. With the library hidden, the pointer at the window's
+left edge brings it back as a floating panel. A disk's or CD-ROM's icon in the
+status bar opens that device's menu.
+
+Settings pages have no subtitles; a field's help is its tooltip. Memory is
+one amount on the Machine page, offering only what the machine can hold (the
+banks are under Advanced), and the machine types are grouped as Workstations
+and Servers. **New Machine** is a wizard: the machine type, name and
+hardware, disks, then a summary before Create.
+
+It also has a **disk browser**: the Browse Files button next to a disk on the
+summary page, Browse Files in the toolbar, the library row's right-click menu,
+or a click on a disk's status light opens the disk. It shows the partitions
+and their files, exports files, folders and `.tar`/`.tar.gz` archives,
+imports files and folders (unpacking `.tardist` and tar archives unless told
+not to; optionally converting DOS line endings to Unix ones), and edits text
+files, names, permissions and owners on EFS and XFS. Files dragged from the
+Finder onto the list are imported. Moving files between folders is not there
+yet.
+
+- **While the machine runs** the disk is read through the machine, as IRIX
+  sees it, and opens read-only;
+  what it shows can be a few seconds behind what IRIX has written. Stop the
+  machine to change files; the browser closes when the machine stops.
+- **CD-ROMs** open read-only.
+- **XFS** that IRIX did not shut down cleanly opens read-only, with **Replay
+  Log** to apply the log as IRIX would at its next mount; after that it can
+  be edited.
+
+Over a remote desktop (RustDesk, Screen Sharing) a captured mouse does not
+move the guest's pointer, because those tools move the Mac's pointer without
+reporting motion. Set **Preferences > Mouse** to *Follow the Mac pointer*:
+nothing is captured, the guest's pointer is steered to wherever yours is over
+the display (it trails fast moves a little), clicks and the wheel go with
+it, and the keyboard reaches the guest while the display is focused (Command
+shortcuts stay with the Mac).
+
+Closing the window (File > Close) leaves the app and its machine running;
+the Dock icon brings it back. Quit (Command-Q) asks first while a machine
+runs. Only one copy of IRIS runs at a time: opening it again brings the
+running one forward.
+
+The **Devices** menu lists each disk and CD-ROM with what it can do now:
+change or eject a disc, mount it in IRIX, browse it, and commit or discard a
+disk's copy-on-write changes. The Help menu has the guide to mounting the
+shared folder (with the command for this machine), camera and networking,
+the Ultra64 board, the licenses and the privacy policy.
+
+Build and run it from a checkout with `cargo run -p iris-gui-appkit`, or
+make the app with `iris-gui/frontends/appkit/scripts/bundle.sh` (see the
+script's `--help`).
 
 ## 4. Storage model
 
@@ -492,6 +592,29 @@ disks…", with per-disk progress). Under the macOS App Sandbox the fold needs
 write access to the *folder* holding the CHD, which is why the App Store build
 asks for folder grants (`clanker/macos/chd-fold-needs-folder-grant-not-file-grant.md`).
 
+A compressed CHD is rebuilt in full every time the machine stops, so the wait
+depends on the codecs, not on how much the guest wrote. chdman's default for
+hard disks (lzma first) is the slowest: about 2.5 minutes for a 4 GB IRIX disk
+on an Apple M1. The Mac app points such disks out on the machine page and
+offers **Convert…** there and in the Devices menu (**Convert for Quicker
+Stops…**), with the machine stopped:
+
+- **zlib** (offered first) keeps the file about the same size. Each stop still
+  rebuilds the disk, but faster (about 100 s against 167 s for that disk), and
+  every version of chdman and MAME reads it.
+- **Uncompressed** never rebuilds: the CHD is written in place. The file grows
+  to the space the disk uses (2.9 GB for that 4.3 GB disk), up to its full size.
+
+The Mac app asks when such a disk is attached in Settings or New Machine,
+and again before the machine starts (Start Without Converting keeps it as it
+is; choosing a format converts it and then starts the machine). The machine
+page keeps pointing it out until it is converted or kept with **Keep As Is**. A kept disk is remembered (`convert_declined` in
+`gui.json`) and never suggested again; the Devices menu still converts it.
+
+The file keeps its name, so the machine's settings do not change. Pending
+changes in a `.diff.chd` are folded in, and a cancelled or failed conversion
+leaves the disk as it was.
+
 ### Stop timeout for a wedged machine
 
 `Machine::stop()` begins with `cpu.stop()`, which blocks until the CPU thread
@@ -510,36 +633,64 @@ reclaims them at exit). The same bound is applied on **Quit**.
 
 ```
 iris/
-├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks; iris-hostgl excluded
+├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks, iris-prom, iris-gui/frontends/appkit; iris-hostgl and iris-audio excluded
 ├── src/               iris library + CLI
 └── iris-gui/
-    ├── Cargo.toml     depends on iris with gpujit; CHD/camera built into core
+    ├── Cargo.toml     the egui app; depends on iris with gpujit and on iris-gui-core
     ├── build.rs       APP_VERSION (from RELEASE_VERSION or the crate version)
     ├── assets/        icons, default NVRAM
-    └── src/
+    ├── locales/       Fluent text catalogs, shared by every front end
+    ├── scripts/check-boundaries.sh   layer rules (see below)
+    ├── core/          iris-gui-core: the model and controllers, no UI toolkit
+    │   └── src/
+    │       ├── controller/    Controller trait, Effect, widget ids, shortcuts, icons,
+    │       │                  and one controller per task: app, session, display,
+    │       │                  settings, preferences, new machine, disk browser,
+    │       │                  network, serial, bench, camera, debug
+    │       └── model/
+    │           ├── handle.rs          EmulatorHandle: worker thread, Cmd/Evt channels
+    │           ├── framebuffer.rs     CaptureRenderer + FrameSink (GfxDisplay → shell texture)
+    │           ├── job.rs             slow work with progress and cancel
+    │           ├── i18n.rs            the catalogs and the t! macro
+    │           ├── hardware.rs        profile families, SCSI naming, profile refit
+    │           ├── safe_stop.rs       Stop-safety evaluator
+    │           ├── settings.rs        GUI preferences, migration, NVRAM seeding and MAC helpers
+    │           ├── machines.rs        TOML folders, relative paths, discovery, and rename
+    │           ├── summary.rs         stopped-machine summary and missing-disk preflight
+    │           ├── ram.rs             RAM presets shared by menus and tabs
+    │           ├── netplan.rs         subnet math for the Networking tab
+    │           ├── netfix.rs          "check / fix guest networking" logic
+    │           ├── capture_access.rs  per-OS packet-capture permission (PCAP)
+    │           ├── macos_sandbox.rs   security-scoped bookmarks (App Store)
+    │           └── single_instance.rs previous-instance reclaim
+    ├── frontends/appkit/   iris-gui-appkit: the native macOS shell (binary iris-appkit)
+    │   └── scripts/bundle.sh   builds the AppKit "IRIS.app" and its DMG
+    └── src/           the egui shell
         ├── main.rs            App: control column, menus, modals, update loop
-        ├── handle.rs          EmulatorHandle: worker thread, Cmd/Evt channels
-        ├── framebuffer.rs     CaptureRenderer + FrameSink (GfxDisplay → egui texture)
         ├── input.rs           capture, egui → PS/2 keyboard+mouse pump
         ├── config_ui.rs       configuration tabs
+        ├── extra_ui.rs        less common settings, the complete-config editor
         ├── bench_ui.rs        Benchmark tab
         ├── scsi_menu.rs       SCSI menu (per-ID actions, disc pickers)
-        ├── safe_stop.rs       Stop-safety evaluator
-        ├── settings.rs        GUI preferences, migration, NVRAM seeding and MAC helpers
-        ├── machines.rs        TOML folders, relative paths, discovery, and rename
-        ├── ram.rs             RAM presets shared by menus and tabs
-        ├── netplan.rs         subnet math for the Networking tab
-        ├── netfix.rs          "check / fix guest networking" logic
-        ├── capture_access.rs  per-OS packet-capture permission (PCAP)
         ├── camera_test.rs     Test Camera preview
         ├── serial_console.rs  in-app ttyd1 console
         ├── filedialog.rs      where file dialogs open
-        ├── macos_sandbox.rs   security-scoped bookmarks (App Store)
-        ├── single_instance.rs previous-instance reclaim
+        ├── host.rs            host services (reveal in Finder)
         └── dialogs/
             ├── new_machine.rs Startup "New machine" dialog
             └── create_disk.rs Blank-HDD-image creator
 ```
+
+The front ends are moving onto shared controllers: `iris-gui-core` holds the
+model and one controller per task, and a shell (egui, and the native AppKit
+app) only draws, turns input into controller actions and carries out the
+effects a controller asks for (file pickers, confirmations, the clipboard).
+Forms such as the machine settings, the new-machine dialog and the
+preferences are lists of fields the controller builds; a shell draws each
+field kind once and reports a control by its id.
+`iris-gui/scripts/check-boundaries.sh` fails when the core names a UI toolkit
+or a controller spawns a thread, and counts what the shells still reach past
+the controllers for.
 
 ### Thread model
 
@@ -559,7 +710,7 @@ iris/
   iris's own `src/ui.rs` event loop is **not** used — iris-gui never
   calls `Ui::run`, so iris never opens its own window. The selected graphics
   board runs its display loop; iris-gui installs a custom `Renderer`
-  (`framebuffer.rs::CaptureRenderer`) through `Machine::get_display()`
+  (`model/framebuffer.rs::CaptureRenderer`) through `Machine::get_display()`
   and the `GfxDisplay` trait before the CPU starts, then uploads frames to an
   `egui::TextureHandle`.
 - Window operations (resize, fullscreen, surface creation) must run on the
@@ -605,10 +756,10 @@ a build feature — read `MachineConfig::machine.cpu`.
 ### Conventions
 
 - Every user-visible string is a Fluent message in `iris-gui/locales/<lang>/*.ftl`,
-  looked up with `t!("id")` (`src/i18n.rs`). Optional captions and tooltips go
+  looked up with `t!("id")` (`core/src/model/i18n.rs`). Optional captions and tooltips go
   through `subtitle()` and `.tip()`, which draw nothing when the catalog value
   is empty. `locales/README.md` covers the writing style and adding a language;
-  `cargo test -p iris-gui i18n` checks ids and arguments against the code.
+  `cargo test -p iris-gui-core i18n` checks ids and arguments against the code of every front end.
 - `Result<T, String>` for fallible APIs (matches in-tree iris style; no
   anyhow / thiserror).
 - `log` macros for diagnostics; the existing iris `devlog` module

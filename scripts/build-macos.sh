@@ -10,13 +10,14 @@
 # Usage:
 #   ./scripts/build-macos.sh            # the nightly/release feature set
 #   ./scripts/build-macos.sh lightning  # iris/lightning only
-#   ./scripts/build-macos.sh appstore   # SANDBOXED build (App Store parity)
+#   ./scripts/build-macos.sh appstore   # the Mac app, SANDBOXED (App Store parity)
 #
-# The `appstore` variant compiles `--features appstore` (so the real
-# security-scoped bookmark code + IRIS_CHD_DIFF_DIR are active, not the
-# off-sandbox stubs) and signs with installer/iris-gui-sandbox-local.entitlements
-# (app-sandbox = true). The result is a genuinely sandboxed IRIS.app you can run
-# locally — no App Store round-trip — to test the folder-grant / CHD-fold flow.
+# The `appstore` variant builds the native Mac app (the App Store's app, not
+# egui) with `--features appstore` (so the real security-scoped bookmark code +
+# IRIS_CHD_DIFF_DIR are active, not the off-sandbox stubs) and signs it with
+# installer/iris-gui-sandbox-local.entitlements (app-sandbox = true). The result
+# is a genuinely sandboxed IRIS.app you can run locally — no App Store
+# round-trip — to test the folder-grant / CHD-fold flow.
 # Ad-hoc signing by default; set CODESIGN_IDENTITY="Developer ID Application: …"
 # to get persistent app-scoped bookmarks (see the entitlements file's caveat).
 #
@@ -37,14 +38,17 @@ case "$VARIANT" in
     standard) ;;
     lightning) ARGS+=(--features iris/lightning) ;;
     appstore|sandbox)
-        # lightning gives a usable interpreter (the appstore feature forces
-        # IRIS_NO_JIT, so the MIPS/REX JITs are off regardless).
-        ARGS+=(--features "appstore,iris/lightning"
-               --entitlements installer/iris-gui-sandbox-local.entitlements) ;;
+        # The Mac app's App Store build (appstore,lightning: the appstore
+        # feature forces IRIS_NO_JIT, so the MIPS/REX JITs are off regardless).
+        iris-gui/frontends/appkit/scripts/bundle.sh --appstore "${ARGS[@]}" \
+            --entitlements installer/iris-gui-sandbox-local.entitlements ;;
     *) echo "Unknown variant '$VARIANT' (standard, lightning, appstore)" >&2; exit 2 ;;
 esac
 
-scripts/dist/macos-bundle.sh "${ARGS[@]}"
+case "$VARIANT" in
+    appstore|sandbox) ;;
+    *) scripts/dist/macos-bundle.sh "${ARGS[@]}" ;;
+esac
 
 echo ""
 echo "Launch without Terminal:  open IRIS.app"
@@ -52,7 +56,7 @@ if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
     echo ""
     echo "This is a SANDBOXED build. Verify the sandbox is actually on:"
     echo "  codesign -d --entitlements - IRIS.app 2>/dev/null | grep -A1 app-sandbox"
-    echo "  ls ~/Library/Containers/io.techomancer.iris/   # created on first launch"
+    echo "  ls ~/Library/Containers/io.techomancer.iris.appkit/   # created on first launch"
     echo ""
     echo "Test the CHD folder-grant / fold: attach a compressed .chd from a"
     echo "folder you have NOT granted -> the grant modal should appear; grant the"

@@ -29,8 +29,6 @@ scsi-eject = Eject disc
 scsi-insert-disc = Insert disc…
 scsi-change-disc = Change disc…
 scsi-insert-disc-picker = Insert disc
-scsi-mount-in-irix = Mount disc in IRIX
-scsi-mount-in-irix-tip = Mounts the disc at /CDROM. A shell must be open on the console.
 scsi-detach-cdrom = Detach CD-ROM drive
 scsi-overlay-enable = Enable write overlay
 scsi-overlay-disable = Disable write overlay
@@ -63,3 +61,6 @@ serial-socket-failed = The serial console connection failed: { $error }
 ## Camera test
 
 camera-opening = Opening camera…
+# egui's SCSI menu only (the Mac app no longer offers it).
+scsi-mount-in-irix = Mount disc in IRIX
+scsi-mount-in-irix-tip = Mounts the disc at /CDROM. A shell must be open on the console.

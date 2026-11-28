@@ -3,9 +3,10 @@
 #
 #   scripts/dist/macos-bundle.sh [options]
 #
-# This is the one place the macOS app bundle is assembled. The nightly and
-# release builds call it through package-macos.sh, the App Store workflow calls
-# it with --appstore, and you can run it by hand to get the same .app locally.
+# This assembles the egui app's bundle, for a build from source:
+# scripts/build-macos.sh wraps it, and you can run it by hand. The nightly and
+# release macOS downloads and the Mac App Store build are the AppKit IRIS.app
+# instead (iris-gui/frontends/appkit/scripts/bundle.sh).
 #
 # Options:
 #   --features LIST       iris-gui features
@@ -24,9 +25,6 @@
 #                         installer/iris-gui-notarized.entitlements for a real
 #                         identity and none for ad-hoc signing.
 #   --no-sign             leave the bundle unsigned
-#   --appstore            App Store bundle: adds the export-compliance key and
-#                         signs without a secure timestamp
-#   --provisioning-profile FILE   embed this profile (App Store)
 #
 # Then: open dist/IRIS.app
 source "$(dirname "$0")/lib.sh"
@@ -40,8 +38,6 @@ BUILD_VERSION=""
 IDENTITY="${CODESIGN_IDENTITY:--}"
 ENTITLEMENTS=""
 SIGN=1
-APPSTORE=0
-PROFILE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,8 +52,6 @@ while [ $# -gt 0 ]; do
         --sign)          IDENTITY="$2"; shift 2 ;;
         --entitlements)  ENTITLEMENTS="$2"; shift 2 ;;
         --no-sign)       SIGN=0; shift ;;
-        --appstore)      APPSTORE=1; shift ;;
-        --provisioning-profile) PROFILE="$2"; shift 2 ;;
         -h|--help)       sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -107,21 +101,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/iris-gui"
 chmod 755 "$APP/Contents/MacOS/iris-gui"
 cp iris-gui/assets/icons/icon.icns "$APP/Contents/Resources/AppIcon.icns"
-if [ "$APPSTORE" = 0 ]; then
-    cp LICENSE LICENSE-libchdman-rs.txt "$APP/Contents/Resources/"
-fi
-if [ -n "$PROFILE" ]; then
-    cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
-fi
-
-APPSTORE_KEYS=""
-if [ "$APPSTORE" = 1 ]; then
-    # Export compliance: the app uses no non-exempt encryption (its network
-    # path is plaintext; rustls/ring are build-time deps of libchdman-rs's
-    # downloader only). Saying so here skips the per-build question in App
-    # Store Connect.
-    APPSTORE_KEYS="    <key>ITSAppUsesNonExemptEncryption</key><false/>"
-fi
+cp LICENSE LICENSE-libchdman-rs.txt "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -140,7 +120,6 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>LSMinimumSystemVersion</key><string>10.13</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
     <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
-${APPSTORE_KEYS}
 </dict>
 </plist>
 EOF
@@ -162,9 +141,7 @@ if [ "$SIGN" = 1 ]; then
         # otherwise surface as an unsigned or unsandboxed app.
         plutil -lint "$ENTITLEMENTS" >/dev/null
         log "signing as '$IDENTITY' with $ENTITLEMENTS"
-        ts=(--timestamp)
-        [ "$APPSTORE" = 1 ] && ts=()
-        codesign --force --options runtime ${ts[@]+"${ts[@]}"} \
+        codesign --force --options runtime --timestamp \
             --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$APP"
         codesign --verify --deep --strict "$APP"
     fi

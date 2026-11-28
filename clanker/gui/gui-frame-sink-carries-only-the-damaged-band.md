@@ -1,6 +1,6 @@
 # iris-gui's frame sink carries only the damaged band
 
-Status: rule, 2026-10-31. `iris-gui/src/framebuffer.rs`.
+Status: rule, 2026-10-31. `iris-gui/core/src/model/framebuffer.rs`.
 
 ## Symptom
 

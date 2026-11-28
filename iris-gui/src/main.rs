@@ -1,28 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[macro_use]
+extern crate iris_gui_core;
+
 mod i18n;
 mod bench_ui;
 mod filedialog;
-mod camera_test;
-mod capture_access;
 mod config_ui;
 mod extra_ui;
 mod dialogs;
-mod framebuffer;
-mod handle;
+mod effects;
+mod host;
 mod input;
-mod macos_sandbox;
-mod machines;
-mod netfix;
-mod netplan;
-mod ram;
-mod safe_stop;
 mod scsi_menu;
-mod serial_console;
-mod settings;
-mod single_instance;
-mod summary;
+
+// The toolkit-free model, shared with the native shells. Bound at the crate
+// root so `crate::handle::Cmd` and friends keep their paths.
+use iris_gui_core::model::{
+    capture_access, framebuffer, handle, machines, netplan, ram,
+    serial_console, settings, single_instance, summary,
+};
 
 use config_ui::{show_tab, ConfigAction, MemoryUiContext, Tab};
 use dialogs::create_disk::CreateDiskDialog;
@@ -30,9 +27,12 @@ use dialogs::new_machine::{distribute_ram, NewMachineDialog};
 use ram::{ram_summary, ram_presets};
 use eframe::egui;
 use egui::{Color32, RichText, ViewportCommand};
-use handle::{Cmd, EmulatorHandle, Evt, NetState};
-use iris::config::MachineConfig;
-use safe_stop::{evaluate, reason_lines};
+use handle::{Cmd, NetState};
+use iris_gui_core::controller::app::{AppAction, AppController};
+use iris_gui_core::controller::display::DisplayAction;
+use iris_gui_core::controller::serial::SerialAction;
+use iris_gui_core::controller::session::{SessionAction, SessionEvent};
+use iris_gui_core::controller::{Controller, Enabled};
 use settings::{GuiSettings, UI_SCALE_MAX, UI_SCALE_MIN, WINDOW_DEFAULT_SIZE};
 use std::path::PathBuf;
 use i18n::{subtitle, ResponseExt};
@@ -67,16 +67,6 @@ fn developer_binary(name: &str) -> PathBuf {
     launch_dir().join(format!("target/release/{name}{suffix}"))
 }
 
-/// Largest aspect-preserving size (egui points) that fits `avail` for a
-/// framebuffer whose native pixel dimensions are `px`.
-fn fb_fit_size(avail: egui::Vec2, px: egui::Vec2) -> egui::Vec2 {
-    let fb_aspect = px.x / px.y;
-    if avail.x / avail.y > fb_aspect {
-        egui::vec2(avail.y * fb_aspect, avail.y)
-    } else {
-        egui::vec2(avail.x, avail.x / fb_aspect)
-    }
-}
 
 /// Resolve a config path to an absolute string for display — a relative path is
 /// joined to the process working directory (where the emulator actually looks
@@ -98,13 +88,6 @@ fn picked_path(path: &std::path::Path) -> String {
     relative.unwrap_or_else(|| path.to_path_buf()).to_string_lossy().into_owned()
 }
 
-/// How far (in device pixels per emulated pixel) the fit may exceed a whole
-/// device-pixel scale and still be drawn at exactly that scale. Makes an
-/// integer scale "sticky" when the window is a little larger than it needs to
-/// be (window-manager rounding, a free resize that lands near 1×): the picture
-/// is drawn pixel-exact with a thin border instead of stretched by a fraction
-/// of a percent — which NEAREST can only do by dropping whole rows.
-const FB_INTEGER_SNAP: f32 = 0.02;
 
 /// Repaint follow-up (ms) while frames are arriving. The frame sinks wake the
 /// GUI the instant a frame is published, so this is only insurance against a
@@ -133,19 +116,8 @@ const REPAINT_IDLE_MS: u64 = 250;
 /// panel would clip rows off the picture, which is the bug this exists to fix.
 /// Off an integer, returns the aspect-preserving fit to be drawn with LINEAR.
 fn fb_draw_size(avail: egui::Vec2, px: egui::Vec2, ppp: f32, max_scale: f32) -> (egui::Vec2, bool) {
-    let mut fit = fb_fit_size(avail, px);
-    if px.x < 1.0 || px.y < 1.0 || ppp <= 0.0 { return (fit, true); }
-    if max_scale > 0.0 && fit.y > px.y * max_scale {
-        fit = px * max_scale;
-    }
-    let dev = fit.y * ppp / px.y;
-    // The epsilon absorbs float error when the fit is exactly an integer.
-    let n = (dev + 1e-3).floor();
-    if n >= 1.0 && dev - n <= FB_INTEGER_SNAP {
-        (px * (n / ppp), true)
-    } else {
-        (fit, false)
-    }
+    let ((w, h), integer) = iris_gui_core::controller::display::draw_size((avail.x, avail.y), (px.x, px.y), ppp, max_scale, false);
+    (egui::vec2(w, h), integer)
 }
 
 /// Centre the framebuffer in `outer` and put its edges on the device-pixel
@@ -188,8 +160,6 @@ fn main() -> eframe::Result<()> {
     // killed with SIGKILL/CODESIGNING "Invalid Page" on the REX3-Processor
     // thread — right after the emulator window opens, before any video. Set
     // once, before any worker thread (CPU / REX3) can read it.
-    #[cfg(feature = "appstore")]
-    std::env::set_var("IRIS_NO_JIT", "1");
     let viewport = egui::ViewportBuilder::default()
         .with_title(t!("app-name"))
         // app_id sets the X11 WM_CLASS / Wayland app_id so the compositor can
@@ -233,18 +203,32 @@ fn main() -> eframe::Result<()> {
                     ctx.request_repaint();
                 });
             }
-            Ok(Box::new(App::new(prefs)))
+            Ok(Box::new(App::new(prefs, std::sync::Arc::new(EguiWake(cc.egui_ctx.clone())))))
         }),
     )
 }
 
+/// The egui shell's wake: a repaint request, which eframe proxies into the
+/// event loop from any thread.
+struct EguiWake(egui::Context);
+
+impl iris_gui_core::model::job::Notify for EguiWake {
+    fn wake(&self) {
+        self.0.request_repaint();
+    }
+}
+
 struct App {
-    prefs: GuiSettings,
-    cfg: MachineConfig,
-    /// Marks the current cfg as having unsaved (in-memory) changes.
-    cfg_dirty: bool,
-    /// Timestamp of the most recent edit; used to debounce auto-save.
-    cfg_dirty_since: Option<std::time::Instant>,
+    /// The library, the selected machine and its session (iris-gui-core).
+    app: AppController,
+    /// Carries out what the controllers ask for: dialogs, pickers, reveal.
+    effects: effects::EffectHost,
+    /// Set once the controller agreed to quit, so the close is not intercepted.
+    allow_close: bool,
+    /// Set by an `Effect::Quit`: close the window on the next pass.
+    quit_now: bool,
+    /// Text an effect asked to put on the clipboard.
+    pending_clipboard: Option<String>,
     /// Banks passed to the last `Cmd::Start` (guest-visible RAM is fixed until Stop).
     started_banks: Option<[u32; iris::config::MAX_BANKS]>,
     /// The CPU the running guest booted on — see `MemoryUiContext::started_cpu`.
@@ -254,19 +238,10 @@ struct App {
     /// last outcome. Lives here rather than in the tab function because a run
     /// outlives many frames.
     bench: bench_ui::BenchState,
-    emu: EmulatorHandle,
     toast: Option<(String, std::time::Instant)>,
     /// rfd's reasons, when a Browse button found no file dialog to open.
     picker_unavailable: Option<Vec<String>>,
     fullscreen: bool,
-    stop_modal: Option<StopModal>,
-    missing_modal: Option<MissingDiskModal>,
-    /// Set on Start when attached CHDs sit in folders we can't write (App Store
-    /// sandbox) — prompts the user to grant the folder so on-exit fold can work.
-    chd_grant_modal: Option<ChdGrantModal>,
-    /// One-shot: the user chose "Start without compacting", so the next
-    /// `start_emulator` skips the CHD folder-grant preflight. Consumed on read.
-    skip_chd_grant_check: bool,
     /// Set when the user clicks "Use embedded PROM"; drives a confirmation modal.
     confirm_embedded_prom: bool,
     /// Host interface networks (from `if-addrs`), used by the Networking tab for
@@ -275,24 +250,11 @@ struct App {
     /// Set when the Networking tab commits a subnet that fails the sanity checks
     /// (non-RFC1918 or a host conflict); drives the Override/Cancel modal.
     net_sanity_modal: Option<NetSanityModal>,
-    /// `true` while the "Enable packet capture" prompt is open — raised either by
-    /// the user's button in the Network tab or automatically when a pcap-mode
-    /// machine reports `PcapStatus::PermissionDenied` on Start.
-    pcap_perm_modal: bool,
-    /// One-shot guard so the automatic permission prompt fires at most once per
-    /// run (reset on `Evt::Started`); without it the modal would re-open every
-    /// frame the capture stays denied.
-    pcap_perm_prompted: bool,
     new_machine: NewMachineDialog,
     create_disk: CreateDiskDialog,
     /// If true, central panel shows the tabbed config editor; otherwise the
     /// welcome/status summary panel (default — most config lives in menus).
     show_config_editor: bool,
-    /// In-progress name in the "Rename machine" modal (`Some` while it's open).
-    /// Kept as App state, not a per-frame local, so typed input persists.
-    rename_buffer: Option<String>,
-    /// Whether the "Check networking" diagnosis window is open.
-    show_net_check: bool,
     save_state_name: String,
     restore_state_name: String,
     /// egui texture holding the most recent REX3 framebuffer. Allocated
@@ -342,23 +304,9 @@ struct App {
     /// Per-frame state for the egui→PS2 input pump (modifier diff,
     /// mouse button mask, last cursor position).
     input_state: input::InputState,
-    /// Previous frame's `cpu_halted` status, so we can edge-detect the guest
-    /// becoming "safe to stop" and auto-release the captured mouse/keyboard
-    /// exactly once on that transition. Reset to true on Start so the initial
-    /// idle-at-PROM state doesn't count as a halt.
-    prev_cpu_halted: bool,
-    /// Previous frame's `cpu_stopped`, to edge-trigger the auto-consolidation
-    /// when the guest powers itself off (a clean IRIX shutdown).
-    prev_cpu_stopped: bool,
-    /// Active "Test Camera" preview (None when the window is closed). Opening it
-    /// starts host-camera capture; dropping it releases the device.
-    camera_test: Option<camera_test::CameraTest>,
     /// egui texture for the camera-test preview + the last frame seq uploaded.
     camera_test_tex: Option<egui::TextureHandle>,
     camera_test_seq: u64,
-    /// Active in-app IRIX serial-console viewer (None when closed). Connects to
-    /// the loopback serial server; dropping it closes the connection.
-    serial_console: Option<serial_console::SerialConsole>,
     /// Pending line typed into the serial console input field.
     serial_input: String,
     /// Whether the "How camera & networking work" Help window is open.
@@ -370,15 +318,6 @@ struct App {
     /// Whether the License / Privacy Help windows are open.
     show_license: bool,
     show_privacy: bool,
-    /// Active "Synchronizing disks…" job (folding CHD diffs back into bases on a
-    /// clean exit); `Some` shows the modal. `None` when no sync is in flight.
-    syncing: Option<SyncJob>,
-    /// Latched once the exit-time disk sync has been kicked off, so the close
-    /// isn't re-intercepted after it finishes.
-    sync_then_close: bool,
-    /// Pending "Discard changes (roll back)" awaiting confirmation; `Some` shows
-    /// the are-you-sure modal.
-    cow_discard_confirm: Option<CowDiscard>,
     /// Cached host network-interface list for the PCAP backend selector on the
     /// Network tab. `None` until first enumerated (lazily on tab open / refresh)
     /// so we don't call libpcap every frame. `Some(Ok(..))` holds the candidate
@@ -390,25 +329,7 @@ struct App {
     launched_net: Option<(iris::config::NetMode, Option<String>)>,
 }
 
-/// Progress of the exit-time "Synchronizing disks…" step.
-struct SyncJob {
-    /// Disk index currently being synced (0-based) and the total count.
-    disk: usize,
-    total: usize,
-    /// Fraction (0.0..=1.0) through the current disk's rebuild.
-    fraction: f32,
-}
 
-/// A COW overlay the user has asked to discard, awaiting confirmation.
-struct CowDiscard {
-    id: u8,
-    base: String,
-    chd: bool,
-}
-
-struct StopModal {
-    lines: Vec<String>,
-}
 
 /// Confirmation when the Networking tab commits a sanity-failing subnet. Cancel
 /// restores `revert_to`; Override keeps the value as typed.
@@ -418,113 +339,17 @@ struct NetSanityModal {
     revert_to: Option<String>,
 }
 
-/// True if `path` can actually be *read*. The Start preflight uses this instead
-/// of `Path::exists()` because under the macOS App Sandbox a user-selected file
-/// we hold no current grant for (e.g. a disk image picked in a previous session,
-/// before a security-scoped bookmark was minted — see [`macos_sandbox`]) still
-/// `stat()`s as present, so `exists()` would wave it through to `Machine::new`,
-/// which then fails to attach the disk. We probe an actual read (not just an
-/// `open`) because the sandbox can permit `open()` yet deny `read()` once a
-/// grant has lapsed — so opening alone would still slip past the check and only
-/// fail deep in the CHD/image loader. Catching it here routes the disk to the
-/// missing-disk modal, where the user can re-select or detach it.
-pub(crate) fn disk_readable(path: &str) -> bool {
-    use std::io::Read;
-    if iris::http_disk::is_url(path) {
-        return true; // read over the network, not through the sandbox
-    }
-    if path.is_empty() {
-        return false;
-    }
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut probe = [0u8; 1];
-    matches!(f.read(&mut probe), Ok(n) if n >= 1)
-}
 
-/// True if we can create (and remove) a file *in* `dir` — i.e. we hold write
-/// access to the directory itself, not merely to the files already inside it.
-///
-/// This matters for the exit-time CHD fold ("Synchronizing disks…"): it writes
-/// a `.synctmp.chd` beside the base and atomically renames it over the base,
-/// both of which need directory write access. Under the macOS App Sandbox a
-/// *file*-scoped grant (the user picking a disk image) does NOT convey that —
-/// only a folder grant (a directory security-scoped bookmark) does. We probe a
-/// real create because, as with [`disk_readable`], the sandbox can let a path
-/// `stat()` yet deny the write. The probe file is uniquely named and removed
-/// immediately.
-fn dir_writable(dir: &std::path::Path) -> bool {
-    let probe = dir.join(format!(".iris-write-probe-{}", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
 
-/// True if a granted folder is currently *reachable* — we can list it. Under the
-/// sandbox this is gated by an active security-scoped grant, so it's a cheap,
-/// non-writing liveness check (unlike [`dir_writable`], safe to call every frame
-/// while a menu is open). Since we only ever mint recursive read-write directory
-/// grants, "reachable" implies "writable", so this tells the user whether a
-/// recorded folder grant is actually in effect right now.
-fn folder_accessible(path: &str) -> bool {
-    std::fs::read_dir(path).is_ok()
-}
 
-/// Modal shown when one or more SCSI image files are missing on Start.
-/// `Machine::new` would otherwise call `std::process::exit(1)` and take
-/// the whole GUI down with it.
-struct MissingDiskModal {
-    missing: Vec<summary::MissingDisk>,
-}
 
-/// One attached CHD whose containing folder the app can't write to, so its
-/// exit-time fold would be denied (see [`dir_writable`]).
-struct ChdNeedsGrant {
-    id: u8,
-    path: String,
-    /// Absolute parent directory that needs a folder grant.
-    dir: String,
-}
 
-/// Modal shown on Start (App Store build) when attached CHD disks live in
-/// folders the sandbox hasn't granted directory write access to. Without that
-/// grant the copy-on-write `.diff.chd` can never be folded back into the base on
-/// exit, so the disk's footprint only ever grows. Lets the user grant the
-/// folder(s) up front, or start anyway and forgo on-exit compaction.
-struct ChdGrantModal {
-    disks: Vec<ChdNeedsGrant>,
-}
 
 impl App {
-    fn new(mut prefs: GuiSettings) -> Self {
-        let mut cfg = MachineConfig::default();
+    fn new(prefs: GuiSettings, notify: std::sync::Arc<dyn iris_gui_core::model::job::Notify>) -> Self {
         let mut new_machine = NewMachineDialog::default();
-        let mut startup_errors = prefs.errors.clone();
-        if let Some(name) = prefs.active_machine.clone() {
-            if let Some(stored) = prefs.machines.get(&name).cloned() {
-                cfg = stored;
-            } else {
-                prefs.active_machine = None;
-            }
-        }
-        if prefs.active_machine.is_none() {
-            prefs.active_machine = prefs.machines.keys().next().cloned();
-            if let Some(name) = &prefs.active_machine { cfg = prefs.machines[name].clone(); }
-            else { new_machine.open(); }
-        }
-        let dir = match prefs.active_machine.as_deref() {
-            Some(name) => prefs.machine_dir(name),
-            None => prefs.root().map(std::path::Path::to_path_buf),
-        };
-        if let Err(e) = dir.and_then(|dir| Self::enter_directory(&dir)) { startup_errors.push(e); }
-        let startup_toast = (!startup_errors.is_empty())
-            .then(|| (startup_errors.join("\n"), std::time::Instant::now()));
-
+        let app = AppController::new(prefs, notify);
+        if app.is_empty() { new_machine.open(); }
         Self {
             fullscreen: false,
             // First-ever launch (no saved size) → fit the window to the monitor
@@ -532,31 +357,23 @@ impl App {
             pending_launcher_fit: true,
             revealed: false,
             startup_frame: 0,
-            prefs,
-            cfg,
-            cfg_dirty: false,
-            cfg_dirty_since: None,
             started_banks: None,
             started_cpu: None,
             tab: Tab::General,
-            bench: bench_ui::BenchState::default(),
-            emu: EmulatorHandle::spawn(),
-            toast: startup_toast,
+            bench: bench_ui::BenchState::new(app.notify()),
+            toast: None,
+            app,
+            effects: effects::EffectHost::default(),
+            allow_close: false,
+            quit_now: false,
+            pending_clipboard: None,
             picker_unavailable: None,
-            stop_modal: None,
-            missing_modal: None,
-            chd_grant_modal: None,
-            skip_chd_grant_check: false,
             confirm_embedded_prom: false,
             net_ifaces: netplan::gather_host_ifaces(),
             net_sanity_modal: None,
-            pcap_perm_modal: false,
-            pcap_perm_prompted: false,
             new_machine,
             create_disk: CreateDiskDialog::default(),
             show_config_editor: false,
-            rename_buffer: None,
-            show_net_check: false,
             save_state_name: "snap1".into(),
             restore_state_name: "snap1".into(),
             fb_tex: None,
@@ -568,21 +385,14 @@ impl App {
             fb_scale: 0.0,
             pending_fb_snap: false,
             input_state: input::InputState::default(),
-            prev_cpu_halted: true,
-            prev_cpu_stopped: false,
-            camera_test: None,
             camera_test_tex: None,
             camera_test_seq: 0,
-            serial_console: None,
             serial_input: String::new(),
             show_help_info: false,
             show_nfs_help: false,
             show_ultra64_help: false,
             show_license: false,
             show_privacy: false,
-            syncing: None,
-            sync_then_close: false,
-            cow_discard_confirm: None,
             pcap_ifaces: None,
             launched_net: None,
         }
@@ -595,21 +405,6 @@ impl App {
         self.pcap_ifaces = Some(config_ui::enumerate_pcap_ifaces());
     }
 
-    /// Run the platform's "grant packet-capture permission" flow and report the
-    /// result. Invoked by the Network tab's "Enable packet capture…" button and
-    /// by the automatic permission-denied prompt. The per-OS work lives in
-    /// `capture_access` (Linux pkexec/setcap, macOS ChmodBPF, Windows Npcap).
-    fn run_enable_packet_capture(&mut self) {
-        use capture_access::EnableOutcome;
-        // Dismiss the prompt regardless of outcome; the user made a choice.
-        self.pcap_perm_modal = false;
-        match capture_access::enable_packet_capture() {
-            EnableOutcome::Enabled => self.toast(t!("toast-pcap-enabled")),
-            EnableOutcome::NeedsRelaunch(msg) => self.toast(msg),
-            EnableOutcome::Cancelled => {}
-            EnableOutcome::Failed(why) => self.toast(why),
-        }
-    }
 
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), std::time::Instant::now()));
@@ -617,80 +412,68 @@ impl App {
 
     /// Mark the in-memory config as edited and arm the auto-save debounce.
     fn mark_dirty(&mut self) {
-        if let Some(name) = &self.prefs.active_machine {
-            if let Err(e) = self.prefs.machine_dir(name).and_then(|dir| machines::make_relative(&mut self.cfg, &dir)) {
-                self.toast(e);
-            }
-        }
-        self.cfg_dirty = true;
-        self.cfg_dirty_since = Some(std::time::Instant::now());
+        self.run_app(AppAction::ConfigEdited);
     }
 
-    fn enter_directory(dir: &std::path::Path) -> Result<(), String> {
-        std::fs::create_dir_all(dir.join("disks")).map_err(|e| e.to_string())?;
-        std::env::set_current_dir(dir).map_err(|e| t!("toast-enter-dir-failed", path = dir.display(), error = e.to_string()))?;
-        #[cfg(feature = "appstore")]
-        std::env::set_var("IRIS_CHD_DIFF_DIR", dir.join("chd-diffs"));
-        Ok(())
-    }
 
     fn can_select_machine(&mut self) -> bool {
-        if let Err(e) = self.prefs.ensure_writable() { self.toast(e); return false; }
-        if !self.emu.can_change_directory() || self.syncing.is_some() {
-            self.toast(t!("toast-switch-machine-busy"));
-            false
-        } else { true }
+        match self.app.can_change_machine() {
+            Enabled::Yes => true,
+            Enabled::No(why) => { self.toast(why); false }
+        }
     }
 
     /// Persist edits through the core TOML schema and retain failed edits.
     fn flush_machine(&mut self) -> bool {
-        let Some(name) = self.prefs.active_machine.clone() else { return false; };
-        if let Err(e) = self.prefs.save_machine(&name, &mut self.cfg) {
-            self.toast(t!("toast-autosave-failed", error = e));
-            return false;
-        }
-        self.cfg_dirty = false;
-        self.cfg_dirty_since = None;
-        true
+        self.run_app(AppAction::Flush);
+        !self.app.is_dirty()
     }
 
-    fn maybe_autosave(&mut self) {
-        if let Some(t) = self.cfg_dirty_since {
-            if t.elapsed().as_millis() >= 600 { self.flush_machine(); }
+    /// Run an app action and carry out what it asks for.
+    fn run_app(&mut self, action: AppAction) {
+        let fx = self.app.apply(action);
+        self.run_effects(fx);
+    }
+
+    /// Carry out controller effects; answers go back to the app controller.
+    fn run_effects(&mut self, fx: Vec<iris_gui_core::controller::Effect>) {
+        if fx.is_empty() { return; }
+        let out = self.effects.run(fx);
+        for t in out.toasts { self.toast(t); }
+        if let Some(text) = out.clipboard { self.pending_clipboard = Some(text); }
+        if out.quit { self.allow_close = true; self.quit_now = true; }
+        if let Some(page) = out.open_settings {
+            use iris_gui_core::controller::ids::settings as page_ids;
+            self.tab = match page {
+                page_ids::DISKS => config_ui::Tab::Disks,
+                page_ids::NETWORK => config_ui::Tab::Network,
+                _ => config_ui::Tab::General,
+            };
+            self.show_config_editor = true;
+        }
+        for a in out.answers {
+            if a.purpose().starts_with("bench.") {
+                self.bench.answer(a);
+            } else {
+                self.run_app(AppAction::Answer(a));
+            }
         }
     }
+
 
     /// Reload from TOML when selecting a machine, including external edits.
     fn switch_to(&mut self, name: &str) {
-        if !self.can_select_machine() { return; }
-        if self.cfg_dirty && !self.flush_machine() { return; }
-        let result = (|| -> Result<MachineConfig, String> {
-            let mut cfg = machines::read(&self.prefs.machine_path(name)?)?;
-            let dir = self.prefs.machine_dir(name)?;
-            machines::make_relative(&mut cfg, &dir)?;
-            Self::enter_directory(&dir)?;
-            Ok(cfg)
-        })();
-        match result {
-            Ok(cfg) => {
-                self.cfg = cfg;
-                self.prefs.machines.insert(name.into(), self.cfg.clone());
-                self.prefs.active_machine = Some(name.into());
-                if let Err(e) = self.prefs.save() { self.toast(t!("toast-settings-save-failed", error = e)); }
-                else { self.toast(t!("toast-machine-loaded", name = name)); }
-            }
-            Err(e) => self.toast(t!("toast-machine-load-failed", error = e)),
-        }
+        self.run_app(AppAction::Select(name.to_string()));
     }
 
     /// Premiere uses the machine's existing TOML and working directory.
     fn prepare_for_premiere(&mut self) {
         if !self.can_select_machine() { return; }
-        self.cfg.scale = 1;
+        self.app.config_mut().scale = 1;
         self.mark_dirty();
         if !self.flush_machine() { return; }
-        if let Some(name) = self.prefs.active_machine.as_deref() {
-            if let Ok(path) = self.prefs.machine_path(name) {
+        if let Some(name) = self.app.prefs().active_machine.as_deref() {
+            if let Ok(path) = self.app.prefs().machine_path(name) {
                 self.toast(t!("toast-premiere-config", path = path.display()));
             }
         }
@@ -718,15 +501,15 @@ impl App {
     }
 
     fn test_ci_launch(&mut self) {
-        if self.emu.is_running() {
+        if self.app.session().handle().is_running() {
             self.toast(t!("toast-ci-test-stop-first"));
             return;
         }
-        if self.cfg_dirty && !self.flush_machine() { return; }
-        let Some(name) = self.prefs.active_machine.as_deref() else { return; };
-        let Ok(path) = self.prefs.machine_path(name) else { return; };
-        let Ok(dir) = self.prefs.machine_dir(name) else { return; };
-        let socket = if iris::config::ci_socket_is_tcp(&self.cfg.ci_socket) { self.cfg.ci_socket.clone() } else { abs_path(&self.cfg.ci_socket) };
+        if self.app.is_dirty() && !self.flush_machine() { return; }
+        let Some(name) = self.app.prefs().active_machine.as_deref() else { return; };
+        let Ok(path) = self.app.prefs().machine_path(name) else { return; };
+        let Ok(dir) = self.app.prefs().machine_dir(name) else { return; };
+        let socket = if iris::config::ci_socket_is_tcp(&self.app.config().ci_socket) { self.app.config().ci_socket.clone() } else { abs_path(&self.app.config().ci_socket) };
         let iris = developer_binary("iris");
         let client = developer_binary("iris-ci");
         self.toast(t!("toast-ci-test-starting"));
@@ -746,327 +529,49 @@ impl App {
     }
 
     fn start_emulator(&mut self) {
-        // Flush any pending edits before the machine starts so the on-disk
-        // copy matches what we're about to boot. This also harvests a
-        // security-scoped bookmark for any newly user-selected file.
-        if !self.can_select_machine() { return; }
-        if self.cfg_dirty && !self.flush_machine() { return; }
-        let Some(name) = self.prefs.active_machine.clone() else { return; };
-        let result = (|| -> Result<MachineConfig, String> {
-            let cfg = machines::read(&self.prefs.machine_path(&name)?)?;
-            Self::enter_directory(&self.prefs.machine_dir(&name)?)?;
-            Ok(cfg)
-        })();
-        match result {
-            Ok(mut cfg) => {
-                // Files added by hand can contain absolute paths; normalize them
-                // before either the GUI or the emulator uses the saved config.
-                let before = crate::machines::to_toml(&cfg).unwrap_or_default();
-                let dir = self.prefs.machine_dir(&name).unwrap();
-                if let Err(e) = machines::make_relative(&mut cfg, &dir) { self.toast(e); return; }
-                if crate::machines::to_toml(&cfg).unwrap_or_default() != before {
-                    if let Err(e) = self.prefs.save_machine(&name, &mut cfg) { self.toast(e); return; }
-                }
-                self.cfg = cfg;
-            },
-            Err(e) => { self.toast(t!("toast-start-failed", error = e)); return; }
-        }
-        self.prefs.machines.insert(name, self.cfg.clone());
-        // (Re)assert macOS sandbox access to every bookmarked file *before* the
-        // preflight opens them. The startup restore() ran before any bookmark
-        // for a freshly-picked file existed, and the file picker's grant does
-        // not survive a machine stop/restart — so without re-asserting here the
-        // second Start of a session can no longer read the disk image. No-op off
-        // the App Store build. See [`macos_sandbox`].
-        macos_sandbox::restore(&self.prefs.bookmarks);
-        if iris::build_features::LIGHTNING && self.cfg.gdb_port.is_some() {
-            // GDB stub is a no-op under lightning; silently drop the setting
-            // so we don't hand the executor a port it can't honour.
-            self.cfg.gdb_port = None;
-        }
-        if let Err(e) = self.cfg.validate() {
-            self.toast(t!("toast-invalid-config", error = e.to_string()));
-            return;
-        }
-        // Preflight: Machine::new will call std::process::exit(1) on the
-        // first SCSI device whose backing file is missing — we'd lose the
-        // GUI process. Catch that case here and prompt the user instead.
-        if let Some(path) = summary::expansion_paths(&self.cfg).into_iter().find(|p| !disk_readable(p)) {
-            self.toast(t!("extra-unreadable-disk", path = path));
-            return;
-        }
-        let missing = summary::missing_disks(&self.cfg, disk_readable);
-        if !missing.is_empty() {
-            self.missing_modal = Some(MissingDiskModal { missing });
-            return;
-        }
-        // Preflight: under the App Sandbox, folding a compressed CHD's `.diff.chd`
-        // back into its base on exit needs write access to the disk's *folder*,
-        // which picking the disk file alone doesn't grant. If any attached CHD is
-        // in a folder we can't write, prompt the user to grant it now — otherwise
-        // the disk silently never shrinks. "Start without compacting" sets the
-        // one-shot bypass so the user can proceed regardless.
-        if !std::mem::take(&mut self.skip_chd_grant_check) {
-            let needs_grant = self.chd_dirs_needing_grant();
-            if !needs_grant.is_empty() {
-                self.chd_grant_modal = Some(ChdGrantModal { disks: needs_grant });
-                return;
-            }
-        }
-        // The core reads an empty `prom` as a file name and refuses it; an
-        // older GUI wrote it to mean the built-in PROM, which `(embedded)` names.
-        if self.cfg.prom.is_empty() {
-            self.cfg.prom = "(embedded)".into();
-            self.mark_dirty();
-        }
-        // Say when the built-in PROM runs, so it's clear the start did happen
-        // (iris::dev::prom_image::resolve picks it).
-        if crate::extra_ui::builtin_prom(&self.cfg) {
-            self.toast(t!("toast-prom-builtin"));
-        }
-        self.cfg.debug.apply_env();
-        self.cfg.jitv2.apply_env();
-        // An automatic `[jitv2] threads` follows the CPU count chosen since.
-        self.cfg.settle_jitv2_threads();
-        // Latch the networking backend the machine is being started with, so the
-        // running status footer can report PCAP vs NAT (and which interface)
-        // independent of any later edits to the config editor. On a build without
-        // PCAP support the runtime forces NAT (even for an imported `mode =
-        // "pcap"`), so reflect that here and never surface PCAP. Off and
-        // stream stay what they are.
-        self.launched_net = Some(match self.cfg.network.mode {
-            iris::config::NetMode::Pcap if !iris::build_features::PCAP => (iris::config::NetMode::Nat, None),
-            mode => (mode, self.cfg.network.pcap_interface.clone()),
-        });
-        self.started_banks = Some(self.cfg.banks);
-        self.started_cpu = Some(self.cfg.cpu());
-        // Don't resize the window when the VM launches — its size is latched at
-        // app load (the saved window size, or the first-launch fit to vm_scale)
-        // and the guest display is letterboxed into it. Only the VM-scale slider
-        // and UI zoom re-snap the window after that.
-        // Drop the previous run's cached textures so we never flash their last
-        // frame before the new run renders (the shared FrameSinks are reset
-        // worker-side on Start; this clears the GUI's mirror of them).
-        self.fb_tex = None;
-        self.fb_tex_head1 = None;
-        self.last_fb_seq = 0;
-        self.last_fb_seq_head1 = 0;
-        self.fb_took_frame = false;
-        // Assume halted at boot (idle at the PROM) so the auto-release only
-        // fires on a later running→halted transition, not at startup.
-        self.prev_cpu_halted = true;
-        // Fresh run isn't powered off; a later running→stopped edge means the
-        // guest shut itself down (drives the auto-consolidation below).
-        self.prev_cpu_stopped = false;
-        // If the NVRAM has no Ethernet MAC, IRIX won't attach ec0 — networking,
-        // System Manager, and Disk Manager all fail. Offer to set one up, and
-        // hold the machine at the PROM by interrupting autoboot (see the Esc
-        // guard in `update`) so the user sets the MAC before IRIX boots — one
-        // boot instead of boot-then-reboot.
-        // Seed a default NVRAM if there's none yet (a fresh install / bundled
-        // app has nothing in the working dir to migrate), so the machine boots
-        // with proper PROM env instead of a blank one. `toast` holds one
-        // message, so every step below collects into `notes` and one final
-        // call reports them all, rather than each overwriting the last.
-        let mut notes = Vec::new();
-        // Seed only the Indy/Indigo2 battery files. Other platforms use their
-        // own NVRAM or flash layouts and a configured/generated Ethernet MAC.
-        if crate::extra_ui::mc_machine(self.cfg.machine.profile) {
-            if settings::ensure_nvram_seeded(&self.cfg.nvram) {
-                notes.push(t!("toast-nvram-seeded"));
-            }
-            // Networking needs an Ethernet MAC in NVRAM (6 raw bytes at a fixed
-            // offset). If there's none, write a generated one *now*, before boot —
-            // so IRIX attaches ec0 on the first boot, no PROM monitor / reboot.
-            //
-            // Indigo2/IP28 read `eaddr` from the NVRAM *EEPROM* instead
-            // (`nveeprom`, see `clanker/irix/networking.md`) — the DS1386 write
-            // above has no effect on those profiles' guest networking at all.
-            // Patch whichever chip(s) the config carries; harmless on a profile
-            // that doesn't use one (core's own `backdoor_set_mac_if_blank` simply
-            // never reads it then).
-            if !settings::nvram_has_mac(&self.cfg.nvram) {
-                let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
-                let mac = settings::generate_mac_bytes(seed);
-                notes.push(match settings::write_nvram_mac(&self.cfg.nvram, mac) {
-                    Ok(true)  => t!("toast-nvram-mac-written", mac = settings::mac_to_string(mac)),
-                    Ok(false) => t!("toast-nvram-mac-no-file"),
-                    Err(e)    => t!("toast-nvram-mac-failed", error = e.to_string()),
-                });
-            }
-            if !settings::nveeprom_has_mac(&self.cfg.nveeprom) {
-                settings::ensure_nveeprom_exists(&self.cfg.nveeprom);
-                let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
-                let mac = settings::generate_mac_bytes(seed);
-                if let Ok(true) = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac) {
-                    notes.push(t!("toast-nveeprom-mac-written", mac = settings::mac_to_string(mac)));
-                }
-            }
-        }
-        self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
-        if !notes.is_empty() {
-            self.toast(notes.join("\n"));
-        }
+        self.run_app(AppAction::Session(SessionAction::PowerOn));
     }
 
 
-    /// Detach the given SCSI IDs from the live config and (optionally) try Start again.
-    fn detach_and_start(&mut self, ids: &[u8]) {
-        for &id in ids { self.cfg.remove_disk(id); }
-        self.mark_dirty();
-        self.start_emulator();
-    }
 
-    /// App Store sandbox: let the user grant a folder (recursive read-write) so
-    /// disk images, the CHD diff / fold temp written beside a base, and an NFS
-    /// shared subfolder under it are all accessible from one grant. Persists a
-    /// directory security-scoped bookmark and asserts access immediately.
-    fn grant_disk_folder(&mut self) {
-        self.grant_disk_folder_at(None);
-    }
 
-    /// As [`grant_disk_folder`](Self::grant_disk_folder), but opens the picker
-    /// already pointed at `start_dir` (e.g. the folder of a CHD that needs a
-    /// grant), so the user just confirms it.
-    fn grant_disk_folder_at(&mut self, start_dir: Option<&str>) {
-        // `start_dir` is itself the folder that needs granting, so open *at*
-        // it — the caller's whole point is that the user just confirms. With
-        // none, the managed disks folder beats wherever rfd last was.
-        let dialog = filedialog::dialog_at_dir(
-            &t!("main-grant-folder-title"),
-            start_dir.unwrap_or(""),
-            filedialog::Anchor::Disks,
-        );
-        if let Some(dir) = dialog.pick_folder() {
-            let path = dir.to_string_lossy().into_owned();
-            if !self.prefs.disk_folders.contains(&path) {
-                self.prefs.disk_folders.push(path.clone());
-            }
-            let _ = self.prefs.save(); // mints the directory bookmark
-            macos_sandbox::restore(&self.prefs.bookmarks); // start accessing now
-            self.toast(t!("toast-folder-granted", path = &path));
-        }
-    }
 
-    /// macOS preflight: attached CHD disks (non-scratch HDDs) whose folder we
-    /// can't write, so their on-exit `.diff.chd` fold would be denied. Runs on
-    /// ALL macOS builds: the sandbox (MAS) build needs an explicit directory
-    /// security-scoped grant, while the notarized build is subject to macOS TCC
-    /// (Documents/Desktop/Downloads/iCloud/external/network volumes are blocked
-    /// until the user consents). Either way we probe real writability and prompt
-    /// up front, so the fold doesn't silently fail at quit. Empty off macOS,
-    /// where there's no such gate and folders are writable directly.
-    fn chd_dirs_needing_grant(&self) -> Vec<ChdNeedsGrant> {
-        if !cfg!(target_os = "macos") {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        for (id, i) in self.cfg.disks() {
-            let dev = self.cfg.devices[i].device.scsi().expect("listed by disks");
-            // CD-ROM CHDs are read-only (no diff); scratch disks live in the
-            // writable container. Only writable HDD CHDs ever get folded.
-            if dev.scratch || dev.is_cdrom() { continue; }
-            if !dev.path.ends_with(".chd") { continue; }
-            let absolute = abs_path(&dev.path);
-            let Some(parent) = std::path::Path::new(&absolute).parent() else { continue };
-            if !dir_writable(parent) {
-                out.push(ChdNeedsGrant {
-                    id,
-                    path: dev.path.clone(),
-                    dir: parent.to_string_lossy().into_owned(),
-                });
-            }
-        }
-        out.sort_by_key(|c| c.id);
-        out
-    }
 
-    /// Pop the folder-grant modal if any attached CHD is in a folder we can't
-    /// write. Called right after a disk is assigned (Browse pick), so the user
-    /// resolves permissions up front. No-op if already prompting or all good.
     fn check_chd_folder_grants(&mut self) {
-        if self.chd_grant_modal.is_some() { return; }
-        let needs = self.chd_dirs_needing_grant();
-        if !needs.is_empty() {
-            self.chd_grant_modal = Some(ChdGrantModal { disks: needs });
-        }
+        self.run_app(AppAction::Session(SessionAction::CheckFolderGrants));
     }
 
     /// SCSI-menu section: per-disk Commit / Discard for copy-on-write overlays.
     /// Only offered while the machine is stopped — the disk files are closed
     /// then, so applying or discarding can't corrupt a running guest.
     fn draw_cow_menu(&mut self, ui: &mut egui::Ui) {
-        // Snapshot disks that currently have an overlay on disk (cloned so we
-        // don't hold a `cfg` borrow while sending worker commands below).
-        let mut entries: Vec<(u8, String, bool)> = Vec::new(); // (id, base, is_chd)
-        for (id, i) in self.cfg.disks() {
-            let dev = self.cfg.devices[i].device.scsi().expect("listed by disks");
-            if dev.is_cdrom() || dev.scratch || dev.path.trim().is_empty() {
-                continue;
-            }
-            let is_chd = iris::chd_disk::is_chd(&dev.path);
-            let has_overlay = if is_chd {
-                iris::chd_disk::diff_path_for(std::path::Path::new(&dev.path)).exists()
-            } else if dev.overlay {
-                std::path::Path::new(&format!("{}.overlay", dev.path)).exists()
-            } else {
-                false
-            };
-            if has_overlay {
-                entries.push((id, dev.path.clone(), is_chd));
-            }
-        }
+        let entries = self.app.overlays();
         if entries.is_empty() {
             return;
         }
         ui.separator();
         ui.label(RichText::new(t!("menu-cow-heading")).strong());
-        if self.emu.is_running() {
+        if self.app.session().is_running() {
             ui.label(RichText::new(t!("menu-cow-stop-first")).weak());
             return;
         }
-        for (id, base, is_chd) in entries {
-            let name = std::path::Path::new(&base).file_name().and_then(|n| n.to_str()).unwrap_or(&base);
-            let label = crate::extra_ui::scsi_name(id);
-            ui.label(RichText::new(t!("menu-cow-disk", id = &label, name = name)).weak());
-            if ui.button(t!("menu-cow-commit"))
-                .tip(t!("menu-cow-commit-tip"))
-                .clicked()
-            {
-                if is_chd {
-                    // A CHD commit recompresses — show the progress modal.
-                    self.syncing = Some(SyncJob { disk: 0, total: 1, fraction: 0.0 });
-                }
-                self.emu.send(Cmd::CowCommit { base: base.clone(), chd: is_chd });
+        for (key, base, _) in entries {
+            let name = std::path::Path::new(&base).file_name().and_then(|n| n.to_str()).unwrap_or(&base).to_string();
+            let label = crate::extra_ui::scsi_name(key);
+            ui.label(RichText::new(t!("menu-cow-disk", id = &label, name = &name)).weak());
+            if ui.button(t!("menu-cow-commit")).tip(t!("menu-cow-commit-tip")).clicked() {
+                self.run_app(AppAction::Session(SessionAction::ApplyChanges { key }));
                 ui.close();
             }
-            if ui.button(t!("menu-cow-discard"))
-                .tip(t!("menu-cow-discard-tip"))
-                .clicked()
-            {
-                // Destructive — confirm before discarding.
-                self.cow_discard_confirm = Some(CowDiscard { id, base: base.clone(), chd: is_chd });
+            if ui.button(t!("menu-cow-discard")).tip(t!("menu-cow-discard-tip")).clicked() {
+                self.run_app(AppAction::Session(SessionAction::RollBack { key }));
                 ui.close();
             }
         }
     }
 
     fn request_stop(&mut self) {
-        let reasons = evaluate(&self.emu.status, &self.cfg);
-        if !reasons.is_empty() {
-            self.stop_modal = Some(StopModal { lines: reason_lines(&reasons) });
-            return;
-        }
-        // Safe to stop (guest quiesced). If a CHD has diff-borne changes, fold
-        // them back into the base now ("Synchronizing disks…") instead of leaving
-        // a sidecar — the worker stops the machine as part of the sync. This is a
-        // stop, not a quit, so `sync_then_close` stays false and the app stays open.
-        if self.emu.has_pending_chd_sync() {
-            self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
-            self.emu.send(Cmd::SyncDisks);
-        } else {
-            self.emu.send(Cmd::Stop);
-        }
+        self.run_app(AppAction::Session(SessionAction::PowerOff));
     }
 
     /// Point the frame sinks at this context so the REX3 refresh thread wakes
@@ -1075,62 +580,40 @@ impl App {
     /// `App` outlives the sinks only in the other direction: the sinks are built
     /// with the worker thread, before any context exists to give them.
     fn install_frame_wake(&self, ctx: &egui::Context) {
-        self.emu.frame_sink.set_wake(ctx);
-        self.emu.frame_sink_head1.set_wake(ctx);
+        let wake: std::sync::Arc<dyn iris_gui_core::model::job::Notify> =
+            std::sync::Arc::new(EguiWake(ctx.clone()));
+        self.app.session().handle().frame_sink.set_wake(wake.clone());
+        self.app.session().handle().frame_sink_head1.set_wake(wake);
     }
 
     fn handle_events(&mut self, ctx: &egui::Context) {
-        for evt in self.emu.drain_events() {
-            match evt {
-                Evt::Started   => {
-                    // Fresh run: re-arm the one-shot PCAP permission prompt so a
-                    // pcap-mode machine that can't open its capture re-prompts.
-                    self.pcap_perm_prompted = false;
+        // The app controller drains the worker: toasts, sync progress, the
+        // fold after a guest power-off, and the end of a quit.
+        let fx = self.app.tick();
+        self.run_effects(fx);
+        for event in self.app.take_session_events() {
+            match event {
+                SessionEvent::Started => {
+                    let started = self.app.session().started_config().cloned();
+                    self.started_banks = started.as_ref().map(|c| c.banks);
+                    self.started_cpu = started.as_ref().map(|c| c.cpu());
+                    self.launched_net = started.as_ref().map(|c| match c.network.mode {
+                        iris::config::NetMode::Pcap if !iris::build_features::PCAP => (iris::config::NetMode::Nat, None),
+                        mode => (mode, c.network.pcap_interface.clone()),
+                    });
+                    // Drop the previous run's textures so its last frame never
+                    // flashes before the new run renders.
+                    self.fb_tex = None;
+                    self.fb_tex_head1 = None;
+                    self.last_fb_seq = 0;
+                    self.last_fb_seq_head1 = 0;
+                    self.fb_took_frame = false;
                     // Stop drops the machine and its serial listener; reconnect the
                     // in-app viewer so it attaches to the new VM, not a dead socket.
-                    if self.serial_console.is_some() {
-                        self.open_serial_console();
-                    }
-                    self.toast(t!("toast-emulator-started"));
+                    // An open serial console reconnects itself (the app controller).
                 }
-                Evt::Stopped   => {
-                    self.toast(t!("toast-emulator-stopped"));
-                }
-                Evt::PowerOff  => self.toast(t!("toast-guest-powered-off")),
-                Evt::StateSaved(n)    => self.toast(t!("toast-state-saved", name = n)),
-                Evt::StateRestored(n) => self.toast(t!("toast-state-restored", name = n)),
-                Evt::Screenshot(p)    => self.toast(t!("toast-screenshot-saved", path = p.display())),
-                Evt::Error(e)         => self.toast(t!("toast-error", error = e)),
-                Evt::Status(_) => {}
-                Evt::SyncProgress { disk, total, fraction } => {
-                    self.syncing = Some(SyncJob { disk, total, fraction });
-                }
-                Evt::CowDone { committed } => {
-                    self.toast(if committed { t!("toast-cow-committed") } else { t!("toast-cow-done") });
-                }
-                Evt::SyncDone(n) => {
-                    self.syncing = None;
-                    if n > 0 { self.toast(t!("toast-disks-synced", count = n)); }
-                    // If the sync was a pre-quit step, finish closing now. The
-                    // `sync_then_close` latch stays set so this Close isn't
-                    // re-intercepted (the machine is gone, so `chd_sync_pending`
-                    // is stale-true). A Stop-triggered sync leaves it false, so
-                    // the app stays open with the machine stopped.
-                    if self.sync_then_close {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
+                SessionEvent::Stopped | SessionEvent::Halted | SessionEvent::PoweredOff | SessionEvent::SyncDone => {}
             }
-        }
-        // Automatic PCAP elevation prompt: a pcap-mode machine that couldn't open
-        // its raw capture for lack of privilege reports `PermissionDenied`. Raise
-        // the same "Enable packet capture" prompt the Network tab button uses,
-        // once per run (the one-shot guard avoids re-opening it every frame).
-        if !self.pcap_perm_prompted
-            && self.emu.pcap_status() == iris::net::PcapStatus::PermissionDenied
-        {
-            self.pcap_perm_prompted = true;
-            self.pcap_perm_modal = true;
         }
 
         // Repaint cadence. The frame sinks wake us the moment a frame lands
@@ -1160,15 +643,15 @@ impl App {
         ui.vertical(|ui| {
             ui.menu_button(t!("menu-file"), |ui| {
                 ui.set_min_width(220.0);
-                if ui.add_enabled(self.emu.can_change_directory(), egui::Button::new(t!("menu-file-new-machine"))).clicked() {
+                if ui.add_enabled(self.app.session().handle().can_change_directory(), egui::Button::new(t!("menu-file-new-machine"))).clicked() {
                     self.new_machine.open();
                     ui.close();
                 }
                 ui.menu_button(t!("menu-file-switch-machine"), |ui| {
                     ui.set_min_width(200.0);
-                    let active = self.prefs.active_machine.clone();
-                    let names: Vec<String> = self.prefs.machines.keys().cloned().collect();
-                    if names.is_empty() && self.prefs.needs_edit.is_empty() {
+                    let active = self.app.prefs().active_machine.clone();
+                    let names: Vec<String> = self.app.prefs().machines.keys().cloned().collect();
+                    if names.is_empty() && self.app.prefs().needs_edit.is_empty() {
                         ui.label(RichText::new(t!("menu-file-no-machines")).weak());
                     }
                     let mut want_switch: Option<String> = None;
@@ -1176,19 +659,19 @@ impl App {
                         // selectable_label highlights the active machine — no
                         // marker glyph (a leading ● rendered as tofu).
                         let is_active = active.as_deref() == Some(name.as_str());
-                        if ui.add_enabled(self.emu.can_change_directory(), egui::Button::selectable(is_active, name.as_str())).clicked() {
+                        if ui.add_enabled(self.app.session().handle().can_change_directory(), egui::Button::selectable(is_active, name.as_str())).clicked() {
                             want_switch = Some(name);
                             ui.close();
                         }
                     }
                     // Files that do not read: listed, with the error on hover.
-                    for (name, error) in &self.prefs.needs_edit {
+                    for (name, error) in &self.app.prefs().needs_edit {
                         ui.add_enabled(false, egui::Button::new(t!("menu-file-needs-edit", name = name.as_str())))
                             .on_disabled_hover_text(error);
                     }
                     if let Some(n) = want_switch { self.switch_to(&n); }
                 });
-                if ui.add_enabled(self.prefs.active_machine.is_some() && self.emu.can_change_directory(),
+                if ui.add_enabled(self.app.prefs().active_machine.is_some() && self.app.session().handle().can_change_directory(),
                         egui::Button::new(t!("menu-file-rename-machine")))
                     .on_disabled_hover_text(t!("menu-file-rename-machine-disabled-tip"))
                     .clicked()
@@ -1196,13 +679,30 @@ impl App {
                     // Open the rename modal seeded with the current name. (A
                     // text box inside the menu can't work — the menu closure
                     // re-runs each frame and would reset the buffer.)
-                    self.rename_buffer = self.prefs.active_machine.clone();
+                    if let Some(machine) = self.app.selected().map(str::to_string) {
+                        self.run_app(AppAction::Rename { machine });
+                    }
                     ui.close();
                 }
-                let active = self.prefs.active_machine.clone();
-                if ui.add_enabled(active.is_some() && self.emu.can_change_directory(),
+                let active = self.app.prefs().active_machine.clone();
+                if ui.add_enabled(active.is_some() && self.app.session().handle().can_change_directory(),
                         egui::Button::new(t!("menu-file-delete-machine"))).clicked() {
-                    if let Some(name) = active { self.delete_machine(&name); }
+                    if let Some(name) = active.clone() { self.delete_machine(&name); }
+                    ui.close();
+                }
+                if ui.add_enabled(active.is_some() && self.app.session().handle().can_change_directory(),
+                        egui::Button::new(t!("menu-file-duplicate-machine")))
+                    .tip(t!("menu-file-duplicate-machine-tip"))
+                    .clicked() {
+                    if let Some(machine) = active.clone() { self.run_app(AppAction::Duplicate { machine }); }
+                    ui.close();
+                }
+                if ui.add_enabled(active.is_some(), egui::Button::new(t!("menu-file-show-folder"))).clicked() {
+                    if let Some(machine) = active.clone() { self.run_app(AppAction::ShowInFileManager { machine }); }
+                    ui.close();
+                }
+                if ui.add_enabled(active.is_some(), egui::Button::new(t!("menu-file-open-config"))).clicked() {
+                    if let Some(machine) = active.clone() { self.run_app(AppAction::OpenConfigFile { machine }); }
                     ui.close();
                 }
                 if !cfg!(feature = "bundled") {
@@ -1212,53 +712,10 @@ impl App {
                         ui.close();
                     }
                 }
-                // App Store sandbox: grant a whole folder (recursive) so the
-                // disk-sync fold — which writes a temp beside the base and
-                // renames over it — works, and so a disk image / NFS shared
-                // subfolder under it is covered by one grant. Hidden elsewhere.
-                if cfg!(feature = "appstore") {
-                    ui.separator();
-                    ui.label(RichText::new(t!("menu-file-folders-heading")).strong());
-                    if ui.button(t!("menu-file-grant-folder"))
-                        .tip(t!("menu-file-grant-folder-tip"))
-                        .clicked()
-                    {
-                        self.grant_disk_folder();
-                        ui.close();
-                    }
-                    let folders = self.prefs.disk_folders.clone();
-                    if folders.is_empty() {
-                        ui.label(RichText::new(t!("menu-file-no-folders")).weak().small());
-                    }
-                    for f in &folders {
-                        ui.horizontal(|ui| {
-                            // Live access state: green bullet if the grant is in
-                            // effect this session, red if it lapsed (re-grant to
-                            // fix). U+2022 (bullet) renders; U+25CF (●) and the
-                            // check/cross dingbats are tofu in egui's label font.
-                            let live = folder_accessible(f);
-                            let (color, tip) = if live {
-                                (Color32::from_rgb(120, 200, 120), t!("menu-file-folder-active-tip"))
-                            } else {
-                                (Color32::from_rgb(220, 140, 90), t!("menu-file-folder-lapsed-tip"))
-                            };
-                            ui.label(RichText::new("\u{2022}").size(15.0).color(color)).tip(tip);
-                            ui.label(RichText::new(f).weak());
-                            if ui.small_button("📂").tip(t!("menu-file-folder-reveal-tip")).clicked() {
-                                config_ui::reveal_in_file_manager(f);
-                            }
-                            if ui.small_button("\u{00D7}").tip(t!("menu-file-folder-revoke-tip")).clicked() {
-                                self.prefs.disk_folders.retain(|x| x != f);
-                                self.prefs.bookmarks.remove(f);
-                                let _ = self.prefs.save();
-                            }
-                        });
-                    }
-                }
                 ui.separator();
                 if ui.button(t!("menu-file-quit")).clicked() {
-                    if self.cfg_dirty { self.flush_machine(); }
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    self.run_app(AppAction::RequestQuit);
+                    ui.close();
                 }
             });
             // Closes only on a click outside it: the Save and Restore state
@@ -1268,7 +725,7 @@ impl App {
                 .config(egui::containers::menu::MenuConfig::new()
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
                 .ui(ui, |ui| {
-                let running = self.emu.is_running();
+                let running = self.app.session().handle().is_running();
                 if ui.add_enabled(!running, egui::Button::new(t!("menu-machine-start"))).clicked() {
                     self.start_emulator();
                     ui.close();
@@ -1278,13 +735,12 @@ impl App {
                     ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new(t!("menu-machine-reset"))).clicked() {
-                    self.emu.send(Cmd::Stop);
-                    self.start_emulator();
+                    self.run_app(AppAction::Session(SessionAction::Restart));
                     ui.close();
                 }
-                if ui.add_enabled(!running && (crate::extra_ui::mc_machine(self.cfg.machine.profile) || self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30), egui::Button::new(t!("menu-machine-reset-nvram")))
+                if ui.add_enabled(!running && (crate::extra_ui::mc_machine(self.app.config().machine.profile) || self.app.config().machine.profile == iris::config::MachineProfile::OctaneIp30), egui::Button::new(t!("menu-machine-reset-nvram")))
                     .tip(t!("menu-machine-reset-nvram-tip",
-                        nvram = abs_path(&self.cfg.nvram), nveeprom = abs_path(&self.cfg.nveeprom)))
+                        nvram = abs_path(&self.app.config().nvram), nveeprom = abs_path(&self.app.config().nveeprom)))
                     .clicked()
                 {
                     // Indigo2/IP28 read eaddr and PROM env from the NVRAM
@@ -1295,13 +751,13 @@ impl App {
                     // message, so collect both MC outcomes into a
                     // single final one rather than letting a later call
                     // silently overwrite an earlier failure.
-                    let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
+                    let seed = self.app.prefs().active_machine.as_deref().unwrap_or("indy");
                     let mac = settings::generate_mac_bytes(seed);
                     let mut errors = Vec::new();
-                    if self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30 {
+                    if self.app.config().machine.profile == iris::config::MachineProfile::OctaneIp30 {
                         // A blank DS1685 NVRAM is the Octane's factory state:
                         // keep a backup and remove the file.
-                        let path = &self.cfg.nvram;
+                        let path = &self.app.config().nvram;
                         let _ = std::fs::copy(path, format!("{path}.bak"));
                         match std::fs::remove_file(path) {
                             Ok(()) => self.toast(t!("toast-nvram-reset-octane")),
@@ -1309,12 +765,12 @@ impl App {
                             Err(e) => self.toast(t!("toast-nvram-reset-failed", error = e.to_string())),
                         }
                     } else {
-                        match settings::reset_nvram(&self.cfg.nvram) {
-                            Ok(()) => { let _ = settings::write_nvram_mac(&self.cfg.nvram, mac); }
+                        match settings::reset_nvram(&self.app.config().nvram) {
+                            Ok(()) => { let _ = settings::write_nvram_mac(&self.app.config().nvram, mac); }
                             Err(e) => errors.push(t!("toast-nvram-reset-failed", error = e.to_string())),
                         }
-                        match settings::reset_nveeprom(&self.cfg.nveeprom) {
-                            Ok(()) => { let _ = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac); }
+                        match settings::reset_nveeprom(&self.app.config().nveeprom) {
+                            Ok(()) => { let _ = settings::write_nveeprom_mac(&self.app.config().nveeprom, mac); }
                             Err(e) => errors.push(t!("toast-nveeprom-reset-failed", error = e.to_string())),
                         }
                         self.toast(if errors.is_empty() {
@@ -1329,11 +785,11 @@ impl App {
                 // Chosen at Machine::new, so an edit while running is pending, not live —
                 // same shape as the Memory menu's RAM rows.
                 ui.set_min_width(240.0);
-                ui.label(RichText::new(t!("menu-machine-processor", cpu = self.cfg.cpu().label())).strong());
-                ui.add_enabled_ui(!running && self.cfg.machine.profile.cpus().len() > 1, |ui| {
-                    for &c in self.cfg.machine.profile.cpus() {
-                        if ui.radio(self.cfg.cpu() == c, c.label()).clicked() {
-                            self.cfg.set_cpu(c);
+                ui.label(RichText::new(t!("menu-machine-processor", cpu = self.app.config().cpu().label())).strong());
+                ui.add_enabled_ui(!running && self.app.config().machine.profile.cpus().len() > 1, |ui| {
+                    for &c in self.app.config().machine.profile.cpus() {
+                        if ui.radio(self.app.config().cpu() == c, c.label()).clicked() {
+                            self.app.config_mut().set_cpu(c);
                             self.mark_dirty();
                             self.toast(t!("toast-cpu-set", cpu = c.label()));
                             ui.close();
@@ -1342,7 +798,7 @@ impl App {
                 });
                 if running {
                     match self.started_cpu {
-                        Some(started) if started != self.cfg.cpu() => {
+                        Some(started) if started != self.app.config().cpu() => {
                             ui.label(RichText::new(t!("menu-machine-running-pending", cpu = started.label()))
                                 .color(Color32::YELLOW));
                         }
@@ -1358,7 +814,7 @@ impl App {
                     ui.label(t!("menu-machine-save-state"));
                     ui.add(egui::TextEdit::singleline(&mut self.save_state_name).desired_width(120.0));
                     if ui.button(t!("common-save")).clicked() {
-                        self.emu.send(Cmd::SaveState(self.save_state_name.clone()));
+                        self.run_app(AppAction::Session(SessionAction::SaveState(self.save_state_name.clone())));
                         ui.close();
                     }
                 });
@@ -1366,15 +822,13 @@ impl App {
                     ui.label(t!("menu-machine-restore-state"));
                     ui.add(egui::TextEdit::singleline(&mut self.restore_state_name).desired_width(120.0));
                     if ui.button(t!("menu-machine-restore")).clicked() {
-                        self.emu.send(Cmd::RestoreState(self.restore_state_name.clone()));
+                        self.run_app(AppAction::Session(SessionAction::RestoreState(self.restore_state_name.clone())));
                         ui.close();
                     }
                 });
                 ui.separator();
                 if ui.button(t!("menu-machine-screenshot")).clicked() {
-                    if let Some(p) = native_save_dialog(&t!("menu-machine-screenshot-title"), &[("PNG", &["png"])]) {
-                        self.emu.send(Cmd::Screenshot(p));
-                    }
+                    self.run_app(AppAction::Session(SessionAction::Screenshot));
                     ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new(t!("menu-machine-serial-console")))
@@ -1387,12 +841,12 @@ impl App {
             });
             ui.menu_button(t!("menu-memory"), |ui| {
                 ui.set_min_width(220.0);
-                let running = self.emu.is_running();
-                let summary = ram_summary(&self.cfg.banks);
+                let running = self.app.session().handle().is_running();
+                let summary = ram_summary(&self.app.config().banks);
                 ui.label(RichText::new(t!("menu-memory-configured", ram = summary)).strong());
                 if running {
                     if let Some(started) = self.started_banks {
-                        if started != self.cfg.banks {
+                        if started != self.app.config().banks {
                             ui.label(
                                 RichText::new(t!("menu-memory-running-pending", ram = ram_summary(&started)))
                                 .color(Color32::YELLOW),
@@ -1405,7 +859,7 @@ impl App {
                 } else {
                     subtitle(ui, t!("menu-memory-stopped-subtitle"));
                 }
-                let profile = self.cfg.machine.profile;
+                let profile = self.app.config().machine.profile;
                 ui.separator();
                 ui.label(t!("menu-memory-presets"));
                 for &p in ram_presets(profile) {
@@ -1414,17 +868,17 @@ impl App {
                         .on_disabled_hover_text(t!("menu-memory-stop-first-tip"))
                         .clicked()
                     {
-                        self.cfg.banks = distribute_ram(p, profile);
-                        self.cfg.banks_set = true;
+                        self.app.config_mut().banks = distribute_ram(p, profile);
+                        self.app.config_mut().banks_set = true;
                         self.mark_dirty();
-                        self.toast(t!("toast-ram-set", ram = ram_summary(&self.cfg.banks), banks = format!("{:?}", self.cfg.banks)));
+                        self.toast(t!("toast-ram-set", ram = ram_summary(&self.app.config().banks), banks = format!("{:?}", self.app.config().banks)));
                         ui.close();
                     }
                 }
                 ui.separator();
                 ui.label(t!("menu-memory-banks"));
                 for i in 0..profile.memory_banks() {
-                    ui.menu_button(t!("menu-memory-bank", bank = i, mb = self.cfg.banks[i]), |ui| {
+                    ui.menu_button(t!("menu-memory-bank", bank = i, mb = self.app.config().banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui
                                 .add_enabled(!running && profile.bank_sizes().contains(&sz), egui::Button::new(t!("menu-memory-size", mb = sz)))
@@ -1435,8 +889,8 @@ impl App {
                                 })
                                 .clicked()
                             {
-                                self.cfg.banks[i] = sz;
-                                self.cfg.banks_set = true;
+                                self.app.config_mut().banks[i] = sz;
+                                self.app.config_mut().banks_set = true;
                                 self.mark_dirty();
                                 ui.close();
                             }
@@ -1446,8 +900,8 @@ impl App {
             });
             // The IP35 brick machines keep their disks on the I-brick's Fibre
             // Channel loop, edited in the Disks tab; they have no [scsi.N].
-            if !self.cfg.machine.profile.is_ip35_bricks() { ui.menu_button(t!("menu-scsi"), |ui| {
-                let action = scsi_menu::draw(ui, &self.cfg);
+            if !self.app.config().machine.profile.is_ip35_bricks() { ui.menu_button(t!("menu-scsi"), |ui| {
+                let action = scsi_menu::draw(ui, &self.app.config());
                 match action {
                     scsi_menu::ScsiAction::None => {}
                     scsi_menu::ScsiAction::CreateBlank { id } => {
@@ -1455,52 +909,52 @@ impl App {
                     }
                     scsi_menu::ScsiAction::InsertDisc { id, path } => {
                         if let Some(msg) = scsi_menu::apply(
-                            &mut self.cfg,
+                            &mut self.app.config_mut(),
                             scsi_menu::ScsiAction::InsertDisc { id, path: path.clone() },
                         ) {
                             self.mark_dirty();
                             self.toast(msg);
                         }
-                        if self.emu.is_running() {
-                            self.emu.send(Cmd::LoadDisc { id, path, remount: true });
+                        if self.app.session().is_running() {
+                            self.run_app(AppAction::Session(SessionAction::LoadDisc { key: id, path }));
                         } else {
                             self.toast(t!("toast-disc-saved"));
                         }
                     }
                     scsi_menu::ScsiAction::AttachCdromWithDisc { id, path } => {
                         if let Some(msg) = scsi_menu::apply(
-                            &mut self.cfg,
+                            &mut self.app.config_mut(),
                             scsi_menu::ScsiAction::AttachCdromWithDisc { id, path: path.clone() },
                         ) {
                             self.mark_dirty();
                             self.toast(msg);
                         }
-                        if self.emu.is_running() {
-                            self.emu.send(Cmd::LoadDisc { id, path, remount: true });
+                        if self.app.session().is_running() {
+                            self.run_app(AppAction::Session(SessionAction::LoadDisc { key: id, path }));
                         }
                     }
                     scsi_menu::ScsiAction::Eject { id } => {
                         if let Some(msg) = scsi_menu::apply(
-                            &mut self.cfg,
+                            &mut self.app.config_mut(),
                             scsi_menu::ScsiAction::Eject { id },
                         ) {
                             self.mark_dirty();
                             self.toast(msg);
                         }
-                        if self.emu.is_running() {
-                            self.emu.send(Cmd::EjectCdrom { id });
+                        if self.app.session().is_running() {
+                            self.run_app(AppAction::Session(SessionAction::EjectDisc { key: id }));
                         }
                     }
                     scsi_menu::ScsiAction::RemountInIrix { id } => {
-                        if self.emu.is_running() {
-                            self.emu.send(Cmd::RemountCdrom { id });
+                        if self.app.session().is_running() {
+                            self.run_app(AppAction::Session(SessionAction::RemountDisc { key: id }));
                             self.toast(t!("toast-cdrom-remount-sent", id = id));
                         } else {
                             self.toast(t!("toast-cdrom-remount-not-running"));
                         }
                     }
                     other => {
-                        if let Some(msg) = scsi_menu::apply(&mut self.cfg, other) {
+                        if let Some(msg) = scsi_menu::apply(&mut self.app.config_mut(), other) {
                             self.mark_dirty();
                             self.toast(msg);
                         }
@@ -1509,9 +963,8 @@ impl App {
                 self.draw_cow_menu(ui);
             }); }
             ui.menu_button(t!("menu-view"), |ui| {
-                if ui.button(if self.fullscreen { t!("menu-view-exit-fullscreen") } else { t!("menu-view-fullscreen") }).clicked() {
-                    self.fullscreen = !self.fullscreen;
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+                if ui.button(if self.app.display().fullscreen() { t!("menu-view-exit-fullscreen") } else { t!("menu-view-fullscreen") }).clicked() {
+                    self.run_app(AppAction::Display(DisplayAction::ToggleFullScreen));
                     ui.close();
                 }
                 ui.horizontal(|ui| {
@@ -1520,9 +973,9 @@ impl App {
                     // factor on Apply. Applying mid-drag rescales the whole UI
                     // (slider included) under the cursor, which makes the value
                     // jump around — hence the explicit button.
-                    ui.add(egui::Slider::new(&mut self.prefs.ui_scale, UI_SCALE_MIN..=UI_SCALE_MAX));
+                    ui.add(egui::Slider::new(&mut self.app.prefs_mut().ui_scale, UI_SCALE_MIN..=UI_SCALE_MAX));
                     if ui.button(t!("common-apply")).clicked() {
-                        ctx.set_zoom_factor(self.prefs.ui_scale);
+                        ctx.set_zoom_factor(self.app.prefs().ui_scale);
                         // Re-fit the window so the bigger/smaller controls grow
                         // the window rather than squeezing the picture.
                         self.pending_fb_snap = true;
@@ -1536,7 +989,7 @@ impl App {
                     // native), independent of UI scale. The window resizes to
                     // hold the picture at the chosen size on the next frame.
                     let changed = ui.add(
-                        egui::Slider::new(&mut self.prefs.vm_scale, settings::VM_SCALE_MIN..=settings::VM_SCALE_MAX)
+                        egui::Slider::new(&mut self.app.prefs_mut().vm_scale, settings::VM_SCALE_MIN..=settings::VM_SCALE_MAX)
                             .step_by(settings::VM_SCALE_STEP)
                             .suffix("×"),
                     ).changed();
@@ -1551,7 +1004,7 @@ impl App {
                 ui.label(t!("menu-help-version", version = env!("APP_VERSION"), commit = env!("APP_COMMIT")));
                 ui.separator();
                 ui.label(RichText::new(t!("menu-help-diagnostics")).strong());
-                let running = self.emu.is_running();
+                let running = self.app.session().handle().is_running();
                 if ui.add_enabled(running, egui::Button::new(t!("menu-help-test-camera")))
                     .tip(t!("menu-help-test-camera-tip"))
                     .on_disabled_hover_text(t!("menu-help-start-first-tip"))
@@ -1561,7 +1014,7 @@ impl App {
                     ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new(t!("menu-help-serial-console")))
-                    .tip(t!("menu-help-serial-console-tip", port = serial_console::console_port(&self.cfg).to_string()))
+                    .tip(t!("menu-help-serial-console-tip", port = serial_console::console_port(&self.app.config()).to_string()))
                     .on_disabled_hover_text(t!("menu-help-start-first-tip"))
                     .clicked()
                 {
@@ -1582,7 +1035,6 @@ impl App {
                 // N64 dev board getting-started guide. Never in App Store
                 // builds, where it can't run anyway (sandbox blocks the POSIX
                 // shm bridge and there's no way to run the external gopher64).
-                #[cfg(not(feature = "appstore"))]
                 if ui.button(t!("menu-help-ultra64"))
                     .tip(t!("menu-help-ultra64-tip"))
                     .clicked()
@@ -1614,19 +1066,9 @@ impl App {
                 });
                 ui.separator();
                 ui.label(RichText::new(t!("menu-help-build-features")).strong());
-                use iris::build_features as bf;
-                // rex-jit is a compile-time feature, but the sandbox (App
-                // Store) build forces interpreter-only at runtime via IRIS_NO_JIT
-                // (Cranelift's non-MAP_JIT pages get killed under the sandbox).
-                // Report the runtime reality so a compiled-in "on" doesn't read
-                // as "the JIT is running" when it can't be.
-                let jit_off = std::env::var_os("IRIS_NO_JIT").is_some();
-                let jit_state = |feat: bool| if !feat { t!("menu-help-feature-off") } else if jit_off { t!("menu-help-feature-off-sandbox") } else { t!("menu-help-feature-on") };
-                ui.label(t!("menu-help-feature", name = "rex-jit", state = jit_state(bf::REX_JIT)));
-                ui.label(t!("menu-help-feature", name = "gr2-jit", state = jit_state(bf::GR2_JIT)));
-                ui.label(t!("menu-help-feature", name = "gr4-jit", state = jit_state(bf::GR4_JIT)));
-                ui.label(t!("menu-help-feature", name = "jitv2", state = jit_state(bf::JITV2)));
-                ui.label(t!("menu-help-feature", name = "lightning", state = if bf::LIGHTNING { t!("menu-help-feature-on-no-debug") } else { t!("menu-help-feature-off") }));
+                for f in iris_gui_core::controller::debug::build_features() {
+                    ui.label(t!("menu-help-feature", name = f.name, state = f.state));
+                }
             });
         });
     }
@@ -1635,22 +1077,20 @@ impl App {
     /// View > Language: the system default plus every installed catalog.
     fn language_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button(t!("menu-view-language"), |ui| {
-            let mut choice = self.prefs.language.clone();
+            let mut choice = self.app.prefs().language.clone();
             ui.radio_value(&mut choice, String::new(), t!("menu-view-language-system"));
             for (code, name) in i18n::languages() {
                 ui.radio_value(&mut choice, code.to_string(), name);
             }
-            if choice != self.prefs.language {
-                self.prefs.language = choice;
-                i18n::set_language(&self.prefs.language);
-                if let Err(e) = self.prefs.save() { self.toast(e); }
+            if choice != self.app.prefs().language {
+                self.run_app(AppAction::SetLanguage(choice));
                 ui.close();
             }
         });
     }
 
     fn machine_controls(&mut self, ui: &mut egui::Ui) {
-        let running = self.emu.is_running();
+        let running = self.app.session().handle().is_running();
         let full = egui::vec2(ui.available_width(), 0.0);
         if !running {
             if ui.add_sized(full, crate::extra_ui::filled_button(RichText::new(t!("main-start")).size(16.0), Color32::from_rgb(40, 110, 40))).clicked()
@@ -1664,12 +1104,12 @@ impl App {
         if ui.add_enabled_ui(running, |ui| {
             ui.add_sized(egui::vec2(ui.available_width(), 0.0), egui::Button::new(t!("main-save-state"))).clicked()
         }).inner {
-            self.emu.send(Cmd::SaveState(self.save_state_name.clone()));
+            self.run_app(AppAction::Session(SessionAction::SaveState(self.save_state_name.clone())));
         }
         if ui.add_enabled_ui(running, |ui| {
             ui.add_sized(egui::vec2(ui.available_width(), 0.0), egui::Button::new(t!("main-restore-state"))).clicked()
         }).inner {
-            self.emu.send(Cmd::RestoreState(self.restore_state_name.clone()));
+            self.run_app(AppAction::Session(SessionAction::RestoreState(self.restore_state_name.clone())));
         }
     }
 
@@ -1690,7 +1130,7 @@ impl App {
                 if !iris::build_features::LIGHTNING && ui.button(t!("main-tab-debug")).clicked() {
                     self.tab = Tab::Debug;
                 }
-                if !cfg!(feature = "appstore") && ui.button(t!("main-tab-ci")).clicked() {
+                if ui.button(t!("main-tab-ci")).clicked() {
                     self.tab = Tab::Ci;
                 }
             });
@@ -1699,9 +1139,9 @@ impl App {
 
     /// Capture state for the control column; only *capture* is a button, since while captured the grabbed pointer can't click anything.
     fn capture_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if self.input_state.captured {
+        if self.app.display().captured() {
             ui.label(RichText::new(t!("main-capture-on")).color(Color32::LIGHT_GREEN));
-            ui.label(RichText::new(t!("main-capture-release", keys = input::RELEASE_HINT)).weak());
+            ui.label(RichText::new(self.app.display().release_hint()).weak());
             subtitle(ui, t!("main-capture-f11-subtitle"));
         } else {
             ui.label(RichText::new(t!("main-capture-off")).weak());
@@ -1712,7 +1152,8 @@ impl App {
                 )
                 .clicked()
             {
-                input::engage_capture(ctx, &mut self.input_state);
+                let _ = ctx;
+                self.run_app(AppAction::Display(DisplayAction::Capture));
             }
         }
     }
@@ -1722,21 +1163,12 @@ impl App {
     /// mismatch — no guest login required (detection is from frames the guest
     /// already emits). The permanent auto-fix over telnet comes later.
     fn network_check_window(&mut self, ctx: &egui::Context) {
-        if !self.show_net_check {
+        use iris_gui_core::controller::network::{CheckLine, NetworkAction};
+        if !self.app.network().check_open() {
             return;
         }
-        let state = self.emu.net_state();
-        let guest = self.emu.status.net_guest_ip;
-        let gw = self.emu.status.net_guest_gateway;
-        // The configured NAT subnet, for fresh-guest guidance and the
-        // "match the guest" action. IRIS is plug-and-play: it ADOPTS whatever
-        // gateway the guest ARPs for (src/net/mod.rs), so the guest's own subnet is
-        // fine — there is no fixed address it must use once ec0 is configured.
-        let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
-        let cfg_net = netplan::classify(eb, ep, &[]).derived;
-        let fresh_hint = cfg_net.as_ref().map(|d| t!("window-net-fresh-hint",
-            ip = d.client.to_string(), gateway = d.gateway.to_string(), netmask = d.netmask.to_string()));
-        let mut switch_to: Option<String> = None;
+        let check = self.app.net_check();
+        let mut adopt = None;
         let mut open = true;
         egui::Window::new(t!("window-net-title"))
             .collapsible(false)
@@ -1745,119 +1177,38 @@ impl App {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_max_width(440.0);
-                match state {
-                    NetState::Off => {
-                        ui.label(t!("window-net-not-running"));
-                        return;
-                    }
-                    NetState::Active => {
-                        ui.label(RichText::new(t!("window-net-up"))
-                            .color(Color32::from_rgb(0x35, 0xb8, 0x4a)).strong());
-                        ui.label(match guest {
-                            Some(i) => t!("window-net-up-detail", ip = i.to_string()),
-                            None => t!("window-net-up-detail-no-ip"),
-                        });
-                        if let Some(g) = gw {
-                            ui.label(RichText::new(t!("window-net-gateway", gateway = g.to_string())).weak());
-                        }
-                        return;
-                    }
-                    NetState::Idle => {} // running but no traffic — diagnose below
-                }
-                let Some(ip) = guest else {
-                    ui.label(RichText::new(t!("window-net-no-traffic")).strong());
-                    ui.label(t!("window-net-no-traffic-detail"));
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(t!("window-net-enable")).strong());
-                    ui.code("chkconfig network on");
-                    ui.label(RichText::new(t!("window-net-enable-detail")).weak());
-                    if let Some(l) = &fresh_hint { ui.label(RichText::new(l).weak()); }
-                    return;
-                };
-                let o = ip.octets();
-                let guest_net = std::net::Ipv4Addr::new(o[0], o[1], o[2], 0);
-                let sub_gw = std::net::Ipv4Addr::new(o[0], o[1], o[2], 1);
-                ui.label(RichText::new(t!("window-net-down"))
-                    .color(Color32::from_rgb(0xd9, 0x4a, 0x3d)).strong());
-                ui.label(t!("window-net-guest-ip", ip = ip.to_string(), network = format!("{guest_net}/24")));
-                ui.add_space(6.0);
-                match gw {
-                    Some(g) => {
-                        ui.label(t!("window-net-has-gateway", gateway = g.to_string()));
-                        ui.label(RichText::new(t!("window-net-has-gateway-detail")).weak());
-                    }
-                    None => {
-                        ui.label(t!("window-net-no-gateway"));
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(t!("window-net-run-as-root")).strong());
-                        ui.code(format!("/usr/etc/route add default {sub_gw} 1"));
-                        ui.label(RichText::new(t!("window-net-route-temporary")).weak());
+                for line in &check.lines {
+                    match line {
+                        CheckLine::Good(t) => { ui.label(RichText::new(t).color(Color32::from_rgb(0x35, 0xb8, 0x4a)).strong()); }
+                        CheckLine::Bad(t) => { ui.label(RichText::new(t).color(Color32::from_rgb(0xd9, 0x4a, 0x3d)).strong()); }
+                        CheckLine::Text(t) => { ui.label(t); }
+                        CheckLine::Weak(t) => { ui.label(RichText::new(t).weak()); }
+                        CheckLine::Strong(t) => { ui.add_space(4.0); ui.label(RichText::new(t).strong()); }
+                        CheckLine::Code(t) => { ui.code(t); }
                     }
                 }
-                // Optional: align IRIS's configured subnet to the guest's, for a
-                // guest kept permanently on a fixed subnet. IRIS adopts live
-                // regardless; this just makes IRIS's default match on next boot.
-                let cfg_base = cfg_net.as_ref().map(|d| d.network);
-                if cfg_base != Some(guest_net) {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    match netplan::conflict(guest_net, 24, &self.net_ifaces) {
-                        Some(h) => {
-                            // The guest's subnet is one the host itself uses.
-                            // Refuse to move IRIS there (it would shadow the
-                            // host's real network); tell the user to renumber the
-                            // guest onto IRIS's own subnet instead.
-                            ui.label(RichText::new(t!("window-net-overlap",
-                                network = format!("{guest_net}/24"), iface = &h.name, addr = h.addr.to_string()))
-                                .color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
-                            if let Some(d) = cfg_net.as_ref() {
-                                ui.add_space(4.0);
-                                ui.label(RichText::new(t!("window-net-run-as-root")).strong());
-                                let e = netfix::ExpectedNet { ip: d.client, gateway: d.gateway, netmask: d.netmask };
-                                for cmd in netfix::runtime_fix_commands(&e) {
-                                    ui.code(cmd);
-                                }
-                                ui.label(RichText::new(t!("window-net-overlap-result",
-                                    ip = d.client.to_string(), gateway = d.gateway.to_string())).weak());
-                            }
-                        }
-                        None => {
-                            ui.label(RichText::new(match cfg_net.as_ref() {
-                                Some(d) => t!("window-net-nat-subnet", network = format!("{}/{}", d.network, d.prefix)),
-                                None => t!("window-net-nat-subnet-other"),
-                            }).weak());
-                            if ui.button(t!("window-net-use-guest-subnet", network = format!("{guest_net}/24"))).clicked() {
-                                switch_to = Some(format!("{guest_net}/24"));
-                            }
-                        }
+                if let Some(net) = &check.adopt {
+                    if ui.button(t!("window-net-use-guest-subnet", network = net.as_str())).clicked() {
+                        adopt = Some(net.clone());
                     }
                 }
             });
-        if let Some(s) = switch_to {
-            self.cfg.nat_subnet = Some(s.clone());
-            self.mark_dirty();
-            if self.emu.is_running() {
-                // Apply to the running NAT so the guest can route immediately,
-                // and persist for next launch.
-                self.emu.send(Cmd::SetNatSubnet(s.clone()));
-                self.toast(t!("toast-nat-subnet-live", network = &s));
-            } else {
-                self.toast(t!("toast-nat-subnet-next-start", network = &s));
-            }
+        if let Some(s) = adopt {
+            self.run_app(AppAction::Network(NetworkAction::AdoptSubnet(s)));
         }
         if !open {
-            self.show_net_check = false;
+            self.run_app(AppAction::Network(NetworkAction::CloseCheck));
         }
     }
 
     /// Run-state line (IRIX running / PROM / halted / stopped + MIPS). Used in
     /// the control column's status footer.
     fn run_state_label(&mut self, ui: &mut egui::Ui) {
-        let running = self.emu.is_running();
-        let halted = running && self.emu.status.cpu_halted;
+        let running = self.app.session().handle().is_running();
+        let halted = running && self.app.session().handle().status.cpu_halted;
         let status = if halted {
             RichText::new(t!("status-halted")).color(Color32::LIGHT_GRAY)
-        } else if self.emu.status.in_prom {
+        } else if self.app.session().handle().status.in_prom {
             RichText::new(t!("status-prom")).color(Color32::LIGHT_BLUE)
         } else if running {
             RichText::new(t!("status-running")).color(Color32::LIGHT_GREEN)
@@ -1866,9 +1217,9 @@ impl App {
         };
         ui.label(status);
         if running && !halted {
-            ui.label(t!("status-mips", mips = format!("{:.0}", self.emu.status.mips)))
+            ui.label(t!("status-mips", mips = format!("{:.0}", self.app.session().handle().status.mips)))
                 .tip(t!("status-mips-tip"));
-            ui.label(t!("status-kernel-hz", hz = format!("{:.0}", self.emu.status.kernel_hz)))
+            ui.label(t!("status-kernel-hz", hz = format!("{:.0}", self.app.session().handle().status.kernel_hz)))
                 .tip(t!("status-kernel-hz-tip"));
         }
         // Networking indicator — ONE badge that shows both liveness (the dot's
@@ -1879,7 +1230,7 @@ impl App {
         // (launched_net), not the live editor.
         use iris::config::NetMode;
         let backend = self.launched_net.clone();
-        let state = self.emu.net_state();
+        let state = self.app.session().handle().net_state();
         let net_color = match state {
             NetState::Active => Color32::from_rgb(0x35, 0xb8, 0x4a),
             NetState::Idle => Color32::from_rgb(0xd9, 0x4a, 0x3d),
@@ -1913,7 +1264,7 @@ impl App {
             _ => (t!("status-net"), t!("status-net-off-tip")),
         };
         // A machine with no Ethernet has no light: nothing can carry traffic.
-        let net_mode = if running { backend.as_ref().map(|(m, _)| *m) } else { Some(self.cfg.network.mode) };
+        let net_mode = if running { backend.as_ref().map(|(m, _)| *m) } else { Some(self.app.config().network.mode) };
         let unplugged = net_mode == Some(NetMode::Off);
         // "check" diagnoses the guest IP against the NAT subnet — only meaningful
         // in NAT mode, so it's hidden in PCAP.
@@ -1934,7 +1285,47 @@ impl App {
             }
         });
         if want_check {
-            self.show_net_check = true;
+            self.run_app(AppAction::Network(iris_gui_core::controller::network::NetworkAction::OpenCheck));
+        }
+        // Disk, CD-ROM and audio activity lights from the session's status bar.
+        {
+            use iris_gui_core::controller::session::{LightState, LightTarget};
+            let bar = self.app.status_bar();
+            // A click runs what the light stands for (the controller decides).
+            let mut clicked: Option<String> = None;
+            ui.horizontal(|ui| {
+                for light in bar.lights.iter().filter(|l| matches!(l.target, LightTarget::Disk { .. } | LightTarget::CdRom { .. } | LightTarget::Audio)) {
+                    let color = match light.state {
+                        LightState::Off => Color32::from_gray(0x60),
+                        LightState::Idle => Color32::from_gray(0x90),
+                        LightState::Reading | LightState::Active => Color32::from_rgb(0x35, 0xb8, 0x4a),
+                        LightState::Writing => Color32::from_rgb(0xe0, 0x9a, 0x2a),
+                        LightState::Fault => Color32::from_rgb(0xd9, 0x4a, 0x3d),
+                    };
+                    let tag = match light.target {
+                        LightTarget::CdRom { .. } => "CD",
+                        LightTarget::Audio => "AU",
+                        _ => "HD",
+                    };
+                    let mut text = format!("\u{2022}{tag}");
+                    if let Some(b) = &light.badge { text.push_str(&format!(" {b}")); }
+                    // egui has no disk browser window yet: a disk light's
+                    // browse would open the image with nothing on screen.
+                    let clickable = self
+                        .app
+                        .light_command(&light.id)
+                        .is_some_and(|c| !c.starts_with(iris_gui_core::controller::ids::item::BROWSE_DISK));
+                    let label = egui::Label::new(RichText::new(text).small().color(color));
+                    let r = ui.add(if clickable { label.sense(egui::Sense::click()) } else { label }).tip(light.tooltip.clone());
+                    if clickable && r.clicked() {
+                        clicked = Some(light.id.clone());
+                    }
+                }
+            });
+            if let Some(id) = clicked {
+                let routed = self.app.command(&id);
+                self.run_effects(routed.effects);
+            }
         }
         if running && self.fb_scale > 0.0 {
             // How magnified the emulated display currently is (1× = native).
@@ -2033,7 +1424,7 @@ impl App {
     /// Draw the live REX3 framebuffer as an egui image, scaled to fit
     /// the available area while preserving aspect ratio.
     fn framebuffer_panel(&mut self, ui: &mut egui::Ui) {
-        if self.cfg.has_device("newport") {
+        if self.app.config().has_device("newport") {
             self.framebuffer_panel_dual(ui);
             return;
         }
@@ -2043,8 +1434,8 @@ impl App {
     /// Dual Newport heads: side-by-side viewports (head 0 captures input).
     fn framebuffer_panel_dual(&mut self, ui: &mut egui::Ui) {
         let max_scale = self.fb_max_scale(ui.ctx());
-        let seq0 = self.emu.frame_sink.seq();
-        let seq1 = self.emu.frame_sink_head1.seq();
+        let seq0 = self.app.session().handle().frame_sink.seq();
+        let seq1 = self.app.session().handle().frame_sink_head1.seq();
         if seq0 == 0 && seq1 == 0 {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new(t!("fb-waiting"))
@@ -2052,18 +1443,19 @@ impl App {
             });
             return;
         }
+        let mut capture_clicked = false;
         ui.columns(2, |cols| {
             cols[0].vertical(|ui| {
                 ui.label(RichText::new(t!("fb-head", head = 0)).small().weak());
                 if seq0 > 0 {
-                    if Self::upload_fb_texture(ui, &self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb", max_scale) {
+                    if Self::upload_fb_texture(ui, &self.app.session().handle().frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb", max_scale) {
                         self.fb_took_frame = true;
                     }
                     if let Some(tex) = &self.fb_tex {
                         let (response, _) = Self::paint_fb(ui, tex, max_scale);
                         if response.clicked() {
                             response.request_focus();
-                            self.input_state.captured = true;
+                            capture_clicked = true;
                         }
                     }
                 } else {
@@ -2075,7 +1467,7 @@ impl App {
                 if seq1 > 0 {
                     if Self::upload_fb_texture(
                         ui,
-                        &self.emu.frame_sink_head1,
+                        &self.app.session().handle().frame_sink_head1,
                         &mut self.fb_tex_head1,
                         &mut self.last_fb_seq_head1,
                         "rex3_fb_h1",
@@ -2091,6 +1483,9 @@ impl App {
                 }
             });
         });
+        if capture_clicked {
+            self.run_app(AppAction::Display(DisplayAction::Capture));
+        }
     }
 
     /// Paint a framebuffer texture centred in the remaining space, on the
@@ -2110,7 +1505,7 @@ impl App {
     /// the most the picture is ever drawn at (see `fb_draw_size`). Same units
     /// as the window-fit target in `snap_window_to_fb`.
     fn fb_max_scale(&self, ctx: &egui::Context) -> f32 {
-        self.prefs.vm_scale / ctx.zoom_factor().max(0.1)
+        self.app.prefs().vm_scale / ctx.zoom_factor().max(0.1)
     }
 
     /// Upload the newest frame from `sink` into `tex_slot`, allocating the
@@ -2188,7 +1583,7 @@ impl App {
         // repaint regardless was ~300 MB/s of pointless copying and needless lock
         // contention with the REX3 refresh thread; now the renderer also wakes us
         // when a frame lands, so an unchanging screen costs nothing at all.
-        let seq = self.emu.frame_sink.seq();
+        let seq = self.app.session().handle().frame_sink.seq();
         if seq == 0 {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new(t!("fb-waiting"))
@@ -2226,7 +1621,7 @@ impl App {
         if want_nearest != self.fb_nearest || (seq != 0 && seq != self.last_fb_seq) {
             let uploaded = Self::upload_fb_texture(
                 ui,
-                &self.emu.frame_sink,
+                &self.app.session().handle().frame_sink,
                 &mut self.fb_tex,
                 &mut self.last_fb_seq,
                 "rex3_fb",
@@ -2248,7 +1643,7 @@ impl App {
             let tex_size = tex.size_vec2();
             // First frame after Start (or after a VM/UI scale change): size the
             // window so the picture lands at the requested VM scale.
-            if do_snap && !Self::snap_window_to_fb(ui.ctx(), tex_size, avail, self.prefs.vm_scale) {
+            if do_snap && !Self::snap_window_to_fb(ui.ctx(), tex_size, avail, self.app.prefs().vm_scale) {
                 self.pending_fb_snap = true;
             }
             // Draw at the chosen VM scale, centred; shrink to fit (aspect-
@@ -2262,7 +1657,7 @@ impl App {
             if tex_size.y >= 1.0 {
                 new_fb_scale = fb_rect.height() * zoom / tex_size.y;
             }
-            let captured = self.input_state.captured;
+            let captured = self.app.display().captured();
             {
                 // Take keyboard focus so that egui delivers Key events
                 // to us instead of routing them to other widgets when
@@ -2297,7 +1692,7 @@ impl App {
             // Keyed on `cpu_stopped` (a real CPU stop), NOT `cpu_halted` — the
             // latter also trips on 0-MIPS idle at the PROM, which would wrongly
             // dim a machine that's only paused. The frame underneath stays visible.
-            if self.emu.status.cpu_stopped {
+            if self.app.session().handle().status.cpu_stopped {
                 let p = ui.painter_at(fb_rect);
                 p.rect_filled(fb_rect, 0.0, Color32::from_rgba_unmultiplied(40, 42, 48, 130));
                 p.text(
@@ -2317,100 +1712,31 @@ impl App {
         // triggered on the running→halted transition (prev is reset to true at
         // Start, so idling at the PROM during boot doesn't count), and they can
         // still click the display to re-capture.
-        let halted = self.emu.status.cpu_halted;
-        if halted && !self.prev_cpu_halted && self.input_state.captured {
-            input::force_release(ui.ctx(), &mut self.input_state);
-            self.toast(t!("toast-guest-halted"));
-        }
-        self.prev_cpu_halted = halted;
 
-        // Auto-consolidate on a clean guest power-off. A guest `poweroff` stops
-        // the CPU thread (`cpu_stopped`) while the GUI still considers the
-        // machine running — the worker isn't told, and only a user STOP sets
-        // `running=false`, so `running && cpu_stopped` uniquely identifies "the
-        // guest shut itself down". Fold any pending CHD overlay back into its
-        // base NOW so consolidation happens even when the user later quits via
-        // Cmd+Q (which bypasses the close-time fold — winit 0.29 doesn't hook
-        // applicationShouldTerminate). Edge-triggered → fires once per power-off.
-        // (`Evt::PowerOff` is never emitted — it awaits a core subscribe API — so
-        // we key off the status-derived `cpu_stopped`, same as the overlay.)
-        let stopped = self.emu.status.cpu_stopped;
-        if stopped && !self.prev_cpu_stopped && self.emu.is_running()
-            && self.emu.has_pending_chd_sync() && self.syncing.is_none()
-        {
-            self.toast(t!("toast-guest-off-syncing"));
-            self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
-            self.emu.send(Cmd::SyncDisks);
-        }
-        self.prev_cpu_stopped = stopped;
+        // A guest power-off folds pending CHD diffs at once (SessionController::drain).
 
         // Pump egui input → PS/2 controller. Mouse/keyboard only reach the
         // guest while captured (click the framebuffer to capture, Ctrl+Alt+Esc
         // to release), so menu clicks and config typing don't leak in.
-        let ps2 = self.emu.ps2.lock().clone();
-        if let Some(ps2) = ps2 {
-            input::pump(ui.ctx(), fb_clicked, &ps2, &mut self.input_state, self.cfg.mouse_scroll_pixels_per_line);
+        for action in input::pump(ui.ctx(), fb_clicked, self.app.display().captured()) {
+            self.run_app(AppAction::Display(action));
         }
+        input::sync_cursor(ui.ctx(), &mut self.input_state, self.app.display().captured());
 
     }
 
-    /// Apply a rename of the active machine to `new_name` (from the modal).
-    /// No-op for an empty/unchanged name or when there's no active machine.
-    fn apply_rename(&mut self, new_name: &str) {
-        if !self.can_select_machine() { return; }
-        let new = new_name.trim();
-        let Some(old) = self.prefs.active_machine.clone() else { return; };
-        if new == old { return; }
-        if let Err(e) = machines::validate_name(new) { self.toast(e); return; }
-        if self.cfg_dirty && !self.flush_machine() { return; }
-        let name = self.prefs.unique_name(new);
-        // The folder is the working directory, and Windows won't rename that.
-        let result = self.prefs.root().and_then(|root| {
-            std::env::set_current_dir(root).map_err(|e| e.to_string())?;
-            machines::rename(root, &old, &name)
-        });
-        if let Err(e) = result {
-            self.toast(t!("toast-rename-failed", error = e));
-            if let Err(e) = self.prefs.machine_dir(&old).and_then(|d| Self::enter_directory(&d)) { self.toast(e); }
-            return;
-        }
-        self.prefs.machines.remove(&old);
-        self.prefs.machines.insert(name.clone(), self.cfg.clone());
-        self.prefs.active_machine = Some(name.clone());
-        if let Err(e) = self.prefs.machine_dir(&name).and_then(|d| Self::enter_directory(&d)) {
-            self.toast(e);
-            return;
-        }
-        if let Err(e) = self.prefs.save() { self.toast(e); }
-        else { self.toast(t!("toast-renamed", name = &name)); }
-    }
 
-    /// Remove the TOML registration and retain disks/battery-backed state.
+    /// Ask, then remove the machine from the library (disks are kept).
     fn delete_machine(&mut self, name: &str) {
-        if !self.can_select_machine() { return; }
-        let result = self.prefs.machine_path(name).and_then(|p| std::fs::remove_file(p).map_err(|e| e.to_string()));
-        if let Err(e) = result { self.toast(t!("toast-delete-failed", error = e)); return; }
-        self.cfg_dirty = false;
-        self.cfg_dirty_since = None;
-        self.prefs.machines.remove(name);
-        self.prefs.active_machine = None;
-        if let Some(next) = self.prefs.machines.keys().next().cloned() {
-            self.switch_to(&next);
-        } else {
-            self.cfg = MachineConfig::default();
-            if let Err(e) = self.prefs.root().and_then(Self::enter_directory) { self.toast(e); }
-            self.new_machine.open();
-            if let Err(e) = self.prefs.save() { self.toast(e); }
-        }
-        self.toast(t!("toast-deleted", name = name));
+        self.run_app(AppAction::Delete { machine: name.to_string() });
     }
 
     /// Heading + tabbed config editor body, used both as the right side panel
     /// (while a machine runs) and full-width in the central panel (while idle).
     /// The header names the active machine ("default" if unset).
     fn config_editor_panel(&mut self, ui: &mut egui::Ui) {
-        for error in &self.prefs.errors { ui.colored_label(Color32::from_rgb(230, 140, 70), error); }
-        let machine = self.prefs.active_machine.clone().unwrap_or_else(|| t!("main-settings-no-machine"));
+        for error in &self.app.prefs().errors { ui.colored_label(Color32::from_rgb(230, 140, 70), error); }
+        let machine = self.app.prefs().active_machine.clone().unwrap_or_else(|| t!("main-settings-no-machine"));
         ui.horizontal(|ui| {
             ui.heading(t!("main-settings-heading", name = &machine));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2442,19 +1768,19 @@ impl App {
             }
         }
 
-        let banks_before = self.cfg.banks;
-        let banks_set_before = self.cfg.banks_set;
-        let debug_before = self.cfg.debug.clone();
-        let cfg_before = crate::machines::to_toml(&self.cfg).unwrap_or_default();
+        let banks_before = self.app.config().banks;
+        let banks_set_before = self.app.config().banks_set;
+        let debug_before = self.app.config().debug.clone();
+        let cfg_before = crate::machines::to_toml(&self.app.config()).unwrap_or_default();
+        let running = self.app.session().is_running();
         let out = show_tab(
             ui,
             self.tab,
-            &mut self.cfg,
+            self.app.config_mut(),
             &self.net_ifaces,
-            &self.prefs.disk_folders,
             &self.pcap_ifaces,
             MemoryUiContext {
-                running: self.emu.is_running(),
+                running,
                 started_banks: self.started_banks,
                 started_cpu: self.started_cpu,
             },
@@ -2464,10 +1790,11 @@ impl App {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
             ConfigAction::TestCamera => self.open_camera_test(),
             ConfigAction::RefreshPcapIfaces => self.refresh_pcap_ifaces(),
-            ConfigAction::EnablePacketCapture => self.run_enable_packet_capture(),
+            ConfigAction::EnablePacketCapture => self.run_app(AppAction::Network(iris_gui_core::controller::network::NetworkAction::AskEnableCapture)),
             ConfigAction::LoadDisc { id, path, remount } => {
-                if self.emu.is_running() {
-                    self.emu.send(Cmd::LoadDisc { id, path: path.clone(), remount });
+                if self.app.session().is_running() {
+                    let _ = remount;
+                    self.run_app(AppAction::Session(SessionAction::LoadDisc { key: id, path: path.clone() }));
                     let filename = std::path::Path::new(&path)
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -2480,16 +1807,16 @@ impl App {
             ConfigAction::None => {}
         }
         if out.disks_changed { self.mark_dirty(); }
-        if self.cfg.banks != banks_before {
+        if self.app.config().banks != banks_before {
             // Chosen banks are written; unchosen ones leave the machine's own.
             // The TOML editor says itself whether `banks` is set: an applied
             // draft without it is unset, not a choice of the default.
-            if self.cfg.banks_set == banks_set_before {
-                self.cfg.banks_set = true;
+            if self.app.config().banks_set == banks_set_before {
+                self.app.config_mut().banks_set = true;
             }
             self.mark_dirty();
         }
-        if self.cfg.debug != debug_before {
+        if self.app.config().debug != debug_before {
             self.mark_dirty();
         }
         // A disk image was just picked: check up front whether its folder is
@@ -2497,13 +1824,13 @@ impl App {
         // than discovering at exit that the disk can't be compacted.
         if out.disk_picked { self.check_chd_folder_grants(); }
         if out.net.changed { self.mark_dirty(); }
-        if crate::machines::to_toml(&self.cfg).unwrap_or_default() != cfg_before {
+        if crate::machines::to_toml(&self.app.config()).unwrap_or_default() != cfg_before {
             self.mark_dirty();
         }
-        if out.net.forwards_changed && self.emu.is_running() {
+        if out.net.forwards_changed && self.app.session().handle().is_running() {
             // Rebind the running NAT's listeners so a forward added/removed now
             // takes effect without a restart (latest-wins coalesces in the NAT).
-            self.emu.send(Cmd::SetPortForwards(self.cfg.port_forward.clone()));
+            self.app.session().handle().send(Cmd::SetPortForwards(self.app.config().port_forward.clone()));
         }
         // Live PCAP host-NIC reswap: if the running machine is bridged and the
         // interface was just committed, reopen the capture on the new NIC — no
@@ -2512,9 +1839,9 @@ impl App {
         if out.net.iface_changed
             && matches!(self.launched_net.as_ref(), Some((iris::config::NetMode::Pcap, _)))
         {
-            self.emu.send(Cmd::SetPcapInterface(self.cfg.network.pcap_interface.clone()));
+            self.app.session().handle().send(Cmd::SetPcapInterface(self.app.config().network.pcap_interface.clone()));
             if let Some((_, iface)) = self.launched_net.as_mut() {
-                *iface = self.cfg.network.pcap_interface.clone();
+                *iface = self.app.config().network.pcap_interface.clone();
             }
         }
         if let Some(p) = out.net.prompt {
@@ -2527,26 +1854,19 @@ impl App {
     /// Open (or restart) the live host-camera preview using the current
     /// `[vino]` standard and camera index. Releases any previous test first.
     fn open_camera_test(&mut self) {
-        use iris::video_source::VideoStandard;
-        let standard = match self.cfg.vino.standard {
-            iris::config::VinoStandard::Ntsc => VideoStandard::Ntsc,
-            iris::config::VinoStandard::Pal  => VideoStandard::Pal,
-        };
-        // Drop the previous instance first so the camera is fully released
-        // before re-opening (its Drop joins the capture thread).
-        self.camera_test = None;
         self.camera_test_tex = None;
         self.camera_test_seq = 0;
-        self.camera_test = Some(camera_test::CameraTest::start(standard, self.cfg.vino.camera_index));
+        self.run_app(AppAction::Camera(iris_gui_core::controller::camera::CameraAction::Open));
     }
 
     /// Draw the live host-camera preview window (no-op when closed). Closing it
     /// (or pressing Stop) drops the `CameraTest`, releasing the camera.
     fn camera_test_window(&mut self, ctx: &egui::Context) {
-        let Some(test) = &self.camera_test else { return };
+        let Some((status, failed)) = self.app.camera().status() else { return };
+        let error = failed.then(|| status.clone());
 
         // Pull the latest frame and upload it to the preview texture.
-        if let Some((w, h, rgba)) = test.take_new_frame(&mut self.camera_test_seq) {
+        if let Some((w, h, rgba)) = self.app.camera().take_new_frame(&mut self.camera_test_seq) {
             let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
             match &mut self.camera_test_tex {
                 Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
@@ -2556,9 +1876,6 @@ impl App {
                 }
             }
         }
-        let status = test.status();
-        let error = test.error();
-
         let mut open = true;
         let mut close_now = false;
         egui::Window::new(t!("window-camera-title"))
@@ -2591,8 +1908,8 @@ impl App {
             });
 
         if !open || close_now {
-            // Drop releases the camera (CameraTest::Drop joins the worker).
-            self.camera_test = None;
+            // Closing releases the camera.
+            self.run_app(AppAction::Camera(iris_gui_core::controller::camera::CameraAction::Close));
             self.camera_test_tex = None;
             self.camera_test_seq = 0;
         } else {
@@ -2604,18 +1921,14 @@ impl App {
     /// Open (or reconnect) the in-app IRIX serial-console viewer. Connects to
     /// the loopback serial server the running emulator exposes.
     fn open_serial_console(&mut self) {
-        self.serial_console = Some(serial_console::SerialConsole::connect(serial_console::console_port(&self.cfg)));
+        self.run_app(AppAction::Serial(SerialAction::Open));
     }
 
     /// Draw the selected platform's in-app serial-console window.
     fn serial_console_window(&mut self, ctx: &egui::Context) {
-        let Some(console) = &self.serial_console else { return };
-        let (text, connected, error, _seq) = console.snapshot();
-
+        let Some(view) = self.app.serial().view() else { return };
         let mut open = true;
-        let mut close_now = false;
-        let mut clear_now = false;
-        let mut to_send: Option<String> = None;
+        let mut actions = Vec::new();
         egui::Window::new(t!("window-serial-title"))
             .open(&mut open)
             .default_width(620.0)
@@ -2623,30 +1936,23 @@ impl App {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(e) = &error {
-                        ui.colored_label(Color32::from_rgb(200, 80, 80), e);
-                    } else if connected {
-                        ui.colored_label(Color32::from_rgb(90, 170, 90),
-                            t!("window-serial-connected", addr = console.addr().to_string()));
+                    let color = if view.error {
+                        Color32::from_rgb(200, 80, 80)
+                    } else if view.connected {
+                        Color32::from_rgb(90, 170, 90)
                     } else {
-                        ui.label(t!("window-serial-disconnected"));
-                    }
+                        ui.visuals().text_color()
+                    };
+                    ui.colored_label(color, &view.status);
                 });
                 ui.separator();
-
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .max_height(320.0)
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&text).monospace().size(12.0),
-                            )
-                            .wrap(),
-                        );
+                        ui.add(egui::Label::new(RichText::new(&view.text).monospace().size(12.0)).wrap());
                     });
-
                 ui.separator();
                 ui.horizontal(|ui| {
                     let resp = ui.add(
@@ -2655,32 +1961,23 @@ impl App {
                             .desired_width(420.0),
                     );
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (ui.button(t!("window-serial-send")).clicked() || entered) && connected {
-                        to_send = Some(std::mem::take(&mut self.serial_input));
+                    if (ui.button(t!("window-serial-send")).clicked() || entered) && view.connected {
+                        actions.push(SerialAction::SendLine(std::mem::take(&mut self.serial_input)));
                         resp.request_focus();
                     }
                     if ui.button(t!("window-serial-clear")).clicked() {
-                        clear_now = true;
+                        actions.push(SerialAction::Clear);
                     }
                     if ui.button(t!("common-close")).clicked() {
-                        close_now = true;
+                        actions.push(SerialAction::Close);
                     }
                 });
             });
-
-        if let Some(line) = to_send {
-            let mut bytes = line.into_bytes();
-            bytes.push(b'\n');
-            console.send(&bytes);
+        if !open {
+            actions.push(SerialAction::Close);
         }
-        if clear_now {
-            console.clear();
-        }
-        if !open || close_now {
-            self.serial_console = None;
-        } else if connected {
-            // Poll for new console output even when egui is otherwise idle.
-            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        for a in actions {
+            self.run_app(AppAction::Serial(a));
         }
     }
 
@@ -2692,6 +1989,8 @@ impl App {
         // The CHD backend (libchdman-rs >= 0.288.8) is BSD-3-Clause, as is the
         // MAME CHD core it vendors, so every build stays fully BSD-3-Clause.
         const LICENSE_CHD: &str = include_str!("../../LICENSE-libchdman-rs.txt");
+        // The disk browser's filesystem crates (MIT).
+        const LICENSE_RB: &str = include_str!("../../LICENSE-rusty-backup-crates.txt");
         if !self.show_license { return; }
         let mut open = true;
         egui::Window::new(t!("window-license-title"))
@@ -2720,6 +2019,11 @@ impl App {
                     ui.label(RichText::new(t!("window-license-chd-heading")).strong());
                     ui.add_space(2.0);
                     ui.label(RichText::new(LICENSE_CHD).monospace());
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(RichText::new(t!("window-license-rb-heading")).strong());
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(LICENSE_RB).monospace());
                 });
             });
         if !open { self.show_license = false; }
@@ -2777,8 +2081,8 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(RichText::new(t!("help-network-serial-heading")).strong());
                     ui.label(t!("help-network-serial",
-                        serial = self.cfg.serial_ports()[1].to_string(),
-                        monitor = config_ui::monitor_port(&self.cfg).to_string()));
+                        serial = self.app.config().serial_ports()[1].to_string(),
+                        monitor = config_ui::monitor_port(&self.app.config()).to_string()));
                     ui.add_space(6.0);
                     ui.label(RichText::new(t!("help-privacy")).strong());
                     ui.label(t!("help-network-privacy"));
@@ -2807,17 +2111,17 @@ impl App {
         // gateway (there is none). NAT mode: the gateway IRIS live-adopted while
         // running, else the gateway derived from the configured subnet, else the
         // documented default. (Matches network_check_window's derivation.)
-        let pcap = self.cfg.network.mode == iris::config::NetMode::Pcap;
+        let pcap = self.app.config().network.mode == iris::config::NetMode::Pcap;
         let gw = if pcap {
-            self.cfg
+            self.app.config()
                 .network
                 .nfs_pcap_ip
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| t!("help-nfs-no-server-ip"))
         } else {
-            let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
+            let (eb, ep) = netplan::parse_cidr(self.app.config().nat_subnet.as_deref());
             let cfg_gw = netplan::classify(eb, ep, &[]).derived.map(|d| d.gateway.to_string());
-            self.emu
+            self.app.session().handle()
                 .status
                 .net_guest_gateway
                 .map(|g| g.to_string())
@@ -2838,7 +2142,7 @@ impl App {
                 // Cap height so the limitations-expanded page scrolls instead of
                 // growing off-screen; short content just shrinks to fit.
                 egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, true]).show(ui, |ui| {
-                    let Some(nfs) = self.cfg.nfs.as_ref() else {
+                    let Some(nfs) = self.app.config().nfs.as_ref() else {
                         ui.label(RichText::new(t!("help-nfs-disabled")).strong());
                         ui.add_space(4.0);
                         ui.label(t!("help-nfs-disabled-detail"));
@@ -2929,7 +2233,7 @@ impl App {
         if !self.show_ultra64_help {
             return;
         }
-        let enabled = self.cfg.has_device("ultra64");
+        let enabled = self.app.config().has_device("ultra64");
 
         let mut open = true;
         egui::Window::new(t!("help-ultra64-title"))
@@ -3006,7 +2310,7 @@ impl App {
     /// CHD `.diff.chd` sidecars back into their bases. Driven by `self.syncing`,
     /// updated from `Evt::SyncProgress`; closes the app on `Evt::SyncDone`.
     fn sync_modal(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.syncing else { return };
+        let Some(job) = self.app.session().syncing() else { return };
         let frac = if job.total > 0 {
             ((job.disk as f32 + job.fraction) / job.total as f32).clamp(0.0, 1.0)
         } else {
@@ -3032,58 +2336,22 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// Confirmation before discarding a COW overlay (it's destructive).
-    fn cow_discard_modal(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.cow_discard_confirm else { return };
-        let name = std::path::Path::new(&job.base).file_name().and_then(|n| n.to_str()).unwrap_or(&job.base).to_string();
-        let (id, base, chd) = (job.id, job.base.clone(), job.chd);
-        let label = crate::extra_ui::scsi_name(id);
-        let mut decision: Option<bool> = None; // Some(true) = discard, Some(false) = cancel
-        egui::Window::new(t!("modal-discard-title"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_max_width(400.0);
-                ui.label(RichText::new(t!("modal-discard-body")).strong());
-                ui.add_space(4.0);
-                ui.label(RichText::new(t!("menu-cow-disk", id = &label, name = &name)).weak());
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button(t!("common-cancel")).clicked() {
-                        decision = Some(false);
-                    }
-                    if ui.add(crate::extra_ui::filled_button(RichText::new(t!("modal-discard-confirm")).color(Color32::WHITE), Color32::from_rgb(140, 40, 40))).clicked()
-                    {
-                        decision = Some(true);
-                    }
-                });
-            });
-        match decision {
-            Some(true) => {
-                self.emu.send(Cmd::CowReset { base, chd });
-                self.cow_discard_confirm = None;
-            }
-            Some(false) => self.cow_discard_confirm = None,
-            None => {}
-        }
-    }
 
     fn welcome_panel(&mut self, ui: &mut egui::Ui) {
-        for error in &self.prefs.errors { ui.colored_label(Color32::from_rgb(230, 140, 70), error); }
+        for error in &self.app.prefs().errors { ui.colored_label(Color32::from_rgb(230, 140, 70), error); }
         ui.add_space(8.0);
         ui.heading(t!("app-name"));
         ui.add_space(4.0);
 
-        let name = self.prefs.active_machine.clone().unwrap_or_else(|| t!("welcome-unsaved"));
-        let profile = self.cfg.machine.profile.label();
+        let name = self.app.prefs().active_machine.clone().unwrap_or_else(|| t!("welcome-unsaved"));
+        let profile = self.app.config().machine.profile.label();
         ui.label(t!("welcome-machine", name = &name, profile = profile));
-        if self.cfg_dirty {
+        if self.app.is_dirty() {
             subtitle(ui, t!("welcome-autosave-pending-subtitle"));
         }
         ui.add_space(8.0);
 
-        let ram_line = ram_summary(&self.cfg.banks);
+        let ram_line = ram_summary(&self.app.config().banks);
         // Paths are shown relative to the machine folder (the working
         // directory) and cut to the panel's width; the tooltip has them whole.
         let machine_dir = std::env::current_dir().ok();
@@ -3100,39 +2368,39 @@ impl App {
             }
             ui.end_row();
             ui.label(t!("welcome-platform"));
-            ui.label(self.cfg.machine.profile.label());
+            ui.label(self.app.config().machine.profile.label());
             ui.end_row();
             // Guest-visible (PRId, cache geometry, ISA level), so it belongs in
             // the summary next to the platform rather than buried in a tab.
             ui.label(t!("welcome-processor"));
-            ui.label(self.cfg.cpu().label());
+            ui.label(self.app.config().cpu().label());
             ui.end_row();
             if let Some(started) = self.started_cpu {
-                if started != self.cfg.cpu() {
+                if started != self.app.config().cpu() {
                     ui.label(t!("welcome-processor-running"));
                     ui.label(started.label());
                     ui.end_row();
                 }
             }
             ui.label(t!("welcome-prom"));
-            let prom = if crate::extra_ui::builtin_prom(&self.cfg) || self.cfg.prom.is_empty() {
+            let prom = if crate::extra_ui::builtin_prom(&self.app.config()) || self.app.config().prom.is_empty() {
                 t!("welcome-prom-builtin")
-            } else if std::path::Path::new(&self.cfg.prom).exists() {
-                shown(&self.cfg.prom)
+            } else if std::path::Path::new(&self.app.config().prom).exists() {
+                shown(&self.app.config().prom)
             } else {
-                let s = shown(&self.cfg.prom);
+                let s = shown(&self.app.config().prom);
                 t!("welcome-prom-missing", path = &s)
             };
-            path_label(ui, prom, &self.cfg.prom);
+            path_label(ui, prom, &self.app.config().prom);
             ui.end_row();
             ui.label(t!("welcome-nvram"));
-            path_label(ui, shown(&self.cfg.nvram), &self.cfg.nvram);
+            path_label(ui, shown(&self.app.config().nvram), &self.app.config().nvram);
             ui.end_row();
             ui.label(t!("welcome-memory"));
             ui.label(ram_line);
             ui.end_row();
             if let Some(started) = self.started_banks {
-                if started != self.cfg.banks {
+                if started != self.app.config().banks {
                     ui.label(t!("welcome-memory-running"));
                     ui.label(ram_summary(&started));
                     ui.end_row();
@@ -3140,7 +2408,7 @@ impl App {
             }
             ui.label(t!("welcome-drives"));
             ui.vertical(|ui| {
-                let drives = summary::drives(&self.cfg);
+                let drives = summary::drives(&self.app.config());
                 if drives.is_empty() {
                     ui.label(RichText::new(t!("common-none")).weak());
                 }
@@ -3164,7 +2432,7 @@ impl App {
             // On a build without PCAP support, the runtime always uses NAT
             // regardless of any imported `mode = "pcap"`, and the UI must never
             // surface PCAP (`summary::network` reports NAT there).
-            ui.label(match summary::network(&self.cfg, iris::build_features::PCAP) {
+            ui.label(match summary::network(&self.app.config(), iris::build_features::PCAP) {
                 summary::Network::Bridged(iface) => {
                     let iface = iface.unwrap_or_else(|| t!("common-auto"));
                     t!("welcome-network-bridged", iface = &iface)
@@ -3197,26 +2465,26 @@ impl App {
         ui.add_space(4.0);
         self.run_state_label(ui);
         ui.separator();
-        let name = self.prefs.active_machine.clone().unwrap_or_else(|| t!("welcome-unsaved"));
-        let profile = self.cfg.machine.profile.label();
+        let name = self.app.prefs().active_machine.clone().unwrap_or_else(|| t!("welcome-unsaved"));
+        let profile = self.app.config().machine.profile.label();
         // While running, name the CPU the guest actually booted on — the config
         // may already have been changed to one that only takes effect next Start.
-        let running_cpu = if self.emu.is_running() { self.started_cpu } else { None };
-        let cpu = running_cpu.unwrap_or(self.cfg.cpu());
-        ui.label(if self.cfg_dirty {
+        let running_cpu = if self.app.session().handle().is_running() { self.started_cpu } else { None };
+        let cpu = running_cpu.unwrap_or(self.app.config().cpu());
+        ui.label(if self.app.is_dirty() {
             t!("status-machine-unsaved", name = &name, profile = profile, cpu = cpu.label())
         } else {
             t!("status-machine", name = &name, profile = profile, cpu = cpu.label())
         });
         if let Some(started) = running_cpu {
-            if started != self.cfg.cpu() {
+            if started != self.app.config().cpu() {
                 ui.label(
-                    RichText::new(t!("status-cpu-pending", cpu = self.cfg.cpu().label()))
+                    RichText::new(t!("status-cpu-pending", cpu = self.app.config().cpu().label()))
                         .color(Color32::YELLOW).small(),
                 );
             }
         }
-        ui.label(t!("status-dirty-sectors", count = self.emu.status.dirty_cow));
+        ui.label(t!("status-dirty-sectors", count = self.app.session().handle().status.dirty_cow));
         if let Some((msg, when)) = self.toast.clone() {
             if when.elapsed().as_secs() < 5 {
                 ui.add_space(2.0);
@@ -3245,7 +2513,7 @@ impl App {
             self.config_quick_buttons(ui);
             // Capture status + "Capture" button — only while a machine is up
             // (it's meaningless at the stopped state shown in the footer).
-            if self.emu.is_running() {
+            if self.app.session().handle().is_running() {
                 ui.separator();
                 self.capture_controls(ui, ctx);
             }
@@ -3259,47 +2527,61 @@ impl eframe::App for App {
         let ctx = &ui.ctx().clone();
         self.install_frame_wake(ctx);
         self.handle_events(ctx);
-        self.maybe_autosave();
 
-        // Intercept a clean exit (window close / File→Quit) to fold any pending
-        // CHD `.diff.chd` back into its base first ("Synchronizing disks…"). On
-        // the first close request with a pending sync we kick off the worker,
-        // show the modal, and cancel the close; the real close happens on
-        // Evt::SyncDone. `sync_then_close` latches so we don't re-intercept the
-        // final close (by then the machine is gone and chd_sync_pending is stale).
+        // A clean exit (window close / File→Quit) asks the app controller,
+        // which folds pending CHD diffs into their bases first ("Synchronizing
+        // disks…") and answers with Effect::Quit once that is done. A signal
+        // closes at once: the fold can outlast whoever sent it.
         if ctx.input(|i| i.viewport().close_requested()) {
             let on_signal = CLOSE_ON_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
-            if !on_signal && !self.sync_then_close && self.emu.has_pending_chd_sync() {
-                self.sync_then_close = true;
-                self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
-                self.emu.send(Cmd::SyncDisks);
+            if !on_signal && !self.allow_close {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            } else if self.syncing.is_some() {
-                ctx.send_viewport_cmd(ViewportCommand::CancelClose); // still syncing — stay alive
+                if !self.app.quitting() {
+                    self.run_app(AppAction::RequestQuit);
+                }
             }
         }
+        if std::mem::take(&mut self.quit_now) {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+        if let Some(text) = self.pending_clipboard.take() {
+            ctx.copy_text(text);
+        }
+        // Controller dialogs (confirmations, text prompts), one at a time.
+        if let Some(answer) = self.effects.show(ctx) {
+            self.run_app(AppAction::Answer(answer));
+        }
+        let bench_fx = std::mem::take(&mut self.bench.effects);
+        self.run_effects(bench_fx);
 
         // F11 toggles fullscreen — except Ctrl+Alt+F11, which is reserved as the
         // way to send a real F11 keystroke through to the guest (plain F11 never
         // reaches IRIX because this toggle eats it). input::pump forwards that
         // chord to the guest while captured.
-        if ctx.input(|i| i.key_pressed(egui::Key::F11) && !(i.modifiers.ctrl && i.modifiers.alt)) {
-            self.fullscreen = !self.fullscreen;
+        // While captured, F11 goes to the display controller with the other keys.
+        if !self.app.display().captured()
+            && ctx.input(|i| i.key_pressed(egui::Key::F11) && !(i.modifiers.ctrl && i.modifiers.alt))
+        {
+            self.run_app(AppAction::Display(DisplayAction::ToggleFullScreen));
+        }
+        // The window follows the controller's full-screen state.
+        if self.fullscreen != self.app.display().fullscreen() {
+            self.fullscreen = self.app.display().fullscreen();
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
         }
 
         // Ctrl+F12 opens a file picker to load a CD-ROM disc on the fly (hot-swap)
         // without needing to configure it in iris.toml or use the SCSI menu.
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F12)) {
-            if self.emu.is_running() {
+            if self.app.session().handle().is_running() {
                 // The first CD-ROM drive on controller 0: a disc loads by
                 // that controller's SCSI id.
-                let cdrom = (1u8..=15).find(|&id| self.cfg.disk(id).is_some_and(|d| d.is_cdrom()));
+                let cdrom = (1u8..=15).find(|&id| self.app.config().disk(id).is_some_and(|d| d.is_cdrom()));
 
-                if let Some(id) = cdrom {
-                    let cur = self.cfg.disk(id).map(|d| d.path.clone()).unwrap_or_default();
+                if let Some(key) = cdrom {
+                    let cur = self.app.config().disk(key).map(|d| d.path.clone()).unwrap_or_default();
                     if let Some(path) = scsi_menu::pick_iso(&t!("main-load-disc-title"), &cur) {
-                        self.emu.send(Cmd::LoadDisc { id, path, remount: true });
+                        self.run_app(AppAction::Session(SessionAction::LoadDisc { key, path }));
                     }
                 } else {
                     self.toast(t!("toast-no-cdrom"));
@@ -3316,9 +2598,9 @@ impl eframe::App for App {
             i.modifiers.command && i.key_pressed(egui::Key::Minus),
             i.modifiers.command && i.key_pressed(egui::Key::Num0),
         ));
-        if zoom_in    { self.prefs.ui_scale = (self.prefs.ui_scale + 0.1).min(UI_SCALE_MAX); ctx.set_zoom_factor(self.prefs.ui_scale); }
-        if zoom_out   { self.prefs.ui_scale = (self.prefs.ui_scale - 0.1).max(UI_SCALE_MIN); ctx.set_zoom_factor(self.prefs.ui_scale); }
-        if zoom_reset { self.prefs.ui_scale = settings::UI_SCALE_DEFAULT; ctx.set_zoom_factor(self.prefs.ui_scale); }
+        if zoom_in    { self.app.prefs_mut().ui_scale = (self.app.prefs().ui_scale + 0.1).min(UI_SCALE_MAX); ctx.set_zoom_factor(self.app.prefs().ui_scale); }
+        if zoom_out   { self.app.prefs_mut().ui_scale = (self.app.prefs().ui_scale - 0.1).max(UI_SCALE_MIN); ctx.set_zoom_factor(self.app.prefs().ui_scale); }
+        if zoom_reset { self.app.prefs_mut().ui_scale = settings::UI_SCALE_DEFAULT; ctx.set_zoom_factor(self.app.prefs().ui_scale); }
         // Any UI-zoom change re-fits the window so the controls grow it instead
         // of squeezing the (decoupled) VM screen.
         if zoom_in || zoom_out || zoom_reset { self.pending_fb_snap = true; }
@@ -3337,7 +2619,7 @@ impl eframe::App for App {
         //  - IDLE: it takes the WHOLE central area instead (below), hiding the
         //    welcome/info screen — no cramped split when there's nothing to
         //    watch. The toolbar's "Edit config…" toggle drives both.
-        let mut config_in_side_panel = self.show_config_editor && self.emu.is_running();
+        let mut config_in_side_panel = self.show_config_editor && self.app.session().handle().is_running();
         egui::Panel::right("config_editor")
             .resizable(true)
             .default_size(420.0)
@@ -3350,15 +2632,16 @@ impl eframe::App for App {
         let central_frame = egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::ZERO);
         egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
-            if self.show_config_editor && !self.emu.is_running() {
+            if self.show_config_editor && !self.app.session().handle().is_running() {
                 // Idle + editing: config fills the whole pane (welcome hidden).
                 // A small margin gives it breathing room (the central frame is
                 // edge-to-edge for the framebuffer).
-                input::force_release(ui.ctx(), &mut self.input_state);
+                self.run_app(AppAction::Display(DisplayAction::Release));
+                input::sync_cursor(ui.ctx(), &mut self.input_state, false);
                 egui::Frame::new()
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| self.config_editor_panel(ui));
-            } else if self.emu.is_running() {
+            } else if self.app.session().handle().is_running() {
                 self.framebuffer_panel(ui);
             } else {
                 // Size the window for the standard 1280×1024 display at the
@@ -3372,74 +2655,33 @@ impl eframe::App for App {
                     self.pending_launcher_fit = !Self::snap_window_to_fb(
                         ui.ctx(),
                         egui::vec2(
-                            self.cfg.graphics.host_display_size().0 as f32,
-                            self.cfg.graphics.host_display_size().1 as f32,
+                            self.app.config().graphics.host_display_size().0 as f32,
+                            self.app.config().graphics.host_display_size().1 as f32,
                         ),
                         ui.available_size(),
-                        self.prefs.vm_scale,
+                        self.app.prefs().vm_scale,
                     );
                 }
                 // Emulator not running: make sure a leftover mouse capture is
                 // released so the host cursor isn't stuck hidden/locked.
-                input::force_release(ui.ctx(), &mut self.input_state);
+                self.run_app(AppAction::Display(DisplayAction::Release));
+                input::sync_cursor(ui.ctx(), &mut self.input_state, false);
                 self.welcome_panel(ui);
             }
         });
 
-        // Rename-machine modal: a text box + OK/Cancel. The buffer is App state
-        // (`rename_buffer`), so typed input persists across frames — a text box
-        // inside the menu can't, because the menu closure resets it each frame.
-        let mut rename_result: Option<Option<String>> = None; // outer Some=action; inner Some=new name, None=cancel
-        if let Some(buf) = &mut self.rename_buffer {
-            egui::Window::new(t!("modal-rename-title"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(t!("modal-rename-label"));
-                    let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(260.0));
-                    resp.request_focus();
-                    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let ok = ui.add(crate::extra_ui::filled_button(t!("modal-rename-confirm"), Color32::from_rgb(60, 90, 140))).clicked();
-                        if (ok || entered) && !buf.trim().is_empty() {
-                            rename_result = Some(Some(buf.clone()));
-                        }
-                        if ui.button(t!("common-cancel")).clicked() { rename_result = Some(None); }
-                    });
-                });
-        }
-        match rename_result {
-            Some(Some(name)) => { self.apply_rename(&name); self.rename_buffer = None; }
-            Some(None)       => { self.rename_buffer = None; }
-            None             => {}
-        }
 
         // New machine dialog.
-        self.new_machine.show(ctx, &self.prefs);
+        self.new_machine.show(ctx, &self.app.prefs());
         if let Some(result) = self.new_machine.take_result() {
-            if self.can_select_machine() {
-                if let Err(e) = machines::validate_name(&result.name) { self.toast(e); }
-                else if !self.cfg_dirty || self.flush_machine() {
-                    let name = self.prefs.unique_name(&result.name);
-                    let mut cfg = result.cfg;
-                    match self.prefs.save_machine(&name, &mut cfg) {
-                        Ok(()) => {
-                            self.switch_to(&name);
-                            self.toast(t!("toast-machine-created", name = &name));
-                        }
-                        Err(e) => self.toast(t!("toast-machine-create-failed", error = e)),
-                    }
-                }
-            }
+            self.run_app(AppAction::CreateMachine { name: result.name, config: Box::new(result.cfg) });
         }
 
         // Create blank disk dialog.
         self.create_disk.show(ctx);
         if let Some(result) = self.create_disk.take_result() {
             let path_str = result.path.to_string_lossy().into_owned();
-            self.cfg.set_disk(result.scsi_id, iris::config::ScsiDeviceConfig {
+            self.app.config_mut().set_disk(result.scsi_id, iris::config::ScsiDeviceConfig {
                 path: path_str.clone(), ..Default::default()
             });
             self.mark_dirty();
@@ -3467,45 +2709,7 @@ impl eframe::App for App {
         self.sync_modal(ctx);
 
         // "Discard changes?" confirmation for a COW roll-back.
-        self.cow_discard_modal(ctx);
 
-        // Safe-stop confirmation modal.
-        let mut close_modal = false;
-        let mut do_force = false;
-        let mut do_halt  = false;
-        if let Some(modal) = &self.stop_modal {
-            egui::Window::new(t!("modal-stop-title"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(RichText::new(t!("modal-stop-body")).strong());
-                    for line in &modal.lines { ui.label(t!("modal-list-item", item = line)); }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(t!("common-cancel")).clicked() { close_modal = true; }
-                        if ui.button(t!("modal-stop-halt")).clicked() { do_halt = true; close_modal = true; }
-                        if ui.add(crate::extra_ui::filled_button(RichText::new(t!("modal-stop-force")).color(Color32::WHITE), Color32::from_rgb(140, 40, 40))).clicked()
-                        {
-                            do_force = true; close_modal = true;
-                        }
-                    });
-                });
-        }
-        if close_modal { self.stop_modal = None; }
-        if do_force { self.emu.send(Cmd::Stop); }
-        if do_halt  {
-            // Type "halt\n" at the IRIX serial console in-process (see
-            // EmulatorHandle / Machine::inject_serial_console). This used to
-            // open a loopback TCP client to 127.0.0.1:8881; doing it in-process
-            // means clean shutdown no longer depends on the serial server
-            // socket (which the macOS App Sandbox would otherwise gate behind
-            // the network.server entitlement). IRIX takes a few seconds to shut
-            // down cleanly; the user can hit Stop once the PROM "halted"
-            // message appears.
-            self.emu.send(Cmd::HaltIrix);
-            self.toast(t!("toast-halt-sent"));
-        }
 
         // A Browse button found no file dialog to open (Linux without a
         // desktop portal or zenity): say so instead of doing nothing.
@@ -3535,7 +2739,7 @@ impl eframe::App for App {
 
         // Confirm switching from a custom PROM back to the built-in image.
         if self.confirm_embedded_prom {
-            let prom = self.cfg.prom.clone();
+            let prom = self.app.config().prom.clone();
             let mut close = false;
             let mut do_clear = false;
             egui::Window::new(t!("modal-prom-title"))
@@ -3552,7 +2756,7 @@ impl eframe::App for App {
                     });
                 });
             if do_clear {
-                self.cfg.prom = "(embedded)".into();
+                self.app.config_mut().prom = "(embedded)".into();
                 self.mark_dirty();
                 self.toast(t!("toast-prom-builtin"));
             }
@@ -3589,8 +2793,8 @@ impl eframe::App for App {
                         }
                     });
                 });
-            if do_revert  { self.cfg.nat_subnet = revert_to;          self.mark_dirty(); }
-            if do_suggest { self.cfg.nat_subnet = Some(suggestion);   self.mark_dirty(); }
+            if do_revert  { self.app.config_mut().nat_subnet = revert_to;          self.mark_dirty(); }
+            if do_suggest { self.app.config_mut().nat_subnet = Some(suggestion);   self.mark_dirty(); }
             if close { self.net_sanity_modal = None; }
         }
 
@@ -3598,194 +2802,6 @@ impl eframe::App for App {
         // permission-denied capture). "Enable" runs the platform privilege flow;
         // "Not now" just dismisses — the guest keeps running on NAT-less PCAP
         // (i.e. no networking) until the user enables capture or switches to NAT.
-        if self.pcap_perm_modal {
-            let mut do_enable = false;
-            let mut close = false;
-            egui::Window::new(t!("modal-pcap-title"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.set_max_width(440.0);
-                    ui.label(RichText::new(t!("modal-pcap-body")).strong());
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(capture_access::permission_hint()).weak());
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add(crate::extra_ui::filled_button(t!("modal-pcap-enable"), Color32::from_rgb(60, 90, 140))).clicked()
-                        {
-                            do_enable = true;
-                        }
-                        if ui.button(t!("modal-pcap-not-now")).clicked() { close = true; }
-                    });
-                });
-            if do_enable { self.run_enable_packet_capture(); } // also clears the modal
-            if close { self.pcap_perm_modal = false; }
-        }
-
-        // Missing-disk modal.
-        enum MissingChoice { None, Cancel, Detach, EditDisks }
-        let mut choice = MissingChoice::None;
-        if let Some(modal) = &self.missing_modal {
-            egui::Window::new(t!("modal-missing-title"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(RichText::new(t!("modal-missing-body")).strong());
-                    for m in &modal.missing {
-                        ui.label(if m.cdrom {
-                            t!("modal-missing-cdrom", id = &m.name, path = &m.path)
-                        } else {
-                            t!("modal-missing-disk", id = &m.name, path = &m.path)
-                        });
-                    }
-                    ui.add_space(8.0);
-                    if cfg!(feature = "appstore") {
-                        // Under the sandbox an existing file may be unreadable
-                        // because the app's access to it lapsed — re-selecting it
-                        // re-grants access and stores a bookmark for next launch.
-                        ui.label(RichText::new(t!("modal-missing-sandbox")).weak());
-                        ui.add_space(4.0);
-                    }
-                    subtitle(ui, t!("modal-missing-subtitle"));
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(t!("common-cancel")).clicked() { choice = MissingChoice::Cancel; }
-                        if ui.button(t!("modal-missing-edit")).clicked() { choice = MissingChoice::EditDisks; }
-                        if ui.add(crate::extra_ui::filled_button(t!("modal-missing-detach"), Color32::from_rgb(60, 90, 140))).clicked()
-                        {
-                            choice = MissingChoice::Detach;
-                        }
-                    });
-                });
-        }
-        match choice {
-            MissingChoice::None => {}
-            MissingChoice::Cancel => { self.missing_modal = None; }
-            MissingChoice::EditDisks => {
-                // Switching the tab alone is invisible if the config editor
-                // side panel is collapsed (its default state) — open it too,
-                // or the button appears to do nothing.
-                self.tab = config_ui::Tab::Disks;
-                self.show_config_editor = true;
-                self.missing_modal = None;
-            }
-            MissingChoice::Detach => {
-                let ids: Vec<u8> = self.missing_modal.as_ref()
-                    .map(|m| m.missing.iter().map(|d| d.key).collect())
-                    .unwrap_or_default();
-                self.missing_modal = None;
-                self.detach_and_start(&ids);
-            }
-        }
-
-        // CHD folder-grant modal (App Store): attached CHDs sit in folders we
-        // can't write, so their on-exit fold would be denied. Offer to grant
-        // each folder, or start anyway and forgo compaction.
-        // `Grant` is built only in the sandbox branch, `OpenPrivacy`/`Recheck`
-        // only in the notarized branch — so one set is always cfg-dead.
-        #[allow(dead_code)]
-        enum ChdGrantChoice { None, Cancel, StartAnyway, Grant(String), OpenPrivacy, Recheck }
-        let mut chd_choice = ChdGrantChoice::None;
-        if let Some(modal) = &self.chd_grant_modal {
-            egui::Window::new(t!("modal-grant-title"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(RichText::new(t!("modal-grant-body")).strong());
-                    for d in &modal.disks {
-                        ui.label(t!("modal-grant-disk", id = d.id, path = &d.path));
-                    }
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(t!("modal-grant-why")).weak());
-                    ui.add_space(6.0);
-                    subtitle(ui, t!("modal-grant-subtitle"));
-                    ui.add_space(6.0);
-                    // Sandbox (MAS): a directory security-scoped grant via the
-                    // open panel conveys write access. One button per distinct
-                    // folder — a recursive grant covers every disk under it.
-                    #[cfg(feature = "appstore")]
-                    {
-                        ui.label(RichText::new(t!("modal-grant-sandbox")).weak());
-                        let mut dirs: Vec<&str> = modal.disks.iter().map(|d| d.dir.as_str()).collect();
-                        dirs.sort_unstable();
-                        dirs.dedup();
-                        for dir in dirs {
-                            if ui.button(t!("modal-grant-folder", path = dir)).clicked() {
-                                chd_choice = ChdGrantChoice::Grant(dir.to_string());
-                            }
-                        }
-                    }
-                    // Notarized macOS: the block is macOS Privacy (TCC), which a
-                    // folder pick doesn't override — the user allows IRIS in
-                    // System Settings, then re-checks (a relaunch may be needed
-                    // for Full Disk Access to take effect).
-                    #[cfg(not(feature = "appstore"))]
-                    {
-                        ui.label(RichText::new(t!("modal-grant-tcc")).weak());
-                        ui.horizontal(|ui| {
-                            if ui.button(t!("modal-grant-open-privacy")).clicked() {
-                                chd_choice = ChdGrantChoice::OpenPrivacy;
-                            }
-                            if ui.button(t!("modal-grant-recheck")).clicked() {
-                                chd_choice = ChdGrantChoice::Recheck;
-                            }
-                        });
-                    }
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(t!("common-cancel")).clicked() { chd_choice = ChdGrantChoice::Cancel; }
-                        if ui.add(crate::extra_ui::filled_button(t!("modal-grant-start-anyway"), Color32::from_rgb(60, 90, 140))).clicked()
-                        {
-                            chd_choice = ChdGrantChoice::StartAnyway;
-                        }
-                    });
-                });
-        }
-        match chd_choice {
-            ChdGrantChoice::None => {}
-            ChdGrantChoice::Cancel => { self.chd_grant_modal = None; }
-            ChdGrantChoice::StartAnyway => {
-                self.chd_grant_modal = None;
-                self.skip_chd_grant_check = true; // one-shot bypass
-                self.start_emulator();
-            }
-            ChdGrantChoice::Grant(dir) => {
-                self.grant_disk_folder_at(Some(&dir));
-                // Re-probe: drop disks whose folder is now writable. When all are
-                // satisfied, dismiss and start; otherwise leave the rest listed.
-                if let Some(modal) = &mut self.chd_grant_modal {
-                    modal.disks.retain(|d| !dir_writable(std::path::Path::new(&d.dir)));
-                    if modal.disks.is_empty() {
-                        self.chd_grant_modal = None;
-                        self.start_emulator();
-                    }
-                }
-            }
-            ChdGrantChoice::OpenPrivacy => {
-                // Open System Settings → Privacy & Security → Full Disk Access so
-                // the user can add IRIS (the "+"). No-op off macOS.
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = std::process::Command::new("open")
-                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
-                        .spawn();
-                }
-            }
-            ChdGrantChoice::Recheck => {
-                // Re-probe each listed folder; drop the ones now writable (the
-                // user allowed IRIS in System Settings). Mirrors the Grant path.
-                if let Some(modal) = &mut self.chd_grant_modal {
-                    modal.disks.retain(|d| !dir_writable(std::path::Path::new(&d.dir)));
-                    if modal.disks.is_empty() {
-                        self.chd_grant_modal = None;
-                        self.start_emulator();
-                    }
-                }
-            }
-        }
 
         // The window starts hidden so the first frame(s) can fit it to the
         // monitor (the launcher fit, when not running) before it's shown —
@@ -3806,13 +2822,11 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Make sure the latest cfg lands in `machines` before save().
-        if self.cfg_dirty { self.flush_machine(); } else { let _ = self.prefs.save(); }
-        // Synchronously stop the machine and join the worker, so a running
-        // guest is cleaned up even if the user closed the window without
-        // pressing Stop (rather than relying on Drop ordering / racing
-        // process teardown). Bounded by the worker's stop timeout.
-        self.emu.shutdown();
+        // Save pending edits, then stop the machine and join the worker, so a
+        // running guest is cleaned up even if the window closed without a Stop
+        // (rather than relying on Drop ordering or racing process teardown).
+        // Bounded by the worker's stop timeout.
+        self.app.shutdown();
         // Finish a Perfetto trace started from the Debug tab, so the file is
         // complete rather than cut off mid-buffer.
         #[cfg(feature = "perfetto")]
@@ -3823,94 +2837,11 @@ impl eframe::App for App {
     }
 }
 
-// --- platform dialogs ------------------------------------------------------
-//
-// Screenshot save panels open in the selected machine folder.
-fn native_save_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
-    filedialog::dialog_with(title, "", filedialog::Anchor::Data,
-                            filedialog::Purpose::Save, filters).save_file()
-}
-
-#[cfg(test)]
-mod preflight_tests {
-    use super::disk_readable;
-    use std::io::Write;
-
-    #[test]
-    fn empty_and_missing_paths_are_not_readable() {
-        assert!(!disk_readable(""));
-        assert!(!disk_readable("/no/such/iris/disk/image.chd"));
-    }
-
-    #[test]
-    fn an_existing_readable_file_is_readable() {
-        let mut p = std::env::temp_dir();
-        p.push(format!("iris_readable_{}.raw", std::process::id()));
-        std::fs::File::create(&p).unwrap().write_all(b"\0\0\0\0").unwrap();
-        assert!(disk_readable(&p.to_string_lossy()));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    // The case the sandbox actually hits: a file that exists (so Path::exists()
-    // is true) but cannot be opened. Simulated with chmod 000. Skipped when the
-    // test runs as root, where DAC permission checks are bypassed and the open
-    // would still succeed.
-    #[cfg(unix)]
-    #[test]
-    fn an_unreadable_but_present_file_is_not_readable() {
-        use std::os::unix::fs::PermissionsExt;
-        if unsafe { libc_geteuid() } == 0 {
-            return; // root bypasses 000 perms; the distinction can't be shown
-        }
-        let mut p = std::env::temp_dir();
-        p.push(format!("iris_unreadable_{}.raw", std::process::id()));
-        std::fs::File::create(&p).unwrap().write_all(b"\0\0\0\0").unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // exists() says present, but disk_readable() must say no.
-        assert!(p.exists());
-        assert!(!disk_readable(&p.to_string_lossy()));
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[cfg(unix)]
-    extern "C" {
-        #[link_name = "geteuid"]
-        fn libc_geteuid() -> u32;
-    }
-}
-
 #[cfg(test)]
 mod fb_scaling_tests {
     use super::*;
 
     const FB: egui::Vec2 = egui::vec2(1280.0, 1024.0);
-
-    #[test]
-    fn exact_fit_is_integer_and_nearest() {
-        assert_eq!(fb_draw_size(FB, FB, 1.0, 0.0), (FB, true));
-        assert_eq!(fb_draw_size(FB, FB, 2.0, 0.0), (FB, true)); // Retina 1× = 2 device px
-        assert_eq!(fb_draw_size(FB * 2.0, FB, 1.0, 0.0), (FB * 2.0, true));
-    }
-
-    #[test]
-    fn slightly_large_window_snaps_down_never_up() {
-        // Window-manager slack / a free resize a few pixels past 1×.
-        let (size, nearest) = fb_draw_size(egui::vec2(1290.0, 1034.0), FB, 1.0, 0.0);
-        assert_eq!((size, nearest), (FB, true));
-        // A hair short of 1× must not be drawn at 1× (that clips rows); it is
-        // a filtered fit instead.
-        let (size, nearest) = fb_draw_size(egui::vec2(1280.0, 1020.0), FB, 1.0, 0.0);
-        assert!(!nearest);
-        assert!(size.y <= 1020.0);
-    }
-
-    #[test]
-    fn fractional_fit_is_filtered() {
-        let (size, nearest) = fb_draw_size(egui::vec2(1600.0, 1280.0), FB, 1.0, 0.0);
-        assert!(!nearest);
-        assert_eq!(size, egui::vec2(1600.0, 1280.0));
-    }
 
     #[test]
     fn rect_lands_on_device_pixel_grid() {
@@ -3926,28 +2857,12 @@ mod fb_scaling_tests {
         }
     }
 
-    #[test]
-    fn larger_window_is_capped_at_vm_scale_and_centred() {
-        // Fullscreen 1080p minus the 186pt control column, VM screen at 1x.
-        let outer = egui::Rect::from_min_size(egui::pos2(186.0, 0.0), egui::vec2(1734.0, 1080.0));
-        let (rect, nearest) = fb_draw_rect(outer, FB, 1.0, 1.0);
-        assert!(nearest);
-        assert_eq!(rect.size(), FB);
-        assert_eq!(rect.center().round(), outer.center().round());
-        // Retina, 1x = 2 device px: still capped at 1280x1024 points.
-        assert_eq!(fb_draw_size(egui::vec2(3000.0, 2000.0), FB, 2.0, 1.0), (FB, true));
-        // 0.5x on Retina = 1 device px per emulated pixel: crisp.
-        assert_eq!(fb_draw_size(egui::vec2(3000.0, 2000.0), FB, 2.0, 0.5), (FB * 0.5, true));
-        // A window too small for the setting still shrinks to fit.
-        let (size, nearest) = fb_draw_size(egui::vec2(1000.0, 800.0), FB, 1.0, 1.0);
-        assert!(!nearest);
-        assert!(size.y <= 800.0);
-    }
 }
 
 #[cfg(test)]
 mod machine_storage_integration {
     use super::*;
+    use iris_gui_core::controller::{app, Answer};
 
     // Run the App/worker integration in a child: cwd and environment are process
     // global, and must not disturb other concurrently running unit tests.
@@ -3957,7 +2872,7 @@ mod machine_storage_integration {
         let root = PathBuf::from(root);
         std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
         let mut prefs = GuiSettings::load_in(root.clone(), launch_dir());
-        let mut cfg = MachineConfig::default();
+        let mut cfg = iris::config::MachineConfig::default();
         cfg.banks = iris::config::banks_from4([8, 8, 0, 0]);
         cfg.devices.clear();
         cfg.headless = true;
@@ -3969,55 +2884,57 @@ mod machine_storage_integration {
         prefs.save_machine("beta", &mut cfg).unwrap();
         prefs.active_machine = Some("alpha".into());
         prefs.save().unwrap();
-        let mut app = App::new(prefs);
-        let alpha = app.prefs.machine_dir("alpha").unwrap();
-        let beta = app.prefs.machine_dir("beta").unwrap();
+        let mut app = App::new(prefs, std::sync::Arc::new(iris_gui_core::controller::NoWake));
+        let alpha = app.app.prefs().machine_dir("alpha").unwrap();
+        let beta = app.app.prefs().machine_dir("beta").unwrap();
         assert_eq!(std::env::current_dir().unwrap(), alpha);
-        app.cfg.serial_log = Some(alpha.join("serial.log").to_string_lossy().into_owned());
+        app.app.config_mut().serial_log = Some(alpha.join("serial.log").to_string_lossy().into_owned());
         app.mark_dirty();
         assert!(app.flush_machine());
-        assert_eq!(machines::read(&app.prefs.machine_path("alpha").unwrap()).unwrap().serial_log.as_deref(), Some("serial.log"));
+        assert_eq!(machines::read(&app.app.prefs().machine_path("alpha").unwrap()).unwrap().serial_log.as_deref(), Some("serial.log"));
         let ctx = egui::Context::default();
         for name in ["alpha", "beta"] {
             app.switch_to(name);
-            assert_eq!(std::env::current_dir().unwrap(), app.prefs.machine_dir(name).unwrap());
+            assert_eq!(std::env::current_dir().unwrap(), app.app.prefs().machine_dir(name).unwrap());
             app.start_emulator();
-            assert!(!app.emu.can_change_directory(), "queued Start must lock cwd");
+            assert!(!app.app.session_mut().handle_mut().can_change_directory(), "queued Start must lock cwd");
             app.switch_to(if name == "alpha" { "beta" } else { "alpha" });
-            assert_eq!(app.prefs.active_machine.as_deref(), Some(name));
+            assert_eq!(app.app.prefs().active_machine.as_deref(), Some(name));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-            while !app.emu.is_running() && std::time::Instant::now() < deadline {
+            while !app.app.session_mut().handle_mut().is_running() && std::time::Instant::now() < deadline {
                 app.handle_events(&ctx);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            assert!(app.emu.is_running(), "start failed: {:?}", app.toast);
+            assert!(app.app.session_mut().handle_mut().is_running(), "start failed: {:?}", app.toast);
             assert!(std::fs::metadata("nvram.bin").unwrap().len() > 0);
             assert!(std::fs::metadata("nveeprom.bin").unwrap().len() > 0);
-            app.emu.send(Cmd::Stop);
+            app.app.session_mut().handle_mut().send(Cmd::Stop);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-            while !app.emu.can_change_directory() && std::time::Instant::now() < deadline {
+            while !app.app.session_mut().handle_mut().can_change_directory() && std::time::Instant::now() < deadline {
                 app.handle_events(&ctx);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            assert!(app.emu.can_change_directory(), "stop failed: {:?}", app.toast);
+            assert!(app.app.session_mut().handle_mut().can_change_directory(), "stop failed: {:?}", app.toast);
         }
         assert_ne!(settings::nvram_mac(alpha.join("nvram.bin").to_str().unwrap()), settings::nvram_mac(beta.join("nvram.bin").to_str().unwrap()));
         // Switch rereads external TOML edits rather than the startup map.
-        let mut edited = machines::read(&app.prefs.machine_path("alpha").unwrap()).unwrap();
+        let mut edited = machines::read(&app.app.prefs().machine_path("alpha").unwrap()).unwrap();
         edited.banks = iris::config::banks_from4([16, 16, 0, 0]);
         machines::save(&root, "alpha", &mut edited).unwrap();
         app.switch_to("alpha");
-        assert_eq!(app.cfg.banks, iris::config::banks_from4([16, 16, 0, 0]));
-        app.apply_rename("renamed");
-        assert_eq!(app.prefs.active_machine.as_deref(), Some("renamed"), "rename failed: {:?}", app.toast);
-        assert_eq!(std::env::current_dir().unwrap(), app.prefs.machine_dir("renamed").unwrap());
+        assert_eq!(app.app.config().banks, iris::config::banks_from4([16, 16, 0, 0]));
+        app.run_app(AppAction::Rename { machine: "alpha".into() });
+        app.run_app(AppAction::Answer(Answer::Text { purpose: app::RENAME_MACHINE, text: Some("renamed".into()) }));
+        assert_eq!(app.app.prefs().active_machine.as_deref(), Some("renamed"), "rename failed: {:?}", app.toast);
+        assert_eq!(std::env::current_dir().unwrap(), app.app.prefs().machine_dir("renamed").unwrap());
         assert!(root.join("machines/renamed/renamed.toml").is_file());
         app.delete_machine("renamed");
-        assert_eq!(app.prefs.active_machine.as_deref(), Some("beta"));
+        app.run_app(AppAction::Answer(Answer::Confirmed { purpose: app::DELETE_MACHINE, yes: true }));
+        assert_eq!(app.app.prefs().active_machine.as_deref(), Some("beta"));
         assert_eq!(std::env::current_dir().unwrap(), beta);
         assert!(root.join("machines/renamed/nvram.bin").is_file());
         assert!(!root.join("machines/renamed/renamed.toml").exists());
-        app.emu.shutdown();
+        app.app.shutdown();
         let restored = GuiSettings::load_in(root.clone(), launch_dir());
         assert_eq!(restored.active_machine.as_deref(), Some("beta"));
         assert_eq!(restored.machines.len(), 1);
@@ -4025,7 +2942,7 @@ mod machine_storage_integration {
 
     #[test]
     fn toml_machine_lifecycle_and_emulator_paths() {
-        let root = machines::tests::TempRoot::new("app-lifecycle");
+        let root = machines::testing::TempRoot::new("app-lifecycle");
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "machine_storage_integration::machine_storage_child", "--nocapture"])
             .env("IRIS_GUI_STORAGE_TEST", &root.0).current_dir(&root.0).output().unwrap();

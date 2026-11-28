@@ -1,8 +1,8 @@
 # GUI text catalogs (i18n) gotchas
 
-- All GUI text is Fluent (`iris-gui/locales/<lang>/*.ftl`, `src/i18n.rs`).
+- All GUI text is Fluent (`iris-gui/locales/<lang>/*.ftl`, `iris-gui/core/src/model/i18n.rs`).
   `build.rs` embeds every locale folder; nothing registers a language.
-- Fluent rejects a message with no value. `src/i18n.rs` rewrites a bare
+- Fluent rejects a message with no value. `iris-gui/core/src/model/i18n.rs` rewrites a bare
   `id =` (next non-blank line not indented) to `id = {""}` before parsing, so
   an empty value is how a catalog hides a `subtitle()` or `.tip()`. Don't
   "fix" those lines to `{""}` by hand, and don't remove the rewrite.

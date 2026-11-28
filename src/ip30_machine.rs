@@ -1462,6 +1462,13 @@ impl Workstation for OctaneMachine {
     fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
         self.disk_buses().iter().map(|b| b.activity()).collect()
     }
+    fn read_disk(&self, bus: usize, id: u8, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.disk_buses().get(bus).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such disk bus"))?
+            .read_media(id, offset, buf)
+    }
+    fn disk_size(&self, bus: usize, id: u8) -> Option<u64> {
+        self.disk_buses().get(bus).and_then(|b| b.media_size(id))
+    }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.disk_buses().iter().try_for_each(|b| b.flush())
     }

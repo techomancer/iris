@@ -11,7 +11,7 @@ kept the counter alive on its own. It is now
 `MipsCore.hot.cycles`, which lives inside the `Machine`'s executor. Read it with
 `CyclesPtr::get()` (a volatile read; returns 0 while unwired).
 
-`iris-gui`'s `worker_loop` (`iris-gui/src/handle.rs`) latches that pointer on
+`iris-gui`'s `worker_loop` (`iris-gui/core/src/model/handle.rs`) latches that pointer on
 `Cmd::Start` and polls it every status tick to compute the live MIPS number. The
 pointer is only valid while the `Machine` it came from is alive, so **every path
 that drops the machine must set `cycles = None` first** — `Cmd::Stop`,

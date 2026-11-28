@@ -1,0 +1,49 @@
+[package]
+name = "iris-gui-appkit"
+version = "0.1.0"
+edition = "2021"
+description = "IRIS, the native macOS front end: AppKit over iris-gui-core's controllers"
+license = "BSD-3-Clause"
+publish = false
+
+# Phase 4 of clanker/plans/iris-newgui-plan.md. A pure view over
+# iris_gui_core::controller: it renders, maps input to actions and carries out
+# effects. Everything is gated on macOS (D19), so `cargo build --workspace`
+# elsewhere builds a binary that only says so.
+
+[[bin]]
+name = "iris-appkit"
+path = "src/main.rs"
+
+[features]
+# Forwarded to the core, as iris-gui does.
+pcap = ["iris-gui-core/iris-pcap"]
+# Distributed build (the bundle script sets it).
+bundled = ["iris-gui-core/bundled"]
+# Mac App Store build: the App Sandbox (security-scoped bookmarks, the
+# container's data folder, CHD diffs in the container, no JIT). Implies
+# `bundled`. Set by .github/workflows/appstore.yml through bundle.sh --appstore.
+appstore = ["bundled", "iris-gui-core/appstore"]
+# The emulator's speed features, as the egui release build uses them
+# (scripts/dist/lib.sh DEFAULT_GUI_FEATURES).
+lightning = ["iris/lightning"]
+jitv2 = ["iris/jitv2"]
+idle-pause = ["iris/idle-pause"]
+hostgl = ["iris/hostgl", "iris/hostcall"]
+
+[dependencies]
+iris-gui-core = { path = "../../core" }
+# Only so the features above reach the emulator. The shell's code never
+# names it (iris-gui/scripts/check-boundaries.sh).
+iris = { path = "../../..", features = ["gpujit"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-quartz-core = { version = "0.3", features = ["objc2-metal"] }
+objc2-metal = "0.3"
+dispatch2 = "0.3"
+# Draws the shared machine pictures (iris-gui/assets/icons/machine-*.svg);
+# line art only, so no text, fonts or embedded images.
+resvg = { version = "0.50", default-features = false }

@@ -122,6 +122,38 @@ build_gui() {  # <target> <features>
     group_end
 }
 
+# The iris-gui features the Mac app (iris-appkit) also has (the GUI feature list is
+# egui's, and some of its features, wgpu or perfetto, are egui only); the
+# others are dropped with a note instead of failing the build. `iris/...`
+# passes through to the core.
+appkit_features() {  # <features>
+    local f kept=() have
+    have=$(sed -n '/^\[features\]/,/^\[/s/^\([a-z0-9_-]*\) *=.*/\1/p' "$DIST_ROOT/iris-gui/frontends/appkit/Cargo.toml")
+    IFS=',' read -ra list <<< "$1"
+    for f in "${list[@]}"; do
+        f="${f// /}"
+        [ -n "$f" ] || continue
+        if [[ "$f" == iris/* ]] || grep -qx "$f" <<< "$have"; then
+            kept+=("$f")
+        else
+            warn "the Mac app has no feature '$f': left out of its build"
+        fi
+    done
+    local IFS=,
+    echo "${kept[*]}"
+}
+
+build_appkit() {  # <target> <features>: the macOS app
+    [ "$SKIP_BUILD" = 1 ] && return 0
+    ensure_target "$1"
+    set -- "$1" "$(appkit_features "$2")"
+    group_start "cargo build iris-gui-appkit ($1) features=$2"
+    # The Mac app needs macOS 11 (Info.plist LSMinimumSystemVersion): build
+    # both slices for it, so the Intel one is not marked for an older system.
+    MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target "$1" -p iris-gui-appkit --features "$2"
+    group_end
+}
+
 build_cli() {  # <target> <features>
     [ "$SKIP_BUILD" = 1 ] && return 0
     ensure_target "$1"

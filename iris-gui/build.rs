@@ -37,42 +37,6 @@ fn main() {
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=APP_COMMIT={commit}");
 
-    embed_locales();
-}
-
-/// Embed every `locales/<language>/*.ftl` catalog (see `src/i18n.rs`). Adding a
-/// language is adding a folder; nothing in the source needs to list it.
-fn embed_locales() {
-    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let root = manifest.join("locales");
-    println!("cargo:rerun-if-changed={}", root.display());
-    let mut languages: Vec<_> = std::fs::read_dir(&root)
-        .expect("iris-gui/locales")
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    languages.sort();
-    let mut out = String::from("pub static LOCALES: &[(&str, &[(&str, &str)])] = &[\n");
-    for dir in languages {
-        let lang = dir.file_name().unwrap().to_string_lossy().into_owned();
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "ftl"))
-            .collect();
-        files.sort();
-        out.push_str(&format!("    ({lang:?}, &[\n"));
-        for f in files {
-            let name = f.file_name().unwrap().to_string_lossy().into_owned();
-            out.push_str(&format!("        ({name:?}, include_str!({:?})),\n", f.display().to_string()));
-        }
-        out.push_str("    ]),\n");
-    }
-    out.push_str("];\n");
-    let dest = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("locales.rs");
-    std::fs::write(dest, out).unwrap();
 }
 
 fn git_output(args: &[&str]) -> Option<String> {

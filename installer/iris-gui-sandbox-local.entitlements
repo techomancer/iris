@@ -5,7 +5,7 @@
     <!-- LOCAL sandbox test entitlements (NOT the Mac App Store).
 
          Purpose: reproduce the App Sandbox locally so the security-scoped
-         bookmark / folder-grant flow (iris-gui/src/macos_sandbox.rs) can be
+         bookmark / folder-grant flow (iris-gui/core/src/model/macos_sandbox.rs) can be
          exercised without an App Store round-trip. The sandbox is enforced by
          the app-sandbox entitlement at signing time; App Store distribution is
          not required to get a sandboxed process.

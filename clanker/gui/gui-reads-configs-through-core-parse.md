@@ -1,12 +1,12 @@
 # The GUI must read machine configs through `MachineConfig::from_toml_str`
 
-Status: rule, 2026-11.
+Status: rule, 2026-11 (fold_cards added 2026-11-27).
 
 **Symptom.** A machine made in iris-gui kept one jitv2 compile thread however
 many CPUs it had, while the same file run with `iris --config` got one per CPU.
 Older `[o2]` spellings were not folded either, and `banks` read as unset.
 
-**Cause.** `iris-gui/src/machines.rs::read` parsed the file with a bare
+**Cause.** `iris-gui/core/src/model/machines.rs::read` parsed the file with a bare
 `toml::from_str`. The core's loader (`MachineConfig::parse_toml`, reached by
 `try_load`) does more after parsing: it records whether `banks` and
 `[jitv2] threads` were given (`banks_set`, `jitv2_threads_set`, both
@@ -15,7 +15,12 @@ the CPU count. A plain serde parse leaves the skip fields false and
 `threads` at its serde default of 1.
 
 **Rule.**
-- Read with `MachineConfig::from_toml_str`, which is `parse_toml` made public.
+- Read with `machines::parse` (`machines::read` for a file):
+  `MachineConfig::from_toml_str`, which is `parse_toml` made public, then
+  `fold_cards`, which turns the older card flags (`graphics.heads = 2`,
+  `[ultra64]`, `test_device`, `[virtio_*]`) into `[[devices]]` entries as a
+  run does. Without the fold the GUI shows those cards as absent. See
+  `gui-disks-and-cards-are-devices-by-slot.md`.
 - Write with `machines::to_toml`, which leaves `[jitv2] threads` out while it
   is automatic, and `banks` out while it is unset and still the generic
   default (the core's own test for "unset"; the Tezro and IP35 machines then

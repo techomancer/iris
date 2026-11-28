@@ -101,3 +101,5 @@ bench-dev-matrix-finished = Matrix finished.
 bench-dev-matrix-failed = Matrix failed.
 bench-dev-host-finished = Host measurement finished.
 bench-dev-host-failed = Host measurement failed.
+bench-running = A benchmark is already running.
+bench-save-failed = Couldn't save the report: { $error }

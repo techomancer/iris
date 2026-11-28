@@ -218,6 +218,38 @@ pub struct ScsiDevice {
     released: Option<Media>,
     /// The bus's counters for this id, from the moment it is attached.
     activity: Option<std::sync::Arc<bus::DiskActivity>>,
+    /// [`ScsiTarget::media_generation`]: moves on every command that is not
+    /// known to leave the medium alone, and on every overlay or disc change.
+    changes: u64,
+}
+
+/// Commands that never change what the medium holds. Anything else counts as
+/// a change for [`ScsiTarget::media_generation`], so a command added later is
+/// safe until it is listed here.
+fn leaves_media_alone(op: u8) -> bool {
+    matches!(
+        op,
+        scsi_cmd::TEST_UNIT_READY
+            | scsi_cmd::REQUEST_SENSE
+            | scsi_cmd::INQUIRY
+            | scsi_cmd::READ_CAPACITY_10
+            | scsi_cmd::SERVICE_ACTION_IN_16
+            | scsi_cmd::READ_6
+            | scsi_cmd::READ_10
+            | scsi_cmd::READ_16
+            | scsi_cmd::MODE_SENSE_6
+            | scsi_cmd::MODE_SENSE_10
+            | scsi_cmd::READ_BUFFER
+            | scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL
+            | scsi_cmd::SYNCHRONIZE_CACHE_10
+            | scsi_cmd::SYNCHRONIZE_CACHE_16
+            | scsi_cmd::RESERVE_6
+            | scsi_cmd::RELEASE_6
+            | scsi_cmd::VERIFY_10
+            | scsi_cmd::SET_CD_SPEED
+            | scsi_cmd::READ_TOC_PMA_ATIP
+            | scsi_cmd::GET_CONFIGURATION
+    )
 }
 
 impl Drop for ScsiDevice {
@@ -272,6 +304,7 @@ impl ScsiDevice {
             background,
             released: None,
             activity: None,
+            changes: 0,
         }
     }
 
@@ -293,6 +326,7 @@ impl ScsiDevice {
             background: None,
             released: None,
             activity: None,
+            changes: 0,
         }
     }
 
@@ -1204,6 +1238,9 @@ impl ScsiTarget for ScsiDevice {
         }
 
         crate::dlog!(crate::devlog::LogModule::Scsi, "SCSI target cmd {:02x} cdb={:02x?}", req.cdb[0], &req.cdb);
+        if !leaves_media_alone(req.cdb[0]) {
+            self.changes += 1;
+        }
         let lun = (req.cdb[1] >> 5) & 0x7;
 
         // For most commands, only LUN 0 is valid
@@ -1281,6 +1318,25 @@ impl ScsiTarget for ScsiDevice {
         self.activity = Some(activity);
     }
 
+    fn read_media(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if !self.media.present() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no medium"));
+        }
+        let node = self.media.node_mut();
+        if offset.checked_add(buf.len() as u64).map_or(true, |end| end > node.size()) {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "past the end of the medium"));
+        }
+        node.read(offset, buf)
+    }
+
+    fn media_size(&self) -> Option<u64> {
+        self.media.present().then(|| self.media.node().size())
+    }
+
+    fn media_generation(&self) -> u64 {
+        self.changes
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         if self.is_cdrom() {
             return Ok(());
@@ -1294,6 +1350,7 @@ impl ScsiTarget for ScsiDevice {
     /// Returns a coarse count of what was committed. The concrete behaviour is
     /// [`BlockNode::commit`] — including the CHD handle close/reopen.
     fn cow_commit(&mut self) -> io::Result<usize> {
+        self.changes += 1;
         self.media.node_mut().commit()
     }
 
@@ -1302,6 +1359,7 @@ impl ScsiTarget for ScsiDevice {
     /// reopens a fresh overlay over the untouched base. No-op if not overlaid.
     /// The concrete behaviour is [`BlockNode::rollback`].
     fn cow_reset(&mut self) -> io::Result<()> {
+        self.changes += 1;
         self.media.node_mut().rollback()
     }
 
@@ -1315,6 +1373,7 @@ impl ScsiTarget for ScsiDevice {
     /// Replace the COW overlay with the contents of `source` and adopt
     /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
     fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
+        self.changes += 1;
         self.media.node_mut().import_overlay(source, dirty)
     }
 
@@ -1331,12 +1390,14 @@ impl ScsiTarget for ScsiDevice {
     /// answers with its tray empty, until [`ScsiTarget::reattach_chd`].
     fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let pending = self.media.node_mut().release_for_sync()?;
+        self.changes += 1;
         // Nothing talks to the disk once the guest has stopped.
         self.released = Some(std::mem::replace(&mut self.media, Media::Changer(ChangerNode::empty())));
         Some(pending)
     }
 
     fn reattach_chd(&mut self) -> io::Result<()> {
+        self.changes += 1;
         match self.released.take() {
             Some(media) => {
                 self.media = media;
@@ -1351,6 +1412,8 @@ impl ScsiTarget for ScsiDevice {
         if !self.is_cdrom() {
             return None;
         }
+        // Whoever has the tray may change the disc.
+        self.changes += 1;
         match &mut self.media {
             Media::Changer(c) => Some(c),
             Media::Fixed(..) => None,

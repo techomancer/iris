@@ -6,6 +6,7 @@ language-name = English
 
 app-name = IRIS
 
+common-ok = OK
 common-cancel = Cancel
 common-close = Close
 common-apply = Apply

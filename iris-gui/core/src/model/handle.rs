@@ -1,0 +1,1253 @@
+use crate::model::framebuffer::{new_capture_renderer, FrameSink};
+use crate::model::job::Notify;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use iris::block_node::BlockNode;
+use iris::config::{MachineConfig, PortForwardConfig};
+use iris::workstation::Workstation;
+use iris::dev::ps2::Ps2Controller;
+use parking_lot::Mutex;
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::JoinHandle;
+
+#[derive(Debug)]
+pub enum Cmd {
+    Start(Box<MachineConfig>),
+    Stop,
+    /// Type `halt\n` at the IRIX serial console in-process (no loopback socket)
+    /// for a clean guest shutdown.
+    HaltIrix,
+    /// Ask IRIX to restart cleanly, the same way (`shutdown -i6`).
+    RebootIrix,
+    /// Move the running NAT onto a new subnet live (CIDR string, e.g.
+    /// `192.168.1.0/24`) — no reboot. Ignored if not running / invalid.
+    SetNatSubnet(String),
+    /// Rebind the running NAT's inbound port-forward listeners from this rule
+    /// set, live — no reboot. Ignored if not running.
+    SetPortForwards(Vec<PortForwardConfig>),
+    /// Reopen the PCAP capture on a different host interface (`None` = auto-pick)
+    /// without rebooting the guest. Ignored if not running / not in PCAP mode.
+    SetPcapInterface(Option<String>),
+    SaveState(String),
+    RestoreState(String),
+    Screenshot(PathBuf),
+    /// Stop the machine and fold any pending CHD `.diff.chd` sidecars back into
+    /// their bases ("Synchronizing disks"), emitting `SyncProgress`/`SyncDone`.
+    /// Sent on a clean exit when `Status::chd_sync_pending` is set.
+    SyncDisks,
+    /// Commit a single disk's COW overlay into its base ("apply changes"). File-
+    /// level (no machine) — only valid while stopped. `chd` picks the `.diff.chd`
+    /// vs raw `.overlay` path. A CHD commit streams `SyncProgress`/`SyncDone`
+    /// (it recompresses); a raw commit ends with `CowDone`.
+    CowCommit { base: String, chd: bool },
+    /// Discard a single disk's COW overlay ("roll back") — delete the
+    /// `.diff.chd` / `.overlay`. File-level; only valid while stopped.
+    CowReset { base: String, chd: bool },
+    /// Load a disc image into a CD-ROM device (live hot-swap).
+    /// Valid only while running. The path is loaded as the active disc.
+    LoadDisc { id: u8, path: String, remount: bool },
+    /// Empty the CD-ROM tray on a running machine (SCSI layer only).
+    EjectCdrom { id: u8 },
+    /// Inject an IRIX shell command to (re)mount /CDROM for SCSI `id`.
+    RemountCdrom { id: u8 },
+    /// Read `len` bytes at `offset` of the running machine's disk at SCSI
+    /// `id` on disk bus `bus`, as the guest sees it (`Workstation::read_disk`),
+    /// for the disk browser. Read-only.
+    ReadDisk { bus: usize, id: u8, offset: u64, len: usize, reply: Sender<std::io::Result<Vec<u8>>> },
+    /// That disk's size, `None` when there is none.
+    DiskSize { bus: usize, id: u8, reply: Sender<Option<u64>> },
+    Quit,
+}
+
+// Command completions come from the worker; Status arrives on its periodic
+// tick. PowerOff is reserved and has no producer; the GUI detects a guest
+// shutdown through Status::cpu_stopped.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum Evt {
+    Started,
+    Stopped,
+    PowerOff,
+    StateSaved(String),
+    StateRestored(String),
+    Screenshot(PathBuf),
+    Error(String),
+    /// A Start failed: no machine came up (the session stops "starting").
+    StartFailed(String),
+    /// A CD-ROM's disc changed: `path` is the new disc, `None` an empty tray.
+    Disc { id: u8, path: Option<String>, message: String },
+    /// Something worth telling that is not a failure.
+    Notice(String),
+    Status(Status),
+    /// Per-disk progress of a `SyncDisks` run: `disk` of `total` disks, the
+    /// current disk `fraction` (0.0..=1.0) through its rebuild.
+    SyncProgress { disk: usize, total: usize, fraction: f32 },
+    /// `SyncDisks` finished; the app may now close. Carries the disks synced.
+    SyncDone(usize),
+    /// A `CowCommit` (raw) or `CowReset` finished. `committed` = changes were
+    /// applied (vs rolled back / nothing to do).
+    CowDone { committed: bool },
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Status {
+    pub running: bool,
+    /// CPU is currently in PROM (not yet booted IRIX, or post-halt).
+    pub in_prom: bool,
+    /// IRIX has shut down cleanly (PowerOff event observed).
+    pub power_off_seen: bool,
+    /// Count of dirty COW overlay sectors across all SCSI devices.
+    pub dirty_cow: usize,
+    /// Approximate instructions/sec (millions).
+    pub mips: f32,
+    /// The kernel's clock-tick rate in Hz (see `Machine::fasttick_count`) —
+    /// what IRIX actually ticks time with, distinct from `mips` (host
+    /// emulation throughput). Mirrors the CLI status bar's Hz readout.
+    pub kernel_hz: f32,
+    /// The CPU is not executing: either stopped (soft power-off) or idle at the
+    /// PROM after an IRIX `halt` (0 MIPS). When set, the guest has shut down and
+    /// stopping the machine can't corrupt a disk — see [`crate::model::safe_stop`].
+    pub cpu_halted: bool,
+    /// The CPU thread has actually stopped — a soft power-off called
+    /// `Machine::stop`. Unlike `cpu_halted` this is NOT set by mere 0-MIPS idle
+    /// (PROM prompt, idle desktop), so it's the precise "the machine powered
+    /// off" signal the framebuffer overlay uses.
+    pub cpu_stopped: bool,
+    /// At least one attached CHD has diff-borne changes pending a fold-back into
+    /// its base on a clean shutdown — drives the "Synchronizing disks" step.
+    pub chd_sync_pending: bool,
+    /// Cumulative count of guest Ethernet frames the NAT engine has processed.
+    /// Monotonic within a run; the handle watches it advance to light the
+    /// internal-network indicator (see [`EmulatorHandle::net_state`]).
+    pub net_frames: u64,
+    /// The guest's observed source IP (None until a frame reveals one) and the
+    /// address NAT expects it to have. Drive the "Check networking" diagnosis.
+    pub net_guest_ip: Option<Ipv4Addr>,
+    /// The guest's likely default gateway (passively inferred from its ARPs).
+    pub net_guest_gateway: Option<Ipv4Addr>,
+    /// IRIS's current NAT gateway (reflects any live adoption).
+    pub net_nat_gateway: Option<Ipv4Addr>,
+    /// Live PCAP capture-backend status. `Inactive` in NAT mode / non-pcap
+    /// builds; `PermissionDenied` when a pcap-mode machine couldn't open the raw
+    /// capture, which drives the "Enable packet capture" elevation prompt.
+    pub pcap_status: iris::net::PcapStatus,
+    /// Disk activity since the previous tick, per disk bus then per SCSI id
+    /// (the order of `Workstation::disk_activity`).
+    pub disks: Vec<Vec<DiskMoved>>,
+    /// The sound card moved frames since the previous tick.
+    pub audio_moving: bool,
+    /// The machine has a sound card at all.
+    pub has_audio: bool,
+}
+
+/// What one disk did between two status ticks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskMoved {
+    pub read: bool,
+    pub wrote: bool,
+}
+
+/// The disk and audio counters as last sampled, to turn the core's
+/// monotonic counts into "moved since the last tick".
+#[derive(Default)]
+struct LightSampler {
+    disks: Vec<Vec<iris::scsi::DiskCounts>>,
+    audio: Option<u64>,
+}
+
+impl LightSampler {
+    fn sample(&mut self, m: &dyn Workstation) -> (Vec<Vec<DiskMoved>>, bool, bool) {
+        let disks = m.disk_activity();
+        let audio = m.audio_frames();
+        let moved = disks
+            .iter()
+            .enumerate()
+            .map(|(b, bus)| {
+                bus.iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let prev = self.disks.get(b).and_then(|p| p.get(i)).copied().unwrap_or(*c);
+                        DiskMoved { read: c.reads > prev.reads, wrote: c.writes > prev.writes }
+                    })
+                    .collect()
+            })
+            .collect();
+        let audio_moving = matches!((self.audio, audio), (Some(a), Some(b)) if b > a);
+        self.disks = disks;
+        self.audio = audio;
+        (moved, audio_moving, audio.is_some())
+    }
+}
+
+impl Status {
+    /// Take the fields the worker's status tick measures from `s`. The worker
+    /// only knows these; `running`, `power_off_seen` and `in_prom` are driven
+    /// by lifecycle events, so merge rather than replace to avoid clobbering
+    /// them.
+    /// The machine stopped: what its ticks reported (speed, halted, pending
+    /// CHD changes, lights) is no longer true, and no tick will say so.
+    pub(crate) fn clear_worker_fields(&mut self) {
+        self.take_worker_fields(&Status::default());
+    }
+
+    fn take_worker_fields(&mut self, s: &Status) {
+        self.mips = s.mips;
+        self.kernel_hz = s.kernel_hz;
+        self.dirty_cow = s.dirty_cow;
+        self.cpu_halted = s.cpu_halted;
+        self.cpu_stopped = s.cpu_stopped;
+        self.chd_sync_pending = s.chd_sync_pending;
+        self.net_frames = s.net_frames;
+        self.net_guest_ip = s.net_guest_ip;
+        self.net_guest_gateway = s.net_guest_gateway;
+        self.net_nat_gateway = s.net_nat_gateway;
+        self.pcap_status = s.pcap_status;
+        self.disks = s.disks.clone();
+        self.audio_moving = s.audio_moving;
+        self.has_audio = s.has_audio;
+    }
+}
+
+/// The live MIPS and Hz figures, from the machine's CPU counters sampled
+/// once per status tick. Mirrors the CLI status bar's math (`src/disp.rs`),
+/// which the GUI never runs.
+struct RateMeter {
+    /// Each CPU's retired-cycle counter and clock-tick counter, CPU 0 first.
+    cpus: Vec<(iris::cpu::mips_core::CyclesPtr, Arc<std::sync::atomic::AtomicU64>)>,
+    prev: Vec<(u64, u64)>,
+    at: std::time::Instant,
+}
+
+impl RateMeter {
+    fn new(cpus: Vec<(iris::cpu::mips_core::CyclesPtr, Arc<std::sync::atomic::AtomicU64>)>, now: std::time::Instant) -> Self {
+        let prev = Self::read(&cpus);
+        Self { cpus, prev, at: now }
+    }
+
+    fn read(cpus: &[(iris::cpu::mips_core::CyclesPtr, Arc<std::sync::atomic::AtomicU64>)]) -> Vec<(u64, u64)> {
+        cpus.iter().map(|(c, t)| (c.retired(), t.load(Ordering::Relaxed))).collect()
+    }
+
+    /// MIPS and Hz over the window since the last sample, or None when it is
+    /// under `RATE_WINDOW` (the window then keeps growing).
+    fn sample(&mut self, now: std::time::Instant) -> Option<(f32, f32)> {
+        let dt = now.duration_since(self.at).as_secs_f64();
+        if dt < RATE_WINDOW {
+            return None;
+        }
+        let cur = Self::read(&self.cpus);
+        let rates = window_rates(&self.prev, &cur, dt);
+        self.prev = cur;
+        self.at = now;
+        Some(rates)
+    }
+}
+
+/// The shortest window the MIPS and Hz figures are measured over. The status
+/// tick is faster (for the activity lights); the rates keep their last value
+/// in between.
+const RATE_WINDOW: f64 = 0.45;
+
+/// MIPS and Hz over `dt` seconds between two counter samples, one
+/// `(retired cycles, clock ticks)` pair per CPU, CPU 0 first. MIPS is the
+/// total over all CPUs: it is how fast the machine runs. Hz is CPU 0's tick
+/// rate: every CPU takes its own clock interrupt at the kernel's rate, so
+/// adding them would show twice the Hz on two CPUs.
+fn window_rates(prev: &[(u64, u64)], cur: &[(u64, u64)], dt: f64) -> (f32, f32) {
+    let retired: u64 = prev.iter().zip(cur).map(|(p, c)| iris::status::cycles_moved(p.0, c.0)).sum();
+    let mips = (retired as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
+    let hz = match (prev.first(), cur.first()) {
+        (Some(p), Some(c)) => (c.1.wrapping_sub(p.1) as f64 / dt).round() as f32,
+        _ => 0.0,
+    };
+    (mips, hz)
+}
+
+/// State of the internal-network ("NET") indicator shown next to MIPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetState {
+    /// Guest isn't executing — stopped, halted, or idle at the PROM (grey).
+    Off,
+    /// NAT IP traffic has flowed this run — networking is up (green).
+    Active,
+    /// Running, but no NAT IP traffic seen yet this run (red).
+    Idle,
+}
+
+/// Pure decision for the NET indicator, factored out so it's unit-testable
+/// without a live machine. Grey whenever the guest isn't executing; otherwise
+/// green once NAT IP traffic has been seen this run (`net_seen > 0`) — the
+/// signal latches, since a guest that has networked doesn't become misconfigured
+/// just by going idle — else red.
+fn net_state_for(running: bool, halted: bool, net_seen: u64) -> NetState {
+    if !running || halted {
+        return NetState::Off;
+    }
+    if net_seen > 0 { NetState::Active } else { NetState::Idle }
+}
+
+pub struct EmulatorHandle {
+    cmd_tx: Sender<Cmd>,
+    pending_commands: Arc<AtomicUsize>,
+    abandoned_machine: Arc<AtomicBool>,
+    evt_rx: Receiver<Evt>,
+    thread: Option<JoinHandle<()>>,
+    /// Shared latest-framebuffer slot, written by the CaptureRenderer
+    /// inside the worker and read by the GUI each egui frame.
+    pub frame_sink: FrameSink,
+    /// Second Newport head (a `newport` device); inactive when seq stays 0.
+    pub frame_sink_head1: FrameSink,
+    /// Handle to the live machine's PS/2 controller (when running), so
+    /// the GUI thread can push keyboard / mouse events at it directly.
+    /// `None` when no machine is up.
+    pub ps2: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
+    /// The live machine's host input (pointer steering by the hardware
+    /// cursor, as the VNC server uses it), when running.
+    pub host: Arc<Mutex<Option<Arc<iris::hostinput::HostInput>>>>,
+    pub status: Status,
+    /// NAT IP-frame count observed this run (reset on Start). Non-zero once the
+    /// guest's networking has actually carried traffic; latches the NET
+    /// indicator green for the rest of the run.
+    net_seen_frames: u64,
+}
+
+impl EmulatorHandle {
+    /// Start the worker. `notify` wakes the shell whenever an event is queued.
+    pub fn spawn(notify: Arc<dyn Notify>) -> Self {
+        let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
+        let pending_commands = Arc::new(AtomicUsize::new(0));
+        let pending_for_worker = pending_commands.clone();
+        let abandoned_machine = Arc::new(AtomicBool::new(false));
+        let abandoned_for_worker = abandoned_machine.clone();
+        let (evt_tx, evt_rx) = unbounded::<Evt>();
+        let frame_sink = FrameSink::new();
+        let frame_sink_head1 = FrameSink::new();
+        let sink_for_worker = frame_sink.clone();
+        let sink_head1_for_worker = frame_sink_head1.clone();
+        let ps2: Arc<Mutex<Option<Arc<Ps2Controller>>>> = Arc::new(Mutex::new(None));
+        let ps2_for_worker = ps2.clone();
+        let host: Arc<Mutex<Option<Arc<iris::hostinput::HostInput>>>> = Arc::new(Mutex::new(None));
+        let host_for_worker = host.clone();
+        let thread = std::thread::Builder::new()
+            .name("iris-gui-emu".into())
+            // Machine::new alone puts >1 MB on the stack (Physical::device_map),
+            // and unlike the CLI — which builds the machine on a minimal,
+            // dedicated thread — we call it from inside worker_loop's deeper
+            // frame (catch_unwind + loop). With unoptimized debug-sized frames
+            // the 8 MB the CLI uses overflows during Rex3::new, so give the
+            // worker generous headroom. This is virtual address space, lazily
+            // committed, so the large reservation has no real cost.
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || worker_loop(Events { tx: evt_tx, notify }, sink_for_worker, sink_head1_for_worker, ps2_for_worker, host_for_worker, pending_for_worker, abandoned_for_worker, cmd_rx))
+            .expect("spawn iris-gui-emu thread");
+        Self {
+            cmd_tx,
+            pending_commands,
+            abandoned_machine,
+            evt_rx,
+            thread: Some(thread),
+            frame_sink,
+            frame_sink_head1,
+            ps2,
+            host,
+            status: Status::default(),
+            net_seen_frames: 0,
+        }
+    }
+
+    pub fn send(&self, cmd: Cmd) {
+        self.pending_commands.fetch_add(1, Ordering::AcqRel);
+        if self.cmd_tx.send(cmd).is_err() { self.pending_commands.fetch_sub(1, Ordering::Release); }
+    }
+
+    /// The running machine's disk at SCSI `id` on bus `bus` as a read-only
+    /// block node, read through the machine (`LiveDisk`); `None` when the
+    /// machine is not running or has no such disk.
+    pub fn live_disk(&self, bus: usize, id: u8) -> Option<LiveDisk> {
+        let tx = WorkerLink { tx: self.cmd_tx.clone(), pending: self.pending_commands.clone() };
+        // Asked on the UI thread: not behind other work (a state being
+        // saved, a stop), and not for long.
+        if self.pending_commands.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        tx.send(Cmd::DiskSize { bus, id, reply });
+        let size = answer.recv_timeout(std::time::Duration::from_secs(3)).ok().flatten()?;
+        Some(LiveDisk { link: tx, bus, id, size })
+    }
+
+    /// Drain pending events; return them for the UI to consume.
+    pub fn drain_events(&mut self) -> Vec<Evt> {
+        let mut out = Vec::new();
+        while let Ok(evt) = self.evt_rx.try_recv() {
+            if let Evt::Status(s) = &evt {
+                self.status.take_worker_fields(s);
+                // Latch the NET light: once NAT IP traffic has flowed this run
+                // the guest's networking is up, so keep it green through idle
+                // lulls (it resets to red on the next Start).
+                if s.net_frames > self.net_seen_frames {
+                    self.net_seen_frames = s.net_frames;
+                }
+            }
+            match &evt {
+                Evt::Started => {
+                    self.status.running = true;
+                    // Clear a stale stop from the previous run so the new boot
+                    // isn't dimmed before the first status tick lands.
+                    self.status.cpu_stopped = false;
+                    // Fresh machine → fresh NAT counter (starts at 0); reset our
+                    // tracking so the indicator starts red and only greens on
+                    // this run's first observed NAT traffic.
+                    self.net_seen_frames = 0;
+                }
+                Evt::Stopped => self.status.running = false,
+                Evt::PowerOff => self.status.power_off_seen = true,
+                _ => {}
+            }
+            out.push(evt);
+        }
+        out
+    }
+
+    pub fn is_running(&self) -> bool { self.status.running }
+
+    /// Directory changes must wait for queued Start, Stop, snapshot, and disk
+    /// operations as well as a live machine. Unconsumed events can include a
+    /// Started notification, so check those before trusting the cached status.
+    pub fn can_change_directory(&self) -> bool {
+        !self.is_running() && self.pending_commands.load(Ordering::Acquire) == 0
+            && self.evt_rx.is_empty() && !self.abandoned_machine.load(Ordering::Acquire)
+    }
+
+    /// Whether a clean exit needs a "Synchronizing disks" step (a CHD has
+    /// diff-borne changes to fold back into its base). Latest reported status.
+    pub fn has_pending_chd_sync(&self) -> bool { self.status.chd_sync_pending }
+
+    /// State of the internal-network indicator: grey when the guest isn't
+    /// executing (stopped/halted/PROM), green once NAT IP traffic has flowed
+    /// this run, red while a running guest has produced no NAT traffic yet.
+    pub fn net_state(&self) -> NetState {
+        net_state_for(self.status.running, self.status.cpu_halted, self.net_seen_frames)
+    }
+
+    /// Live PCAP capture-backend status, sampled from the running machine.
+    /// `Inactive` when no machine is up, in NAT mode, or on a non-pcap build.
+    /// The app watches this for `PermissionDenied` to raise the "Enable packet
+    /// capture" elevation prompt.
+    pub fn pcap_status(&self) -> iris::net::PcapStatus { self.status.pcap_status }
+
+    /// Stop the machine (if running) and join the worker thread. Idempotent.
+    /// Call this from the GUI's `on_exit` so a running machine is cleaned up
+    /// even when the user closes the window without pressing Stop — and so the
+    /// cleanup completes synchronously rather than racing process teardown.
+    /// The worker's Quit handler bounds the stop with a timeout, so this can't
+    /// hang on a wedged guest.
+    pub fn shutdown(&mut self) {
+        self.send(Cmd::Quit);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for EmulatorHandle {
+    // Backstop in case `shutdown()` wasn't called explicitly (e.g. a panic
+    // path). No-op once the worker has already been joined.
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_tick_carries_the_kernel_hz() {
+        let mut shown = Status::default();
+        let tick = Status { mips: 90.0, kernel_hz: 100.0, ..Status::default() };
+        shown.running = true;
+        shown.take_worker_fields(&tick);
+        assert_eq!(shown.kernel_hz, 100.0);
+        assert_eq!(shown.mips, 90.0);
+        assert!(shown.running, "lifecycle fields are not the worker's to set");
+    }
+
+    #[test]
+    fn mips_totals_every_cpu_and_hz_is_cpu_zeros() {
+        let prev = [(1_000, 10), (5_000, 3)];
+        let cur = [(51_000_000 + 1_000, 20), (50_000_000 + 5_000, 13)];
+        // Two CPUs at 51 and 50 million cycles a second.
+        assert_eq!(window_rates(&prev, &cur, 1.0), (101.0, 10.0));
+        // Over half a second the same deltas are twice the rate.
+        assert_eq!(window_rates(&prev, &cur, 0.5), (202.0, 20.0));
+    }
+
+    /// A CPU reset in the window set its counter back to 0: count what ran
+    /// since rather than a wrapped difference.
+    #[test]
+    fn a_reset_in_the_window_counts_from_zero() {
+        assert_eq!(window_rates(&[(900_000_000, 10)], &[(40_000_000, 110)], 1.0), (40.0, 100.0));
+    }
+
+    #[test]
+    fn one_cpu_and_no_cpu() {
+        assert_eq!(window_rates(&[(0, 0)], &[(95_000_000, 100)], 1.0), (95.0, 100.0));
+        assert_eq!(window_rates(&[], &[], 1.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn meter_skips_a_short_window() {
+        let t0 = std::time::Instant::now();
+        let mut m = RateMeter::new(Vec::new(), t0);
+        assert_eq!(m.sample(t0 + std::time::Duration::from_millis(50)), None);
+        assert_eq!(m.sample(t0 + std::time::Duration::from_millis(500)), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn net_indicator_states() {
+        // Unpowered (not running) → grey, regardless of past traffic.
+        assert_eq!(net_state_for(false, false, 42), NetState::Off);
+        // Running but halted / idle at the PROM → grey.
+        assert_eq!(net_state_for(true, true, 42), NetState::Off);
+        // Running, no NAT traffic seen yet → red.
+        assert_eq!(net_state_for(true, false, 0), NetState::Idle);
+        // Running, NAT traffic has flowed → green (and latches, so it stays).
+        assert_eq!(net_state_for(true, false, 1), NetState::Active);
+    }
+}
+
+/// Worker thread loop. Owns the `Machine` while it exists. The eframe app
+/// thread sends `Cmd`s and drains `Evt`s, never touching the machine
+/// directly. All `Machine` calls are wrapped in `catch_unwind` so a panic
+/// becomes an `Evt::Error` toast rather than killing the worker.
+/// The worker's event channel: every send wakes the shell.
+struct Events {
+    tx: Sender<Evt>,
+    notify: Arc<dyn Notify>,
+}
+
+impl Events {
+    fn send(&self, evt: Evt) -> Result<(), crossbeam_channel::SendError<Evt>> {
+        let r = self.tx.send(evt);
+        self.notify.wake();
+        r
+    }
+}
+
+fn worker_loop(
+    evt_tx: Events,
+    frame_sink: FrameSink,
+    frame_sink_head1: FrameSink,
+    ps2_slot: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
+    host_slot: Arc<Mutex<Option<Arc<iris::hostinput::HostInput>>>>,
+    pending_commands: Arc<AtomicUsize>,
+    abandoned_machine: Arc<AtomicBool>,
+    cmd_rx: Receiver<Cmd>,
+) {
+    let mut machine: Option<Box<dyn Workstation>> = None;
+    // The built-in VNC server, when `[vnc] listen` is set. Lives exactly as
+    // long as the machine it serves: dropped on Stop, disk sync and Quit, so a
+    // restarted machine never leaves the old port bound.
+    let mut vnc_server: Option<iris::vnc::VncServer> = None;
+    // Live rates: sum every CPU's cycle deltas and use CPU 0's fast-clock
+    // counter over the wall-clock window. `None` until a machine is up.
+    let mut meter: Option<RateMeter> = None;
+    let mut lights = LightSampler::default();
+    // The last MIPS and Hz, carried between rate windows.
+    let mut rates = (0.0f32, 0.0f32);
+    let mut last_status: Option<Status> = None;
+    // Tick cadence for the status poll while idle on the command channel: fast
+    // enough for a disk light to blink; the rates are measured over a longer
+    // window (RATE_WINDOW). Reading the counters costs a few atomic loads.
+    const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+    loop {
+        let command = cmd_rx.recv_timeout(STATUS_TICK);
+        // RAII covers all early continues and returns in command handlers.
+        let _in_flight = command.as_ref().ok().map(|_| CommandInFlight(&pending_commands));
+        match command {
+            // Periodic tick (no command pending): refresh the MIPS estimate.
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                let Some(m) = meter.as_mut() else { continue };
+                if let Some(r) = m.sample(std::time::Instant::now()) {
+                    rates = r;
+                }
+                let (mips, kernel_hz) = rates;
+                // A stopped CPU thread can signal guest power-off. Zero
+                // throughput can also mean an idle or halted guest; keep
+                // that separate from the actual thread lifecycle.
+                let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
+                let cpu_halted = cpu_stopped || mips == 0.0;
+                let chd_sync_pending = machine.as_ref().map_or(false, |m| m.pending_chd_sync_count() > 0);
+                let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
+                let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
+                let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
+                let net_nat_gateway = machine.as_ref().and_then(|m| m.nat_expected()).map(|(_, gw, _)| gw);
+                let pcap_status = machine.as_ref()
+                    .map_or(iris::net::PcapStatus::Inactive, |m| m.net_pcap_status());
+                let (disks, audio_moving, has_audio) =
+                    machine.as_ref().map_or((Vec::new(), false, false), |m| lights.sample(&**m));
+                let status = Status {
+                    mips, kernel_hz, cpu_halted, cpu_stopped, chd_sync_pending,
+                    net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
+                    pcap_status, disks, audio_moving, has_audio,
+                    ..Status::default()
+                };
+                // Only a change is news: an idle guest costs the shell no wakes.
+                if last_status.as_ref() != Some(&status) {
+                    last_status = Some(status.clone());
+                    let _ = evt_tx.send(Evt::Status(status));
+                }
+                continue;
+            }
+            Ok(Cmd::Start(cfg)) => {
+                if machine.is_some() {
+                    let _ = evt_tx.send(Evt::StartFailed(t!("emu-already-running")));
+                    continue;
+                }
+                // Clear the previous run's last frame so the restarted machine
+                // shows the "waiting for first REX3 frame" placeholder instead
+                // of the stale screen until its first frame is rendered.
+                frame_sink.reset();
+                frame_sink_head1.reset();
+                // Wrap construction in catch_unwind: Machine::new and
+                // friends may panic on missing files, bad images, etc.
+                // We surface those as Evt::Error toasts instead of
+                // silently killing the worker thread.
+                //
+                // We do NOT force `headless = true` here — iris-gui needs
+                // REX3 alive so it can capture the framebuffer. Iris
+                // itself never opens a winit window unless `main.rs`
+                // calls `Ui::run`; we don't, so there's no event-loop
+                // conflict with eframe.
+                let cfg_owned = *cfg;
+                let sink_for_machine = frame_sink.clone();
+                let sink_for_head1 = frame_sink_head1.clone();
+                let dual = cfg_owned.has_device("newport");
+                // Read before the closure moves the config into it.
+                let vnc_listen = cfg_owned.vnc.listen.clone();
+                let vnc_max_fps = cfg_owned.vnc.max_fps;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // A machine that cannot be built panics here, so the
+                    // catch_unwind below reports why.
+                    let mut m = iris::workstation::build(cfg_owned).unwrap_or_else(|e| panic!("{e}"));
+                    m.register_system_controller();
+                    // Install the capture renderer before the CPU starts
+                    // so the very first REX3 frame already lands in the
+                    // sink the GUI can read.
+                    if let Some(display) = m.get_display() {
+                        *display.renderer_slot().lock() =
+                            Some(new_capture_renderer(sink_for_machine));
+                    }
+                    if dual {
+                        if let Some(display) = m.get_display_head1() {
+                            *display.renderer_slot().lock() =
+                                Some(new_capture_renderer(sink_for_head1));
+                        }
+                    }
+                    m.start();
+                    m
+                }));
+                match result {
+                    Ok(m) => {
+                        // Tell the NAT the host's own networks so it won't adopt a
+                        // guest subnet that overlaps the host's real LAN/VPN/Docker.
+                        m.set_host_nets(
+                            crate::model::netplan::gather_host_ifaces()
+                                .into_iter().map(|h| (h.network, h.prefix)).collect());
+                        *ps2_slot.lock() = Some(m.get_ps2());
+                        // One host input per machine: it adds the monitor's
+                        // screen/ptr/key commands, the VNC server shares it,
+                        // and the display's follow-the-pointer mode steers by it.
+                        let host_input = iris::hostinput::HostInput::attach(&*m);
+                        *host_slot.lock() = Some(host_input.clone());
+                        // Latch every CPU's counters for the live MIPS and Hz estimate.
+                        // A headless machine has none, and then sends no tick.
+                        let counters = m.cpu_counters();
+                        meter = (!counters.is_empty()).then(|| RateMeter::new(counters, std::time::Instant::now()));
+                        rates = (0.0, 0.0);
+                        last_status = None;
+                        lights = LightSampler::default();
+                        // The built-in VNC server, if `[vnc] listen` is set.
+                        // The GUI builds its own machine, so without this the
+                        // Performance tab's VNC settings would be config the
+                        // GUI silently ignores. A bind failure is a toast, not
+                        // an exit: the machine itself is fine without it.
+                        if let Some(listen) = vnc_listen {
+                            match iris::vnc::VncServer::start(
+                                host_input.clone(),
+                                &listen,
+                                vnc_max_fps,
+                                "IRIS",
+                            ) {
+                                Ok(s) => vnc_server = Some(s),
+                                Err(e) => {
+                                    let _ = evt_tx.send(Evt::Error(
+                                        t!("emu-vnc-failed", listen = &listen, error = e)));
+                                }
+                            }
+                        }
+                        machine = Some(m);
+                        let _ = evt_tx.send(Evt::Started);
+                    }
+                    Err(panic) => {
+                        let msg = panic_msg(&panic);
+                        let _ = evt_tx.send(Evt::StartFailed(t!("emu-start-failed", error = msg)));
+                    }
+                }
+            }
+            // Both type IRIX's own shutdown on the serial console, so its rc
+            // scripts run; a shell must be logged in there. -p powers off at
+            // the end, which the session then stops the machine on.
+            Ok(Cmd::HaltIrix) => {
+                match machine.as_ref() {
+                    Some(m) => m.inject_serial_console(b"shutdown -y -g0 -p\n"),
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
+                }
+            }
+            Ok(Cmd::RebootIrix) => {
+                match machine.as_ref() {
+                    Some(m) => m.inject_serial_console(b"shutdown -y -g0 -i6\n"),
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
+                }
+            }
+            Ok(Cmd::SetNatSubnet(cidr)) => {
+                match machine.as_ref() {
+                    Some(m) => match iris::config::parse_nat_subnet(&cidr) {
+                        Ok((gateway, client, netmask)) => m.set_nat_subnet(gateway, client, netmask),
+                        Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-nat-subnet-invalid", subnet = &cidr, error = e.to_string()))); }
+                    },
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
+                }
+            }
+            Ok(Cmd::SetPortForwards(rules)) => {
+                if let Some(m) = machine.as_ref() { m.set_port_forwards(rules); }
+            }
+            Ok(Cmd::SetPcapInterface(iface)) => {
+                if let Some(m) = machine.as_ref() { m.set_pcap_interface(iface); }
+            }
+            Ok(Cmd::Stop) => {
+                if let Some(m) = machine.take() {
+                    // The last screen, for the stopped machine's preview.
+                    save_picture(&frame_sink, std::path::Path::new(LAST_SCREEN));
+                    *ps2_slot.lock() = None;
+                    *host_slot.lock() = None;
+                    meter = None;
+                    // Drop the VNC server with the machine it serves: it holds
+                    // the display and the port, and a restart rebinds both.
+                    drop(vnc_server.take());
+                    // Always report the machine as stopped so the user regains
+                    // control, even if the stop failed or had to be abandoned.
+                    if let Err(msg) = stop_machine_timed(m, &abandoned_machine) {
+                        let _ = evt_tx.send(Evt::Error(msg));
+                    }
+                    let _ = evt_tx.send(Evt::Stopped);
+                } else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
+                }
+            }
+            Ok(Cmd::SyncDisks) => {
+                // Clean-exit disk sync: stop the machine (quiescing disk I/O),
+                // then fold each pending CHD diff back into its base, streaming
+                // progress so the GUI can show "Synchronizing disks…". The
+                // machine is dropped afterwards, exactly like a Stop.
+                let mut synced = 0usize;
+                if let Some(m) = machine.take() {
+                    save_picture(&frame_sink, std::path::Path::new(LAST_SCREEN));
+                    *ps2_slot.lock() = None;
+                    *host_slot.lock() = None;
+                    meter = None;
+                    // Its grab loop reads the display, so it goes first.
+                    drop(vnc_server.take());
+                    // Bounded as a Stop is: a stuck guest is abandoned (and its
+                    // diffs left for next time) rather than hanging Quit.
+                    let m = match stop_machine_timed_keep(m, &abandoned_machine) {
+                        Ok(m) => m,
+                        Err(msg) => {
+                            let _ = evt_tx.send(Evt::Error(msg));
+                            let _ = evt_tx.send(Evt::Stopped);
+                            let _ = evt_tx.send(Evt::SyncDone(0));
+                            continue;
+                        }
+                    };
+                    synced = match m.sync_chd_disks(
+                        None,
+                        &mut |disk, total, fraction| {
+                            let _ = evt_tx.send(Evt::SyncProgress { disk, total, fraction });
+                        },
+                        &|| false,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            // Don't swallow this. The fold writes a `.synctmp.chd`
+                            // beside the base and atomically renames it over the
+                            // base — both need write access to the *folder*, which
+                            // under the macOS App Sandbox a file-scoped grant (just
+                            // picking the disk image) does not convey. Surfaced so
+                            // the diff isn't silently left unmerged and the disk
+                            // never shrinks.
+                            let _ = evt_tx.send(Evt::Error(t!("emu-chd-compact-failed", error = e.to_string())));
+                            0
+                        }
+                    };
+                    // `m` dropped here → fully torn down.
+                }
+                let _ = evt_tx.send(Evt::Stopped);
+                let _ = evt_tx.send(Evt::SyncDone(synced));
+            }
+            Ok(Cmd::CowCommit { base, chd }) => {
+                // File-level commit (the GUI only offers this while stopped, so
+                // the disk files are closed). CHD recompresses with progress; raw
+                // applies the overlay in place.
+                if chd {
+                    let diff = iris::chd_disk::diff_path_for(std::path::Path::new(&base));
+                    if diff.exists() {
+                        let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: 0.0 });
+                        match iris::chd_disk::flatten_diff(
+                            std::path::Path::new(&base),
+                            &diff,
+                            &mut |f| { let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: f }); },
+                            &|| false,
+                        ) {
+                            Ok(()) => { let _ = evt_tx.send(Evt::SyncDone(1)); }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(t!("emu-commit-failed", error = e.to_string())));
+                                let _ = evt_tx.send(Evt::SyncDone(0));
+                            }
+                        }
+                    } else {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                } else {
+                    let overlay = format!("{base}.overlay");
+                    if std::path::Path::new(&overlay).exists() {
+                        let size = std::fs::metadata(&base).map(|m| m.len()).unwrap_or(0);
+                        let commit = (|| -> std::io::Result<usize> {
+                            let backing = iris::block_node::RawNode::open_readonly(
+                                std::path::Path::new(&base),
+                            )?;
+                            let mut node = iris::block_node::CowNode::new(
+                                Some(Box::new(backing)),
+                                &overlay,
+                                size,
+                            )?
+                            .with_base_path(&base);
+                            node.commit()
+                        })();
+                        match commit {
+                            Ok(_) => { let _ = evt_tx.send(Evt::CowDone { committed: true }); }
+                            Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-commit-failed", error = e.to_string()))); }
+                        }
+                    } else {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                }
+            }
+            Ok(Cmd::CowReset { base, chd }) => {
+                // Roll back: discard the overlay. File-level; stopped-only.
+                let target = if chd {
+                    iris::chd_disk::diff_path_for(std::path::Path::new(&base))
+                } else {
+                    let _ = std::fs::remove_file(format!("{base}.overlay.dirty"));
+                    std::path::PathBuf::from(format!("{base}.overlay"))
+                };
+                match std::fs::remove_file(&target) {
+                    Ok(()) => { let _ = evt_tx.send(Evt::CowDone { committed: false }); }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    }
+                    Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-rollback-failed", error = e.to_string()))); }
+                }
+            }
+            Ok(Cmd::SaveState(name)) => {
+                let Some(m) = machine.as_mut() else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
+                    continue;
+                };
+                // save_snapshot stops the machine as part of its work; once
+                // it returns, carry on as the monitor's `machine-start` does
+                // (`start` would also start a second monitor server), and
+                // only if the machine was running before.
+                // The screen as it is now, before saving stops the machine.
+                let shot = std::env::temp_dir().join(format!("iris-state-{}.png", std::process::id()));
+                let have_shot = save_picture(&frame_sink, &shot);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let was_running = m.cpu_is_running();
+                    let r = m.save_snapshot(&name);
+                    if was_running {
+                        if let Err(e) = m.start_guest() {
+                            eprintln!("iris-gui: resume after save: {e}");
+                        }
+                    }
+                    r
+                }));
+                match result {
+                    Ok(Ok(())) => {
+                        if have_shot {
+                            let to = std::path::Path::new("saves").join(&name).join(STATE_SCREEN);
+                            if std::fs::copy(&shot, &to).is_err() {
+                                log::warn!("could not keep the saved state's picture at {}", to.display());
+                            }
+                        }
+                        let _ = evt_tx.send(Evt::StateSaved(name));
+                    }
+                    Ok(Err(e)) => { let _ = evt_tx.send(Evt::Error(t!("emu-save-failed", name = &name, error = e.to_string()))); }
+                    Err(p) => { let _ = evt_tx.send(Evt::Error(t!("emu-save-crashed", error = panic_msg(&p)))); }
+                }
+                // The picture was copied into the state (or is not wanted).
+                let _ = std::fs::remove_file(&shot);
+            }
+            Ok(Cmd::RestoreState(name)) => {
+                let Some(m) = machine.as_mut() else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
+                    continue;
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    m.ci_restore(&name)
+                }));
+                match result {
+                    Ok(Ok(())) => { let _ = evt_tx.send(Evt::StateRestored(name)); }
+                    Ok(Err(e)) => { let _ = evt_tx.send(Evt::Error(t!("emu-restore-failed", name = &name, error = e.to_string()))); }
+                    Err(p) => { let _ = evt_tx.send(Evt::Error(t!("emu-restore-crashed", error = panic_msg(&p)))); }
+                }
+            }
+            Ok(Cmd::Screenshot(path)) => {
+                // Pull a whole composed frame from the board and encode it as
+                // PNG. We do this in the worker (rather than the GUI thread)
+                // because PNG encoding is non-trivial CPU.
+                //
+                // Not `frame_sink.snapshot()`: the sink carries only the
+                // damaged band of the newest frame (see `framebuffer`), so it
+                // cannot serve a whole picture. `screen.rgba` can, and the
+                // board keeps it current the moment something asks — a
+                // `request_frame` makes REX3's refresh loop compose and copy,
+                // which costs nothing until a screenshot is taken.
+                let Some(m) = machine.as_ref() else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
+                    continue;
+                };
+                let Some(display) = m.get_display() else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-no-frame")));
+                    continue;
+                };
+                let mut px: Vec<u32> = Vec::new();
+                let Some((w, h, _)) = iris::gfx_display::fresh_frame(
+                    &*display, &mut px, std::time::Duration::from_secs(2),
+                ) else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-no-frame")));
+                    continue;
+                };
+                // Tight RGBA bytes from the tightly-packed words `copy_frame`
+                // hands over (`w` a row, 0xAABBGGRR, R in the low byte).
+                let mut rgba = Vec::with_capacity(w * h * 4);
+                for &word in &px[..w * h] {
+                    rgba.extend_from_slice(&(word | 0xFF00_0000).to_le_bytes());
+                }
+                match write_png(&path, w as u32, h as u32, &rgba) {
+                    Ok(()) => { let _ = evt_tx.send(Evt::Screenshot(path)); }
+                    Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-failed", error = e))); }
+                }
+            }
+            Ok(Cmd::LoadDisc { id, path, remount }) => {
+                match machine.as_ref() {
+                    Some(m) => {
+                        match m.disc_changer().ok_or_else(no_cdrom).and_then(|d| d.load_disc(id as usize, path.clone())) {
+                            Ok(loaded_path) => {
+                                let filename = std::path::Path::new(&loaded_path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| loaded_path.clone());
+                                let message = if remount {
+                                    m.remount_cdrom_guest(id);
+                                    t!("emu-disc-loaded-remount", id = id, file = &filename)
+                                } else {
+                                    t!("emu-disc-loaded", id = id, file = &filename)
+                                };
+                                let _ = evt_tx.send(Evt::Disc { id, path: Some(loaded_path), message });
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(t!("emu-scsi-error", id = id, error = e.to_string())));
+                            }
+                        }
+                    }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
+                }
+            }
+            Ok(Cmd::EjectCdrom { id }) => {
+                match machine.as_ref() {
+                    Some(m) => {
+                        match m.disc_changer().ok_or_else(no_cdrom).and_then(|d| d.eject_to_empty(id as usize)) {
+                            Ok(()) => {
+                                let _ = evt_tx.send(Evt::Disc { id, path: None, message: t!("emu-disc-ejected", id = id) });
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Evt::Error(t!("emu-scsi-error", id = id, error = e.to_string())));
+                            }
+                        }
+                    }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
+                }
+            }
+            Ok(Cmd::ReadDisk { bus, id, offset, len, reply }) => {
+                let read = match machine.as_ref() {
+                    Some(m) => {
+                        let mut buf = vec![0u8; len];
+                        m.read_disk(bus, id, offset, &mut buf).map(|()| buf)
+                    }
+                    None => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, t!("emu-not-running"))),
+                };
+                let _ = reply.send(read);
+            }
+            Ok(Cmd::DiskSize { bus, id, reply }) => {
+                let _ = reply.send(machine.as_ref().and_then(|m| m.disk_size(bus, id)));
+            }
+            Ok(Cmd::RemountCdrom { id }) => {
+                match machine.as_ref() {
+                    Some(m) => {
+                        m.remount_cdrom_guest(id);
+                        let _ = evt_tx.send(Evt::Notice(t!("emu-remount-sent", id = id)));
+                    }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
+                }
+            }
+            Ok(Cmd::Quit) | Err(_) => {
+                *ps2_slot.lock() = None;
+                *host_slot.lock() = None;
+                // Drop the VNC server first: its grab loop reads the display,
+                // and it must not outlive the machine it serves.
+                drop(vnc_server.take());
+                if let Some(m) = machine.take() {
+                    // Bounded so a wedged guest can't hang app exit (Drop joins
+                    // this thread). If the stop is abandoned, the process is
+                    // exiting anyway and the OS reclaims everything.
+                    let _ = stop_machine_timed(m, &abandoned_machine);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// How long one read of a running machine's disk may wait for the worker
+/// (it may be busy saving a state).
+const LIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Sends commands to the worker as `EmulatorHandle::send` does.
+#[derive(Clone)]
+struct WorkerLink {
+    tx: Sender<Cmd>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl WorkerLink {
+    fn send(&self, cmd: Cmd) {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(cmd).is_err() {
+            self.pending.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+/// A running machine's disk, read through the machine as the guest sees it
+/// (overlay and CHD diff included), for browsing. It cannot be written: the
+/// guest owns the disk while it runs.
+#[derive(Clone)]
+pub struct LiveDisk {
+    link: WorkerLink,
+    bus: usize,
+    id: u8,
+    size: u64,
+}
+
+impl BlockNode for LiveDisk {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        // The worker reads the hook in one go; ask for at most 1 MiB at a time.
+        for (i, chunk) in buf.chunks_mut(1 << 20).enumerate() {
+            let at = offset + (i as u64) * (1 << 20);
+            let (reply, answer) = crossbeam_channel::bounded(1);
+            self.link.send(Cmd::ReadDisk { bus: self.bus, id: self.id, offset: at, len: chunk.len(), reply });
+            let data = answer
+                .recv_timeout(LIVE_READ_TIMEOUT)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, t!("emu-not-running")))??;
+            chunk.copy_from_slice(&data);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, _offset: u64, _buf: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, t!("browser-unavailable-running")))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn discard(&mut self, _offset: u64, _len: u64) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, t!("browser-unavailable-running")))
+    }
+
+    fn block_status(&self, _offset: u64, len: u64) -> std::io::Result<iris::block_node::BlockStatus> {
+        Ok(iris::block_node::BlockStatus { state: iris::block_node::BlockState::Data, backing_offset: None, len })
+    }
+
+    fn backing(&self) -> Option<&dyn BlockNode> {
+        None
+    }
+}
+
+struct CommandInFlight<'a>(&'a AtomicUsize);
+impl Drop for CommandInFlight<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Release); }
+}
+
+/// The error for a disc command on a machine with no CD-ROM controller.
+fn no_cdrom() -> String {
+    "no CD-ROM controller".to_string()
+}
+
+/// Stop a machine, but never block longer than `STOP_TIMEOUT`. `Machine::stop()`
+/// starts with `cpu.stop()`, which waits for the CPU thread to acknowledge the
+/// halt; a wedged guest can make that never return. We run it on a detached
+/// helper thread and give up after the timeout — the helper thread and that
+/// `Machine` then leak, but the caller (and the whole GUI) stays responsive.
+/// Stop `m` as `stop_machine_timed` does (5 s, a panic caught), but hand it
+/// back stopped, for the work that follows a stop (folding CHD diffs).
+fn stop_machine_timed_keep(m: Box<dyn Workstation>, abandoned: &Arc<AtomicBool>) -> Result<Box<dyn Workstation>, String> {
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<Box<dyn Workstation>, String>>();
+    let late = Abandon::new(abandoned);
+    let late_t = late.clone();
+    if std::thread::Builder::new()
+        .name("iris-gui-stop".into())
+        .spawn(move || {
+            let mut m = m;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                m.stop();
+                m
+            }));
+            // A stop given up on frees the library once it does finish (the
+            // machine it hands back is dropped with the send).
+            late_t.finished();
+            let _ = done_tx.send(r.map_err(|p| panic_msg(&p)));
+        })
+        .is_err()
+    {
+        return Err(t!("emu-stop-spawn-failed"));
+    }
+    match done_rx.recv_timeout(STOP_TIMEOUT) {
+        Ok(Ok(m)) => Ok(m),
+        Ok(Err(msg)) => Err(t!("emu-stop-failed", error = msg)),
+        Err(_) => {
+            late.given_up();
+            Err(t!("emu-stop-timeout"))
+        }
+    }
+}
+
+/// A timed stop's share of the worker's "machine abandoned" flag: set when
+/// the stop is given up on, cleared again when the stop thread finishes
+/// after all, whichever happens first.
+#[derive(Clone)]
+struct Abandon {
+    flag: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl Abandon {
+    fn new(flag: &Arc<AtomicBool>) -> Self {
+        Self { flag: flag.clone(), done: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// The stop thread finished (in time or late).
+    fn finished(&self) {
+        self.done.store(true, Ordering::Release);
+        self.flag.store(false, Ordering::Release);
+    }
+
+    /// The worker stopped waiting for it.
+    fn given_up(&self) {
+        self.flag.store(true, Ordering::Release);
+        if self.done.load(Ordering::Acquire) {
+            self.flag.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn stop_machine_timed(m: Box<dyn Workstation>, abandoned: &Arc<AtomicBool>) -> Result<(), String> {
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let late = Abandon::new(abandoned);
+    let late_t = late.clone();
+    if std::thread::Builder::new()
+        .name("iris-gui-stop".into())
+        .spawn(move || {
+            let mut m = m;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                m.stop();
+                drop(m); // Complete teardown before allowing a directory change.
+            }));
+            late_t.finished();
+            let _ = done_tx.send(r.map_err(|p| panic_msg(&p)));
+        })
+        .is_err()
+    {
+        return Err(t!("emu-stop-spawn-failed"));
+    }
+    match done_rx.recv_timeout(STOP_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(t!("emu-stop-failed", error = msg)),
+        Err(_) => {
+            late.given_up();
+            Err(t!("emu-stop-timeout"))
+        }
+    }
+}
+
+/// The picture beside a stopped machine (its summary's preview) and inside
+/// each saved state (`saves/NAME/`), relative to the machine folder.
+pub const LAST_SCREEN: &str = "last-screen.png";
+pub const STATE_SCREEN: &str = "screen.png";
+
+/// Write the screen as the app last received it (head 0), scaled down to at
+/// most 640 pixels wide, as a PNG at `path`. Best effort: `false` when there
+/// is no picture yet. The board's own screen buffer is not kept current while
+/// the app draws the frames, so this reads the frame sink's whole picture.
+fn save_picture(sink: &FrameSink, path: &std::path::Path) -> bool {
+    let Some((w, h, src)) = sink.whole() else { return false };
+    // Whole steps only: every output pixel averages a block of the source.
+    let step = w.div_ceil(640).max(1);
+    let (ow, oh) = (w / step, h / step);
+    let mut rgba = Vec::with_capacity(ow * oh * 4);
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut sum = [0u32; 3];
+            for dy in 0..step {
+                for dx in 0..step {
+                    let i = ((oy * step + dy) * w + ox * step + dx) * 4;
+                    sum[0] += u32::from(src[i]);
+                    sum[1] += u32::from(src[i + 1]);
+                    sum[2] += u32::from(src[i + 2]);
+                }
+            }
+            let n = (step * step) as u32;
+            rgba.extend_from_slice(&[(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, 0xFF]);
+        }
+    }
+    write_png(path, ow as u32, oh as u32, &rgba).is_ok()
+}
+
+fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
+    iris::disp::write_png(path, w, h, png::ColorType::Rgba, rgba).map_err(|e| e.to_string())
+}
+
+fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&'static str>() { return (*s).to_string(); }
+    if let Some(s) = p.downcast_ref::<String>()       { return s.clone(); }
+    t!("emu-unknown-error")
+}

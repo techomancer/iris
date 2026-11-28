@@ -16,9 +16,9 @@ keys is right for every profile, as long as the file goes through
 
 **Rule.**
 - Work out what the summary lists and what the preflight checks in
-  `iris-gui/src/summary.rs` (`drives`, `network`, `missing_disks`,
+  `iris-gui/core/src/model/summary.rs` (`drives`, `network`, `missing_disks`,
   `expansion_paths`), from the config alone, so tests need no window.
-- Name SCSI targets with `extra_ui::scsi_name` (controller:id), never the
+- Name SCSI targets with `model::hardware::scsi_name` (controller:id), never the
   `[scsi.KEY]` key; keep the key only for detaching.
 - A new place disks can live (another expansion card, another machine's own
   map) goes into `drives` and, if a missing image would make `Machine::new`
