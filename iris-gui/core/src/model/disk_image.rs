@@ -86,6 +86,19 @@ pub fn taken(path: &Path) -> bool {
         .any(|p| std::fs::symlink_metadata(p).is_ok())
 }
 
+/// Why `path` cannot take a new image, said truly: the file itself is
+/// there, or only a sidecar of an earlier disk is. `None` when it is free.
+pub fn refusal(path: &Path) -> Option<String> {
+    let file = path.display().to_string();
+    if std::fs::symlink_metadata(path).is_ok() {
+        Some(t!("create-disk-exists", file = file))
+    } else if taken(path) {
+        Some(t!("create-disk-sidecar", file = file))
+    } else {
+        None
+    }
+}
+
 /// The temporary file an image is written as, beside `path`, so a cancel or
 /// a crash never leaves a half-written image under the name asked for.
 fn temporary(path: &Path) -> PathBuf {
@@ -123,8 +136,8 @@ pub fn create(
     let mb = mb.clamp(MIN_MB, MAX_MB);
     let bytes = mb * 1024 * 1024;
     let exists = || t!("create-disk-exists", file = path.display().to_string());
-    if taken(path) {
-        return Err(exists());
+    if let Some(why) = refusal(path) {
+        return Err(why);
     }
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
@@ -204,7 +217,8 @@ mod tests {
         let path = root.0.join("old.img");
         std::fs::write(root.0.join("old.img.overlay"), b"old overlay").unwrap();
         assert!(taken(&path));
-        assert!(create(&path, Format::Raw, 1, &mut |_| {}, &|| false).is_err());
+        let why = create(&path, Format::Raw, 1, &mut |_| {}, &|| false).expect_err("refused");
+        assert!(why.contains("old.img") && !why.contains("already exists"), "{why}");
         assert!(!path.exists());
         let chd = root.0.join("new.chd");
         let mut last = 0.0;

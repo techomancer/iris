@@ -142,8 +142,8 @@ impl CreateDiskController {
             return Enabled::No(t!("create-disk-needs-size"));
         }
         let full = self.full_path();
-        if disk_image::taken(&full) {
-            return Enabled::No(t!("create-disk-exists", file = full.display().to_string()));
+        if let Some(why) = disk_image::refusal(&full) {
+            return Enabled::No(why);
         }
         Enabled::Yes
     }

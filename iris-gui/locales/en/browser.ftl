@@ -149,6 +149,7 @@ browser-closed-stopped = The machine stopped, so the disk browser closed. Browse
 
 # $file is the path that is already there.
 create-disk-exists = { $file } already exists. Choose another name; IRIS never replaces an image.
+create-disk-sidecar = An earlier disk named { $file } left its copy-on-write overlay or CHD diff beside it, so a new image there would read as the old one. Choose another name.
 create-disk-title = New disk image
 create-disk-format = Format
 create-disk-format-raw = Raw image
