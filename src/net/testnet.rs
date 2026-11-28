@@ -22,6 +22,56 @@ pub const GUEST_MAC: MacAddr = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 /// How long a test waits for something before failing.
 const PATIENCE: Duration = Duration::from_secs(10);
 
+#[test]
+fn live_forward_rebind_reuses_ports_and_preserves_transient_listeners() {
+    let reserve_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let tcp_port = reserve_tcp.local_addr().unwrap().port();
+    let reserve_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let udp_port = reserve_udp.local_addr().unwrap().port();
+    drop((reserve_tcp, reserve_udp));
+    let mut rules = vec![
+        PortForwardConfig { proto: ForwardProto::Tcp, host_port: tcp_port, guest_port: 23, bind: ForwardBind::Localhost },
+        PortForwardConfig { proto: ForwardProto::Udp, host_port: udp_port, guest_port: 69, bind: ForwardBind::Localhost },
+    ];
+    let mut net = TestNet::new(GatewayConfig { port_forwards: rules.clone(), ..Default::default() });
+    let transient = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    transient.set_nonblocking(true).unwrap();
+    let transient_addr = transient.local_addr().unwrap();
+    net.e.add_ftp_data_forward(transient, 40000);
+    // Reusing an unchanged port must work, as must replacing its guest port
+    // or switching between loopback and all-interface binds.
+    for (bind, guest_port) in [
+        (ForwardBind::Localhost, 23), // unchanged rule set
+        (ForwardBind::Localhost, 24),
+        (ForwardBind::Any, 25),
+        (ForwardBind::Localhost, 26),
+    ] {
+        rules[0].guest_port = guest_port;
+        for rule in &mut rules { rule.bind = bind.clone(); }
+        net.e.ctl.set_port_forwards(rules.clone());
+        net.pump();
+        assert_eq!(net.e.fwd_static_count, 1);
+        assert_eq!(net.e.tcp_fwd_listeners.len(), 2);
+        assert_eq!(net.e.udp_fwd_listeners.len(), 1);
+        let addr = net.e.tcp_fwd_listeners[0].listener.local_addr().unwrap();
+        let expected = if bind == ForwardBind::Any { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::LOCALHOST };
+        assert_eq!(addr.ip(), expected);
+        assert_eq!(addr.port(), tcp_port);
+        assert_eq!(net.e.tcp_fwd_listeners[0].guest_port, rules[0].guest_port);
+        let udp_addr = net.e.udp_fwd_listeners[0].sock.local_addr().unwrap();
+        assert_eq!(udp_addr.ip(), expected);
+        assert_eq!(udp_addr.port(), udp_port);
+        assert_eq!(net.e.tcp_fwd_listeners[1].listener.local_addr().unwrap(), transient_addr);
+    }
+    net.e.ctl.set_port_forwards(vec![]);
+    net.pump();
+    assert_eq!(net.e.fwd_static_count, 0);
+    assert_eq!(net.e.tcp_fwd_listeners.len(), 1);
+    assert!(net.e.udp_fwd_listeners.is_empty());
+    TcpListener::bind((Ipv4Addr::LOCALHOST, tcp_port)).unwrap();
+    UdpSocket::bind((Ipv4Addr::LOCALHOST, udp_port)).unwrap();
+}
+
 pub struct TestNet {
     pub e: NatEngine,
     rx: rtrb::Consumer<Vec<u8>>,

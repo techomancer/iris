@@ -78,6 +78,11 @@ impl NatEngine {
     pub(super) fn rebind_forwards(&mut self, rules: &[PortForwardConfig]) {
         let cut = self.fwd_static_count.min(self.tcp_fwd_listeners.len());
         let transient = self.tcp_fwd_listeners.split_off(cut);
+        // Release the old ports before binding their replacements. Assigning
+        // the new vectors afterwards is too late: retained rules and bind-scope
+        // changes otherwise collide with our own still-open sockets.
+        self.tcp_fwd_listeners.clear();
+        self.udp_fwd_listeners.clear();
         let (mut tcp, udp) = bind_forwards(rules, &self.tx_wake);
         self.fwd_static_count = tcp.len();
         tcp.extend(transient);

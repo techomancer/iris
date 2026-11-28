@@ -715,6 +715,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Networking
 
+- Live NAT port forwards on every machine keep working when edited rules reuse
+  their existing host ports, including changes between loopback and LAN access.
 - IRIX 6.5.30 guests mount the NFS share with `mount -o proto=udp`; a plain
   `mount` still fails there (see HELP.md).
 - A guest re-addressed onto another subnet after boot gets its new gateway
