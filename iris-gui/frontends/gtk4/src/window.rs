@@ -32,7 +32,13 @@ pub struct MainWindow {
     status: StatusBar,
     /// The guest's screen, and the scroller that holds it at Actual Size.
     pub screen: Screen,
+    /// The second display head (a dual Newport), beside the first.
+    pub head1: Screen,
+    head1_box: gtk::Box,
+    head1_label: gtk::Label,
     screen_scroll: gtk::ScrolledWindow,
+    /// Whether the pane is laid out for two heads.
+    showing_head1: bool,
     /// Whether the pane is showing the display rather than the page.
     showing_display: bool,
     /// The display's own window, while it is detached.
@@ -77,11 +83,23 @@ impl MainWindow {
         let status = StatusBar::new();
         content.add_bottom_bar(&status.root);
         let screen = Screen::new();
-        let screen_scroll = gtk::ScrolledWindow::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .child(&screen.view)
-            .build();
+        let head1 = Screen::new();
+        let head1_label = gtk::Label::new(None);
+        head1_label.add_css_class("dim-label");
+        head1_label.add_css_class("caption");
+        let head1_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        head1_box.set_hexpand(true);
+        head1_box.set_vexpand(true);
+        head1_box.append(&head1_label);
+        head1_box.append(&head1.view);
+        head1_box.set_visible(false);
+
+        // Head 0, and head 1 beside it when the machine has one.
+        let heads = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        heads.set_homogeneous(true);
+        heads.append(&screen.view);
+        heads.append(&head1_box);
+        let screen_scroll = gtk::ScrolledWindow::builder().hexpand(true).vexpand(true).child(&heads).build();
         screen_scroll.add_css_class("iris-screen");
 
         let library = Library::new(app);
@@ -136,7 +154,11 @@ impl MainWindow {
             toolbar,
             status,
             screen,
+            head1,
+            head1_box,
+            head1_label,
             screen_scroll,
+            showing_head1: false,
             showing_display: false,
             detached: None,
             pane: content,
@@ -168,6 +190,20 @@ impl MainWindow {
             }
         }
         if running {
+            // A dual Newport draws both heads side by side; head 0 keeps the
+            // input. The label says when the second head has drawn nothing.
+            let dual = app.session().dual_head();
+            if dual != self.showing_head1 {
+                self.showing_head1 = dual;
+                self.head1_box.set_visible(dual);
+                if !dual {
+                    self.head1.clear();
+                }
+            }
+            if dual {
+                let live = app.session().head1_live();
+                self.head1_label.set_label(&if live { t!("fb-head", head = 1) } else { t!("fb-head-waiting") });
+            }
             return;
         }
         let o = app.overview();

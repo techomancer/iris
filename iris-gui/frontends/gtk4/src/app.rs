@@ -569,11 +569,15 @@ pub fn tick() {
         for e in s.app.take_session_events() {
             if e == iris_gui_core::controller::session::SessionEvent::Started {
                 s.win.screen.clear();
+                s.win.head1.clear();
             }
         }
         if s.app.session().is_running() {
-            let (sink, _) = s.app.session().frame_sinks();
+            let (sink, head1) = s.app.session().frame_sinks();
             s.win.screen.take(sink);
+            if s.app.session().dual_head() {
+                s.win.head1.take(head1);
+            }
         }
         fx
     });

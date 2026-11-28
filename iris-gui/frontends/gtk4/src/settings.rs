@@ -114,7 +114,8 @@ impl Form {
                 finish(group, &row, enabled, tip.as_deref());
             }
             FieldKind::Path { value, pick } => {
-                let row = adw::ActionRow::builder().title(&f.label).subtitle(shown_path(value)).build();
+                let folder = matches!(pick, PickKind::Folder);
+                let row = adw::ActionRow::builder().title(&f.label).subtitle(shown_path(value, folder)).build();
                 row.set_subtitle_lines(0);
                 let what = match pick {
                     PickKind::Folder => t!("settings-choose"),
@@ -238,7 +239,7 @@ impl Form {
 
     fn disk_row(self: &std::rc::Rc<Self>, field: &'static str, i: usize, row: &DiskRow, enabled: bool) -> adw::ExpanderRow {
         let title = t!("ov-scsi", id = row.name.as_str());
-        let expander = adw::ExpanderRow::builder().title(&title).subtitle(shown_path(&row.path)).build();
+        let expander = adw::ExpanderRow::builder().title(&title).subtitle(shown_path(&row.path, false)).build();
         if let Some(problem) = &row.problem {
             let warn = icons::image(iris_gui_core::controller::icons::Icon::Warning, 16, problem);
             warn.add_css_class("warning");
@@ -268,6 +269,86 @@ impl Form {
         browse.connect_clicked(move |_| me.report(pick.clone(), Value::Bool(true)));
         path.add_suffix(&browse);
         expander.add_row(&path);
+
+        if row.is_daynaport() {
+            // A DaynaPort is an Ethernet card on the bus, not storage.
+            for (part, label, value) in [
+                (part::MAC, t!("config-scsi-mac"), row.mac.clone()),
+                (part::SUBNET, t!("config-scsi-subnet"), row.subnet.clone()),
+            ] {
+                let entry = adw::EntryRow::builder().title(&label).text(&value).sensitive(enabled).build();
+                let me = self.clone();
+                let id = control_id(field, Some(i), Some(part));
+                entry.connect_changed(move |r| me.report(id.clone(), Value::Text(r.text().to_string())));
+                expander.add_row(&entry);
+            }
+            let remove = gtk::Button::builder().label(t!("config-remove")).halign(gtk::Align::End).sensitive(enabled).build();
+            remove.add_css_class("destructive-action");
+            let me = self.clone();
+            let id = control_id(field, Some(i), Some(part::REMOVE));
+            remove.connect_clicked(move |_| me.report(id.clone(), Value::Bool(true)));
+            let remove_row = adw::ActionRow::new();
+            remove_row.set_child(Some(&remove));
+            expander.add_row(&remove_row);
+            return expander;
+        }
+
+        if row.is_cdrom() {
+            // The changer: the discs behind the one loaded now.
+            for (n, disc) in row.discs.iter().enumerate() {
+                let entry = adw::EntryRow::builder()
+                    .title(t!("config-scsi-changer-slot", n = n + 1))
+                    .text(disc)
+                    .sensitive(enabled)
+                    .build();
+                let me = self.clone();
+                let id = control_id(field, Some(i), Some(&format!("{}{n}", part::DISC)));
+                entry.connect_changed(move |r| me.report(id.clone(), Value::Text(r.text().to_string())));
+                let pick = gtk::Button::builder().label(t!("settings-choose")).valign(gtk::Align::Center).build();
+                let me = self.clone();
+                let id = control_id(field, Some(i), Some(&format!("{}{n}", part::DISC)));
+                pick.connect_clicked(move |_| me.report(id.clone(), Value::Bool(true)));
+                entry.add_suffix(&pick);
+                expander.add_row(&entry);
+            }
+            let add = gtk::Button::builder().label(t!("config-scsi-add-disc")).halign(gtk::Align::Start).sensitive(enabled).build();
+            let me = self.clone();
+            let id = control_id(field, Some(i), Some(part::ADD_DISC));
+            add.connect_clicked(move |_| me.report(id.clone(), Value::Bool(true)));
+            let add_row = adw::ActionRow::builder().title(t!("config-scsi-changer")).build();
+            add_row.add_suffix(&add);
+            expander.add_row(&add_row);
+        }
+
+        if row.is_disk() {
+            let scratch =
+                adw::SwitchRow::builder().title(t!("config-scsi-scratch")).active(row.scratch).sensitive(enabled).build();
+            let me = self.clone();
+            let id = control_id(field, Some(i), Some(part::SCRATCH));
+            scratch.connect_active_notify(move |r| me.report(id.clone(), Value::Bool(r.is_active())));
+            expander.add_row(&scratch);
+            if row.scratch {
+                let size = adw::SpinRow::with_range(1.0, 1_048_576.0, 64.0);
+                size.set_title(&t!("config-scsi-scratch-size"));
+                size.set_value(row.scratch_mb as f64);
+                size.set_sensitive(enabled);
+                let me = self.clone();
+                let id = control_id(field, Some(i), Some(part::SCRATCH_MB));
+                size.connect_value_notify(move |r| me.report(id.clone(), Value::Number(r.value())));
+                expander.add_row(&size);
+            }
+            let cache = adw::SwitchRow::builder()
+                .title(t!("config-scsi-write-cache"))
+                .subtitle(t!("config-scsi-write-cache-tip"))
+                .active(row.write_cache)
+                .sensitive(enabled)
+                .build();
+            cache.set_subtitle_lines(0);
+            let me = self.clone();
+            let id = control_id(field, Some(i), Some(part::WRITE_CACHE));
+            cache.connect_active_notify(move |r| me.report(id.clone(), Value::Bool(r.is_active())));
+            expander.add_row(&cache);
+        }
 
         if row.can_overlay() {
             let overlay =
@@ -360,6 +441,11 @@ impl Form {
         expander
     }
 
+    /// Report a control from outside the form (a section's own button).
+    pub fn report_public(&self, id: String, value: Value) {
+        self.report(id, value);
+    }
+
     /// A control changed: tell the shell, unless it was the shell filling it in.
     fn report(&self, id: String, value: Value) {
         if self.syncing.get() {
@@ -377,11 +463,12 @@ fn strings(options: &[String]) -> gtk::StringList {
     list
 }
 
-fn shown_path(value: &str) -> String {
-    if value.trim().is_empty() {
-        t!("ov-empty")
-    } else {
-        value.to_string()
+/// A path row's subtitle: the path, or what it is when nothing is chosen.
+fn shown_path(value: &str, folder: bool) -> String {
+    match (value.trim().is_empty(), folder) {
+        (false, _) => value.to_string(),
+        (true, true) => t!("wizard-none"),
+        (true, false) => t!("ov-empty"),
     }
 }
 
@@ -491,6 +578,19 @@ impl SettingsDialog {
         let group = adw::PreferencesGroup::new();
         self.form.fill(&group, &section.fields);
         page.add(&group);
+        // The guest clock's Reset: an action on the section, which the core
+        // takes as a plain set on the reset field (the schema has no button
+        // kind, and adding one would break the AppKit shell's match).
+        if section.id == iris_gui_core::controller::ids::settings::CLOCK {
+            let button = gtk::Button::builder().label(t!("config-rtc-reset")).halign(gtk::Align::Center).build();
+            let form = self.form.clone();
+            button.connect_clicked(move |_| form.report_public(fid::RTC_RESET.to_string(), Value::Bool(true)));
+            let holder = adw::PreferencesGroup::new();
+            let row = adw::ActionRow::new();
+            row.set_child(Some(&button));
+            holder.add(&row);
+            page.add(&holder);
+        }
         page
     }
 }

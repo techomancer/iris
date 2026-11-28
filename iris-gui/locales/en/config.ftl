@@ -208,6 +208,8 @@ config-scsi-scratch = Scratch disk
 config-scsi-scratch-size = Scratch size (MB)
 config-scsi-changer = Extra discs in the changer
 config-scsi-disc-remove-tip = Remove this disc
+# $n is the slot in the changer, from 1.
+config-scsi-changer-slot = Disc { $n }
 config-scsi-add-disc = Add disc
 
 ## Network

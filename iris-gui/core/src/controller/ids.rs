@@ -65,6 +65,7 @@ pub mod status {
 pub mod settings {
     pub const GENERAL: &str = "settings.general";
     pub const DISKS: &str = "settings.disks";
+    pub const CLOCK: &str = "settings.clock";
     pub const NETWORK: &str = "settings.network";
     pub const DISPLAY: &str = "settings.display";
 }
