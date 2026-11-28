@@ -583,6 +583,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Storage
 
+- Windows hosts: flushing a read-only raw image no longer reports access
+  denied, on any emulated machine.
 - Indy and Indigo2 under NetBSD (and other drivers that arm the DMA channel
   after starting a transfer): a SCSI data phase now starts when the driver
   arms the channel, not on a 100 µs poll after it (issue 346).

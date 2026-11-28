@@ -195,7 +195,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 | [isp2200-linux-logs-in-through-ring-mailbox-entries.md](scsi/isp2200-linux-logs-in-through-ring-mailbox-entries.md) | rule | Linux qla2xxx logs in to ISP2200 loop ports with 0x0074 and with type 0x39 mailbox entries in the request ring; both must be answered or no FC disk appears |
 | [linux-lun-scan-and-mode-sense-gaps.md](scsi/linux-lun-scan-and-mode-sense-gaps.md) | rule | Linux SCSI probe noise: phantom LUNs, missing Caching page, no MODE SENSE(10) |
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |
-| [windows-cannot-fsync-a-directory.md](scsi/windows-cannot-fsync-a-directory.md) | rule | Windows cannot fsync a directory: raw COW overlays failed every sidecar rewrite |
+| [windows-cannot-fsync-a-directory.md](scsi/windows-cannot-fsync-a-directory.md) | rule | Windows sidecars use write-through replacement after retiring append handles; read-only raw nodes do not flush |
 | [openbsd.md](scsi/openbsd.md) | rule | OpenBSD SCSI Boot Crash — Investigation Notes |
 | [octane-internal-bus-probes-only-ids-1-3.md](scsi/octane-internal-bus-probes-only-ids-1-3.md) | rule | Octane: the internal SCSI bus is probed only at ids 1-3; CD-ROMs go on controller 1 |
 
