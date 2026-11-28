@@ -672,7 +672,7 @@ accesses, one counter read in 256 with the host's clock, and every
 interrupt vector raised or lowered, and on the Octane every access nothing
 answers. `o2audio` logs the O2's audio register accesses and codec writes.
 Events: `pdma` — one per HPC3 channel, `hal0`..`hal7`, `scsi0`, `scsi1`,
-`enet0`, `enet1`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
+`enet0`, `enet1`; `mips` — `insn tlb mem fpu`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing)).
 `bedrock` covers the devices of the Bedrock node (Fuel, Tezro, Origin 3200,
 Onyx 3000), `l1` their L1 system controller and `usb` the OHCI USB controller. `ice1724` logs the Tezro's audio

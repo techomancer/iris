@@ -18,14 +18,13 @@ use std::time::Duration;
 use crate::exp::{self, Expr, RegTarget};
 use crate::snapshot::{get_field, u64_slice_to_toml, load_u64_slice, toml_u64, toml_u32, toml_bool, hex_u64, hex_u32};
 
-/// The `mips.*` trace points: per-instruction disassembly, TLB ops, uncached accesses, FP
-/// operands and results, and CP0 traffic (EPC/EntryHi/XContext, ECC and CacheErr, Status.DE).
-pub const EVENTS: &[&str] = &["insn", "tlb", "mem", "fpu", "cp0"];
+/// The `mips.*` trace points: per-instruction disassembly, TLB ops, uncached accesses and FP
+/// operands and results.
+pub const EVENTS: &[&str] = &["insn", "tlb", "mem", "fpu"];
 pub const MIPS_LOG_INSN: u32 = event(EVENTS, "insn");
 pub const MIPS_LOG_TLB:  u32 = event(EVENTS, "tlb");
 pub const MIPS_LOG_MEM:  u32 = event(EVENTS, "mem");
 pub const MIPS_LOG_FPU:  u32 = event(EVENTS, "fpu");
-pub const MIPS_LOG_CP0:  u32 = event(EVENTS, "cp0");
 
 /// Opt-in gate for the `developerx` Coprocessor-Unusable break (see the three
 /// `handle_exception*` wrappers). Off unless `IRIS_BREAK_CPU=1`.
@@ -43,17 +42,6 @@ fn cpu_unusable_break_enabled() -> bool {
 #[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
-    devlog_on(LogModule::Mips, bit)
-}
-
-/// Like `mips_log`, but live in every build.
-///
-/// The IP28 bring-up traces this gates were plain environment variables that
-/// worked in release, and the machines they diagnose are booted in release —
-/// so they keep that reach. The cost is one relaxed atomic load, against the
-/// `getenv` per call some of them used to do.
-#[inline(always)]
-fn mips_log_always(bit: u32) -> bool {
     devlog_on(LogModule::Mips, bit)
 }
 
@@ -4720,91 +4708,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// Handle an exception: update CP0 registers and jump to handler vector.
     /// Takes an ExecStatus with EXEC_IS_EXCEPTION set; extracts code and TLB-refill flag.
-    /// IP28 bring-up: dump everything about the one exception whose BadVAddr
-    /// is `IRIS_IP28_EXC_VADDR`.
-    ///
-    /// A first-N trace is useless for a fault that lands after thousands of
-    /// ordinary TLB misses, and reading the register file from the monitor
-    /// afterwards shows the guest's panic handler, not the fault. Costs one
-    /// relaxed load per exception on the R10000 model and folds away on every
-    /// other; exceptions are not a hot path.
-    #[inline]
-    fn ip28_trace_exception(&self, status: ExecStatus) {
-        if !C::R10K_CACHE_OPS {
-            return;
-        }
-        static WANT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        let want = *WANT.get_or_init(|| {
-            std::env::var("IRIS_IP28_EXC_VADDR").ok().and_then(|v| {
-                let v = v.trim();
-                if v.is_empty() { return None; }
-                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
-            })
-        });
-        let Some(want) = want else { return };
-
-        // Keep the run-up. The exception that panics the guest is the second
-        // one: the first is an ordinary miss, and its handler then faults.
-        // Only the run-up says what the handler was handed, and BadVAddr has
-        // already been overwritten by the time the match fires.
-        static RING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        const KEEP: usize = 12;
-        let line = format!(
-            "code={:<2} pc={:#018x} bd={} badvaddr={:#018x} xcontext={:#018x} \
-             context={:#018x} entryhi={:#018x} ra={:#018x}",
-            (status & CAUSE_EXCCODE_MASK) >> 2,
-            self.core.pc,
-            self.core.in_delay_slot as u8,
-            self.core.cp0_badvaddr,
-            self.core.cp0_xcontext,
-            self.core.cp0_context,
-            self.core.cp0_entryhi,
-            self.core.read_gpr(31),
-        );
-        if let Ok(mut ring) = RING.lock() {
-            if ring.len() == KEEP {
-                ring.remove(0);
-            }
-            ring.push(line);
-            if want == self.core.cp0_badvaddr {
-                eprintln!("ip28exc: --- last {} exceptions, oldest first ---", ring.len());
-                for (i, l) in ring.iter().enumerate() {
-                    eprintln!("ip28exc: [{i}] {l}");
-                }
-            }
-        }
-
-        if want != self.core.cp0_badvaddr {
-            return;
-        }
-        const NAMES: [&str; 32] = [
-            "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
-            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-            "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
-        ];
-        let code = (status & CAUSE_EXCCODE_MASK) >> 2;
-        eprintln!(
-            "ip28exc: code={code} pc={:#018x} delay_slot={} badvaddr={:#018x} status={:#010x}",
-            self.core.pc, self.core.in_delay_slot, self.core.cp0_badvaddr,
-            self.core.cp0_status,
-        );
-        for i in 0..32u32 {
-            if self.core.read_gpr(i) == self.core.cp0_badvaddr {
-                eprintln!("ip28exc:   {} (${i}) holds the bad address", NAMES[i as usize]);
-            }
-        }
-        for chunk in (0..32u32).collect::<Vec<_>>().chunks(4) {
-            let mut line = String::from("ip28exc: ");
-            for &i in chunk {
-                line.push_str(&format!(" {:>4}={:#018x}", NAMES[i as usize], self.core.read_gpr(i)));
-            }
-            eprintln!("{line}");
-        }
-    }
-
     fn handle_exception(&mut self, status: ExecStatus) -> ExecStatus {
-        self.ip28_trace_exception(status);
         // In developer builds, bus/address error exceptions break into the
         // monitor at the fault site rather than dispatching to the MIPS
         // vector — must be decided before deliver_exception runs, since that
@@ -7389,44 +7293,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if C::R10K_CACHE_OPS {
             self.cache.set_cache_ecc(self.core.cp0_ecc);
         }
-        // IP28 cache-error investigation (`log mips.cp0 on`). Two kinds
-        // of op are worth seeing: one carrying non-zero check bits, which is a
-        // guest staging a parity error on purpose, and any op from outside the
-        // PROM — i.e. from a loaded diagnostic, which runs out of XKPHYS.
-        //
-        // Both halves of that gate were learned the hard way. Gating on ECC
-        // alone hid every op the IDE issued, because the IDE's ECC reads back
-        // zero: the exact symptom under investigation was also blinding the
-        // instrument to its cause. The cap then has to be generous, because a
-        // cap of 600 silently truncated a run at precisely the boundary and
-        // made a partial picture look like the whole one. It exists only so a
-        // hot loop cannot rewrite the timing it is measuring.
-        if crate::cpu::mips_core::cachediag_on() {
-            let from_prom = (self.core.pc >> 32) == 0xFFFF_FFFF;
-            // CBARRIER is pure ordering: it names no line and carries no check
-            // bits, and it outnumbers everything else ~8:1 (83534 of 94322 in
-            // one IDE run). Tracing it swamped the log and slowed the guest
-            // enough that the run no longer reached the loop being studied —
-            // so drop it unless it is carrying staged check bits.
-            let noise = op == C_R10K_CBARRIER && self.core.cp0_ecc == 0;
-            if (self.core.cp0_ecc != 0 || !from_prom) && !noise {
-                const CACHE_TRACE_CAP: u32 = 200_000;
-                static SEEN: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < CACHE_TRACE_CAP {
-                    crate::dlog!(LogModule::Mips,
-                        "ip28cd: CACHE op={:#04x} sel={} vaddr={:#018x} ECC={:#010x} \
-                         TagHi:Lo={:#010x}:{:#018x} pc={:#018x}",
-                        op, sel, virt_addr, self.core.cp0_ecc,
-                        self.core.cp0_taghi, self.core.cp0_taglo, self.core.pc);
-                } else if n == CACHE_TRACE_CAP {
-                    crate::dlog!(LogModule::Mips,
-                        "ip28cd: CACHE trace capped at {CACHE_TRACE_CAP} ops \
-                         — output past this point is incomplete");
-                }
-            }
-        }
         // Call unified cache interface
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
         // An I-cache write-back of a line with bad parity raises a Cache
@@ -7700,7 +7566,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
-        self.ip28_cp0_trace("mfc0", rd_val, value);
         // Sign-extend 32-bit value to 64 bits
         self.core.write_gpr(rt_reg, value as u32 as i32 as i64 as u64);
         self.handle_exec_complete()
@@ -7711,7 +7576,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
         let value = self.core.read_cp0(rd_val);
-        self.ip28_cp0_trace("dmfc0", rd_val, value);
         self.core.write_gpr(rt_reg, value);
         self.handle_exec_complete()
     }
@@ -7729,7 +7593,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     fn exec_mtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
-        self.ip28_cp0_trace("mtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
 
         // MTC0 moves the whole register. DMTC0 differs in what the
@@ -7764,22 +7627,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     // DMTC0 - Doubleword Move To CP0 (MIPS III)
-    /// IP28 bring-up: watch the cache-tag CP0 registers (26 ECC, 28 TagLo,
-    /// 29 TagHi) under `log mips.cp0 on`. Only the R10000 model compiles
-    /// this in.
-    ///
-    /// The env-var form this replaced did an uncached `getenv` on every
-    /// DMTC0/MTC0, armed or not.
-    #[inline(always)]
-    fn ip28_cp0_trace(&self, what: &str, reg: u32, val: u64) {
-        if C::R10K_CACHE_OPS && matches!(reg, 26 | 28 | 29) && mips_log_always(MIPS_LOG_CP0) {
-            crate::dlog!(LogModule::Mips, "ip28cp0: {what} ${reg} = {val:#018x}");
-        }
-    }
-
     fn exec_dmtc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_val = self.core.read_gpr(d.rt as u32);
-        self.ip28_cp0_trace("dmtc0", d.rd as u32, rt_val);
         let rd_val = d.rd as u32;
         self.core.write_cp0(rd_val, rt_val);
         self.handle_cp0_side_effects(rd_val);
@@ -7960,31 +7809,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // TLBWI - Write Indexed TLB Entry
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to the TLB entry indexed by CP0.Index
-    /// Report every TLB write, under `log mips.tlb on`.
-    ///
-    /// `IRIS_IP28_TLBW=wired` additionally narrows it to writes below CP0
-    /// Wired — the mappings a kernel means never to be evicted. That stays an
-    /// environment variable because it selects a *subset*, which the module
-    /// mask has no way to express; the on/off is devlog's.
-    #[inline]
-    fn ip28_trace_tlb_write(&self, op: &str, index: usize, entry: &crate::cpu::mips_tlb::TlbEntry) {
-        if !mips_log_always(MIPS_LOG_TLB) {
-            return;
-        }
-        static WIRED_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let wired_only = *WIRED_ONLY.get_or_init(|| {
-            matches!(std::env::var("IRIS_IP28_TLBW").as_deref(), Ok("wired"))
-        });
-        if wired_only && index >= self.core.cp0_wired as usize {
-            return;
-        }
-        crate::dlog!(LogModule::Mips,
-            "ip28tlbw: {op} idx={index:<2} wired={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} \
-             mask={:#x} pc={:#018x}",
-            self.core.cp0_wired, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1],
-            entry.page_mask, self.core.pc);
-    }
-
     fn exec_tlbwi(&mut self) -> ExecStatus {
         // The slot is Index[5:0]. Masking rather than `%` matters twice:
         //
@@ -8010,7 +7834,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return self.handle_exec_complete();
         }
         let entry = self.create_tlb_entry_from_cp0();
-        self.ip28_trace_tlb_write("tlbwi", index, &entry);
         self.tlb.write(index, entry);
         self.note_tlb_write_conflict();
         // Flushes the nutlb too — the TLB it caches just changed.
@@ -8040,7 +7863,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return self.handle_exec_complete();
         }
         let entry = self.create_tlb_entry_from_cp0();
-        self.ip28_trace_tlb_write("tlbwr", index, &entry);
         self.tlb.write(index, entry);
         self.note_tlb_write_conflict();
         self.nanotlb_invalidate();
@@ -8237,16 +8059,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // code through the kernel translator. The flush alone cannot cover it: it
         // *guarantees* the next access misses and therefore calls `translate_fn`.
         self.resync_privilege_state();
-
-        // `log mips.cp0 on`. If the target's top half is already gone by
-        // the time we get here, the guest wrote a truncated EPC; if it is
-        // intact and the next fetch is truncated anyway, the loss is
-        // downstream of this.
-        if C::R10K_CACHE_OPS && mips_log_always(MIPS_LOG_CP0) {
-            crate::dlog!(LogModule::Mips,
-                "ip28epc: eret -> {target:#018x} (epc={:#018x} errorepc={:#018x} status={:#010x})",
-                self.core.cp0_epc, self.core.cp0_errorepc, self.core.cp0_status);
-        }
 
         // ERET jumps immediately without delay slot
         self.core.pc = target;

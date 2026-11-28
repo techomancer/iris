@@ -40,6 +40,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   every physical bus access. That and the `hit` category of `log l1i` and
   `log l1d` need a `developer` build; before, every build but `lightning` paid
   a check per access for them.
+- The `IRIS_IP28_*` bring-up variables (cache ops, watch window, exception
+  address, TLB writes, GPR watch) and `log mips.cp0` are gone, as is the
+  stderr line printed on every R10000 secondary-cache Index_Load_Tag. Only
+  the TLB-write trace has a replacement: `log mips.tlb` in a `developer`
+  build. Cache ops, the watch window and the exception address have none.
+  `bp add ADDR if REG==VAL` breaks at a PC on a register value, but nothing
+  reports every write to a register, so it replaces `IRIS_IP28_WATCHGPR`
+  only in part.
 
 - One pattern names trace points everywhere: `log heart,l1d.*,-l1d.hit on`,
   `--log PATTERN` and `[debug] log`. `IRIS_DEBUG_LOG` and `[debug] debug_log`

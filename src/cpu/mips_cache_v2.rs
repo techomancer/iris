@@ -1629,29 +1629,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// index in its secondary tags but resolves a mismatch in hardware.
     const HAS_VCE: bool = MODEL == model::R4400;
 
-    /// IP28 bring-up watch: physical window to trace, from IRIS_IP28_WATCH.
-    /// Folds to a constant `None` on every model but the R10000, so the
-    /// non-IP28 hot path keeps no trace of this.
-    #[inline(always)]
-    fn ip28_watch() -> Option<u64> {
-        if !Self::R10K_CACHE_OPS { return None; }
-        static W: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        *W.get_or_init(|| {
-            std::env::var("IRIS_IP28_WATCH").ok().and_then(|v| {
-                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
-            })
-        })
-    }
-
-    #[inline(always)]
-    fn ip28_trace(&self, what: &str, addr: u64, val: u64) {
-        if let Some(w) = Self::ip28_watch() {
-            if (addr & !0x7f) == (w & !0x7f) {
-                eprintln!("ip28watch: {what:<18} addr={addr:#018x} val={val:#018x}");
-            }
-        }
-    }
-
     // Logical L2 size; 0 means the model has no secondary cache.
     pub const L2_SIZE: usize = if HAS_L2 { L2_CACHE_SIZE } else { 0 };
 
@@ -4015,7 +3992,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
-        self.ip28_trace("read", phys_addr, 0);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(feature = "debug_cache")]
         {
@@ -4082,7 +4058,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
-        self.ip28_trace("write", phys_addr, val);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(feature = "debug_cache")]
         {
@@ -4212,19 +4187,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
-        if Self::R10K_CACHE_OPS && std::env::var_os("IRIS_IP28_CACHEOPS").is_some() {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static SEEN: AtomicU32 = AtomicU32::new(0);
-            let bit = 1u32 << (cache_op & 0x1F);
-            let all = matches!(std::env::var("IRIS_IP28_CACHEOPS").as_deref(), Ok("all"));
-            if all || SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-                eprintln!("ip28: op {} raw={:#04x} va={:#018x} arg={:#018x}",
-                          cache_op_name(cache_op), cache_op, virt_addr, phys_addr);
-            }
-        }
-        if Self::ip28_watch().is_some() {
-            self.ip28_trace(cache_op_name(cache_op), virt_addr, phys_addr);
-        }
         // R10000 ops 5/6/7 are not the R4000 hit operations that share these
         // encodings — see C_R10K_ISD. Handled before the shared decode below.
         if Self::R10K_CACHE_OPS {
@@ -4370,10 +4332,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     // L2 TagLo format:
                     //   [31:13] physical tag   [12:10] state   [9:7] PIdx
                     let tag: L2Tag = self.l2.get_tag(idx);
-                    if MODEL == model::R10000 {
-                        eprintln!("ip28: C_ILT(SD) idx={idx:#x} ptag={:#x} cs={:#x} pidx={:#x}",
-                                  tag.ptag(), tag.cs(), tag.pidx());
-                    }
                     let state = match tag.cs() {
                         L2_CS_INVALID => 0,
                         L2_CS_CLEAN_EXCLUSIVE => 4,

@@ -28,36 +28,6 @@ pub const STATUS_CU1: u32 = 1 << 29;    // Coprocessor 1 (FPU) Usable
 pub const STATUS_CU2: u32 = 1 << 30;    // Coprocessor 2 Usable
 pub const STATUS_CU3: u32 = 1 << 31;    // Coprocessor 3 Usable
 
-/// Is CP0 register tracing on? `log mips.cp0 on` on the monitor.
-///
-/// Traces everything the cache-error machinery touches — CP0 ECC (26) and
-/// CacheErr (27) accesses, Status.DE transitions, and CACHE ops.
-///
-/// Built to explain why SGI's own IDE field diagnostic reports "Failure
-/// detected on the CPU module" on an otherwise healthy emulated R10000. What
-/// it found: the IDE ends in a bounded 3712-iteration loop reading CacheErr
-/// and ECC, both of which return zero every pass, because nothing in this
-/// emulator ever writes CacheErr — we do not detect or log a cache error at
-/// all. Note it does this with Status.DE *set*: DE suppresses only the trap,
-/// while real hardware still records the error, which is what a poll-based
-/// parity test relies on. (An earlier guess that the IDE wanted a Cache Error
-/// *exception* was refuted by this tracer — DE is never cleared outside the
-/// PROM's own memory sizing.)
-///
-/// One relaxed atomic load when off, and unlike the `IRIS_IP28_CACHEDIAG`
-/// environment variable this replaced it can be turned on, masked and
-/// redirected to a file part-way through a boot.
-#[inline(always)]
-pub fn cachediag_on() -> bool {
-    cp0_log()
-}
-
-/// `log mips.cp0 on` — CP0 register traffic.
-#[inline(always)]
-pub fn cp0_log() -> bool {
-    crate::devlog::devlog_on(crate::devlog::LogModule::Mips, crate::cpu::mips_exec::MIPS_LOG_CP0)
-}
-
 // CP0 Cause Register bit definitions
 pub const CAUSE_EXCCODE_MASK: u32 = 0x1F << 2; // Exception Code mask
 pub const CAUSE_EXCCODE_SHIFT: u32 = 2;        // Exception Code shift
@@ -1620,19 +1590,6 @@ impl MipsCore {
     /// Write a GPR by index. Unconditionally re-zeros gpr\[0\] to avoid a branch.
     #[inline(always)]
     pub fn write_gpr(&mut self, reg: u32, value: u64) {
-        // IP28 bring-up: `IRIS_IP28_WATCHGPR=<n>` reports every write to that GPR.
-        // Developer builds only: a release build would pay a check per write.
-        #[cfg(feature = "developer")]
-        {
-            static WATCH: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-            let watch = *WATCH.get_or_init(|| {
-                std::env::var("IRIS_IP28_WATCHGPR").ok().and_then(|v| v.trim().parse().ok())
-            });
-            if watch == Some(reg) {
-                crate::dlog!(crate::devlog::LogModule::Mips,
-                             "ip28gpr: ${reg} = {value:#018x} at pc={:#018x}", self.pc);
-            }
-        }
         unsafe { *self.gpr.get_unchecked_mut(reg as usize) = value; }
         self.gpr[0] = 0;
     }
@@ -1714,20 +1671,8 @@ impl MipsCore {
                 eprintln!("[ip7] MFC0 PerfCnt (reg 25) read -> 0");
                 0
             }
-            26 => {
-                if cachediag_on() {
-                    eprintln!("ip28cd: MFC0 ECC -> {:#010x} pc={:#018x}",
-                              self.cp0_ecc, self.pc);
-                }
-                self.cp0_ecc as u64
-            }
-            27 => {
-                if cachediag_on() {
-                    eprintln!("ip28cd: MFC0 CacheErr -> {:#010x} pc={:#018x}",
-                              self.cp0_cacheerr, self.pc);
-                }
-                self.cp0_cacheerr as u64
-            }
+            26 => self.cp0_ecc as u64,
+            27 => self.cp0_cacheerr as u64,
             28 => self.cp0_taglo,
             29 => self.cp0_taghi as u64,
             30 => self.cp0_errorepc,
@@ -2190,16 +2135,6 @@ impl MipsCore {
                 self.reanchor_count_and_reschedule();
             }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
-                // `log mips.cp0 on` shows what the guest wrote against
-                // what survives the mask: the model's VPN2 width, 40 bits or the
-                // R10000 family's 44.
-                if cp0_log() && (value & !self.entryhi_mask) != 0 {
-                    crate::dlog!(crate::devlog::LogModule::Mips,
-                        "ip28ehi: wrote {value:#018x} -> kept {:#018x} (lost {:#018x}) pc={:#018x}",
-                        value & self.entryhi_mask,
-                        value & !self.entryhi_mask,
-                        self.pc);
-                }
                 self.cp0_entryhi = value & self.entryhi_mask;
             },
             11 => {
@@ -2330,18 +2265,6 @@ impl MipsCore {
             12 => {
                 let old = self.cp0_status;
                 self.cp0_status = value as u32;
-                // Status.DE gates cache error exceptions. A diagnostic that
-                // means to provoke one has to clear it first, so a DE
-                // transition is the guest announcing its intent.
-                if cachediag_on() && (old ^ self.cp0_status) & STATUS_DE != 0 {
-                    eprintln!("ip28cd: Status.DE {} pc={:#018x}",
-                              if self.cp0_status & STATUS_DE != 0 {
-                                  "SET (cache exceptions DISABLED)"
-                              } else {
-                                  "CLEAR (cache exceptions ENABLED)"
-                              },
-                              self.pc);
-                }
                 // Trace every change to the IP7 mask bit (Status.IM7). Linux's
                 // mips_cpu_irq_controller masks IM7 on interrupt entry
                 // (irq_ack) and unmasks on EOI; if the unmask never comes, no
@@ -2371,14 +2294,6 @@ impl MipsCore {
                 self.sync_soft_interrupts();
             }
             14 => {
-                // A guest write of a 32-bit value here is where a 64-bit
-                // return address would lose its top half, so the ERET that
-                // follows lands at a truncated PC. `log mips.cp0 on`.
-                if cp0_log() {
-                    crate::dlog!(crate::devlog::LogModule::Mips,
-                        "ip28epc: write EPC={value:#018x} (was {:#018x}) from pc={:#018x}",
-                        self.cp0_epc, self.pc);
-                }
                 self.cp0_epc = value;
             }
             15 => { /* PRId is read-only */ }
@@ -2399,15 +2314,6 @@ impl MipsCore {
             18 => self.cp0_watchlo = value as u32,
             19 => self.cp0_watchhi = value as u32,
             20 => {
-                // IP28 bring-up: IRIX's XTLB refill handler builds the page
-                // table base itself and expects XContext's PTEBase to be
-                // zero, so anything landing in bits [63:33] becomes a wild
-                // pointer inside the handler. `log mips.cp0 on`.
-                if cp0_log() {
-                    crate::dlog!(crate::devlog::LogModule::Mips,
-                        "ip28xctx: write {value:#018x} (ptebase={:#018x}) pc={:#018x}",
-                        value & 0xFFFF_FFFE_0000_0000, self.pc);
-                }
                 self.cp0_xcontext = value;
             }
             // FrameMask: bits 15:0 are implemented, the rest read as zero
@@ -2418,20 +2324,8 @@ impl MipsCore {
                 #[cfg(feature = "developer_ip7")]
                 eprintln!("[ip7] MTC0 PerfCnt (reg 25) write {:#018x} (ignored)", value);
             }
-            26 => {
-                if cachediag_on() {
-                    eprintln!("ip28cd: MTC0 ECC = {:#010x} (was {:#010x}) pc={:#018x}",
-                              value as u32, self.cp0_ecc, self.pc);
-                }
-                self.cp0_ecc = value as u32;
-            }
-            27 => {
-                if cachediag_on() {
-                    eprintln!("ip28cd: MTC0 CacheErr = {:#010x} (was {:#010x}) pc={:#018x}",
-                              value as u32, self.cp0_cacheerr, self.pc);
-                }
-                self.cp0_cacheerr = value as u32;
-            }
+            26 => self.cp0_ecc = value as u32,
+            27 => self.cp0_cacheerr = value as u32,
             28 => self.cp0_taglo = value,
             29 => self.cp0_taghi = value as u32,
             30 => self.cp0_errorepc = value,
