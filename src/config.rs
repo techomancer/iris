@@ -1746,8 +1746,8 @@ impl Default for O2Section {
 /// Misc debug/capture runtime tuning (`[debug]` section). Applied to process
 /// env at Start. These knobs are independent of any particular JIT engine —
 /// gui_gl_capture picks iris-gui's framebuffer capture renderer, no_idle
-/// disables the interpreter's idle-park path, and debug_log seeds the devlog
-/// module spec — see their respective `IRIS_*` env var readers.
+/// disables the interpreter's idle-park path, and `log` turns trace points on
+/// from startup (see `devlog`) — see their respective `IRIS_*` env var readers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
@@ -1756,8 +1756,12 @@ pub struct DebugConfig {
     pub gui_gl_capture: bool,
     #[serde(default)]
     pub no_idle: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub debug_log: String,
+    /// Trace points to turn on at startup, as for the monitor's `log`.
+    #[serde(default, skip_serializing_if = "String::is_empty", alias = "debug_log")]
+    pub log: String,
+    /// Monitor commands to run once the machine is built, before the CPU starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub startup: Vec<String>,
 }
 
 impl Default for DebugConfig {
@@ -1765,7 +1769,8 @@ impl Default for DebugConfig {
         Self {
             gui_gl_capture: false,
             no_idle: false,
-            debug_log: String::new(),
+            log: String::new(),
+            startup: Vec::new(),
         }
     }
 }
@@ -1776,19 +1781,11 @@ impl DebugConfig {
     /// Default false/blank values preserve variables the caller already set;
     /// explicit nonempty values overwrite the corresponding variable.
     ///
-    /// The caller's comment has always promised "env vars still override if
-    /// set externally" and the code did the opposite: a config with no
-    /// `debug_log` key called `remove_var`, so `IRIS_DEBUG_LOG=l2c ./iris
-    /// --config foo.toml` silently deleted its own setting and produced no
-    /// logging at all — devlog looked dead when only its bootstrap was.
-    ///
-    /// This governs all three `[debug]` keys, not just `debug_log`: a caller
-    /// who sets `IRIS_NO_IDLE` or `IRIS_GUI_GL` keeps it when the corresponding
-    /// config value is false; an enabled setting publishes `1`.
+    /// A caller who sets `IRIS_NO_IDLE` or `IRIS_GUI_GL` keeps it when the
+    /// corresponding config value is false; an enabled setting publishes `1`.
     pub fn apply_env(&self) {
         set_or_remove_env("IRIS_NO_IDLE", if self.no_idle { "1" } else { "" });
         set_or_remove_env("IRIS_GUI_GL", if self.gui_gl_capture { "1" } else { "" });
-        set_or_remove_env("IRIS_DEBUG_LOG", &self.debug_log);
     }
 }
 
@@ -4206,6 +4203,16 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub perfetto: Option<String>,
 
+    /// Trace points to turn on from startup, e.g. `heart,l1d.*,-l1d.hit`; output goes to stderr.
+    /// Same patterns as the monitor's `log`.
+    #[arg(long = "log", value_name = "POINTS")]
+    pub log: Option<String>,
+
+    /// A monitor command to run once the machine is built, before the CPU starts, e.g.
+    /// `--startup "rex trace /tmp/rex.txt"`. May be repeated.
+    #[arg(long = "startup", value_name = "COMMAND")]
+    pub startup: Vec<String>,
+
     /// Perfetto categories, e.g. `irq,gfx` or `all,-jit` [default: all]
     #[arg(long = "perfetto-cats", value_name = "LIST")]
     pub perfetto_cats: Option<String>,
@@ -4355,6 +4362,8 @@ impl Cli {
         if let Some(k) = self.keyboard { cfg.keyboard = k; }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref p) = self.perfetto { cfg.perfetto = Some(p.clone()); }
+        if let Some(ref p) = self.log { cfg.debug.log = p.clone(); }
+        if !self.startup.is_empty() { cfg.debug.startup = self.startup.clone(); }
         if let Some(ref p) = self.perfetto_cats { cfg.perfetto_cats = Some(p.clone()); }
         if let Some(ref p) = self.perfetto_clock { cfg.perfetto_clock = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
@@ -5665,7 +5674,7 @@ mod apply_env_tests {
             std::env::var(EXTERNAL).ok().as_deref(),
             Some("l2c"),
             "a config that does not mention the key must leave the caller's value alone: \
-             `IRIS_DEBUG_LOG=l2c iris --config foo.toml` used to silently delete itself",
+             `IRIS_NO_IDLE=1 iris --config foo.toml` used to silently delete itself",
         );
         std::env::remove_var(EXTERNAL);
     }

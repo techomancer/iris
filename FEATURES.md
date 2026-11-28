@@ -527,7 +527,8 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `debug.gui_gl_capture` | `false` | GUI GL compositor capture path (IRIS_GUI_GL). |
 | `debug.no_idle` | `false` | Suppress idle parking (IRIS_NO_IDLE); useful with idle-pause builds. |
-| `debug.debug_log` | `""` | Device log specification (IRIS_DEBUG_LOG); developer instrumentation required. |
+| `debug.log` | `""` | Trace points to turn on at startup (`--log`), as for the monitor's `log`: `heart,l1d.*,-l1d.hit`. Some points need a `developer` build. Was `debug_log`, still read. |
+| `debug.startup` | `[]` | Monitor commands to run once the machine is built, before the CPU starts (`--startup`, repeatable): `["rex trace /tmp/rex.txt", "log hal2.* on"]`. A command that fails stops the start; the commands are split on spaces, so a path cannot contain one. `--startup` replaces the config's list. Not run again on a reset or a snapshot load. |
 
 ### [perf]
 
@@ -778,7 +779,6 @@ mistaken for GUI settings.
 | `IRIS_CHD_DIFF_DIR` | Redirect CHD diff sidecars; GUI App Store sets a writable container directory. | [src/chd_disk.rs](src/chd_disk.rs) |
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
 | `IRIS_CRASH_SELFTEST` | Standalone crash diagnostic self-test selector; deliberately crashes. | [src/main.rs](src/main.rs) |
-| `IRIS_DEBUG_LOG` | Device log specification; applied to developer devlog after machine creation. | [src/main.rs](src/main.rs) |
 | `IRIS_DISPLAY_VERIFY` | 1 checks the boards' "nothing changed" verdicts: a frame IMPACT or VPro would have left standing is composed anyway and compared with the one on screen; a difference is reported on stderr, with a count every 600 checks. For development; it composes every frame. | [src/display/verify.rs](src/display/verify.rs) |
 | `IRIS_ENTRY_PREAMBLE` | 0 turns off jitv2's interrupt check at an externally dispatched entry word (on by default; `j2 entrypre`). | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_GPRCACHE` | Guest registers a JIT v2 function with a loop keeps in host registers, 0 to 31 (`j2 gprcache`; default 6, 10 on AArch64). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
@@ -797,12 +797,6 @@ mistaken for GUI settings.
 | `IRIS_IDLE_SLICE_US` | `idle-pause` builds, on a multiprocessor: the longest park in microseconds while every CPU is idle (default 10000); a CPU that ran an interrupt handler or other work wakes the others sooner. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_IDLE_WARMUP_SECS` | `idle-pause` builds: seconds after CPU start before idle parking engages (default 60; 0 disables the warm-up). | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_INTRUN` | Integer interrupt-check coalescing budget for JIT v2 code; also used by offline tools. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs), [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
-| `IRIS_IP28_CACHEOPS` | Presence traces cache ops in the legacy R10K cache model; all broadens logging. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
-| `IRIS_IP28_EXC_VADDR` | IP28 exception virtual-address trace filter. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
-| `IRIS_IP28_TLBW` | wired enables extra IP28 Wired/TLB-write tracing. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
-| `IRIS_IP28_WATCH` | IP28 physical-address/window access trace filter. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
-| `IRIS_IP28_WATCHGPR` | Guest GPR index whose writes are traced in IP28 bring-up. | [src/cpu/mips_core.rs](src/cpu/mips_core.rs) |
-| `IRIS_IP32_RE_TRACE` | Number of O2 rendering-engine primitives to record for `o2 retrace PATH`. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `IRIS_IP32_RE_LAG_US` | Test aid: the O2 rendering engine waits this many microseconds before each memory transfer, as on a host that keeps its thread waiting. Used with `tools/prom-boot-loop.py` to check that the PROM still reaches its menu (see [TESTING.md](TESTING.md#repeated-prom-boots)). | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `IRIS_JIT_ARENA_FLUSH_MB` | Treat a code arena as full when it holds this many MiB, so the compile pool switches arenas and retires the oldest often. For testing the arena rotation. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
 | `IRIS_JIT_PAGES` | Size of JIT v2's page pool in pages (default 4096, at least 16), so the pool recycles page slots often. For testing the recycling. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
@@ -820,24 +814,17 @@ mistaken for GUI settings.
 | `IRIS_JIT_VERIFY` | 1 or on runs Cranelift's IR verifier on every JIT v2 compile. Already on in unit tests and `--features developer` builds. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MGRAS_ENGINES` | IMPACT raster engine threads: `1`, `2` or `4` (default 2 on Maximum IMPACT, 1 on the others). More threads split the scanlines without changing what the guest sees. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
-| `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
-| `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
 | `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_NO_IDLE` | Any presence disables idle parking at startup (`idle-pause` builds); `idle on` re-enables it. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_NO_INLINE_MEM` | Any presence disables JIT inline memory emission. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT, the IMPACT raster JIT and the GR2 span JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs), [src/dev/mgras/rss_jit/mod.rs](src/dev/mgras/rss_jit/mod.rs), [src/dev/gr2/re3_jit/mod.rs](src/dev/gr2/re3_jit/mod.rs) |
 | `IRIS_O2_AUDIO_CAPTURE` | O2 host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
-| `IRIS_O2_TRACE` | Trace the O2's rendering engine, GBE and CRIME from power-on to this path (`gputrace` builds). | [src/dev/o2gfx_trace.rs](src/dev/o2gfx_trace.rs) |
 | `IRIS_OCTANE_AUDIO_CAPTURE` | Octane and Onyx2 (RAD1) host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/rad1.rs](src/dev/rad1.rs) |
 | `IRIS_ODSY_BACKEND` | `inline` keeps the VPro fragment pipeline's shading and back end (depth, stencil, blend and stores) on the raster thread, with no worker pool. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
-| `IRIS_ODSY_REC` | Record VPro bus stores, loads and DMA reads from power-on to this path (gzip; replayed by the tests in `src/dev/odyssey/golden/`; `vpro rec` does the same from the monitor). | [src/dev/odyssey/record.rs](src/dev/odyssey/record.rs) |
 | `IRIS_ODSY_SHADER` | `inline` walks and shades VPro filled triangles on the raster thread; the tile workers then only store. | [src/dev/odyssey/raster_unit.rs](src/dev/odyssey/raster_unit.rs) |
-| `IRIS_ODSY_TRACE` | Trace VPro command words, GL commands, bus accesses and DMA descriptors from power-on to this path (`gputrace` builds; `vpro trace` from the monitor). Also traces an offline replay (`VPRO_REPLAY`); a test that replays several sessions adds `.1`, `.2` and so on for the later ones. | [src/dev/odyssey/trace.rs](src/dev/odyssey/trace.rs) |
 | `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
 | `IRIS_REX3_GPU_STATS` | Set (any value) to add the costlier Newport GPU-raster telemetry to `rex status`: command generation time per GO and which state-slot words change from one primitive to the next. Read when the GPU raster starts. | [src/dev/ng1/wgpu/resident.rs](src/dev/ng1/wgpu/resident.rs) |
-| `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
-| `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
 | `IRIS_REX_JIT_PROFILE` | Where the REX3 shader JIT keeps its profile of draw modes between runs, instead of `~/.iris/rex-jit-profile.bin` (`rex-jit` builds). | [src/dev/ng1/rex3_profile.rs](src/dev/ng1/rex3_profile.rs) |
 | `IRIS_SNAPSHOT_SKIP_CHECK` | 1 bypasses selected snapshot compatibility checks; diagnostic escape hatch. | [src/machine.rs](src/machine.rs) |
 | `IRIS_SOCKET` | iris-ci default socket override (Unix path or TCP address). | [src/iris_ci_main.rs](src/iris_ci_main.rs) |
@@ -904,13 +891,13 @@ tests, and subprocesses the tests start. A normal run never needs them.
 | `REX3_CORPUS_OUT` | Existing directory, relative to the repository, the ignored REX3 shader-corpus generator writes into. | [src/dev/ng1/rex3_corpus.rs](src/dev/ng1/rex3_corpus.rs) |
 | `REX3_REPLAY` | Recording for the ignored one-file REX3 replay test. `REX3_REPLAY_ENGINE` is `jit` (default), `interp`, or `resident` (the GPU raster, `wgpu`, with `REX3_GPU_BACKEND`); `REX3_REPLAY_LIMIT=<n>` replays the first n records; `REX3_REPLAY_NOCHECK` skips the checkpoints; `REX3_REPLAY_TRACE=<file>` traces the replay; `REX3_REPLAY_STATE=<file>` writes the final register state as TOML; `REX3_REPLAY_OUT=<png>` saves the screen. | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `REX3_RESIDENT_BACKEND` | Test-only resident GPU adapter backend: `auto`, `vulkan`, `dx12`, `metal` or `gl`. The ignored hardware tests require the selected backend and a hardware adapter; this variable does not enable a live renderer. See [TESTING.md](TESTING.md). | [src/dev/ng1/wgpu/resident_tests.rs](src/dev/ng1/wgpu/resident_tests.rs) |
-| `RE_REPLAY`, `RE_SPEED` | O2 rendering-engine traces (`IRIS_IP32_RE_TRACE`, saved with `retrace`) for the ignored replay and replay-speed tests. `RE_REPLAY_PNG` names the replay's image (default `replay.png`); `RE_REPLAY_BUF`, `RE_REPLAY_LOW`, `RE_REPLAY_HALF`, `RE_REPLAY_PX`, `RE_REPLAY_PRELOAD`, `RE_REPLAY_PRELOAD_EVERY` and `RE_GOURAUD` select what it shows and preloads; `RE_SPEED_PASSES` (default 5) the timed passes. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
+| `RE_REPLAY`, `RE_SPEED` | O2 rendering-engine traces (`re rec`) for the ignored replay and replay-speed tests. `RE_REPLAY_PNG` names the replay's image (default `replay.png`); `RE_REPLAY_BUF`, `RE_REPLAY_LOW`, `RE_REPLAY_HALF`, `RE_REPLAY_PX`, `RE_REPLAY_PRELOAD`, `RE_REPLAY_PRELOAD_EVERY` and `RE_GOURAUD` select what it shows and preloads; `RE_SPEED_PASSES` (default 5) the timed passes. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `VPRO_GOLDEN` | `tolerance` lets a VPro golden frame whose hash changed pass inside its stored limits. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
 | `VPRO_GOLDEN_BLESS`, `VPRO_GOLDEN_SCENE` | The ignored `bless` test requires `VPRO_GOLDEN_BLESS` before replacing reference hashes/images; `VPRO_GOLDEN_SCENE` restricts it to one scene. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
 | `VPRO_GOLDEN_OUT` | Directory for images of failing golden frames; does not replace the references. | [src/dev/odyssey/golden/mod.rs](src/dev/odyssey/golden/mod.rs) |
 | `VPRO_GPU_TRACE_WAITS` | With the `wgpu` feature: the VPro GPU unit counts its readbacks by the board function that caused them; the replay prints the histogram. | [src/dev/odyssey/wgpu/mod.rs](src/dev/odyssey/wgpu/mod.rs) |
 | `VPRO_PARITY_DIR` | Recording directory for CPU/GPU replay parity tests, default `ignore/recordings/gpu-cases`. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
-| `VPRO_REPLAY` | Replay input path for one VPro recording; `VPRO_REPLAY_DIR` picks the directory that is replayed otherwise, `VPRO_REPLAY_THREADS=1` replays with the raster and back-end threads running, `VPRO_REPLAY_GPU=1` replays on the GPU raster unit (`wgpu` feature; with `VPRO_REPLAY_LAZY=1` the unit skips the readbacks between checkpoints, to time the GPU path alone), `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks only the checkpoints reached (with `VPRO_REPLAY_DUMP` to see the board there), `VPRO_REPLAY_TICK=<n>` ends a board slice every n stores as a running machine does (on the GPU unit each slice end can submit a batch), `VPRO_REPLAY_WRITES=<file>` logs every write the board makes to guest memory (pixel reads, fences, query results); the report line gives their hash and the final memory hash, to compare two replays, and the time the stores took to draw without the checkpoints' hashing ("(x s drawing)"), to time two builds. `VPRO_GPU=1` puts every VPro test board (the golden scenes among them) on the GPU raster unit. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
+| `VPRO_REPLAY` | Replay input path for one VPro recording; `VPRO_REPLAY_DIR` picks the directory that is replayed otherwise, `VPRO_REPLAY_THREADS=1` replays with the raster and back-end threads running, `VPRO_REPLAY_GPU=1` replays on the GPU raster unit (`wgpu` feature; with `VPRO_REPLAY_LAZY=1` the unit skips the readbacks between checkpoints, to time the GPU path alone), `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks only the checkpoints reached (with `VPRO_REPLAY_DUMP` to see the board there), `VPRO_REPLAY_TICK=<n>` ends a board slice every n stores as a running machine does (on the GPU unit each slice end can submit a batch), `VPRO_REPLAY_TRACE=<file>` writes the annotated trace of a replay (`gputrace` builds; later sessions of one test get `.1`, `.2`), `VPRO_REPLAY_WRITES=<file>` logs every write the board makes to guest memory (pixel reads, fences, query results); the report line gives their hash and the final memory hash, to compare two replays, and the time the stores took to draw without the checkpoints' hashing ("(x s drawing)"), to time two builds. `VPRO_GPU=1` puts every VPro test board (the golden scenes among them) on the GPU raster unit. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
 | `VPRO_REPLAY_BLESS`, `VPRO_REPLAY_REQUIRE` | The ignored checkpoint-replacement test requires `VPRO_REPLAY_BLESS`; `VPRO_REPLAY_REQUIRE` makes an empty replay corpus fail instead of skip. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
 | `VPRO_REPLAY_OUT`, `VPRO_REPLAY_SHOTS`, `VPRO_REPLAY_EVERY` | Save the final replay screen to a PNG, save each checkpoint screen in a directory, or additionally save a screen every N records. | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
 | `VPRO_REPLAY_POOL` | With threaded replay, `<threads>,<tile>` selects the worker count and tile size (default `2,32`). | [src/dev/odyssey/golden/replay.rs](src/dev/odyssey/golden/replay.rs) |
@@ -918,7 +905,7 @@ tests, and subprocesses the tests start. A normal run never needs them.
 | `WGPU_TEST_BACKEND` | wgpu backend for the ignored common-layer GPU tests (default `auto`). | [src/wgpu/tests/mod.rs](src/wgpu/tests/mod.rs) |
 
 `RUST_LOG` configures the host Rust logger (errors only when unset);
-`IRIS_DEBUG_LOG` configures device logging. Standard host variables (`HOME`,
+`--log` configures device logging. Standard host variables (`HOME`,
 `XDG_CACHE_HOME`, `LOCALAPPDATA`, `TMPDIR`, `PATH`, `USER`, `DISPLAY`,
 `WAYLAND_DISPLAY`, `APPIMAGE`, `PROCESSOR_IDENTIFIER`, `SystemRoot`) affect
 platform paths/launch behavior, not guest hardware; `TMPDIR` also places the

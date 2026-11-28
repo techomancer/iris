@@ -28,7 +28,7 @@ ignore/gr4/GE11.h, `mask`.
 Repro: `test/gltest/cicopy.c` (`sh irix.sh cicopy; ./cicopy`), and pixtest
 `--ci 12 --only ci12/copy/`.
 
-Debugging that found it: a power-on recording (`IRIS_MGRAS_REC`) replays
+Debugging that found it: a power-on recording (`--startup "mgras rec FILE"`) replays
 to the live state with all checkpoints; a mid-session `mgras rec` does
 not (the GL HLE never sees the context's CI format). Replay with the
 raster JIT off and on gave the same final hash, which put the bug ahead of

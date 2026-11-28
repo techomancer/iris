@@ -65,19 +65,33 @@ impl Monitor {
         self.devices.lock().push(device);
     }
 
+    fn offering(&self, cmd: &str) -> Vec<Arc<dyn Device>> {
+        self.devices.lock().iter().filter(|d| d.register_commands().iter().any(|(c, _)| c == cmd)).cloned().collect()
+    }
+
+    /// Run a command line as a client would type it, on each device that offers
+    /// the command: what it printed, or the first error.
+    pub fn run_line(&self, line: &str) -> Result<String, String> {
+        let mut words = line.split_whitespace();
+        let cmd = words.next().ok_or("empty command")?;
+        let args: Vec<&str> = words.collect();
+        let devs = self.offering(cmd);
+        if devs.is_empty() {
+            return Err(format!("unknown command {cmd}"));
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        for d in devs {
+            d.execute_command(cmd, &args, Box::new(Capture(out.clone())))?;
+        }
+        let text = String::from_utf8_lossy(&out.lock()).into_owned();
+        Ok(text)
+    }
+
     /// What `cmd args` prints, from every device that offers it.
     #[cfg(test)]
     pub(crate) fn run(&self, cmd: &str, args: &[&str]) -> String {
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-        impl Write for Capture {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-        }
         let out = Arc::new(Mutex::new(Vec::new()));
-        let devs: Vec<_> = self.devices.lock().iter().filter(|d| d.register_commands().iter().any(|(c, _)| c == cmd)).cloned().collect();
+        let devs = self.offering(cmd);
         for d in devs {
             if let Err(e) = d.execute_command(cmd, args, Box::new(Capture(out.clone()))) {
                 out.lock().extend_from_slice(format!("Error: {e}\n").as_bytes());
@@ -160,13 +174,10 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     // Register this connection with DevLog so log output is broadcast here.
     // Wrap in CrlfWriter so bare \n from log messages renders as CRLF on the
     // telnet client side.
-    let sink = crate::devlog::DEVLOG.get().map(|dl| {
-        let w: crate::devlog::DevLogWriter = Arc::new(Mutex::new(
-            BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap()))
-        ));
-        dl.add_sink(w.clone());
-        (dl, w)
-    });
+    let sink: crate::devlog::DevLogWriter = Arc::new(Mutex::new(
+        BufWriter::new(crate::net::telnet::CrlfWriter::new(stream.try_clone().unwrap()))
+    ));
+    crate::devlog::DEVLOG.add_sink(sink.clone());
 
     // Monitor is line-oriented: stay in NVT (passive telnet — strip inbound
     // IAC, decline whatever the client offers, but don't initiate). The
@@ -311,9 +322,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
         let _ = write!(writer, "> ");
         let _ = writer.flush();
     }
-    if let Some((dl, w)) = sink {
-        dl.remove_sink(&w);
-    }
+    crate::devlog::DEVLOG.remove_sink(&sink);
     // Hang up. Closing our handles is not enough: a device may keep the
     // writer a command was given, whose handle keeps the connection open,
     // and the console client waits for it to close before it exits.
@@ -448,6 +457,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_line_runs_a_command_and_refuses_an_unknown_one() {
+        struct Echo;
+        impl Device for Echo {
+            fn step(&self, _: u64) {}
+            fn stop(&self) {}
+            fn start(&self) {}
+            fn is_running(&self) -> bool { true }
+            fn register_commands(&self) -> Vec<(String, String)> { vec![("echo".into(), "echo".into())] }
+            fn execute_command(&self, _: &str, args: &[&str], mut w: Box<dyn Write + Send>) -> Result<(), String> {
+                if args == ["bad"] { return Err("no".into()) }
+                writeln!(w, "{}", args.join(" ")).map_err(|e| e.to_string())
+            }
+        }
+        let monitor = Monitor::new();
+        monitor.register_device(Arc::new(Echo));
+        assert_eq!(monitor.run_line(" echo a  b "), Ok("a b\n".into()));
+        assert_eq!(monitor.run_line("echo bad"), Err("no".into()));
+        assert_eq!(monitor.run_line("nope"), Err("unknown command nope".into()));
+    }
+
     /// A command two devices both offer runs on each, and `help` lists it once.
     #[test]
     fn a_shared_command_runs_on_every_device_that_offers_it() {
@@ -528,7 +558,6 @@ mod tests {
     #[test]
     fn quit_hangs_up_despite_the_log_sink() {
         use std::io::{Read, Write};
-        crate::devlog::init_devlog();
         let monitor = Arc::new(Monitor::new());
         monitor.clone().start_server("127.0.0.1:0".to_string());
         let addr = wait_for("bind", || monitor.bound_addr());
@@ -548,7 +577,6 @@ mod tests {
 
     fn converse_with(devices: Vec<Arc<dyn Device>>, input: &[u8]) -> String {
         use std::io::{Read, Write};
-        crate::devlog::init_devlog();
         let monitor = Arc::new(Monitor::new());
         for d in devices {
             monitor.register_device(d);

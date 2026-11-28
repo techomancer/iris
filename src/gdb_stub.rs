@@ -338,7 +338,6 @@ impl Target for IrisTarget {
 impl SingleThreadBase for IrisTarget {
     fn read_registers(&mut self, regs: &mut IrisMipsRegs) -> TargetResult<(), Self> {
         regs.0 = self.cpu.read_regs();
-        //eprintln!("GDB: read_registers PC={:#018x}", regs.0.pc);
         Ok(())
     }
 
@@ -413,7 +412,6 @@ impl SingleRegisterAccess<()> for IrisTarget {
 
 impl SingleThreadResume for IrisTarget {
     fn resume(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
-        //eprintln!("GDB: resume() called (continue)");
         // Mark as running; the event loop (IrisEventLoop::wait_for_stop_reason)
         // will spawn the debug thread and poll for completion.
         self.exec_state = ExecState::Running;
@@ -428,10 +426,8 @@ impl SingleThreadResume for IrisTarget {
 
 impl SingleThreadSingleStep for IrisTarget {
     fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
-        //eprintln!("GDB: step() called");
         // Execute one logical MIPS instruction (branch + delay slot as a unit).
         let reason = self.cpu.step_one();
-        //eprintln!("GDB: step() done, reason={:?}, exec_state->StepDone", reason);
         self.last_stop = reason;
         self.exec_state = ExecState::StepDone;
         Ok(())
@@ -656,18 +652,15 @@ impl BlockingEventLoop for IrisEventLoop {
         >,
     > {
         use run_blocking::Event;
-        //eprintln!("GDB: wait_for_stop_reason entered, exec_state={}", target.exec_state as u8);
 
         // If a single-step just completed synchronously, report it immediately.
         if target.exec_state == ExecState::StepDone {
-            //eprintln!("GDB: wait_for_stop_reason: StepDone -> TargetStopped({:?})", target.last_stop);
             target.exec_state = ExecState::Stopped;
             return Ok(Event::TargetStopped(target.last_stop.to_gdb()));
         }
 
         // Launch the CPU in a background thread so we can poll for Ctrl-C.
         if target.exec_state == ExecState::Running {
-            //eprintln!("GDB: launching gdb-continue thread");
             let cpu = target.cpu.clone();
             thread::Builder::new()
                 .name("gdb-continue".to_string())
@@ -688,13 +681,11 @@ impl BlockingEventLoop for IrisEventLoop {
                 target.exec_state = ExecState::Stopped;
                 let reason = target.cpu.last_stop_reason();
                 target.last_stop = reason;
-                //eprintln!("GDB: continue stopped, reason={:?}", reason);
                 return Ok(Event::TargetStopped(reason.to_gdb()));
             }
 
             match conn.peek() {
                 Ok(Some(byte)) => {
-                    //eprintln!("GDB: incoming 0x{:02x} during run", byte);
                     // Only 0x03 (Ctrl-C) is valid while running — pass it to gdbstub
                     // which will call on_interrupt. Any other byte (e.g. stray '+' ACK)
                     // is ignored here; gdbstub shouldn't send packets mid-execution.
@@ -713,19 +704,15 @@ impl BlockingEventLoop for IrisEventLoop {
     fn on_interrupt(
         target: &mut IrisTarget,
     ) -> Result<Option<Self::StopReason>, <Self::Target as Target>::Error> {
-        //eprintln!("GDB: on_interrupt called, exec_state={:?}, is_running={}",
-        //    target.exec_state as u8, target.cpu.is_running());
         // Spurious 0x03 from GDB's stack-frame heuristic. It fires before the step
         // packet is sent, while we are either Stopped (idle, from_idle=true) or
         // Polling (inside wait_for_stop_reason, from_idle=false but CPU not running).
         // In both cases the CPU is stopped and the interrupt is noise.
         // Return DoneStep so gdbstub sends a stop reply and GDB can then send si again.
         if !target.cpu.is_running() {
-            //eprintln!("GDB: on_interrupt: CPU not running (spurious), returning DoneStep");
             target.exec_state = ExecState::Stopped;
             return Ok(Some(SingleThreadStopReason::DoneStep));
         }
-        //eprintln!("GDB: on_interrupt: real interrupt, stopping CPU");
         target.cpu.stop();
         target.exec_state = ExecState::Stopped;
         target.last_stop = StopReason::Interrupted;
@@ -762,7 +749,6 @@ impl gdbstub::conn::ConnectionExt for LoggingStream {
         self.0.set_nonblocking(false)?;
         let mut buf = [0u8; 1];
         Read::read_exact(&mut self.0, &mut buf)?;
-        //eprintln!("GDB <<< 0x{:02x} {:?}", buf[0], char::from(buf[0]));
         Ok(buf[0])
     }
     fn peek(&mut self) -> Result<Option<u8>, Self::Error> {

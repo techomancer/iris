@@ -1634,9 +1634,9 @@ fn device_log() -> String {
     static LOG: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
     let log = LOG.get_or_init(|| {
         let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dl = crate::devlog::DEVLOG.get().cloned().unwrap_or_else(crate::devlog::init_devlog);
+        let dl = &crate::devlog::DEVLOG;
         dl.add_sink(Arc::new(parking_lot::Mutex::new(Sink(buf.clone()))));
-        dl.enable(crate::devlog::LogModule::Ioc);
+        dl.select("ioc", true).unwrap();
         buf
     });
     String::from_utf8_lossy(&log.lock().unwrap()).into_owned()

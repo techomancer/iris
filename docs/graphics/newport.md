@@ -231,7 +231,7 @@ The device commands: `vc2 status|ramdump`, `xmap status|dump`,
 - `rex3_tests.rs`: unit tests that start the real processor thread through
   `make_rex3`, drive it through the bus, and read the frame buffers directly.
 - `rex3_rec.rs`: a replayable recording of every bus access and DMA, with hash
-  checkpoints. `rex rec <file>` or `IRIS_REX3_REC=<file>` writes one. The ignored
+  checkpoints. `rex rec <file>` (or `--startup "rex rec <file>"`) writes one. The ignored
   test `rex3_replay_file` replays the file named by `REX3_REPLAY`, and needs
   `gputrace`. `REX3_REPLAY_ENGINE=interp|jit|gpu` picks the draw path.
 - `rex3_corpus.rs` and `testdata/`: a synthetic set of seven recordings with a

@@ -100,7 +100,7 @@ not as a crash; the `vpro dirty` counter is the diagnostic.
 |---|---|---|---|---|
 | Monitor commands | `vpro refusals`, `vpro dirty` only | `mgras status|hq|gl|ge|ucode|vc3|xmap|cmap|dac|pix|stats|jit|fbdump|shot|dump|trace|rec`, `rss regs|pix` | `gr2 status|hq|ge|shram|ucode|vc1|xmap|clut|dac|pix|trace`, `re3 regs|pix` | `rex status|jit|debug|cmap|trace`, `vc2`, `xmap`, `cmap`, `bt445` |
 | Perfetto | `VPro cfifo level`, `VPro irq`, `VPro display/capture/present`, `slice`/`drain`, `raster slice`/`raster wait`, `dma descriptor` | yes | yes | yes |
-| Recording | `IRIS_ODSY_REC=<file>` at build time only; gzip; W/R/B/b records (bus stores, non-repeated loads, DMA reads) | `IRIS_MGRAS_REC` **and** `mgras rec <file>|mark|off` from the monitor; W/R/M/m/F records | `.rec` via monitor | `.rec` via monitor |
+| Recording | `vpro rec <file>` or `--startup "vpro rec <file>"` for power-on; gzip; W/R/B/b records (bus stores, non-repeated loads, DMA reads) | `mgras rec <file>|mark|off` from the monitor, or `--startup "mgras rec <file>"`; W/R/M/m/F records | `.rec` via monitor | `.rec` via monitor |
 | Replay test | `odyssey::golden::replay`, hashes every 500,000 records, `VPRO_REPLAY_OUT` PNG | `mgras_replay_file`, `MGRAS_REPLAY_TRACE` annotated trace, `mgras_rebaseline_file` | yes | yes |
 | Draw-level goldens | 78 scenes through `Board::gl_draw`, bit-exact hashes with a per-scene tolerance mode, PNGs in `testdata/golden/frames/`; vertex goldens for 6 matrix and 6 light setups | power-on replay goldens | pixel checks in `irix-gfx-loop` | pixel checks |
 | Benchmarks | `raster_bench` (fill rate per scene, `BENCH_FILL=table|dynamic|off`), `display_bench` (resolve) | sweep benches in `rss_jit_tests` | re3 bench | gfifo bench |

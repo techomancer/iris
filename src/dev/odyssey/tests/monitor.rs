@@ -343,8 +343,8 @@ fn trace_needs_gputrace_and_then_writes_the_classes_asked_for() {
     let path = dir.join("vpro.trace");
     let p = path.to_string_lossy().to_string();
     let err = vpro(&v, &format!("trace {p} hq")).expect_err("not a VPro class");
-    assert!(err.contains("unknown trace class 'hq'"), "{err}");
-    assert!(err.contains("(fifo, draw, cpu, dma, all)"), "the list names the real classes: {err}");
+    assert!(err.contains("'hq' matches nothing"), "{err}");
+    assert!(err.contains("all, fifo, draw, cpu, dma)"), "the list names the real classes: {err}");
 
     let started = vpro(&v, &format!("trace {p} fifo,draw,cpu"));
     if !cfg!(feature = "gputrace") {
@@ -382,7 +382,7 @@ fn trace_needs_gputrace_and_then_writes_the_classes_asked_for() {
     let draw_lines = text.lines().filter(|l| l.contains(" DRAW #")).count();
 
     let text = ok(&v, "trace off");
-    assert!(text.contains(&format!("trace closed: {p} (fifo {fifo_lines} / draw {draw_lines} / cpu 1 / dma 0)")), "{text}");
+    assert!(text.contains(&format!("trace closed: {p} (fifo {fifo_lines} / draw {draw_lines} / cpu 1 / dma 0 entries")), "{text}");
     assert_eq!(ok(&v, "trace").trim(), "trace not active");
     let _ = std::fs::remove_dir_all(&dir);
 }

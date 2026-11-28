@@ -54,6 +54,15 @@ fn main() {
     cfg.debug.apply_env();
     cfg.jitv2.apply_env();
 
+    // Before the machine exists, so what it logs while it is built is seen.
+    if std::env::var_os("IRIS_DEBUG_LOG").is_some() {
+        eprintln!("iris: IRIS_DEBUG_LOG is no longer read; use --log or [debug] log");
+    }
+    if let Err(e) = iris::devlog::DEVLOG.start(&cfg.debug.log) {
+        eprintln!("iris: --log: {}", e);
+        std::process::exit(1);
+    }
+
     // A window is wanted unless the run is headless or windowless CI (whether
     // a board is fitted is known only once the machine is built). A board
     // that draws through wgpu opens its device while the machine is built,
@@ -101,31 +110,6 @@ fn main() {
             Err(e) => {
                 eprintln!("iris: --load-elf {}: {}", path, e);
                 std::process::exit(1);
-            }
-        }
-    }
-
-    // DIAG: optionally enable verbose logging from startup via IRIS_DEBUG_LOG.
-    // IRIS_DEBUG_LOG="mc,mips" enables those modules. "all" enables everything.
-    // Output is broadcast to a stderr sink so jit-diag.sh's tee captures it inline.
-    if let Ok(spec) = std::env::var("IRIS_DEBUG_LOG") {
-        if let Some(dl) = iris::devlog::DEVLOG.get() {
-            // Register stderr as a sink so dlog output reaches our captured log.
-            let stderr_sink: iris::devlog::DevLogWriter = std::sync::Arc::new(
-                parking_lot::Mutex::new(std::io::stderr()),
-            );
-            dl.add_sink(stderr_sink);
-
-            for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                if name == "all" {
-                    for m in iris::devlog::LogModule::all() { dl.enable(*m); }
-                    eprintln!("DIAG: enabled all log modules -> stderr");
-                } else if let Some(m) = iris::devlog::LogModule::from_str(name) {
-                    dl.enable(m);
-                    eprintln!("DIAG: enabled log module {} -> stderr", m.name());
-                } else {
-                    eprintln!("DIAG: unknown log module '{}'", name);
-                }
             }
         }
     }

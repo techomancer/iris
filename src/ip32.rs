@@ -498,7 +498,6 @@ impl Ip32Bus {
             scsi: Mutex::new(Vec::new()),
             cards: std::sync::OnceLock::new(),
         };
-        bus.gbe.tr.start_from_env();
         if let Some(mac) = opts.mac {
             bus.mace.id = crate::dev::mace_id::MaceId::new(mac);
         }

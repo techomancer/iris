@@ -6,7 +6,7 @@ Same monitor syntax as gr2/mgras/rex:
 
     vpro trace <file> [fifo,draw,cpu,dma|all]   vpro trace flush|off   vpro trace (state)
     vpro rec <file>                           vpro rec mark|off      vpro rec (state)
-    IRIS_ODSY_TRACE=<file>  IRIS_ODSY_REC=<file>   from power-on
+    --startup "vpro trace <file>"   --startup "vpro rec <file>"   from power-on
     VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture
 
 ## The trace
@@ -25,8 +25,8 @@ Where the hooks are, and which thread writes:
 | `cpu` | `BoardLocks::taken`: every bus access that is not a command store, front registers included; a repeat of one (dir, offset, size, value) extends a run, closed by the next line of any class or a flush | processors |
 | `dma` | `Board::dma_descriptor`, once the header is read | board |
 
-The sink is a `Mutex<TraceSink>` behind `Board::trace` (an `Arc` the
-`BoardLocks` share). It is a leaf lock: nothing is taken while it is held,
+The sink is a `Mutex<TraceFile<CpuRun, 4>>` behind `Board::trace` (an
+`Arc` the `BoardLocks` share). It is a leaf lock: nothing is taken while it is held,
 so a hook can run on any thread. The display thread flushes it every frame,
 at most twice a second (`Odyssey::frame`); `vpro trace flush` forces it.
 
@@ -68,7 +68,7 @@ reached and lists marks as checkpoints beside the every-500,000-records
 ones. A first mark a fresh board does not reach means the recording started
 mid-session (`Report::mid_session`): its marks are then reported, not
 failed, and its blessed checkpoints pin the model's determinism under those
-stores, not the live screen. Only a power-on recording (`IRIS_ODSY_REC`)
+stores, not the live screen. Only a power-on recording (`--startup "vpro rec <file>"`)
 reproduces what the guest saw.
 
 What a `vpro rec` start cannot catch: a front-register access on another

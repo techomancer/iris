@@ -271,6 +271,21 @@ pub(crate) fn decode_dm1(v: u32) -> String {
     format!("{} {} host:{} cmp:{} logicop:{}{}", planes, depth, hdepth, dm.compare(), logicop, flags)
 }
 
+/// Say what an access nothing handles, the first few times per register and kind, so a polled one
+/// cannot flood stderr or hide a later one.
+fn unhandled(kind: &'static str, offset: u32, what: std::fmt::Arguments) {
+    static SEEN: std::sync::OnceLock<Mutex<HashMap<(&'static str, u32), u32>>> = std::sync::OnceLock::new();
+    if first_few(&mut SEEN.get_or_init(Default::default).lock(), kind, offset) {
+        eprintln!("REX3: unhandled {what}");
+    }
+}
+
+fn first_few(seen: &mut HashMap<(&'static str, u32), u32>, kind: &'static str, offset: u32) -> bool {
+    let n = seen.entry((kind, offset)).or_insert(0);
+    *n += 1;
+    *n <= 8
+}
+
 pub(crate) fn rex3_reg_name(offset: u32) -> &'static str {
     match offset {
         REX3_DRAWMODE1 => "DRAWMODE1",
@@ -1684,7 +1699,7 @@ impl Rex3 {
             #[cfg(feature = "gputrace")]
             rec: Mutex::new(None),
             #[cfg(feature = "gputrace")]
-            trace: Mutex::new(trace::Rex3Trace::new()),
+            trace: Mutex::new(trace::Rex3Trace::new(["gfifo", "cpu"], 1)),
             show_cmap: AtomicBool::new(false),
             show_disp_debug: AtomicBool::new(false),
         }
@@ -1717,7 +1732,7 @@ impl Rex3 {
         #[cfg(feature = "gputrace")]
         if self.tap.load(Ordering::Acquire) != 0
             || self.rec.lock().is_some()
-            || self.trace.lock().is_active()
+            || self.trace.lock().is_open()
         {
             return Err(ResidentError::InvalidState("REX3 cannot attach while recording or tracing"));
         }
@@ -4043,14 +4058,7 @@ impl Rex3 {
             REX3_SLOPEALPHA => ctx.slopealpha = from_slope(val),
             REX3_SLOPEGRN => ctx.slopegrn = from_slope(val),
             REX3_SLOPEBLUE => ctx.slopeblue = from_slope(val),
-            REX3_WRMASK => {
-                //if val & 0xFFFFFF == 0x6db6db {
-                //    eprintln!("REX3 process_register WRMASK write: val={:08x} -> forcing 0xffffff", val);
-                //    ctx.wrmask = 0xFFFFFF;
-                //} else {
-                    ctx.wrmask = val;
-                //}
-            }
+            REX3_WRMASK => ctx.wrmask = val,
             REX3_COLORI => ctx.set_colori(val),
             REX3_COLORX => ctx.colorx = from_color_red(val, ctx.drawmode1),
             REX3_SLOPERED1 => ctx.slopered = from_slope_red(val),
@@ -4069,7 +4077,7 @@ impl Rex3 {
             REX3_CONFIG | REX3_STATUS | REX3_USER_STATUS |
             REX3_DCBMODE | REX3_DCBDATA0 | REX3_DCBDATA1 | REX3_DCBRESET => {}
             _ => {
-                eprintln!("REX3 Write: unhandled reg {:04x} ({}), val {:08x}", reg_offset, rex3_reg_name(reg_offset), val);
+                unhandled("write", reg_offset, format_args!("write reg {:04x} ({}), val {:08x}", reg_offset, rex3_reg_name(reg_offset), val));
             }
         }
         exit
@@ -4393,26 +4401,6 @@ impl Device for Rex3 {
         let head: Arc<dyn crate::display::Head> = shim.clone();
         self.head.attach(Arc::downgrade(&head));
         self.head.start();
-
-        // Started here rather than at construction: the machine resets the
-        // board (power_on) in between, and a recording's start state must be
-        // the state its first record applies to.
-        #[cfg(feature = "gputrace")]
-        if let Some(path) = std::env::var_os("IRIS_REX3_REC") {
-            let path = path.to_string_lossy();
-            match self.set_recording(Some(&path), true) {
-                Ok(_) => eprintln!("REX3: recording to {path}"),
-                Err(e) => eprintln!("REX3: cannot record to {path}: {e}"),
-            }
-        }
-        #[cfg(feature = "gputrace")]
-        if let Some(path) = std::env::var_os("IRIS_REX3_TRACE") {
-            let path = path.to_string_lossy();
-            match self.start_trace(&path, trace::TRACE_ALL) {
-                Ok(()) => eprintln!("REX3: tracing to {path}"),
-                Err(e) => eprintln!("REX3: cannot trace to {path}: {e}"),
-            }
-        }
     }
 
     fn is_running(&self) -> bool {
@@ -5041,7 +5029,7 @@ impl Rex3 {
                     REX3_XYWIN        => busy_or_val!(ctx.xywin),
                     REX3_CLIPMODE     => busy_or_val!(ctx.clipmode & 0x1FFF),
                     _ => {
-                        eprintln!("REX3 Read32: unhandled reg {:04x} ({})", reg_offset, rex3_reg_name(reg_offset));
+                        unhandled("read32", reg_offset, format_args!("read32 reg {:04x} ({})", reg_offset, rex3_reg_name(reg_offset)));
                         BusRead32::ok(0)
                     }
                 }
@@ -5111,7 +5099,7 @@ impl Rex3 {
             dlog_dev!(LogModule::Dcb, "DCB Read8: Offset {:04x} -> {:02x}", offset, val);
             BusRead8::ok(val)
         } else {
-            eprintln!("REX3 Read8: unhandled offset {:04x}", offset);
+            unhandled("read8", offset, format_args!("read8 offset {:04x}", offset));
             BusRead8::err()
         };
 
@@ -5133,7 +5121,7 @@ impl Rex3 {
             self.dcb_write((val as u32) << 24);
             return BUS_OK;
         }
-        eprintln!("REX3 Write8: unhandled offset {:04x} val {:02x}", offset, val);
+        unhandled("write8", offset, format_args!("write8 offset {:04x} val {:02x}", offset, val));
         BUS_ERR
     }
 
@@ -5145,7 +5133,7 @@ impl Rex3 {
             dlog_dev!(LogModule::Dcb, "DCB Read16: Offset {:04x} -> {:04x}", offset, val);
             BusRead16::ok(val)
         } else {
-            eprintln!("REX3 Read16: unhandled offset {:04x}", offset);
+            unhandled("read16", offset, format_args!("read16 offset {:04x}", offset));
             BusRead16::err()
         };
 
@@ -5167,7 +5155,7 @@ impl Rex3 {
             self.dcb_write((val as u32) << ((offset & 2) << 3));
             return BUS_OK;
         }
-        eprintln!("REX3 Write16: unhandled offset {:04x} val {:04x}", offset, val);
+        unhandled("write16", offset, format_args!("write16 offset {:04x} val {:04x}", offset, val));
         BUS_ERR
     }
 

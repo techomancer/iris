@@ -35,11 +35,11 @@
 //! * The vendor and device numbers are the ones QEMU's emulated controller
 //!   already uses.
 //!
-//! `log nvme` (or `IRIS_DEBUG_LOG=nvme`) traces what the host does to the
+//! `log nvme` (or `--log nvme`) traces what the host does to the
 //! controller and what it does back, each line stamped with host time since
 //! the controller was made: `state` (CC writes, CSTS changes, resets, fatal
 //! errors), `admin`, `io` (doorbells, commands, completions) and `regs`
-//! (every register access). Off, each costs two atomic loads.
+//! (every register access). Off, each costs one atomic load.
 
 mod cmd;
 mod spec;
@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Instant;
 
-use crate::devlog::{LogModule, NVME_LOG_ADMIN, NVME_LOG_IO, NVME_LOG_REGS, NVME_LOG_STATE};
+use crate::devlog::{event, LogModule};
 use crate::pci::{Bar, DevFn, PciBus, PciConfig, PciDma, PciFunction, PciFunctionState, PCI_INTA};
 use crate::scsi::{ScsiBus, ScsiIdentities, ScsiIdentity};
 use crate::scsi_monitor::ScsiTargets;
@@ -68,19 +68,13 @@ pub const PCI_VENDOR: u16 = 0x1b36;
 pub const PCI_DEVICE: u16 = 0x0010;
 pub const PCI_CLASS_NVME: u32 = 0x01_0802;
 
-/// A trace line of category `cat` (a `NVME_LOG_*` bit), stamped with the
-/// microseconds since the controller was made. Nothing is formatted unless
-/// the module is on and the category is in its mask.
-macro_rules! trace {
-    ($n:expr, $cat:expr, $($arg:tt)*) => {
-        if crate::devlog::devlog_is_active(LogModule::Nvme) && crate::devlog::devlog_mask(LogModule::Nvme) & $cat != 0 {
-            crate::devlog::devlog().write(
-                LogModule::Nvme,
-                format_args!("t={}us {}", $n.born.elapsed().as_micros(), format_args!($($arg)*)),
-            );
-        }
-    };
-}
+/// The `nvme.*` trace points: controller state changes, admin traffic, register accesses
+/// below the doorbells, and I/O traffic.
+pub const EVENTS: &[&str] = &["state", "admin", "regs", "io"];
+const STATE: u32 = event(EVENTS, "state");
+const ADMIN: u32 = event(EVENTS, "admin");
+const REGS: u32 = event(EVENTS, "regs");
+const IO: u32 = event(EVENTS, "io");
 
 const IDENTITY: ScsiIdentity = ScsiIdentity::new(b"IRIS    ", b"NVME NAMESPACE  ", b"1.0 ");
 
@@ -430,7 +424,7 @@ impl Nvme {
     fn write_cc(&self, st: &mut State, val: u32) {
         let (was, csts) = (st.enabled(), st.csts);
         let val = val & CC_WRITABLE;
-        trace!(self, NVME_LOG_STATE, "CC {:#010x} -> {val:#010x} (CSTS {csts:#x})", st.cc);
+        crate::dlog!(LogModule::Nvme, STATE, "t={}us CC {:#010x} -> {val:#010x} (CSTS {csts:#x})", self.born.elapsed().as_micros(), st.cc);
         if was && val & CC_EN == 0 {
             self.reset_locked(st, Reset::Controller);
         } else {
@@ -447,7 +441,7 @@ impl Nvme {
             }
         }
         if st.csts != csts {
-            trace!(self, NVME_LOG_STATE, "CSTS {csts:#x} -> {:#x}", st.csts);
+            crate::dlog!(LogModule::Nvme, STATE, "t={}us CSTS {csts:#x} -> {:#x}", self.born.elapsed().as_micros(), st.csts);
         }
     }
 
@@ -471,11 +465,11 @@ impl Nvme {
             None
         };
         if let Some(why) = why {
-            trace!(self, NVME_LOG_STATE, "fatal: {why} (CC {:#x} AQA {:#x} ASQ {:#x} ACQ {:#x})", st.cc, st.aqa, st.asq, st.acq);
+            crate::dlog!(LogModule::Nvme, STATE, "t={}us fatal: {why} (CC {:#x} AQA {:#x} ASQ {:#x} ACQ {:#x})", self.born.elapsed().as_micros(), st.cc, st.aqa, st.asq, st.acq);
             st.fail(why);
             return;
         }
-        trace!(self, NVME_LOG_STATE, "ready: admin SQ {:#x} x{asqs}, CQ {:#x} x{acqs}", st.asq, st.acq);
+        crate::dlog!(LogModule::Nvme, STATE, "t={}us ready: admin SQ {:#x} x{asqs}, CQ {:#x} x{acqs}", self.born.elapsed().as_micros(), st.asq, st.acq);
         st.sqs[0] = Some(Sq { base: st.asq, entries: asqs, cqid: 0, ..Default::default() });
         st.cqs[0] = Some(Cq { base: st.acq, entries: acqs, phase: true, ien: true, ..Default::default() });
         st.csts = CSTS_RDY;
@@ -486,7 +480,7 @@ impl Nvme {
     /// and ACQ. The PCI header is not touched. Work begun before it is
     /// discarded; the counters and the refusal records stay.
     fn reset_locked(&self, st: &mut State, kind: Reset) {
-        trace!(self, NVME_LOG_STATE, "{kind:?} reset (CC {:#x} CSTS {:#x})", st.cc, st.csts);
+        crate::dlog!(LogModule::Nvme, STATE, "t={}us {kind:?} reset (CC {:#x} CSTS {:#x})", self.born.elapsed().as_micros(), st.cc, st.csts);
         let old = std::mem::replace(st, State::new());
         st.generation = old.generation + 1;
         st.pin = old.pin;
@@ -523,11 +517,12 @@ impl Nvme {
         let idx = ((off - DOORBELLS) / 4) as usize;
         let (qid, cq) = (idx / 2, idx & 1 == 1);
         let val = val & 0xffff;
-        trace!(self, if qid == 0 { NVME_LOG_ADMIN } else { NVME_LOG_IO }, "doorbell {} {qid} = {val}", if cq { "CQ head" } else { "SQ tail" });
+        let ev = if qid == 0 { ADMIN } else { IO };
+        crate::dlog!(LogModule::Nvme, ev, "t={}us doorbell {} {qid} = {val}", self.born.elapsed().as_micros(), if cq { "CQ head" } else { "SQ tail" });
         {
             let mut st = self.st.lock().unwrap();
             if !st.enabled() || st.csts & CSTS_RDY == 0 || qid > MAX_IO_QUEUES {
-                trace!(self, NVME_LOG_STATE, "doorbell at {off:#x} ignored: CC {:#x} CSTS {:#x}", st.cc, st.csts);
+                crate::dlog!(LogModule::Nvme, STATE, "t={}us doorbell at {off:#x} ignored: CC {:#x} CSTS {:#x}", self.born.elapsed().as_micros(), st.cc, st.csts);
                 return;
             }
             if cq {
@@ -602,14 +597,14 @@ impl Nvme {
             // The queue is not in memory the controller can reach: fatal.
             let mut st = self.st.lock().unwrap();
             if st.generation == job.generation {
-                trace!(self, NVME_LOG_STATE, "fatal: SQ {} entry at {:#x} cannot be read", job.sqid, job.addr);
+                crate::dlog!(LogModule::Nvme, STATE, "t={}us fatal: SQ {} entry at {:#x} cannot be read", self.born.elapsed().as_micros(), job.sqid, job.addr);
                 st.fail("a submission queue entry could not be read");
             }
             return;
         }
         let sqe = Sqe::parse(&raw);
-        let cat = if job.sqid == 0 { NVME_LOG_ADMIN } else { NVME_LOG_IO };
-        trace!(self, cat, "SQ {} cid {} opcode {:#04x} nsid {} prp {:#x} {:#x} cdw10 {:#x} cdw11 {:#x}", job.sqid, sqe.cid, sqe.opcode, sqe.nsid, sqe.prp1, sqe.prp2, sqe.cdw[0], sqe.cdw[1]);
+        let cat = if job.sqid == 0 { ADMIN } else { IO };
+        crate::dlog!(LogModule::Nvme, cat, "t={}us SQ {} cid {} opcode {:#04x} nsid {} prp {:#x} {:#x} cdw10 {:#x} cdw11 {:#x}", self.born.elapsed().as_micros(), job.sqid, sqe.cid, sqe.opcode, sqe.nsid, sqe.prp1, sqe.prp2, sqe.cdw[0], sqe.cdw[1]);
         let done = if job.sqid == 0 {
             self.st.lock().unwrap().admin_commands += 1;
             self.admin(&sqe)
@@ -619,10 +614,10 @@ impl Nvme {
         if let Some((status, dw0)) = done {
             let mut st = self.st.lock().unwrap();
             if st.generation == job.generation {
-                trace!(self, cat, "SQ {} cid {} done: status {:#x} dw0 {dw0:#x}", job.sqid, sqe.cid, status.0);
+                crate::dlog!(LogModule::Nvme, cat, "t={}us SQ {} cid {} done: status {:#x} dw0 {dw0:#x}", self.born.elapsed().as_micros(), job.sqid, sqe.cid, status.0);
                 self.post(&mut st, job.sqid, sqe.cid, dw0, status);
             } else {
-                trace!(self, cat, "SQ {} cid {} done after a reset: dropped", job.sqid, sqe.cid);
+                crate::dlog!(LogModule::Nvme, cat, "t={}us SQ {} cid {} done after a reset: dropped", self.born.elapsed().as_micros(), job.sqid, sqe.cid);
             }
         }
     }
@@ -658,7 +653,7 @@ impl Nvme {
             // it never sees a half-written entry.
             let ok = self.dma().is_some_and(|d| d.dma_write(at, &e[..12]).is_ok() && d.dma_write(at + 12, &e[12..]).is_ok());
             if !ok {
-                trace!(self, NVME_LOG_STATE, "fatal: CQ {} entry at {at:#x} cannot be written", sq.cqid);
+                crate::dlog!(LogModule::Nvme, STATE, "t={}us fatal: CQ {} entry at {at:#x} cannot be written", self.born.elapsed().as_micros(), sq.cqid);
                 st.fail("a completion queue entry could not be written");
                 st.backlog.clear();
                 break;
@@ -773,7 +768,7 @@ impl PciFunction for Nvme {
         let dword = if off >= DOORBELLS { 0 } else { self.read_reg(off & !3) };
         let shift = (off & 3) * 8;
         let v = (dword >> shift) & (u32::MAX >> (32 - 8 * width as u32));
-        trace!(self, NVME_LOG_REGS, "read {width} at {off:#x} = {v:#x}");
+        crate::dlog!(LogModule::Nvme, REGS, "t={}us read {width} at {off:#x} = {v:#x}", self.born.elapsed().as_micros());
         v
     }
 
@@ -785,7 +780,7 @@ impl PciFunction for Nvme {
             self.doorbell(off & !3, val);
             return;
         }
-        trace!(self, NVME_LOG_REGS, "write {width} at {off:#x} = {val:#x}");
+        crate::dlog!(LogModule::Nvme, REGS, "t={}us write {width} at {off:#x} = {val:#x}", self.born.elapsed().as_micros());
         let shift = (off & 3) * 8;
         let mask = (u32::MAX >> (32 - 8 * width as u32)) << shift;
         let val = if width == 4 { val } else { (self.read_reg(off & !3) & !mask) | (val << shift & mask) };

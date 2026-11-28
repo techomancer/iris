@@ -39,6 +39,6 @@ cow status
 mc regs
 ```
 
-Developer build adds `log mips mask insn`, `dt file crash-trace.txt 1048576`.
+Developer build adds `log mips.insn on`, `dt file crash-trace.txt 1048576`.
 
 See also `clanker/jitv2/`, `clanker/testing/disk-image-hygiene.md`.

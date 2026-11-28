@@ -68,19 +68,7 @@ pub mod cat {
 
     /// `"irq,gfx"`, `"all"`, or `"all,-jit"`.
     pub fn parse(s: &str) -> Result<u32, String> {
-        let mut mask = 0;
-        for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-            let (neg, name) = match tok.strip_prefix('-') { Some(n) => (true, n), None => (false, tok) };
-            let bits = if name == "all" {
-                ALL
-            } else {
-                NAMES.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
-                    .ok_or_else(|| format!("unknown perfetto category '{name}' (have: all, {})",
-                        NAMES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")))?
-            };
-            if neg { mask &= !bits } else { mask |= bits }
-        }
-        Ok(mask)
+        crate::devlog::select(s, NAMES, ALL)
     }
 
     pub fn format(mask: u32) -> String {

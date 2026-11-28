@@ -44,9 +44,9 @@ files do. They are found in `ignore/vpro-golden/` (git-ignored) or in
 `VPRO_REPLAY_DIR`. Without them the replay test prints SKIPPED and passes;
 `scripts/vpro-goldens.sh replay` fails instead.
 
-Record from power-on with `IRIS_ODSY_REC=<file>.rec iris ...` (the board is
-built with the recorder; the file is gzip-compressed and stays readable if the
-emulator is killed). Boot to the desktop, start the application for a few
+Record from power-on with `iris --startup "vpro rec <file>.rec" ...` (the
+recorder starts before the CPU runs; the file is gzip-compressed and stays
+readable if the emulator is killed). Boot to the desktop, start the application for a few
 seconds, stop. Name it for the scene, put it in the directory, then take its
 checkpoints:
 
@@ -57,7 +57,7 @@ replays one file; `VPRO_REPLAY_THREADS=1` replays it with the raster thread and 
 running, as a live machine draws (`IRIS_ODSY_BACKEND=inline` stores on the
 raster thread with no pool; `VPRO_REPLAY_POOL=<threads>,<tile>` sets the
 pool's workers and tile size, default 2 and 32); `VPRO_REPLAY_GPU=1` draws on the GPU raster unit (a build with the `wgpu` feature; `VPRO_REPLAY_LAZY=1` skips the readbacks between checkpoints to time the GPU path alone); `VPRO_REPLAY_LIMIT=<n>` stops after n records and checks the checkpoints reached;
-`IRIS_ODSY_TRACE=<file>` writes the annotated trace of the replay, as `vpro trace` does on a
+`VPRO_REPLAY_TRACE=<file>` writes the annotated trace of the replay, as `vpro trace` does on a
 running machine (a build with the `gputrace` feature; a test that replays several sessions writes
 the first to `<file>`, the next to `<file>.1` and so on, so name the test in full with `--exact`:
 `dev::odyssey::golden::replay::recorded_sessions_replay_to_their_checkpoints`);
@@ -88,5 +88,5 @@ mark is not a fresh board's, the replay says so (`started mid-session`) and
 treats its marks as information, not failures. The replay is still
 deterministic, so its blessed checkpoints are a regression net for the model
 under those stores, just not a comparison with what the guest saw. For a
-recording that reproduces the screen, start at power-on with `IRIS_ODSY_REC`
-and mark from the monitor.
+recording that reproduces the screen, start at power-on with `--startup
+"vpro rec <file>"` and mark from the monitor.

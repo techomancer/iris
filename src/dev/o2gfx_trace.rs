@@ -15,15 +15,14 @@
 //! register collapsed and runs through a table merged.
 //!
 //! All three devices share one sink so that their lines interleave in time.
-//! `IRIS_O2_TRACE=<file>` starts a full trace at power-on. All of it needs
+//! `--startup "re trace <file>"` starts a full trace at power-on. All of it needs
 //! the `gputrace` feature; without it `on` is a constant false.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
 
 use crate::dev::o2gfx::{gbe_reg, gl_coord, re_reg};
-use crate::trace_writer::TraceWriter;
+use crate::trace_sink::{trace_command, Classes, TraceFile, TraceRun};
 
 /// Interface buffer entries as the engine applies them.
 pub const TRACE_RE: u32 = 1;
@@ -36,7 +35,7 @@ pub const TRACE_CRIME: u32 = 8;
 /// CRIME's interrupt registers: IRIX writes the mask on every spl change, so
 /// this outweighs everything else and `all` leaves it out.
 pub const TRACE_IRQ: u32 = 16;
-/// The categories `all` and `IRIS_O2_TRACE` mean.
+/// The categories `all` means.
 pub const TRACE_ALL: u32 = TRACE_RE | TRACE_CPU | TRACE_GBE | TRACE_CRIME;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,39 +54,40 @@ struct Run {
     last: u32,
     val: u64,
     count: u64,
+    /// Polled registers collapse whatever they read; a write through a
+    /// table merges into one range.
+    poll: bool,
+    table: bool,
 }
 
-struct Sink {
-    out: Option<TraceWriter>,
-    start: Option<Instant>,
-    re_seq: u64,
-    seq: u64,
-    run: Option<Run>,
-    last_flush: Option<Instant>,
-}
-
-impl Sink {
-    fn line(&mut self, text: std::fmt::Arguments) {
-        let t = self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-        if let Some(f) = self.out.as_mut() {
-            f.line(format_args!("{t:12.6} {text}"));
+impl TraceRun for Run {
+    fn merge(&mut self, n: &Self) -> bool {
+        let same = self.first == n.first && (n.poll || self.val == n.val);
+        let next = n.table && n.first == self.last + 4;
+        let merged = (self.block, self.write, self.bits) == (n.block, n.write, n.bits) && (same || next);
+        if merged {
+            self.count += 1;
+            self.last = n.first;
+            self.val = n.val;
         }
+        merged
     }
 
-    fn close_run(&mut self) {
-        let Some(r) = self.run.take() else { return };
-        let seq = self.seq;
-        let dir = if r.write { "wr" } else { "rd" };
-        let (tag, name, note) = match r.block {
-            Block::Cpu => ("CPU", re_name(r.first), String::new()),
-            Block::Gbe => ("GBE", gbe_name(r.first, r.last), if r.write { gbe_note(r.first, r.val as u32) } else { String::new() }),
-            Block::Crime => ("CRM", crime_name(r.first), String::new()),
+    fn emit(&self, seq: u64, line: impl FnOnce(std::fmt::Arguments)) {
+        let dir = if self.write { "wr" } else { "rd" };
+        let (tag, name, note) = match self.block {
+            Block::Cpu => ("CPU", re_name(self.first), String::new()),
+            Block::Gbe => ("GBE", gbe_name(self.first, self.last), if self.write { gbe_note(self.first, self.val as u32) } else { String::new() }),
+            Block::Crime => ("CRM", crime_name(self.first), String::new()),
         };
-        let val = if r.bits > 32 { format!("{:#018x}", r.val) } else { format!("{:#010x}", r.val) };
-        let times = if r.count > 1 { format!("  (x{})", r.count) } else { String::new() };
-        self.line(format_args!("{tag:3} #{seq:06} {dir} {name} = {val}{times}{note}"));
+        let val = if self.bits > 32 { format!("{:#018x}", self.val) } else { format!("{:#010x}", self.val) };
+        let times = if self.count > 1 { format!("  (x{})", self.count) } else { String::new() };
+        line(format_args!("{tag:3} #{seq:06} {dir} {name} = {val}{times}{note}"));
     }
 }
+
+/// One counter for the RE's lines, one for the rest.
+type Sink = TraceFile<Run, 2>;
 
 pub struct O2Trace {
     mask: AtomicU32,
@@ -96,21 +96,15 @@ pub struct O2Trace {
 
 impl Default for O2Trace {
     fn default() -> Self {
-        Self { mask: AtomicU32::new(0), s: Mutex::new(Sink { out: None, start: None, re_seq: 0, seq: 0, run: None, last_flush: None }) }
+        Self { mask: AtomicU32::new(0), s: Mutex::new(Sink::new(["re", "other"], 1)) }
     }
 }
 
-/// Parse a trace category list: `re,cpu,gbe,crime,irq` or `all`.
-pub fn trace_mask(s: &str) -> u32 {
-    s.split(',').fold(0, |m, w| m | match w {
-        "re" => TRACE_RE,
-        "cpu" => TRACE_CPU,
-        "gbe" => TRACE_GBE,
-        "crime" => TRACE_CRIME,
-        "irq" => TRACE_IRQ,
-        _ => TRACE_ALL,
-    })
-}
+/// `re,cpu,gbe,crime,irq` or `all`.
+const CLASSES: Classes = Classes {
+    names: &[("re", TRACE_RE), ("cpu", TRACE_CPU), ("gbe", TRACE_GBE), ("crime", TRACE_CRIME), ("irq", TRACE_IRQ)],
+    all: TRACE_ALL,
+};
 
 impl O2Trace {
     /// Whether a trace of `what` runs. A constant false without `gputrace`,
@@ -125,31 +119,12 @@ impl O2Trace {
     /// (`poll`) collapse whatever they read, and writes through a table
     /// merge into one range (`table`).
     pub fn access(&self, block: Block, write: bool, bits: u32, off: u32, val: u64, poll: bool, table: bool) {
-        let mut t = self.s.lock().unwrap();
-        if let Some(r) = t.run.as_mut() {
-            if r.block == block && r.write == write && r.bits == bits {
-                let same = r.first == off && (poll || r.val == val);
-                let next = table && off == r.last + 4;
-                if same || next {
-                    r.count += 1;
-                    r.last = off;
-                    r.val = val;
-                    return;
-                }
-            }
-        }
-        t.close_run();
-        t.seq += 1;
-        t.run = Some(Run { block, write, bits, first: off, last: off, val, count: 1 });
+        self.s.lock().unwrap().access(Run { block, write, bits, first: off, last: off, val, count: 1, poll, table });
     }
 
     /// A free-form event line from a block.
     pub fn event(&self, tag: &str, text: std::fmt::Arguments) {
-        let mut t = self.s.lock().unwrap();
-        t.close_run();
-        t.seq += 1;
-        let seq = t.seq;
-        t.line(format_args!("{tag:3} #{seq:06} {text}"));
+        self.s.lock().unwrap().event(1, tag, text);
     }
 
     /// One interface buffer entry, before it is applied. `regs` holds the
@@ -166,11 +141,7 @@ impl O2Trace {
             if note.is_empty() { note } else { format!("  ; {note}") }
         };
         let name = re_name(base);
-        let mut t = self.s.lock().unwrap();
-        t.close_run();
-        t.re_seq += 1;
-        let seq = t.re_seq;
-        t.line(format_args!("RE  #{seq:06} {name}{go} = {v}{run}"));
+        self.s.lock().unwrap().event(0, "RE ", format_args!("{name}{go} = {v}{run}"));
     }
 
     /// Hand the trace to its writer thread (called from the machine's service
@@ -179,14 +150,7 @@ impl O2Trace {
         if !cfg!(feature = "gputrace") || (self.mask.load(Ordering::Relaxed) == 0 && !force) {
             return;
         }
-        let mut t = self.s.lock().unwrap();
-        if force || t.last_flush.map_or(true, |l| l.elapsed().as_millis() >= 500) {
-            t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                f.flush();
-            }
-            t.last_flush = Some(Instant::now());
-        }
+        self.s.lock().unwrap().flush(force);
     }
 
     /// Start the annotated trace into `path` for the categories in `mask`.
@@ -194,13 +158,8 @@ impl O2Trace {
         if !cfg!(feature = "gputrace") {
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "needs a build with the gputrace feature (on with developer)"));
         }
-        let f = TraceWriter::create(path)?;
         let mut t = self.s.lock().unwrap();
-        t.out = Some(f);
-        t.start = Some(Instant::now());
-        t.re_seq = 0;
-        t.seq = 0;
-        t.run = None;
+        t.open(path)?;
         t.line(format_args!("O2 graphics trace started (mask {mask:#x})"));
         drop(t);
         self.mask.store(mask, Ordering::SeqCst);
@@ -211,47 +170,12 @@ impl O2Trace {
     /// when no trace was running.
     pub fn stop(&self) -> Option<String> {
         self.mask.store(0, Ordering::SeqCst);
-        let mut t = self.s.lock().unwrap();
-        t.close_run();
-        let f = t.out.take()?;
-        let path = f.path.clone();
-        let res = f.finish();
-        Some(match res {
-            Ok(bytes) => format!("{path} (re {} / other {} entries, {bytes} bytes)", t.re_seq, t.seq),
-            Err(e) => format!("{path}: write failed: {e}"),
-        })
-    }
-
-    /// `IRIS_O2_TRACE=<file>`: a full trace from power-on.
-    pub fn start_from_env(&self) {
-        if let Ok(path) = std::env::var("IRIS_O2_TRACE") {
-            if let Err(e) = self.start(&path, TRACE_ALL) {
-                eprintln!("IRIS_O2_TRACE {path}: {e}");
-            }
-        }
+        self.s.lock().unwrap().stop()
     }
 
     /// `re trace ...`, `gbe trace ...`, `crime trace ...`.
     pub fn command(&self, args: &[&str], w: &mut dyn std::io::Write) -> Result<(), String> {
-        let e = |r: std::io::Result<()>| r.map_err(|e| e.to_string());
-        match args {
-            ["flush"] => {
-                self.flush(true);
-                if let Some(f) = self.s.lock().unwrap().out.as_mut() {
-                    f.sync();
-                }
-                e(writeln!(w, "trace flushed"))
-            }
-            [] | ["off"] => e(match self.stop() {
-                Some(s) => writeln!(w, "trace closed: {s}"),
-                None => writeln!(w, "trace not active"),
-            }),
-            [path, rest @ ..] => {
-                let mask = trace_mask(rest.first().copied().unwrap_or("all"));
-                self.start(path, mask).map_err(|e| format!("trace {path}: {e}"))?;
-                e(writeln!(w, "tracing to {path} (mask {mask:#x})"))
-            }
-        }
+        trace_command(args, "trace", &CLASSES, w, || self.flush(true), || self.stop(), |p, m| self.start(p, m))
     }
 }
 

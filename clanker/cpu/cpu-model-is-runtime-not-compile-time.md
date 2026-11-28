@@ -29,10 +29,9 @@ guest ELF — see
 
 ## Startup logging
 
-`src/main.rs` applies `IRIS_DEBUG_LOG` after `Machine::new` initializes the
-devlog registry. It adds a stderr sink and enables the named modules. This
-startup path no longer has the initialization-order problem recorded here.
-Devlog output requires a `developer` build; ordinary `log` warnings use the
+`src/main.rs` applies `--log` (or `[debug] log`) before `Machine::new`: the
+devlog state is a static, so there is no initialization order to get wrong. It
+adds a stderr sink and turns on the named trace points. Devlog output requires a `developer` build; ordinary `log` warnings use the
 CLI's `env_logger` backend.
 
 Use the monitor instead (`Monitor listening on 127.0.0.1:8888`): `log scsi on`,

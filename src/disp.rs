@@ -477,7 +477,7 @@ impl Rex3Screen {
 
         self.cursor_x_adjust = cursor_x_adjust;
         if w > 0 && h > 0 && (w != self.width || h != self.height) {
-            println!("Rex3: Resolution changed to {}x{} cursor_x_adjust={}", w, h, cursor_x_adjust);
+            crate::dlog!(crate::devlog::LogModule::Rex3, "Rex3: Resolution changed to {}x{} cursor_x_adjust={}", w, h, cursor_x_adjust);
             self.width  = w;
             self.height = h;
             resized = true;

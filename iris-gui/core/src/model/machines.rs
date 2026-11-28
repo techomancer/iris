@@ -604,7 +604,7 @@ pub(crate) mod tests {
         }
         cfg.jitv2.cache_dir = dir.join("jit-cache").to_string_lossy().into_owned();
         cfg.ci_socket = "tcp:127.0.0.1:19851".into();
-        cfg.debug.debug_log = "scsi=debug,cpu=warn".into();
+        cfg.debug.log = "scsi,l1d.*,-l1d.hit".into();
         cfg.network.pcap_interface = Some("\\Device\\NPF_{example}".into());
         cfg.network.mac = Some("08:00:69:12:34:56".into());
         save(&root.0, "Indigo2 IP28", &mut cfg).unwrap();
@@ -618,7 +618,7 @@ pub(crate) mod tests {
         assert_eq!(back.nvram, "nvram.bin");
         assert_eq!(back.nveeprom, "nveeprom.bin");
         assert_eq!(back.ci_socket, "tcp:127.0.0.1:19851");
-        assert_eq!(back.debug.debug_log, cfg.debug.debug_log);
+        assert_eq!(back.debug.log, cfg.debug.log);
         assert_eq!(back.network.pcap_interface, cfg.network.pcap_interface);
         assert_eq!(back.network.mac, cfg.network.mac);
         assert_eq!(back.nfs.as_ref().unwrap().shared_dir, root.0.join("shared").to_string_lossy());

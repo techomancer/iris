@@ -54,13 +54,50 @@ hashes are given where a change is easiest to understand by reading the commit.
   launch; `log` output goes to monitor clients, or to a file with
   `log <module> file PATH`. `IRIS_IP32_HOT` is gone too; its counters were
   never shown anywhere.
-- The CPU `debug` command is gone: `log mips mask insn` and `log mips on`
-  print each instruction `run` and `step` execute, and `log mips file PATH`
-  writes them to a file.
+- The CPU `debug` command is gone: `log mips.insn on` prints each instruction
+  `run` and `step` execute, and `log mips file PATH` writes them to a file.
 - `phys trace` and the physical `trace` alias are gone: `log phys on` logs
   every physical bus access. That and the `hit` category of `log l1i` and
   `log l1d` need a `developer` build; before, every build but `lightning` paid
   a check per access for them.
+- The `IRIS_IP28_*` bring-up variables (cache ops, watch window, exception
+  address, TLB writes, GPR watch) and the `cp0` category of `log mips` are
+  gone, as is the stderr line printed on every R10000 secondary-cache
+  Index_Load_Tag. Only the TLB-write trace has a replacement:
+  `log mips.tlb on` in a `developer` build. Cache ops, the watch window
+  and the exception address have none.
+  `bp add ADDR if REG==VAL` breaks at a PC on a register value, but nothing
+  reports every write to a register, so it replaces `IRIS_IP28_WATCHGPR`
+  only in part.
+- `--startup COMMAND` (repeatable) and `[debug] startup = [...]` run monitor
+  commands once the machine is built, before the CPU starts. A command that
+  fails fails the build; a reset or a snapshot load does not run them again.
+  They replace the board trace and recording variables, which are gone:
+  - `IRIS_REX3_TRACE` and `IRIS_REX3_REC`: `--startup "rex trace FILE"` and
+    `--startup "rex rec FILE"`.
+  - `IRIS_MGRAS_TRACE` and `IRIS_MGRAS_REC`: `--startup "mgras trace FILE"`
+    and `--startup "mgras rec FILE"`.
+  - `IRIS_ODSY_TRACE` and `IRIS_ODSY_REC`: `--startup "vpro trace FILE"` and
+    `--startup "vpro rec FILE"`. The replay tests' trace is now
+    `VPRO_REPLAY_TRACE`.
+  - `IRIS_O2_TRACE`: `--startup "re trace FILE"`.
+  - `IRIS_IP32_RE_TRACE` and `o2 retrace PATH`: `--startup "re rec FILE"`
+    (`gputrace` builds) writes the same register writes from the moment it
+    starts. It has no look-back: the old variable kept the last N writes to
+    dump after a glitch, and nothing replaces that.
+- Some default console lines are quiet now. `MC: GIO Timeout` (stderr) is shown
+  by `log mc`, and `Rex3: Resolution changed` (stdout) by `log rex3`. The IP28
+  `guest writes MEMCFG0/1` stderr lines are deleted. `MC: CPU Error` still
+  prints on stderr. REX3's "unhandled" stderr lines now stop after 8 per
+  register and access kind.
+- One pattern names trace points everywhere: `log heart,l1d.*,-l1d.hit on`,
+  `--log PATTERN` and `[debug] log`. `IRIS_DEBUG_LOG` and `[debug] debug_log`
+  are replaced by `--log` and `[debug] log` (the old key still loads), and
+  `log MODULE mask CATEGORY|HEX` by `log MODULE.CATEGORY on`; the `pdma`
+  categories are now one per channel (`pdma.hal0`, `pdma.enet*`). The Perfetto
+  categories, the `rex`, `gr2`, `mgras`, `vpro` and O2 `trace` class lists and
+  the `exception` command take the same patterns; a name matching nothing is an
+  error, where the `rex`, `gr2`, `mgras` and O2 lists used to select everything.
 
 ### Serial ports
 

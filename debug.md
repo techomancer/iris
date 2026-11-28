@@ -411,8 +411,8 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `rex status` | All REX3 drawing registers; on the GPU raster also a `TELEMETRY` line (batches and flush reasons, copies by path and pixels, snapshot bytes, state-slot words changed per slot and command generation time with `IRIS_REX3_GPU_STATS` set, GFIFO pressure, waits) |
 | `rex jit <on\|off\|status\|list>` | REX3 shader JIT (`rex-jit`): switch, counters, compiled and failed shaders |
 | `rex jit <disable\|enable> <dm0> <dm1>` | Take one draw mode out of (or back into) JIT dispatch |
-| `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (also `IRIS_REX3_TRACE=<file>`) |
-| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, `REX3_REPLAY_ENGINE=resident` with `--features wgpu` for the GPU raster (`raster = "wgpu"`; prints its telemetry). Recording itself needs the CPU raster |
+| `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (`--startup "rex trace <file>"` for one before the CPU runs) |
+| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (`--startup "rex rec <file>"` for one from power-on); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, `REX3_REPLAY_ENGINE=resident` with `--features wgpu` for the GPU raster (`raster = "wgpu"`; prints its telemetry). Recording itself needs the CPU raster |
 | `rex fbdump [DIR]` | Framebuffers as files in `DIR` (default `.`) |
 | `rex cmap <on\|off>` | CMAP access trace |
 | `vc2 status` / `vc2 ramdump` | VC2 video timing and cursor state / RAM dump |
@@ -473,8 +473,8 @@ upload, composition, and readback slices and byte/tile/rectangle counters; see
 | `mgras jit` | Raster JIT (`gr4-jit`) state |
 | `mgras fbdump [dir]` | Planes and the screen as PNG and raw files |
 | `mgras shot <file.png>` / `mgras dump <file>` | Screenshot / the board state image that replay checkpoints hash (waits for the board to go idle) |
-| `mgras trace <file> [hq,rss,cpu,tex\|all]` / `mgras trace flush\|off` | Annotated trace (also `IRIS_MGRAS_TRACE=<file>`) |
-| `mgras rec <file>` / `mgras rec mark\|off` | Replayable recording; replay with `MGRAS_REPLAY=<file> cargo test --release --lib mgras_replay_file` |
+| `mgras trace <file> [hq,rss,cpu,tex\|all]` / `mgras trace flush\|off` | Annotated trace (`--startup "mgras trace <file>"` for one from power-on) |
+| `mgras rec <file>` / `mgras rec mark\|off` | Replayable recording (`--startup "mgras rec <file>"` for one from power-on); replay with `MGRAS_REPLAY=<file> cargo test --release --lib mgras_replay_file` |
 | `mgras tram <page> [row] [width]` | One row of texture RAM: the 32-bit texel cells of a level `width` texels wide (default 32) at `page`, as nibbles in TRAM order |
 | `rss [regs]` / `rss pix <x> <y> [w] [h]` | Raster registers (decoded IR, each engine's backlog) / raw pixels |
 
@@ -511,8 +511,8 @@ guest. `y = 0` is the top display line throughout.
 | `vpro unimp` | Offsets and command words the board reported as not modelled |
 | `vpro refusals [reset]` | Bus accesses answered busy, by reason, offset and width, with the longest time one access was kept retrying |
 | `vpro gpu [trace on\|off]` | With `[graphics] raster = "wgpu"`: the GPU raster unit's counters (records and batches, how the batches were submitted, bytes uploaded and read back, waits, readbacks and copies the copy kernel took) and the GPU scan-out's (frames composed, bytes read back; with `renderer = "wgpu"` frames are presented from the GPU and only screenshots, frame requests and VNC read them back); `trace on` counts readbacks by the board function that caused them from then on, shown under the counters. The same lines appear in `vpro status`. On the GPU unit the commands that read board memory (`pix`, `raw`, `peek`, `shot`, `fbdump`, `hash`, `mem` and the state commands) first read the unit's memory back into the board's copy, when the board can be quiesced |
-| `vpro trace <file> [fifo,draw,cpu,dma\|all]` / `vpro trace flush\|off` / `vpro trace` | Annotated trace (`gputrace` builds; also `IRIS_ODSY_TRACE=<file>` from power-on): `FIFO` lines are command words as the parser completes them, named, with their operands as words and as floats where the word carries floats, plus copy rects, pattern and matrix loads, image boxes and bursts, queries and unknown words; `DRAW` lines each assembled primitive sent to the raster unit (`draw TRIANGLES n=3 ctx=1 textured depth queued cost 96`) and each clear; `CPU` lines every bus access that is not a command store, repeats collapsed; `DMA` lines the page-table descriptors. `IRIS_ODSY_TRACE` also traces an offline replay of a `vpro rec` recording (see `src/dev/odyssey/testdata/README.md`). `flush` writes the buffer out (it is written at most twice a second otherwise); alone, the trace's state |
-| `vpro rec <file>` / `vpro rec mark\|off` / `vpro rec` | Replayable recording (record.rs; also `IRIS_ODSY_REC=<file>` from power-on): every bus store and load and the DMA reads, gzip. A start, a `mark` and `off` wait for the board to go idle and write the memory hash (`vpro hash`) into the file, so a replay can check board memory at those points; a recording started mid-session cannot reproduce the live memory and says so when replayed, but still replays deterministically. Alone, the recording's state. Replay: `VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture` (see `src/dev/odyssey/testdata/README.md`) |
+| `vpro trace <file> [fifo,draw,cpu,dma\|all]` / `vpro trace flush\|off` / `vpro trace` | Annotated trace (`gputrace` builds; `--startup "vpro trace <file>"` from power-on): `FIFO` lines are command words as the parser completes them, named, with their operands as words and as floats where the word carries floats, plus copy rects, pattern and matrix loads, image boxes and bursts, queries and unknown words; `DRAW` lines each assembled primitive sent to the raster unit (`draw TRIANGLES n=3 ctx=1 textured depth queued cost 96`) and each clear; `CPU` lines every bus access that is not a command store, repeats collapsed; `DMA` lines the page-table descriptors. `VPRO_REPLAY_TRACE=<file>` traces an offline replay of a `vpro rec` recording (see `src/dev/odyssey/testdata/README.md`). `flush` writes the buffer out (it is written at most twice a second otherwise); alone, the trace's state |
+| `vpro rec <file>` / `vpro rec mark\|off` / `vpro rec` | Replayable recording (record.rs; `--startup "vpro rec <file>"` from power-on): every bus store and load and the DMA reads, gzip. A start, a `mark` and `off` wait for the board to go idle and write the memory hash (`vpro hash`) into the file, so a replay can check board memory at those points; a recording started mid-session cannot reproduce the live memory and says so when replayed, but still replays deterministically. Alone, the recording's state. Replay: `VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture` (see `src/dev/odyssey/testdata/README.md`) |
 
 **InfiniteReality (KONA)**
 
@@ -622,20 +622,29 @@ a forced termination; a normal stop saves them automatically.
 
 ### Logging
 
-Per-module logging, printed to every monitor connection or to a file. Messages
-on hot paths are compiled in only in a developer build: that is most of the
-Indy and Indigo2 modules (`net hpc3 seeq hal2 mc rex3 pdma vino dcb cmap scc
-gr2`, much of `ioc` and `mips`) and part of `odyssey`. The other modules log
+Per-module logging, printed to every monitor connection or to a file. A trace
+point is `module.event`, as in `l1d.miss`; a module with no events is one point.
+Messages on hot paths are compiled in only in a developer build: that is most
+of the Indy and Indigo2 modules (`net hpc3 seeq hal2 mc rex3 pdma vino dcb cmap
+scc gr2`, much of `ioc` and `mips`) and part of `odyssey`. The other modules log
 in every build.
 
 | Command | Description |
 |---|---|
 | `log status` | Each module's state |
-| `log <module\|all> <on\|off>` | Enable / disable |
-| `log <module> mask <cat\|hex>` | Category mask |
+| `log <points> <on\|off>` | Enable / disable |
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
-`log mips mask insn` then `log mips on` prints every instruction `run` and
+`<points>` is comma-separated globs over `module.event`, where a bare module is
+all its events, `all` is everything and a leading `-` removes: `heart`,
+`l1*.miss`, `heart,l1d.*,-l1d.hit`. The same patterns work as `--log` and
+`[debug] log` at startup, which print to stderr. The same grammar picks the
+classes of the `perfetto` categories, of the `rex`, `gr2`, `mgras`, `vpro` and
+O2 `trace` commands (`all,-jit`) and of the `exception` command (`bus,tlb`); a
+name that matches nothing is an error. The GUI applies `[debug] log` at Start
+and does not turn points off again at the next Start.
+
+`log mips.insn on` prints every instruction `run` and
 `step` execute (`log mips file <path>` writes them to a file instead) **[DEV]**.
 A device's trace is its module: `log ps2 on`, `log scsi on`, `log rtc on`.
 `log net` traces packets, `log ioc` the 8254 timer, and `log phys` accesses
@@ -662,14 +671,12 @@ and the HEART vector it sets or clears. `heart` logs HEART's register
 accesses, one counter read in 256 with the host's clock, and every
 interrupt vector raised or lowered, and on the Octane every access nothing
 answers. `o2audio` logs the O2's audio register accesses and codec writes.
-Mask categories: `pdma` —
-`hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
-miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
-every module also takes `on`/`all`, `off`/`none` or a hex mask.
+Events: `pdma` — one per HPC3 channel, `hal0`..`hal7`, `scsi0`, `scsi1`,
+`enet0`, `enet1`; `mips` — `insn tlb mem fpu`; `l1i`/`l1d`/`l2c` — `hit
+miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing)).
 `bedrock` covers the devices of the Bedrock node (Fuel, Tezro, Origin 3200,
 Onyx 3000), `l1` their L1 system controller and `usb` the OHCI USB controller. `ice1724` logs the Tezro's audio
 controller's accesses and values nothing establishes.
-`IRIS_DEBUG_LOG` or `[debug] debug_log` set the same thing at startup.
 
 ### Performance and locks
 
@@ -724,7 +731,6 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `o2 pixel X Y` | One screen pixel |
 | `o2 pc` / `o2 regs` | CPU PC / registers as last published |
 | `o2 peek ADDR LEN PATH` | Physical memory to a file (up to 1 MB) |
-| `o2 retrace PATH` | Recorded rendering-engine primitives (`IRIS_IP32_RE_TRACE`) |
 | `o2 scsi PATH` | The SCSI controllers' recent commands |
 | `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each (not kept in a `lightning` build) |
 | `o2 ps2log PATH` / `o2 crimelog PATH` | PS/2 traffic / CRIME interrupt-register accesses recorded since `crime irqlog on` |
