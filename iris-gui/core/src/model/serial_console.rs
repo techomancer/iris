@@ -19,34 +19,9 @@ use parking_lot::Mutex;
 
 use iris::net::telnet::{self, TelnetFilter};
 
-/// The TCP listener carrying this profile's selected console.
-pub fn console_port(cfg: &iris::config::MachineConfig) -> u16 {
-    use iris::config::*;
-    let [a, b] = cfg.serial_ports();
-    match cfg.machine.profile {
-        p if crate::model::hardware::mc_machine(p) => b,
-        MachineProfile::FuelIp34 => match cfg.fuel.console {
-            Ip35Console::L1 => cfg.fuel.l1_port.unwrap_or(8882),
-            Ip35Console::Ioc3A => a,
-            Ip35Console::Ioc3B => b,
-        },
-        MachineProfile::TezroIp53 => match cfg.tezro.console {
-            TezroConsole::L1 => cfg.tezro.l1_port.unwrap_or(8882),
-            TezroConsole::Ioc4A => a,
-            TezroConsole::Ioc4B => b,
-            TezroConsole::Ioc4C => cfg.tezro.serial_port_c.unwrap_or(8883),
-            TezroConsole::Ioc4D => cfg.tezro.serial_port_d.unwrap_or(8884),
-        },
-        p if p.is_ip35_bricks() => {
-            let s = cfg.ip35_section();
-            match s.console {
-                Ip35Console::L1 => s.l1_port.unwrap_or(8882),
-                Ip35Console::Ioc3A => a,
-                Ip35Console::Ioc3B => b,
-            }
-        }
-        _ => a,
-    }
+/// The TCP listener carrying the machine's console, none when its entry has no TCP end.
+pub fn console_port(cfg: &iris::config::MachineConfig) -> Option<u16> {
+    cfg.console_port()
 }
 
 #[cfg(test)]
@@ -55,27 +30,23 @@ mod routing_tests {
     use iris::config::*;
 
     #[test]
-    fn console_listener_tracks_profile_and_selected_channel() {
+    fn console_listener_tracks_the_profile_and_the_selected_port() {
         let mut cfg = MachineConfig::default();
-        cfg.serial_port_a = Some(18880);
-        cfg.serial_port_b = Some(18881);
         for p in MachineProfile::EVERY {
             cfg.machine.profile = p;
-            let expected = if crate::model::hardware::mc_machine(p) { 18881 }
-                else if p.is_ip35_bricks() || matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) { 8882 }
-                else { 18880 };
-            assert_eq!(console_port(&cfg), expected, "{p:?}");
+            let expected = match p {
+                MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 => 8881,
+                p if p.is_ip35_bricks() || matches!(p, MachineProfile::FuelIp34 | MachineProfile::TezroIp53) => 8882,
+                _ => 8880,
+            };
+            assert_eq!(console_port(&cfg), Some(expected), "{p:?}");
         }
         cfg.machine.profile = MachineProfile::TezroIp53;
-        cfg.tezro.console = TezroConsole::Ioc4D;
-        cfg.tezro.serial_port_d = Some(19884);
-        assert_eq!(console_port(&cfg), 19884);
-        cfg.machine.profile = MachineProfile::FuelIp34;
-        cfg.fuel.console = Ip35Console::Ioc3B;
-        assert_eq!(console_port(&cfg), 18881);
-        cfg.machine.profile = MachineProfile::Onyx3000Ip35;
-        cfg.onyx3000.console = Ip35Console::Ioc3A;
-        assert_eq!(console_port(&cfg), 18880);
+        cfg.machine.console = Some("serial2".into());
+        cfg.devices.push(iris::devices::ConfiguredDevice::from_arg("serial@serial2,backend=tcp:19881").unwrap());
+        assert_eq!(console_port(&cfg), Some(19881));
+        cfg.devices[0] = iris::devices::ConfiguredDevice::from_arg("serial@serial2,backend=unix:/run/tty.sock").unwrap();
+        assert_eq!(console_port(&cfg), None, "a Unix-only console has no TCP port to connect to");
     }
 }
 

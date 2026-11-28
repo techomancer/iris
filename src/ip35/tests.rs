@@ -449,26 +449,23 @@ fn compatibility_hub_heads_do_not_hide_the_l1_uart_window() {
 /// machine from starting, including when any of its three ports serves CI.
 #[test]
 fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
-    use crate::config::Ip35Console;
     let listeners: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
     let ports: Vec<_> = listeners.iter().map(|socket| socket.local_addr().unwrap().port()).collect();
     let dir = TempPath::dir("fuel-busy-serial");
     let missing = dir.join("absent").join("serial.txt");
     assert!(!missing.parent().unwrap().exists(), "the log parent must be absent");
-    for (ci, console) in [
-        (true, Ip35Console::L1),
-        (true, Ip35Console::Ioc3A),
-        (true, Ip35Console::Ioc3B),
-        (false, Ip35Console::L1),
-    ] {
+    for (ci, console) in [(true, "l1"), (true, "serial1"), (true, "serial2"), (false, "l1")] {
         let mut cfg = fuel_config(&dir);
         cfg.fuel.l1_port = Some(ports[0]);
-        cfg.serial_port_a = Some(ports[1]);
-        cfg.serial_port_b = Some(ports[2]);
+        cfg.devices.clear();
+        for (at, port) in ["serial1", "serial2"].into_iter().zip(&ports[1..]) {
+            let line = format!("serial@{at},backend=tcp:{port},backend=log:{}", missing.display());
+            cfg.devices.push(crate::devices::ConfiguredDevice::from_arg(&line).unwrap());
+        }
         cfg.ci = ci;
         cfg.serial_log = Some(missing.to_string_lossy().into_owned());
         cfg.fuel.l1_log = cfg.serial_log.clone();
-        cfg.fuel.console = console;
+        cfg.machine.console = Some(console.into());
         with_machine(cfg, |_| ());
     }
 }
@@ -678,8 +675,7 @@ fn a_stop_and_start_keeps_a_flash_erase_in_flight() {
     });
 }
 
-/// The I/O chip's first two ports serve `serial_socket_a/b` and keep `serial_log_a/b`, as the
-/// other machines' do.
+/// The I/O chip's two ports serve the Unix sockets and keep the logs their entries name.
 #[cfg(unix)]
 #[test]
 fn the_io_ports_honour_their_sockets_and_logs() {
@@ -687,11 +683,12 @@ fn the_io_ports_honour_their_sockets_and_logs() {
     for (name, board) in [("fuel", fuel_config as fn(&std::path::Path) -> _), ("tezro", |d| tezro_config(d, 1))] {
         let dir = TempPath::dir(&format!("{name}-serial-lines"));
         let mut cfg = board(&dir);
-        let path = |file: &str| dir.join(file).to_string_lossy().into_owned();
-        cfg.serial_socket_a = Some(path("a.sock"));
-        cfg.serial_socket_b = Some(path("b.sock"));
-        cfg.serial_log_a = Some(path("a.log"));
-        cfg.serial_log_b = Some(path("b.log"));
+        cfg.devices.clear();
+        let ports = crate::dev::serial_dev::ports(cfg.machine.profile);
+        for ((n, _), name) in ports.iter().zip(["a", "b"]) {
+            let line = format!("serial@serial{n},backend=unix:{0}/{name}.sock,backend=log:{0}/{name}.log", dir.display());
+            cfg.devices.push(crate::devices::ConfiguredDevice::from_arg(&line).unwrap());
+        }
         let at = dir.to_path_buf();
         with_machine(cfg, move |_| {
             for file in ["a.sock", "b.sock", "a.log", "b.log"] {

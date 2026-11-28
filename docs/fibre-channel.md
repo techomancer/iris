@@ -20,7 +20,7 @@ at = "cage/pci0"         # the first free slot; cage/pci0/2 names one
 
 [[devices]]
 type = "hdd"
-at = "fc/l5"             # a loop ID, 0 to 125
+at = "fc/loop5"             # a loop ID, 0 to 125
 path = "frame0.raw"      # raw or CHD
 overlay = false
 ```
@@ -36,7 +36,7 @@ Put the card behind a PCI-to-PCI bridge with a `pci_bridge` device and
 `at = "bridge/pci0/0"`.
 
 On Origin 3200 and Onyx 3000 the adapter is already fitted on the I-brick, at
-`xio15/pci0/1`. Put its disks at `xio15/pci0/1/lN`. The I-brick's slots are
+`xio15/pci0/1`. Put its disks at `xio15/pci0/1/loopN`. The I-brick's slots are
 `bus1-slot2`, `bus1-slot3` and `bus2-slot1`, `bus2-slot2` (the guide's
 labels; their PCI device numbers are inferred, and the adapter stands for
 `bus1-slot1`). They take PCI cards, not NVMe yet. See the

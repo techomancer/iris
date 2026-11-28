@@ -61,7 +61,7 @@ use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, HOST_WIDGET, PCI_ROUTING};
 use crate::hptimer::TimerManager;
 use crate::ip35::node::NodeSpec;
 use crate::ip35::presence::PresenceHold;
-use crate::ip35::serial::connect_serial_ports;
+use crate::dev::serial_dev::connect_l1_board;
 use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
 use crate::sn::BoardIo;
 use crate::topology::{DeviceFamily, MachineSlotKind};
@@ -248,18 +248,7 @@ fn build_baseio(
     eprintln!("iris: Fibre Channel on the I-brick, {} loop disk(s)", disks.len());
     let fibre = card.fc;
     fibre.set_heartbeat(heartbeat.clone());
-    let section = cfg.ip35_section();
-    let (ioc3, serial) = attach_ioc3(
-        timers,
-        cfg,
-        pci,
-        &IO7,
-        l1,
-        &timekeeper,
-        section.l1_port.unwrap_or(8882),
-        "machine.l1_port",
-        section.l1_log.clone(),
-    );
+    let ioc3 = attach_ioc3(timers, pci, &IO7, l1, &timekeeper);
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("the IO7's IOC3 has Ethernet").clone();
     // The I-brick's keyboard and mouse are USB, not the IOC3's PS/2 ports.
@@ -275,9 +264,14 @@ fn build_baseio(
     xbridge.register_locks();
     ioc3.register_locks();
     fibre.register_locks();
-    let console_index = section.console.index();
-    connect_serial_ports(cfg, cfg.machine.profile.product_name().unwrap_or_default(), &serial, console_index)?;
-    let console = cfg.ci.then(|| serial[console_index].ci.clone());
+    let section = cfg.ip35_section();
+    let console = connect_l1_board(
+        cfg,
+        cfg.machine.profile.product_name().unwrap_or_default(),
+        ["IOC3 A", "IOC3 B"],
+        (section.l1_port, section.l1_log.as_deref()),
+        [&|b| l1.set_serial_backend(b), &|b| ioc3.set_serial_backend(0, b), &|b| ioc3.set_serial_backend(1, b)],
+    )?;
     let (reset_xbridge, reset_ioc3, reset_usb, reset_clock) = (xbridge.clone(), ioc3.clone(), usb.clone(), timekeeper.clone());
     // `scsi2` and `cow2`: the Fibre Channel loop's disks.
     let monitor: Vec<Arc<dyn Device>> = vec![ioc3.ps2(), fibre.clone(), crate::pci::pci_host_commands("XBridge", &[xbridge.bus(HEAD_E), pci], None)];

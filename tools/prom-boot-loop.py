@@ -24,8 +24,7 @@ Example, the O2 PROM with no disks, serial console on 23011:
   headless = true
   no_audio = true
   monitor_port = 23010
-  serial_port_a = 23011
-  serial_port_b = 23012
+  devices = [ { type = "serial", at = "serial1", backend = "tcp:23011" }, { type = "serial", at = "serial2", backend = "tcp:23012" } ]
   serial_log = "serial.log"
   serial_log_overwrite = true
   [machine]

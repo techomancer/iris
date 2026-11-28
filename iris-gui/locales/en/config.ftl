@@ -93,10 +93,9 @@ config-autosave-subtitle =
 config-host-ports = Host ports
 config-port-monitor = Monitor console
 config-port-monitor-tip = Connect with telnet to 127.0.0.1 on this port.
-config-port-serial1 = Serial port 1 (console)
-config-port-serial1-tip = The PROM and IRIX console.
-config-port-serial2 = Serial port 2
-config-port-serial2-tip =
+# $line is the port's name, such as serial1.
+config-port-serial = Serial { $line }
+config-port-serial-tip = Connect with telnet to 127.0.0.1 on this port.
 # $port is the default port number.
 config-port-default-tip = Use { $port }.
 config-ports-conflict = Two of these use the same port. Only the first to start gets it.
@@ -461,10 +460,9 @@ extra-raster-threads = Raster threads
 extra-tile = Raster tile size
 extra-graphics-flash = Graphics flash file
 extra-connections = Serial, network and input settings
-extra-socket-a = Serial A Unix socket
-extra-socket-b = Serial B Unix socket
-extra-log-a = Serial A log file
-extra-log-b = Serial B log file
+# $line is the port's name, such as serial1.
+extra-serial-socket = Serial { $line } Unix socket
+extra-serial-log = Serial { $line } log file
 extra-stream = Ethernet stream peer
 extra-rx-hold = Hold received Ethernet frames when the receive ring is full
 extra-aspect = Lock display aspect ratio
@@ -479,8 +477,6 @@ extra-l1-log = Separate L1 log file
 extra-l1-revision = L1 firmware revision
 extra-brick-serial = Brick serial
 extra-ps2 = Fit PS/2 keyboard and mouse
-extra-port-c = IOC4 serial C TCP port
-extra-port-d = IOC4 serial D TCP port
 extra-c-bricks = C-bricks
 extra-emu-id = Emulator instance ID
 extra-expansion = Expansion boards and storage

@@ -241,10 +241,6 @@ the first `[section]`, because TOML tables continue until the next header.
 | `keyboard` | `ansi` | Physical shape of the host keyboard: `ansi` (US, `\|` above Enter), `iso` (European) or `jis` (Japanese 106/109; use it with the PROM's `keybd` set to Japanese). It decides which SGI key the host's ambiguous key left of Enter sends; the guest applies the character layout. `--keyboard` overrides. |
 | `gdb_port` | `unset` | Start the GDB TCP stub; debugging is unavailable in lightning builds. |
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
-| `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
-| `serial_port_b` | `8881 when unset` | SCC channel B listener (tty1/console); the O2's second serial port. GUI halt uses this port. |
-| `serial_socket_a` | `unset` | Also serve serial channel A on this Unix socket (raw bytes, one client at a time). |
-| `serial_socket_b` | `unset` | Likewise for channel B. With `ci` the console stays readable through `serial-read` and `wait-serial` as well. |
 | `load_elf` | `unset` | Load a static big-endian MIPS ELF32 binary before starting the CPU. |
 | `cheritest_dump_hook` | `false` | CP0 register 26 dump convention; needs a `test_device` device, unsafe for normal PROM boot. |
 | `nat_subnet` | `192.168.0.0/24 when unset` | CIDR; NAT gateway network+1 and guest network+2. |
@@ -255,9 +251,8 @@ the first `[section]`, because TOML tables continue until the next header.
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `renderer` | `gl` | What draws the window: `gl`, or `wgpu` (needs a build with the `wgpu` feature). With `wgpu` the window is presented through wgpu on the same GPU as a VPro or IMPACT whose raster unit is on the GPU, and its frames are shown without being read back. The iris-gui front end ignores it. |
 | `vsync` | `false` | Wait for the host monitor's vertical sync when a frame is shown. Off, frames are shown at once and the guest's video timing is independent of the host monitor; on an X11 desktop with no compositor this can tear. On, a present can wait up to one host frame, which also delays the guest's vertical retrace. The iris-gui front end ignores it. |
-| `serial_log` | `unset` | Log what the guest sends on its serial console (channel B on the Indy and Indigo2, A on the Octane and O2). An existing file is added to, or started over with `serial_log_overwrite`. Used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
-| `serial_log_overwrite` | `false` | Start `serial_log`, `serial_log_a` and `serial_log_b` over each run instead of adding to them, so a script tailing the file sees only this run. `--serial-log-overwrite` sets it. |
-| `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's), appended to like `serial_log`. |
+| `serial_log` | `unset` | Log what the guest sends on its serial console (`machine.console`). An existing file is added to, or started over with `serial_log_overwrite`. Used by CI and GUI serial capture. `-` writes to standard output (for a container's log collector). |
+| `serial_log_overwrite` | `false` | Start `serial_log` and every `log:` end of a `serial` device over each run instead of adding to them, so a script tailing the file sees only this run. `--serial-log-overwrite` sets it. |
 | `serial_log_timestamps` | `off` | `off` (raw transcript), `wall` (prefix each completed line with a UTC ISO-8601 stamp) or `ecs` (one Elastic Common Schema JSON document per non-empty line, logger `irix.guest`, control characters dropped). A partial line is held until its newline and written on stop. `--serial-log-timestamps` overrides. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
@@ -269,6 +264,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`), meaning the machine's part of that family, or a part (`r14000_600`); independent of build features. With `test_device` set (the bare-metal benchmark rig) any part is accepted on any machine, `r14000_500` and the R16000 parts among them. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
 | `machine.cache` | `auto` | How the CPU caches are modelled: `full` (tags, line data, LRU and write-back, as on a real R4400 or R5000; transparent in a `tcache` or `jitv2` build, which keeps tags and states but writes through to memory), `shadow` (memory is the only store; tag arrays only answer CACHE instructions, the faster model under jitv2) or `auto` (`shadow` in a `jitv2` build, `full` otherwise). The R10000 family always uses `shadow`. `--cache` overrides. |
 | `machine.cpus` | `1`; `4` on the Tezro | Processors fitted on each node board, each run on its own host thread. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro; one selects the one-processor board with one PIC, two or four the board with two PICs. 1, 2 or 4 on each C-brick of the Origin 3200 and Onyx 3000, so two C-bricks run up to eight. 1 or 2 on each node board of the Origin 200, Origin 2000 and Onyx2, so a two-board deskside runs four. |
+| `machine.console` | the machine's own | The port that serves `--ci` and `serial_log`: `serial1`, `serial2` (the Onyx2's MediaIO adds `serial3` and `serial4`), or `l1` on the Fuel, Tezro, Origin 3200 and Onyx 3000, which start on it. On the Tezro this selects the host connection only: the PROM uses the L1 until `console ioc4` is run in its Command Monitor and the machine is reset; it then uses the first IOC4 port (`serial1`), and keeps the choice in the `flash` file. |
 | `machine.emu_id` | `0` | 0 to 4095; only the Fuel and Tezro take it, and other machines refuse a nonzero one. Mints the machine's system id (`sysinfo -s`, `lmhostid`) in iris's layout. When nonzero it gives the station address `08:00:69:e2:<emu_id>`, which is the Fuel's id. The Tezro's L1 system serial is `LEMU2<emu_id>0`, whose fold is the Tezro's id. 0 is the generic id. See [the Fuel guide](docs/fuel-ip34.md) and [the Tezro guide](docs/tezro-ip53.md). |
 
 The keys in the sections below, down to `[onyx3000]`, and those of
@@ -306,9 +302,8 @@ Fuel settings apply when `machine.profile = "fuel_ip34"`.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `flash` | unset | Persistent 16 MiB boot-flash file. Unset, the flash is volatile. |
-| `console` | `l1` | `l1`, `ioc3_a` or `ioc3_b`. Selects the guest console connection; the console serves CI and `serial_log`. |
-| `l1_port` | `8882` | Host TCP port for the L1 console. The IOC3's ports use `serial_port_a` and `serial_port_b`. |
-| `l1_log` | unset | Optional serial log path for L1 output when an IOC3 port is selected as console. |
+| `l1_port` | `8882` | Host TCP port for the L1 console. |
+| `l1_log` | unset | Optional serial log path for L1 output when it is not the console. |
 | `ps2_input` | `true` | Fit the IOC3's PS/2 keyboard and mouse and feed them host input. |
 | `usb_input` | `false` | Plug a USB keyboard and mouse into the OHCI controller's first two root ports and send host input to them instead of the PS/2 pair, which stays fitted unless `ps2_input = false`. |
 | `l1_revision` | `1.48.1` | L1 firmware revision as `major.minor.patch`, decimal. The guest reads it with L1 request `0x0005`. |
@@ -327,10 +322,8 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `flash` | unset | Persistent 16 MiB boot-flash file. Unset, the flash is volatile. |
-| `console` | `l1` | `l1`, `ioc4_a`, `ioc4_b`, `ioc4_c` or `ioc4_d`. Selects the host connection only. The PROM uses the L1 until `console ioc4` is run in its Command Monitor and the machine is reset; it then uses UART A (`ioc4_a`) only, and keeps the choice in the `flash` file. |
 | `l1_port` | `8882` | Host TCP port for the L1 console. |
-| `l1_log` | unset | Optional serial log path for L1 output when an IOC4 port is selected as console. |
-| `serial_port_c`, `serial_port_d` | `8883`, `8884` | Host TCP ports of IOC4 ports 2 and 3; ports 0 and 1 use `serial_port_a` and `serial_port_b`. |
+| `l1_log` | unset | Optional serial log path for L1 output when it is not the console. |
 | `audio` | `false` | Add the ICE1724 audio controller on the IO9's PCI bridge. Off, the bridge's bus is empty. On, it plays to the host as `[audio]` sets, or silently with `no_audio`. See the [Tezro guide](docs/tezro-ip53.md). |
 
 The machine runs the 700 MHz R16000 (`r16000_700`, the default), or the 800, 900
@@ -350,21 +343,19 @@ Origin 3200 settings apply when `machine.profile = "origin3200_ip35"`.
 |---|---|---|
 | `c_bricks` | `1`; `2` on an Onyx 3000 with a V12 | 1 or 2 C-bricks, each with `machine.cpus` processors. Two are joined by the direct NUMAlink cable. |
 | `flash` | unset | Persistent 16 MiB boot-flash file of the first C-brick; the second keeps its own at the name with `.1` added. Unset, the flash is volatile. |
-| `console` | `l1` | `l1`, `ioc3_a` or `ioc3_b`. Selects the guest console connection. |
-| `l1_port` | `8882` | Host TCP port for the first C-brick's L1 console. |
-| `l1_log` | unset | Optional serial log path for L1 output when an IOC3 port is selected as console. |
+| `l1_port`, `l1_log` | `8882`, unset | Host TCP port and log of the first C-brick's L1 console, as for the Fuel. |
 | `l1_revision`, `brick_serial` | `1.48.1`, `EMUN00` | What the first C-brick's L1 reports, as for the Fuel. |
 
 `banks` is per C-brick and defaults to two 256 MiB banks; 256 and 512 MiB banks
 are accepted, in the matched pairs a lane of the memory controller holds. The I-brick's Fibre Channel
-adapter is always fitted; its disks are `hdd` devices at `xio15/pci0/1/lN`. A `[origin3200]` table is
+adapter is always fitted; its disks are `hdd` devices at `xio15/pci0/1/loopN`. A `[origin3200]` table is
 written to a saved config only when one of these keys is set. See the
 [Origin 3200 guide](docs/origin3200-ip35.md), which lists its limits.
 
 ### [onyx3000]
 
 Onyx 3000 settings apply when `machine.profile = "onyx3000_ip35"`. The keys are
-those of `[origin3200]`, with the same defaults: `c_bricks` (`[machine] nodes`), `flash`, `console`,
+those of `[origin3200]`, with the same defaults: `c_bricks` (`[machine] nodes`), `flash`,
 `l1_port`, `l1_log`, `l1_revision` and `brick_serial`. Either graphics board
 takes one or two C-bricks; `c_bricks` left unset is 2 with a V12, whose V-brick
 then has a C-brick of its own. A `[onyx3000]` table is written to a saved config only when
@@ -406,14 +397,15 @@ takes; `--device [NAME:]TYPE[@SLOT][,KEY=VALUE]...` adds or replaces one from th
 | `cdrom` | a SCSI target | `path` (a file, or an `http://` or `https://` URL, [STORAGE.md](STORAGE.md#cd-rom-images-over-http); empty means an empty tray), `discs` (more changer images), `overlay` |
 | `daynaport` | a SCSI target | `mac` (`00:80:19:44:50:<target>` when unset), `subnet` (`192.168.10.0/24` when unset, separate from ec0's). Refused on the machines with built-in Ethernet only (the O2, the Origin 200, Origin 2000 and Onyx2, the Fuel and the Tezro) and with `network.mode = "stream"`. |
 | `nvme` | a PCI slot | `path` (raw or CHD, at most 2 TiB), `overlay`, `write_cache` (as for `hdd`). An NVM Express controller with one namespace; any number per machine; see [docs/nvme.md](docs/nvme.md). |
-| `qla2200` | a PCI slot | A QLogic ISP2200 Fibre Channel adapter; its disks are `hdd` entries at `CARD/lN`, N the loop ID 0 to 125. The Origin 3200 and Onyx 3000 have one fitted at `xio15/pci0/1`. See [docs/fibre-channel.md](docs/fibre-channel.md). |
+| `qla2200` | a PCI slot | A QLogic ISP2200 Fibre Channel adapter; its disks are `hdd` entries at `CARD/loopN`, N the loop ID 0 to 125. The Origin 3200 and Onyx 3000 have one fitted at `xio15/pci0/1`. See [docs/fibre-channel.md](docs/fibre-channel.md). |
+| `serial` | a serial port (`serial1`, `serial2`, ...; `--list-slots` lists them) | `backend`: one string or a list of `tcp:PORT` (telnet on 127.0.0.1, 0 = any free port), `unix:PATH` (raw bytes) and `log:PATH` (a transcript). The device replaces the port's default (TCP 8880 and up; under `--ci` any free port on every port but the console); with no `backend` the port is unplugged. `hostserial`, `midi_synth` and `midi_raw` put a device on the port instead. See [HELP.md](HELP.md#serial-ports). |
 | `ice1724` | a PCI slot | The IC Ensemble ICE1724 audio card; plays as `[audio]` sets. |
 | `pci_cage`, `pci_shoehorn` | an Octane XIO slot (`xio9` to `xio13`; the cage at `xio13`, alias `pci_module`) | The PCI module (slots 1 to 3) and the single-slot XIO-to-PCI adapter; see [docs/pci.md](docs/pci.md#option-boards-in-xio-slots). |
 | `pci_bridge` | a PCI slot | A PCI-to-PCI bridge, with one slot behind it at `BRIDGE/pci0/0`. |
 | `virtio_serial` | a spare slot (a GIO slot on the Indy and Indigo2) | `port` tables, `[[devices.port]]`, at most 31: `name`, `console`, and `tcp_port` (raw TCP on 127.0.0.1) or `socket` (a Unix socket, exclusive with `tcp_port`); one console on TCP 8890 when none. See [docs/dev/virtio-serial.md](docs/dev/virtio-serial.md). |
 | `virtio_9p` | a spare slot | `path` (required), `tag` (`"share"`), `readonly`, `owners` (`"squash"` or `"passthrough"`), `uid`, `gid`, `uid_map`, `gid_map`. Needs a Unix host; see [docs/dev/virtio-9p.md](docs/dev/virtio-9p.md). |
 | `ultra64`, `test_device`, `newport` | `gio0` | The N64 development board (needs an external gopher64 peer), the bare-metal test device (`dump`, `run_config` as `time_pct=N,repeats=N,groups=MASK`; with `cheritest_dump_hook`) and the Indy's or Indigo2's second Newport head. |
-| `hostserial` | a serial port, `serialN` (IRIX's `/dev/ttydN`: `serial1` and `serial2`, on the Tezro `serial3` and `serial4`); `at` is required | `path` (required): a host serial port such as `"/dev/ttyUSB0"`. Its rate, framing, DTR, RTS and break follow the guest; its CTS, DCD, DSR and RI are the guest's modem inputs. Linux and macOS. See the serial ports section of [HELP.md](HELP.md). |
+| `hostserial` | a serial port, `serialN`, N the number on the machine's case (`serial1` and `serial2`; the Onyx2's MediaIO adds `serial3` and `serial4`); `at` is required | `path` (required): a host serial port such as `"/dev/ttyUSB0"`. Its rate, framing, DTR, RTS and break follow the guest; its CTS, DCD, DSR and RI are the guest's modem inputs. Linux and macOS. See the serial ports section of [HELP.md](HELP.md). |
 | `midi_synth` | a serial port, as `hostserial` | `path` (required): a General MIDI SoundFont (`.sf2`), loaded at start. `gain` (`1.0`, 0 to 16): times the synth's own level, which leaves room for many voices; the host mix clips above full scale. Plays into the host's audio as a stream of its own (muted by `no_audio`); with `[audio] file`, into a file beside it (`out.wav` → `out-midi.wav`); `IRIS_MIDI_CAPTURE=file.wav` also records it. |
 | `midi_raw` | a serial port, as `hostserial` | `path` (required): a host MIDI port. A raw MIDI device (Linux: `"/dev/snd/midiC1D0"` or `"/dev/midi1"`) passes the bytes as they are, both ways; a host serial port with a MIDI interface (`"/dev/ttyUSB0"`) is set up as `hostserial` does. |
 | `graphics` | a graphics port or slot (`gfx`, `xio11`, `node1/xio8`) | Where the board goes; which board it is stays `[graphics] board`. Left out, the machine places it. |
@@ -562,14 +554,14 @@ installer's `ip32prom.image`), `nvram` (the PROM's flash, which holds
 its environment; the DS1687's RAM goes beside it in `<nvram>.rtc`, the
 Octane's 512-byte image, and its clock in `<nvram>.rtc.clock`), `banks`
 (the kit in each of the four DIMM pairs: 32, 64,
-128 or 256 MB, largest first), `serial_port_a`/`serial_port_b`/`serial_log`,
+128 or 256 MB, largest first), `serial_log`,
 `headless` (serial console instead of the graphics console and keyboard),
 `[clock] fixed_mhz` (CP0 Count; the CPU runs at twice it, so 90 MHz is a
 180 MHz O2), `[network]` including `mac` and `mode = "off"` for an unplugged
 Ethernet, `[[port_forward]]`, `nat_subnet`, `[nfs]` and `[[devices]]`
 (`scsi0` and `scsi1` are its buses). See [the O2 guide](docs/o2-ip32.md). The old
 O2-only spellings (`o2.prom`, `o2.flash`, `o2.ram_mb`, `o2.dimms`,
-`o2.disks`, `o2.serial_port`, `o2.serial_log`, `o2.graphics`, `o2.cpu_mhz`,
+`o2.disks`, `o2.serial_log`, `o2.graphics`, `o2.cpu_mhz`,
 `o2.net`, `o2.forwards`) are deprecated: they are folded into those keys when
 the file is loaded, with a note, and never written back.
 
@@ -584,8 +576,7 @@ Used with `machine.profile = "octane_ip30"` (an R10000, R12000 or R14000,
 one or two of them). An Octane is configured by the shared keys: `prom` (the IP30 PROM,
 which overrides the embedded 6.5.30 image; `prom.bin`, then `IP30prom.bin`, is tried when it is left at its default), `nvram` (the
 DS1685's NVRAM, behind IOC3, its clock in `<nvram>.clock`), `banks` (the MB in each HEART bank: 64, 128, 256,
-512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
-`serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
+512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_log` (the first IOC3 port is the console),
 `headless`, `[clock] fixed_mhz` (CP0 Count; 97.5 for the 195 MHz R10000),
 `[network]`, `[[port_forward]]`, `nat_subnet`, `[[devices]]` (`scsi0` is the internal bus, `scsi1` the external) and `[graphics] board`. See [the Octane guide](docs/octane-ip30.md).
 
@@ -669,11 +660,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--monitor-port` | Monitor console port on 127.0.0.1 (default 8888). Give each iris running at once its own. |
 | `--vnc-password-file FILE` | Ask VNC viewers for the password in FILE (first 8 bytes). Without it, `IRIS_VNC_PASSWORD_FILE` or `IRIS_VNC_PASSWORD` (the password itself) in the environment is used. Sets `vnc.password_file`. |
 | `--vnc [ADDR]` | Serve the screen, keyboard and mouse over VNC on ADDR (`host:port` or a port; default 127.0.0.1:5900). Sets `vnc.listen`. |
-| `--serial-port-a` | Serial channel A (tty2) port on 127.0.0.1 (default 8880). |
-| `--serial-port-b` | Serial channel B (tty1, the console) port on 127.0.0.1 (default 8881). |
-| `--serial-socket-a`, `--serial-socket-b` | Also serve channel A or B on a Unix socket. |
+| `--device serial@PORT,backend=tcp:N` | Serve a serial port; repeat `backend=` for each `tcp:`, `unix:` and `log:` end. |
 | `--keyboard LAYOUT` | Physical host keyboard: `ansi` (default), `iso` or `jis`. Use `jis` for a Japanese keyboard with the PROM's `keybd` set to JP. Sets `keyboard`. |
-| `--serial-log-a`, `--serial-log-b` | Log what the guest sends on channel A or B when it is not the console. |
 | `--device test_device@gio0` | Map the bare-metal test device into GIO expansion slot 0: SIGNATURE, PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT (terminate with the guest's exit code). Off by default. Its `dump` key says where the machine-state dump goes; `run_config` asks a bare-metal guest for a shorter run, as `time_pct=N,repeats=N,groups=MASK`, any of them. |
 | `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs a `test_device` device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
 | `--tftp-dir` | Serve this directory read-only over TFTP at the gateway address, so the PROM can network-boot from it: `boot -f bootp()<file>`. Off when unset. |

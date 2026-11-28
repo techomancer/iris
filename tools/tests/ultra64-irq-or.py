@@ -49,7 +49,7 @@ def main():
     iris = subprocess.Popen(
         [os.path.abspath(a.iris), "--config", cfg, "--headless",
          "--monitor-port", str(a.port),
-         "--serial-port-a", str(a.port + 1), "--serial-port-b", str(a.port + 2)],
+         "--device", f"serial@serial2,backend=tcp:{a.port + 1}", "--device", f"serial@serial1,backend=tcp:{a.port + 2}"],
         cwd=work, stdout=log, stderr=subprocess.STDOUT)
     failures = []
     try:

@@ -12,9 +12,6 @@ banks = [128, 0, 0, 0]
 headless = true
 no_audio = true
 monitor_port = 18988
-# The IOC3's first port is the console.
-serial_port_a = 18980
-serial_port_b = 18981
 
 [machine]
 profile = "onyx2_ip27"
@@ -31,6 +28,17 @@ controller_store = "ignore/onyx2/controller.raw"
 [network]
 # Disconnected cable. For NAT, use mode = "nat".
 mode = "off"
+
+# Where each serial port is served: TCP on 127.0.0.1, in place of 8880 and up.
+[[devices]]
+type = "serial"
+at = "serial1"
+backend = "tcp:18980"
+
+[[devices]]
+type = "serial"
+at = "serial2"
+backend = "tcp:18981"
 
 [[devices]]
 type = "hdd"

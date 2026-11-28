@@ -145,10 +145,10 @@ interrupt pin, so nothing takes it. A virtio entry with no `at` takes them in th
 
 ## Console, keyboard and mouse
 
-The console is IOC3's first serial port on TCP 127.0.0.1 (`serial_port_a`,
-8880 unless set), and `serial_log` copies what it sends to a file, adding to
+The console is IOC3's first serial port, `serial1`, on TCP 127.0.0.1 (8880
+unless a `serial` device says otherwise), and `serial_log` copies what it sends to a file, adding to
 an existing log unless `serial_log_overwrite` is set; the second port is
-`serial_port_b`. The PROM's `console` variable picks between the
+`serial2`. The PROM's `console` variable picks between the
 serial and graphics consoles; `headless` only removes the window.
 
 A PS/2 keyboard and mouse are always plugged into IOC3's two PS/2 ports;

@@ -225,7 +225,7 @@ mod tests {
             path = "unused.img"
             [[devices]]
             type = "hdd"
-            at = "xio15/pci0/1/l0"
+            at = "xio15/pci0/1/loop0"
             path = "fc0.img"
         "#);
         assert!(missing_disks(&cfg, none_readable).is_empty());

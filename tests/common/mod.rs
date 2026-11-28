@@ -72,7 +72,7 @@ pub fn machine_config(suite_config: &str, dir: &Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("{}: {}", suite_config, e));
     // Top-level keys, so they go before the file's first table.
     let text = format!(
-        "monitor_port = 0\nserial_port_a = 0\nserial_port_b = 0\n\n{}",
+        "monitor_port = 0\ndevices = [ {{ type = \"serial\", at = \"serial1\", backend = \"tcp:0\" }}, {{ type = \"serial\", at = \"serial2\", backend = \"tcp:0\" }} ]\n\n{}",
         base
     );
     let path = dir.join("run").join("bare.toml");

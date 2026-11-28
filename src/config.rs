@@ -1499,8 +1499,8 @@ pub struct MachineSection {
     /// The file that keeps the boot flash between runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flash: Option<String>,
-    /// The console connection: `l1`, `ioc3_a`, `ioc3_b`, or on the Tezro
-    /// `ioc4_a` to `ioc4_d`.
+    /// The port that serves CI and `serial_log`: `serial1`, `serial2` or, where the machine has an L1, `l1`. Unset:
+    /// the machine's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1511,11 +1511,6 @@ pub struct MachineSection {
     pub l1_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brick_serial: Option<String>,
-    /// Tezro: host TCP ports of IOC4 ports 2 and 3.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_port_c: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_port_d: Option<u16>,
     /// Fuel: which keyboard and mouse the host's reach.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ps2_input: Option<bool>,
@@ -1554,7 +1549,7 @@ impl MachineSection {
 /// What only an O2 has (`[o2]` section). The rest of an O2 is the shared
 /// keys: `prom` (an override of its built-in PROM image), `nvram` (the PROM's flash,
 /// which holds its environment), `banks` (the kit in each DIMM pair),
-/// `serial_port_a`/`serial_port_b`/`serial_log`, `headless` (a serial
+/// `serial_log`, `headless` (a serial
 /// console instead of the graphics console), `[clock] fixed_mhz` (CP0 Count,
 /// half the CPU clock), `[network]`, `[[port_forward]]` and `[scsi.N]`. The
 /// deprecated keys below are the old O2-only spellings of those:
@@ -1587,9 +1582,6 @@ pub struct O2Section {
     /// Deprecated: `[scsi.N]` with `controller` = bus.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<O2Disk>,
-    /// Deprecated: `serial_port_a`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_port: Option<u16>,
     /// Deprecated: `serial_log`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log: Option<String>,
@@ -1617,7 +1609,6 @@ impl O2Section {
             && self.ram_mb.is_none()
             && self.dimms.is_none()
             && self.disks.is_empty()
-            && self.serial_port.is_none()
             && self.serial_log.is_none()
             && self.graphics.is_none()
             && self.cpu_mhz.is_none()
@@ -1635,7 +1626,7 @@ fn is_false(b: &bool) -> bool {
 /// (the 1 MB flash image; IRIX's `IP30prom.bin` is tried when it is left
 /// unset), `nvram` (the DS1685's RAM), `banks` (MB in each HEART bank),
 /// `[scsi.N]` (`controller` 0 internal, 1 external), `[network]`,
-/// `serial_port_a`/`serial_port_b`/`serial_log` and `[clock] fixed_mhz`.
+/// `serial_log` and `[clock] fixed_mhz`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OctaneSection {
@@ -1733,7 +1724,6 @@ impl Default for O2Section {
             ram_mb: None,
             dimms: None,
             disks: Vec::new(),
-            serial_port: None,
             serial_log: None,
             graphics: None,
             cpu_mhz: None,
@@ -2214,12 +2204,10 @@ pub struct FuelSection {
     /// Persistent 16 MiB boot flash store; absent means volatile flash.
     #[serde(default)]
     pub flash: Option<String>,
-    #[serde(default)]
-    pub console: Ip35Console,
-    /// L1 host console TCP port; IOC3 keeps serial_port_a and serial_port_b.
+    /// L1 host console TCP port.
     #[serde(default)]
     pub l1_port: Option<u16>,
-    /// Separate L1 log when an IOC3 port is selected as console.
+    /// L1 log, when the L1 is not the console.
     #[serde(default)]
     pub l1_log: Option<String>,
     /// Attach the PS/2 keyboard and mouse controller in the onboard IOC3 and
@@ -2248,7 +2236,6 @@ impl Default for FuelSection {
     fn default() -> Self {
         Self {
             flash: None,
-            console: Ip35Console::default(),
             l1_port: None,
             l1_log: None,
             ps2_input: true,
@@ -2263,31 +2250,12 @@ impl FuelSection {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
         self.flash.is_none()
-            && self.console == Ip35Console::default()
             && self.l1_port.is_none()
             && self.l1_log.is_none()
             && self.ps2_input
             && !self.usb_input
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
-    }
-}
-
-/// The L1 and IOC3 serial connections of the Fuel, Origin 3200 and Onyx 3000: the
-/// first brick's L1, then the IOC3 ports. The selected console serves CI and serial_log.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Ip35Console {
-    #[default]
-    L1,
-    Ioc3A,
-    Ioc3B,
-}
-
-impl Ip35Console {
-    /// The connection's index: 0 for the L1, then the IOC3's ports.
-    pub fn index(self) -> usize {
-        self as usize
     }
 }
 
@@ -2305,13 +2273,10 @@ pub struct Ip35Section {
     /// own beside it, at the name with `.1` added). Absent means volatile.
     #[serde(default)]
     pub flash: Option<String>,
-    #[serde(default)]
-    pub console: Ip35Console,
-    /// The first C-brick's L1 host console TCP port; the IOC3 keeps
-    /// serial_port_a and serial_port_b.
+    /// The first C-brick's L1 host console TCP port.
     #[serde(default)]
     pub l1_port: Option<u16>,
-    /// Separate L1 log when an IOC3 port is selected as console.
+    /// L1 log, when the L1 is not the console.
     #[serde(default)]
     pub l1_log: Option<String>,
     /// L1 firmware revision as "major.minor.patch", reported to request
@@ -2329,7 +2294,6 @@ impl Default for Ip35Section {
         Self {
             c_bricks: None,
             flash: None,
-            console: Ip35Console::default(),
             l1_port: None,
             l1_log: None,
             l1_revision: None,
@@ -2343,31 +2307,10 @@ impl Ip35Section {
     fn is_default(&self) -> bool {
         self.c_bricks.is_none()
             && self.flash.is_none()
-            && self.console == Ip35Console::default()
             && self.l1_port.is_none()
             && self.l1_log.is_none()
             && self.l1_revision.is_none()
             && self.brick_serial.is_none()
-    }
-}
-
-/// The Tezro's serial connections: the L1 and the IOC4's four ports. The
-/// selected console serves CI and serial_log.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TezroConsole {
-    #[default]
-    L1,
-    Ioc4A,
-    Ioc4B,
-    Ioc4C,
-    Ioc4D,
-}
-
-impl TezroConsole {
-    /// The connection's index: 0 for the L1, then the IOC4's ports.
-    pub fn index(self) -> usize {
-        self as usize
     }
 }
 
@@ -2380,31 +2323,18 @@ pub struct TezroSection {
     /// Persistent 16 MiB boot flash store; absent means volatile flash.
     #[serde(default)]
     pub flash: Option<String>,
-    #[serde(default)]
-    pub console: TezroConsole,
-    /// L1 host console TCP port; IOC4 ports 0 and 1 keep serial_port_a and
-    /// serial_port_b.
+    /// L1 host console TCP port.
     #[serde(default)]
     pub l1_port: Option<u16>,
-    /// Separate L1 log when an IOC4 port is selected as console.
+    /// L1 log, when the L1 is not the console.
     #[serde(default)]
     pub l1_log: Option<String>,
-    /// Host TCP ports of IOC4 ports 2 and 3.
-    #[serde(default)]
-    pub serial_port_c: Option<u16>,
-    #[serde(default)]
-    pub serial_port_d: Option<u16>,
 }
 
 impl TezroSection {
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
-        self.flash.is_none()
-            && self.console == TezroConsole::default()
-            && self.l1_port.is_none()
-            && self.l1_log.is_none()
-            && self.serial_port_c.is_none()
-            && self.serial_port_d.is_none()
+        self.flash.is_none() && self.l1_port.is_none() && self.l1_log.is_none()
     }
 }
 
@@ -2498,24 +2428,6 @@ pub struct MachineConfig {
     /// then has no monitor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_port: Option<u16>,
-
-    /// TCP ports of the serial channels on 127.0.0.1: A (tty2) and B (tty1,
-    /// the console). None means 8880 and 8881
-    /// (`crate::dev::z85c30::DEFAULT_PORTS`); like the monitor's, they have to
-    /// differ between iris processes running at once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_port_a: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_port_b: Option<u16>,
-
-    /// Unix socket paths that serve serial channels A and B as well as their
-    /// TCP ports: raw bytes, one client at a time. Where the machine has a CI
-    /// socket, a console on a socket is also still readable through
-    /// `serial-read`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_socket_a: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_socket_b: Option<String>,
 
     /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Set `jis`
     /// with a Japanese keyboard and the PROM's `keybd` set to Japanese. See
@@ -2618,16 +2530,6 @@ pub struct MachineConfig {
     /// `off` (the default) writes raw bytes, byte-for-byte a transcript.
     #[serde(default)]
     pub serial_log_timestamps: crate::dev::serial_log::SerialLogTimestamps,
-
-    /// Files that receive what the guest sends on serial channel A or B when
-    /// that channel is not the console (`serial_log` is the console's):
-    /// channel B on the Octane and O2, channel A on the Indy and Indigo2.
-    /// Appended to on every machine, like `serial_log`, unless
-    /// `serial_log_overwrite` is set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_log_a: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serial_log_b: Option<String>,
 
     // --- table / array-of-table fields: must be emitted after all scalars ---
 
@@ -2899,10 +2801,6 @@ impl Default for MachineConfig {
             no_audio: false,
             gdb_port: None,
             monitor_port: None,
-            serial_port_a: None,
-            serial_port_b: None,
-            serial_socket_a: None,
-            serial_socket_b: None,
             keyboard: KeyboardLayout::default(),
             load_elf: None,
             perfetto: None,
@@ -2919,8 +2817,6 @@ impl Default for MachineConfig {
             serial_log: None,
             serial_log_overwrite: false,
             serial_log_timestamps: Default::default(),
-            serial_log_a: None,
-            serial_log_b: None,
             vino: VinoConfig::default(),
             vnc: VncConfig::default(),
             network: NetworkSection::default(),
@@ -2958,10 +2854,9 @@ impl Default for MachineConfig {
 fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::default() }
 
 impl MachineConfig {
-    /// The serial channels' TCP ports (A, B), defaults filled in.
-    pub fn serial_ports(&self) -> [u16; 2] {
-        let [a, b] = crate::dev::z85c30::DEFAULT_PORTS;
-        [self.serial_port_a.unwrap_or(a), self.serial_port_b.unwrap_or(b)]
+    /// The TCP port of the serial console on 127.0.0.1, for a front end to connect to.
+    pub fn console_port(&self) -> Option<u16> {
+        crate::dev::serial_dev::console_port(self)
     }
 
     /// Parse a config file's text as [`try_load`](Self::try_load) does, for
@@ -2997,7 +2892,6 @@ impl MachineConfig {
         use MachineProfile as P;
         let p = self.machine.profile;
         let not_here = |key: &str| format!("machine.{key} is not a key of machine.profile {}", p.name());
-        let console = |text: &str| format!("machine.console \"{text}\" is not a console of machine.profile {}", p.name());
         if let Some(nodes) = self.machine.nodes.take() {
             match p {
                 P::Origin3200Ip35 => self.origin3200.c_bricks = Some(nodes),
@@ -3021,16 +2915,6 @@ impl MachineConfig {
                 _ => return Err(not_here("flash")),
             };
             *slot = Some(flash);
-        }
-        if let Some(text) = self.machine.console.take() {
-            let value = toml::Value::String(text.clone());
-            match p {
-                P::FuelIp34 => self.fuel.console = value.try_into().map_err(|_| console(&text))?,
-                P::Origin3200Ip35 => self.origin3200.console = value.try_into().map_err(|_| console(&text))?,
-                P::Onyx3000Ip35 => self.onyx3000.console = value.try_into().map_err(|_| console(&text))?,
-                P::TezroIp53 => self.tezro.console = value.try_into().map_err(|_| console(&text))?,
-                _ => return Err(not_here("console")),
-            }
         }
         if let Some(port) = self.machine.l1_port.take() {
             let slot = match p {
@@ -3069,15 +2953,6 @@ impl MachineConfig {
                 _ => return Err(not_here("brick_serial")),
             };
             *slot = Some(serial);
-        }
-        let tezro = p == P::TezroIp53;
-        if let Some(port) = self.machine.serial_port_c.take() {
-            if !tezro { return Err(not_here("serial_port_c")); }
-            self.tezro.serial_port_c = Some(port);
-        }
-        if let Some(port) = self.machine.serial_port_d.take() {
-            if !tezro { return Err(not_here("serial_port_d")); }
-            self.tezro.serial_port_d = Some(port);
         }
         let fuel = p == P::FuelIp34;
         if let Some(on) = self.machine.ps2_input.take() {
@@ -3122,9 +2997,6 @@ impl MachineConfig {
     /// and that section left out. The inverse of [`Self::fold_machine_keys`]; serialize the result.
     pub fn for_writing(&self) -> Self {
         use MachineProfile as P;
-        fn name<T: Serialize>(value: &T) -> Option<String> {
-            toml::Value::try_from(value).ok().and_then(|v| v.as_str().map(str::to_owned))
-        }
         let mut out = self.clone();
         let m = &mut out.machine;
         match self.machine.profile {
@@ -3148,7 +3020,6 @@ impl MachineConfig {
             P::FuelIp34 => {
                 let fuel = std::mem::take(&mut out.fuel);
                 m.flash = fuel.flash;
-                m.console = (fuel.console != Ip35Console::default()).then(|| name(&fuel.console)).flatten();
                 m.l1_port = fuel.l1_port;
                 m.l1_log = fuel.l1_log;
                 m.ps2_input = (!fuel.ps2_input).then_some(false);
@@ -3159,17 +3030,13 @@ impl MachineConfig {
             P::TezroIp53 => {
                 let tezro = std::mem::take(&mut out.tezro);
                 m.flash = tezro.flash;
-                m.console = (tezro.console != TezroConsole::default()).then(|| name(&tezro.console)).flatten();
                 m.l1_port = tezro.l1_port;
                 m.l1_log = tezro.l1_log;
-                m.serial_port_c = tezro.serial_port_c;
-                m.serial_port_d = tezro.serial_port_d;
             }
             P::Origin3200Ip35 | P::Onyx3000Ip35 => {
                 let section = std::mem::take(if self.machine.profile == P::Onyx3000Ip35 { &mut out.onyx3000 } else { &mut out.origin3200 });
                 m.nodes = section.c_bricks;
                 m.flash = section.flash;
-                m.console = (section.console != Ip35Console::default()).then(|| name(&section.console)).flatten();
                 m.l1_port = section.l1_port;
                 m.l1_log = section.l1_log;
                 m.l1_revision = section.l1_revision;
@@ -3574,7 +3441,6 @@ impl MachineConfig {
                 return Err(format!("[[devices]] daynaport at \"{at}\": cannot join a stream segment: [network] stream names the onboard Ethernet's peer"));
             }
         }
-        self.validate_serial_sockets()?;
         for d in &self.devices {
             match &d.device {
                 DeviceModel::TestDevice(t) => t.run().map(|_| ())?,
@@ -3841,30 +3707,6 @@ impl MachineConfig {
             }
         }
         Ok(())
-    }
-
-    /// The Unix serial sockets and per-line logs: each path names one line,
-    /// and the console line's log is `serial_log`, not a per-line key.
-    fn validate_serial_sockets(&self) -> Result<(), String> {
-        let sockets = [("serial_socket_a", self.serial_socket_a.as_deref()), ("serial_socket_b", self.serial_socket_b.as_deref())];
-        for (i, (setting, path)) in sockets.iter().enumerate() {
-            let Some(path) = path else { continue };
-            if path.is_empty() {
-                return Err(format!("{setting}: the socket path is empty"));
-            }
-            if let Some((other, _)) = sockets[..i].iter().find(|(_, p)| *p == Some(*path)) {
-                return Err(format!("{setting} and {other} both name {path}"));
-            }
-        }
-        match self.machine.profile {
-            MachineProfile::OctaneIp30 | MachineProfile::O2Ip32 if self.serial_log_a.is_some() => {
-                Err("serial_log_a: channel A is the console here; its log is serial_log".into())
-            }
-            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 if self.serial_log_b.is_some() => {
-                Err("serial_log_b: channel B is the console here; its log is serial_log".into())
-            }
-            _ => Ok(()),
-        }
     }
 
     /// The station address when `[network] mac` is unset: the address
@@ -4142,22 +3984,6 @@ pub struct Cli {
     #[arg(long = "vnc-password-file", value_name = "FILE")]
     pub vnc_password_file: Option<String>,
 
-    /// Serial channel A (tty2) port on 127.0.0.1 (default 8880).
-    #[arg(long = "serial-port-a", value_name = "PORT")]
-    pub serial_port_a: Option<u16>,
-
-    /// Serial channel B (tty1, the console) port on 127.0.0.1 (default 8881).
-    #[arg(long = "serial-port-b", value_name = "PORT")]
-    pub serial_port_b: Option<u16>,
-
-    /// Also serve serial channel A on this Unix socket.
-    #[arg(long = "serial-socket-a", value_name = "PATH")]
-    pub serial_socket_a: Option<String>,
-
-    /// Also serve serial channel B on this Unix socket.
-    #[arg(long = "serial-socket-b", value_name = "PATH")]
-    pub serial_socket_b: Option<String>,
-
     /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Use `jis`
     /// for a Japanese keyboard with the PROM's `keybd` set to JP.
     #[arg(long = "keyboard", value_name = "LAYOUT")]
@@ -4243,16 +4069,6 @@ pub struct Cli {
     #[arg(long = "serial-log-timestamps", value_name = "MODE")]
     pub serial_log_timestamps: Option<crate::dev::serial_log::SerialLogTimestamps>,
 
-    /// Write what the guest sends on serial channel A to this file when A is
-    /// not the console (Indy, Indigo2).
-    #[arg(long = "serial-log-a", value_name = "FILE")]
-    pub serial_log_a: Option<String>,
-
-    /// Write what the guest sends on serial channel B to this file when B is
-    /// not the console (Octane, O2).
-    #[arg(long = "serial-log-b", value_name = "FILE")]
-    pub serial_log_b: Option<String>,
-
     /// Override CP0 Count MHz (default: half the CPU's clock, e.g. 75 on a 150 MHz R4400).
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
@@ -4329,8 +4145,6 @@ impl Cli {
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
         if self.serial_log_overwrite { cfg.serial_log_overwrite = true; }
         if let Some(mode) = self.serial_log_timestamps { cfg.serial_log_timestamps = mode; }
-        if let Some(p) = &self.serial_log_a { cfg.serial_log_a = Some(p.clone()); }
-        if let Some(p) = &self.serial_log_b { cfg.serial_log_b = Some(p.clone()); }
         if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
@@ -4348,10 +4162,6 @@ impl Cli {
         if let Some(p) = self.monitor_port { cfg.monitor_port = Some(p); }
         if let Some(a) = &self.vnc { cfg.vnc.listen = Some(a.clone()); }
         if let Some(f) = &self.vnc_password_file { cfg.vnc.password_file = Some(f.clone()); }
-        if let Some(p) = self.serial_port_a { cfg.serial_port_a = Some(p); }
-        if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
-        if let Some(p) = &self.serial_socket_a { cfg.serial_socket_a = Some(p.clone()); }
-        if let Some(p) = &self.serial_socket_b { cfg.serial_socket_b = Some(p.clone()); }
         if let Some(k) = self.keyboard { cfg.keyboard = k; }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref p) = self.perfetto { cfg.perfetto = Some(p.clone()); }
@@ -4384,6 +4194,9 @@ impl Cli {
 /// to clap's derive, which wants a constant, so it is set on the command here.
 /// No machine is configured yet, so only the model-neutral words can appear.
 fn parse_cli() -> Cli {
+    if let Some(e) = legacy::removed_flag(std::env::args().skip(1)) {
+        Cli::command().error(clap::error::ErrorKind::UnknownArgument, e).exit();
+    }
     let mut matches = Cli::command().about(crate::machine::emulator_name()).get_matches();
     Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|e| e.format(&mut Cli::command()).exit())
 }
@@ -5113,17 +4926,15 @@ mod export_tests {
     #[test]
     fn the_machine_section_holds_each_machines_own_keys() {
         let load = |text: &str| MachineConfig::from_toml_str(text).map_err(|e| e.to_string());
-        let onyx = load("[machine]\nprofile = \"onyx3000_ip35\"\nc_bricks = 2\nflash = \"f\"\nconsole = \"ioc3_a\"\nl1_port = 9000\nbrick_serial = \"S\"\n").unwrap();
+        let onyx = load("[machine]\nprofile = \"onyx3000_ip35\"\nc_bricks = 2\nflash = \"f\"\nconsole = \"serial2\"\nbrick_serial = \"S\"\n").unwrap();
         assert_eq!((onyx.c_bricks(), onyx.node_boards()), (2, 2));
-        assert_eq!((onyx.onyx3000.flash.as_deref(), onyx.onyx3000.console, onyx.onyx3000.l1_port), (Some("f"), Ip35Console::Ioc3A, Some(9000)));
+        assert_eq!(onyx.onyx3000.flash.as_deref(), Some("f"));
+        assert_eq!(onyx.machine.console.as_deref(), Some("serial2"), "a port name, kept in [machine]");
         assert_eq!(onyx.machine.nodes, None, "moved to the machine's section");
         let text = toml::to_string_pretty(&onyx.for_writing()).unwrap();
-        assert!(text.contains("nodes = 2") && text.contains("console = \"ioc3_a\"") && !text.contains("[onyx3000]"), "{text}");
+        assert!(text.contains("nodes = 2") && text.contains("console = \"serial2\"") && !text.contains("[onyx3000]"), "{text}");
         let back = load(&text).unwrap();
         assert_eq!((back.c_bricks(), back.onyx3000.brick_serial.as_deref()), (2, Some("S")));
-
-        let tezro = load("[machine]\nprofile = \"tezro_ip53\"\nconsole = \"ioc4_c\"\nserial_port_c = 9003\n").unwrap();
-        assert_eq!((tezro.tezro.console, tezro.tezro.serial_port_c), (TezroConsole::Ioc4C, Some(9003)));
 
         let onyx2 = load("[machine]\nprofile = \"onyx2_ip27\"\nnodes = 2\nio_prom = \"io6prom.img\"\n").unwrap();
         assert_eq!((onyx2.node_boards(), onyx2.onyx2.io_prom.as_deref()), (2, Some("io6prom.img")));
@@ -5140,12 +4951,10 @@ mod export_tests {
         let both = load("[machine]\nprofile = \"origin3200_ip35\"\nnodes = 1\n[origin3200]\nc_bricks = 2\n").unwrap();
         assert_eq!(both.c_bricks(), 1);
 
-        // A key the machine does not have, a second node board on a machine of one, a console of
-        // another machine.
+        // A key the machine does not have, a second node board on a machine of one.
         assert!(load("[machine]\nprofile = \"indy_ip24\"\nflash = \"f\"\n").unwrap_err().contains("machine.flash is not a key"));
         assert!(load("[machine]\nprofile = \"tezro_ip53\"\nnodes = 2\n").unwrap_err().contains("one node board"));
         load("[machine]\nprofile = \"tezro_ip53\"\nnodes = 1\n").unwrap();
-        assert!(load("[machine]\nprofile = \"fuel_ip34\"\nconsole = \"ioc4_a\"\n").unwrap_err().contains("is not a console"));
     }
 
     /// A `graphics` device says where the board plugs in, on the machines with a choice.
@@ -5379,38 +5188,27 @@ mod export_tests {
         assert!(!help.contains("SGI Indy"));
     }
 
-    /// The serial sockets come from the file and the command line, must
-    /// differ, and a log key for the console line is refused.
+    /// A removed serial key is refused with the `[[devices]]` entry that replaces it, at the port its channel is on that
+    /// machine, and so is its flag.
     #[test]
-    fn serial_sockets_and_line_logs_are_read_and_checked() {
-        let mut octane: MachineConfig = toml::from_str(r#"
-            serial_socket_a = "/run/a.sock"
-            serial_socket_b = "/run/b.sock"
-            serial_log_b = "b.log"
-            banks = [128, 0, 0, 0]
-            [machine]
-            profile = "octane_ip30"
-            cpu = "r10000"
-        "#).expect("parse");
-        assert_eq!(octane.serial_socket_a.as_deref(), Some("/run/a.sock"));
-        assert_eq!(octane.serial_log_b.as_deref(), Some("b.log"));
-        octane.validate().expect("an Octane serves sockets");
-        octane.serial_socket_b = octane.serial_socket_a.clone();
-        assert!(octane.validate().unwrap_err().contains("both name /run/a.sock"));
-        octane.serial_socket_b = Some("/run/b.sock".into());
-        octane.serial_log_a = Some("a.log".into());
-        assert!(octane.validate().unwrap_err().contains("channel A is the console"));
-
-        let cli = Cli::parse_from(["iris", "--serial-socket-a", "/run/x.sock", "--serial-log-a", "y.log"]);
-        let cfg = cli.apply(MachineConfig::default());
-        assert_eq!(cfg.serial_socket_a.as_deref(), Some("/run/x.sock"));
-        assert_eq!(cfg.serial_log_a.as_deref(), Some("y.log"));
-        cfg.validate().expect("the Indy serves sockets and logs channel A");
-        let mut indy = cfg.clone();
-        indy.serial_log_b = Some("y.log".into());
-        assert!(indy.validate().unwrap_err().contains("channel B is the console"));
-        let back: MachineConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(back.serial_socket_a.as_deref(), Some("/run/x.sock"));
+    fn the_older_serial_keys_name_their_replacement() {
+        let hint = |text: &str| MachineConfig::from_toml_str(text).unwrap_err().to_string();
+        let e = hint("serial_socket_b = \"/run/b.sock\"\n");
+        assert!(e.contains("type = \"serial\"\nat = \"serial1\"") && e.contains("backend = \"unix:/run/b.sock\""), "the Indy's channel B is its console: {e}");
+        assert!(hint("serial_port_a = 8890\n").contains("at = \"serial2\"\nbackend = \"tcp:8890\""), "and channel A is serial2");
+        assert!(hint("serial_log_a = \"a.log\"\n[machine]\nprofile = \"octane_ip30\"\n").contains("at = \"serial1\""), "the Octane's is serial1");
+        assert!(hint("serial_port_b = 1\n[machine]\nprofile = \"tezro_ip53\"\n").contains("at = \"serial2\""), "the Tezro's second is serial2");
+        let e = hint("[o2]\nserial_port = 2291\n");
+        assert!(e.contains("`serial_port` is no longer read") && e.contains("serial1"), "{e}");
+        let flag = |args: &[&str]| legacy::removed_flag(args.iter().map(|a| a.to_string()));
+        assert_eq!(flag(&["--serial-port-a", "8890"]).unwrap(), "--serial-port-a is no longer read: write --device serial@serial2,backend=tcp:8890");
+        assert!(flag(&["--machine=o2_ip32", "--serial-port-a=8890"]).unwrap().contains("serial@serial1,backend=tcp:8890"));
+        assert!(flag(&["--serial-log=x.log", "--ci"]).is_none(), "the console's log flag stays");
+        assert!(hint("[fuel]\nconsole = \"ioc3_b\"\n").contains("`console` is no longer read: write `console = \"serial1\"`"), "a section's console key");
+        let file = crate::test_temp::TempPath::file("octane-profile", b"[machine]\nprofile = \"octane_ip30\"\n");
+        let path = file.to_string_lossy().into_owned();
+        assert!(flag(&["--config", &path, "--serial-port-a", "9000"]).unwrap().contains("serial@serial1,"), "the Octane's channel A, from the config file");
+        assert!(flag(&["--config", &path, "--ip22", "--serial-port-a", "9000"]).unwrap().contains("serial@serial2,"), "--ip22 beats the file");
     }
 
     /// Every old `[o2]` key lands on the shared key it stood for, and the
@@ -5425,7 +5223,6 @@ mod export_tests {
             prom = "o2prom.bin"
             flash = "o2flash.bin"
             ram_mb = 384
-            serial_port = 2291
             serial_log = "o2.log"
             graphics = false
             cpu_mhz = 195
@@ -5437,7 +5234,6 @@ mod export_tests {
         assert_eq!(cfg.prom, "o2prom.bin");
         assert_eq!(cfg.nvram, "o2flash.bin");
         assert_eq!(cfg.banks, banks_from4([256, 128, 0, 0]), "384 MB, largest kits first");
-        assert_eq!(cfg.serial_port_a, Some(2291));
         assert_eq!(cfg.serial_log.as_deref(), Some("o2.log"));
         assert!(cfg.headless);
         assert_eq!(cfg.clock.fixed_mhz, Some(97.5));
@@ -5447,7 +5243,7 @@ mod export_tests {
         assert!(!cfg.o2.mouse);
         cfg.validate().expect("the folded config is a valid O2");
         let s = toml::to_string_pretty(&cfg).expect("serialize");
-        for gone in ["ram_mb =", "cpu_mhz =", "flash =", "forwards =", "graphics =", "serial_port =", "net ="] {
+        for gone in ["ram_mb =", "cpu_mhz =", "flash =", "forwards =", "graphics =", "net ="] {
             assert!(!s.contains(gone), "{gone} must not be written back:\n{s}");
         }
 
@@ -5732,19 +5528,13 @@ mod fuel_input_tests {
         let saved = toml::to_string(&other).unwrap();
         assert!(!saved.contains("[fuel]"), "{saved}");
         let mut fuel = MachineConfig::default();
-        fuel.fuel.console = Ip35Console::Ioc3B;
         fuel.fuel.flash = Some("flash.bin".into());
-        fuel.fuel.l1_port = Some(18882);
-        fuel.fuel.l1_log = Some("l1.log".into());
         fuel.fuel.ps2_input = false;
         fuel.fuel.usb_input = true;
         let saved = toml::to_string(&fuel).unwrap();
         assert!(saved.contains("[fuel]"), "{saved}");
         let loaded: MachineConfig = toml::from_str(&saved).unwrap();
-        assert_eq!(loaded.fuel.console, Ip35Console::Ioc3B);
         assert_eq!(loaded.fuel.flash.as_deref(), Some("flash.bin"));
-        assert_eq!(loaded.fuel.l1_port, Some(18882));
-        assert_eq!(loaded.fuel.l1_log.as_deref(), Some("l1.log"));
         assert!(!loaded.fuel.ps2_input && loaded.fuel.usb_input);
         assert!(MachineProfile::ALL.contains(&MachineProfile::FuelIp34));
     }
@@ -6141,14 +5931,11 @@ mod tezro_config_tests {
     fn only_a_configured_tezro_section_is_saved_and_it_round_trips() {
         let saved = toml::to_string(&MachineConfig::default()).unwrap();
         assert!(!saved.contains("[tezro]"), "{saved}");
-        let text = "[machine]\nprofile = \"tezro_ip53\"\ncpu = \"r16000\"\n[tezro]\nconsole = \"ioc4_b\"\nflash = \"flash.bin\"\nl1_port = 18882\nserial_port_c = 18883\n";
+        let text = "[machine]\nprofile = \"tezro_ip53\"\ncpu = \"r16000\"\n[tezro]\nflash = \"flash.bin\"\n";
         let loaded: MachineConfig = toml::from_str(text).unwrap();
         assert_eq!(loaded.machine.profile, MachineProfile::TezroIp53);
-        assert_eq!(loaded.tezro.console, TezroConsole::Ioc4B);
-        assert_eq!(loaded.tezro.console.index(), 2);
         let again: MachineConfig = toml::from_str(&toml::to_string(&loaded).unwrap()).unwrap();
         assert_eq!(again.tezro.flash.as_deref(), Some("flash.bin"));
-        assert_eq!((again.tezro.l1_port, again.tezro.serial_port_c), (Some(18882), Some(18883)));
         assert!(MachineProfile::ALL.contains(&MachineProfile::TezroIp53));
     }
 }

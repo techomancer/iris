@@ -159,6 +159,7 @@ pub mod build_features {
 
 pub mod validate_config;
 pub mod config;
+pub mod backend;
 pub mod devices;
 pub mod slot_path;
 pub mod topology;

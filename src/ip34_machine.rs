@@ -28,7 +28,7 @@ use crate::dev::xbridge::{XBridge, HEAD_E, HEAD_F, PCI_ROUTING};
 use crate::hptimer::TimerManager;
 use crate::ip35::{attach_ioc3, attach_usb, attach_vpro, xbridge_on};
 use crate::ip35::node::NodeSpec;
-use crate::ip35::serial::connect_serial_ports;
+use crate::dev::serial_dev::connect_l1_board;
 use crate::sn::BoardIo;
 use crate::pci::DevFn;
 use crate::topology::MachineSlotKind;
@@ -134,7 +134,7 @@ fn build_baseio(
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), YearBase::From(1968), timers.clock().clone())?);
     let pci = xbridge.bus(HEAD_F);
     let board = if cfg.fuel.ps2_input { &IP34 } else { &IP34_NO_PS2 };
-    let (ioc3, serial) = attach_ioc3(timers, cfg, pci, board, l1, &timekeeper, cfg.fuel.l1_port.unwrap_or(8882), "machine.l1_port", cfg.fuel.l1_log.clone());
+    let ioc3 = attach_ioc3(timers, pci, board, l1, &timekeeper);
     let eth = ioc3.eth().expect("the Fuel's IOC3 has Ethernet").clone();
     let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus(), timers));
     scsi.set_heartbeat(heartbeat.clone());
@@ -164,9 +164,13 @@ fn build_baseio(
     }
     let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &resolved, &buses)?;
     let cards = Arc::new(resolved.build_cards(cfg, timers)?);
-    let console_index = cfg.fuel.console.index();
-    connect_serial_ports(cfg, "Fuel", &serial, console_index)?;
-    let console = cfg.ci.then(|| serial[console_index].ci.clone());
+    let console = connect_l1_board(
+        cfg,
+        "Fuel",
+        ["IOC3 A", "IOC3 B"],
+        (cfg.fuel.l1_port, cfg.fuel.l1_log.as_deref()),
+        [&|b| l1.set_serial_backend(b), &|b| ioc3.set_serial_backend(0, b), &|b| ioc3.set_serial_backend(1, b)],
+    )?;
     scsi.register_locks();
     ioc3.register_locks();
     xbridge.register_locks();

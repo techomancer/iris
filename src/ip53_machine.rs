@@ -50,14 +50,13 @@ use crate::dev::ioc4::{Ioc4, Ioc4Config};
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{BoardIdentity, CpuContext, L1Config, DEFAULT_REVISION, L1};
 use crate::dev::pic::{Function, Pic, PIC_ROUTING};
-use crate::dev::serial_host::{CiSerialBackend, SerialBackend};
+use crate::dev::serial_dev::connect_l1_board;
 use crate::devlog::LogModule;
 use crate::hptimer::TimerManager;
 use crate::ip35::presence::PresenceHold;
 use crate::ip35::{attach_vpro, BEDROCK_PORT};
 use crate::xtalk::Upstream;
 use crate::ip35::node::NodeSpec;
-use crate::ip35::serial::{connect_serial_ports, SerialPort};
 use crate::sn::BoardIo;
 use crate::pci::{DevFn, PciToPciBridge, PCI_INTA};
 use crate::topology::MachineSlotKind;
@@ -290,9 +289,6 @@ const fn board(name: &'static str, part: &'static str, revision: &'static str) -
 /// synthetic.
 const VPRO_BOARD: BoardIdentity = board("ODY128VERSIONB", "030-1611-001", "C");
 
-/// The serial connections: the L1, then IOC4 ports 0 to 3.
-const SERIAL_PORTS: usize = 5;
-
 /// The Tezro's node of `cpus` processors of `chip`, with `banks_mib`, the L1's identity and the
 /// boot flash in `flash` or volatile; an error for a population the board cannot hold.
 fn spec(
@@ -351,8 +347,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let running = Population::populated_cpus(cpus)?;
     let timekeeper = Arc::new(Ds1744::new(YearBase::From(1968), timers.clock().clone())?);
     timekeeper.set_nvram_file(Path::new(&cfg.nvram))?;
-    let serial: [Arc<CiSerialBackend>; SERIAL_PORTS] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
-    l1.set_serial_backend(serial[0].clone());
 
     let to_bedrock = |widget| {
         let port = bedrock.inbound(widget);
@@ -393,9 +387,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     };
     let ioc4 = Arc::new(Ioc4::new(timers, Ioc4Config::tezro()));
     ioc4.attach_clock(timekeeper.clone());
-    for (port, backend) in serial[1..].iter().enumerate() {
-        ioc4.set_serial_backend(port, backend.clone());
-    }
     let scsi = Arc::new(Isp12160::new(Isp12160::new_bus(), Isp12160::new_bus(), timers));
     scsi.set_heartbeat(heartbeat.clone());
     // The Ethernet slot drives REQ64#, which the chip samples as reset ends.
@@ -421,9 +412,13 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &resolved, &buses)?;
     let cards = Arc::new(resolved.build_cards(cfg, timers)?);
     eprintln!("iris: {}", if vpro.is_some() { cfg.graphics_board().label() } else { "no graphics" });
-    let console_index = cfg.tezro.console.index();
-    connect_serial_ports(cfg, "Tezro", &serial_ports(cfg, l1, &ioc4, &serial), console_index)?;
-    let console = cfg.ci.then(|| serial[console_index].clone());
+    let console = connect_l1_board(
+        cfg,
+        "Tezro",
+        ["IOC4 0", "IOC4 1"],
+        (cfg.tezro.l1_port, cfg.tezro.l1_log.as_deref()),
+        [&|b| l1.set_serial_backend(b), &|b| ioc4.set_serial_backend(0, b), &|b| ioc4.set_serial_backend(1, b)],
+    )?;
     let mut monitor: Vec<Arc<dyn Device>> = vec![scsi.clone(), ioc4.ps2()];
     for pic in &pics {
         monitor.push(crate::pci::pci_host_commands(&format!("PIC at widget {}", pic.widget_number()), &[pic.bus(0), pic.bus(1)], None));
@@ -479,52 +474,6 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
         })),
     }
     .with_cards(&cards))
-}
-
-/// The board's serial connections in console order: the L1, then the IOC4's
-/// four ports.
-fn serial_ports(cfg: &MachineConfig, l1: &Arc<L1>, ioc4: &Arc<Ioc4>, serial: &[Arc<CiSerialBackend>; SERIAL_PORTS]) -> Vec<SerialPort> {
-    let [a, b] = cfg.serial_ports();
-    let ioc4 = |port: usize| -> Box<dyn Fn(Arc<dyn SerialBackend>) + Send + Sync> {
-        let ioc4 = ioc4.clone();
-        Box::new(move |backend| ioc4.set_serial_backend(port, backend))
-    };
-    let l1 = l1.clone();
-    vec![
-        SerialPort {
-            label: "L1",
-            port: cfg.tezro.l1_port.unwrap_or(8882),
-            setting: "machine.l1_port",
-            ci: serial[0].clone(),
-            log: cfg.tezro.l1_log.clone(),
-            socket: None,
-            ttyd: None,
-            connect: Box::new(move |backend| l1.set_serial_backend(backend)),
-        },
-        SerialPort { label: "IOC4 0", port: a, setting: "serial_port_a", ci: serial[1].clone(), log: cfg.serial_log_a.clone(), socket: cfg.serial_socket_a.clone().map(|p| (p, "serial_socket_a")), ttyd: Some(3), connect: ioc4(0) },
-        SerialPort { label: "IOC4 1", port: b, setting: "serial_port_b", ci: serial[2].clone(), log: cfg.serial_log_b.clone(), socket: cfg.serial_socket_b.clone().map(|p| (p, "serial_socket_b")), ttyd: Some(4), connect: ioc4(1) },
-        SerialPort {
-            label: "IOC4 2",
-            port: cfg.tezro.serial_port_c.unwrap_or(8883),
-            setting: "machine.serial_port_c",
-            ci: serial[3].clone(),
-            log: None,
-            socket: None,
-            // IRIX makes devices for the IOC4's first two ports only.
-            ttyd: None,
-            connect: ioc4(2),
-        },
-        SerialPort {
-            label: "IOC4 3",
-            port: cfg.tezro.serial_port_d.unwrap_or(8884),
-            setting: "machine.serial_port_d",
-            ci: serial[4].clone(),
-            log: None,
-            socket: None,
-            ttyd: None,
-            connect: ioc4(3),
-        },
-    ]
 }
 
 /// Where the V12 sits: widget 12 behind the PIC that owns widget 0 (QEMU's graphics slot). On the

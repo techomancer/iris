@@ -144,7 +144,9 @@ fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str, older: Op
         dir.join("iris.toml"),
         format!(
             "headless = true\nno_audio = true\nprom = \"prom.bin\"\nbanks = {banks}\n\
-             monitor_port = 0\nserial_port_a = 0\nserial_port_b = 0\nscsi = {{}}\n\
+             monitor_port = 0\n\
+             devices = [ {{ type = \"serial\", at = \"serial1\", backend = \"tcp:0\" }}, {{ type = \"serial\", at = \"serial2\", backend = \"tcp:0\" }} ]\n\
+             scsi = {{}}\n\
              [machine]\nprofile = \"{profile}\"\ncache = \"{cache}\"\n{}",
             // Only the Octane has a graphics board to leave out.
             if profile == "octane_ip30" { "[graphics]\nboard = \"none\"\n" } else { "" }

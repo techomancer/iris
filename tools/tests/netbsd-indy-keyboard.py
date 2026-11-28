@@ -111,7 +111,7 @@ class Guest:
         self.log = open(self.work / "iris.log", "w")
         self.proc = subprocess.Popen(
             [self.args.iris, "--config", str(cfg), "--ci",
-             "--serial-port-a", str(b + 1), "--serial-port-b", str(b + 2)],
+             "--device", f"serial@serial2,backend=tcp:{b + 1}", "--device", f"serial@serial1,backend=tcp:{b + 2}"],
             cwd=self.work, stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.time() + 120
         while not os.path.exists(self.sock):

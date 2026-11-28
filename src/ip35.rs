@@ -40,13 +40,11 @@ use crate::cpu::smp::World;
 use crate::dev::bedrock_flash::Flash;
 use crate::dev::l1::L1;
 use crate::dev::prom_image;
-use crate::dev::serial_host::CiSerialBackend;
 use crate::hptimer::TimerManager;
 use crate::sn::{BoardIo, Machine, NodeBoard, MAX_NODES};
 use crate::traits::Device;
 use crate::workstation::Workstation;
 use node::{connect_cpus, NodeSpec};
-use serial::SerialPort;
 use std::path::PathBuf;
 use crate::traits::MachineEvents;
 
@@ -81,63 +79,12 @@ pub(crate) fn xbridge_on(bedrock: &Bedrock) -> Arc<XBridge> {
     xbridge
 }
 
-/// The IOC3 of `board` at device 4 of head `pci`, with its SuperIO interrupt, and the board's serial
-/// connections in console order: the L1 (on `l1_port`, named by `l1_setting`, logging to `l1_log`),
-/// then the IOC3's two ports.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn attach_ioc3(
-    timers: &Arc<TimerManager>,
-    cfg: &MachineConfig,
-    pci: &PciBus,
-    board: &'static Ioc3Board,
-    l1: &Arc<L1>,
-    timekeeper: &Arc<Timekeeper>,
-    l1_port: u16,
-    l1_setting: &'static str,
-    l1_log: Option<String>,
-) -> (Arc<Ioc3>, Vec<SerialPort>) {
+/// The IOC3 of `board` at device 4 of head `pci`, with its SuperIO interrupt.
+pub(crate) fn attach_ioc3(timers: &Arc<TimerManager>, pci: &PciBus, board: &'static Ioc3Board, l1: &Arc<L1>, timekeeper: &Arc<Timekeeper>) -> Arc<Ioc3> {
     let ioc3 = Arc::new(Ioc3::new(timers, board, l1.station_mac(), ByteBus::M48t35(timekeeper.clone())));
     pci.attach(DevFn { device: 4, function: 0 }, ioc3.clone());
     ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(0)));
-    let serial: [Arc<CiSerialBackend>; 3] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
-    l1.set_serial_backend(serial[0].clone());
-    ioc3.set_serial_backend(0, serial[1].clone());
-    ioc3.set_serial_backend(1, serial[2].clone());
-    let [a, b] = cfg.serial_ports();
-    let (l1, ioc3_a, ioc3_b) = (l1.clone(), ioc3.clone(), ioc3.clone());
-    let ports = vec![
-        SerialPort {
-            label: "L1",
-            port: l1_port,
-            setting: l1_setting,
-            ci: serial[0].clone(),
-            log: l1_log,
-            socket: None,
-            ttyd: None,
-            connect: Box::new(move |backend| l1.set_serial_backend(backend)),
-        },
-        SerialPort {
-            label: "IOC3 A",
-            port: a,
-            setting: "serial_port_a",
-            ci: serial[1].clone(),
-            log: cfg.serial_log_a.clone(),
-            socket: cfg.serial_socket_a.clone().map(|p| (p, "serial_socket_a")),
-            ttyd: Some(1),
-            connect: Box::new(move |backend| ioc3_a.set_serial_backend(0, backend)),
-        },
-        SerialPort {
-            label: "IOC3 B",
-            port: b,
-            setting: "serial_port_b",
-            ci: serial[2].clone(),
-            log: cfg.serial_log_b.clone(),
-            socket: cfg.serial_socket_b.clone().map(|p| (p, "serial_socket_b")),
-            ttyd: Some(2),
-            connect: Box::new(move |backend| ioc3_b.set_serial_backend(1, backend)),
-        },
-    ];
-    (ioc3, ports)
+    ioc3
 }
 
 /// The OHCI controller at device 5 of head `pci`. With `input`, a USB keyboard and mouse sit on its
@@ -323,7 +270,6 @@ pub(crate) fn machine(
 
 pub(crate) mod node;
 pub(crate) mod presence;
-pub(crate) mod serial;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

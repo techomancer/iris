@@ -182,7 +182,7 @@ pub(crate) fn slot_alias<'a>(slots: &'a [MachineSlot], name: &str) -> Option<&'a
     slots.iter().find(|s| s.aliases.iter().any(|a| a == name)).map(|s| &s.path)
 }
 
-fn machine_name(profile: MachineProfile) -> &'static str {
+pub(crate) fn machine_name(profile: MachineProfile) -> &'static str {
     profile.product_name().unwrap_or(profile.label())
 }
 
@@ -237,8 +237,8 @@ impl MachineProfile {
             P::TezroIp53 => crate::ip53_machine::slots(&mut s),
             P::Origin3200Ip35 | P::Onyx3000Ip35 => crate::ip35_machine::slots(&mut s, self == P::Onyx3000Ip35),
         }
-        // The serial ports a device can take, by IRIX's /dev/ttydN.
-        for n in crate::dev::serial_dev::ports(self) {
+        // The serial ports a device can take, by the number on the case.
+        for (n, _) in crate::dev::serial_dev::ports(self) {
             open_slot(&mut s, &format!("serial{n}"), &[DeviceFamily::Serial], &[]);
         }
         s
@@ -277,6 +277,11 @@ impl DevicePlacement {
             let first = || slots.iter().find(|s| s.kind.takes(DeviceFamily::Gfx, false)).map(|s| s.path.to_string());
             let at = (cfg.machine.profile == MachineProfile::Onyx3000Ip35).then(|| crate::ip35_machine::default_at(cfg)).flatten().or_else(first);
             devices.push(ConfiguredDevice { at, ..ConfiguredDevice::new("", DeviceModel::Graphics) });
+        }
+        // A port no entry takes keeps its default listener.
+        for (n, tcp) in crate::dev::serial_dev::ports(cfg.machine.profile).iter().filter_map(|p| Some((p.0, p.1?))) {
+            let line = crate::dev::serial_dev::SerialDeviceConfig { kind: crate::dev::serial_dev::SerialKind::Line, backend: vec![format!("tcp:{tcp}")], ..Default::default() };
+            devices.push(ConfiguredDevice { default: true, ..ConfiguredDevice::new(&format!("serial{n}"), DeviceModel::Serial(line)) });
         }
         let (slots, at) = layout(machine, slots, &devices);
         DevicePlacement { slots, machine, devices, at, pci: HashMap::new() }
@@ -857,8 +862,8 @@ mod tests {
             vec!["gfx", "-", "-", "a graphics board"],
             vec!["gio1", "-", "-", "virtio devices"],
             vec!["gio0", "-", "-", "gio cards, virtio devices"],
-            vec!["serial1", "-", "-", "serial devices"],
-            vec!["serial2", "-", "-", "serial devices"],
+            vec!["serial1", "-", "serial tcp:8881 (default)", "-"],
+            vec!["serial2", "-", "serial tcp:8880 (default)", "-"],
         ]);
     }
 
@@ -940,12 +945,12 @@ mod tests {
         }
         assert_eq!(map.row(&loc("xio15/pci0/1")).map(|r| r.kind), Some(MachineSlotKind::Fixed("qla2200")));
         // A disk goes on any loop ID, 0 to 125, and nowhere else; an unplaced one takes the first.
-        assert_eq!(placed(&[auto(Some("xio15/pci0/1/l125")), auto(None)], MachineProfile::Origin3200Ip35), ["xio15/pci0/1/l125", "xio15/pci0/1/l0"]);
-        assert!(place(&[hdd("xio15/pci0/1/l126", "a")], &map).unwrap_err().contains("no slot xio15/pci0/1/l126"));
-        let cd = ConfiguredDevice::new("xio15/pci0/1/l3", DeviceModel::Scsi(crate::config::ScsiDeviceConfig { cdrom: true, kind_field: crate::config::ScsiKind::Cdrom, ..Default::default() }));
+        assert_eq!(placed(&[auto(Some("xio15/pci0/1/loop125")), auto(None)], MachineProfile::Origin3200Ip35), ["xio15/pci0/1/loop125", "xio15/pci0/1/loop0"]);
+        assert!(place(&[hdd("xio15/pci0/1/loop126", "a")], &map).unwrap_err().contains("no slot xio15/pci0/1/loop126"));
+        let cd = ConfiguredDevice::new("xio15/pci0/1/loop3", DeviceModel::Scsi(crate::config::ScsiDeviceConfig { cdrom: true, kind_field: crate::config::ScsiKind::Cdrom, ..Default::default() }));
         assert!(place(&[cd], &map).unwrap_err().contains("does not take a cdrom"));
-        let text = list_slots(&[hdd("xio15/pci0/1/l3", "d.img")], &map).unwrap();
-        for want in ["xio15/pci0/1/l0-2 ", "xio15/pci0/1/l3 ", "xio15/pci0/1/l4-125 "] {
+        let text = list_slots(&[hdd("xio15/pci0/1/loop3", "d.img")], &map).unwrap();
+        for want in ["xio15/pci0/1/loop0-2 ", "xio15/pci0/1/loop3 ", "xio15/pci0/1/loop4-125 "] {
             assert!(text.lines().any(|l| l.starts_with(want)), "{want} in\n{text}");
         }
         assert!(text.lines().any(|l| l.starts_with("xio15/pci0/2 ") && l.contains("bus1-slot2") && l.ends_with("pci cards")), "{text}");
@@ -957,18 +962,18 @@ mod tests {
         let devs = [
             dev("pci_cage", Some("cage"), Some("shoebox")),
             dev("qla2200", Some("fc"), Some("cage/pci0")),
-            hdd("fc/l9", "d.img"),
+            hdd("fc/loop9", "d.img"),
             auto(None),
         ];
         let got = placed(&devs, MachineProfile::OctaneIp30);
-        assert_eq!(got, ["xio13", "xio13/pci0/1", "xio13/pci0/1/l9", "xio15/pci0/0/t1"], "an unplaced disk keeps to the SCSI bus");
+        assert_eq!(got, ["xio13", "xio13/pci0/1", "xio13/pci0/1/loop9", "xio15/pci0/0/t1"], "an unplaced disk keeps to the SCSI bus");
         let mut cfg = fill(MachineProfile::OctaneIp30).0;
         cfg.devices = devs.to_vec();
         let ids = DevicePlacement::new(&cfg).unwrap().loop_disks(Some(&loc("xio13/pci0/1")));
         assert_eq!(ids.iter().map(|d| d.0).collect::<Vec<_>>(), [9]);
         // Without the card there is no loop, and a second disk cannot take loop ID 9.
-        assert!(place(&[hdd("fc/l9", "d.img")], &fill(MachineProfile::OctaneIp30)).is_err());
-        let both = [devs[0].clone(), devs[1].clone(), hdd("fc/l9", "a"), hdd("xio13/pci0/1/l9", "b")];
+        assert!(place(&[hdd("fc/loop9", "d.img")], &fill(MachineProfile::OctaneIp30)).is_err());
+        let both = [devs[0].clone(), devs[1].clone(), hdd("fc/loop9", "a"), hdd("xio13/pci0/1/loop9", "b")];
         assert!(place(&both, &fill(MachineProfile::OctaneIp30)).unwrap_err().contains("is taken by the hdd"));
     }
 
@@ -978,7 +983,7 @@ mod tests {
         for good in ["boot", "disk-2", "my_cd", "scsi", "cage"] {
             check_name(good, "Octane", &slots).unwrap_or_else(|e| panic!("{good}: {e}"));
         }
-        for hop in ["pci2", "xio15", "t1", "c0", "usb0", "node1", "hpc3", "gfx", "l3", "7", "exp0"] {
+        for hop in ["pci2", "xio15", "t1", "c0", "usb0", "node1", "hpc3", "gfx", "loop3", "7", "exp0"] {
             assert!(check_name(hop, "Octane", &slots).unwrap_err().contains("looks like a slot path step"), "{hop}");
         }
         for bad in ["Boot", "a b", "", "d.1"] {

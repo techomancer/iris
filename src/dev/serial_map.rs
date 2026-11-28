@@ -21,8 +21,8 @@ struct Entry {
     machine: String,
     /// The part and port on the board: "SCC channel B", "IOC4 0", "L1".
     port: String,
-    /// N of IRIX's /dev/ttydN, if IRIX names the port.
-    ttyd: Option<u8>,
+    /// N of `serialN`, the number on the case; the L1 has none.
+    number: Option<u8>,
     console: bool,
     /// The config section that put a device on the port.
     section: Option<&'static str>,
@@ -78,16 +78,16 @@ impl SerialBackend for Mapped {
 }
 
 /// Put a port in the map and return its host end to wire: `machine` and
-/// `port` name it ("Indy", "SCC channel B"), `ttyd` is IRIX's number for it,
+/// `port` name it ("Indy", "SCC channel B"), `number` is the case's number for it,
 /// `console` marks the console port.
-pub fn mapped(machine: &str, port: &str, ttyd: Option<u8>, console: bool, cfg: &MachineConfig, backend: Arc<dyn SerialBackend>) -> Arc<dyn SerialBackend> {
+pub fn mapped(machine: &str, port: &str, number: Option<u8>, console: bool, cfg: &MachineConfig, backend: Arc<dyn SerialBackend>) -> Arc<dyn SerialBackend> {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let section = ttyd.and_then(|n| crate::dev::serial_dev::section_at(cfg, n));
+    let section = number.and_then(|n| crate::dev::serial_dev::section_at(cfg, n));
     MAP.lock().push(Entry {
         id,
         machine: machine.to_string(),
         port: port.to_string(),
-        ttyd,
+        number,
         console,
         section,
         backend: Arc::downgrade(&backend),
@@ -109,13 +109,13 @@ pub fn report() -> String {
             out += &format!("{}:\n", e.machine);
             machine = Some(&e.machine);
         }
-        let name = e.ttyd.map_or_else(|| "-".to_string(), |n| format!("ttyd{n}"));
+        let name = e.number.map_or_else(|| "-".to_string(), |n| format!("serial{n}"));
         let host = e.backend.upgrade().map_or_else(|| "gone".to_string(), |b| b.describe());
         let host = match e.section {
             Some(s) => format!("[{s}] {host}"),
             None => host,
         };
-        out += &format!("  {name:6} {:pw$}  {:7}  {host}\n", e.port, if e.console { "console" } else { "" });
+        out += &format!("  {name:7} {:pw$}  {:7}  {host}\n", e.port, if e.console { "console" } else { "" });
     }
     out
 }
@@ -125,7 +125,7 @@ mod tests {
     use super::*;
     use crate::dev::serial_host::null_serial_backend;
 
-    /// A port is listed while its backend lives, with its IRIX name and what
+    /// A port is listed while its backend lives, with its name and what
     /// the backend says it is, and leaves the list when the backend goes.
     #[test]
     fn a_port_is_listed_while_its_backend_lives() {
@@ -134,7 +134,7 @@ mod tests {
         let b = mapped("Test machine", "UART 2", None, false, &cfg, null_serial_backend());
         let text = report();
         assert!(text.contains("Test machine:"), "{text}");
-        assert!(text.lines().any(|l| l.contains("ttyd1") && l.contains("UART 0") && l.contains("console") && l.ends_with("nothing")), "{text}");
+        assert!(text.lines().any(|l| l.contains("serial1") && l.contains("UART 0") && l.contains("console") && l.ends_with("nothing")), "{text}");
         assert!(text.lines().any(|l| l.trim_start().starts_with("-") && l.contains("UART 2")), "{text}");
         drop(a);
         drop(b);

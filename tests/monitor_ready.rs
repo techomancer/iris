@@ -61,8 +61,7 @@ fn write_config(dir: &Path, monitor: u16, serial_a: u16, serial_b: u16, ci_socke
         "headless = true\n\
          no_audio = true\n\
          monitor_port = {monitor}\n\
-         serial_port_a = {serial_a}\n\
-         serial_port_b = {serial_b}\n\
+         devices = [ {{ type = \"serial\", at = \"serial1\", backend = \"tcp:{serial_a}\" }}, {{ type = \"serial\", at = \"serial2\", backend = \"tcp:{serial_b}\" }} ]\n\
          ci_socket = \"{}\"\n\
          \n\
          # No disk: the embedded PROM is enough for this test, and the default\n\
@@ -203,10 +202,6 @@ fn monitor_start_is_acknowledged_and_idempotent() {
             .arg(&ci_socket)
             .arg("--monitor-port")
             .arg(monitor_port.to_string())
-            .arg("--serial-port-a")
-            .arg(serial_a.to_string())
-            .arg("--serial-port-b")
-            .arg(serial_b.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))

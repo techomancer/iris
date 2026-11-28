@@ -73,8 +73,7 @@ headless = true
 ci = true
 ci_socket = "$sock"
 monitor_port = $base
-serial_port_a = $((base + 1))
-serial_port_b = $((base + 2))
+devices = [ { type = "serial", at = "serial1", backend = "tcp:$((base + 1))" }, { type = "serial", at = "serial2", backend = "tcp:$((base + 2))" } ]
 nvram = "flash.bin"
 serial_log = "serial.log"
 
