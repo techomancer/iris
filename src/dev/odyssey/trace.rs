@@ -1,5 +1,5 @@
 //! The VPro annotated trace: `vpro trace <file> [fifo,draw,cpu,dma|all]`,
-//! `vpro trace flush|off`, or `IRIS_ODSY_TRACE=<file>` from power-on.
+//! `vpro trace flush|off`, or `--startup "vpro trace <file>"` from power-on.
 //!
 //! Lines look like
 //!   `    3.214711 FIFO #000412 DEST_SELECT 0x1017 [4] 00000000 00000400 00000000 00000000`

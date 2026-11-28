@@ -3,8 +3,8 @@
 
 Start iris first with a recording from power-on, e.g.
 
-  IRIS_MGRAS_REC=ignore/mgras-golden/desktop.rec \\
-      target/release/iris --config ignore/ip28/iris-650.toml
+  target/release/iris --config ignore/ip28/iris-650.toml \\
+      --startup "mgras rec ignore/mgras-golden/desktop.rec"
 
 then run this script. It starts the CPU (developer builds wait for `start`),
 waits for the autologin desktop over telnet, and runs scripted scenes,

@@ -218,15 +218,13 @@ pub fn run_with(recs: &[Rec], setup: impl FnOnce(&mut Board), every: usize, opts
     let mem = Arc::new(ReplayMem::new(recs));
     b.guest = Some(mem.clone());
     setup(&mut b);
-    // IRIS_ODSY_TRACE=<file>: the annotated trace of the replay, as the
-    // machine writes it from power-on (`gputrace` builds). A test that
-    // replays several sessions writes the first to <file>, the next to
-    // <file>.1 and so on.
-    if let Ok(path) = std::env::var("IRIS_ODSY_TRACE") {
+    // VPRO_REPLAY_TRACE=<file>: the annotated trace of the replay (`gputrace`
+    // builds). A test replaying several sessions writes <file>, <file>.1 ...
+    if let Ok(path) = std::env::var("VPRO_REPLAY_TRACE") {
         static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = if n == 0 { path } else { format!("{path}.{n}") };
-        b.trace.start(&path, crate::dev::odyssey::trace::TRACE_ALL).expect("IRIS_ODSY_TRACE");
+        b.trace.start(&path, crate::dev::odyssey::trace::TRACE_ALL).expect("VPRO_REPLAY_TRACE");
     }
     // VPRO_REPLAY_GPU=1: draw on the GPU raster unit.
     if opts.gpu {

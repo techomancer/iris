@@ -1004,7 +1004,7 @@ impl Device for O2Control {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("o2".to_string(), "O2 diagnostics: o2 status | pixel X Y | pc | regs | peek ADDR LEN PATH | \
-            retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH".to_string())]
+            scsi PATH | unmapped | ps2log PATH | crimelog PATH".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -1066,10 +1066,6 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         // `ps2log PATH`: the PS/2 ports' recent traffic, `1>f4` a byte to
         // port 1's device, `1<fa` one from it.
         "ps2log" => match std::fs::write(arg, bus.mace.ps2.traffic_timed()) {
-            Ok(()) => "ok".into(),
-            Err(e) => format!("err {e}"),
-        },
-        "retrace" => match std::fs::write(arg, bus.crime.re.trace_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
         },

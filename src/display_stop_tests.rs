@@ -216,3 +216,28 @@ fn a_recording_opened_before_start_replays_with_a_fixed_video_mode() {
     m.stop();
     crate::dev::ng1::rex3::rec::tests::replay(&rec, None).unwrap();
 }
+
+/// A `--startup` recording opens before the machine starts and replays.
+#[cfg(feature = "gputrace")]
+#[test]
+fn a_startup_recording_replays() {
+    let dir = scratch("startup-rec");
+    let rec = dir.join("rec").to_string_lossy().into_owned();
+    let mut cfg = config(&dir, MachineProfile::IndyIp24, GraphicsBoard::Newport);
+    cfg.debug.startup = vec![format!("rex rec {rec}")];
+    let mut m = big_stack(move || crate::workstation::build(cfg).expect("machine"));
+    m.start();
+    m.monitor().run_line("rex rec off").unwrap();
+    m.stop();
+    crate::dev::ng1::rex3::rec::tests::replay(&rec, None).unwrap();
+}
+
+/// A startup command that fails fails the build, naming the command.
+#[test]
+fn a_failing_startup_command_fails_the_build() {
+    let dir = scratch("startup-fail");
+    let mut cfg = config(&dir, MachineProfile::IndyIp24, GraphicsBoard::Newport);
+    cfg.debug.startup = vec!["bogus 1".into()];
+    let e = big_stack(move || crate::workstation::build(cfg).err()).expect("the build fails");
+    assert_eq!(e, "startup bogus 1: unknown command bogus");
+}

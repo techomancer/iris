@@ -161,7 +161,7 @@ summary; `regs`, `fifo`, `state`, `geom`, `tex`, `win`, `mem`, `backend`, `lut`,
 `scanout save` and `fbdump` read the screen and board memory; `hash`, `unimp` and `refusals`
 report replay hashes and what is not modelled; `gpu` shows the GPU unit's
 counters. `vpro trace` (a `gputrace` build) and `vpro rec` write a trace and a
-replayable recording; `IRIS_ODSY_TRACE=<file>` and `IRIS_ODSY_REC=<file>` start
+replayable recording; `--startup "vpro trace <file>"` and `--startup "vpro rec <file>"` start
 them at power-on. `raster_bench.rs` and `display_bench.rs` are the benchmarks
 (`BENCH_SCENE`, `BENCH_SECS`), the tests are under `odyssey/tests/`, and
 `odyssey/golden/` holds scene and replay checks.

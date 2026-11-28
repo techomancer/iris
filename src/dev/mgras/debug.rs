@@ -13,7 +13,7 @@
 //! with repeats of one register and runs through a memory collapsed. Written
 //! from the CPU, HQ3 and RSS threads, so tracing slows the pipeline.
 //!
-//! `IRIS_MGRAS_TRACE=<file>` starts a full trace at power-on. All of it needs
+//! `--startup "mgras trace <file>"` starts a full trace at power-on. All of it needs
 //! the `gputrace` feature; without it `tracing` is a constant false.
 
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ pub const TRACE_RSS: u32 = 2;
 pub const TRACE_CPU: u32 = 4;
 /// One line per texture load (cheap enough for a running game).
 pub const TRACE_TEX: u32 = 8;
-/// The categories `IRIS_MGRAS_TRACE` starts with.
+/// The categories `all` means.
 pub const TRACE_ALL: u32 = TRACE_HQ | TRACE_RSS | TRACE_CPU;
 
 /// Trace state; lives in `Mgras::trace` behind a lock. Counters: HQ, RSS and

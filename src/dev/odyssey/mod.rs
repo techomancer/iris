@@ -208,16 +208,10 @@ impl Odyssey {
         // The recorder's slot is there whether or not a recording runs, so
         // the monitor can start one (`vpro rec`); the DMA path records
         // through it.
-        let rec = record::RecSlot::new(match std::env::var("IRIS_ODSY_REC") {
-            Ok(path) => Some(record::Recorder::create(&path).map_err(|e| format!("IRIS_ODSY_REC {path}: {e}"))?),
-            Err(_) => None,
-        });
+        let rec = record::RecSlot::new(None);
         let mem: Arc<dyn BusDevice> = Arc::new(record::RecordingMem { inner: mem, rec: rec.clone() });
         s.guest = Some(mem);
         s.front.lock().packets = Some(packets);
-        if let Ok(path) = std::env::var("IRIS_ODSY_TRACE") {
-            s.trace.start(&path, trace::TRACE_ALL).map_err(|e| format!("IRIS_ODSY_TRACE {path}: {e}"))?;
-        }
         let mut state = BoardLocks::new(s);
         state.rec = rec;
         let display = Arc::new(Display::new(status));

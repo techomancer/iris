@@ -15,7 +15,7 @@
 //!
 //! Lines are formatted into memory and written by a `TraceWriter` thread, so
 //! a trace costs the processor thread a format, not a syscall.
-//! `IRIS_REX3_TRACE=<file>` starts a full trace when the board starts.
+//! `--startup "rex trace <file>"` starts a full trace before the CPU runs.
 
 use std::sync::atomic::Ordering;
 
