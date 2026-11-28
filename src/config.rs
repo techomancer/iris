@@ -3252,7 +3252,8 @@ impl MachineConfig {
 
     /// Whether the machine has a second graphics head: a second Newport or a board beside the machine's own.
     pub fn has_second_head(&self) -> bool {
-        self.dual_head() || self.devices.iter().any(|d| matches!(d.device, DeviceModel::Board(_)) && !Self::is_head(d) && !d.names_graphics(self.machine.profile))
+        let boards = || self.devices.iter().filter(|d| matches!(d.device, DeviceModel::Board(_)) && !Self::is_head(d));
+        self.dual_head() || boards().any(|d| !d.names_graphics(self.machine.profile)) || boards().count() > 1
     }
 
     fn is_head(d: &ConfiguredDevice) -> bool {
@@ -5101,6 +5102,11 @@ mod export_tests {
         assert!(!octane(&vpro("")).has_second_head(), "the main board, named without a slot");
         assert!(!octane(&vpro("at = \"slot_ab\"\n")).has_second_head(), "the main board, named by its slot");
         assert!(octane(&vpro("at = \"slot_cd\"\n")).has_second_head());
+        let impact = |at: &str| format!("[[devices]]\ntype = \"impact\"\nmodel = \"solid\"\nat = \"{at}\"\n");
+        assert!(!octane(&impact("slot_a")).has_second_head(), "an IMPACT in slot A is the main board");
+        assert!(octane(&impact("slot_b")).has_second_head(), "a Solid IMPACT in slot B is a second");
+        assert!(!octane(&vpro("at = \"slot_a\"\n")).has_second_head(), "a VPro in slot A takes the IMPACT's place");
+        assert!(octane(&format!("{}{}", impact("slot_a"), vpro("at = \"slot_ab\"\n"))).has_second_head(), "an IMPACT with a VPro");
         let mut indy = MachineConfig::default();
         assert!(!indy.has_second_head());
         indy.set_dual_head(true);

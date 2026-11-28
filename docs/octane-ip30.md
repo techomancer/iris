@@ -199,6 +199,21 @@ a second window, the GUI's side-by-side view). With two boards the monitor takes
 a slot first, `vpro slot_cd status`, and a bare `vpro` means the first. A
 two-processor Octane cannot be saved to a snapshot yet.
 
+A second IMPACT goes the same way: an `impact` entry at `slot_b`, `slot_c` or
+`slot_d` adds a board to the default one, or to the one another entry names, and
+is head 1. SGI's guides allow only a Solid IMPACT as the secondary, in slot B,
+or in slot C when B holds a flex-cabled option board, and never in slot D, which
+an SSI or MXI primary covers (007-3531-002, 007-3613-001); iris does not enforce
+this, so any IMPACT may go in any slot. The monitor addresses the boards by
+slot, `mgras slot_b status`, a bare `mgras` meaning the first.
+
+```toml
+[[devices]]
+type  = "impact"
+model = "solid"
+at    = "slot_b"
+```
+
 `v6`, `v8`, `v10` and `v12` are the four Octane VPro boards on the same
 port: a port of the VPro (Odyssey) model in jamesbraid/qemu-sgi-origami
 (`src/dev/odyssey`), with the X server and OpenGL drawn by the model's

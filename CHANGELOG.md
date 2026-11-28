@@ -148,6 +148,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - An Octane takes a second graphics board in any XIO slot, as SGI's Dual Head module has it for the
   Octane2: a `vpro` entry at `slot_cd` beside the first board in `slot_ab`. The CI socket's `screenshot`
   takes `head=N`, and the GUI shows both heads side by side for any machine with a second head.
+- An Octane takes a second IMPACT board, or more, in any other XIO slot: an `impact` entry at `slot_b`, `slot_c`
+  or `slot_d` beside the first in `slot_a`.
 
 ### Disks and cards by slot
 

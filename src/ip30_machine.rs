@@ -133,6 +133,22 @@ fn slot_names(slots: &[crate::topology::MachineSlot], at: &MachineSlotPath) -> V
     std::iter::once(at.to_string()).chain(aliases).collect()
 }
 
+/// Register each board's monitor commands: alone it answers bare commands, and with a second each answers `CMD SLOT ...`.
+fn register_by_slot(monitor: &crate::monitor::Monitor, slots: &[crate::topology::MachineSlot], boards: Vec<(MachineSlotPath, Arc<dyn Device>)>) {
+    let names: Vec<Vec<String>> = boards.iter().map(|(at, _)| slot_names(slots, at)).collect();
+    for (i, (_, board)) in boards.iter().enumerate() {
+        match boards.len() {
+            1 => monitor.register_device(board.clone()),
+            _ => monitor.register_device(Arc::new(SlotCommands {
+                board: board.clone(),
+                names: names[i].clone(),
+                others: names.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, n)| n.clone()).collect(),
+                first: i == 0,
+            })),
+        }
+    }
+}
+
 /// One of two boards that answer the same monitor command: `vpro slot_d status` reaches the board in that slot, and a bare
 /// `vpro` the first.
 struct SlotCommands {
@@ -158,7 +174,7 @@ impl Device for SlotCommands {
             self.board.execute_command(cmd, &args[1..], writer)
         } else if self.first && !self.others.iter().any(|n| n == head) {
             if head.starts_with("slot_") || head.strip_prefix("xio").is_some_and(|n| n.parse::<u8>().is_ok()) {
-                return Err(format!("no VPro board in {head}"));
+                return Err(format!("no {cmd} board in {head}"));
             }
             self.board.execute_command(cmd, args, writer)
         } else {
@@ -721,7 +737,7 @@ impl OctaneMachine {
             ram: ram.clone(),
             xbow: xbow.clone(),
             bridge: bridge.clone(),
-            gfx: gfx.first().map(|(_, g)| g.clone()),
+            gfx: gfx.iter().map(|(at, g)| (at.last_number().unwrap_or(WIDGET_GFX), g.clone())).collect(),
         }));
         for c in &scsi {
             monitor.register_device(c.clone());
@@ -745,22 +761,10 @@ impl OctaneMachine {
         ioc3.register_locks();
         rad.register_locks();
         for (_, g) in &gfx {
-            monitor.register_device(g.mgras().clone());
             g.register_locks();
         }
-        // With two boards each answers `vpro SLOT ...`; a bare `vpro` is the first.
-        let names: Vec<Vec<String>> = vpro.iter().map(|(at, _)| slot_names(&resolved.slots, at)).collect();
-        for (i, (_, v)) in vpro.iter().enumerate() {
-            match vpro.len() {
-                1 => monitor.register_device(v.clone()),
-                _ => monitor.register_device(Arc::new(SlotCommands {
-                    board: v.clone(),
-                    names: names[i].clone(),
-                    others: names.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, n)| n.clone()).collect(),
-                    first: i == 0,
-                })),
-            }
-        }
+        register_by_slot(&monitor, &resolved.slots, gfx.iter().map(|(at, g)| (at.clone(), g.mgras().clone() as Arc<dyn Device>)).collect());
+        register_by_slot(&monitor, &resolved.slots, vpro.iter().map(|(at, v)| (at.clone(), v.clone() as Arc<dyn Device>)).collect());
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
         Self::connect_serial(cfg, &ioc3, ci_serial.as_ref())?;
@@ -1346,7 +1350,8 @@ struct Ip30Monitor {
     ram: Arc<HeartRam>,
     xbow: Arc<Xbow>,
     bridge: Arc<Bridge>,
-    gfx: Option<Arc<ImpactXio>>,
+    /// Each IMPACT board with its widget.
+    gfx: Vec<(u8, Arc<ImpactXio>)>,
 }
 
 const IP30_SUBCOMMANDS: &str = "ip30 unmapped | memcfg | bridge | gfx | xbow";
@@ -1394,14 +1399,18 @@ impl Ip30Monitor {
                 }
                 s
             }
-            "gfx" => match &self.gfx {
-                Some(g) => format!(
-                    "IMPACT on widget {WIDGET_GFX}: link {}, identification {:#010x}\n",
-                    if self.xbow.carries(WIDGET_GFX) { "up" } else { "down" },
-                    g.read32(widget_small_base(WIDGET_GFX) + 4).data
-                ),
-                None => "no graphics board\n".into(),
-            },
+            "gfx" if self.gfx.is_empty() => "no graphics board\n".into(),
+            "gfx" => self
+                .gfx
+                .iter()
+                .map(|(w, g)| {
+                    format!(
+                        "IMPACT on widget {w}: link {}, identification {:#010x}\n",
+                        if self.xbow.carries(*w) { "up" } else { "down" },
+                        g.read32(widget_small_base(*w) + 4).data
+                    )
+                })
+                .collect(),
             "xbow" => self
                 .xbow
                 .unsupported()
@@ -2262,6 +2271,62 @@ mod snapshot_tests {
         assert!(e.contains("no free slot"), "{e}");
     }
 
+    /// An IMPACT is a second board in any slot but the one a board holds, beside any first board.
+    #[test]
+    fn a_second_impact_goes_in_any_other_slot() {
+        let entry = |ty: &str, model: &str, at: &str| format!("[[devices]]\ntype = \"{ty}\"\nmodel = \"{model}\"\nat = \"{at}\"\n");
+        for at in ["slot_b", "xio11", "slot_c", "xio9", "slot_d"] {
+            octane_with_boards(&entry("impact", "solid", at)).unwrap_or_else(|e| panic!("{at}: {e}"));
+        }
+        octane_with_boards(&entry("impact", "high", "slot_b")).unwrap();
+        octane_with_boards(&format!("{}{}", entry("impact", "high", "slot_a"), entry("impact", "max", "slot_b"))).unwrap();
+        octane_with_boards(&format!("{}{}", entry("vpro", "v12", "slot_ab"), entry("impact", "solid", "slot_c"))).unwrap();
+        assert!(octane_with_boards(&format!("{}{}", entry("impact", "solid", "slot_b"), entry("impact", "solid", "xio11"))).is_err());
+    }
+
+    /// Two IMPACT boards sit at ports 12 and 11, answer there, and save and restore by slot.
+    #[test]
+    fn two_impact_boards_sit_at_ports_12_and_11_and_round_trip_by_slot() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let dir = scratch("two-impact");
+            let prom = empty_prom(&dir);
+            let mut m = machine_with(&prom, &dir, |cfg| {
+                let solid = || crate::devices::BoardConfig::new(crate::config::GraphicsBoard::SolidImpact);
+                cfg.set_graphics(Some(solid()));
+                cfg.devices.push(crate::devices::ConfiguredDevice::new("slot_b", crate::devices::DeviceModel::Board(solid())));
+            });
+            let slots: Vec<_> = m.gfx.iter().map(|(at, _)| at.to_string()).collect();
+            assert_eq!(slots, ["xio12", "xio11"]);
+            for w in [12, 11] {
+                assert!(m.xbow.carries(w), "link to port {w}");
+                assert_eq!(m.phys.phys.read32(widget_small_base(w) + 4).status, crate::traits::BUS_OK, "port {w} answers");
+            }
+            let heads: Vec<_> = (0..3).map(|n| crate::workstation::Workstation::display(&m, n)).collect();
+            assert!(heads[0].is_some() && heads[1].is_some() && heads[2].is_none());
+            assert!(!Arc::ptr_eq(heads[0].as_ref().unwrap(), heads[1].as_ref().unwrap()));
+
+            let reg = |w: u8| widget_small_base(w) + 0x24;
+            let set = |m: &OctaneMachine, values: [u32; 2]| {
+                for (w, v) in [12, 11].into_iter().zip(values) {
+                    let board = &m.gfx.iter().find(|(at, _)| at.last_number() == Some(w)).unwrap().1;
+                    assert_eq!(board.write32(reg(w), v), crate::traits::BUS_OK);
+                }
+            };
+            set(&m, [0x1111_2222, 0x3333_4444]);
+            let saves = dir.join("saves");
+            crate::snapshot::save_in(&mut m, &saves, "x").unwrap();
+            let names: Vec<_> = Snapshot::new(saves.join("x")).read_chunks_manifest().unwrap().mgras_chunks.into_iter().map(|c| c.name).collect();
+            assert!(names.iter().any(|n| n.starts_with("impact_xio12/")) && names.iter().any(|n| n.starts_with("impact_xio11/")), "{names:?}");
+            set(&m, [0xaaaa_aaaa, 0xbbbb_bbbb]);
+            crate::snapshot::load_in(&mut m, &saves, "x").unwrap();
+            for (w, v) in [(12, 0x1111_2222), (11, 0x3333_4444)] {
+                let board = &m.gfx.iter().find(|(at, _)| at.last_number() == Some(w)).unwrap().1;
+                assert_eq!(board.read32(reg(w)).data, v, "port {w}");
+            }
+            m.stop();
+        }).unwrap().join().unwrap();
+    }
+
     /// Several boards answer one monitor command: a slot name picks one, and none means the first.
     #[test]
     fn a_monitor_command_reaches_the_board_it_names() {
@@ -2285,7 +2350,7 @@ mod snapshot_tests {
         assert_eq!(monitor.run("vpro", &["slot_d", "status"]), "second status");
         assert_eq!(monitor.run("vpro", &["xio11", "hash"]), "first hash");
         assert_eq!(monitor.run("vpro", &[]), "first ");
-        assert!(monitor.run("vpro", &["slot_a", "status"]).contains("no VPro board in slot_a"));
+        assert!(monitor.run("vpro", &["slot_a", "status"]).contains("no vpro board in slot_a"));
     }
 
     /// Both boards of a dual-head Octane2 are built at their own ports and save and restore by slot.
