@@ -44,6 +44,7 @@ pub mod menu {
     pub const CAMERA_TEST: &str = "menu.camera-test";
     pub const DIAGNOSTICS: &str = "menu.diagnostics";
     pub const RESET_NVRAM: &str = "menu.reset-nvram";
+    pub const SET_MAC: &str = "menu.set-mac";
     pub const GUIDE: &str = "menu.guide";
     pub const REPORT_ISSUE: &str = "menu.report-issue";
 }
@@ -151,6 +152,7 @@ fn session_of(id: &str) -> Option<SessionAction> {
         menu::SYNC_DISKS => SessionAction::SynchronizeDisks,
         menu::GRANT_FOLDER => SessionAction::GrantDiskFolder,
         menu::RESET_NVRAM => SessionAction::ResetNvram,
+        menu::SET_MAC => SessionAction::SetMac,
         _ => return None,
     })
 }

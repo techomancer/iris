@@ -193,6 +193,7 @@ pub fn primary(app: &adw::Application) -> gio::Menu {
             (t!("mb-camera-test"), m::CAMERA_TEST),
             (t!("mb-diagnostics"), m::DIAGNOSTICS),
             (t!("mb-reset-nvram"), m::RESET_NVRAM),
+            (t!("mb-set-mac"), m::SET_MAC),
         ],
     );
 

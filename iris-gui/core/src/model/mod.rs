@@ -10,6 +10,7 @@ pub mod camera_test;
 pub mod chd_convert;
 pub mod capture_access;
 pub mod disk_browser;
+pub mod disk_image;
 pub mod disk_probe;
 pub mod framebuffer;
 pub mod handle;

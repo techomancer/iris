@@ -15,6 +15,8 @@ mod app;
 #[cfg(target_os = "linux")]
 mod browser;
 #[cfg(target_os = "linux")]
+mod create_disk;
+#[cfg(target_os = "linux")]
 mod display;
 #[cfg(target_os = "linux")]
 mod keys;

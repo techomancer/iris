@@ -259,6 +259,21 @@ impl Form {
         kind.connect_selected_notify(move |r| me.report(id.clone(), Value::Index(r.selected() as usize)));
         expander.add_row(&kind);
 
+        if row.is_disk() {
+            let new = gtk::Button::builder()
+                .label(t!("scsi-create-blank"))
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::Center)
+                .sensitive(enabled)
+                .build();
+            let me = self.clone();
+            let id = control_id(field, Some(i), Some(part::NEW_DISK));
+            new.connect_clicked(move |_| me.report(id.clone(), Value::Bool(true)));
+            let new_row = adw::ActionRow::builder().title(t!("create-disk-title")).build();
+            new_row.add_suffix(&new);
+            expander.add_row(&new_row);
+        }
+
         let path = adw::EntryRow::builder().title(t!("settings-disk-image")).text(&row.path).sensitive(enabled).build();
         let me = self.clone();
         let id = control_id(field, Some(i), Some(part::PATH));

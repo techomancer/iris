@@ -262,6 +262,10 @@ pub struct BenchWindow {
     progress: gtk::ProgressBar,
     status: gtk::Label,
     text: gtk::TextView,
+    save: gtk::Button,
+    /// The finished run's figures, replaced when a run ends.
+    results: gtk::Box,
+    shown: RefCell<Option<iris_gui_core::controller::bench::Results>>,
 }
 
 impl BenchWindow {
@@ -297,13 +301,34 @@ impl BenchWindow {
         status.set_wrap(true);
         body.append(&status);
 
+        let results = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        body.append(&results);
+
         let text = gtk::TextView::builder().editable(false).monospace(true).build();
         let scroll = gtk::ScrolledWindow::builder().vexpand(true).child(&text).build();
         scroll.add_css_class("card");
-        scroll.set_size_request(-1, 320);
+        scroll.set_size_request(-1, 220);
         body.append(&scroll);
 
-        let me = std::rc::Rc::new(Self { dialog, ctl: RefCell::new(ctl), start, quick, cpu, progress, status, text });
+        let save = gtk::Button::with_label(&t!("bench-save-report"));
+        save.set_halign(gtk::Align::End);
+        save.set_sensitive(false);
+        save.connect_clicked(|_| crate::app::bench(BenchAction::SaveReport));
+        body.append(&save);
+
+        let me = std::rc::Rc::new(Self {
+            dialog,
+            ctl: RefCell::new(ctl),
+            start,
+            quick,
+            cpu,
+            progress,
+            status,
+            text,
+            save,
+            results,
+            shown: RefCell::default(),
+        });
         let w = std::rc::Rc::downgrade(&me);
         me.start.connect_clicked(move |_| {
             if let Some(me) = w.upgrade() {
@@ -317,7 +342,33 @@ impl BenchWindow {
     }
 
     pub fn refresh(&self, machine_running: bool) {
+        // The figures a finished run produced, from the controller.
+        let results = self.ctl.borrow_mut().results();
+        if *self.shown.borrow() != results {
+            while let Some(child) = self.results.first_child() {
+                self.results.remove(&child);
+            }
+            if let Some(r) = &results {
+                self.results.append(&rows_group(None, &r.headline, true));
+                if !r.categories.is_empty() {
+                    self.results.append(&rows_group(Some(&t!("bench-results")), &r.categories, false));
+                }
+                for line in &r.caveats {
+                    let label = gtk::Label::new(Some(line));
+                    label.set_xalign(0.0);
+                    label.set_wrap(true);
+                    label.add_css_class("dim-label");
+                    self.results.append(&label);
+                }
+                if !r.machine.is_empty() {
+                    let group = rows_group(Some(&t!("bench-machine")), &r.machine, false);
+                    self.results.append(&group);
+                }
+            }
+            *self.shown.borrow_mut() = results;
+        }
         let ctl = self.ctl.borrow();
+        self.save.set_sensitive(!ctl.is_running() && matches!(ctl.last(), Some(Ok(_))));
         let running = ctl.is_running();
         self.start.set_label(&if running { t!("bench-stop") } else { t!("bench-run-pc") });
         let can = ctl.can_start(machine_running);
@@ -348,4 +399,32 @@ impl BenchWindow {
             self.text.scroll_to_iter(&mut end.clone(), 0.0, false, 0.0, 1.0);
         }
     }
+}
+
+/// A titled group of result rows: the label, the value, and a comparison.
+fn rows_group(title: Option<&str>, rows: &[iris_gui_core::controller::bench::ResultRow], big: bool) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    if let Some(title) = title {
+        group.set_title(title);
+    }
+    for r in rows {
+        let row = adw::ActionRow::builder().title(&r.label).build();
+        if !r.note.is_empty() {
+            row.set_subtitle(&r.note);
+        }
+        let value = gtk::Label::new(Some(&r.value));
+        value.add_css_class("numeric");
+        if big {
+            value.add_css_class("title-4");
+        } else {
+            value.add_css_class("monospace");
+        }
+        value.set_valign(gtk::Align::Center);
+        row.add_suffix(&value);
+        if let Some(tip) = &r.tip {
+            row.set_tooltip_text(Some(tip));
+        }
+        group.add(&row);
+    }
+    group
 }

@@ -38,6 +38,8 @@ struct Shell {
     prefs: Option<std::rc::Rc<crate::prefs::PrefsDialog>>,
     /// The New Machine wizard, while it is open.
     new_machine: Option<std::rc::Rc<crate::new_machine::NewMachineDialog>>,
+    /// The blank-image form, shown while the controller has one.
+    create_disk: Option<std::rc::Rc<crate::create_disk::CreateDiskDialog>>,
     /// The disk browser, shown while the controller has one.
     browser: Option<std::rc::Rc<crate::browser::BrowserWindow>>,
     /// The benchmark window; the shell owns its controller, as egui does.
@@ -120,6 +122,17 @@ pub fn setting(id: String, value: iris_gui_core::controller::settings::Value) {
     // of dropping what was typed.
     if SHELL.with(|s| s.try_borrow_mut().is_err()) {
         return later(move || setting(id, value));
+    }
+    // The other forms own their own ids; only the machine settings go
+    // through the settings dialog's router.
+    if id.starts_with("create-disk.") {
+        return create_disk_control(id, value);
+    }
+    if id.starts_with("new-machine.") {
+        return new_machine_control(id, value);
+    }
+    if id.starts_with("prefs.") {
+        return prefs_control(&id, value);
     }
     let action = with(|s| s.settings.as_ref().and_then(|d| d.action(&id, value))).flatten();
     if let Some(a) = action {
@@ -223,6 +236,48 @@ fn open_bench() {
     let Some(w) = dialog else { return later(open_bench) };
     if let Some(window) = window() {
         w.dialog.present(Some(&window));
+    }
+}
+
+/// An action on the blank-image form.
+pub fn create_disk(action: iris_gui_core::controller::create_disk::CreateDiskAction) {
+    later(move || dispatch(AppAction::CreateDisk(action.clone())));
+}
+
+/// A control on the blank-image form reported a value.
+pub fn create_disk_control(id: String, value: iris_gui_core::controller::settings::Value) {
+    use iris_gui_core::controller::create_disk::{field as f, CreateDiskAction as C};
+    use iris_gui_core::controller::settings::Value as V;
+    // A Path row's Choose button reports the browse part.
+    let (id, browse) = match id.strip_suffix("//browse") {
+        Some(base) => (base.to_string(), true),
+        None => (id, false),
+    };
+    let field = [f::FORMAT, f::SIZE, f::FILE].into_iter().find(|x| *x == id);
+    let Some(field) = field else { return };
+    if browse || (field == f::FILE && matches!(value, V::Bool(_))) {
+        return create_disk(C::Pick);
+    }
+    create_disk(C::Set { field, value });
+}
+
+/// The form is shown exactly while the controller has one.
+fn refresh_create_disk(s: &mut Shell) {
+    match (s.app.create_disk(), s.create_disk.clone()) {
+        (Some(c), Some(w)) => w.refresh(c),
+        (Some(c), None) => {
+            let w = crate::create_disk::CreateDiskDialog::new(&c.name);
+            w.refresh(c);
+            if let Some(window) = window() {
+                w.dialog.present(Some(&window));
+            }
+            s.create_disk = Some(w);
+        }
+        (None, Some(w)) => {
+            w.dialog.close();
+            s.create_disk = None;
+        }
+        (None, None) => {}
     }
 }
 
@@ -449,7 +504,7 @@ fn start(app: &adw::Application) {
     menu::window_actions(app);
     let win = MainWindow::new(app);
     win.window.present();
-    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app: ctl, win, wake, may_quit: false, settings: None, prefs: None, new_machine: None, bench: None, browser: None, serial: None, net: None, camera: None, help: Vec::new() }));
+    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app: ctl, win, wake, may_quit: false, settings: None, prefs: None, new_machine: None, bench: None, create_disk: None, browser: None, serial: None, net: None, camera: None, help: Vec::new() }));
     STARTED.with(|f| f.set(true));
     refresh();
     tick();
@@ -607,6 +662,7 @@ pub fn refresh() {
         if let Some(d) = s.prefs.clone() {
             d.refresh(&s.app);
         }
+        refresh_create_disk(s);
         refresh_browser(s);
         refresh_panels(s);
         // The camera preview has no wake of its own: poll it while it runs.
@@ -684,6 +740,10 @@ pub fn answer(a: Answer) {
                 return;
             }
         }
+        if a.purpose() == iris_gui_core::controller::create_disk::PICK {
+            create_disk(iris_gui_core::controller::create_disk::CreateDiskAction::Answer(a));
+            return;
+        }
         if a.purpose().starts_with("bench.") {
             bench(iris_gui_core::controller::bench::BenchAction::Answer(a));
             return;
@@ -703,6 +763,27 @@ pub fn command(id: &str) {
     // The machine capsule's menu: switch to that machine.
     if let Some(name) = id.strip_prefix(crate::toolbar::SELECT_MACHINE) {
         return select_machine(name.to_string());
+    }
+    // The benchmark window's buttons, by id.
+    if let Some(what) = id.strip_prefix("bench.") {
+        use iris_gui_core::controller::bench::BenchAction as B;
+        return match what {
+            "start" => bench(B::Start),
+            "stop" => bench(B::Stop),
+            "save" => bench(B::SaveReport),
+            _ => {}
+        };
+    }
+    // The blank-image form's own buttons, by id.
+    if let Some(what) = id.strip_prefix("create-disk.") {
+        use iris_gui_core::controller::create_disk::CreateDiskAction as C;
+        return match what {
+            "create" => create_disk(C::Create),
+            "cancel" => create_disk(C::Cancel),
+            "close" => create_disk(C::Close),
+            "pick" => create_disk(C::Pick),
+            _ => {}
+        };
     }
     // A settings control a menu item stands for (Add Forward's suggestions).
     if let Some(rest) = id.strip_prefix(SETTING_PREFIX) {

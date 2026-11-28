@@ -13,6 +13,15 @@ use super::{Answer, ChoiceSpec, Effect, Enabled, PickSpec, TextSpec};
 use crate::model::handle::Cmd;
 use crate::model::{hardware, machines, macos_sandbox, settings};
 
+/// The prompt's rule: anything `iris::config::parse_mac` takes.
+fn mac_rule(_: &super::TextSpec, text: &str) -> Result<(), String> {
+    match iris::config::parse_mac(text.trim()) {
+        Ok(_) => Ok(()),
+        Err(_) if text.trim().is_empty() => Err(String::new()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 impl AppController {
     /// Whether a session action can run now, and if not why.
     pub fn session_enabled(&self, action: &SessionAction) -> Enabled {
@@ -185,6 +194,28 @@ impl AppController {
                 confirm_label: t!("session-reset-nvram-ok"),
                 destructive: true,
             })),
+            SessionAction::SetMac => {
+                let cfg = self.config();
+                let eeprom = crate::model::hardware::has_nveeprom(cfg.machine.profile);
+                let path = if eeprom { cfg.nveeprom.clone() } else { cfg.nvram.clone() };
+                let dir = self.machine_dir();
+                let full = dir.map(|d| d.join(&path).to_string_lossy().into_owned()).unwrap_or(path);
+                let now = if eeprom { settings::nveeprom_mac(&full) } else { settings::nvram_mac(&full) };
+                // Nothing set yet: offer one, as the first start would.
+                let initial = now
+                    .map(settings::mac_to_string)
+                    .unwrap_or_else(|| settings::mac_to_string(settings::generate_mac_bytes(&full)));
+                fx.push(Effect::AskText(super::TextSpec {
+                    purpose: session::SET_MAC,
+                    title: t!("session-set-mac-title"),
+                    prompt: t!("session-set-mac-body", chip = full),
+                    initial,
+                    ok_label: t!("session-set-mac-ok"),
+                    taken: Vec::new(),
+                    error: None,
+                    validator: mac_rule,
+                }));
+            }
             SessionAction::Answer(a) => self.session_answer(a, fx),
         }
     }
@@ -232,6 +263,31 @@ impl AppController {
             dev.path = path;
             fx.extend(self.apply_config_edited());
         }
+    }
+
+    /// Write `text` into the chip the machine reads its address from: the
+    /// Indigo2's motherboard EEPROM, every other machine's NVRAM.
+    fn set_mac(&mut self, text: &str, fx: &mut Vec<Effect>) {
+        let Ok(mac) = iris::config::parse_mac(text.trim()) else {
+            fx.push(Effect::Toast(t!("session-set-mac-invalid")));
+            return;
+        };
+        let cfg = self.config();
+        let eeprom = crate::model::hardware::has_nveeprom(cfg.machine.profile);
+        let path = if eeprom { cfg.nveeprom.clone() } else { cfg.nvram.clone() };
+        let dir = self.machine_dir();
+        let full = dir.map(|d| d.join(&path).to_string_lossy().into_owned()).unwrap_or(path);
+        let wrote = if eeprom {
+            settings::ensure_nveeprom_exists(&full);
+            settings::write_nveeprom_mac(&full, mac)
+        } else {
+            settings::ensure_nvram_seeded(&full);
+            settings::write_nvram_mac(&full, mac)
+        };
+        fx.push(Effect::Toast(match wrote {
+            Ok(_) => t!("session-set-mac-done", mac = settings::mac_to_string(mac)),
+            Err(e) => t!("config-eaddr-write-failed", path = full.as_str(), error = e.to_string()),
+        }));
     }
 
     fn reset_nvram(&mut self, fx: &mut Vec<Effect>) {
@@ -512,6 +568,7 @@ impl AppController {
                 }
             }
             (Answer::Confirmed { purpose: session::RESET_NVRAM, yes: true }, _) => self.reset_nvram(fx),
+            (Answer::Text { purpose: session::SET_MAC, text: Some(text) }, _) => self.set_mac(&text, fx),
             (Answer::Picked { purpose: session::SCREENSHOT, paths }, _) => {
                 if let Some(p) = paths.into_iter().next() {
                     self.session_mut().send(Cmd::Screenshot(p));

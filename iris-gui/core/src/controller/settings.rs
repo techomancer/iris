@@ -279,6 +279,8 @@ pub enum DiskEdit {
     /// Ask for an image file.
     Pick(u8),
     SetKind { key: u8, kind: ScsiKind },
+    /// Open the blank-image form for this target.
+    New(u8),
     SetOverlay { key: u8, on: bool },
     /// A scratch volume: emptied at every start, with a size in MB.
     SetScratch { key: u8, on: bool },
@@ -337,6 +339,8 @@ pub mod part {
     pub const HOST: &str = "host";
     pub const GUEST: &str = "guest";
     pub const ANY: &str = "any";
+    /// Make a blank image for this target.
+    pub const NEW_DISK: &str = "new-disk";
     pub const SCRATCH: &str = "scratch";
     pub const SCRATCH_MB: &str = "scratch-mb";
     pub const WRITE_CACHE: &str = "write-cache";
@@ -421,6 +425,7 @@ pub fn action_for(id: &str, value: Value, disk_keys: &[u8], forwards: &[ForwardR
                 (part::MAC, Value::Text(mac)) => DiskEdit::SetMac { key, mac },
                 (part::SUBNET, Value::Text(subnet)) => DiskEdit::SetSubnet { key, subnet },
                 (part::ADD_DISC, _) => DiskEdit::AddDisc(key),
+                (part::NEW_DISK, _) => DiskEdit::New(key),
                 (part::REMOVE, _) => DiskEdit::Remove(key),
                 _ => return None,
             })
@@ -455,6 +460,8 @@ pub struct SettingsController {
     picking: Option<(&'static str, Option<u8>)>,
     /// The changer slot a disc picker is for.
     picking_disc: Option<(u8, usize)>,
+    /// A target asked for a blank image; the app opens the form.
+    new_disk_for: Option<u8>,
     toml_error: Option<String>,
     /// "Use built-in PROM" was switched off: show the PROM image field even
     /// while the config still resolves to the built-in PROM (no file chosen
@@ -1174,6 +1181,12 @@ impl SettingsController {
                     ));
                     false
                 }
+                // The app owns the form; the settings controller only says
+                // which target asked for it.
+                DiskEdit::New(key) => {
+                    self.new_disk_for = Some(key);
+                    false
+                }
                 DiskEdit::AddDisc(key) => {
                     self.picking_disc = cfg.disk(key).map(|d| (key, d.discs.len()));
                     fx.push(Effect::PickFile(
@@ -1258,6 +1271,11 @@ impl SettingsController {
             SettingsAction::Answer(_) => false,
         };
         (changed, fx)
+    }
+
+    /// The target that asked for a blank image, taken once.
+    pub fn take_new_disk(&mut self) -> Option<u8> {
+        self.new_disk_for.take()
     }
 
     /// The live command a change needs on a running machine, if any: the NAT
