@@ -1,6 +1,6 @@
 # Drive the AppKit shell with the screen locked
 
-The AppKit preview (`iris-gui/frontends/appkit`) has test hooks so an agent
+The AppKit shell (`iris-gui/frontends/appkit`) has test hooks so an agent
 can drive it and see it without the screen unlocked.
 
 - `IRIS_APPKIT_SCRIPT="step;step;..."` runs one step every
@@ -25,7 +25,7 @@ can drive it and see it without the screen unlocked.
   separate from the user's.
 - See windows with `screencapture -x -l <window id>`. Get ids from
   `CGWindowListCopyWindowInfo` filtered on the owner name, case-insensitively:
-  the bundled app's owner is "IRIS" (it was "IRIS Preview" before 2026-11-27), the debug binary's "iris-appkit".
+  the bundled app's owner is "IRIS", the debug binary's "iris-appkit".
   Window frames are autosaved per window, so a window that grew once stays
   large in later runs.
 

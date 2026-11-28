@@ -51,7 +51,7 @@ jobs:
     - name: Install pinned toolchain
       run: rustup show
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libgtk-4-dev libadwaita-1-dev
     # Pull requests restore main's cache but never save their own; the nightly
     # run on main saves it.
     - uses: Swatinem/rust-cache@v2

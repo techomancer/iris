@@ -61,6 +61,15 @@ part-tables = { version = "0.2.0", default-features = false, features = ["sgi"] 
 # the CHD library the emulator itself uses, same version and features.
 libchdman-rs = { version = "0.289.2", features = ["prebuilt"] }
 libc = "0.2"
+# Not used here: a cap. filetime 0.2.30 calls std's `fs::set_times`, which is
+# still unstable on the nightly `rust-toolchain.toml` pins, so it does not
+# build at all; it reaches us through rb-fsexporter -> fs-mac, which depend on
+# it outright. Cargo.lock is not in the repository, so every fresh checkout
+# resolves to the newest and breaks without this. The lower bound matters:
+# a bare `<=0.2.29` also matches 0.1.x, and the resolver then locks a 0.1 for
+# us and a 0.2.30 for fs-mac. Lift it when the pinned toolchain has
+# `fs_set_times`.
+filetime = ">=0.2, <=0.2.29"
 
 # Security-scoped bookmarks (Foundation, not a UI toolkit) for the App Store
 # build; see model/macos_sandbox.rs.

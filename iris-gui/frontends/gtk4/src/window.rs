@@ -1,19 +1,30 @@
 //! The main window (D3): the library on the left, the selected machine on the
-//! right, the status bar under it. Each of those arrives with its own slice;
-//! this is the frame they hang in.
+//! right, the status bar under it.
 //!
-//! `AdwToolbarView` carries the header bar (and later the status bar), with
-//! an `AdwToastOverlay` over the lot for `Effect::Toast`.
+//! `AdwOverlaySplitView` is the library's sidebar — collapsing it to an
+//! overlay on a narrow window is the widget's own behaviour — inside an
+//! `AdwToolbarView` that carries the header bar (and later the status bar),
+//! with an `AdwToastOverlay` over the lot for `Effect::Toast`.
+
+use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use gtk4 as gtk;
 use iris_gui_core::controller::app::AppController;
+use iris_gui_core::controller::icons::Icon;
+use iris_gui_core::controller::ids;
 use libadwaita as adw;
+
+use crate::icons;
+use crate::library::Library;
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     title: adw::WindowTitle,
     toasts: adw::ToastOverlay,
+    split: adw::OverlaySplitView,
+    library: Rc<Library>,
     placeholder: adw::StatusPage,
     /// The last toast shown, so a repeat does not stack up.
     last_toast: Option<adw::Toast>,
@@ -22,8 +33,17 @@ pub struct MainWindow {
 impl MainWindow {
     pub fn new(app: &adw::Application) -> Self {
         let title = adw::WindowTitle::new(&t!("app-name"), "");
-        let header = adw::HeaderBar::new();
+        let header = adw::HeaderBar::builder().show_start_title_buttons(false).build();
         header.set_title_widget(Some(&title));
+
+        let toggle = gtk::ToggleButton::builder()
+            .child(&icons::image(Icon::ShowLibrary, 16, &t!("tb-show-library")))
+            .tooltip_text(t!("tb-show-library"))
+            .active(true)
+            .build();
+        toggle.set_widget_name(ids::toolbar::SHOW_LIBRARY);
+        header.pack_start(&toggle);
+
         // GNOME has no menu bar: everything is in the header bar's primary
         // menu. `open-menu-symbolic` is the desktop's own glyph for it, not
         // one of the core's icon meanings, so it comes from the icon theme
@@ -37,30 +57,60 @@ impl MainWindow {
         header.pack_end(&primary);
 
         let placeholder = adw::StatusPage::builder().title(t!("toast-no-machine")).build();
+        let content = adw::ToolbarView::new();
+        content.add_top_bar(&header);
+        content.set_content(Some(&placeholder));
 
-        let view = adw::ToolbarView::new();
-        view.add_top_bar(&header);
-        view.set_content(Some(&placeholder));
+        let library = Library::new(app);
+        let split = adw::OverlaySplitView::builder()
+            .sidebar(&library.root)
+            .content(&content)
+            .min_sidebar_width(220.0)
+            .max_sidebar_width(360.0)
+            .sidebar_width_fraction(0.25)
+            .build();
+
+        // Narrow enough and the sidebar becomes an overlay over the machine,
+        // as every GNOME app does it.
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            640.0,
+            adw::LengthUnit::Px,
+        ));
+        breakpoint.add_setter(&split, "collapsed", Some(&true.into()));
 
         let toasts = adw::ToastOverlay::new();
-        toasts.set_child(Some(&view));
+        toasts.set_child(Some(&split));
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .default_width(1000)
-            .default_height(640)
+            .default_width(1100)
+            .default_height(700)
             .title(t!("app-name"))
+            .content(&toasts)
             .build();
-        window.set_content(Some(&toasts));
+        window.add_breakpoint(breakpoint);
         // Closing the window leaves the application only when the controller
         // says so: it may have disks to synchronize first.
         window.connect_close_request(|_| crate::app::close_requested());
 
-        Self { window, title, toasts, placeholder, last_toast: None }
+        toggle.connect_toggled(glib::clone!(
+            #[weak]
+            split,
+            move |b| split.set_show_sidebar(b.is_active())
+        ));
+        split.connect_show_sidebar_notify(glib::clone!(
+            #[weak]
+            toggle,
+            move |s| toggle.set_active(s.shows_sidebar())
+        ));
+
+        Self { window, title, toasts, split, library, placeholder, last_toast: None }
     }
 
     /// Draw what the controller holds now.
     pub fn refresh(&mut self, app: &AppController) {
+        self.library.refresh(app.library());
         match app.selected() {
             Some(name) => {
                 self.title.set_subtitle(name);
@@ -71,6 +121,10 @@ impl MainWindow {
                 self.placeholder.set_title(&t!("toast-no-machine"));
             }
         }
+    }
+
+    pub fn toggle_library(&self) {
+        self.split.set_show_sidebar(!self.split.shows_sidebar());
     }
 
     /// Draw the window into a PNG, for a test script's `shot:` step.

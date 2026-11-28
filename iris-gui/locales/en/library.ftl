@@ -1,5 +1,8 @@
 ## The machine library on the left of the main window.
 
+# The sidebar's own header, where the window has one of its own.
+library-title = Machines
+
 library-family-indy = Indy
 library-family-indigo2 = Indigo2
 library-family-o2 = O2

@@ -1,7 +1,7 @@
 # App Nap throttles the Mac app's background work unless it holds an activity
 
-**Symptom.** Converting a 4.3 GB CHD to zlib took about 390 s in IRIS
-Preview with the app in the background, against 86–116 s for the same work
+**Symptom.** Converting a 4.3 GB CHD to zlib took about 390 s in the
+Mac app with it in the background, against 86–116 s for the same work
 from a command-line tool. A disk sync after a stop was not slowed.
 
 **Cause.** macOS App Nap lowers the CPU and I/O priority of an app that is

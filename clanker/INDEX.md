@@ -439,7 +439,7 @@ Mac App Store and sandbox constraints.
 | [ppmem-shm-open-is-refused-in-the-app-sandbox.md](macos/ppmem-shm-open-is-refused-in-the-app-sandbox.md) | rule | The App Sandbox refuses ppmem's POSIX shm_open; macOS falls back to Mach memory entries (`IRIS_PPMEM_BACKEND=mach` to test) |
 | [chd-fold-needs-folder-grant-not-file-grant.md](macos/chd-fold-needs-folder-grant-not-file-grant.md) | rule | macOS App Sandbox: the CHD on-exit fold needs a *folder* grant, not a file grant |
 | [test-the-app-sandbox-locally-without-the-app-store.md](macos/test-the-app-sandbox-locally-without-the-app-store.md) | howto | Test the macOS App Sandbox locally — no App Store round-trip needed |
-| [drive-the-appkit-shell-with-the-screen-locked.md](macos/drive-the-appkit-shell-with-the-screen-locked.md) | howto | Script steps, scripted prompt answers and window captures for the AppKit preview; what stalls a script |
+| [drive-the-appkit-shell-with-the-screen-locked.md](macos/drive-the-appkit-shell-with-the-screen-locked.md) | howto | Script steps, scripted prompt answers and window captures for the AppKit shell; what stalls a script |
 | [winit-030-window-handle-main-thread-only.md](macos/winit-030-window-handle-main-thread-only.md) | rule | winit 0.30 macOS: window_handle() only works on the main thread |
 
 ## snapshot/

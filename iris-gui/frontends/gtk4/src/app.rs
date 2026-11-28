@@ -68,6 +68,21 @@ pub fn window() -> Option<gtk::Window> {
     })
 }
 
+/// The application, for the menus and actions a view builds.
+pub fn application() -> Option<adw::Application> {
+    APP.with(|a| a.borrow().clone())
+}
+
+/// Select `name` and show it.
+pub fn select_machine(name: String) {
+    dispatch(AppAction::Select(name));
+}
+
+/// A library row's own menu, or `None` while the shell is busy.
+pub fn machine_menu(name: &str) -> Option<Vec<Vec<iris_gui_core::controller::commands::MenuEntry>>> {
+    with(|s| s.app.machine_menu(name))
+}
+
 pub fn toast(text: &str) {
     let text = text.to_string();
     if with(|s| s.win.toast(&text)).is_none() {
@@ -153,6 +168,21 @@ fn script_step() {
         crate::effects::script_answer(r);
     } else if step == "dump:menu" {
         menu::dump();
+    } else if step == "dump:library" {
+        with(|s| {
+            println!("iris-gtk library:");
+            for g in s.app.library() {
+                println!("  {} ({})", g.title, if g.collapsed { "collapsed" } else { "open" });
+                for r in g.rows {
+                    let dot = match &r.dot {
+                        Some(iris_gui_core::controller::app::RowDot::Running) => " [running]".to_string(),
+                        Some(iris_gui_core::controller::app::RowDot::Problem(p)) => format!(" [problem: {p}]"),
+                        None => String::new(),
+                    };
+                    println!("    {}{} — {}{dot}", r.name, if r.selected { " *" } else { "" }, r.subtitle);
+                }
+            }
+        });
     } else if step == "quit" {
         dispatch(AppAction::RequestQuit);
     } else {
@@ -305,8 +335,10 @@ fn shell_command(c: ShellCommand) {
                 destructive: Vec::new(),
             })]);
         }
-        ShellCommand::ToggleLibrary
-        | ShellCommand::Settings
+        ShellCommand::ToggleLibrary => {
+            with(|s| s.win.toggle_library());
+        }
+        ShellCommand::Settings
         | ShellCommand::SavedStates
         | ShellCommand::DiscMenu
         | ShellCommand::NewMachine
