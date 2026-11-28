@@ -194,6 +194,8 @@ pub(crate) fn append_dirty_sidecar(f: &mut File, lbas: &[u64]) -> io::Result<()>
     f.write_all(&bytes)
 }
 
+/// Publish a complete record. Callers must release append handles to the old
+/// record, including background-sync handles, before replacing it on Windows.
 pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
     let ctx = |what: &str, p: &Path| {
         let what = what.to_string();
@@ -212,9 +214,51 @@ pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Resul
         f.write_all(&bytes).map_err(ctx("writing", &tmp))?;
         f.sync_all().map_err(ctx("syncing", &tmp))?;
     }
-    std::fs::rename(&tmp, path).map_err(ctx("replacing", path))?;
-    // The rename is not on the host's disk until its directory is.
-    crate::chd_disk::fsync_dir(path.parent()).map_err(ctx("syncing the directory of", path))
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(&tmp, path).map_err(ctx("replacing", path))?;
+        // The rename is not on the host's disk until its directory is.
+        crate::chd_disk::fsync_dir(path.parent()).map_err(ctx("syncing the directory of", path))
+    }
+    #[cfg(windows)]
+    {
+        // Windows cannot open/fsync a directory as a normal File. Request
+        // write-through publication after flushing the sidecar's contents.
+        replace_sidecar_windows(&tmp, path).map_err(ctx("replacing", path))
+    }
+}
+
+#[cfg(windows)]
+fn replace_sidecar_windows(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        if path.as_os_str().encode_wide().any(|c| c == 0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in sidecar path"));
+        }
+        // Rust's file APIs accept long paths. Keep that support when calling
+        // Win32 directly: canonicalize the parent to obtain its verbatim path,
+        // leaving the final component alone (the destination may not exist).
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing sidecar file name")
+        })?;
+        let absolute = parent.canonicalize()?.join(name);
+        let mut value: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        value.push(0);
+        Ok(value)
+    }
+    let from = wide(from)?;
+    let to = wide(to)?;
+    // SAFETY: both buffers are NUL-terminated and remain alive for the call.
+    // No COPY_ALLOWED: the sidecar replacement must stay on one filesystem.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// A held lock on an overlay. The lock goes with the last clone, or with the
@@ -280,6 +324,45 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("iris-cow-{}-{}.{}", tag, nanos, ext))
+    }
+
+    #[test]
+    fn sidecar_publication_creates_replaces_and_reports_failure() {
+        let dir = unique_tmp("sidecar-publication", "dir");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("disk-\u{00e9}.overlay.dirty");
+        for dirty in [HashSet::from([1, 9]), HashSet::from([4]), HashSet::new()] {
+            save_dirty_sidecar(&path, &dirty).unwrap();
+            assert_eq!(load_dirty_sidecar(&path).unwrap(), dirty);
+            assert!(!path.with_extension("dirty.tmp").exists());
+        }
+        let blocked = dir.join("blocked.dirty");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), b"untouched").unwrap();
+        assert!(save_dirty_sidecar(&blocked, &HashSet::from([2])).is_err());
+        assert_eq!(std::fs::read(blocked.join("keep")).unwrap(), b"untouched");
+        #[cfg(windows)]
+        {
+            let malformed = dir.join("disk.overlay.dirty\0ignored");
+            assert_eq!(replace_sidecar_windows(&path, &malformed).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert!(path.exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_publication_accepts_long_paths() {
+        let dir = unique_tmp("sidecar-long-path", "dir");
+        let nested = dir.join("a".repeat(120)).join("b".repeat(120));
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("disk.overlay.dirty");
+        assert!(path.as_os_str().len() > 260);
+        for dirty in [HashSet::from([1]), HashSet::from([2, 3])] {
+            save_dirty_sidecar(&path, &dirty).unwrap();
+            assert_eq!(load_dirty_sidecar(&path).unwrap(), dirty);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Another process's open of the lock file: a separate open file, so it
@@ -412,6 +495,8 @@ mod tests {
         dirty.insert(4);
         for extra in [10u64, 11] {
             dirty.insert(extra);
+            // Match CowNode::rewrite_record: retire the old append handle.
+            drop(record);
             save_dirty_sidecar(&path, &dirty).expect("replace");
             record = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         }

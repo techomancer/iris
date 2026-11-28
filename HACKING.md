@@ -101,7 +101,11 @@ constructor, so a controller exists with its targets and keeps only its
 registers and DMA. What a `BlockNode` must guarantee about durable writes,
 and why a disk's `write_cache` setting matters, is in the "Disk write cache"
 section of [STORAGE.md](STORAGE.md) and the `block_node.rs` module docs: read
-them before writing a backend or changing a flush. `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
+them before writing a backend or changing a flush. The background flusher holds
+its per-node file-list lock while syncing ordinary files, so replacing a COW
+record can retire every old handle before a Windows rename. Custom `Durable`
+callbacks run after releasing that lock; they can take backend locks.
+`src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
 subcommands and the run-time disc changes once, over the bus a controller hands
 out through `ScsiTargets::scsi_bus`; chip-specific subcommands (`regs`; the
 WD's `wdt`, `defer`) stay with the chip, and `DiscChanger` is
