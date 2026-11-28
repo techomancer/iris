@@ -325,8 +325,8 @@ forms the Mac app draws, in libadwaita's rows. The guest's display is drawn
 at Actual Size, Scale to Fit or Stretch, sharp at whole multiples, and a
 dual-head Newport draws both heads side by side, head 0 taking the input.
 
-The settings also carry what only the egui app used to offer, which the Mac
-app will draw as soon as it is taught the rows: **New disk image** beside a
+The settings also carry what only the egui app used to offer, as the Mac
+app's do: **New disk image** beside a
 SCSI target makes a blank raw or CHD image in the background, with progress
 and cancel, and never replaces a file; a disk can be a **scratch volume**
 with a size, or have its **write cache** turned off; a CD-ROM keeps a
@@ -358,7 +358,12 @@ page, the guest display (Metal), the machine settings, the new-machine
 window, saved states, the serial console, Check Networking, the benchmark,
 the camera test and Preferences, with SF Symbols and the system's light and
 dark appearance. The machine settings include Video In (the Indy's camera)
-and Performance (thread pinning, the JIT, the VNC server).
+and Performance (thread pinning, the JIT, the VNC server), and the rows the
+Linux app's section lists: blank disk images, scratch volumes, the write
+cache, CD changers, DaynaPort addresses, the Real-time clock page, TFTP and
+rsh, and **Tools > Set MAC Address**. A dual-head Newport draws both heads
+side by side, head 0 taking the input, and the benchmark shows its figures
+rather than a text report.
 
 The library is a sidebar, as in Finder, with its button next to the window
 buttons. After it, the machine capsule shows the machine's picture, name and
