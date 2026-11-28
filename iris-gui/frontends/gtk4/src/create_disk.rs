@@ -7,7 +7,6 @@ use std::cell::RefCell;
 use adw::prelude::*;
 use gtk4 as gtk;
 use iris_gui_core::controller::create_disk::{CreateDiskAction, CreateDiskController};
-use iris_gui_core::controller::settings::Value;
 use libadwaita as adw;
 
 use crate::settings::Form;
