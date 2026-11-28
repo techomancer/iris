@@ -60,7 +60,12 @@ scripts/dist/package-linux.sh --version 1.2.3
 - `release.yml` runs when a `vX.Y.Z` tag is pushed and publishes release
   `X.Y.Z`.
 - `appstore.yml` (manual) builds the sandboxed, JIT-free App Store app (the
-  native Mac app), numbered `YYYYMMDD.HHMM` in UTC unless a version is given.
+  native Mac app) and uploads it to App Store Connect. Its version is the one
+  in `scripts/dist/appstore-version` (or the `version` input) and stays the
+  same until the next release, so only the first TestFlight build of each
+  version waits for Beta App Review. Its build number is `20261129.<run>`,
+  the workflow's run number after a fixed first part that keeps it above the
+  dated builds uploaded before.
 
 ## macOS signing and notarization
 

@@ -435,6 +435,7 @@ Mac App Store and sandbox constraints.
 | Note | Kind | Title |
 |---|---|---|
 | [appstore-private-api.md](macos/appstore-private-api.md) | rule | Mac App Store rejects winit's private SkyLight blur API (`CGSSetWindowBackgroundBlurRadius`) |
+| [mac-build-numbers-must-beat-every-upload.md](macos/mac-build-numbers-must-beat-every-upload.md) | rule | App Store version stays fixed per release (one Beta App Review); the Mac build number is `20261129.<run>` because it must beat every earlier upload |
 | [app-nap-throttles-background-work.md](macos/app-nap-throttles-background-work.md) | rule | App Nap slowed a background CHD conversion 4x; the Mac app holds an NSProcessInfo activity while a machine runs, disks sync or a disk converts |
 | [split-view-controller-and-window-size-gotchas.md](macos/split-view-controller-and-window-size-gotchas.md) | rule | Under NSSplitViewController page constraints above 500 grow the window; the split autosave restores a stale collapse; debug builds wait for the monitor's `start` |
 | [ppmem-shm-open-is-refused-in-the-app-sandbox.md](macos/ppmem-shm-open-is-refused-in-the-app-sandbox.md) | rule | The App Sandbox refuses ppmem's POSIX shm_open; macOS falls back to Mach memory entries (`IRIS_PPMEM_BACKEND=mach` to test) |
