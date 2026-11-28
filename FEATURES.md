@@ -115,6 +115,21 @@ makes `IRIS.app`.
 | `lightning`, `jitv2`, `idle-pause` | The emulator's speed features. | `iris/...` |
 | `hostgl` | Host OpenGL for IRIX programs. | `iris/hostgl`, `iris/hostcall` |
 
+### iris-gui-gtk (the Linux app)
+
+`cargo build -p iris-gui-gtk` builds `iris-gtk`, the GTK 4 and libadwaita
+front end. It needs GTK 4.12 and libadwaita 1.5 or newer and their development
+packages (`libgtk-4-dev libadwaita-1-dev` on Debian and Ubuntu,
+`gtk4-devel libadwaita-devel` on Fedora). On macOS and Windows the crate
+builds a binary that only says where to look instead.
+
+| Feature | Effect | Implies |
+|---|---|---|
+| `bundled` | Distribution UI, as for `iris-gui`. | `iris-gui-core/bundled` |
+| `pcap` | Bridged networking, as for `iris-gui`. | `iris-gui-core/iris-pcap` |
+| `lightning`, `jitv2`, `idle-pause` | The emulator's speed features. | `iris/...` |
+| `hostgl` | Host OpenGL for IRIX programs. | `iris/hostgl`, `iris/hostcall` |
+
 ### iris-audio
 
 Source: [iris-audio/Cargo.toml](iris-audio/Cargo.toml). The host audio output

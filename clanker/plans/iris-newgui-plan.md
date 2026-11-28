@@ -1,6 +1,6 @@
 # New iris-gui framework: shared MVC core plus native shells
 
-Status: **in progress** (2026-11-22): see the GUI code row below. This is the working
+Status: **in progress** (2026-11-27): see the GUI code row below. This is the working
 brief for whoever implements it. Decisions are the user's unless marked
 *proposed*. Start at [Where things stand](#where-things-stand), then
 [Phases](#phases).
@@ -17,6 +17,7 @@ CONTRIBUTING section before writing a controller.
 |---|---|
 | Branch `core-activity-counters` | Merged into `main` as PR techomancer/iris#797 (2026-11-22). |
 | Branch `iris-newgui` | Rebased onto `main` after #797 merged (2026-11-22). Local only, never pushed. Holds this plan and the GUI work. |
+| Branch `iris-gtk` | Cut from `iris-newgui` (2026-11-27). Local only, never pushed. Holds the GTK 4 shell (Phase 5). |
 | GUI code | Phase 4 started: the AppKit shell (`iris-gui/frontends/appkit`, binary `iris-appkit`) has slices 0 to 9: app, window, toolbar, menu bar, wake, library, effects, quit through the controller, the summary page, the Metal presenter with physical-key input, capture, full screen and detach (presenter and key path checked by running; mouse capture, full screen and detach not yet tried by hand), and the settings window over the schema (every field kind drawn; port forward, CD-ROM, copy-on-write and remove edits driven by the script hook reached the machine's TOML). Slice 3: the status lights are buttons; `AppController::light_command` maps a light's id to the command it stands for (disk: browse, CD-ROM: insert, network: check, serial: console, capture), in egui too. The New Machine window draws `NewMachineSpec::fields` (the settings field kinds) and creates through `NewMachineSpec::create`; Saved States is a pop-up menu of per-item ids (built, not yet seen: a pop-up menu cannot be dismissed by the script hook). Slice 5's disk browser: `AppController` owns the browser (`OpenBrowser`, `BrowseFiles`, `Browser`, `CloseBrowser`; power on and switching machines close it first, and wait while it writes), `disk_browser::{tools, columns, action_for, ids}` name its controls, and the AppKit window mirrors `app.browser()`. Seen on a copy of the IRIX 5.3 disk: partitions, listing, path bar, selection, the editor (read-only). Not driven from the shell: the write actions (each starts with a modal prompt the script hook cannot answer; the controller paths were tried on copies earlier) and drag-and-drop import (not built). egui's disk lights stay unclickable until egui has a browser window. Slices 6 to 8: Check Networking, the serial console and the camera test are windows that follow their controllers; the shell owns a `BenchController` (as egui does); Diagnostics is an alert with Copy; Preferences draw `controller::preferences` (language and the app-wide display scaling). Seen running on a PROM-only Indy: all of them, a full quick benchmark run streaming its console; the camera fell back to its black source (no camera opened on this Mac). Slice 9: `iris-gui/frontends/appkit/scripts/bundle.sh` builds "IRIS Preview (renamed IRIS.app on 2026-11-27).app" (`io.techomancer.iris.appkit`, the egui release's speed features) and a DMG, signs with a Developer ID and notarizes when asked; `build.yml` gains a `macos-appkit` job (continue-on-error, so it cannot hold up a release) whose DMG the release publishes as `dist-macos-appkit`. Built and launched here ad hoc, arm64 only; the CI job, Developer ID signing and notarization have not run. After slice 9 (2026-11-22): a Devices menu from `AppController::disk_menu` (disc insert/change/eject/mount, browse, copy-on-write commit and discard by per-item ids); Video In, Performance and the NFS share in the settings schema (Perfetto, Debug and CI stay TOML-only as developer settings); Help pages from `controller::help` (About, camera and networking, NFS with the live gateway, Ultra64, Licenses, Privacy); drag-and-drop import in the browser; test hooks `IRIS_APPKIT_ANSWERS`, `drop:`, `type:`, `dump:` (clanker/macos/drive-the-appkit-shell-with-the-screen-locked.md). Every browser write action was driven from the AppKit shell on a fresh copy of the IRIX 5.3 disk (Edit Anyway, new folder, drop import, chmod, rename, chown, edit and save, export, delete) and the copy booted to the IRIX login in the bundled app. Not done: the hand checks (capture, full screen, detach, a real Finder drag), the SVG icon fallback for the toolbar and controls, the CI job's first run. Machine pictures (2026-11-23, answers the IP-tile circles question): one front-view line drawing per case in `iris-gui/assets/icons/machine-*.svg`, black on transparent so each shell tints it, drawn from reference photos except the Origin/Onyx 3000 rack (no photo found yet); `MachineIcon::svg` embeds them, AppKit renders them with resvg into template images (library rows, the current-state row), so they show below macOS 11 too. Driven on the release bundle the same day: the library row's Start, Devices > insert and eject a disc on a running PROM-only Indy (the menu now follows the live disc), Power Off through the writable-disk question. Phase 2 done (boundary count 0; egui no longer counted, D1): App, Session, Display, Settings (schema), Network, Serial, Bench, Camera, Debug, new-machine and disk-browser controller slices done (library, folders, duplicate, quit guard; power on/off with the preflights as controller questions, saved states, discs, copy-on-write, NVRAM reset, status-bar lights from the core counters; egui rewired). Phases 0 and 1 done: `iris-gui/core` (`iris-gui-core`) with the controller contract, ids, keys, labels, icons, `model::job`, and `iris-gui/scripts/check-boundaries.sh`; the toolkit-free modules live in `core/src/model` (plus `hardware.rs`, the pure profile helpers from `extra_ui.rs`). |
 | Mock-ups | **Not in the repository, by the user's decision; do not commit mock-ups or screenshots.** Seven boards (stopped, running and settings in light and dark, and the macOS menu bar) are in the git-ignored `ignore/mockups/` on the user's machine, with their sources in `src/` (`node expand.js <in> <out.html> [light|dark]` makes plain HTML) and the annotated feedback screenshot; ask the user if the folder is absent. They predate the feedback in [Design changes from feedback](#design-changes-from-feedback-2026-11-21), so [The window](#the-window) is the specification. |
 | Unrelated finding | `kona-tile-handoff-race.md`: a real hang in the KONA tile scheduler, test ignored, not fixed. Not part of this work. |
@@ -69,6 +70,8 @@ When #797 merges, rebase `iris-newgui` onto `main`. Do not put GUI commits on
 | D21 | No importing of CLI `.toml` files into the library (2026-11-21). Machines are created in the GUI; their files remain core-schema TOML. |
 | D23 | A disk browser in the GUI, built on the published rusty-backup crates (2026-11-22): open a machine's disk or CD-ROM, look through EFS, XFS and ext partitions, and import, export and edit files. **No provisioning**: a new disk is an empty image and the user runs `fx`, because fx chooses the root and swap split itself (`clanker/irix/fx-label-create-writes-root-and-swap.md`). No formatting either; the OS installer does that. See [Disk browser](#disk-browser-rusty-backup-crates). |
 | D22 | Display scale is one setting for the whole application, not per machine (2026-11-21). No core config key. |
+| D24 | *2026-11-27:* the GTK shell is built with **libadwaita**, not bare GTK 4. The core's own shapes map onto its widgets (a settings `Section` of `Field`s onto `AdwPreferencesPage`/`Group` and the row types, `ChoiceSpec` onto `AdwAlertDialog`'s responses with its default, dismiss and destructive appearances, `Effect::Toast` onto `AdwToastOverlay`), and `AdwOverlaySplitView` and `AdwToolbarView` are the collapsible library and the sliding status bar the AppKit shell had to hand-build. Floor: libadwaita 1.5 and GTK 4.12 (`v1_5`, `v4_12`), what Ubuntu 24.04 carries — already the host `build.yml` builds the Linux packages on, so the floor costs nothing we ship. |
+| D25 | *2026-11-27:* D11 stands for GTK: the shell draws **our own SVG set** in `iris-gui/assets/icons/`, one file per `Icon` meaning, rendered with resvg and tinted to the current foreground colour, rather than mapping onto the Adwaita icon theme's names. One set of glyphs on every platform, and the same files serve Win32 and the pre-macOS-11 AppKit fallback. |
 
 ## Layout on disk
 
@@ -489,8 +492,35 @@ each one.
    COW, sync on quit, then the disk browser; 6 network; 7 serial console; 8 benchmark, debug,
    camera; 9 bundle, signing, notarized DMG, its own bundle id beside the
    egui app.
-5. **Parity check and release** as a preview beside egui; then GTK4 and Win32
-   over the same controllers.
+5. **GTK 4 shell** (`iris-gui/frontends/gtk4`, binary `iris-gtk`), the native
+   Linux front end, which replaces the egui app on Linux as the AppKit shell
+   replaced it on macOS. libadwaita (D24), our own SVG icons (D25). Slices,
+   one commit each:
+   0. **App.** The crate, `AdwApplication`, single instance, the wake (`Notify`
+      onto the GLib main context) and the timed tick, the
+      action -> effects -> refresh loop, the window with its header bar, quit
+      through the controller, and the `IRIS_GTK_SCRIPT` hook with `shot:`
+      (the window paints itself into a PNG through its own GSK renderer:
+      Wayland has no way to grab another process's window).
+   1. **Icons.** The SVG set (D25) and its loader.
+   2. **Chrome.** The app menu (`GMenu`) over the command ids, enablement
+      through `GSimpleAction`, accelerators from `controller::keys`, and the
+      dialog host: `AdwAlertDialog` for Confirm, Choose, AskText and Alert,
+      `GtkFileDialog` (the xdg portal) for the pickers. Every GTK dialog is
+      asynchronous, so an answer comes back as an action rather than from the
+      effect call; `IRIS_GTK_ANSWERS` answers them unattended.
+   3. **Library** in an `AdwOverlaySplitView`: families, folders, the machine
+      pictures, row Start buttons and the row menu.
+   4. Machine page; 5. status bar and the device lights; 6. the guest display;
+   7. keyboard and mouse (physical keys, pointer lock where the compositor
+      offers it, Follow mode where it does not); 8. settings over the schema;
+   9. New Machine; 10. Preferences; 11. disk browser; 12. serial console,
+   Check Networking, camera test, benchmark, diagnostics, Help;
+   13. packaging (AppImage and deb/rpm ship the GTK app; ask the user before
+   changing what CI ships).
+
+   Then the **parity check and release** beside egui, and Win32 over the same
+   controllers.
 
 Testing: controller unit tests with no window; the existing egui headless
 tests; later a flow driver over the accessibility ids, as rusty-backup's

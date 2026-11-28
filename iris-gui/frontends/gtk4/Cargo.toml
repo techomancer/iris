@@ -1,0 +1,41 @@
+[package]
+name = "iris-gui-gtk"
+version = "0.1.0"
+edition = "2021"
+description = "IRIS, the native Linux front end: GTK 4 and libadwaita over iris-gui-core's controllers"
+license = "BSD-3-Clause"
+publish = false
+
+# Phase 5 of clanker/plans/iris-newgui-plan.md, after the AppKit shell. A pure
+# view over iris_gui_core::controller: it renders, maps input to actions and
+# carries out effects. The toolkit is gated on the platforms that have it
+# (D19), so `cargo build --workspace` on macOS or Windows builds a binary that
+# only says so.
+
+[[bin]]
+name = "iris-gtk"
+path = "src/main.rs"
+
+[features]
+# Forwarded to the core, as iris-gui does.
+pcap = ["iris-gui-core/iris-pcap"]
+# Distributed build (the packaging scripts set it).
+bundled = ["iris-gui-core/bundled"]
+# The emulator's speed features, as the egui release build uses them
+# (scripts/dist/lib.sh DEFAULT_GUI_FEATURES).
+lightning = ["iris/lightning"]
+jitv2 = ["iris/jitv2"]
+idle-pause = ["iris/idle-pause"]
+hostgl = ["iris/hostgl", "iris/hostcall"]
+
+[dependencies]
+iris-gui-core = { path = "../../core" }
+# Only so the features above reach the emulator. The shell's code never
+# names it (iris-gui/scripts/check-boundaries.sh).
+iris = { path = "../../..", features = ["gpujit"] }
+
+# GTK 4.12 and libadwaita 1.5 are what Ubuntu 24.04 carries, and build.yml
+# already builds the Linux packages there, so the floor costs nothing we ship.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "0.11", features = ["v4_12"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }

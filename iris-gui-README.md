@@ -633,7 +633,7 @@ reclaims them at exit). The same bound is applied on **Quit**.
 
 ```
 iris/
-├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks, iris-prom, iris-gui/frontends/appkit; iris-hostgl and iris-audio excluded
+├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks, iris-prom, iris-gui/frontends/{appkit,gtk4}; iris-hostgl and iris-audio excluded
 ├── src/               iris library + CLI
 └── iris-gui/
     ├── Cargo.toml     the egui app; depends on iris with gpujit and on iris-gui-core
@@ -665,6 +665,8 @@ iris/
     │           └── single_instance.rs previous-instance reclaim
     ├── frontends/appkit/   iris-gui-appkit: the native macOS shell (binary iris-appkit)
     │   └── scripts/bundle.sh   builds the AppKit "IRIS.app" and its DMG
+    ├── frontends/gtk4/     iris-gui-gtk: the native Linux shell, GTK 4 and
+    │                       libadwaita (binary iris-gtk)
     └── src/           the egui shell
         ├── main.rs            App: control column, menus, modals, update loop
         ├── input.rs           capture, egui → PS/2 keyboard+mouse pump
@@ -683,7 +685,7 @@ iris/
 
 The front ends are moving onto shared controllers: `iris-gui-core` holds the
 model and one controller per task, and a shell (egui, and the native AppKit
-app) only draws, turns input into controller actions and carries out the
+and GTK apps) only draws, turns input into controller actions and carries out the
 effects a controller asks for (file pickers, confirmations, the clipboard).
 Forms such as the machine settings, the new-machine dialog and the
 preferences are lists of fields the controller builds; a shell draws each
