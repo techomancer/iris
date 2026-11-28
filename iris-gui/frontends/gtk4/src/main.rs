@@ -21,6 +21,8 @@ mod library;
 #[cfg(target_os = "linux")]
 mod menu;
 #[cfg(target_os = "linux")]
+mod status;
+#[cfg(target_os = "linux")]
 mod style;
 #[cfg(target_os = "linux")]
 mod summary;

@@ -18,6 +18,7 @@ use libadwaita as adw;
 
 use crate::icons;
 use crate::library::Library;
+use crate::status::StatusBar;
 use crate::summary;
 use crate::toolbar::Toolbar;
 
@@ -27,6 +28,7 @@ pub struct MainWindow {
     split: adw::OverlaySplitView,
     library: Rc<Library>,
     toolbar: Toolbar,
+    status: StatusBar,
     /// Holds the machine page (and later the guest display).
     pane: adw::ToolbarView,
     /// The overview the page was built from, so it is rebuilt only on a change.
@@ -64,6 +66,8 @@ impl MainWindow {
 
         let content = adw::ToolbarView::new();
         content.add_top_bar(&header);
+        let status = StatusBar::new();
+        content.add_bottom_bar(&status.root);
 
         let library = Library::new(app);
         let split = adw::OverlaySplitView::builder()
@@ -115,6 +119,7 @@ impl MainWindow {
             split,
             library,
             toolbar,
+            status,
             pane: content,
             shown: None,
             tab: summary::TAB_DETAILS.to_string(),
@@ -126,6 +131,7 @@ impl MainWindow {
     pub fn refresh(&mut self, app: &AppController) {
         self.library.refresh(app.library());
         self.toolbar.refresh(app);
+        self.status.refresh(app);
         let o = app.overview();
         if self.shown.as_ref() != Some(&o) {
             let gtk_app = crate::app::application();
