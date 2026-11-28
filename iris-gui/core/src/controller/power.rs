@@ -443,6 +443,9 @@ impl AppController {
             notes.push(t!("toast-prom-builtin"));
         }
         cfg.debug.apply_env();
+        if let Err(e) = iris::devlog::DEVLOG.start(&cfg.debug.log) {
+            fx.push(Effect::Toast(e));
+        }
         cfg.jitv2.apply_env();
         // An automatic `[jitv2] threads` follows the CPU count chosen since.
         cfg.settle_jitv2_threads();

@@ -6,7 +6,7 @@
 //! run drew; the replay checks them against hash checkpoints kept beside the
 //! recording.
 //!
-//! Started with `IRIS_ODSY_REC=<file>` when the board is built (power-on is
+//! Started with `--startup "vpro rec <file>"` before the CPU runs (power-on is
 //! what a replay starts from) or from the monitor (`vpro rec <file>`, `vpro
 //! rec mark`, `vpro rec off`; debug.rs). The recording is gzip-compressed
 //! whatever the name. It stays out of git, as IMPACT's `.rec` files do; the

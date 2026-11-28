@@ -1684,7 +1684,7 @@ impl Rex3 {
             #[cfg(feature = "gputrace")]
             rec: Mutex::new(None),
             #[cfg(feature = "gputrace")]
-            trace: Mutex::new(trace::Rex3Trace::new()),
+            trace: Mutex::new(trace::Rex3Trace::new(["gfifo", "cpu"], 1)),
             show_cmap: AtomicBool::new(false),
             show_disp_debug: AtomicBool::new(false),
         }
@@ -1717,7 +1717,7 @@ impl Rex3 {
         #[cfg(feature = "gputrace")]
         if self.tap.load(Ordering::Acquire) != 0
             || self.rec.lock().is_some()
-            || self.trace.lock().is_active()
+            || self.trace.lock().is_open()
         {
             return Err(ResidentError::InvalidState("REX3 cannot attach while recording or tracing"));
         }
@@ -4393,26 +4393,6 @@ impl Device for Rex3 {
         let head: Arc<dyn crate::display::Head> = shim.clone();
         self.head.attach(Arc::downgrade(&head));
         self.head.start();
-
-        // Started here rather than at construction: the machine resets the
-        // board (power_on) in between, and a recording's start state must be
-        // the state its first record applies to.
-        #[cfg(feature = "gputrace")]
-        if let Some(path) = std::env::var_os("IRIS_REX3_REC") {
-            let path = path.to_string_lossy();
-            match self.set_recording(Some(&path), true) {
-                Ok(_) => eprintln!("REX3: recording to {path}"),
-                Err(e) => eprintln!("REX3: cannot record to {path}: {e}"),
-            }
-        }
-        #[cfg(feature = "gputrace")]
-        if let Some(path) = std::env::var_os("IRIS_REX3_TRACE") {
-            let path = path.to_string_lossy();
-            match self.start_trace(&path, trace::TRACE_ALL) {
-                Ok(()) => eprintln!("REX3: tracing to {path}"),
-                Err(e) => eprintln!("REX3: cannot trace to {path}: {e}"),
-            }
-        }
     }
 
     fn is_running(&self) -> bool {

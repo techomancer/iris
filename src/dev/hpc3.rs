@@ -3,7 +3,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::fs::File;
 use std::io::Write as IoWrite;
-use crate::devlog::{LogModule, devlog_mask};
+use crate::devlog::{devlog_on, LogModule};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, RxRoom, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
 use crate::config::{AudioConfig, NetworkConfig, RtcOffset};
@@ -18,6 +18,11 @@ use crate::dev::ioc::IocInterrupt;
 use crate::dev::hal2::Hal2;
 use crate::hptimer::TimerManager;
 use crate::exp::eval_const_expr;
+
+/// The `pdma.*` trace points, one per channel in channel order: `hal0`..`hal7`, `scsi0`, `scsi1`, `enet0`, `enet1`.
+pub const PDMA_EVENTS: &[&str] = &[
+    "hal0", "hal1", "hal2", "hal3", "hal4", "hal5", "hal6", "hal7", "scsi0", "scsi1", "enet0", "enet1",
+];
 
 pub const HPC3_BASE: u32 = 0x1FB80000;
 pub const HPC3_SIZE: u32 = 0x00080000; // 512KB
@@ -465,9 +470,9 @@ impl PdmaChannel {
         (self.ctrl & self.active_mask) != 0
     }
 
-    /// True if this channel's bit is set in the pdma log mask.
+    /// True if this channel's `pdma` trace point is on.
     fn log_active(&self) -> bool {
-        (devlog_mask(LogModule::Pdma) >> self.id) & 1 != 0
+        devlog_on(LogModule::Pdma, 1 << self.id)
     }
 
 fn start_transaction(&mut self) {

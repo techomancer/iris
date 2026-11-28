@@ -890,12 +890,9 @@ impl Machine {
         #[cfg(feature = "jitv2")]
         crate::cpu::jitv2::jitv2::attach_pool(&cpu, (jitv2_threads, jitv2_threads_reason), jitv2_compile, phys.clone(), world.clone());
 
-        // Setup DevLog (must be before Monitor so log command is available)
-        let devlog = crate::devlog::init_devlog();
-
         // Setup Monitor
         let monitor = Monitor::new();
-        monitor.register_device(devlog.clone());
+        monitor.register_device(Arc::new(crate::devlog::LogDevice));
         monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
         monitor.register_device(Arc::new(mc.clone()));
         monitor.register_device(Arc::new(hpc3.clone()));
@@ -952,7 +949,7 @@ impl Machine {
 
         crate::thread_affinity::init(perf);
 
-        Ok(Self {
+        let machine = Self {
             memory,            cpu,
             board,
             mc,
@@ -977,7 +974,10 @@ impl Machine {
             controller_slot: None,
             controller_registered: false,
             lifecycle: GuestState::Idle,
-        })
+        };
+        // A recording opened before `start` saves its starting state here; `start` applies it again.
+        machine.apply_host_display_resolution();
+        Ok(machine)
     }
 
     fn apply_host_display_resolution(&self) {

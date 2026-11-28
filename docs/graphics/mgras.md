@@ -163,6 +163,6 @@ instead of testing spans per tile.
 The monitor command is `mgras` (`mgras/debug.rs`): `status`, `hq`, `gl`, `ge`,
 `ucode`, `vc3`, `xmap`, `cmap`, `dac`, `pix`, `stats`, `shot`, `fbdump`,
 `trace`, `rec`, `probe`, `dump`, `tram` and, with `gr4-jit`, `jit`. The trace needs the
-`gputrace` feature (on with `developer`). `IRIS_MGRAS_TRACE=<file>` starts it at power-on and `IRIS_MGRAS_REC=<file>` starts a recording
+`gputrace` feature (on with `developer`). `--startup "mgras trace <file>"` starts it at power-on and `--startup "mgras rec <file>"` a recording
 (`record.rs`, which also replays recordings in tests). `mgras_tests.rs`,
 `rss_jit_tests.rs` and `mgras/wgpu/tests.rs` hold the tests.

@@ -142,5 +142,5 @@ hardware would not produce. Index Load Tag (I) reads the stored tag.
 ## Seeing it
 
 `l2 probe 0` in the monitor prints how many lines hold pages and which. Every
-machine should show none at the IRIX login. `log l2c mask op` logs each page held
+machine should show none at the IRIX login. `log l2c.op on` logs each page held
 and released.

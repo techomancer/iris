@@ -140,7 +140,7 @@ state: RSS, HQ3 and DCB state are plain data (no Box/Vec/HashMap), built
 in place with Arc::new_zeroed, C-style structs in case of a JIT later.
 
 regression: tools/mgras-capture.py records a session from power-on
-(IRIS_MGRAS_REC) with hash checkpoints (scripted marks plus one every 250k
+(`--startup "mgras rec FILE"`) with hash checkpoints (scripted marks plus one every 250k
 records); record.rs replays it through the bus interface and checks every
 checkpoint. Goldens live in ignore/mgras-golden (too big for git):
 desktop.rec and dense.rec were recorded by the single-threaded model.
@@ -159,7 +159,7 @@ phases:
   - flatten state to plain data, goldens pass
   - monitor commands and annotated trace (gr2 parity): `mgras help`,
     `mgras stats` (command/primitive counters), `mgras trace <file>
-    [hq,rss,cpu|all]` (IRIS_MGRAS_TRACE from power-on), `rss regs|pix`
+    [hq,rss,cpu|all]` (`--startup` from power-on), `rss regs|pix`
   - trace-replay test architecture:
       rss.rs tests            RSS semantics on a bare `Rss` (no threads)
       mgras_tests.rs          the live board through the bus: FIFO/direct

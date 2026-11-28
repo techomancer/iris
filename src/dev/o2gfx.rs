@@ -1636,12 +1636,6 @@ pub struct CrimeRe {
     unhandled: Mutex<BTreeMap<String, u64>>,
     /// Primitives run, for the end-of-run report.
     pub drawn: std::sync::atomic::AtomicU64,
-    /// Register writes as they happen, `(offset, value, width)`: the last
-    /// `trace_cap` (IRIS_IP32_RE_TRACE) of them, the evidence for what a
-    /// driver does with parts the model does not know yet. The most recent,
-    /// so what was just drawn is in it.
-    trace: Mutex<std::collections::VecDeque<(u32, u64, u8)>>,
-    trace_cap: usize,
     /// Test aid (IRIS_IP32_RE_LAG_US): the engine's thread waits this long
     /// before each MTE transfer, as if the host had kept it off a processor.
     /// It opens the window of the race a status read guards against (see
@@ -1785,8 +1779,6 @@ impl CrimeRe {
             win: Mutex::new(ram.window()),
             unhandled: Mutex::new(BTreeMap::new()),
             drawn: std::sync::atomic::AtomicU64::new(0),
-            trace: Mutex::new(std::collections::VecDeque::new()),
-            trace_cap: std::env::var("IRIS_IP32_RE_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             transfer_lag: std::time::Duration::from_micros(
                 std::env::var("IRIS_IP32_RE_LAG_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
@@ -2041,31 +2033,8 @@ impl CrimeRe {
             self.transfers_queued.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         self.polled_busy.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.record(off, val, width);
         self.wake();
         BUS_OK
-    }
-
-    fn record(&self, off: u32, val: u64, width: u8) {
-        if self.trace_cap == 0 {
-            return;
-        }
-        let mut t = self.trace.lock().unwrap();
-        if t.len() >= self.trace_cap {
-            t.pop_front();
-        }
-        t.push_back((off, val, width));
-    }
-
-    /// The recorded writes, one per line: `w32 OFFSET VALUE` (offsets from
-    /// the RE base, 0x1500_0000).
-    pub fn trace_text(&self) -> String {
-        let t = self.trace.lock().unwrap();
-        let mut s = String::with_capacity(t.len() * 28);
-        for &(off, val, w) in t.iter() {
-            s.push_str(&format!("w{w} {off:05x} {val:0pad$x}\n", pad = w as usize / 4));
-        }
-        s
     }
 
     pub fn unhandled(&self) -> BTreeMap<String, u64> {
@@ -3625,11 +3594,10 @@ impl crate::traits::Device for CrimeRe {
         }
         match args.first().copied().unwrap_or("status") {
             "status" => {
-                writeln!(w, "CRIME RE: {} primitives drawn, {}, {} of {} interface buffer entries; trace {} of {} writes",
+                writeln!(w, "CRIME RE: {} primitives drawn, {}, {} of {} interface buffer entries",
                     self.drawn.load(Relaxed),
                     if self.idle() { "idle" } else { "busy" },
-                    self.ib.len(), IB_DEPTH - 1,
-                    self.trace.lock().unwrap().len(), self.trace_cap).ok();
+                    self.ib.len(), IB_DEPTH - 1).ok();
             }
             "notes" => {
                 for (what, n) in self.unhandled() {
@@ -3819,8 +3787,7 @@ mod tests {
         eprintln!("replay_speed: {} writes, {drawn} primitives, best of {passes}: {:.3} s ({:.0} ns/write), memory {hash:016x}", writes.len(), best, best * 1e9 / writes.len() as f64);
     }
 
-    /// Replay a recorded register trace (IRIS_IP32_RE_TRACE, saved with the
-    /// `o2 retrace`) into a fresh RE and save what TLB A shows
+    /// Replay a recorded register trace (`re rec`) into a fresh RE and save what TLB A shows
     /// at 32 bpp as a PNG: RE_REPLAY=trace RE_REPLAY_PNG=out.png. CPU writes
     /// to the frame buffer are not in the trace, so only drawing shows.
     #[test]

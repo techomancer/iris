@@ -7,8 +7,8 @@
 //!
 //! Started from the monitor (`rex rec <file>`, `rex rec mark`, `rex rec off`)
 //! at any time: the recording opens with the board's state (`S`), so it does
-//! not have to start at power-on. `IRIS_REX3_REC=<file>` starts one when the
-//! board starts. Replay:
+//! not have to start at power-on. `--startup "rex rec <file>"` starts one
+//! before the CPU runs. Replay:
 //! `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored --nocapture`
 //! (`REX3_REPLAY_OUT=<dir>` saves the final framebuffers there,
 //! `REX3_REPLAY_TRACE=<file>` writes the annotated trace of the replay,

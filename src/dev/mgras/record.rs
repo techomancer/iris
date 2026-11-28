@@ -5,9 +5,9 @@
 //! the device's bus interface must reproduce the board state the live run
 //! reached, checked against hash checkpoints taken while recording.
 //!
-//! Started from `IRIS_MGRAS_REC=<file>` (from power-on, which is what replay
-//! needs) or the monitor (`mgras rec <file>`, `mgras rec mark`, `mgras rec
-//! off`). Replay: `MGRAS_REPLAY=<file> cargo test --release mgras_replay_file
+//! Started from the monitor (`mgras rec <file>`, `mgras rec mark`, `mgras rec
+//! off`); `--startup "mgras rec <file>"` records from power-on, which is what
+//! replay needs. Replay: `MGRAS_REPLAY=<file> cargo test --release mgras_replay_file
 //! -- --nocapture` (`MGRAS_REPLAY_OUT=<file.png>` saves the final screen,
 //! `MGRAS_REPLAY_TRACE=<file>` writes the annotated trace of the replay).
 //! After a deliberate change to the board state, `MGRAS_REBASELINE=<in>
@@ -488,7 +488,7 @@ pub(super) mod tests {
         // MGRAS_REPLAY_TRACE_MASK: the categories (`mgras trace`'s, e.g.
         // `rss`), all by default.
         if let Ok(t) = std::env::var("MGRAS_REPLAY_TRACE") {
-            let mask = std::env::var("MGRAS_REPLAY_TRACE_MASK").map_or(crate::dev::mgras::debug::TRACE_ALL, |s| crate::dev::mgras::debug::trace_mask(&s));
+            let mask = std::env::var("MGRAS_REPLAY_TRACE_MASK").map_or(Ok(crate::dev::mgras::debug::TRACE_ALL), |s| crate::dev::mgras::debug::CLASSES.parse(&s))?;
             m.start_trace(&t, mask).map_err(|e| format!("{t}: {e}"))?;
         }
         // MGRAS_REPLAY_NOCHECK=1: a recording that starts mid-session (its
