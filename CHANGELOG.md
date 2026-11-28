@@ -56,6 +56,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   built-in, a default or from your config, and what each serial port is connected to. It
   replaces `serial map`. `iris --list-slots` prints the same tree before a machine runs, in
   box characters and colour on a terminal that shows them, plain ASCII otherwise.
+- Older config keys that still load (`[scsi.N]`, `[o2]`, `[impact]`, `[ultra64]`, `[virtio_*]`,
+  `graphics.heads`, `test_device`) are declared in one table, and a run that read any prints one line
+  naming them instead of one line per group; `--config-dump FILE` writes the file in the current form.
+  `[octane] graphics` is now refused when the file is read, with the board to write, not at validation.
 - `--config-show` prints, and `--config-dump FILE` writes, the effective config as a short
   iris.toml holding only what differs from the machine's defaults, with every device at the
   slot it took; the monitor's `config show` and `config dump PATH` do the same for a running

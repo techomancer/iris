@@ -414,8 +414,8 @@ devices 7, 5 and 6, the Tezro's IO9 bus 1); `at` can name any slot. A snapshot r
 
 #### Old keys
 
-The keys iris wrote before `[[devices]]` still load, each with a warning saying what it became, and will be
-removed in a later release: `[scsi.N]` tables (with `controller`, `kind` and `cdrom`), `[ultra64]`,
+The keys iris wrote before `[[devices]]` still load, and will be removed in a later release. A run that
+reads any says so in one line naming them, and `--config-dump FILE` writes the file in the current form: `[scsi.N]` tables (with `controller`, `kind` and `cdrom`), `[ultra64]`,
 `[virtio_serial]` and `[virtio_9p]` (with `slot`), `graphics.heads = 2`, `test_device` and its two companions,
 and the command-line `--scsi1`/`--cdrom4` family and `--test-device`.
 
@@ -562,7 +562,7 @@ Ethernet, `[[port_forward]]`, `nat_subnet`, `[nfs]` and `[[devices]]`
 O2-only spellings (`o2.prom`, `o2.flash`, `o2.ram_mb`, `o2.dimms`,
 `o2.disks`, `o2.serial_port`, `o2.serial_log`, `o2.graphics`, `o2.cpu_mhz`,
 `o2.net`, `o2.forwards`) are deprecated: they are folded into those keys when
-the file is loaded, with a note, and never written back.
+the file is loaded, with one warning line for the whole file, and never written back.
 
 | Key | Default | Values and behavior |
 |---|---|---|

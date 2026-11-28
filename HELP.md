@@ -968,8 +968,9 @@ will never find.
 
 ### Old keys
 
-The keys iris wrote before `[[devices]]` still load, with a warning that says
-what each became, and will be removed in a later release. `[scsi.N]` tables
+The keys iris wrote before `[[devices]]` still load, and will be removed in a later
+release. A run that reads any prints one line naming them; `iris --config old.toml
+--config-dump new.toml` writes the file in the current form. `[scsi.N]` tables
 (`[scsi.17]` is target 1 of `scsi1`), `controller`, `kind` and `cdrom` in them,
 `[ultra64]`, `[virtio_serial]` and `[virtio_9p]` with their `slot`,
 `graphics.heads = 2` and `test_device` become `[[devices]]` entries; the

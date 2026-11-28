@@ -1,5 +1,5 @@
-//! The keys older versions of iris wrote, read with a warning and turned into their current form. `[scsi.N]`, `--scsiN`,
-//! `--cdromN` and the bare drive number live only here; the card flags keep their fields in `config.rs`.
+//! The keys older versions of iris wrote, each declared once in [`OLD_KEYS`]: read and turned into its current form, or
+//! refused with what to write. `--scsiN`, `--cdromN` and the bare drive number live here too.
 
 use super::*;
 use crate::devices::{ConfiguredDevice, DeviceModel, TestDeviceConfig};
@@ -20,81 +20,186 @@ pub enum VirtioGioSlot {
     Exp1,
 }
 
-/// The older GIO flags (`[ultra64]`, `graphics.heads`, `test_device`) as
-/// `[[devices]]` entries in the slot they named, once the machine is known.
-pub(super) fn gio_cards(cfg: &mut MachineConfig) -> Result<(), String> {
-    if cfg.graphics.heads != 1 && cfg.graphics.heads != 2 {
-        return Err(format!("graphics.heads {} is invalid (valid: 1, 2)", cfg.graphics.heads));
+/// When a row's fold runs: as the file is read, or once the command line has picked the machine.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum When {
+    Load,
+    Placed,
+}
+
+pub(super) enum How {
+    /// Move the key into its current form; true when the config had it.
+    Fold(fn(&mut MachineConfig) -> Result<bool, String>),
+    /// An unknown field in `sections` (none: anywhere), whose replacement needs a slot choice.
+    Refuse { sections: &'static [&'static str], instead: &'static str },
+}
+
+/// An older key, declared once: its translation and its error both come from the row.
+pub(super) struct OldKey {
+    /// The key as a file writes it, which the run's warning names.
+    key: &'static str,
+    when: When,
+    how: How,
+}
+
+const fn fold(key: &'static str, when: When, f: fn(&mut MachineConfig) -> Result<bool, String>) -> OldKey {
+    OldKey { key, when, how: How::Fold(f) }
+}
+
+const fn refuse(key: &'static str, sections: &'static [&'static str], instead: &'static str) -> OldKey {
+    OldKey { key, when: When::Load, how: How::Refuse { sections, instead } }
+}
+
+fn took<T>(old: Option<T>, f: impl FnOnce(T)) -> Result<bool, String> {
+    Ok(old.map(f).is_some())
+}
+
+fn banks_from(c: &mut MachineConfig, kits: &[u32]) {
+    if c.banks == default_banks() && !kits.is_empty() && kits.len() <= MAX_BANKS {
+        c.banks = [0; MAX_BANKS];
+        c.banks[..kits.len()].copy_from_slice(kits);
     }
-    if cfg.test_device_run_config.is_some() && !cfg.test_device {
-        return Err("test_device_run_config needs test_device".into());
+}
+
+/// A card flag as a `[[devices]]` entry at gio0, on a machine that has GIO slots; the flag stays set where it has none.
+fn gio_card(c: &mut MachineConfig, on: bool, card: impl FnOnce(&mut MachineConfig) -> Result<DeviceModel, String>) -> Result<bool, String> {
+    if !on || !slots_take(&c.machine.profile.slots(), DeviceFamily::Gio) {
+        return Ok(false);
     }
-    let slots = cfg.machine.profile.slots();
-    if !slots_take(&slots, DeviceFamily::Gio) {
-        return match cfg.graphics.heads == 2 {
-            true => Err(format!("graphics.heads = 2: the {} has no GIO slot for a second head", cfg.machine.profile.product_name().unwrap_or(cfg.machine.profile.label()))),
-            false => Ok(()),
-        };
+    let card = card(c)?;
+    c.devices.push(ConfiguredDevice::new("gio0", card));
+    Ok(true)
+}
+
+/// A virtio flag as a `[[devices]]` entry in the GIO slot it named, else wherever the machine has a slot for it.
+fn virtio_card(c: &mut MachineConfig, slot: Option<VirtioGioSlot>, card: DeviceModel) -> Result<bool, String> {
+    let gio = slots_take(&c.machine.profile.slots(), DeviceFamily::Gio);
+    let at = gio.then(|| if slot == Some(VirtioGioSlot::Exp0) { "gio0" } else { "gio1" }.to_string());
+    c.devices.push(ConfiguredDevice { at, ..ConfiguredDevice::new("", card) });
+    Ok(true)
+}
+
+fn heads(c: &mut MachineConfig) -> Result<bool, String> {
+    match c.graphics.heads {
+        1 => return Ok(false),
+        2 => {}
+        n => return Err(format!("graphics.heads {n} is invalid (valid: 1, 2)")),
     }
-    let mut cards: Vec<(&str, DeviceModel)> = Vec::new();
-    let mut moved: Vec<&str> = Vec::new();
-    if cfg.graphics.heads == 2 && !cfg.headless {
-        cards.push(("gio0", DeviceModel::Newport));
-        moved.push("graphics.heads = 2 -> newport");
+    if !slots_take(&c.machine.profile.slots(), DeviceFamily::Gio) {
+        return Err(format!("graphics.heads = 2: the {} has no GIO slot for a second head", c.machine.profile.product_name().unwrap_or(c.machine.profile.label())));
     }
-    if cfg.ultra64.enabled {
-        cards.push(("gio0", DeviceModel::Ultra64));
-        moved.push("[ultra64] -> ultra64");
+    c.graphics.heads = 1;
+    if !c.headless {
+        c.devices.push(ConfiguredDevice::new("gio0", DeviceModel::Newport));
     }
-    if cfg.test_device {
-        let run = TestDeviceConfig { dump: cfg.test_device_dump.clone(), run_config: cfg.test_device_run_config.clone() };
-        run.run()?;
-        cards.push(("gio0", DeviceModel::TestDevice(run)));
-    }
-    cfg.graphics.heads = 1;
-    cfg.ultra64.enabled = false;
-    (cfg.test_device, cfg.test_device_dump, cfg.test_device_run_config) = (false, None, None);
-    cfg.devices.extend(cards.into_iter().map(|(at, d)| ConfiguredDevice::new(at, d)));
-    if !moved.is_empty() {
-        eprintln!("iris: deprecated keys folded into [[devices]] ({}); move them in the config to silence this", moved.join(", "));
+    Ok(true)
+}
+
+/// Every key an older iris wrote and a current one still reads, or refuses with what to write instead.
+pub(super) const OLD_KEYS: &[OldKey] = &[
+    fold("scsi", When::Load, scsi_tables),
+    fold("o2.prom", When::Load, |c| took(c.o2.prom.take(), |p| if c.prom == DEFAULT_PROM { c.prom = p })),
+    fold("o2.flash", When::Load, |c| took(c.o2.flash.take(), |f| if c.nvram == DEFAULT_NVRAM { c.nvram = f })),
+    fold("o2.ram_mb", When::Load, |c| {
+        took(c.o2.ram_mb.take(), |mb| match crate::dev::crime_mem::kits_for(mb) {
+            Ok(kits) => banks_from(c, &kits),
+            Err(e) => eprintln!("iris: o2.ram_mb = {mb}: {e}; ignored"),
+        })
+    }),
+    fold("o2.dimms", When::Load, |c| took(c.o2.dimms.take(), |kits| banks_from(c, &kits))),
+    fold("o2.disks", When::Load, |c| {
+        took((!c.o2.disks.is_empty()).then(|| std::mem::take(&mut c.o2.disks)), |disks| {
+            for d in disks {
+                let kind = if d.cdrom { ScsiKind::Cdrom } else { ScsiKind::Disk };
+                let dev = ScsiDeviceConfig { path: d.path, cdrom: d.cdrom, kind_field: kind, overlay: d.overlay, ..Default::default() };
+                c.devices.push(ConfiguredDevice::new(&format!("scsi{}/t{}", d.bus, d.id), DeviceModel::Scsi(dev)));
+            }
+        })
+    }),
+    fold("o2.serial_port", When::Load, |c| took(c.o2.serial_port.take(), |p| c.serial_port_a = c.serial_port_a.or(Some(p)))),
+    fold("o2.serial_log", When::Load, |c| took(c.o2.serial_log.take(), |l| c.serial_log = c.serial_log.take().or(Some(l)))),
+    fold("o2.graphics", When::Load, |c| took(c.o2.graphics.take(), |on| c.headless |= !on)),
+    // CP0 Count runs at half the CPU clock.
+    fold("o2.cpu_mhz", When::Load, |c| took(c.o2.cpu_mhz.take(), |mhz| c.clock.fixed_mhz = c.clock.fixed_mhz.or(Some(f64::from(mhz) / 2.0)))),
+    fold("o2.net", When::Load, |c| took(c.o2.net.take(), |on| if !on { c.network.mode = NetMode::Off })),
+    fold("o2.forwards", When::Load, |c| took((!c.o2.forwards.is_empty()).then(|| std::mem::take(&mut c.o2.forwards)), |f| c.port_forward.extend(f))),
+    fold("impact.gfx", When::Load, |c| {
+        took(c.impact.take(), |impact| {
+            let board = match impact.gfx.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("solid") => Some(GraphicsBoard::SolidImpact),
+                Some("high") => Some(GraphicsBoard::HighImpact),
+                Some("max") => Some(GraphicsBoard::MaxImpact),
+                _ => None,
+            };
+            c.graphics.board = c.graphics.board.or(board);
+        })
+    }),
+    fold("octane.graphics", When::Load, |c| match c.octane.graphics.take() {
+        Some(old) => Err(format!("octane.graphics has moved: set the board in [graphics] as board = \"{}\"", old.trim())),
+        None => Ok(false),
+    }),
+    fold("graphics.heads", When::Placed, heads),
+    fold("ultra64", When::Placed, |c| {
+        gio_card(c, c.ultra64.enabled, |c| {
+            c.ultra64.enabled = false;
+            Ok(DeviceModel::Ultra64)
+        })
+    }),
+    fold("test_device", When::Placed, |c| {
+        if c.test_device_run_config.is_some() && !c.test_device {
+            return Err("test_device_run_config needs test_device".into());
+        }
+        gio_card(c, c.test_device, |c| {
+            let run = TestDeviceConfig { dump: c.test_device_dump.take(), run_config: c.test_device_run_config.take() };
+            run.run()?;
+            c.test_device = false;
+            Ok(DeviceModel::TestDevice(run))
+        })
+    }),
+    fold("virtio_serial", When::Placed, |c| match c.virtio_serial.enabled {
+        true => {
+            let v = std::mem::take(&mut c.virtio_serial);
+            virtio_card(c, v.slot, DeviceModel::VirtioSerial(v))
+        }
+        false => Ok(false),
+    }),
+    fold("virtio_9p", When::Placed, |c| match c.virtio_9p.enabled {
+        true => {
+            let v = std::mem::take(&mut c.virtio_9p);
+            virtio_card(c, v.slot, DeviceModel::Virtio9p(v))
+        }
+        false => Ok(false),
+    }),
+    refuse("xio_board", &[], "a `pci_cage` or `pci_shoehorn` [[devices]] entry at the XIO slot"),
+    refuse("nvme", &[], "an `nvme` [[devices]] entry"),
+    refuse("fibre_channel", &[], "a `qla2200` [[devices]] entry, with its disks as `hdd` entries at CARD/lN"),
+    refuse("audio_card", &[], "an `ice1724` [[devices]] entry"),
+    refuse("audio", &["fuel", "tezro", "origin3200", "onyx3000"], "an `ice1724` [[devices]] entry"),
+    refuse("node", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
+    refuse("widget", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
+    refuse("bridge_slot", &[], "the `at` of the virtio [[devices]] entry"),
+];
+
+/// Run each row's fold of `when`, noting the keys the config had.
+pub(super) fn fold_all(cfg: &mut MachineConfig, when: When) -> Result<(), String> {
+    for old in OLD_KEYS.iter().filter(|o| o.when == when) {
+        if let How::Fold(f) = old.how {
+            if f(cfg)? {
+                cfg.old_keys.push(old.key);
+            }
+        }
     }
     Ok(())
 }
 
-/// An enabled `[virtio_serial]` or `[virtio_9p]` as a `[[devices]]` entry, in the GIO slot it named,
-/// else wherever the machine has a slot for it.
-pub(super) fn virtio_cards(cfg: &mut MachineConfig) {
-    let gio = slots_take(&cfg.machine.profile.slots(), DeviceFamily::Gio);
-    let at = |slot: Option<VirtioGioSlot>| gio.then(|| if slot == Some(VirtioGioSlot::Exp0) { "gio0" } else { "gio1" }.to_string());
-    let mut moved: Vec<&str> = Vec::new();
-    if cfg.virtio_serial.enabled {
-        let serial = std::mem::take(&mut cfg.virtio_serial);
-        cfg.devices.push(ConfiguredDevice { at: at(serial.slot), ..ConfiguredDevice::new("", DeviceModel::VirtioSerial(serial)) });
-        moved.push("[virtio_serial] -> virtio_serial");
-    }
-    if cfg.virtio_9p.enabled {
-        let p9 = std::mem::take(&mut cfg.virtio_9p);
-        cfg.devices.push(ConfiguredDevice { at: at(p9.slot), ..ConfiguredDevice::new("", DeviceModel::Virtio9p(p9)) });
-        moved.push("[virtio_9p] -> virtio_9p");
-    }
-    if !moved.is_empty() {
-        eprintln!("iris: deprecated keys folded into [[devices]] ({}); move them in the config to silence this", moved.join(", "));
+impl MachineConfig {
+    /// The one line a run says when it translated older keys, naming them.
+    pub fn old_keys_warning(&self, file: &str) -> Option<String> {
+        (!self.old_keys.is_empty()).then(|| format!("iris: {file}: older keys or options ({}), translated for this run; `--config-dump FILE` writes the new form", self.old_keys.join(", ")))
     }
 }
 
-/// What replaces each key that placement dropped, and the sections it was valid in (none: anywhere).
-const DROPPED: &[(&str, &[&str], &str)] = &[
-    ("xio_board", &[], "a `pci_cage` or `pci_shoehorn` [[devices]] entry at the XIO slot"),
-    ("nvme", &[], "an `nvme` [[devices]] entry"),
-    ("fibre_channel", &[], "a `qla2200` [[devices]] entry, with its disks as `hdd` entries at CARD/lN"),
-    ("audio_card", &[], "an `ice1724` [[devices]] entry"),
-    ("audio", &["fuel", "tezro", "origin3200", "onyx3000"], "an `ice1724` [[devices]] entry"),
-    ("node", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
-    ("widget", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
-    ("bridge_slot", &[], "the `at` of the virtio [[devices]] entry"),
-];
-
-/// A parse error for a dropped key, with what to write instead; any other error as it was.
+/// A parse error for a refused key, with what to write instead; any other error as it was.
 pub(super) fn name_replacement(e: toml::de::Error, text: &str) -> toml::de::Error {
     let key = e.message().strip_prefix("unknown field `").and_then(|m| m.split('`').next());
     let section = || {
@@ -102,8 +207,12 @@ pub(super) fn name_replacement(e: toml::de::Error, text: &str) -> toml::de::Erro
         let header = before.lines().rev().find_map(|l| l.trim().strip_prefix('['))?;
         header.trim_start_matches('[').split(']').next()
     };
-    match key.and_then(|k| DROPPED.iter().find(|d| d.0 == k && (d.1.is_empty() || section().is_some_and(|s| d.1.contains(&s))))) {
-        Some((key, _, instead)) => <toml::de::Error as serde::de::Error>::custom(format!("{e}\n`{key}` is no longer read: write {instead}")),
+    let refused = OLD_KEYS.iter().find_map(|o| match o.how {
+        How::Refuse { sections, instead } if Some(o.key) == key && (sections.is_empty() || section().is_some_and(|s| sections.contains(&s))) => Some((o.key, instead)),
+        _ => None,
+    });
+    match refused {
+        Some((key, instead)) => <toml::de::Error as serde::de::Error>::custom(format!("{e}\n`{key}` is no longer read: write {instead}")),
         None => e,
     }
 }
@@ -116,100 +225,20 @@ pub(crate) fn drive_number(spec: &str) -> Option<usize> {
     Some(n)
 }
 
-/// The current form of every older key: `[scsi.N]` tables become `[[devices]]` entries at `scsiC/tN`, and the old `[o2]`
-/// spellings move to the shared keys that are still at their defaults.
-pub(super) fn fold(cfg: &mut MachineConfig) -> Result<(), String> {
-    if let Some(tables) = cfg.legacy_scsi.take() {
-        let mut keys: Vec<(u8, toml::Table)> = Vec::new();
-        for (key, t) in tables {
-            let n = key.parse::<u8>().map_err(|_| format!("[scsi.{key}]: the key is not a SCSI id"))?;
-            let toml::Value::Table(t) = t else { return Err(format!("[scsi.{key}] is not a table")) };
-            keys.push((n, t));
-        }
-        keys.sort_by_key(|k| k.0);
-        for (key, t) in keys {
-            cfg.devices.push(scsi_table(key, t)?);
-        }
+/// The older `[scsi.N]` tables as `[[devices]]` entries at `scsiC/tN`.
+fn scsi_tables(cfg: &mut MachineConfig) -> Result<bool, String> {
+    let Some(tables) = cfg.legacy_scsi.take() else { return Ok(false) };
+    let mut keys: Vec<(u8, toml::Table)> = Vec::new();
+    for (key, t) in tables {
+        let n = key.parse::<u8>().map_err(|_| format!("[scsi.{key}]: the key is not a SCSI id"))?;
+        let toml::Value::Table(t) = t else { return Err(format!("[scsi.{key}] is not a table")) };
+        keys.push((n, t));
     }
-    let mut moved: Vec<&str> = Vec::new();
-    if let Some(prom) = cfg.o2.prom.take() {
-        if cfg.prom == DEFAULT_PROM { cfg.prom = prom; }
-        moved.push("o2.prom -> prom");
+    keys.sort_by_key(|k| k.0);
+    for (key, t) in keys {
+        cfg.devices.push(scsi_table(key, t)?);
     }
-    if let Some(flash) = cfg.o2.flash.take() {
-        if cfg.nvram == DEFAULT_NVRAM { cfg.nvram = flash; }
-        moved.push("o2.flash -> nvram");
-    }
-    if let Some(mb) = cfg.o2.ram_mb.take() {
-        match crate::dev::crime_mem::kits_for(mb) {
-            Ok(kits) if cfg.banks == default_banks() => {
-                cfg.banks = [0; MAX_BANKS];
-                cfg.banks[..kits.len()].copy_from_slice(&kits);
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("iris: o2.ram_mb = {mb}: {e}; ignored"),
-        }
-        moved.push("o2.ram_mb -> banks");
-    }
-    if let Some(kits) = cfg.o2.dimms.take() {
-        if cfg.banks == default_banks() && !kits.is_empty() && kits.len() <= MAX_BANKS {
-            cfg.banks = [0; MAX_BANKS];
-            cfg.banks[..kits.len()].copy_from_slice(&kits);
-        }
-        moved.push("o2.dimms -> banks");
-    }
-    if !cfg.o2.disks.is_empty() {
-        for d in std::mem::take(&mut cfg.o2.disks) {
-            let kind = if d.cdrom { ScsiKind::Cdrom } else { ScsiKind::Disk };
-            let dev = ScsiDeviceConfig { path: d.path, cdrom: d.cdrom, kind_field: kind, overlay: d.overlay, ..Default::default() };
-            cfg.devices.push(ConfiguredDevice::new(&format!("scsi{}/t{}", d.bus, d.id), DeviceModel::Scsi(dev)));
-        }
-        moved.push("o2.disks -> [[devices]]");
-    }
-    if let Some(port) = cfg.o2.serial_port.take() {
-        if cfg.serial_port_a.is_none() { cfg.serial_port_a = Some(port); }
-        moved.push("o2.serial_port -> serial_port_a");
-    }
-    if let Some(log) = cfg.o2.serial_log.take() {
-        if cfg.serial_log.is_none() { cfg.serial_log = Some(log); }
-        moved.push("o2.serial_log -> serial_log");
-    }
-    if let Some(graphics) = cfg.o2.graphics.take() {
-        if !graphics { cfg.headless = true; }
-        moved.push("o2.graphics -> headless (inverted)");
-    }
-    if let Some(mhz) = cfg.o2.cpu_mhz.take() {
-        if cfg.clock.fixed_mhz.is_none() { cfg.clock.fixed_mhz = Some(mhz as f64 / 2.0); }
-        moved.push("o2.cpu_mhz -> [clock] fixed_mhz (half: CP0 Count)");
-    }
-    if let Some(net) = cfg.o2.net.take() {
-        if !net { cfg.network.mode = NetMode::Off; }
-        moved.push("o2.net -> [network] mode = \"off\"");
-    }
-    if !cfg.o2.forwards.is_empty() {
-        let forwards = std::mem::take(&mut cfg.o2.forwards);
-        cfg.port_forward.extend(forwards);
-        moved.push("o2.forwards -> [[port_forward]]");
-    }
-    if let Some(impact) = cfg.impact.take() {
-        let board = match impact.gfx.as_deref().map(str::to_ascii_lowercase).as_deref() {
-            Some("solid") => Some(GraphicsBoard::SolidImpact),
-            Some("high") => Some(GraphicsBoard::HighImpact),
-            Some("max") => Some(GraphicsBoard::MaxImpact),
-            _ => None,
-        };
-        if let Some(board) = board {
-            if cfg.graphics.board.is_none() { cfg.graphics.board = Some(board); }
-            eprintln!("iris: deprecated [impact] gfx folded into [graphics] board = \"{}\"; move it in the config to silence this", board.as_str());
-        }
-    }
-    if !moved.is_empty() {
-        eprintln!(
-            "iris: deprecated [o2] keys folded into the shared settings ({}); move them in the config to silence this",
-            moved.join(", ")
-        );
-    }
-    Ok(())
+    Ok(true)
 }
 
 /// One `[scsi.KEY]` table: keys 1-15 are ids on `controller` (default 0),
@@ -230,9 +259,7 @@ fn scsi_table(key: u8, mut t: toml::Table) -> Result<ConfiguredDevice, String> {
     let mut dev: ScsiDeviceConfig = toml::Value::Table(t).try_into().map_err(|e: toml::de::Error| format!("[scsi.{key}]: {}", e.message()))?;
     dev.kind_field = dev.kind();
     dev.cdrom = dev.is_cdrom();
-    let e = ConfiguredDevice::new(&format!("scsi{controller}/t{id}"), DeviceModel::Scsi(dev));
-    eprintln!("iris: [scsi.{key}] is an older spelling of [[devices]] type = \"{}\" at = \"{}\"", e.device.spec().name, e.at.as_deref().unwrap_or(""));
-    Ok(e)
+    Ok(ConfiguredDevice::new(&format!("scsi{controller}/t{id}"), DeviceModel::Scsi(dev)))
 }
 
 /// `--scsiN PATH` and `--cdromN ISO`: a disk at `scsi0/tN`, which replaces
@@ -240,6 +267,9 @@ fn scsi_table(key: u8, mut t: toml::Table) -> Result<ConfiguredDevice, String> {
 pub(super) fn shorthand(cfg: &mut MachineConfig, id: u8, path: String, cdrom: bool, discs: Vec<String>) {
     let kind = if cdrom { ScsiKind::Cdrom } else { ScsiKind::Disk };
     let dev = ScsiDeviceConfig { path, cdrom, kind_field: kind, discs, ..Default::default() };
+    if !cfg.old_keys.contains(&"--scsiN/--cdromN") {
+        cfg.old_keys.push("--scsiN/--cdromN");
+    }
     cfg.legacy_shorthands.push(ConfiguredDevice::new(&format!("scsi0/t{id}"), DeviceModel::Scsi(dev)));
 }
 
@@ -349,6 +379,7 @@ mod tests {
         let mut cfg = Cli::parse_from(["iris", "--cdrom4", "other.iso"]).apply(file);
         cfg.resolve_slots().unwrap();
         assert_eq!(cfg.devices.iter().filter(|d| d.device.scsi().is_some()).count(), 1);
+        assert_eq!(cfg.old_keys, ["--scsiN/--cdromN"]);
         let cd = cfg.disk(4).unwrap();
         assert_eq!((cd.path.as_str(), cd.overlay, cd.is_cdrom()), ("other.iso", true, true));
         // With no drive there, it adds one.
@@ -379,6 +410,57 @@ mod tests {
             let e = MachineConfig::from_toml_str(text).unwrap_err().to_string();
             assert!(e.contains("unknown field") && !e.contains("no longer read"), "{text}: {e}");
         }
+    }
+
+    /// An Indigo2 config from before slots and devices: every key in it is translated, the run says so once and names
+    /// them, and a dump of the result is the new form, which reads back with nothing to say.
+    #[test]
+    fn an_older_indigo2_config_translates_and_dumps_the_new_form() {
+        let old = r#"
+            [machine]
+            profile = "indigo2_ip22"
+            [graphics]
+            heads = 2
+            [impact]
+            gfx = "max"
+            [virtio_serial]
+            enabled = true
+            [scsi.1]
+            path = "irix.raw"
+            [scsi.20]
+            path = "cd.iso"
+            cdrom = true
+        "#;
+        let mut cfg = MachineConfig::from_toml_str(old).unwrap();
+        cfg.fold_cards().unwrap();
+        let cfg = cfg.resolved().unwrap();
+        assert_eq!(cfg.old_keys, ["scsi", "impact.gfx", "graphics.heads", "virtio_serial"]);
+        let line = cfg.old_keys_warning("indigo2.toml").unwrap();
+        assert!(line.contains("indigo2.toml") && line.contains("scsi, impact.gfx, graphics.heads, virtio_serial") && line.contains("--config-dump FILE"), "{line}");
+        let new = cfg.to_toml(Dump::Minimal).unwrap();
+        for gone in ["[scsi", "[impact]", "[virtio_serial]", "heads"] {
+            assert!(!new.contains(gone), "{gone} in\n{new}");
+        }
+        for want in ["board = \"maximpact\"", "type = \"newport\"", "type = \"virtio_serial\"", "at = \"scsi1/t4\"", "type = \"cdrom\""] {
+            assert!(new.contains(want), "{want} in\n{new}");
+        }
+        let again = MachineConfig::from_toml_str(&new).unwrap().resolved().unwrap();
+        assert!(again.old_keys.is_empty() && again.old_keys_warning("x").is_none());
+        assert_eq!(again.to_toml(Dump::Minimal).unwrap(), new);
+    }
+
+    /// The O2's own section and an Octane's section spell what `[machine]` and the shared keys now hold.
+    #[test]
+    fn an_older_o2_config_translates_its_section() {
+        let cfg = MachineConfig::from_toml_str("[o2]\nram_mb = 256\nserial_port = 9000\ngraphics = false\nnet = false\ncpu_mhz = 200\n[machine]\nprofile = \"o2_ip32\"\n").unwrap();
+        assert_eq!(cfg.old_keys, ["o2.ram_mb", "o2.serial_port", "o2.graphics", "o2.cpu_mhz", "o2.net"]);
+        let new = cfg.resolved().unwrap().to_toml(Dump::Minimal).unwrap();
+        for want in ["serial_port_a = 9000", "headless = true", "mode = \"off\"", "fixed_mhz = 100.0"] {
+            assert!(new.contains(want), "{want} in\n{new}");
+        }
+        assert!(!new.contains("[o2]"), "{new}");
+        let e = MachineConfig::from_toml_str("[octane]\ngraphics = \"maximpact\"").unwrap_err().to_string();
+        assert!(e.contains("[graphics] as board = \"maximpact\""), "{e}");
     }
 
     /// A front end that folds the flags when it reads a file sees the cards, and the run's own fold finds

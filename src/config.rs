@@ -2644,6 +2644,9 @@ pub struct MachineConfig {
     /// `--scsiN` and `--cdromN`, until `legacy` merges them into the devices.
     #[serde(skip)]
     pub legacy_shorthands: Vec<ConfiguredDevice>,
+    /// The older keys the config had and translated, which `old_keys_warning` names; never written back.
+    #[serde(skip)]
+    pub old_keys: Vec<&'static str>,
 
     /// NFS share configuration. If present, the NAT's in-process NFS server
     /// (`src/net/nfsudp.rs`) exports `shared_dir` to the guest.
@@ -2894,6 +2897,7 @@ impl Default for MachineConfig {
             devices: default_disks(),
             legacy_scsi: None,
             legacy_shorthands: Vec::new(),
+            old_keys: Vec::new(),
             scale: default_scale(),
             nfs: None,
             port_forward: vec![],
@@ -3280,7 +3284,7 @@ impl MachineConfig {
 
     /// Read the keys an older iris wrote, saying so (see `legacy`).
     pub fn fold_deprecated(&mut self) -> Result<(), String> {
-        legacy::fold(self)
+        legacy::fold_all(self, legacy::When::Load)
     }
 
     /// The O2's memory as the kit in each DIMM pair from pair A: `banks` with
@@ -3511,9 +3515,7 @@ impl MachineConfig {
     /// Turn the older card flags (`[ultra64]`, `graphics.heads = 2`, `test_device`, `[virtio_*]`) into `[[devices]]`
     /// entries. A front end that reads a file itself calls this, so it sees what a run builds; a second fold adds nothing.
     pub fn fold_cards(&mut self) -> Result<(), String> {
-        legacy::gio_cards(self)?;
-        legacy::virtio_cards(self);
-        Ok(())
+        legacy::fold_all(self, legacy::When::Placed)
     }
 
     /// The config with every slot settled, as the command line settles it: what a front end
@@ -3698,12 +3700,6 @@ impl MachineConfig {
                 if !MachineProfile::OctaneIp30.bank_sizes().contains(&sz) {
                     return Err(format!("bank{i} size {sz} MB is invalid for an Octane (valid: 64, 128, 256, 512, 1024, 2048)"));
                 }
-            }
-            if let Some(old) = &self.octane.graphics {
-                return Err(format!(
-                    "octane.graphics has moved: set the board in [graphics] as board = \"{}\"",
-                    old.trim()
-                ));
             }
             if self.graphics.board == Some(GraphicsBoard::Newport) {
                 return Err("graphics.board \"newport\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)".into());
@@ -4442,6 +4438,9 @@ pub fn load_config() -> (MachineConfig, u32) {
         let mut cfg = cli.apply(toml_cfg);
         // A placement error is reported by the check below.
         let _ = cfg.resolve_slots();
+        if let Some(line) = cfg.old_keys_warning(&cli.config) {
+            eprintln!("{line}");
+        }
         std::process::exit(crate::validate_config::report(&cli.config, &cfg));
     }
 
@@ -4450,6 +4449,9 @@ pub fn load_config() -> (MachineConfig, u32) {
     if let Err(e) = cfg.resolve_slots() {
         eprintln!("Configuration error: {e}");
         std::process::exit(1);
+    }
+    if let Some(line) = cfg.old_keys_warning(&cli.config).filter(|_| !cli.config_show && cli.config_dump.is_none()) {
+        eprintln!("{line}");
     }
     if cli.list_slots {
         anstream::print!("{}", crate::tree::render(&cfg, crate::tree::Look::stdout(), false).expect("resolve_slots checked every slot"));
@@ -4644,8 +4646,8 @@ mod export_tests {
         for t in ["xz", "extreme", "newport"] {
             assert!(octane(&format!("[graphics]\nboard = \"{t}\"")).validate().is_err(), "{t} is not modelled on the Octane");
         }
-        let err = octane("[octane]\ngraphics = \"maximpact\"").validate().unwrap_err();
-        assert!(err.contains("[graphics]"), "the retired key names its replacement: {err}");
+        let err = MachineConfig::from_toml_str("[octane]\ngraphics = \"maximpact\"").unwrap_err().to_string();
+        assert!(err.contains("[graphics] as board = \"maximpact\""), "the retired key names its replacement: {err}");
         // Elsewhere the default stays Newport, and none is the Octane's alone.
         let cfg: MachineConfig = toml::from_str("").expect("parse");
         assert_eq!(cfg.graphics_board(), GraphicsBoard::Newport);
