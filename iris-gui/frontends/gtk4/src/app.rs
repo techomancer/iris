@@ -853,6 +853,8 @@ fn shell_command(c: ShellCommand) {
         ShellCommand::DiscMenu => disc_menu(),
         ShellCommand::About => show_help(iris_gui_core::controller::help::HelpPage::About),
         ShellCommand::Benchmark => open_bench(),
+        // Only the Mac app's View menu has Size Window to Display so far.
+        ShellCommand::FitWindow => {}
     }
 }
 

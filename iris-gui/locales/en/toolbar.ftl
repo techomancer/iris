@@ -3,6 +3,8 @@
 tb-show-library = Show Library
 tb-hide-library = Hide Library
 tb-switch-machine = Switch Machine
+# The machine capsule's name where the toolbar lists its items.
+tb-machine = Machine
 tb-power-on = Power On
 tb-shut-down = Shut Down
 tb-power-off = Power Off

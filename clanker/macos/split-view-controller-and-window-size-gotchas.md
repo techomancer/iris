@@ -74,3 +74,39 @@ waits at the reset vector until the monitor's `start`
 (`python3 tools/mon.py start`). The session controller counts a guest power-off
 only on a running -> stopped change, so that waiting CPU is no longer stopped
 two seconds later; drive tests with a monitor `start` after Power On.
+
+## Full screen: the sidebar leaves the split
+
+A tester (2026-11-28) saw two libraries in full screen: our floating panel
+(no animation) at once, and after a longer hover a second, animated sidebar
+that was empty and pushed the display aside, bringing up scroll bars. The
+second is AppKit's own: in full screen a collapsed sidebar item slides in
+when the pointer keeps pushing against the screen's left edge (a pointer
+merely resting there does not trigger it; agent tests need repeated
+mouse-moved events at x=0). It narrows the content column, so the display
+moves whatever it is pinned to. It was empty because the panel had taken the
+list out of the sidebar view.
+
+So in full screen the window removes the sidebar item from the split view
+controller (`removeSplitViewItem`) and inserts it again at index 0 on the way
+out, collapsed or not as it was; the toolbar's sidebar-tracking separator
+copes. The floating panel is the library there (left edge or the library
+button), and the display's leading and top edges move from the safe area to
+the pane's own edges (`MainWindow::full_chrome_edges`), so the panel and the
+auto-hidden toolbar float over the picture. Checked by hand on macOS 27 with
+the app in front.
+
+The panel slides in under a pointer resting at the edge, so its tracking
+area reports an enter and an exit as it passes: an exit closes it only once
+the pointer is clear of the strip from the window's edge to the panel's far
+side (`pointer_by_panel`), re-checked every 0.4 s while it rests there.
+
+## The display refits from its clip view
+
+`windowDidResize:` arrives before the scroll view has retiled, so a fit there
+read the old clip size: scroll bars stayed away after a drag on an edge, and
+stayed up after shrinking only the black border. The display's scroll view
+has its own clip view (`display::DisplayClip`) that refits the display from
+`setFrameSize:`, whatever changed it (a resize, the sidebar sliding, a
+scroller showing). Set the clip view before the scroll view's background
+colour: the colour lives on the clip view.

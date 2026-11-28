@@ -13,7 +13,10 @@ can drive it and see it without the screen unlocked.
   guest pixel), `dump:browser`, `dump:devices`, `hover:library|panel-out|status|status-out`
   (the pointer over a hover zone: the hidden library's edge, leaving its
   floating panel, full screen's bottom edge, leaving its status bar),
-  `split:W` (the sidebar's divider to W points; prints the width it settles at).
+  `split:W` (the sidebar's divider to W points; prints the width it settles at),
+  `window:W,H` (the main window resized to W x H points, its top-left
+  corner kept, as a drag on an edge would). `dump:display` prints the
+  display's size and the visible part of it (the clip view's bounds).
 - The app's monitor has `screen`, `ptr` and `key` (one HostInput per
   machine): `ptr pos` reads where the guest pointer is, `key type` types.
   The Indy PROM on a blank disk stops at a menu with a cursor: enough to
@@ -35,6 +38,13 @@ Gotchas:
   (`performSelector:afterDelay:` does not fire in those run-loop modes):
   answer panels through `IRIS_APPKIT_ANSWERS`, and do not script pop-ups.
 - With the screen locked the app is never active, so there is no key window.
+- With the screen unlocked, the app can be brought to the front
+  (`osascript -e 'tell application "System Events" to set frontmost of
+  (first process whose unix id is PID) to true'`), and a small Swift tool
+  posting `CGEvent` mouse-moved events drives the real pointer (needs the
+  shell to be trusted for Accessibility). Capture only the app's window
+  (`screencapture -l`), never the whole screen, which holds the user's
+  other windows.
 - Full screen does not engage while the app is in the background (launched
   from a shell, not brought to the front): `toggleFullScreen:` is called and
   nothing happens. A run that did enter it had the window in front. Check

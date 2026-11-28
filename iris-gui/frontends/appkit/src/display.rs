@@ -122,6 +122,13 @@ define_class!(
             true
         }
 
+        /// Its y grows down, as a page's: a picture larger than the window
+        /// stays at its top-left while the window is resized.
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, size: NSSize) {
             // SAFETY: NSView's own setter.
@@ -201,11 +208,16 @@ define_class!(
         fn scroll_wheel(&self, e: &NSEvent) {
             let dy = e.scrollingDeltaY() as f32;
             let (lines, points) = if e.hasPreciseScrollingDeltas() { (0.0, -dy) } else { (-dy, 0.0) };
-            if self.ivars().follow.get() {
-                self.follow_at(e, lines, points);
-                return;
-            }
+            // Not captured: the wheel scrolls a picture larger than the
+            // window (and shows the scroll bars); in Follow mode it goes to
+            // the guest only when there is nothing to scroll.
             if !self.ivars().captured.get() {
+                if self.ivars().follow.get() && !self.scrolls() {
+                    self.follow_at(e, lines, points);
+                } else {
+                    // SAFETY: NSResponder's own handler, with the event it got.
+                    let _: () = unsafe { msg_send![super(self), scrollWheel: e] };
+                }
                 return;
             }
             crate::app::display(DisplayAction::Pointer {
@@ -328,6 +340,11 @@ impl DisplayView {
         }
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
         layer.setFramebufferOnly(true);
+        // While the view is resized (the window, the sidebar sliding), the
+        // last frame stays its size in the middle until the next is drawn,
+        // where the picture is, instead of stretching to the new shape.
+        // SAFETY: a constant Core Animation defines.
+        layer.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityCenter });
         let state = State {
             gpu,
             layer: layer.clone(),
@@ -407,7 +424,7 @@ impl DisplayView {
         self.place_head1_label();
     }
 
-    /// Centre the head-1 label in head 1's area (the view's y grows up).
+    /// Centre the head-1 label in head 1's area.
     fn place_head1_label(&self) {
         let st = self.ivars();
         let slot = st.head1_label.borrow();
@@ -419,7 +436,7 @@ impl DisplayView {
         l.sizeToFit();
         let s = l.frame().size;
         let x = ax as f64 + (aw as f64 - s.width) / 2.0;
-        let y = b.height - (ay as f64 + (ah as f64 + s.height) / 2.0);
+        let y = ay as f64 + (ah as f64 - s.height) / 2.0;
         l.setFrameOrigin(NSPoint::new(x.round(), y.round()));
     }
 
@@ -504,6 +521,11 @@ impl DisplayView {
         let st = self.ivars();
         let b = self.bounds().size;
         let mut out = format!("display: {} head(s) in {:.0}x{:.0} pt", st.heads.get(), b.width, b.height);
+        // SAFETY: a plain getter; the view is on the main thread.
+        if let Some(clip) = unsafe { self.superview() } {
+            let c = clip.bounds();
+            out.push_str(&format!(", {:.0}x{:.0} pt visible at ({:.0},{:.0})", c.size.width, c.size.height, c.origin.x, c.origin.y));
+        }
         for head in 0..st.heads.get() {
             match st.textures[head].borrow().as_ref() {
                 Some((_, w, h)) => {
@@ -560,14 +582,52 @@ impl DisplayView {
         };
         let now = self.frame().size;
         if (now.width - want.width).abs() > 0.5 || (now.height - want.height).abs() > 0.5 {
+            // The view is flipped: a picture larger than the window starts at
+            // its top-left, as a page does, and stays there.
             self.setFrameSize(want);
-            // A picture larger than the window starts at its top-left, as a
-            // page does (the view's y grows up, so the top is its far end).
-            if want.height > c.height || want.width > c.width {
-                self.scrollPoint(NSPoint::new(0.0, (want.height - c.height).max(0.0)));
-            }
             self.draw();
         }
+    }
+
+    /// The picture is larger than the visible area (there is something to
+    /// scroll).
+    fn scrolls(&self) -> bool {
+        // SAFETY: a plain getter; the view is on the main thread.
+        let Some(clip) = (unsafe { self.superview() }) else { return false };
+        let (c, f) = (clip.bounds().size, self.frame().size);
+        f.width > c.width + 0.5 || f.height > c.height + 0.5
+    }
+
+    /// The size, in points, that shows the picture as drawn now with nothing
+    /// around it: every head and the gap between them. Stretch counts as
+    /// the largest that fits keeping the aspect ratio. `None` before the
+    /// first frame.
+    pub fn picture_extent(&self) -> Option<(f64, f64)> {
+        use iris_gui_core::controller::display::Sizing;
+        let st = self.ivars();
+        let b = self.bounds().size;
+        let areas = head_areas((b.width as f32, b.height as f32), st.heads.get());
+        let scale = st.layer.contentsScale() as f32;
+        let sizing = match st.sizing.get().0 {
+            Sizing::Stretch => Sizing::Fit { integer_only: false },
+            s => s,
+        };
+        let mut sizes = Vec::new();
+        for (head, ((_, _), avail)) in areas.iter().enumerate() {
+            if let Some((_, w, h)) = st.textures[head].borrow().as_ref() {
+                let ((dw, dh), _) = iris_gui_core::controller::display::picture_size(sizing, *avail, (*w as f32, *h as f32), scale);
+                sizes.push((dw, dh));
+            }
+        }
+        if sizes.is_empty() {
+            return None;
+        }
+        // A head with no picture yet keeps the room of the one drawn.
+        while sizes.len() < st.heads.get() {
+            sizes.push(sizes[0]);
+        }
+        let (w, h) = actual_size(&sizes);
+        Some((w.round() as f64, h.round() as f64))
     }
 
     /// Head `head`'s picture rectangle in the view, in points from the top
@@ -698,15 +758,14 @@ impl DisplayView {
         let (_, w, h) = tex.as_ref()?;
         let (w, h) = (*w as f32, *h as f32);
         let p = self.convertPoint_fromView(e.locationInWindow(), None);
-        let b = self.bounds().size;
         drop(tex);
         let ((ox, oy), (dw, dh), _) = self.picture_rect(0, w, h);
         if dw <= 0.0 || dh <= 0.0 {
             return None;
         }
-        // The view's y grows up; the guest's grows down.
+        // The view is flipped: its y grows down, as the guest's does.
         let gx = ((p.x as f32 - ox) * w / dw).floor().clamp(0.0, w - 1.0);
-        let gy = ((b.height as f32 - p.y as f32 - oy) * h / dh).floor().clamp(0.0, h - 1.0);
+        let gy = ((p.y as f32 - oy) * h / dh).floor().clamp(0.0, h - 1.0);
         Some((gx as i32, gy as i32))
     }
 
@@ -786,4 +845,37 @@ impl DisplayView {
             crate::app::display(DisplayAction::Key { key: k, down, repeat: down && e.isARepeat() });
         }
     }
+}
+
+define_class!(
+    /// The display's clip view: it refits the display whenever it changes
+    /// size, from whatever changed it (the window resized from an edge or a
+    /// corner, the sidebar sliding, a scroll bar coming or going).
+    #[unsafe(super(objc2_app_kit::NSClipView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "IRISDisplayClip"]
+    pub struct DisplayClip;
+
+    unsafe impl NSObjectProtocol for DisplayClip {}
+
+    impl DisplayClip {
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: NSSize) {
+            // SAFETY: NSView's own setter.
+            let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            if let Some(doc) = self.documentView() {
+                if let Some(d) = doc.downcast_ref::<DisplayView>() {
+                    d.fit();
+                }
+            }
+        }
+    }
+);
+
+/// A clip view for the display's scroll view.
+pub fn clip(mtm: MainThreadMarker) -> Retained<objc2_app_kit::NSClipView> {
+    let this = mtm.alloc::<DisplayClip>().set_ivars(());
+    // SAFETY: NSView's designated initialiser.
+    let v: Retained<DisplayClip> = unsafe { msg_send![super(this), initWithFrame: NSRect::ZERO] };
+    Retained::into_super(v)
 }

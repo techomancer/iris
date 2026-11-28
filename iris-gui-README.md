@@ -366,9 +366,10 @@ side by side, head 0 taking the input, and the benchmark shows its figures
 rather than a text report.
 
 The library is a sidebar, as in Finder, with its button next to the window
-buttons. After it, the machine capsule shows the machine's picture, name and
-model; a click lists every machine to switch to, and New Machine. The toolbar follows the machine: a stopped machine offers
-New, Duplicate, Delete, Browse Files, Settings and Start; a running one Save
+buttons and **New Machine** at its foot. After it, the machine capsule shows
+the selected machine's picture, name and model; the library switches
+machines. The toolbar follows the machine: a stopped machine offers
+Duplicate, Delete, Browse Files, Settings and Start; a running one Save
 State, Screenshot, Discs (only with a CD-ROM drive), the serial console, and
 the power buttons as VMware has them: **Shut Down** with **Power Off** in its
 menu, **Restart** with **Reset** in its menu. Shut Down and Restart type
@@ -393,14 +394,18 @@ applying disk changes, and how to release the mouse while it is captured.
 
 The guest display is at **Actual Size** by default (View menu or
 Preferences): one guest pixel to a point, sharp, black around it in a larger
-window and scrollable in a smaller one. **Scale to Fit** keeps the aspect
-ratio and **Stretch** fills the window; scaled, it is smoothed only at
-fractional sizes. Full screen (the window's green button) hides the toolbar
-and menu bar until the pointer reaches the top, puts the library away and
-slides the status bar down to a thin line, bringing it back when the pointer
-reaches the bottom edge. With the library hidden, the pointer at the window's
-left edge brings it back as a floating panel. A disk's or CD-ROM's icon in the
-status bar opens that device's menu.
+window and scrollable in a smaller one (the scroll wheel scrolls it while the
+mouse is not captured). **Scale to Fit** keeps the aspect ratio and
+**Stretch** fills the window; scaled, it is smoothed only at fractional sizes.
+**View > Size Window to Display** sizes the window to the picture as it is
+drawn, so there is no black around it and nothing to scroll. Full screen (the
+window's green button) gives the display the whole screen: it hides the
+toolbar and menu bar until the pointer reaches the top, puts the library away
+(the pointer at the left edge slides it in over the display) and slides the
+status bar down to a thin line, bringing it back when the pointer comes near
+the bottom edge. In a window, with the library hidden, the pointer at the
+window's left edge slides it in as a floating panel. A disk's or CD-ROM's
+icon in the status bar opens that device's menu.
 
 Settings pages have no subtitles; a field's help is its tooltip. Memory is
 one amount on the Machine page, offering only what the machine can hold (the

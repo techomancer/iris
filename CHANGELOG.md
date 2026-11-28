@@ -33,6 +33,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   the guest's clock, serve a folder over TFTP or rsh, and read the
   benchmark's figures as a table rather than a block of text. A dual Newport
   draws both heads again: the native shells had been showing only the first.
+- Mac app: **View > Size Window to Display** sizes the window to the guest's
+  picture, with no black border and nothing to scroll.
+- Mac app: the display's scroll bars now follow every resize (edges, corners,
+  the sidebar), appear only when the picture does not fit, and the scroll
+  wheel scrolls a large picture while the mouse is not captured.
+- Mac app: the hidden library slides in and out; in full screen it slides in
+  over the display without moving it, and the status bar comes up before the
+  pointer reaches the Dock.
+- Mac and Linux apps: New Machine sits in the library sidebar rather than the
+  toolbar. On the Mac the machine capsule only shows the machine (no menu),
+  and the sidebar is narrower with tighter rows.
+
 ### Snapshots
 
 - A failed snapshot load leaves the machine stopped, on every machine, and a snapshot of

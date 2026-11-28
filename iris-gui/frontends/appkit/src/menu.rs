@@ -175,6 +175,7 @@ pub fn build(mtm: MainThreadMarker) {
             o(t!("prefs-display-actual"), m::VIEW_ACTUAL),
             o(t!("mb-view-fit"), m::VIEW_FIT),
             o(t!("mb-view-stretch"), m::VIEW_STRETCH),
+            o(t!("mb-view-fit-window"), m::VIEW_FIT_WINDOW),
             None,
             o(t!("tb-full-screen"), tb::FULL_SCREEN),
             o(t!("tb-detach"), tb::DETACH_DISPLAY),
@@ -322,42 +323,6 @@ fn fill_devices(mtm: MainThreadMarker, menu: &NSMenu, groups: &[iris_gui_core::c
         menu.addItem(&it);
     }
 }
-
-/// The machine capsule's menu: the library's machines by family (the
-/// selected one ticked), then New Machine. Opens under the capsule.
-pub fn machines(mtm: MainThreadMarker, groups: &[iris_gui_core::controller::app::LibraryGroup], at: &objc2_app_kit::NSView) {
-    let keys = KeyMap::default();
-    let menu = NSMenu::initWithTitle(mtm.alloc(), &ns(&t!("tb-switch-machine")));
-    for g in groups.iter().filter(|g| !g.rows.is_empty()) {
-        if menu.numberOfItems() > 0 {
-            menu.addItem(&NSMenuItem::separatorItem(mtm));
-        }
-        let head = NSMenuItem::new(mtm);
-        head.setTitle(&ns(&g.title));
-        head.setEnabled(false);
-        menu.addItem(&head);
-        for r in &g.rows {
-            let it = ours(mtm, &keys, &r.name, &format!("{SELECT_MACHINE}{}", r.name));
-            it.setIndentationLevel(1);
-            if r.selected {
-                it.setState(objc2_app_kit::NSControlStateValueOn);
-            }
-            if let Some(img) = crate::glyphs::machine_image(r.icon, 16.0, &r.subtitle) {
-                it.setImage(Some(&img));
-            }
-            it.setToolTip(Some(&ns(&r.subtitle)));
-            menu.addItem(&it);
-        }
-    }
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    menu.addItem(&ours(mtm, &keys, &t!("mb-new-machine"), tb::NEW_MACHINE));
-    let h = at.bounds().size.height;
-    let y = if at.isFlipped() { h + 4.0 } else { -4.0 };
-    menu.popUpMenuPositioningItem_atLocation_inView(None, objc2_foundation::NSPoint::new(0.0, y), Some(at));
-}
-
-/// The id prefix of the machine menu's items; the machine's name follows.
-pub const SELECT_MACHINE: &str = "shell.select-machine:";
 
 /// A device's menu, popped up at `at` (a status-bar light), as VMware's
 /// device icons do.
