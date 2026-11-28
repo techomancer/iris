@@ -18,23 +18,29 @@ use libadwaita as adw;
 
 use crate::icons;
 use crate::library::Library;
+use crate::summary;
+use crate::toolbar::Toolbar;
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
-    title: adw::WindowTitle,
     toasts: adw::ToastOverlay,
     split: adw::OverlaySplitView,
     library: Rc<Library>,
-    placeholder: adw::StatusPage,
+    toolbar: Toolbar,
+    /// Holds the machine page (and later the guest display).
+    pane: adw::ToolbarView,
+    /// The overview the page was built from, so it is rebuilt only on a change.
+    shown: Option<Option<iris_gui_core::controller::overview::Overview>>,
+    /// Which tab the machine page shows.
+    tab: String,
     /// The last toast shown, so a repeat does not stack up.
     last_toast: Option<adw::Toast>,
 }
 
 impl MainWindow {
     pub fn new(app: &adw::Application) -> Self {
-        let title = adw::WindowTitle::new(&t!("app-name"), "");
         let header = adw::HeaderBar::builder().show_start_title_buttons(false).build();
-        header.set_title_widget(Some(&title));
+        let toolbar = Toolbar::new(&header);
 
         let toggle = gtk::ToggleButton::builder()
             .child(&icons::image(Icon::ShowLibrary, 16, &t!("tb-show-library")))
@@ -56,10 +62,8 @@ impl MainWindow {
             .build();
         header.pack_end(&primary);
 
-        let placeholder = adw::StatusPage::builder().title(t!("toast-no-machine")).build();
         let content = adw::ToolbarView::new();
         content.add_top_bar(&header);
-        content.set_content(Some(&placeholder));
 
         let library = Library::new(app);
         let split = adw::OverlaySplitView::builder()
@@ -105,21 +109,37 @@ impl MainWindow {
             move |s| toggle.set_active(s.shows_sidebar())
         ));
 
-        Self { window, title, toasts, split, library, placeholder, last_toast: None }
+        Self {
+            window,
+            toasts,
+            split,
+            library,
+            toolbar,
+            pane: content,
+            shown: None,
+            tab: summary::TAB_DETAILS.to_string(),
+            last_toast: None,
+        }
     }
 
     /// Draw what the controller holds now.
     pub fn refresh(&mut self, app: &AppController) {
         self.library.refresh(app.library());
-        match app.selected() {
-            Some(name) => {
-                self.title.set_subtitle(name);
-                self.placeholder.set_title(name);
-            }
-            None => {
-                self.title.set_subtitle("");
-                self.placeholder.set_title(&t!("toast-no-machine"));
-            }
+        self.toolbar.refresh(app);
+        let o = app.overview();
+        if self.shown.as_ref() != Some(&o) {
+            let gtk_app = crate::app::application();
+            let page = summary::build(gtk_app.as_ref(), o.as_ref(), &self.tab, app.is_empty());
+            self.pane.set_content(Some(&page));
+            self.shown = Some(o);
+        }
+    }
+
+    /// The machine page's tab, kept across refreshes.
+    pub fn set_tab(&mut self, tab: &str) {
+        if self.tab != tab {
+            self.tab = tab.to_string();
+            self.shown = None;
         }
     }
 

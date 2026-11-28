@@ -21,6 +21,12 @@ mod library;
 #[cfg(target_os = "linux")]
 mod menu;
 #[cfg(target_os = "linux")]
+mod style;
+#[cfg(target_os = "linux")]
+mod summary;
+#[cfg(target_os = "linux")]
+mod toolbar;
+#[cfg(target_os = "linux")]
 mod wake;
 #[cfg(target_os = "linux")]
 mod window;

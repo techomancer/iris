@@ -59,7 +59,9 @@ mod imp {
         /// Drawn by something that has no symbolic colour to give (a plain
         /// `GtkPicture`): take the window's foreground.
         fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
-            self.obj().snapshot_symbolic(snapshot, width, height, &[gdk::RGBA::new(0.0, 0.0, 0.0, 1.0)]);
+            // Mid grey: whoever drew it gave no colour, and black on a dark
+            // background would be nothing at all.
+            self.obj().snapshot_symbolic(snapshot, width, height, &[gdk::RGBA::new(0.5, 0.5, 0.5, 1.0)]);
         }
     }
 

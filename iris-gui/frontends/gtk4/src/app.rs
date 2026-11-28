@@ -78,6 +78,15 @@ pub fn select_machine(name: String) {
     dispatch(AppAction::Select(name));
 }
 
+/// The machine page's tab changed; the shell keeps it across refreshes.
+pub fn set_summary_tab(tab: &str) {
+    let tab = tab.to_string();
+    match with(|s| s.win.set_tab(&tab)) {
+        Some(()) => refresh(),
+        None => later(move || set_summary_tab(&tab)),
+    }
+}
+
 /// A library row's own menu, or `None` while the shell is busy.
 pub fn machine_menu(name: &str) -> Option<Vec<Vec<iris_gui_core::controller::commands::MenuEntry>>> {
     with(|s| s.app.machine_menu(name))
@@ -123,6 +132,7 @@ pub fn run() -> glib::ExitCode {
 }
 
 fn start(app: &adw::Application) {
+    crate::style::load();
     let wake = Arc::new(GlibWake::default());
     let ctl = AppController::launch(wake.clone());
     // Frames wake the shell like any event: the sink calls the same wake.
@@ -168,6 +178,8 @@ fn script_step() {
         crate::effects::script_answer(r);
     } else if step == "dump:menu" {
         menu::dump();
+    } else if let Some(tab) = step.strip_prefix("tab:") {
+        set_summary_tab(tab);
     } else if step == "dump:library" {
         with(|s| {
             println!("iris-gtk library:");
@@ -297,6 +309,10 @@ pub fn answer(a: Answer) {
 
 /// A menu item, toolbar button or script step with this command id.
 pub fn command(id: &str) {
+    // The machine capsule's menu: switch to that machine.
+    if let Some(name) = id.strip_prefix(crate::toolbar::SELECT_MACHINE) {
+        return select_machine(name.to_string());
+    }
     if let Some(page) = iris_gui_core::controller::help::HelpPage::from_id(id) {
         // The help windows arrive with their own slice.
         eprintln!("iris-gtk: no help window yet ({})", page.id());
