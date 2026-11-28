@@ -816,8 +816,20 @@ pub fn command(id: &str) {
 fn shell_command(c: ShellCommand) {
     match c {
         ShellCommand::CloseWindow => {
-            if let Some(w) = window() {
-                w.close();
+            // A dialog is a widget inside the window here, not a window of
+            // its own: Close means the dialog while one is up, as Cmd+W
+            // closes the front window on the Mac.
+            let window = window();
+            let dialog = with(|s| s.win.window.visible_dialog()).flatten();
+            match dialog {
+                Some(d) => {
+                    d.close();
+                }
+                None => {
+                    if let Some(w) = window {
+                        w.close();
+                    }
+                }
             }
         }
         ShellCommand::Diagnostics => {

@@ -84,6 +84,10 @@ impl MainWindow {
         content.add_bottom_bar(&status.root);
         let screen = Screen::new();
         let head1 = Screen::new();
+        for v in [&screen.view, &head1.view] {
+            v.set_hexpand(true);
+            v.set_vexpand(true);
+        }
         let head1_label = gtk::Label::new(None);
         head1_label.add_css_class("dim-label");
         head1_label.add_css_class("caption");
@@ -94,7 +98,8 @@ impl MainWindow {
         head1_box.append(&head1.view);
         head1_box.set_visible(false);
 
-        // Head 0, and head 1 beside it when the machine has one.
+        // Head 0, and head 1 beside it when the machine has one. Each keeps
+        // its own aspect, as egui's two viewports do; head 0 takes the input.
         let heads = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         heads.set_homogeneous(true);
         heads.append(&screen.view);

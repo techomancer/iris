@@ -26,6 +26,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The mouse follows the host pointer over the Linux app's display instead of
   being captured: GTK 4 offers no pointer lock, and Wayland only through
   protocols it does not expose.
+- The front ends can do what only the egui app could: make a blank disk image
+  (raw or CHD, in the background, never replacing a file), set a machine's
+  Ethernet address, keep a CD changer's discs, make a disk a scratch volume,
+  turn its write cache off, give a DaynaPort its address and subnet, shift
+  the guest's clock, serve a folder over TFTP or rsh, and read the
+  benchmark's figures as a table rather than a block of text. A dual Newport
+  draws both heads again: the native shells had been showing only the first.
 
 ### Serial ports
 
