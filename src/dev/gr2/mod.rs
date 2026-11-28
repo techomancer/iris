@@ -344,7 +344,7 @@ impl Gr2 {
             addr_of_mut!((*p).head).write(status.refresh().head(status.clone()));
             addr_of_mut!((*p).retrace_cb).write(Mutex::new(None));
             addr_of_mut!((*p).status).write(status);
-            addr_of_mut!((*p).trace).write(Mutex::new(debug::Gr2Trace::new()));
+            addr_of_mut!((*p).trace).write(Mutex::new(debug::Gr2Trace::new(["hq", "re3", "cpu"], 2)));
             addr_of_mut!((*p).trace_mask).write(AtomicU32::new(0));
             #[cfg(feature = "gr2-jit")]
             addr_of_mut!((*(*p).re3.get()).jit.mode).write(re3_jit::default_mode());

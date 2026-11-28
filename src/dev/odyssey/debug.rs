@@ -31,7 +31,8 @@ use super::frame::Frame;
 use super::reader::DisplayRegs;
 use super::vram::{VramPtr, UNIT};
 use super::record::Recorder;
-use super::trace::trace_mask;
+use super::trace::CLASSES;
+use crate::trace_sink::trace_command;
 use super::Odyssey;
 use super::assembly::CLIP_PLANES;
 
@@ -211,18 +212,10 @@ impl Odyssey {
             [] | ["status"] => self.status_text()?,
             ["help"] => HELP.join("\n") + "\n",
             ["trace"] => self.state.trace.status().unwrap_or_else(|| "trace not active".into()) + "\n",
-            ["trace", "off"] => match self.state.trace.stop() {
-                Some(s) => format!("trace closed: {s}\n"),
-                None => "trace not active\n".to_string(),
-            },
-            ["trace", "flush"] => {
-                self.state.trace.flush(true);
-                "trace flushed\n".to_string()
-            }
-            ["trace", path, rest @ ..] => {
-                let mask = trace_mask(rest.first().copied().unwrap_or("all"))?;
-                self.state.trace.start(path, mask).map_err(|e| format!("vpro trace {path}: {e}"))?;
-                format!("tracing to {path} (mask {mask:#x})\n")
+            ["trace", rest @ ..] => {
+                let t = &self.state.trace;
+                trace_command(rest, "vpro trace", &CLASSES, w, || t.flush(true), || t.stop(), |p, m| t.start(p, m))?;
+                String::new()
             }
             ["rec", rest @ ..] => self.rec_text(rest)?,
             ["regs"] => self.regs_text()?,
