@@ -38,6 +38,10 @@ struct Shell {
     prefs: Option<std::rc::Rc<crate::prefs::PrefsDialog>>,
     /// The New Machine wizard, while it is open.
     new_machine: Option<std::rc::Rc<crate::new_machine::NewMachineDialog>>,
+    /// The disk browser, shown while the controller has one.
+    browser: Option<std::rc::Rc<crate::browser::BrowserWindow>>,
+    /// The benchmark window; the shell owns its controller, as egui does.
+    bench: Option<std::rc::Rc<crate::panels::BenchWindow>>,
     /// The windows that follow a controller of their own.
     serial: Option<std::rc::Rc<crate::panels::SerialWindow>>,
     net: Option<std::rc::Rc<crate::panels::NetWindow>>,
@@ -190,6 +194,124 @@ fn refresh_panels(s: &mut Shell) {
     if let Some(w) = &s.camera {
         w.refresh(&s.app);
     }
+    if let Some(w) = &s.bench {
+        w.refresh(s.app.session().is_running());
+    }
+}
+
+/// A benchmark action; the shell owns the controller, so it applies here.
+pub fn bench(action: iris_gui_core::controller::bench::BenchAction) {
+    let fx = with(|s| {
+        let running = s.app.session().is_running();
+        s.bench.as_ref().map(|w| w.ctl.borrow_mut().apply(action, running))
+    })
+    .flatten();
+    if let Some(fx) = fx {
+        run_effects(fx);
+        refresh();
+    }
+}
+
+/// Open the benchmark window.
+fn open_bench() {
+    let dialog = with(|s| {
+        let notify: Arc<dyn iris_gui_core::controller::Notify> = s.wake.clone();
+        let w = s.bench.get_or_insert_with(|| crate::panels::BenchWindow::new(notify)).clone();
+        w.refresh(s.app.session().is_running());
+        w
+    });
+    let Some(w) = dialog else { return later(open_bench) };
+    if let Some(window) = window() {
+        w.dialog.present(Some(&window));
+    }
+}
+
+/// A disk-browser action.
+pub fn browser(action: iris_gui_core::controller::disk_browser::BrowserAction) {
+    dispatch(AppAction::Browser(action));
+}
+
+/// A browser control by its id; Save and Close carry the editor's text first.
+pub fn browser_control(id: &str, value: bool) {
+    use iris_gui_core::controller::disk_browser::BrowserAction as B;
+    let Some(action) = crate::browser::control(id, value) else { return };
+    if matches!(action, B::EditorSave | B::EditorClose) {
+        let text = with(|s| s.browser.as_ref().map(|w| w.editor_text())).flatten();
+        if let Some(text) = text {
+            let changed = with(|s| s.app.browser().and_then(|b| b.editor()).is_some_and(|e| e.text != text)).unwrap_or(false);
+            if changed {
+                dispatch(AppAction::Browser(B::EditorChanged(text)));
+            }
+        }
+    }
+    browser(action);
+}
+
+/// The browser window's close button.
+pub fn close_browser() {
+    dispatch(AppAction::CloseBrowser);
+}
+
+/// The browser window is shown exactly while the controller has a browser.
+fn refresh_browser(s: &mut Shell) {
+    match (s.app.browser(), s.browser.clone()) {
+        (Some(b), Some(w)) => w.refresh(b),
+        (Some(b), None) => {
+            let w = crate::browser::BrowserWindow::new();
+            w.refresh(b);
+            w.window.present();
+            s.browser = Some(w);
+        }
+        (None, Some(w)) => {
+            w.window.close();
+            s.browser = None;
+        }
+        (None, None) => {}
+    }
+}
+
+/// The toolbar's Saved States: restore, rename or delete one.
+fn saved_states_menu() {
+    use iris_gui_core::controller::ids::{item, toolbar as tb};
+    let Some(app) = application() else { return };
+    let states = with(|s| s.app.saved_states()).unwrap_or_default();
+    let menu = gtk::gio::Menu::new();
+    if states.is_empty() {
+        let empty = gtk::gio::MenuItem::new(Some(&t!("ov-no-states")), None);
+        menu.append_item(&empty);
+    }
+    for state in &states {
+        let section = gtk::gio::Menu::new();
+        for (prefix, label) in [
+            (item::RESTORE_STATE, t!("ov-restore")),
+            (item::RENAME_STATE, t!("ov-rename")),
+            (item::DELETE_STATE, t!("ov-delete")),
+        ] {
+            let it = gtk::gio::MenuItem::new(Some(&label), None);
+            it.set_detailed_action(&format!("app.{}", menu::action_for(&app, &item::id(prefix, &state.name))));
+            section.append_item(&it);
+        }
+        menu.append_section(Some(&state.name), &section);
+    }
+    with(|s| s.win.popup_at(tb::SAVED_STATES, &menu));
+}
+
+/// The toolbar's Discs: what can be done with each CD-ROM now.
+fn disc_menu() {
+    use iris_gui_core::controller::ids::toolbar as tb;
+    let Some(app) = application() else { return };
+    let groups = with(|s| s.app.disk_menu()).unwrap_or_default();
+    let menu = gtk::gio::Menu::new();
+    for group in &groups {
+        let section = gtk::gio::Menu::new();
+        for e in &group.entries {
+            let it = gtk::gio::MenuItem::new(Some(&e.label), None);
+            it.set_detailed_action(&format!("app.{}", menu::action_for(&app, &e.id)));
+            section.append_item(&it);
+        }
+        menu.append_section(Some(&group.title), &section);
+    }
+    with(|s| s.win.popup_at(tb::DISC, &menu));
 }
 
 /// Open the application preferences.
@@ -253,7 +375,15 @@ pub fn display(action: iris_gui_core::controller::display::DisplayAction) {
         return later(move || display(action));
     }
     let lost_focus = matches!(action, iris_gui_core::controller::display::DisplayAction::Focus(false));
-    let fx = with(|s| s.app.apply(AppAction::Display(action)));
+    let fx = with(|s| {
+        let before = (s.app.display().fullscreen(), s.app.display().detached());
+        let fx = s.app.apply(AppAction::Display(action));
+        let after = (s.app.display().fullscreen(), s.app.display().detached());
+        if before != after {
+            s.win.sync_display(&s.app);
+        }
+        fx
+    });
     if let Some(fx) = fx {
         run_effects(fx);
     }
@@ -319,7 +449,7 @@ fn start(app: &adw::Application) {
     menu::window_actions(app);
     let win = MainWindow::new(app);
     win.window.present();
-    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app: ctl, win, wake, may_quit: false, settings: None, prefs: None, new_machine: None, serial: None, net: None, camera: None, help: Vec::new() }));
+    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app: ctl, win, wake, may_quit: false, settings: None, prefs: None, new_machine: None, bench: None, browser: None, serial: None, net: None, camera: None, help: Vec::new() }));
     STARTED.with(|f| f.set(true));
     refresh();
     tick();
@@ -350,11 +480,37 @@ fn script_step() {
             None => eprintln!("iris-gtk script: busy, no screenshot"),
         }
     } else if let Some(text) = step.strip_prefix("type:") {
-        crate::effects::script_type(&text.replace("\\n", "\n"));
+        let text = text.replace("\\n", "\n");
+        let in_editor = with(|s| s.browser.as_ref().map(|w| w.set_editor_text(&text))).flatten().is_some();
+        if !in_editor {
+            crate::effects::script_type(&text);
+        }
     } else if let Some(r) = step.strip_prefix("answer:") {
         crate::effects::script_answer(r);
     } else if step == "dump:menu" {
         menu::dump();
+    } else if let Some(row) = step.strip_prefix("open:").and_then(|r| r.parse().ok()) {
+        browser(iris_gui_core::controller::disk_browser::BrowserAction::Activate(row));
+    } else if let Some(rows) = step.strip_prefix("pick:") {
+        browser(iris_gui_core::controller::disk_browser::BrowserAction::Select(
+            rows.split(',').filter_map(|r| r.parse().ok()).collect(),
+        ));
+    } else if let Some(path) = step.strip_prefix("drop:") {
+        browser(iris_gui_core::controller::disk_browser::BrowserAction::Drop {
+            paths: vec![std::path::PathBuf::from(path)],
+            into: None,
+        });
+    } else if step == "dump:browser" {
+        with(|s| {
+            if let Some(b) = s.app.browser() {
+                println!("iris-gtk browser: {:?} read-only: {:?}", b.path(), b.read_only_reason());
+                for r in b.rows() {
+                    println!("  {} {} {} {}:{}", r.mode, r.size, r.name, r.owner, r.group);
+                }
+            } else {
+                println!("iris-gtk browser: none open");
+            }
+        });
     } else if let Some((id, v)) = step.strip_prefix("set:").and_then(|s| s.split_once('=')) {
         // set:ID=i:N | b:0/1 | t:TEXT | n:NUMBER, as the control would report.
         use iris_gui_core::controller::settings::Value;
@@ -439,9 +595,11 @@ pub fn refresh() {
         if let Some(d) = s.prefs.clone() {
             d.refresh(&s.app);
         }
+        refresh_browser(s);
         refresh_panels(s);
         // The camera preview has no wake of its own: poll it while it runs.
-        let camera = s.app.camera().is_open().then(|| Duration::from_millis(66));
+        let bench = s.bench.as_ref().is_some_and(|b| b.ctl.borrow().is_running()).then(|| Duration::from_secs(1));
+        let camera = s.app.camera().is_open().then(|| Duration::from_millis(66)).or(bench);
         let app = &s.app;
         menu::refresh_enabled(|id| app.command_enabled(id) == Enabled::Yes);
         match (app.wake_due_in(), camera) {
@@ -514,6 +672,10 @@ pub fn answer(a: Answer) {
                 return;
             }
         }
+        if a.purpose().starts_with("bench.") {
+            bench(iris_gui_core::controller::bench::BenchAction::Answer(a));
+            return;
+        }
         if a.purpose() == DIAGNOSTICS {
             if let Answer::Chose { index: 1, .. } = a {
                 run_effects(vec![Effect::CopyToClipboard(iris_gui_core::controller::debug::diagnostics_text())]);
@@ -582,10 +744,10 @@ fn shell_command(c: ShellCommand) {
         ShellCommand::Settings => open_settings(None),
         ShellCommand::AppSettings => open_prefs(),
         ShellCommand::NewMachine => open_new_machine(),
-        ShellCommand::SavedStates
-        | ShellCommand::DiscMenu
-        | ShellCommand::About
-        | ShellCommand::Benchmark => eprintln!("iris-gtk: {c:?} has no window yet"),
+        ShellCommand::SavedStates => saved_states_menu(),
+        ShellCommand::DiscMenu => disc_menu(),
+        ShellCommand::About => show_help(iris_gui_core::controller::help::HelpPage::About),
+        ShellCommand::Benchmark => open_bench(),
     }
 }
 

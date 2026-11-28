@@ -15,7 +15,9 @@ cargo run --release
 
 No disk image yet? [clanker/irix/irix-install.md](clanker/irix/irix-install.md)
 walks through installing IRIX 5.3 or 6.5.22 from the original CDs. Prefer
-windows and menus? `cargo run -p iris-gui --release` (see
+windows and menus? `cargo run -p iris-gui --release`, or the native front
+ends: `cargo run -p iris-gui-gtk --release` on Linux (GTK 4 and libadwaita)
+and `cargo run -p iris-gui-appkit --release` on macOS (see
 [iris-gui-README.md](iris-gui-README.md)).
 
 Building without network access, for example for a Linux distribution

@@ -17,7 +17,7 @@ use adw::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, gsk};
 use gtk4 as gtk;
-use iris_gui_core::controller::display::{DisplayAction, FrameSink, Sizing};
+use iris_gui_core::controller::display::{DisplayAction, DisplayFilter, FrameSink, Sizing};
 use libadwaita as adw;
 
 mod imp {
@@ -28,8 +28,9 @@ mod imp {
         /// The guest's own size in pixels.
         pub px: Cell<(f32, f32)>,
         pub sizing: Cell<Sizing>,
-        /// Sample nearest rather than linear (the filter preference).
-        pub nearest: Cell<bool>,
+        /// The smoothing preference; Auto is sharp only at whole multiples,
+        /// which is known once the picture has been sized.
+        pub filter: Cell<DisplayFilter>,
         /// Where the picture was last drawn, so a pointer position can be
         /// turned back into a guest pixel.
         pub rect: Cell<(f32, f32, f32, f32)>,
@@ -41,7 +42,7 @@ mod imp {
                 texture: RefCell::default(),
                 px: Cell::new((0.0, 0.0)),
                 sizing: Cell::new(Sizing::Fit { integer_only: false }),
-                nearest: Cell::new(true),
+                filter: Cell::new(DisplayFilter::Auto),
                 rect: Cell::new((0.0, 0.0, 0.0, 0.0)),
             }
         }
@@ -89,12 +90,17 @@ mod imp {
                 return;
             }
             let ppp = obj.scale_factor().max(1) as f32;
-            let (size, _) = iris_gui_core::controller::display::picture_size(self.sizing.get(), (vw, vh), px, ppp);
+            let (size, whole) = iris_gui_core::controller::display::picture_size(self.sizing.get(), (vw, vh), px, ppp);
             // Centred, with the black of the screen around it.
             let (x, y) = (((vw - size.0) / 2.0).max(0.0), ((vh - size.1) / 2.0).max(0.0));
             self.rect.set((x, y, size.0, size.1));
             let bounds = graphene::Rect::new(x, y, size.0, size.1);
-            let filter = if self.nearest.get() { gsk::ScalingFilter::Nearest } else { gsk::ScalingFilter::Linear };
+            let nearest = match self.filter.get() {
+                DisplayFilter::Auto => whole,
+                DisplayFilter::Nearest => true,
+                DisplayFilter::Linear => false,
+            };
+            let filter = if nearest { gsk::ScalingFilter::Nearest } else { gsk::ScalingFilter::Linear };
             snapshot.append_scaled_texture(&texture, filter, &bounds);
         }
     }
@@ -248,14 +254,14 @@ impl GuestView {
     }
 
     /// How the picture is sized and sampled now.
-    pub fn set_look(&self, sizing: Sizing, nearest: bool) {
+    pub fn set_look(&self, sizing: Sizing, filter: DisplayFilter) {
         let imp = self.imp();
         if imp.sizing.get() != sizing {
             imp.sizing.set(sizing);
             self.queue_resize();
         }
-        if imp.nearest.get() != nearest {
-            imp.nearest.set(nearest);
+        if imp.filter.get() != filter {
+            imp.filter.set(filter);
             self.queue_draw();
         }
     }

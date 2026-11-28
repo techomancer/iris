@@ -16,6 +16,43 @@ publish = false
 name = "iris-gtk"
 path = "src/main.rs"
 
+# Packaging, for when the Linux packages carry this app instead of the egui
+# one (scripts/dist/package-linux.sh). Asset paths resolve against this
+# directory, as cargo-deb and cargo-generate-rpm read them.
+[package.metadata.deb]
+maintainer = "Dani Sarfati <dani@funkervogt.com>"
+copyright = "2025 Dani Sarfati"
+license-file = "../../../LICENSE"
+extended-description = "IRIS emulates SGI Indy, Indigo2, O2, Octane, Origin, Onyx, Fuel and Tezro systems with runtime-selectable MIPS processors. It runs IRIX 6.5 and 5.3 with networking and graphical or serial consoles, depending on the machine."
+# dpkg-shlibdeps resolves GTK, libadwaita and the pcap variant's libpcap to
+# this distro's package names, so none of them is hardcoded here.
+depends = "$auto"
+maintainer-scripts = "../../../installer/linux"
+section = "games"
+priority = "optional"
+assets = [
+  ["../../../target/release/iris-gtk", "usr/bin/iris-gtk", "755"],
+  ["../../assets/icons/icon-256.png", "usr/share/icons/hicolor/256x256/apps/iris-gtk.png", "644"],
+  ["../../assets/icons/icon-128.png", "usr/share/icons/hicolor/128x128/apps/iris-gtk.png", "644"],
+  ["../../assets/icons/icon-64.png", "usr/share/icons/hicolor/64x64/apps/iris-gtk.png", "644"],
+  ["iris-gtk.desktop", "usr/share/applications/iris-gtk.desktop", "644"],
+]
+
+[package.metadata.generate-rpm]
+# cargo-generate-rpm detects no shared-library dependencies, so the toolkit
+# and libpcap are named here.
+requires = { libpcap = "*", gtk4 = "*", libadwaita = "*" }
+post_install_script = '''
+if command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_raw,cap_net_admin+eip /usr/bin/iris-gtk 2>/dev/null || true
+fi
+'''
+assets = [
+  { source = "../../../target/release/iris-gtk", dest = "/usr/bin/iris-gtk", mode = "755" },
+  { source = "../../assets/icons/icon-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/iris-gtk.png", mode = "644" },
+  { source = "iris-gtk.desktop", dest = "/usr/share/applications/iris-gtk.desktop", mode = "644" },
+]
+
 [features]
 # Forwarded to the core, as iris-gui does.
 pcap = ["iris-gui-core/iris-pcap"]

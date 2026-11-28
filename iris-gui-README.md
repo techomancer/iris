@@ -301,6 +301,36 @@ PCAP-mode NFS IP).
 
 ---
 
+### The Linux app
+
+`iris-gtk` is the native Linux front end, written with GTK 4 and libadwaita
+instead of egui. It needs GTK 4.12 and libadwaita 1.5 or newer. Build and run
+it from a checkout with `cargo run -p iris-gui-gtk --release`; the Linux
+packages still ship the egui app for now.
+
+It has the library as a sidebar, with the machines grouped by family and by
+the folders you make, each row showing the machine's picture, its model and
+its own Start button; the header bar follows the machine, as the Mac app's
+toolbar does, with the machine's name and model in the middle and the list of
+machines under it. A stopped machine's page shows its last screen with Power
+On over it, then Details (the hardware, with Browse Files beside a disk) or
+Saved States. The status bar under it has the run state, the executor, and a
+light for every disk, CD-ROM, the network and audio, each opening what it
+stands for. Everything else is in the header bar's menu, as GNOME has no menu
+bar: the machine's power actions, the view, the library, the tools and the
+help pages, with the same shortcuts as elsewhere (Ctrl instead of Command).
+
+The machine settings, the New Machine wizard and Preferences are the same
+forms the Mac app draws, in libadwaita's rows. The guest's display is drawn
+at Actual Size, Scale to Fit or Stretch, sharp at whole multiples.
+
+**The mouse follows the pointer** rather than being captured: GTK 4 has no
+pointer lock of its own, and Wayland offers one only through protocols it
+does not expose, so IRIS steers the guest's pointer to wherever yours is over
+the display — the same mode the Mac app offers for remote desktops. The
+keyboard reaches the guest while the display is focused, and the keys are
+sent by position, so the guest's own keyboard layout applies.
+
 ### The macOS app
 
 `IRIS.app` in the macOS downloads is the native front end, written with

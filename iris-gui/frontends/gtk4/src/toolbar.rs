@@ -118,6 +118,11 @@ impl Toolbar {
         menu
     }
 
+    /// The button with this command id, for a pop-up to hang on.
+    pub fn item_widget(&self, id: &str) -> Option<gtk::Widget> {
+        self.items.iter().find(|w| w.widget_name() == id).cloned()
+    }
+
     fn item(&self, id: &str) -> gtk::Widget {
         let keys = KeyMap::default();
         let tip = commands::tip(id, &keys);

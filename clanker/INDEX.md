@@ -391,6 +391,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [01-overview.md](gui/01-overview.md) | design | iris-gui — overview |
 | [debug-builds-never-start-the-cpu.md](gui/debug-builds-never-start-the-cpu.md) | rule | Debug front-end builds park the CPU at reset; `start` on the monitor |
 | [a-sleeping-shell-needs-a-timed-tick-for-autosave.md](gui/a-sleeping-shell-needs-a-timed-tick-for-autosave.md) | rule | Shells that tick only on wakes must schedule a tick at `autosave_due_in()` |
+| [gtk4-has-no-pointer-lock-use-follow-mode.md](gui/gtk4-has-no-pointer-lock-use-follow-mode.md) | rule | GTK 4 exposes no pointer lock, confine or warp on either backend, so the Linux shell uses the core's Follow mode |
 | [drive-the-gtk-shell-and-screenshot-it.md](gui/drive-the-gtk-shell-and-screenshot-it.md) | howto | Driving `iris-gtk` with `IRIS_GTK_SCRIPT`, and the window painting itself into a PNG through its own GSK renderer (Wayland cannot grab another process's window) |
 | [disk-browser-xfs-log-replay.md](gui/disk-browser-xfs-log-replay.md) | rule | Disk browser: XFS opens read-only until Edit Anyway; fs-xfs 0.2 cannot see an unreplayed log |
 | [fs-xfs-deletes-leave-freed-inodes-half-cleared.md](gui/fs-xfs-deletes-leave-freed-inodes-half-cleared.md) | open | fs-xfs 0.2.3: a deleted file's inode keeps nlink/nblocks, and its log replay miscounts sb_fdblocks; how to check XFS edits with xfs_check against a baseline |

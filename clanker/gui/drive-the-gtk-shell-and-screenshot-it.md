@@ -9,11 +9,22 @@ screen.
 
 - `IRIS_GTK_SCRIPT="step;step;..."` runs one step every
   `IRIS_GTK_SCRIPT_DELAY` seconds (default 3, fractions allowed). Steps so
-  far: a command id (`menu.new-folder`, `toolbar.power-on`, a help page's
-  id), `type:TEXT` and `answer:RESPONSE` for the question on screen (`ok`,
-  `cancel`, or a choice's index), `shot:PATH` (write the window to a PNG),
-  `dump:menu` and `quit`. Later slices add `select:`, `set:` and
-  `open:`/`pick:`, as AppKit has them.
+  far:
+
+  | Step | What it does |
+  |---|---|
+  | a command id | `menu.new-folder`, `toolbar.power-on`, `help.nfs`, a status light's id — anything `AppController::command` takes |
+  | `select:NAME` | select that machine |
+  | `page:SECTION` | open the machine settings at a section (`settings.disks`) |
+  | `set:ID=VALUE` | report a settings control: `i:N`, `b:0/1`, `t:TEXT`, `n:NUM`, as the control would |
+  | `tab:details` / `tab:states` | the machine page's tab |
+  | `type:TEXT`, `answer:RESPONSE` | the question on screen (`ok`, `cancel`, or a choice's index) |
+  | `shot:PATH` | write the window to a PNG |
+  | `dump:menu`, `dump:library` | print the primary menu with each item's id and whether it is enabled; print the library's rows and their problems |
+  | `quit` | quit through the controller |
+
+  Still to come, as AppKit has them: `open:`/`pick:` and `drop:` for the
+  disk browser.
 - `IRIS_GTK_ANSWERS="yes;text:foo;choose:1;pick:/path"` answers the next
   prompts in order *without showing them*, as the AppKit hook does. Prefer
   `type:`/`answer:`, which drive the real dialog and so test the view as
@@ -62,5 +73,9 @@ Gotchas found so far:
   over the monitor and serial ports.
 - The bindings have no "press this response" call for `AdwAlertDialog`: emit
   its `response` signal and `close()` it, as its buttons do.
+- **A debug build is no good for the display at all.** It parks the CPU
+  (below), the session then sees a machine that never runs, and its
+  "IRIX powered off, stop the machine" rule stops it a few seconds after
+  Power On. Use a release build to look at anything the guest draws.
 - A debug build never starts the guest CPU
   (`debug-builds-never-start-the-cpu.md`); that holds for `iris-gtk` too.

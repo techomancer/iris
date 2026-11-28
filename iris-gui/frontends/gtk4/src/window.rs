@@ -35,6 +35,8 @@ pub struct MainWindow {
     screen_scroll: gtk::ScrolledWindow,
     /// Whether the pane is showing the display rather than the page.
     showing_display: bool,
+    /// The display's own window, while it is detached.
+    detached: Option<adw::Window>,
     /// Holds the machine page (and later the guest display).
     pane: adw::ToolbarView,
     /// The overview the page was built from, so it is rebuilt only on a change.
@@ -136,6 +138,7 @@ impl MainWindow {
             screen,
             screen_scroll,
             showing_display: false,
+            detached: None,
             pane: content,
             shown: None,
             tab: summary::TAB_DETAILS.to_string(),
@@ -152,8 +155,9 @@ impl MainWindow {
         let running = app.session().is_running();
         self.screen.view.set_look(
             iris_gui_core::controller::display::sizing(app.prefs()),
-            iris_gui_core::controller::display::nearest(app.prefs(), true),
+            app.prefs().display_filter,
         );
+        let running = running && self.detached.is_none();
         if running != self.showing_display {
             self.showing_display = running;
             if running {
@@ -179,6 +183,58 @@ impl MainWindow {
     pub fn set_tab(&mut self, tab: &str) {
         if self.tab != tab {
             self.tab = tab.to_string();
+            self.shown = None;
+        }
+    }
+
+    /// A pop-up menu hung on the header bar's button for `id`, or on the
+    /// window when that button is not there.
+    pub fn popup_at(&self, id: &str, menu: &gtk::gio::Menu) {
+        let popover = gtk::PopoverMenu::from_model(Some(menu));
+        let anchor: gtk::Widget = self.toolbar.item_widget(id).unwrap_or_else(|| self.window.clone().upcast());
+        popover.set_parent(&anchor);
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+    }
+
+    /// Full screen and the detached window follow the display controller.
+    pub fn sync_display(&mut self, app: &AppController) {
+        let want = app.display().fullscreen();
+        if want != self.window.is_fullscreen() {
+            if want {
+                self.window.fullscreen();
+            } else {
+                self.window.unfullscreen();
+            }
+        }
+        let detached = app.display().detached();
+        if detached == self.detached.is_some() {
+            return;
+        }
+        if detached {
+            let window = adw::Window::builder()
+                .title(app.selected().unwrap_or(&t!("app-name")))
+                .default_width(1280)
+                .default_height(1024)
+                .build();
+            let header = adw::HeaderBar::new();
+            let view = adw::ToolbarView::new();
+            view.add_top_bar(&header);
+            self.pane.set_content(None::<&gtk::Widget>);
+            view.set_content(Some(&self.screen_scroll));
+            window.set_content(Some(&view));
+            window.connect_close_request(|_| {
+                crate::app::display(iris_gui_core::controller::display::DisplayAction::ToggleDetached);
+                glib::Propagation::Proceed
+            });
+            window.present();
+            self.detached = Some(window);
+            self.showing_display = false;
+            self.shown = None;
+        } else if let Some(window) = self.detached.take() {
+            window.set_content(None::<&gtk::Widget>);
+            window.close();
+            self.showing_display = false;
             self.shown = None;
         }
     }

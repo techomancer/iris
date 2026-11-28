@@ -66,16 +66,12 @@ impl SerialWindow {
         let clear = gtk::Button::with_label(&t!("window-serial-clear"));
         clear.connect_clicked(|_| crate::app::dispatch_serial(SerialAction::Clear));
         row.append(&clear);
-        let bar = adw::ToolbarView::new();
-        let _ = &bar;
         view.add_bottom_bar(&row);
 
         let me = std::rc::Rc::new(Self { dialog, text, status, entry, seq: Cell::new(u64::MAX) });
-        let w = std::rc::Rc::downgrade(&me);
-        me.entry.connect_activate(move |e| {
+        me.entry.connect_activate(|e| {
             let line = e.text().to_string();
             e.set_text("");
-            let _ = &w;
             crate::app::dispatch_serial(SerialAction::SendLine(line));
         });
         me.dialog.connect_closed(|_| crate::app::dispatch_serial(SerialAction::Close));
@@ -248,6 +244,108 @@ fn help_line(line: &Line) -> gtk::Widget {
                 label.add_css_class("iris-code");
             }
             label.upcast()
+        }
+    }
+}
+
+// ---- the benchmark ---------------------------------------------------------
+
+use iris_gui_core::controller::bench::{BenchAction, BenchController};
+use iris_gui_core::controller::Notify;
+
+pub struct BenchWindow {
+    pub dialog: adw::Dialog,
+    pub ctl: RefCell<BenchController>,
+    start: gtk::Button,
+    quick: gtk::CheckButton,
+    cpu: gtk::DropDown,
+    progress: gtk::ProgressBar,
+    status: gtk::Label,
+    text: gtk::TextView,
+}
+
+impl BenchWindow {
+    pub fn new(notify: std::sync::Arc<dyn Notify>) -> std::rc::Rc<Self> {
+        let (dialog, _view, body) = shell_dialog(&t!("bench-heading"), 720, 620);
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let ctl = BenchController::new(notify);
+        let (cpus, selected) = ctl.cpus();
+        let model = gtk::StringList::new(&[]);
+        for c in &cpus {
+            model.append(c);
+        }
+        let cpu = gtk::DropDown::builder().model(&model).selected(selected as u32).tooltip_text(t!("bench-cpu-tip")).build();
+        row.append(&cpu);
+        let quick = gtk::CheckButton::with_label(&t!("bench-quick"));
+        quick.set_active(ctl.quick());
+        quick.set_tooltip_text(Some(&t!("bench-quick-tip")));
+        row.append(&quick);
+        let start = gtk::Button::with_label(&t!("bench-run-pc"));
+        start.add_css_class("suggested-action");
+        start.set_hexpand(true);
+        start.set_halign(gtk::Align::End);
+        row.append(&start);
+        body.append(&row);
+
+        let progress = gtk::ProgressBar::new();
+        progress.set_show_text(true);
+        progress.set_visible(false);
+        body.append(&progress);
+        let status = gtk::Label::new(None);
+        status.set_xalign(0.0);
+        status.set_wrap(true);
+        body.append(&status);
+
+        let text = gtk::TextView::builder().editable(false).monospace(true).build();
+        let scroll = gtk::ScrolledWindow::builder().vexpand(true).child(&text).build();
+        scroll.add_css_class("card");
+        scroll.set_size_request(-1, 320);
+        body.append(&scroll);
+
+        let me = std::rc::Rc::new(Self { dialog, ctl: RefCell::new(ctl), start, quick, cpu, progress, status, text });
+        let w = std::rc::Rc::downgrade(&me);
+        me.start.connect_clicked(move |_| {
+            if let Some(me) = w.upgrade() {
+                let running = me.ctl.borrow().is_running();
+                crate::app::bench(if running { BenchAction::Stop } else { BenchAction::Start });
+            }
+        });
+        me.quick.connect_toggled(|b| crate::app::bench(BenchAction::SetQuick(b.is_active())));
+        me.cpu.connect_selected_notify(|d| crate::app::bench(BenchAction::SetCpu(d.selected() as usize)));
+        me
+    }
+
+    pub fn refresh(&self, machine_running: bool) {
+        let ctl = self.ctl.borrow();
+        let running = ctl.is_running();
+        self.start.set_label(&if running { t!("bench-stop") } else { t!("bench-run-pc") });
+        let can = ctl.can_start(machine_running);
+        self.start.set_sensitive(running || can.is_yes());
+        self.start.set_tooltip_text(can.reason());
+        self.quick.set_sensitive(!running);
+        self.cpu.set_sensitive(!running);
+        match ctl.progress() {
+            Some(p) => {
+                self.progress.set_visible(true);
+                self.progress.set_fraction(p.fraction as f64);
+                self.progress.set_text(Some(&p.line));
+                self.status.set_label(&p.time);
+            }
+            None => {
+                self.progress.set_visible(false);
+                self.status.set_label(match ctl.last() {
+                    Some(Err(e)) => e,
+                    _ => "",
+                });
+            }
+        }
+        let lines = ctl.lines().join("\n");
+        let buffer = self.text.buffer();
+        if buffer.text(&buffer.start_iter(), &buffer.end_iter(), false) != lines {
+            buffer.set_text(&lines);
+            let end = buffer.end_iter();
+            self.text.scroll_to_iter(&mut end.clone(), 0.0, false, 0.0, 1.0);
         }
     }
 }

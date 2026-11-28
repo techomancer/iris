@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=IRIS
+Comment=SGI workstation and server emulator
+Exec=iris-gtk
+Icon=iris-gtk
+Categories=Emulator;Game;
+Terminal=false
+StartupNotify=true

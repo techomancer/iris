@@ -13,6 +13,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Front ends
+
+- A native Linux front end, `iris-gtk`, built with GTK 4 and libadwaita over
+  the same controllers the Mac app uses: the machine library as a sidebar,
+  the machine page with its last screen and saved states, the status bar's
+  device lights, the guest display, the machine settings, the New Machine
+  wizard, Preferences, the serial console, Check Networking, the camera test
+  and the help pages. It needs GTK 4.12 and libadwaita 1.5. Build it with
+  `cargo run -p iris-gui-gtk --release`; the Linux packages still ship the
+  egui app.
+- The mouse follows the host pointer over the Linux app's display instead of
+  being captured: GTK 4 offers no pointer lock, and Wayland only through
+  protocols it does not expose.
+
 ### Serial ports
 
 - A serial port can carry a device in place of its socket, on every machine:
