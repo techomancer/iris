@@ -17,6 +17,8 @@ mod effects;
 #[cfg(target_os = "linux")]
 mod icons;
 #[cfg(target_os = "linux")]
+mod menu;
+#[cfg(target_os = "linux")]
 mod wake;
 #[cfg(target_os = "linux")]
 mod window;

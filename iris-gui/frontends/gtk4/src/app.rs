@@ -13,9 +13,11 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use gtk::glib;
 use iris_gui_core::controller::app::{AppAction, AppController};
-use iris_gui_core::controller::{Controller, Effect};
+use iris_gui_core::controller::commands::ShellCommand;
+use iris_gui_core::controller::{Answer, Controller, Effect, Enabled};
 use libadwaita as adw;
 
+use crate::menu;
 use crate::wake::GlibWake;
 use crate::window::MainWindow;
 
@@ -112,6 +114,7 @@ fn start(app: &adw::Application) {
     let (head0, head1) = ctl.session().frame_sinks();
     head0.set_wake(wake.clone());
     head1.set_wake(wake.clone());
+    menu::window_actions(app);
     let win = MainWindow::new(app);
     win.window.present();
     SHELL.with(|s| *s.borrow_mut() = Some(Shell { app: ctl, win, wake, may_quit: false }));
@@ -144,10 +147,16 @@ fn script_step() {
             Some(Err(e)) => eprintln!("iris-gtk script: no screenshot: {e}"),
             None => eprintln!("iris-gtk script: busy, no screenshot"),
         }
+    } else if let Some(text) = step.strip_prefix("type:") {
+        crate::effects::script_type(&text.replace("\\n", "\n"));
+    } else if let Some(r) = step.strip_prefix("answer:") {
+        crate::effects::script_answer(r);
+    } else if step == "dump:menu" {
+        menu::dump();
     } else if step == "quit" {
         dispatch(AppAction::RequestQuit);
     } else {
-        eprintln!("iris-gtk script: no step named {step} yet");
+        command(&step);
     }
     schedule_script_step();
 }
@@ -181,7 +190,9 @@ fn timed_tick() {
 pub fn refresh() {
     let due = with(|s| {
         s.win.refresh(&s.app);
-        s.app.wake_due_in()
+        let app = &s.app;
+        menu::refresh_enabled(|id| app.command_enabled(id) == Enabled::Yes);
+        app.wake_due_in()
     })
     .flatten();
     // Nothing wakes a quiet shell, so the autosave pause and the stop after
@@ -222,12 +233,86 @@ pub fn run_effects(fx: Vec<Effect>) {
         eprintln!("iris-gtk: no settings window yet (page {page})");
     }
     if out.quit {
-        with(|s| s.may_quit = true);
-        APP.with(|a| {
-            if let Some(app) = a.borrow().as_ref() {
-                app.quit();
+        quit();
+    }
+}
+
+fn quit() {
+    with(|s| s.may_quit = true);
+    APP.with(|a| {
+        if let Some(app) = a.borrow().as_ref() {
+            app.quit();
+        }
+    });
+}
+
+/// The Diagnostics alert's purpose: the shell asked it, so the shell takes
+/// the answer (its Copy button).
+const DIAGNOSTICS: &str = "shell.diagnostics";
+
+/// A question's answer, from a dialog or the test hook, back to whoever
+/// asked. Queued: a dialog answers from inside its own callback, and the
+/// scripted answers from inside `run_effects`.
+pub fn answer(a: Answer) {
+    later(move || {
+        if a.purpose() == DIAGNOSTICS {
+            if let Answer::Chose { index: 1, .. } = a {
+                run_effects(vec![Effect::CopyToClipboard(iris_gui_core::controller::debug::diagnostics_text())]);
             }
+            return;
+        }
+        dispatch(AppAction::Answer(a));
+    });
+}
+
+/// A menu item, toolbar button or script step with this command id.
+pub fn command(id: &str) {
+    if let Some(page) = iris_gui_core::controller::help::HelpPage::from_id(id) {
+        // The help windows arrive with their own slice.
+        eprintln!("iris-gtk: no help window yet ({})", page.id());
+        return;
+    }
+    let Some(routed) = with(|s| s.app.command(id)) else {
+        return later({
+            let id = id.to_string();
+            move || command(&id)
         });
+    };
+    run_effects(routed.effects);
+    if let Some(c) = routed.shell {
+        shell_command(c);
+    }
+    refresh();
+}
+
+/// The commands that only change the shell's own views. The ones whose
+/// window has not been built yet say so; each arrives with its slice.
+fn shell_command(c: ShellCommand) {
+    match c {
+        ShellCommand::CloseWindow => {
+            if let Some(w) = window() {
+                w.close();
+            }
+        }
+        ShellCommand::Diagnostics => {
+            run_effects(vec![Effect::Choose(iris_gui_core::controller::ChoiceSpec {
+                purpose: DIAGNOSTICS,
+                title: t!("app-name"),
+                message: iris_gui_core::controller::debug::diagnostics_text(),
+                choices: vec![t!("common-ok"), t!("common-copy")],
+                dismiss: 0,
+                default: Some(0),
+                destructive: Vec::new(),
+            })]);
+        }
+        ShellCommand::ToggleLibrary
+        | ShellCommand::Settings
+        | ShellCommand::SavedStates
+        | ShellCommand::DiscMenu
+        | ShellCommand::NewMachine
+        | ShellCommand::About
+        | ShellCommand::AppSettings
+        | ShellCommand::Benchmark => eprintln!("iris-gtk: {c:?} has no window yet"),
     }
 }
 

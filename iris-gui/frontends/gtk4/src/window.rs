@@ -24,6 +24,17 @@ impl MainWindow {
         let title = adw::WindowTitle::new(&t!("app-name"), "");
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&title));
+        // GNOME has no menu bar: everything is in the header bar's primary
+        // menu. `open-menu-symbolic` is the desktop's own glyph for it, not
+        // one of the core's icon meanings, so it comes from the icon theme
+        // libadwaita already requires.
+        let primary = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text(t!("mb-menu"))
+            .menu_model(&crate::menu::primary(app))
+            .primary(true)
+            .build();
+        header.pack_end(&primary);
 
         let placeholder = adw::StatusPage::builder().title(t!("toast-no-machine")).build();
 
