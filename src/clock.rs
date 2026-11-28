@@ -2,6 +2,10 @@
 
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}}, Arc};
 
+/// Whether this build runs machines on instruction counts, not host time (`ci_clock`). The one
+/// switch the devices test; a machine whose clock counts says so with [`Clock::is_counting`].
+pub const COUNTING: bool = cfg!(feature = "ci_clock");
+
 #[derive(Default)]
 struct Inner {
     /// Source minus machine nanoseconds, while running.
@@ -50,9 +54,28 @@ impl Clock {
         Clock(Arc::new(Inner { cycles: Some(Default::default()), ..Default::default() }))
     }
 
-    #[cfg(feature = "ci_clock")]
-    pub fn set_cpu_cycles(&self, cycles: crate::cpu::mips_core::CyclesPtr) {
-        let _ = self.0.cycles.as_ref().map(|o| o.set(cycles));
+    /// The clock of a machine whose timers can run on its one CPU: that CPU's instructions when
+    /// the build counts, else host time.
+    pub fn cpu_or_host() -> Self {
+        #[cfg(feature = "ci_clock")]
+        return Self::counting();
+        #[cfg(not(feature = "ci_clock"))]
+        Self::new()
+    }
+
+    /// Whether the clock counts the CPU's instructions: its timers then run on that CPU.
+    #[inline]
+    pub fn is_counting(&self) -> bool {
+        #[cfg(feature = "ci_clock")]
+        return self.0.cycles.is_some();
+        #[cfg(not(feature = "ci_clock"))]
+        false
+    }
+
+    /// Give a counting clock its counter; any other clock ignores it.
+    pub fn set_cpu_cycles(&self, _cycles: crate::cpu::mips_core::CyclesPtr) {
+        #[cfg(feature = "ci_clock")]
+        let _ = self.0.cycles.as_ref().map(|o| o.set(_cycles));
     }
 
     pub fn now(&self) -> u64 {

@@ -25,7 +25,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `perfetto` | Perfetto trace recording (`--perfetto FILE`, monitor `perfetto`); see [docs/perfetto.md](docs/perfetto.md). Lightning-compatible. | — |
 | `rexdiag` | REX3 per-GO activity and dispatch counters. Default on; removable in a core build. | — |
 | `fetchverify` | Compare executed instruction bytes with memory in interpreter/JIT; expensive stale-code detector. | — |
-| `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. Also times the Indy's DS1386 and 8254 on the cycle count. | — |
+| `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. Also times the Indy's DS1386 and 8254 on the cycle count, starts every battery clock at 2026-01-01T00:00:00Z, and on the Indy and the O2 runs the timers and the display's retrace on CPU 0's instructions: two runs of one PROM are byte-identical. Not repeatable with `idle-pause` (which it turns off on those machines), after a CPU hard reset, which sets the clock back, or on the O2's CRIME cold reset and power-off, which the service thread still performs at a host-chosen instruction. | — |
 | `opcodefusion` | Interpreter instruction fusion; breakpoints on a fused second instruction cannot fire. | — |
 | `lightning` | Strip breakpoints/traceback for speed; hides GUI Debug controls. | `opcodefusion` |
 | `tlbvmap` | O(1) TLB fast path (the vmap); without it lookups use the MRU scan. On by default. | — |

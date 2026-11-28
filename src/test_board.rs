@@ -66,6 +66,22 @@ impl Stepped {
     }
 }
 
+/// A timer manager on a clock that counts instructions, and a step that moves the count on
+/// `ns` and runs the due timers, as the CPU does between batches.
+#[cfg(feature = "ci_clock")]
+pub(crate) fn counting() -> (Arc<TimerManager>, impl Fn(u64)) {
+    // Leaked: the clock reads it for as long as any holder of the manager lives.
+    let cycles: &'static std::sync::atomic::AtomicU64 = Box::leak(Box::default());
+    let clock = Clock::counting();
+    clock.set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(cycles.as_ptr()));
+    let tm = Arc::new(TimerManager::with_clock(clock));
+    let t = tm.clone();
+    (tm, move |ns| {
+        cycles.fetch_add(ns / crate::cpu::mips_core::NS_PER_GUEST_CYCLE, std::sync::atomic::Ordering::SeqCst);
+        t.run_expired();
+    })
+}
+
 impl Deref for Stepped {
     type Target = Clock;
     fn deref(&self) -> &Clock {

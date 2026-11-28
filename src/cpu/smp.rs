@@ -33,6 +33,11 @@ pub const MAX_CPUS: usize = 8;
 /// soft-reset request; Cause only takes bits 8..15.
 pub const HOST_PARK_BIT: u64 = 1 << 62;
 
+/// Bit of `MipsCore::hot.interrupts` that makes a counting machine's CPU leave its batch and
+/// run its timers (a deadline came due, or one was armed). Like [`HOST_PARK_BIT`] it stays out of
+/// Cause and wakes nothing.
+pub(crate) const TIMERS_BIT: u64 = 1 << 61;
+
 /// HEART's MODE register disables this processor.
 pub const HOLD_HEART: u32 = 1 << 0;
 /// Another thread needs the machine still ([`World::stop_others`]).

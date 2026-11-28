@@ -42,6 +42,8 @@ use crate::traits::{BusDevice, Device, MachineEvent, Signal};
 use crate::workstation::{MachineRef, MachineSlot, Workstation};
 
 const PROM_VA: std::ops::Range<u32> = 0xbfc0_0000..0xbfc8_0000;
+/// How often the service thread, or on a counting clock a timer, looks after the devices while CRIME is interrupting.
+const SERVICE_POLL: Duration = Duration::from_micros(100);
 
 /// Whether `pc` is in the firmware the PROM copies into RAM, at its KSEG0
 /// address or its KSEG1 alias (0xa100_0000, uncached): it runs from both.
@@ -213,8 +215,19 @@ impl O2Machine {
             rtc_file: Some(format!("{}.rtc", cfg.nvram).into()),
             rtc_offset: cfg.rtc_offset,
         };
-        let timer_manager = Arc::new(TimerManager::new());
+        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::cpu_or_host()));
         let bus = Ip32Bus::with_options(mem, prom, opts, &timer_manager);
+        // On a counting clock the service pass runs from the timers, on the CPU's instructions.
+        if timer_manager.clock().is_counting() {
+            use crate::hptimer::TimerReturn;
+            let bus = Arc::downgrade(&bus);
+            timer_manager.add_recurring(SERVICE_POLL, SERVICE_POLL, move || {
+                bus.upgrade().map_or(TimerReturn::Delete, |b| {
+                    b.service();
+                    TimerReturn::Continue
+                })
+            });
+        }
         // MACE audio plays through the host unless audio is off.
         if !cfg.no_audio {
             bus.mace.audio.enable_output(cfg.audio.clone());
@@ -312,6 +325,8 @@ impl O2Machine {
         let status = crate::status::MachineStatus::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
         status.set_scsi_wide(true);
         status.set_cpu_cycles(cpu.cycles_ptr());
+        timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
+        timer_manager.set_interrupts(cpu.interrupts_ptr());
         status.set_count_hz(cpu.count_hz_atomic());
         // The O2's clock is CP0 Compare: publish the rate it programs.
         cpu.publish_tick_rate(status.cpu(0).tick_rate());
@@ -493,7 +508,6 @@ impl O2Machine {
         // asynchronous input (a typed key, a frame from the network) —
         // and while any of that is flowing, its interrupts keep the poll
         // at 100 µs anyway.
-        const SERVICE_POLL: Duration = Duration::from_micros(100);
         const SERVICE_POLL_IDLE: Duration = Duration::from_millis(2);
         let mut poll = SERVICE_POLL;
         while running.load(Ordering::Relaxed) {
@@ -510,8 +524,9 @@ impl O2Machine {
                 }
             }
             // Frames from the network, and any line that changed without a
-            // register access (a disk finishing, a key from the window).
-            let interrupting = bus.service();
+            // register access (a disk finishing, a key from the window). A timer does this
+            // pass on a counting clock.
+            let interrupting = !crate::clock::COUNTING && bus.service();
             poll = if interrupting { SERVICE_POLL } else {
                 (poll * 2).min(SERVICE_POLL_IDLE)
             };
@@ -836,6 +851,8 @@ impl Drop for O2Machine {
         self.cpu.clone().as_device().stop();
         #[cfg(feature = "jitv2")]
         crate::cpu::jitv2::Jitv2::stop_for_drop(&self.cpu.jitv2(), || self.cpu.clone().as_device().stop());
+        // The clock reads the CPU's cycle counter, which goes with the core.
+        self.timer_manager.clock().stop();
         // The refresh thread lets go of the renderer here (`DisplayStop`).
         self.display.head.stop();
         self.running.store(false, Ordering::SeqCst);

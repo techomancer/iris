@@ -31,6 +31,9 @@ fn boot(profile: MachineProfile, cpu: &str, quiet: usize, edit: fn(&mut MachineC
             m.start();
             m.cpu_start();
             let deadline = Instant::now() + Duration::from_secs(1700);
+            // Sound follows machine time on a counting clock, which a debug build under load
+            // advances slowly: five host seconds of nothing new is then not the end.
+            let patience = if crate::clock::COUNTING { 400 } else { 20 };
             let (mut seen, mut still) = (0, 0);
             let played = loop {
                 std::thread::sleep(Duration::from_millis(250));
@@ -39,7 +42,7 @@ fn boot(profile: MachineProfile, cpu: &str, quiet: usize, edit: fn(&mut MachineC
                 still = if all.len() == seen { still + 1 } else { 0 };
                 seen = all.len();
                 let tail = all.iter().rev().take_while(|&&f| f == (0, 0)).count();
-                if all.iter().any(|&f| f != (0, 0)) && (tail >= quiet || still >= 20) {
+                if all.iter().any(|&f| f != (0, 0)) && (tail >= quiet || still >= patience) {
                     let rate = recs[0].0;
                     assert!(recs.iter().all(|r| r.0 == rate), "the card changed rate");
                     break (rate, all.into_iter().filter(|&f| f != (0, 0)).collect());

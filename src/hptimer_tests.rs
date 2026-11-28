@@ -28,7 +28,7 @@ fn test_precision_one_shot_and_recurring() {
 
     let r_count = recurring_count.clone();
     manager.add_recurring(
-        start + Duration::from_millis(20),
+        Duration::from_millis(20),
         Duration::from_millis(20),
         move || {
             let c = r_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -94,7 +94,7 @@ fn test_extended_callback_recovery() {
     // A fast recurring timer every 10ms
     let str = short_timer_runs.clone();
     manager.add_recurring(
-        start + Duration::from_millis(10),
+        Duration::from_millis(10),
         Duration::from_millis(10),
         move || {
             str.fetch_add(1, Ordering::SeqCst);
@@ -223,7 +223,7 @@ fn recurring_timer_at_1khz_keeps_its_rate() {
     let period = Duration::from_millis(1);
     let (f, l) = (fired.clone(), late_ns.clone());
     let mut n = 0u32;
-    manager.add_recurring(start + period, period, move || {
+    manager.add_recurring(period, period, move || {
         n += 1;
         f.fetch_add(1, Ordering::SeqCst);
         let due = start + period * n;

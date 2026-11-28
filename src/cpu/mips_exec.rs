@@ -8139,7 +8139,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // completes when an interrupt the IM bits pass is pending.
         // ci_clock retries even with interrupts enabled: the stall below runs no steps, so no
         // deadline would be checked and no instruction counted while it waited.
-        if cfg!(feature = "ci_clock") || !self.core.interrupts_enabled() {
+        if crate::clock::COUNTING || !self.core.interrupts_enabled() {
             if self.wait_wake_pending() {
                 return self.handle_exec_complete();
             }
@@ -8183,10 +8183,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // then tracks wall time the same way a running one does.
             let now = std::time::Instant::now();
             let elapsed_ns = now.duration_since(stall_start).as_nanos() as u64;
-            // 10ns/cycle — the same rate `mips_core::NS_PER_GUEST_CYCLE`
-            // defines, restated here because that constant is `ci_clock`-only
-            // while this pacing must hold in every build.
-            const STALL_NS_PER_CYCLE: u64 = 10;
+            // 10ns/cycle: the rate `mips_core::NS_PER_GUEST_CYCLE` defines.
+            const STALL_NS_PER_CYCLE: u64 = crate::cpu::mips_core::NS_PER_GUEST_CYCLE;
             let want = elapsed_ns / STALL_NS_PER_CYCLE;
             if want > issued {
                 let delta = want - issued;
@@ -11568,6 +11566,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             #[cfg(all(feature = "idle-pause", feature = "jitv2"))]
             let mut probe_next = false;
 
+            // A counting machine's one CPU runs its timers between batches.
+            let timers = if crate::clock::COUNTING {
+                guard.core.timer_mgr.clone().filter(|tm| cpu_id == 0 && tm.clock().is_counting())
+            } else {
+                None
+            };
+
             while running.load(Ordering::Relaxed) {
                 // Another thread is holding this CPU: stop here, between
                 // instructions, outside compiled code, with the executor free.
@@ -11648,6 +11653,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 let status = guard.$step();
                                 #[cfg(feature = "idle-pause")]
                                 idle_state.sample(&guard.core);
+                                // A timer came due or was armed: end the batch to run it.
+                                if crate::clock::COUNTING
+                                    && guard.core.hot.interrupts.load(Ordering::Relaxed) & crate::cpu::smp::TIMERS_BIT != 0
+                                {
+                                    break;
+                                }
                                 match status {
                                     EXEC_BREAKPOINT => {
                                         // Reported through the stop note (`status`, `wait`),
@@ -11677,8 +11688,20 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     hook(&mut guard);
                     guard.batch_hook = Some(hook);
                 }
+                if let Some(tm) = &timers {
+                    if guard.core.hot.interrupts.load(Ordering::Relaxed) & crate::cpu::smp::TIMERS_BIT != 0 {
+                        // Cleared first, so a timer armed from now on asks again. The callbacks
+                        // run with the executor unlocked, so one that needs it cannot deadlock.
+                        guard.core.hot.interrupts.fetch_and(!crate::cpu::smp::TIMERS_BIT, Ordering::SeqCst);
+                        drop(guard);
+                        let next = tm.run_expired();
+                        guard = executor.lock();
+                        guard.core.set_timer_deadline(next, tm.clock().now());
+                    }
+                }
+                // Idle parking paces the CPU on host time, which a counting machine does not use.
                 #[cfg(feature = "idle-pause")]
-                if crate::cpu::idle_park::idle_park_enabled() {
+                if crate::cpu::idle_park::idle_park_enabled() && timers.is_none() {
                     let decision = idle_state.update(&guard.core);
                     let parked = matches!(decision, crate::cpu::idle_park::IdleDecision::Park);
                     match decision {

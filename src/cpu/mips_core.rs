@@ -85,7 +85,6 @@ pub const DEFAULT_COUNT_HZ: u64 = 33_000_000;
 /// ci_clock: synthetic nanoseconds per retired instruction (~100 MIPS R4400).
 /// Virtual time is derived from `hot.cycles` instead of the wall clock so the
 /// snapshot determinism validator stays reproducible at any host speed.
-#[cfg(feature = "ci_clock")]
 pub const NS_PER_GUEST_CYCLE: u64 = 10;
 
 /// Claim the right to deliver IP7 for the armed deadline `ticket`.
@@ -146,7 +145,7 @@ const IP7_SEQ_CLAIMING: u64 = u64::MAX;
 /// `Ioc::set_interrupts`'s stored pointer: it points into the core owned by
 /// the executor's top-level `Arc<Mutex<..>>`, and `Drop for MipsCore` removes
 /// the timer before the core goes away.
-struct TimerIrqPtr(*const AtomicU64);
+pub(crate) struct TimerIrqPtr(pub(crate) *const AtomicU64);
 unsafe impl Send for TimerIrqPtr {}
 pub const CAUSE_CE_MASK: u32 = 0x3 << 28;      // Coprocessor Error mask
 pub const CAUSE_CE_SHIFT: u32 = 28;            // Coprocessor Error shift
@@ -986,10 +985,17 @@ pub struct MipsCore {
     /// ci_clock: the part of a Count tick the anchor has run, in ns times Hz.
     #[cfg(feature = "ci_clock")]
     pub(crate) count_frac: u64,
-    /// ci_clock: `hot.cycles` value at which IP7 fires (checked in step()'s
-    /// preamble instead of an hptimer). u64::MAX = disarmed.
+    /// ci_clock: `hot.cycles` value at which the next deadline falls, Compare's or the timers'
+    /// (checked in step()'s preamble and at compiled code's cycle flushes).
+    /// u64::MAX = none. Only the CPU thread writes it.
     #[cfg(feature = "ci_clock")]
     pub count_fire_cycle: u64,
+    /// ci_clock: the part of `count_fire_cycle` that is Compare's, and the part that is the
+    /// timer manager's next deadline. u64::MAX = none.
+    #[cfg(feature = "ci_clock")]
+    count_compare_cycle: u64,
+    #[cfg(feature = "ci_clock")]
+    count_timer_cycle: u64,
     /// developer_ip7: total CP0 Compare writes seen, and how many of those
     /// landed behind Count (which arms a full-wrap ~2^32 wait).
     #[cfg(feature = "developer_ip7")]
@@ -1348,6 +1354,10 @@ impl Drop for MipsCore {
         // core (`TimerIrqPtr`) — take it out of the manager before the
         // pointee goes away.
         self.disarm_compare_timer();
+        // So is the counting manager's pointer to the interrupt word, which only CPU 0 hands over.
+        if let Some(tm) = self.timer_mgr.as_ref().filter(|_| self.cpu_id == 0) {
+            tm.set_interrupts(std::ptr::null());
+        }
     }
 }
 
@@ -1511,6 +1521,10 @@ impl MipsCore {
             count_frac: 0,
             #[cfg(feature = "ci_clock")]
             count_fire_cycle: u64::MAX,
+            #[cfg(feature = "ci_clock")]
+            count_compare_cycle: u64::MAX,
+            #[cfg(feature = "ci_clock")]
+            count_timer_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
             ip7_writes: 0,
             #[cfg(feature = "developer_ip7")]
@@ -1568,7 +1582,7 @@ impl MipsCore {
             {
                 self.count_anchor_cycle = 0;
                 self.count_frac = 0;
-                self.count_fire_cycle = u64::MAX;
+                self.count_timer_cycle = u64::MAX;
             }
             self.disarm_compare_timer();
             self.tick_rate.reset(0);
@@ -1617,6 +1631,18 @@ impl MipsCore {
         self.reset_registers(soft);
         // A reset does not release a CPU another thread is holding.
         self.hot.interrupts.fetch_and(crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
+        self.ask_for_timers();
+    }
+
+    /// Have a counting manager's timers run at the next batch end: a reset or a restart loses the
+    /// deadline this CPU was watching.
+    fn ask_for_timers(&self) {
+        if crate::clock::COUNTING
+            && self.cpu_id == 0
+            && self.timer_mgr.as_ref().is_some_and(|tm| tm.clock().is_counting())
+        {
+            self.hot.interrupts.fetch_or(crate::cpu::smp::TIMERS_BIT, Ordering::SeqCst);
+        }
     }
 
     /// Read a GPR by index. gpr\[0\] is always kept at zero.
@@ -1988,7 +2014,8 @@ impl MipsCore {
         let ns = compare_delay_ns(self.cp0_compare as u32, self.cp0_count as u32, self.count_hz);
         #[cfg(feature = "ci_clock")]
         {
-            self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
+            self.count_compare_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
+            self.count_fire_cycle = self.count_compare_cycle.min(self.count_timer_cycle);
         }
         #[cfg(not(feature = "ci_clock"))]
         {
@@ -2055,26 +2082,51 @@ impl MipsCore {
         }
     }
 
-    /// ci_clock: raise IP7 once `hot.cycles` has reached the Compare
-    /// deadline. A threshold, not an edge, so a caller that looks late still
-    /// delivers it, once.
+    /// ci_clock: act on whichever deadline `hot.cycles` has reached. Compare's raises IP7; the
+    /// timers' ask the CPU loop to run them (`TIMERS_BIT`). A threshold, not an edge, so a caller
+    /// that looks late still delivers each, once.
     #[cfg(feature = "ci_clock")]
     #[inline(always)]
     pub(crate) fn fire_compare_if_due(&mut self) {
-        if self.hot.cycles >= self.count_fire_cycle {
+        if self.hot.cycles < self.count_fire_cycle {
+            return;
+        }
+        if self.hot.cycles >= self.count_compare_cycle {
             // Next architectural match is a full 32-bit Count wrap away;
             // normally a Compare write re-arms much sooner.
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
-            self.count_fire_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
+            self.count_compare_cycle = self.hot.cycles.saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
             // Claim the armed ticket, as the host timer does, so a Count read crossing Compare does not deliver it again.
             claim_ip7(&self.ip7_seq_shared, self.ip7_seq, &self.hot.interrupts, &self.fasttick_count, self.cpu_id);
         }
+        if self.hot.cycles >= self.count_timer_cycle {
+            // The CPU loop runs them and sets the next deadline.
+            self.count_timer_cycle = u64::MAX;
+            self.hot.interrupts.fetch_or(crate::cpu::smp::TIMERS_BIT, Ordering::SeqCst);
+        }
+        self.count_fire_cycle = self.count_compare_cycle.min(self.count_timer_cycle);
+    }
+
+    /// The timers have run, `now` machine nanoseconds in, and the next is due at `next`: set the
+    /// deadline `fire_compare_if_due` watches for them.
+    pub(crate) fn set_timer_deadline(&mut self, next: Option<u64>, now: u64) {
+        #[cfg(feature = "ci_clock")]
+        {
+            let wait = next.map_or(u64::MAX, |due| due.saturating_sub(now).div_ceil(NS_PER_GUEST_CYCLE));
+            self.count_timer_cycle = self.hot.cycles.saturating_add(wait);
+            self.count_fire_cycle = self.count_compare_cycle.min(self.count_timer_cycle);
+        }
+        #[cfg(not(feature = "ci_clock"))]
+        let _ = (next, now);
     }
 
     /// Cancel any armed Count==Compare interrupt source.
     fn disarm_compare_timer(&mut self) {
         #[cfg(feature = "ci_clock")]
-        { self.count_fire_cycle = u64::MAX; }
+        {
+            self.count_compare_cycle = u64::MAX;
+            self.count_fire_cycle = self.count_timer_cycle;
+        }
         if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
             tm.remove(id);
         }
@@ -2172,6 +2224,7 @@ impl MipsCore {
     pub fn on_cpu_start(&mut self) {
         self.count_paused = false;
         self.reanchor_count_and_reschedule();
+        self.ask_for_timers();
     }
 
     /// Write CP0 register by index.

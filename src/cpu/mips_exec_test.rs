@@ -2289,7 +2289,7 @@ mod tests {
     }
 
     /// A Compare the deadline check delivers is one tick: the handler's Count
-    /// read that follows must not deliver it again.
+    /// read that follows must not deliver it again. With no timer due it asks for no timer pass.
     #[cfg(feature = "ci_clock")]
     #[test]
     fn ci_clock_compare_counts_one_tick() {
@@ -2300,6 +2300,7 @@ mod tests {
         core.hot.cycles += 2_000;
         core.fire_compare_if_due();
         assert_ne!(core.hot.interrupts.load(Ordering::SeqCst) & crate::cpu::mips_core::CAUSE_IP7 as u64, 0);
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst) & crate::cpu::smp::TIMERS_BIT, 0);
         core.count_now();
         assert_eq!(core.fasttick_count.load(Ordering::Relaxed), 1);
     }
@@ -2346,6 +2347,65 @@ mod tests {
         assert!(steps >= deadline - 100, "{steps} dispatches reached cycle {deadline}: the stall skipped time");
         let pending = exec.core.hot.interrupts.load(std::sync::atomic::Ordering::SeqCst);
         assert_ne!((pending as u32 | exec.core.cp0_cause) & crate::cpu::mips_core::CAUSE_IP7, 0, "IP7 must be pending");
+    }
+
+    /// Spin CPU `cpu_id` on a counting manager with one timer due after 1 us of its instructions,
+    /// and say which thread ran the timer, if any did. Only CPU 0's word is the manager's, as in a machine.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_cpu_zero_runs_the_timers_its_instructions_reach_and_another_cpu_does_not() {
+        let spin = |cpu_id: u8| -> Option<String> {
+            let (mut exec, mem) = create_executor();
+            mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+            mem.set_word(0x1004, 0);
+            exec.core.pc = 0xffff_ffff_8000_1000;
+            exec.core.cpu_id = cpu_id;
+            let tm = Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting()));
+            exec.core.set_timer_manager(tm.clone());
+            let ran = Arc::new(parking_lot::Mutex::new(None));
+            let by = ran.clone();
+            tm.add_one_shot(std::time::Duration::from_micros(1), move || {
+                *by.lock() = Some(std::thread::current().name().unwrap_or("").to_string());
+                crate::hptimer::TimerReturn::Delete
+            });
+            let cpu = Arc::new(crate::cpu::mips_exec::MipsCpu::new(exec));
+            tm.clock().set_cpu_cycles(cpu.cycles_ptr());
+            if cpu_id == 0 {
+                tm.set_interrupts(cpu.interrupts_ptr());
+            }
+            crate::traits::Device::start(&*cpu);
+            // Run until the CPU is far past the deadline, not for a fixed host time.
+            assert!(crate::test_board::until(|| cpu.cycles_ptr().get() > 1_000_000));
+            crate::traits::Device::stop(&*cpu);
+            tm.set_interrupts(std::ptr::null());
+            let by = ran.lock().take();
+            by
+        };
+        let by = spin(0).expect("the timer ran");
+        assert_ne!(by, "hptimer", "run by the CPU, not the host timer thread");
+        assert_eq!(spin(1), None);
+    }
+
+    /// A timer's deadline is not Compare's: reaching it asks the CPU loop to run the timers and
+    /// leaves IP7 alone.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_a_due_timer_asks_for_the_timers_and_not_for_ip7() {
+        use std::sync::atomic::Ordering;
+        let mut core = crate::cpu::mips_core::MipsCore::default();
+        core.write_cp0(11, 0x10_0000); // Compare far away
+        core.hot.cycles = 1_000;
+        core.set_timer_deadline(Some(5_000), 0); // due in 500 cycles
+        core.hot.cycles += 499;
+        core.fire_compare_if_due();
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), 0, "not yet");
+        core.hot.cycles += 1;
+        core.fire_compare_if_due();
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), crate::cpu::smp::TIMERS_BIT);
+        assert_eq!(core.fasttick_count.load(Ordering::Relaxed), 0, "no Compare tick");
+        core.hot.cycles += 1;
+        core.fire_compare_if_due();
+        assert_eq!(core.hot.interrupts.load(Ordering::SeqCst), crate::cpu::smp::TIMERS_BIT, "asked once");
     }
 
     #[test]
@@ -8232,6 +8292,60 @@ mod tests {
         assert_eq!(exec.core.hot.interrupts.load(Ordering::SeqCst) & HOST_PARK_BIT, 0,
             "the compiled spin ran 2 s past the deadline");
         assert_ne!(exec.core.cp0_status & STATUS_EXL, 0, "no interrupt taken");
+    }
+
+    /// A spin on one `beq` leaves compiled code only for a nonzero interrupt word, and nothing
+    /// arms Compare here: the timers' deadline alone must reach it.
+    #[cfg(all(feature = "jitv2", feature = "ci_clock"))]
+    #[test]
+    fn ci_clock_a_compiled_spin_takes_a_timer_deadline() {
+        use crate::cpu::mips_core::STATUS_IE;
+        use crate::cpu::smp::{HOST_PARK_BIT, TIMERS_BIT};
+        use std::sync::atomic::Ordering;
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.jitv2_inline_compile = true;
+        exec.install_jit_hooks();
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        mem.set_word(0x1000, (OP_BEQ << 26) | 0xFFFF); // beq $0, $0, self
+        mem.set_word(0x1004, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        exec.core.cp0_status = STATUS_IE;
+        let tm = Arc::new(crate::hptimer::TimerManager::with_clock(crate::clock::Clock::counting()));
+        exec.core.set_timer_manager(tm.clone());
+        tm.clock().set_cpu_cycles(crate::cpu::mips_core::CyclesPtr::new(&exec.core.hot.cycles));
+        tm.set_interrupts(exec.interrupts_ptr());
+        tm.add_one_shot(std::time::Duration::from_micros(1), || crate::hptimer::TimerReturn::Delete); // 100 cycles
+        assert_ne!(exec.core.hot.interrupts.load(Ordering::SeqCst) & TIMERS_BIT, 0, "arming asked for the timers");
+        exec.core.hot.interrupts.fetch_and(!TIMERS_BIT, Ordering::SeqCst);
+        let next = tm.run_expired();
+        exec.core.set_timer_deadline(next, tm.clock().now());
+
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let (done, stop) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let irq = irq;
+            if stop.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                // SAFETY: the executor outlives this thread, which is joined below.
+                unsafe { &*irq.0 }.fetch_or(HOST_PARK_BIT, Ordering::SeqCst);
+            }
+        });
+        for _ in 0..100_000 {
+            exec.step_jit();
+            if exec.core.hot.interrupts.load(Ordering::SeqCst) & (TIMERS_BIT | HOST_PARK_BIT) != 0 {
+                break;
+            }
+        }
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        let word = exec.core.hot.interrupts.load(Ordering::SeqCst);
+        assert_eq!(word & HOST_PARK_BIT, 0, "the compiled spin ran 2 s past the deadline");
+        assert_ne!(word & TIMERS_BIT, 0, "the deadline asked for the timers");
     }
 
     #[test]

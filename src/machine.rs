@@ -394,10 +394,7 @@ impl Machine {
             eeprom_mc.lock().set_cachsz(0);
         }
 
-        #[cfg(feature = "ci_clock")]
-        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::counting()));
-        #[cfg(not(feature = "ci_clock"))]
-        let timer_manager = Arc::new(TimerManager::new());
+        let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::cpu_or_host()));
         // 1. Create all devices first
         // Memory Controller
         let mc_banks: [u32; 4] = cfg.banks[..4].try_into().expect("the MC has four banks");
@@ -443,6 +440,10 @@ impl Machine {
         // What every graphics board's status bar reads; the CPU feeds its
         // fetch counters and the cycle counter is wired in below.
         let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick_count.clone());
+        // On a counting clock the refresh runs on the machine's instructions, not on its own thread.
+        if timer_manager.clock().is_counting() {
+            status.refresh().set_timers(timer_manager.clone());
+        }
         let [decoded_count, l1i_hit_count, l1i_fetch_count, uncached_fetch_count] = status.fetch_counters();
         let (fatal_tx, fatal_rx) = mpsc::channel::<MachineFatal>();
 
@@ -924,6 +925,7 @@ impl Machine {
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
         mc.set_cpu(Arc::downgrade(&cpu_device));
         ioc.set_interrupts(cpu.interrupts_ptr());
+        timer_manager.set_interrupts(cpu.interrupts_ptr());
 
         // ppmem: the CPU's cache and the JIT read RAM through a cached view of
         // the window that is the CPU's own, so what the cache holds stays out
@@ -971,7 +973,6 @@ impl Machine {
             }
         }
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
-        #[cfg(feature = "ci_clock")]
         timer_manager.clock().set_cpu_cycles(cpu.cycles_ptr());
 
         // Inject the CPU/self handles jitv2's compile-thread worker needs to

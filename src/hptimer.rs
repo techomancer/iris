@@ -52,6 +52,10 @@ struct TimerManagerInner {
     stop: bool,
     /// Wakes the worker out of its wait (`Waiter`), once the worker has made one.
     waker: Option<Waker>,
+    /// A counting manager's CPU interrupt word, where an armed timer asks that CPU to run it.
+    /// Read and cleared under this lock, so it is never used after the CPU is gone.
+    #[cfg(feature = "ci_clock")]
+    interrupts: Option<crate::cpu::mips_core::TimerIrqPtr>,
 }
 
 impl TimerManagerInner {
@@ -120,6 +124,8 @@ impl TimerManager {
             fifo: VecDeque::new(),
             stop: false,
             waker: None,
+            #[cfg(feature = "ci_clock")]
+            interrupts: None,
         }));
 
         let new_timer_added = Arc::new(AtomicBool::new(false));
@@ -127,18 +133,19 @@ impl TimerManager {
         let thread_inner = inner.clone();
         let thread_added = new_timer_added.clone();
 
-        let thread_handle = thread::Builder::new().name("hptimer".into()).spawn(move || {
+        // A counting clock's timers run on its CPU (`run_expired`), so it needs no thread.
+        let thread_handle = (!clock.is_counting()).then(|| thread::Builder::new().name("hptimer".into()).spawn(move || {
             let waiter = Waiter::new();
             {
                 let mut guard = thread_inner.lock();
                 guard.waker = Some(waiter.waker());
             }
-            timer_thread_loop(thread_inner, thread_added, &waiter);
-        }).expect("spawn hptimer thread");
+            timer_thread_loop(&thread_inner, &thread_added, Some(&waiter), Instant::now);
+        }).expect("spawn hptimer thread"));
 
         Self {
             inner,
-            thread_handle: Some(thread_handle),
+            thread_handle,
             new_timer_added,
             clock,
             #[cfg(test)]
@@ -146,6 +153,34 @@ impl TimerManager {
             #[cfg(test)]
             manual: AtomicBool::new(false),
         }
+    }
+
+    /// Where deadlines count from: now in host time, or in machine time on a counting manager.
+    fn deadline_base(&self) -> Instant {
+        if self.clock.is_counting() {
+            return epoch() + Duration::from_nanos(self.clock.now());
+        }
+        Instant::now()
+    }
+
+    /// Where a counting manager's CPU asks to have its timers run: `word` is that CPU's interrupt
+    /// word, or null when the CPU goes.
+    pub fn set_interrupts(&self, word: *const AtomicU64) {
+        #[cfg(feature = "ci_clock")]
+        {
+            self.inner.lock().interrupts = (self.clock.is_counting() && !word.is_null())
+                .then(|| crate::cpu::mips_core::TimerIrqPtr(word));
+        }
+        #[cfg(not(feature = "ci_clock"))]
+        let _ = word;
+    }
+
+    /// One pass of the timer thread's loop, on this thread: run every timer the clock has reached,
+    /// then return the next deadline in machine nanoseconds. For a counting manager's CPU.
+    #[cfg_attr(not(feature = "ci_clock"), allow(dead_code))]
+    pub(crate) fn run_expired(&self) -> Option<u64> {
+        timer_thread_loop(&self.inner, &self.new_timer_added, None, || self.deadline_base())
+            .map(|t| t.saturating_duration_since(epoch()).as_nanos() as u64)
     }
 
     /// Run the callback of every started timer the clock has reached, oldest deadline first and
@@ -192,7 +227,7 @@ impl TimerManager {
     {
         let mut inner = self.inner.lock();
         let id = inner.allocate(TimerEntry {
-            next_expiration: Instant::now() + expire_in,
+            next_expiration: self.deadline_base() + expire_in,
             period: None,
             in_fifo: false,
             callback: Some(Box::new(cb)),
@@ -202,14 +237,14 @@ impl TimerManager {
         id
     }
 
-    /// Add a recurring timer to the manager.
-    pub fn add_recurring<F>(&self, expire_at: Instant, period: Duration, cb: F) -> TimerId
+    /// Add a recurring timer to the manager, first due `expire_in` from now.
+    pub fn add_recurring<F>(&self, expire_in: Duration, period: Duration, cb: F) -> TimerId
     where
         F: FnMut() -> TimerReturn + Send + 'static,
     {
         let mut inner = self.inner.lock();
         let id = inner.allocate(TimerEntry {
-            next_expiration: expire_at,
+            next_expiration: self.deadline_base() + expire_in,
             period: Some(period),
             in_fifo: false,
             callback: Some(Box::new(cb)),
@@ -228,6 +263,13 @@ impl TimerManager {
     fn wake_up(&self) {
         self.new_timer_added.store(true, Ordering::Release);
         let inner = self.inner.lock();
+        // No thread to wake: ask the CPU to leave its batch and run the timers.
+        #[cfg(feature = "ci_clock")]
+        if let Some(word) = &inner.interrupts {
+            // SAFETY: the CPU clears the pointer, under this lock, before its word goes.
+            unsafe { &*word.0 }.fetch_or(crate::cpu::smp::TIMERS_BIT, Ordering::SeqCst);
+            return;
+        }
         if let Some(w) = &inner.waker {
             w.wake();
         }
@@ -409,10 +451,22 @@ impl Drop for TimerInner {
     }
 }
 
-/// The core loop tracking timeouts precisely.
-fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<AtomicBool>, waiter: &Waiter) {
+/// Where machine time 0 falls on the `Instant` line: a counting manager keeps its deadlines there.
+fn epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// The core loop tracking timeouts precisely, in the time `time` reads. With no `waiter` it runs
+/// what is due and returns the next deadline instead of waiting for it.
+fn timer_thread_loop(
+    inner: &Mutex<TimerManagerInner>,
+    new_timer_added: &AtomicBool,
+    waiter: Option<&Waiter>,
+    time: impl Fn() -> Instant,
+) -> Option<Instant> {
     loop {
-        let now = Instant::now();
+        let now = time();
         let mut next_wakeup = None;
         let mut to_call = None;
 
@@ -492,7 +546,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                             TimerReturn::Continue => {
                                 if let Some(period) = period {
                                     t.next_expiration += period;
-                                    let now = Instant::now();
+                                    let now = time();
                                     if catch_up + 1 < MAX_CATCHUP
                                         && t.next_expiration <= now
                                     {
@@ -510,7 +564,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
                                 guard.deallocate(((generation as u64) << 32) | (idx as u64));
                             }
                             TimerReturn::RescheduleOneShot(new_delay) => {
-                                t.next_expiration = Instant::now() + new_delay;
+                                t.next_expiration = time() + new_delay;
                                 t.period = None;
                             }
                         }
@@ -521,6 +575,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
             continue; // Re-evaluate time continuously
         }
 
+        let Some(waiter) = waiter else { return next_wakeup };
         // 5. Spin or park depending on how long we have to wait
         if let Some(target) = next_wakeup {
             loop {
@@ -559,6 +614,7 @@ fn timer_thread_loop(inner: Arc<Mutex<TimerManagerInner>>, new_timer_added: Arc<
             }
         }
     }
+    None
 }
 
 /// The longest the worker spins to land a deadline that falls between two
