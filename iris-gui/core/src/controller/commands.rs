@@ -39,6 +39,9 @@ pub mod menu {
     pub const VIEW_ACTUAL: &str = "menu.view-actual-size";
     pub const VIEW_FIT: &str = "menu.view-fit";
     pub const VIEW_STRETCH: &str = "menu.view-stretch";
+    /// Size the display's window to the picture, as large as it is drawn
+    /// now: no black around it and nothing to scroll.
+    pub const VIEW_FIT_WINDOW: &str = "menu.view-fit-window";
     pub const CHECK_NETWORK: &str = "menu.check-network";
     pub const BENCHMARK: &str = "menu.benchmark";
     pub const CAMERA_TEST: &str = "menu.camera-test";
@@ -65,6 +68,8 @@ pub enum ShellCommand {
     Benchmark,
     Diagnostics,
     CloseWindow,
+    /// Size the window that shows the display to its picture.
+    FitWindow,
 }
 
 /// What a command id did.
@@ -238,7 +243,6 @@ impl AppController {
                 tb::SHOW_LIBRARY,
                 tb::TITLE,
                 tb::GAP,
-                tb::NEW_MACHINE,
                 tb::DUPLICATE,
                 tb::DELETE,
                 tb::BROWSE_FILES,
@@ -420,6 +424,9 @@ impl AppController {
                 need_running()
             }
             tb::SERIAL_CONSOLE | menu::CHECK_NETWORK => need_running(),
+            // Full screen sizes the window itself.
+            menu::VIEW_FIT_WINDOW if self.display().fullscreen() => Enabled::No(t!("mb-view-fit-window-full-screen")),
+            menu::VIEW_FIT_WINDOW => need_running(),
             menu::GRANT_FOLDER => Enabled::when(cfg!(feature = "appstore"), || t!("menu-file-grant-folder-tip")),
             tb::MACHINE_SETTINGS | menu::SHOW_IN_FINDER | menu::OPEN_CONFIG => machine(),
             menu::DUPLICATE | menu::RENAME | menu::DELETE => match machine() {
@@ -553,6 +560,10 @@ impl AppController {
             menu::VIEW_ACTUAL => Some(display(DisplayAction::SetMode(super::display::DisplayMode::Actual))),
             menu::VIEW_FIT => Some(display(DisplayAction::SetMode(super::display::DisplayMode::Fit))),
             menu::VIEW_STRETCH => Some(display(DisplayAction::SetMode(super::display::DisplayMode::Stretch))),
+            menu::VIEW_FIT_WINDOW => {
+                r.shell = Some(ShellCommand::FitWindow);
+                None
+            }
             menu::SEND_F11 => Some(display(DisplayAction::Send(GuestChord::F11))),
             menu::SEND_CAD => Some(display(DisplayAction::Send(GuestChord::CtrlAltDel))),
             menu::SEND_ESC => Some(display(DisplayAction::Send(GuestChord::Escape))),

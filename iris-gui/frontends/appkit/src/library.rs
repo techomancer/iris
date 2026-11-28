@@ -99,8 +99,8 @@ define_class!(
         #[unsafe(method(tableView:heightOfRow:))]
         fn height(&self, _t: &NSTableView, row: NSInteger) -> f64 {
             match self.ivars().items.borrow().get(row as usize) {
-                Some(Item::Group(_)) => 26.0,
-                _ => 46.0,
+                Some(Item::Group(_)) => 24.0,
+                _ => 38.0,
             }
         }
 
@@ -138,7 +138,7 @@ fn cell(mtm: MainThreadMarker, item: &Item) -> Retained<NSView> {
         }
         Item::Machine(m) => {
             let image = NSImageView::new(mtm);
-            if let Some(img) = glyphs::machine_image(m.icon, 32.0, &m.subtitle) {
+            if let Some(img) = glyphs::machine_image(m.icon, 28.0, &m.subtitle) {
                 image.setImage(Some(&img));
             }
             image.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
@@ -161,7 +161,7 @@ fn cell(mtm: MainThreadMarker, item: &Item) -> Retained<NSView> {
             );
             text.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
             text.setAlignment(objc2_app_kit::NSLayoutAttribute::Leading);
-            text.setSpacing(1.0);
+            text.setSpacing(0.0);
             text.setClippingResistancePriority_forOrientation(500.0, NSLayoutConstraintOrientation::Horizontal);
             let mut views: Vec<Retained<NSView>> =
                 vec![Retained::into_super(Retained::into_super(image)), Retained::into_super(text)];
@@ -186,7 +186,7 @@ fn cell(mtm: MainThreadMarker, item: &Item) -> Retained<NSView> {
                 b.setBordered(false);
                 if let Some(img) = glyphs::symbol("play.circle.fill", &tip) {
                     b.setImage(Some(&img));
-                    b.setSymbolConfiguration(Some(&objc2_app_kit::NSImageSymbolConfiguration::configurationWithPointSize_weight(20.0, 0.0)));
+                    b.setSymbolConfiguration(Some(&objc2_app_kit::NSImageSymbolConfiguration::configurationWithPointSize_weight(18.0, 0.0)));
                 } else {
                     b.setTitle(&ns("\u{25B6}"));
                 }
@@ -197,7 +197,7 @@ fn cell(mtm: MainThreadMarker, item: &Item) -> Retained<NSView> {
             let row = NSStackView::stackViewWithViews(&objc2_foundation::NSArray::from_retained_slice(&views), mtm);
             row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             row.setSpacing(8.0);
-            row.setEdgeInsets(objc2_foundation::NSEdgeInsets { top: 4.0, left: 12.0, bottom: 4.0, right: 8.0 });
+            row.setEdgeInsets(objc2_foundation::NSEdgeInsets { top: 2.0, left: 10.0, bottom: 2.0, right: 8.0 });
             row.setDistribution(NSStackViewDistribution::Fill);
             row.setHuggingPriority_forOrientation(250.0, NSLayoutConstraintOrientation::Horizontal);
             set_id(&row, &format!("library.row.{}", m.name));
@@ -229,7 +229,7 @@ impl Library {
         // at its trailing edge however wide the sidebar is.
         table.setColumnAutoresizingStyle(objc2_app_kit::NSTableViewColumnAutoresizingStyle::FirstColumnOnlyAutoresizingStyle);
         column.setMaxWidth(10_000.0);
-        table.setIntercellSpacing(NSSize::new(0.0, 2.0));
+        table.setIntercellSpacing(NSSize::new(0.0, 1.0));
         table.setHeaderView(None);
         // See-through, so the sidebar's own material shows behind the rows.
         table.setBackgroundColor(&NSColor::clearColor());

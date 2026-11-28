@@ -17,7 +17,6 @@ use crate::ui::{ns, target};
 /// (`AppController::toolbar_layout`).
 const ITEMS: &[&str] = &[
     tb::SHOW_LIBRARY,
-    tb::NEW_MACHINE,
     tb::POWER_ON,
     tb::SHUT_DOWN_GUEST,
     tb::POWER_OFF,
@@ -40,14 +39,12 @@ const ITEMS: &[&str] = &[
     tb::TITLE,
 ];
 
-/// The machine capsule's parts: the name, the model, the picture, and the
-/// capsule itself (the menu opens under it).
+/// The machine capsule's parts: the name, the model and the picture.
 struct Title {
     name: Retained<objc2_app_kit::NSTextField>,
     model: Retained<objc2_app_kit::NSTextField>,
     picture: Retained<objc2_app_kit::NSImageView>,
     icon: std::cell::Cell<Option<iris_gui_core::controller::profile::MachineIcon>>,
-    view: Retained<objc2_app_kit::NSView>,
 }
 
 thread_local! {
@@ -70,11 +67,6 @@ pub fn set_title(name: &str, model: &str, icon: Option<iris_gui_core::controller
             }
         }
     });
-}
-
-/// The capsule, for the machine menu to open under.
-pub fn title_view() -> Option<Retained<objc2_app_kit::NSView>> {
-    TITLE.with(|t| t.borrow().as_ref().map(|t| t.view.clone()))
 }
 
 fn identifier(id: &str) -> Retained<NSString> {
@@ -120,8 +112,8 @@ fn make_item(mtm: MainThreadMarker, id: &NSString) -> Option<Retained<NSToolbarI
     let key = id.to_string();
     if key == tb::TITLE {
         // The machine capsule, where Finder has back and forward: the
-        // machine's picture, its name over its model, and a chevron. A click
-        // opens the library's machines (`menu::machines`).
+        // machine's picture and its name over its model. It only shows which
+        // machine this is; the library switches machines.
         use objc2_app_kit::{NSFont, NSImageView, NSLayoutAttribute, NSStackView, NSUserInterfaceLayoutOrientation as O};
         let view = |v: &objc2_app_kit::NSView| -> Retained<objc2_app_kit::NSView> { objc2::Message::retain(v) };
         let name = crate::ui::label(mtm, "");
@@ -135,41 +127,22 @@ fn make_item(mtm: MainThreadMarker, id: &NSString) -> Option<Retained<NSToolbarI
         let picture = NSImageView::new(mtm);
         picture.setContentTintColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
         picture.widthAnchor().constraintEqualToConstant(26.0).setActive(true);
-        let chevron = NSImageView::new(mtm);
-        if let Some(img) = glyphs::symbol("chevron.down", "") {
-            chevron.setImage(Some(&img));
-        }
-        chevron.setContentTintColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
-        chevron.setSymbolConfiguration(Some(&objc2_app_kit::NSImageSymbolConfiguration::configurationWithPointSize_weight(9.0, 0.3)));
-        let row = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&[view(&picture), view(&lines), view(&chevron)]), mtm);
+        let row = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&[view(&picture), view(&lines)]), mtm);
         row.setOrientation(O::Horizontal);
         row.setAlignment(NSLayoutAttribute::CenterY);
         row.setSpacing(7.0);
-        row.setEdgeInsets(objc2_foundation::NSEdgeInsets { top: 0.0, left: 8.0, bottom: 0.0, right: 10.0 });
-        // A borderless button over it all takes the click.
-        let hit = crate::ui::button(mtm, "", tb::TITLE);
-        hit.setBordered(false);
-        hit.setTitle(&ns(""));
-        hit.setTranslatesAutoresizingMaskIntoConstraints(false);
-        row.addSubview(&hit);
-        for (a, b) in [(hit.leadingAnchor(), row.leadingAnchor()), (hit.trailingAnchor(), row.trailingAnchor())] {
-            a.constraintEqualToAnchor(&b).setActive(true);
-        }
-        hit.topAnchor().constraintEqualToAnchor(&row.topAnchor()).setActive(true);
-        hit.bottomAnchor().constraintEqualToAnchor(&row.bottomAnchor()).setActive(true);
+        // As much room after the text as before the picture: the capsule is
+        // as wide as what it says.
+        row.setEdgeInsets(objc2_foundation::NSEdgeInsets { top: 0.0, left: 10.0, bottom: 0.0, right: 12.0 });
         row.heightAnchor().constraintEqualToConstant(36.0).setActive(true);
-        row.widthAnchor().constraintGreaterThanOrEqualToConstant(170.0).setActive(true);
-        hit.setToolTip(Some(&ns(&t!("tb-switch-machine"))));
-        // VoiceOver: what it does (the machine's name is its value, below).
-        objc2_app_kit::NSAccessibility::setAccessibilityLabel(&*hit, Some(&ns(&t!("tb-switch-machine"))));
         let item = NSToolbarItem::initWithItemIdentifier(mtm.alloc(), id);
         item.setView(Some(&row));
         // In the toolbar's own glass, as the buttons on the right are.
         item.setBordered(true);
         item.setAutovalidates(false);
-        item.setLabel(&ns(&t!("tb-switch-machine")));
+        item.setLabel(&ns(&t!("tb-machine")));
         TITLE.with(|t| {
-            *t.borrow_mut() = Some(Title { name, model, picture, icon: std::cell::Cell::new(None), view: Retained::into_super(row) })
+            *t.borrow_mut() = Some(Title { name, model, picture, icon: std::cell::Cell::new(None) })
         });
         return Some(item);
     }
@@ -247,7 +220,7 @@ fn all_ids() -> Retained<NSArray<NSString>> {
 /// What the toolbar starts with: the stopped layout (the window sets the
 /// real one on its first refresh).
 fn default_ids() -> Retained<NSArray<NSString>> {
-    let v = with_separator(&[tb::SHOW_LIBRARY, tb::NEW_MACHINE, tb::GAP, tb::POWER_ON]);
+    let v = with_separator(&[tb::SHOW_LIBRARY, tb::TITLE, tb::GAP, tb::POWER_ON]);
     NSArray::from_retained_slice(&v)
 }
 

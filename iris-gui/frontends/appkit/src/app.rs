@@ -336,6 +336,12 @@ pub fn script_step() {
         if let Some(now) = with(|s| s.win.drag_sidebar(w)) {
             eprintln!("iris-appkit script: sidebar is {now:.0} pt wide");
         }
+    } else if let Some((w, h)) = step.strip_prefix("window:").and_then(|s| s.split_once(',')) {
+        // The main window resized to W x H points, as a drag on its edge
+        // would (its top-left corner stays).
+        if let (Ok(w), Ok(h)) = (w.parse::<f64>(), h.parse::<f64>()) {
+            with(|s| s.win.resize_for_test(w, h));
+        }
     } else if let Some(z) = step.strip_prefix("hover:") {
         // The pointer over a hover zone (`chrome::Zone`), for tests.
         use crate::chrome::Zone;
@@ -893,16 +899,6 @@ pub fn command(id: &str) {
     if id.starts_with("panel.") {
         return panel_control(id, iris_gui_core::controller::settings::Value::Bool(false));
     }
-    // The machine capsule opens the machine menu; its items select.
-    if id == iris_gui_core::controller::ids::toolbar::TITLE {
-        if let (Some(groups), Some(at)) = (with(|s| s.app.library()), crate::toolbar::title_view()) {
-            crate::menu::machines(mtm(), &groups, &at);
-        }
-        return;
-    }
-    if let Some(name) = id.strip_prefix(crate::menu::SELECT_MACHINE) {
-        return select_machine(name.to_string());
-    }
     // A disk's or CD-ROM's light opens that device's menu.
     if let Some((group, at)) = with(|s| s.app.light_menu(id).zip(s.win.light_view(id))).flatten() {
         crate::menu::pop_device(mtm(), &group, &at);
@@ -971,6 +967,11 @@ pub fn machine_menu(name: &str) -> Option<Vec<Vec<iris_gui_core::controller::com
 /// The pointer entered or left one of the window's hover zones.
 pub fn hover(zone: crate::chrome::Zone, inside: bool) {
     let _ = with(|s| s.win.hover(zone, inside));
+}
+
+/// The floating library finished sliding out (`MainWindow::library_panel_closed`).
+pub fn library_panel_closed(seq: u64) {
+    let _ = with(|s| s.win.library_panel_closed(seq));
 }
 
 /// The display refits its scroll view (a window was resized).
@@ -1049,6 +1050,9 @@ fn shell_command(c: ShellCommand) {
                 default: Some(0),
                 destructive: Vec::new(),
             })]);
+        }
+        ShellCommand::FitWindow => {
+            with(|s| s.win.fit_window());
         }
     }
 }

@@ -10,7 +10,7 @@ use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOn
 use objc2_app_kit::{
     NSEvent, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
-use objc2_foundation::NSRect;
+use objc2_foundation::{NSPoint, NSRect};
 
 /// What a hover zone stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,17 @@ define_class!(
         fn exited(&self, _e: &NSEvent) {
             let z = self.ivars().get();
             crate::app::later(Box::new(move || crate::app::hover(z, false)));
+        }
+
+        /// The edge zones only watch the pointer: clicks go through to the
+        /// display or page under them.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            match self.ivars().get() {
+                Zone::LibraryEdge | Zone::StatusEdge => None,
+                // SAFETY: NSView's own hit test.
+                _ => unsafe { msg_send![super(self), hitTest: point] },
+            }
         }
     }
 );

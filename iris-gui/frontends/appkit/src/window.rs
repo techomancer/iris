@@ -27,10 +27,11 @@ pub struct MainWindow {
     /// sidebar: its material, collapse animation and resizing rules).
     _split_vc: Retained<objc2_app_kit::NSSplitViewController>,
     sidebar: Retained<objc2_app_kit::NSSplitViewItem>,
-    /// The sidebar's view; the library's scroll view lives in it, or in the
-    /// floating panel while that is open.
+    /// The sidebar's view; the library (its list and the New Machine button
+    /// under it) lives in it, or in the floating panel while that is open.
     sidebar_view: Retained<NSView>,
     library: Library,
+    library_body: Retained<NSView>,
     content: Retained<NSScrollView>,
     /// Holds the summary or the display, whichever the run state calls for.
     pane: Retained<NSView>,
@@ -38,6 +39,12 @@ pub struct MainWindow {
     /// Holds the display: black around a smaller picture, scroll bars
     /// around a larger one (Actual Size).
     display_scroll: Retained<NSScrollView>,
+    /// The display's leading and top edges: at the pane's safe area (clear
+    /// of the toolbar and a floating sidebar), or in full screen at the
+    /// pane's own edges, so a sidebar or toolbar shown there floats over the
+    /// picture instead of moving it.
+    display_safe: Vec<Retained<objc2_app_kit::NSLayoutConstraint>>,
+    display_edge: Vec<Retained<objc2_app_kit::NSLayoutConstraint>>,
     detached: Option<Retained<NSWindow>>,
     /// In the main window while the display is in its own window.
     detached_note: Retained<NSStackView>,
@@ -66,6 +73,11 @@ pub struct MainWindow {
     panel: Retained<crate::chrome::HoverZone>,
     panel_body: Retained<NSView>,
     panel_open: bool,
+    /// The panel's leading edge: slid in from beyond the window's edge.
+    panel_leading: Retained<objc2_app_kit::NSLayoutConstraint>,
+    /// Counts the panel's openings, so a close that finishes after its
+    /// slide does not undo a newer opening.
+    panel_seq: u64,
     _status_zone: Retained<crate::chrome::HoverZone>,
     split_to_bar: Retained<objc2_app_kit::NSLayoutConstraint>,
     split_to_root: Retained<objc2_app_kit::NSLayoutConstraint>,
@@ -74,10 +86,9 @@ pub struct MainWindow {
     status_bottom: Retained<objc2_app_kit::NSLayoutConstraint>,
     /// The pointer is over the status bar (full screen keeps it up then).
     status_hovered: bool,
-    /// Full screen's chrome is in force (no library, the status bar on hover),
-    /// and whether the library was shown before it.
+    /// Full screen's chrome is in force (the library only as the floating
+    /// panel, the status bar on hover).
     full_chrome: bool,
-    library_before_full: bool,
     last: Option<Option<Overview>>,
     /// The sidebar's collapsed state as last applied to the chrome.
     library_shown_as: Option<bool>,
@@ -86,9 +97,16 @@ pub struct MainWindow {
 /// The status bar's height, and how much of it shows when it is tucked away
 /// in full screen.
 const STATUS_H: f64 = 26.0;
-const STATUS_PEEK: f64 = 2.0;
+const STATUS_PEEK: f64 = 3.0;
+/// How far up from the bottom edge the pointer brings the status bar back in
+/// full screen: before it reaches the edge, where the Dock comes up.
+const STATUS_REACH: f64 = 18.0;
 /// The chrome's animations, as long as the sidebar's.
 const SLIDE: f64 = 0.25;
+/// The library's width the first time, and the floating panel's.
+const SIDEBAR_W: f64 = 220.0;
+/// The floating panel's distance from the window's edges.
+const PANEL_INSET: f64 = 8.0;
 
 impl MainWindow {
     pub fn new(mtm: MainThreadMarker) -> Self {
@@ -112,7 +130,8 @@ impl MainWindow {
         // No title-bar band: the library's card runs up under the window
         // buttons, as Finder's sidebar does.
         window.setTitlebarAppearsTransparent(true);
-        window.setMinSize(NSSize::new(760.0, 480.0));
+        // Small enough for Size Window to Display to fit a 640x480 guest.
+        window.setMinSize(NSSize::new(600.0, 400.0));
         let (tb, delegate) = toolbar::build(mtm);
         window.setToolbar(Some(&tb));
 
@@ -125,16 +144,22 @@ impl MainWindow {
         display_scroll.setHasVerticalScroller(true);
         display_scroll.setHasHorizontalScroller(true);
         display_scroll.setAutohidesScrollers(true);
+        // A clip view that refits the display whenever its own size changes
+        // (a window resized from any edge, the sidebar sliding, scroll bars
+        // coming and going), not only when the window says it resized. Set
+        // first: the background below is the clip view's.
+        display_scroll.setContentView(&crate::display::clip(mtm));
         display_scroll.setDrawsBackground(true);
         display_scroll.setBackgroundColor(&objc2_app_kit::NSColor::blackColor());
         display.setTranslatesAutoresizingMaskIntoConstraints(true);
         display_scroll.setDocumentView(Some(&display));
         let pane = NSView::new(mtm);
-        for v in [Retained::into_super(content.clone()), Retained::into_super(display_scroll.clone())] {
-            v.setTranslatesAutoresizingMaskIntoConstraints(false);
-            pane.addSubview(&v);
-            pin_safe(&v, &pane);
-        }
+        content.setTranslatesAutoresizingMaskIntoConstraints(false);
+        pane.addSubview(&content);
+        pin_safe(&content, &pane);
+        display_scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
+        pane.addSubview(&display_scroll);
+        let (display_safe, display_edge) = pin_display(&display_scroll, &pane);
         display_scroll.setHidden(true);
         // While detached: a line saying where the display went, and a button
         // that brings it back.
@@ -182,8 +207,32 @@ impl MainWindow {
         edge.topAnchor().constraintEqualToAnchor(&sidebar_view.topAnchor()).setActive(true);
         edge.bottomAnchor().constraintEqualToAnchor(&sidebar_view.bottomAnchor()).setActive(true);
         edge.widthAnchor().constraintEqualToConstant(1.0).setActive(true);
-        sidebar_view.addSubview(&library.scroll);
-        place_on_card(&library.scroll, &sidebar_view);
+        // The library: its list, and New Machine under it.
+        let library_body = NSView::new(mtm);
+        library_body.setTranslatesAutoresizingMaskIntoConstraints(false);
+        library_body.addSubview(&library.scroll);
+        let new_machine = crate::ui::button(mtm, &t!("tb-new-machine"), iris_gui_core::controller::commands::menu::NEW_MACHINE);
+        new_machine.setBordered(false);
+        if let Some(img) = crate::glyphs::symbol("plus", &t!("tb-new-machine")) {
+            new_machine.setImage(Some(&img));
+            new_machine.setImagePosition(objc2_app_kit::NSCellImagePosition::ImageLeading);
+            new_machine.setSymbolConfiguration(Some(&objc2_app_kit::NSImageSymbolConfiguration::configurationWithPointSize_weight(12.0, 0.0)));
+        }
+        new_machine.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        new_machine.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        new_machine.setToolTip(Some(&ns(&t!("tb-new-machine"))));
+        new_machine.setTranslatesAutoresizingMaskIntoConstraints(false);
+        library_body.addSubview(&new_machine);
+        library.scroll.leadingAnchor().constraintEqualToAnchor(&library_body.leadingAnchor()).setActive(true);
+        library.scroll.trailingAnchor().constraintEqualToAnchor(&library_body.trailingAnchor()).setActive(true);
+        library.scroll.topAnchor().constraintEqualToAnchor(&library_body.topAnchor()).setActive(true);
+        library.scroll.bottomAnchor().constraintEqualToAnchor_constant(&new_machine.topAnchor(), -4.0).setActive(true);
+        new_machine.leadingAnchor().constraintEqualToAnchor_constant(&library_body.leadingAnchor(), 14.0).setActive(true);
+        new_machine.trailingAnchor().constraintLessThanOrEqualToAnchor_constant(&library_body.trailingAnchor(), -8.0).setActive(true);
+        new_machine.bottomAnchor().constraintEqualToAnchor_constant(&library_body.bottomAnchor(), -10.0).setActive(true);
+        new_machine.heightAnchor().constraintEqualToConstant(22.0).setActive(true);
+        sidebar_view.addSubview(&library_body);
+        place_on_card(&library_body, &sidebar_view);
         let side_vc = objc2_app_kit::NSViewController::new(mtm);
         side_vc.setView(&sidebar_view);
         // The machine's column: the pane (the page or the display), the
@@ -195,7 +244,7 @@ impl MainWindow {
         main_vc.setView(&column);
         let sidebar = objc2_app_kit::NSSplitViewItem::sidebarWithViewController(&side_vc);
         sidebar.setMinimumThickness(150.0);
-        sidebar.setMaximumThickness(420.0);
+        sidebar.setMaximumThickness(360.0);
         sidebar.setCanCollapse(true);
         // The card runs up under the window buttons: no line across it.
         sidebar.setTitlebarSeparatorStyle(objc2_app_kit::NSTitlebarSeparatorStyle::None);
@@ -211,7 +260,9 @@ impl MainWindow {
         let split_vc = objc2_app_kit::NSSplitViewController::new(mtm);
         split_vc.addSplitViewItem(&sidebar);
         split_vc.addSplitViewItem(&main_item);
-        split_vc.splitView().setAutosaveName(Some(&ns("IRISLibrarySplit")));
+        // A new name with the narrower default, so a width saved from the
+        // old default (saved whether or not anyone dragged it) goes.
+        split_vc.splitView().setAutosaveName(Some(&ns(SPLIT_AUTOSAVE)));
         // A hairline between the sidebar and the machine's pane.
         split_vc.splitView().setDividerStyle(objc2_app_kit::NSSplitViewDividerStyle::Thin);
 
@@ -312,7 +363,7 @@ impl MainWindow {
         edge_bottom.leadingAnchor().constraintEqualToAnchor(&root.leadingAnchor()).setActive(true);
         edge_bottom.trailingAnchor().constraintEqualToAnchor(&root.trailingAnchor()).setActive(true);
         edge_bottom.bottomAnchor().constraintEqualToAnchor(&root.bottomAnchor()).setActive(true);
-        edge_bottom.heightAnchor().constraintEqualToConstant(6.0).setActive(true);
+        edge_bottom.heightAnchor().constraintEqualToConstant(STATUS_REACH).setActive(true);
         edge_left.setHidden(true);
         edge_bottom.setHidden(true);
 
@@ -331,10 +382,12 @@ impl MainWindow {
         panel.addSubview(&panel_fx);
         pin(&panel_fx, &panel);
         root.addSubview(&panel);
-        panel.leadingAnchor().constraintEqualToAnchor_constant(&root.leadingAnchor(), 8.0).setActive(true);
-        panel.topAnchor().constraintEqualToAnchor_constant(&root.safeAreaLayoutGuide().topAnchor(), 8.0).setActive(true);
-        panel.bottomAnchor().constraintEqualToAnchor_constant(&root.bottomAnchor(), -8.0).setActive(true);
-        panel.widthAnchor().constraintEqualToConstant(260.0).setActive(true);
+        // Out beyond the window's edge until it slides in.
+        let panel_leading = panel.leadingAnchor().constraintEqualToAnchor_constant(&root.leadingAnchor(), -(SIDEBAR_W + PANEL_INSET));
+        panel_leading.setActive(true);
+        panel.topAnchor().constraintEqualToAnchor_constant(&root.safeAreaLayoutGuide().topAnchor(), PANEL_INSET).setActive(true);
+        panel.bottomAnchor().constraintEqualToAnchor_constant(&root.bottomAnchor(), -PANEL_INSET).setActive(true);
+        panel.widthAnchor().constraintEqualToConstant(SIDEBAR_W).setActive(true);
         panel.setHidden(true);
         // The split view controller is the window's content, so the sidebar
         // gets AppKit's full-height glass, as Finder's does.
@@ -343,14 +396,13 @@ impl MainWindow {
         window.setFrame_display(frame, false);
         // Full screen, as the green button offers.
         window.setCollectionBehavior(window.collectionBehavior() | objc2_app_kit::NSWindowCollectionBehavior::FullScreenPrimary);
-        // 250 points wide the first time; after that, as the user left it.
+        // SIDEBAR_W wide the first time; after that, as the user left it.
         let split_view = split_vc.splitView();
-        if objc2_foundation::NSUserDefaults::standardUserDefaults()
-            .objectForKey(&ns("NSSplitView Subview Frames IRISLibrarySplit"))
-            .is_none()
-        {
-            split_view.setPosition_ofDividerAtIndex(250.0, 0);
+        let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+        if defaults.objectForKey(&ns(&format!("NSSplitView Subview Frames {SPLIT_AUTOSAVE}"))).is_none() {
+            split_view.setPosition_ofDividerAtIndex(SIDEBAR_W, 0);
         }
+        defaults.removeObjectForKey(&ns("NSSplitView Subview Frames IRISLibrarySplit"));
         // The library always starts shown: the autosave keeps the width,
         // but a collapsed state restored from it disagrees with the item.
         sidebar.setCollapsed(false);
@@ -365,10 +417,13 @@ impl MainWindow {
             sidebar,
             sidebar_view,
             library,
+            library_body,
             content,
             pane,
             display,
             display_scroll,
+            display_safe,
+            display_edge,
             detached: None,
             detached_note,
             _detached_delegate: DetachedDelegate::new(mtm),
@@ -390,13 +445,14 @@ impl MainWindow {
             panel,
             panel_body: Retained::into_super(panel_fx),
             panel_open: false,
+            panel_leading,
+            panel_seq: 0,
             _status_zone: status_zone,
             split_to_bar,
             split_to_root,
             status_bottom,
             status_hovered: false,
             full_chrome: false,
-            library_before_full: false,
             last: None,
             library_shown_as: None,
         }
@@ -443,7 +499,10 @@ impl MainWindow {
             }
             display_view.setTranslatesAutoresizingMaskIntoConstraints(false);
             self.pane.addSubview(display_view);
-            pin_safe(display_view, &self.pane);
+            let (safe, edge) = pin_display(display_view, &self.pane);
+            self.display_safe = safe;
+            self.display_edge = edge;
+            self.full_chrome_edges();
             if running {
                 self.window.makeKeyAndOrderFront(None);
                 self.window.makeFirstResponder(Some(&*self.display));
@@ -496,13 +555,38 @@ impl MainWindow {
         self.sidebar_view.frame().size.width
     }
 
+    /// Resize the main window to `w` x `h` points, keeping its top-left
+    /// corner (for tests: as a drag on an edge would).
+    pub fn resize_for_test(&self, w: f64, h: f64) {
+        let mut f = self.window.frame();
+        let top = f.origin.y + f.size.height;
+        f.size = NSSize::new(w, h);
+        f.origin.y = top - h;
+        self.window.setFrame_display(f, true);
+    }
+
+    /// In full screen the library is the floating panel; in a window, the
+    /// sidebar.
     fn library_hidden(&self) -> bool {
-        self.sidebar.isCollapsed()
+        if self.full_chrome {
+            !self.panel_open
+        } else {
+            self.sidebar.isCollapsed()
+        }
     }
 
     /// Show or hide the library, sliding as a sidebar does. The window
     /// keeps its size; the machine's pane takes the room.
     pub fn toggle_library(&mut self) {
+        if self.full_chrome {
+            if self.panel_open {
+                self.close_panel();
+            } else {
+                self.open_panel();
+            }
+            self.sync_library_chrome();
+            return;
+        }
         self.close_panel();
         // The split view controller's own toggle: it animates both ways
         // (setting the item's collapsed state through its animator slid it
@@ -543,7 +627,20 @@ impl MainWindow {
         use crate::chrome::Zone;
         match (zone, inside) {
             (Zone::LibraryEdge, true) if self.library_hidden() => self.open_panel(),
-            (Zone::LibraryPanel, false) => self.close_panel(),
+            // The panel slides in under a pointer resting at the edge, which
+            // reports it entering and leaving: leaving counts only once the
+            // pointer is clear of the panel's strip.
+            (Zone::LibraryPanel, false) if self.panel_open => {
+                if self.pointer_by_panel() {
+                    // Looked at again shortly: the pointer may leave the
+                    // strip without crossing the panel.
+                    if let Ok(when) = dispatch2::DispatchTime::try_from(std::time::Duration::from_millis(400)) {
+                        let _ = dispatch2::DispatchQueue::main().after(when, || crate::app::hover(Zone::LibraryPanel, false));
+                    }
+                } else {
+                    self.close_panel();
+                }
+            }
             (Zone::StatusEdge, true) if self.full_chrome => {
                 self.status_hovered = true;
                 self.slide_status(true);
@@ -557,6 +654,19 @@ impl MainWindow {
             }
             _ => {}
         }
+    }
+
+    /// The pointer is over the strip the open panel takes: from the
+    /// window's edge to the panel's far side, as tall as the panel.
+    fn pointer_by_panel(&self) -> bool {
+        // SAFETY: a plain getter, on the main thread.
+        let Some(root) = (unsafe { self.panel.superview() }) else { return false };
+        let p = root.convertPoint_fromView(self.window.mouseLocationOutsideOfEventStream(), None);
+        let (b, f) = (root.bounds(), self.panel.frame());
+        p.x >= b.origin.x - 1.0
+            && p.x < b.origin.x + PANEL_INSET + SIDEBAR_W
+            && p.y >= f.origin.y
+            && p.y <= f.origin.y + f.size.height
     }
 
     /// Slide the status bar up into view or down to a sliver (full screen).
@@ -579,46 +689,100 @@ impl MainWindow {
         }
     }
 
-    /// Show the hidden library as a floating panel, as Arc does.
+    /// Show the hidden library as a floating panel, as Arc does: it slides
+    /// in from the window's edge.
     fn open_panel(&mut self) {
         if self.panel_open {
             return;
         }
-        let scroll = &self.library.scroll;
-        scroll.removeFromSuperview();
-        self.panel_body.addSubview(scroll);
-        pin(scroll, &self.panel_body);
-        self.panel.setHidden(false);
         self.panel_open = true;
+        self.panel_seq += 1;
+        let body = &self.library_body;
+        // Still in the panel when a close had not finished sliding out.
+        // SAFETY: a plain getter, on the main thread.
+        if !unsafe { body.superview() }.is_some_and(|v| *v == *self.panel_body) {
+            body.removeFromSuperview();
+            self.panel_body.addSubview(body);
+            pin(body, &self.panel_body);
+        }
+        if self.panel.isHidden() {
+            self.panel_leading.setConstant(-(SIDEBAR_W + PANEL_INSET));
+            self.panel.setAlphaValue(0.0);
+            self.panel.setHidden(false);
+            // SAFETY: a plain getter, on the main thread.
+            if let Some(root) = unsafe { self.panel.superview() } {
+                root.layoutSubtreeIfNeeded();
+            }
+        }
+        self.slide_panel(true);
     }
 
-    /// Put the floating library back in the sidebar.
+    /// Slide the floating library out; it goes back in the sidebar once out
+    /// of sight (`library_panel_closed`).
     fn close_panel(&mut self) {
         if !self.panel_open {
             return;
         }
         self.panel_open = false;
-        self.panel.setHidden(true);
-        let scroll = &self.library.scroll;
-        scroll.removeFromSuperview();
-        self.sidebar_view.addSubview(scroll);
-        place_on_card(scroll, &self.sidebar_view);
+        self.slide_panel(false);
+        let seq = self.panel_seq;
+        if let Ok(when) = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(SLIDE)) {
+            let _ = dispatch2::DispatchQueue::main().after(when, move || crate::app::library_panel_closed(seq));
+        }
     }
 
-    /// Full screen: no library (it comes back as the floating panel), and
-    /// the status bar over the display, tucked away to a sliver after a
-    /// moment and brought back from the bottom edge. Leaving puts back what
-    /// was there.
+    fn slide_panel(&self, shown: bool) {
+        objc2_app_kit::NSAnimationContext::beginGrouping();
+        objc2_app_kit::NSAnimationContext::currentContext().setDuration(SLIDE);
+        self.panel_leading.animator().setConstant(if shown { PANEL_INSET } else { -(SIDEBAR_W + PANEL_INSET) });
+        self.panel.animator().setAlphaValue(if shown { 1.0 } else { 0.0 });
+        objc2_app_kit::NSAnimationContext::endGrouping();
+    }
+
+    /// The floating library finished sliding out: put the list back in the
+    /// sidebar, unless it was opened again meanwhile.
+    pub fn library_panel_closed(&mut self, seq: u64) {
+        if self.panel_open || seq != self.panel_seq {
+            return;
+        }
+        self.panel.setHidden(true);
+        self.put_library_back();
+    }
+
+    /// The library's list back in the sidebar, at once.
+    fn put_library_back(&self) {
+        let body = &self.library_body;
+        // SAFETY: a plain getter, on the main thread.
+        if unsafe { body.superview() }.is_some_and(|v| *v == *self.sidebar_view) {
+            return;
+        }
+        body.removeFromSuperview();
+        self.sidebar_view.addSubview(body);
+        place_on_card(body, &self.sidebar_view);
+    }
+
+    /// Full screen: the library only as the floating panel (from the left
+    /// edge or the library button), and the status bar over the display,
+    /// tucked away to a sliver after a moment and brought back from near the
+    /// bottom edge. The display takes the whole screen, so neither moves it.
+    ///
+    /// The sidebar leaves the split meanwhile: AppKit slides a collapsed
+    /// sidebar in from the screen's edge in full screen, narrowing the
+    /// display's column. Leaving puts it back as it was, shown or hidden.
     fn set_full_chrome(&mut self, on: bool) {
         if on == self.full_chrome {
             return;
         }
+        self.panel_open = false;
+        self.panel_seq += 1;
+        self.panel.setHidden(true);
+        self.put_library_back();
         self.full_chrome = on;
+        self.full_chrome_edges();
+        // The edge zone and the button follow (`sync_library_chrome`).
+        self.library_shown_as = None;
         if on {
-            self.library_before_full = !self.library_hidden();
-            if !self.library_hidden() {
-                self.toggle_library();
-            }
+            self._split_vc.removeSplitViewItem(&self.sidebar);
             self.split_to_bar.setActive(false);
             self.split_to_root.setActive(true);
             self.status_bottom.setConstant(0.0);
@@ -628,15 +792,54 @@ impl MainWindow {
                 let _ = dispatch2::DispatchQueue::main().after(when, crate::app::tuck_status);
             }
         } else {
-            self.close_panel();
-            if self.library_before_full && self.library_hidden() {
-                self.toggle_library();
-            }
+            self._split_vc.insertSplitViewItem_atIndex(&self.sidebar, 0);
             self.split_to_root.setActive(false);
             self.split_to_bar.setActive(true);
             self.status_bottom.setConstant(0.0);
             self.edge_bottom.setHidden(true);
         }
+        self.sync_library_chrome();
+    }
+
+    /// The display's leading and top edges for the chrome in force: the
+    /// pane's own edges in full screen, its safe area otherwise.
+    fn full_chrome_edges(&self) {
+        let (off, on) = if self.full_chrome { (&self.display_safe, &self.display_edge) } else { (&self.display_edge, &self.display_safe) };
+        for c in off {
+            c.setActive(false);
+        }
+        for c in on {
+            c.setActive(true);
+        }
+    }
+
+    /// Size the window that shows the display so the picture fills it as it
+    /// is drawn now: no black around it, nothing to scroll (at Actual Size a
+    /// guest larger than the window brings the window up to its size, as far
+    /// as the screen allows). The window keeps its top-left corner.
+    pub fn fit_window(&self) {
+        let w = self.detached.clone().unwrap_or_else(|| self.window.clone());
+        if w.styleMask().contains(NSWindowStyleMask::FullScreen) || self.display_scroll.isHidden() {
+            return;
+        }
+        let Some((pw, ph)) = self.display.picture_extent() else { return };
+        // What the display has now, scroll bars included: they go once the
+        // picture fits.
+        let have = self.display_scroll.frame().size;
+        let mut frame = w.frame();
+        let (dw, dh) = (pw - have.width, ph - have.height);
+        let top = frame.origin.y + frame.size.height;
+        frame.size.width = (frame.size.width + dw).max(w.minSize().width);
+        frame.size.height = (frame.size.height + dh).max(w.minSize().height);
+        frame.origin.y = top - frame.size.height;
+        if let Some(screen) = w.screen() {
+            let vis = screen.visibleFrame();
+            frame.size.width = frame.size.width.min(vis.size.width);
+            frame.size.height = frame.size.height.min(vis.size.height);
+            frame.origin.x = frame.origin.x.min(vis.origin.x + vis.size.width - frame.size.width).max(vis.origin.x);
+            frame.origin.y = frame.origin.y.max(vis.origin.y).min(vis.origin.y + vis.size.height - frame.size.height);
+        }
+        w.setFrame_display_animate(frame, true, true);
     }
 
     /// The library button and menu item say what they will do.
@@ -863,6 +1066,27 @@ fn place_on_card(v: &NSView, sidebar: &NSView) {
     v.trailingAnchor().constraintEqualToAnchor_constant(&sidebar.trailingAnchor(), -1.0).setActive(true);
     v.topAnchor().constraintEqualToAnchor(&sidebar.safeAreaLayoutGuide().topAnchor()).setActive(true);
     v.bottomAnchor().constraintEqualToAnchor(&sidebar.bottomAnchor()).setActive(true);
+}
+
+/// The divider's autosave name (the sidebar's width).
+const SPLIT_AUTOSAVE: &str = "IRISSidebarSplit";
+
+/// Pin the display's scroll view in `to`: trailing and bottom at `to`'s
+/// edges, and two sets for leading and top, the safe area's (active) and the
+/// edges' (full screen; `MainWindow::full_chrome_edges`).
+fn pin_display(v: &NSView, to: &NSView) -> (Vec<Retained<objc2_app_kit::NSLayoutConstraint>>, Vec<Retained<objc2_app_kit::NSLayoutConstraint>>) {
+    let safe = to.safeAreaLayoutGuide();
+    v.trailingAnchor().constraintEqualToAnchor(&safe.trailingAnchor()).setActive(true);
+    v.bottomAnchor().constraintEqualToAnchor(&to.bottomAnchor()).setActive(true);
+    let in_safe = vec![
+        v.leadingAnchor().constraintEqualToAnchor(&safe.leadingAnchor()),
+        v.topAnchor().constraintEqualToAnchor(&safe.topAnchor()),
+    ];
+    let at_edges = vec![v.leadingAnchor().constraintEqualToAnchor(&to.leadingAnchor()), v.topAnchor().constraintEqualToAnchor(&to.topAnchor())];
+    for c in &in_safe {
+        c.setActive(true);
+    }
+    (in_safe, at_edges)
 }
 
 /// Pin `v` inside `to`'s safe area, but to its bottom edge: below the title

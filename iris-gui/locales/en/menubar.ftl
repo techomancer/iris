@@ -46,3 +46,5 @@ mb-guide = IRIS Guide
 mb-report-issue = Report an Issue
 mb-view-fit = Scale to Fit
 mb-view-stretch = Stretch
+mb-view-fit-window = Size Window to Display
+mb-view-fit-window-full-screen = Full screen sizes the display to the screen.

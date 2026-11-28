@@ -435,8 +435,9 @@ Mac App Store and sandbox constraints.
 | Note | Kind | Title |
 |---|---|---|
 | [appstore-private-api.md](macos/appstore-private-api.md) | rule | Mac App Store rejects winit's private SkyLight blur API (`CGSSetWindowBackgroundBlurRadius`) |
+| [mac-build-numbers-must-beat-every-upload.md](macos/mac-build-numbers-must-beat-every-upload.md) | rule | App Store version stays fixed per release (one Beta App Review); the Mac build number is `20261129.<run>` because it must beat every earlier upload |
 | [app-nap-throttles-background-work.md](macos/app-nap-throttles-background-work.md) | rule | App Nap slowed a background CHD conversion 4x; the Mac app holds an NSProcessInfo activity while a machine runs, disks sync or a disk converts |
-| [split-view-controller-and-window-size-gotchas.md](macos/split-view-controller-and-window-size-gotchas.md) | rule | Under NSSplitViewController page constraints above 500 grow the window; the split autosave restores a stale collapse; debug builds wait for the monitor's `start` |
+| [split-view-controller-and-window-size-gotchas.md](macos/split-view-controller-and-window-size-gotchas.md) | rule | Under NSSplitViewController page constraints above 500 grow the window; the split autosave restores a stale collapse; full screen takes the sidebar out of the split (AppKit reveals a collapsed one and narrows the display) and pins the display to the pane's edges; the display refits from its clip view; debug builds wait for the monitor's `start` |
 | [ppmem-shm-open-is-refused-in-the-app-sandbox.md](macos/ppmem-shm-open-is-refused-in-the-app-sandbox.md) | rule | The App Sandbox refuses ppmem's POSIX shm_open; macOS falls back to Mach memory entries (`IRIS_PPMEM_BACKEND=mach` to test) |
 | [chd-fold-needs-folder-grant-not-file-grant.md](macos/chd-fold-needs-folder-grant-not-file-grant.md) | rule | macOS App Sandbox: the CHD on-exit fold needs a *folder* grant, not a file grant |
 | [test-the-app-sandbox-locally-without-the-app-store.md](macos/test-the-app-sandbox-locally-without-the-app-store.md) | howto | Test the macOS App Sandbox locally — no App Store round-trip needed |
