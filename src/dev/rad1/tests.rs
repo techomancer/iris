@@ -1598,8 +1598,8 @@ fn a_tone_in_guest_memory_reaches_the_host_on_a_stepped_clock() {
 }
 
 /// The real output pump and the resampling to a file's 48 kHz, which the
-/// stepped tests skip. It waits for frames, not for a time, so a loaded host
-/// only makes it slower.
+/// stepped tests skip. It waits for the card's frames and for the file thread
+/// to render some of them, so a stalled host thread only makes it slower.
 #[test]
 fn a_tone_reaches_a_file_through_the_real_pump() {
     use crate::host_audio::test_signal::*;
@@ -1621,6 +1621,9 @@ fn a_tone_reaches_a_file_through_the_real_pump() {
     program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
     wr(&r, 0x58, 0x2000_0001);
     assert!(until(|| r.state.lock().chan[CH_OUT].frames >= 8820), "the pump never moved the ring");
+    // The card's count follows host time, so a stalled file thread would leave an empty file.
+    assert!(until(|| r.sink.lock().as_ref().and_then(|sk| sk.host.as_ref()).is_some_and(|o| o.stats().played >= 4800)),
+        "the file thread never rendered the tone");
     // The frames played before the DAC mute are counted in the same step.
     let loud = {
         let _tick = r.tick_pass.lock();
