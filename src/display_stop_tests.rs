@@ -193,7 +193,7 @@ fn the_octane_stops_its_disks_before_its_graphics() {
     let mut machine = big_stack(move || crate::ip30_machine::OctaneMachine::new(&cfg).expect("Octane"));
     let (scsi, ioc3) = (machine.scsi.clone(), machine.ioc3.clone());
     let (probe, overlap) = Probe::watching(move || ioc3.is_running() || scsi.iter().any(|s| s.is_running()));
-    *machine.gfx.as_ref().expect("graphics").display().renderer_slot().lock() = Some(Box::new(probe.clone()));
+    *machine.gfx.first().expect("graphics").1.display().renderer_slot().lock() = Some(Box::new(probe.clone()));
     machine.restart_peripherals();
     assert!(!machine.scsi.is_empty() && machine.scsi.iter().all(|s| s.is_running()), "the SCSI controllers are running");
     assert!(machine.ioc3.is_running(), "IOC3 is running");

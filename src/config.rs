@@ -5073,7 +5073,7 @@ mod export_tests {
     }
 
     /// The graphics board is a placed device, so it holds its port: an Octane's default
-    /// board is at xio11 and a machine with no board, or no slot for one, lists none.
+    /// board is at xio12 and a machine with no board, or no slot for one, lists none.
     /// `workstation::build` settles the legacy card flags, as the GUI never runs `load_config`: two flags for
     /// one GIO slot clash only if the build resolved them.
     #[test]
@@ -5114,7 +5114,7 @@ mod export_tests {
             cfg.devices.retain(|d| matches!(d.device, DeviceModel::Board(_) | DeviceModel::Empty));
             DevicePlacement::new(&cfg).unwrap().graphics().map(|at| at.to_string()).into_iter().collect()
         };
-        assert_eq!(at("octane_ip30", ""), ["xio11"]);
+        assert_eq!(at("octane_ip30", ""), ["xio12"]);
         assert_eq!(at("indy_ip24", ""), ["gfx"]);
         assert_eq!(at("onyx2_ip27", "[[devices]]\ntype = \"kona\"\nmodel = \"ir2\"\n"), ["xio8"]);
         assert_eq!(at("fuel_ip34", "[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n"), ["xio13"]);
@@ -5124,11 +5124,11 @@ mod export_tests {
         let mut cfg = MachineConfig::from_toml_str("[machine]\nprofile = \"octane_ip30\"\n").unwrap();
         cfg.devices.clear();
         let listing = DevicePlacement::new(&cfg).unwrap().list_slots();
-        assert!(listing.lines().any(|l| l.starts_with("xio11 ") && l.contains("impact solid (default)")), "{listing}");
+        assert!(listing.lines().any(|l| l.starts_with("xio12 ") && l.contains("impact solid (default)")), "{listing}");
         let mut none = cfg.clone();
         none.set_graphics(None);
         let listing = DevicePlacement::new(&none).unwrap().list_slots();
-        assert!(listing.lines().any(|l| l.starts_with("xio11 ") && l.contains(" none ")), "{listing}");
+        assert!(listing.lines().any(|l| l.starts_with("xio12 ") && l.contains(" none ")), "{listing}");
         let indy = DevicePlacement::new(&MachineConfig::from_toml_str("").unwrap()).unwrap().list_slots();
         assert!(indy.contains("newport (default)") && indy.contains("a graphics board (newport)"), "{indy}");
     }

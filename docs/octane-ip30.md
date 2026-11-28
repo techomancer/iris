@@ -163,9 +163,11 @@ and red for red.
 
 ## Graphics
 
-The graphics board sits on widget 11: the same raster chips as the Indigo2
-IP28's IMPACT boards behind the Octane's XIO host interface (the HQ4), with
-interrupts and DMA through HEART. A device entry (`--device impact,model=max`) picks
+An IMPACT board sits on widget 12, slot A, where real Octanes report it
+(OCTANE Dual Head Installation Guide, 007-3531-002); a VPro sits on widget 11,
+`slot_ab`. The IMPACT is the same raster chips as the Indigo2 IP28's IMPACT
+boards behind the Octane's XIO host interface (the HQ4), with interrupts and
+DMA through HEART. A device entry (`--device impact,model=max`) picks
 the board, as on the other machines:
 
 | Value | The PROM's name | GEs / REs | Texture |
@@ -187,7 +189,7 @@ then runs on its serial console with no window.
 
 An Octane takes graphics boards in any XIO slot, one device to a slot. SGI's
 Dual Head module (Octane2 Dual Head Installation Guide, 007-4493-001) is the
-real case: the first board sits in `slot_ab` (`xio11`, also `graphics`) and a
+real case: the first board sits in `slot_ab` (`xio11`) and a
 `vpro` entry at `slot_cd` (`xio10`) adds the second. iris does not enforce what
 SGI limits for power, cooling or fit (the module's lack of room for another XIO
 board, two processors, an IRIX release, no VPro beside an IMPACT), so the pair

@@ -73,7 +73,7 @@ pub(crate) const SYSTEM_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
 
 /// The XIO slots as Crossbow ports, by letter A to D (007-3582-001 p. 33), in the order a board with no slot takes them;
 /// real Octanes have a shoehorn in 10. The dual-head module takes two slots a head, A/B and C/D (007-4493-001, chapter 1).
-const XIO_SLOTS: [(u8, &[&str]); 4] = [(10, &["slot_d", "slot_cd"]), (12, &["slot_a"]), (9, &["slot_c"]), (11, &["slot_b", "slot_ab", "graphics"])];
+const XIO_SLOTS: [(u8, &[&str]); 4] = [(10, &["slot_d", "slot_cd"]), (12, &["slot_a", "graphics"]), (9, &["slot_c"]), (11, &["slot_b", "slot_ab"])];
 
 /// The Octane's slots.
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
@@ -84,9 +84,14 @@ pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
     for (w, aliases) in XIO_SLOTS {
         crate::topology::open_slot(s, &format!("xio{w}"), &[DeviceFamily::Xio, DeviceFamily::Gfx], aliases);
     }
-    // Any graphics board goes in any XIO slot; a board with no slot goes in B.
-    crate::topology::boards(s, &format!("xio{WIDGET_GFX}"), OCTANE_BOARDS, Some(GraphicsBoard::SolidImpact));
-    for w in [WIDGET_GFX2, 12, 9] {
+    // Any graphics board goes in any XIO slot. With no slot named an IMPACT is the machine's own board in A
+    // (007-3531-002) and a VPro in B, where a measured Octane2 has it.
+    crate::topology::boards(s, &format!("xio{WIDGET_GFX}"), &OCTANE_BOARDS[..3], Some(GraphicsBoard::SolidImpact));
+    crate::topology::boards(s, &format!("xio{WIDGET_VPRO}"), &OCTANE_BOARDS[3..], None);
+    crate::topology::own_boards(s, &format!("xio{WIDGET_VPRO}"));
+    crate::topology::named_boards(s, &format!("xio{WIDGET_GFX}"), &OCTANE_BOARDS[3..]);
+    crate::topology::named_boards(s, &format!("xio{WIDGET_VPRO}"), &OCTANE_BOARDS[..3]);
+    for w in [WIDGET_GFX2, 9] {
         crate::topology::named_boards(s, &format!("xio{w}"), OCTANE_BOARDS);
     }
     crate::topology::open_slot(s, &format!("xio{}", crate::dev::xio_pci::CAGE_WIDGET), &[DeviceFamily::Cage], &["pci_module", "shoebox"]);
@@ -172,9 +177,10 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
     let (major, minor) = rest[..end].split_once('.')?;
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
-/// The graphics port the one IMPACT board sits in. A choice: it is where a
-/// measured Octane2 has its graphics board, not a measured SI placement.
-pub const WIDGET_GFX: u8 = 11;
+/// The port of the IMPACT board in slot A, where an Octane's own graphics board sits (007-3531-002).
+pub const WIDGET_GFX: u8 = 12;
+/// The port of a VPro in slots A/B, where a measured Octane2 has its graphics board; an IMPACT secondary also takes it.
+const WIDGET_VPRO: u8 = 11;
 /// The port of the second VPro of a dual-head Octane2 (007-4493-001 p. 1).
 const WIDGET_GFX2: u8 = 10;
 /// The blank part on the Bridge's second flash select: reads all ones and
@@ -350,8 +356,8 @@ pub struct OctaneMachine {
     /// The virtio and audio functions the entries placed on the buses.
     cards: crate::devices::AttachedCards,
     flash: Arc<CfiFlash>,
-    /// The IMPACT board, when `[graphics] board` or an `impact` entry names one.
-    pub gfx: Option<Arc<ImpactXio>>,
+    /// The IMPACT boards, the machine's own and an `impact` entry's, with the slot each is in; the board at the highest port is first.
+    pub gfx: Vec<(MachineSlotPath, Arc<ImpactXio>)>,
     /// The VPro boards, `[graphics] board`'s and a `vpro` entry's, with the slot each is in; the board at the highest port is first.
     pub vpro: Vec<(MachineSlotPath, Arc<Odyssey>)>,
     nat: Option<(Arc<crate::net::NatControl>, (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr))>,
@@ -382,7 +388,7 @@ impl OctaneMachine {
         let banks = heart_banks(cfg);
         let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
         let boards = placed_boards(&resolved);
-        let board = boards.iter().map(|(b, _)| *b).find(|b| b.is_impact());
+        let impacts: Vec<_> = boards.iter().filter(|(b, _)| b.is_impact()).collect();
         let vpros: Vec<_> = boards.iter().filter(|(b, _)| b.is_vpro()).collect();
         for &&(kind, _) in &vpros {
             let needed = vpro_prom_needed(kind);
@@ -510,13 +516,18 @@ impl OctaneMachine {
         let fasttick = Arc::new(AtomicU64::new(0));
         let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
         status.set_scsi_wide(true);
-        let gfx = board
-            .map(|b| ImpactXio::with_raster(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone(), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str())))
-            .transpose()?;
-        let vpro = vpros
+        let gfx = impacts
             .iter()
             .map(|&&(kind, ref at)| {
                 let widget = at.last_number().unwrap_or(WIDGET_GFX);
+                let board = ImpactXio::with_raster(widget, kind, heart.clone(), mem.clone(), status.clone(), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()))?;
+                Ok((at.clone(), board))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let vpro = vpros
+            .iter()
+            .map(|&&(kind, ref at)| {
+                let widget = at.last_number().unwrap_or(WIDGET_VPRO);
                 let board = Odyssey::new(widget, kind.as_str(), heart.clone(), mem.clone(), status.clone(), (cfg.graphics.threads, cfg.graphics.tile), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()))?;
                 Ok((at.clone(), board))
             })
@@ -537,11 +548,11 @@ impl OctaneMachine {
             phys.attach_long_window(b.widget(), b.bridge().long_window());
             phys.attach_huge_window(b.widget(), b.bridge().huge_window());
         }
-        if let Some(g) = &gfx {
-            phys.attach_widget(WIDGET_GFX, g.clone(), false);
+        for (at, g) in &gfx {
+            phys.attach_widget(at.last_number().unwrap_or(WIDGET_GFX), g.clone(), false);
         }
         for (at, v) in &vpro {
-            phys.attach_widget(at.last_number().unwrap_or(WIDGET_GFX), v.clone(), true);
+            phys.attach_widget(at.last_number().unwrap_or(WIDGET_VPRO), v.clone(), true);
         }
         let phys = Arc::new(phys);
         phys.init();
@@ -643,8 +654,8 @@ impl OctaneMachine {
             let n = status.add_cpu_stats(c.cycles_ptr(), tick.clone());
             c.publish_tick_rate(status.cpu(n).tick_rate());
         }
-        if let Some(g) = &gfx {
-            // Host GL frames composite straight into the IMPACT framebuffer.
+        if let Some((_, g)) = gfx.first() {
+            // Host GL frames composite straight into the first IMPACT framebuffer.
             #[cfg(feature = "hostgl")]
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(g.mgras().clone())));
         }
@@ -710,7 +721,7 @@ impl OctaneMachine {
             ram: ram.clone(),
             xbow: xbow.clone(),
             bridge: bridge.clone(),
-            gfx: gfx.clone(),
+            gfx: gfx.first().map(|(_, g)| g.clone()),
         }));
         for c in &scsi {
             monitor.register_device(c.clone());
@@ -733,7 +744,7 @@ impl OctaneMachine {
         flash.register_locks();
         ioc3.register_locks();
         rad.register_locks();
-        if let Some(g) = &gfx {
+        for (_, g) in &gfx {
             monitor.register_device(g.mgras().clone());
             g.register_locks();
         }
@@ -904,21 +915,19 @@ impl OctaneMachine {
             self.rad.clone(),
         ];
         d.extend(self.cards.devices());
-        if let Some(g) = &self.gfx {
-            d.push(g.clone());
-        }
         d.extend(self.vpro.iter().map(|(_, v)| v.clone() as Arc<dyn Device>));
+        d.extend(self.gfx.iter().map(|(_, g)| g.clone() as Arc<dyn Device>));
         d
     }
 
     /// Reverse of start order, but graphics last: its stop joins a display
     /// thread, which can fail to end, and the disks must be stopped by then.
     fn stop_devices(&self) {
-        // `devices` ends with the graphics board, if there is one.
-        for d in self.devices().iter().rev().skip(self.gfx.iter().count()) {
+        // `devices` ends with the IMPACT boards.
+        for d in self.devices().iter().rev().skip(self.gfx.len()) {
             d.stop();
         }
-        if let Some(g) = &self.gfx {
+        for (_, g) in &self.gfx {
             g.stop();
         }
     }
@@ -984,7 +993,7 @@ impl OctaneMachine {
         self.rad.reset();
         self.cards.power_on();
         self.flash.reset();
-        if let Some(g) = &self.gfx {
+        for (_, g) in &self.gfx {
             g.power_on();
         }
         for (_, v) in &self.vpro {
@@ -1052,7 +1061,7 @@ fn snapshot_refusal_for(_impact: bool, _vpro: bool, cpus: usize) -> Option<Strin
 /// The state a snapshot keeps a board's metadata in. A lone board in slot B keeps `kind`, the name it always had; any
 /// other is told apart by its slot, so a snapshot cannot be loaded with its board at another port.
 fn board_state(kind: &str, at: &MachineSlotPath, count: usize) -> String {
-    if count == 1 && at.last_number() == Some(WIDGET_GFX) { kind.into() } else { format!("{kind}_{at}") }
+    if count == 1 && at.last_number() == Some(WIDGET_VPRO) { kind.into() } else { format!("{kind}_{at}") }
 }
 
 /// The `machine` an Octane snapshot's manifest names.
@@ -1189,7 +1198,7 @@ impl Workstation for OctaneMachine {
         self.lifecycle = state;
     }
     fn display(&self, n: usize) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        self.gfx.iter().map(|g| g.display()).chain(self.vpro.iter().map(|(_, v)| v.display())).nth(n)
+        self.gfx.iter().map(|(_, g)| g.display()).chain(self.vpro.iter().map(|(_, v)| v.display())).nth(n)
     }
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
@@ -1219,14 +1228,14 @@ impl Workstation for OctaneMachine {
         self
     }
     fn snapshot_refusal(&self) -> Option<String> {
-        snapshot_refusal_for(self.gfx.is_some(), !self.vpro.is_empty(), self.cpus.len()).or_else(|| self.cards.snapshot_blocker())
+        snapshot_refusal_for(!self.gfx.is_empty(), !self.vpro.is_empty(), self.cpus.len()).or_else(|| self.cards.snapshot_blocker())
     }
     fn snapshot_layout(&self) -> crate::snapshot::Layout {
         use crate::snapshot::BoardList;
         let cpu = &self.cpus[0];
         let mut states = vec!["cpu".to_string(), "octane".into()];
         states.extend((!self.cards.is_empty()).then(|| "cards".to_string()));
-        let impact = self.gfx.iter().map(|_| ("impact".to_string(), BoardList::Impact));
+        let impact = self.gfx.iter().map(|(at, _)| (board_state("impact", at, self.gfx.len()), BoardList::Impact));
         let vpro = self.vpro.iter().map(|(at, _)| (board_state("vpro", at, self.vpro.len()), BoardList::Vpro));
         crate::snapshot::Layout {
             machine: Some(SNAPSHOT_MACHINE),
@@ -1247,13 +1256,13 @@ impl Workstation for OctaneMachine {
         if !self.cards.is_empty() {
             states.push(("cards".into(), self.cards.save_state()));
         }
-        let impact = self.gfx.as_ref().map(|gfx| gfx.snapshot_parts().map(|p| Board::new("impact", BoardList::Impact, p))).transpose()?;
+        let impact = self.gfx.iter().map(|(at, g)| g.snapshot_parts().map(|p| Board::new(board_state("impact", at, self.gfx.len()), BoardList::Impact, p)));
         let vpro = self.vpro.iter().map(|(at, v)| v.snapshot_parts().map(|p| Board::new(board_state("vpro", at, self.vpro.len()), BoardList::Vpro, p)));
         Ok(crate::snapshot::Image {
             states,
             files: vec![("flash.bin".into(), self.flash.contents())],
             memory: self.ram.bank_words().into_iter().map(|w| (0, w.into())).collect(),
-            boards: impact.into_iter().map(Ok).chain(vpro).collect::<Result<_, String>>()?,
+            boards: impact.chain(vpro).collect::<Result<_, String>>()?,
             ..Default::default()
         })
     }
@@ -1264,7 +1273,8 @@ impl Workstation for OctaneMachine {
         self.ram.restore_bank_words(&image.memory[0].1)?;
         let none = toml::Value::Table(Default::default());
         self.load_board(image.state("octane")?, image.state("cards").unwrap_or(&none))?;
-        if let (Some(gfx), Some(b)) = (&self.gfx, image.board("impact")) {
+        for (at, gfx) in &self.gfx {
+            let b = image.board(&board_state("impact", at, self.gfx.len())).ok_or_else(|| format!("snapshot has no state for the IMPACT board at {at}"))?;
             gfx.restore_snapshot_parts(&b.metadata, &b.parts)?;
         }
         for (at, vpro) in &self.vpro {
@@ -2125,7 +2135,9 @@ mod snapshot_tests {
             let dir = scratch("impact");
             let prom = empty_prom(&dir);
             let mut m = machine_with(&prom, &dir, |cfg| cfg.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::SolidImpact))));
-            let gfx = m.gfx.as_ref().unwrap().clone();
+            assert_eq!(m.gfx[0].0.to_string(), "xio12");
+            assert!(m.xbow.carries(12) && !m.xbow.carries(11), "slot A's link is up, slot B's is not");
+            let gfx = m.gfx[0].1.clone();
             let board = gfx.mgras().clone();
             board.start_engines();
             let rss = |reg: u32, value: u32, exec: bool| {
@@ -2166,6 +2178,11 @@ mod snapshot_tests {
             crate::snapshot::load_in(&mut m, &dir.join("saves"), "x").unwrap();
             assert_eq!(board.fb_pixel(25, 35), 0x12);
             assert_eq!(gfx.read32(base + 0x24).data, 0xC1D2_8354);
+            // A snapshot from when the board was at widget 11 keeps its state under the bare name.
+            let saved = dir.join("saves/x");
+            std::fs::rename(saved.join("impact_xio12.bin"), saved.join("impact.bin")).unwrap();
+            let e = crate::snapshot::read(&m, &dir.join("saves"), "x").err().unwrap();
+            assert!(e.contains("impact_xio12"), "{e}");
             m.stop();
         }).unwrap().join().unwrap();
     }
@@ -2183,7 +2200,7 @@ mod snapshot_tests {
                     cfg.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::V6)))
                 });
                 let vpro = m.vpro[0].1.clone();
-                let sw_token = widget_small_base(WIDGET_GFX) + 0x107c;
+                let sw_token = widget_small_base(WIDGET_VPRO) + 0x107c;
                 vpro.start();
                 assert_eq!(vpro.write32(sw_token, 0x51c2_93a4), crate::traits::BUS_OK);
                 assert_eq!(vpro.read32(sw_token).data, 0x51c2_93a4);

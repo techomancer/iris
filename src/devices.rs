@@ -314,7 +314,12 @@ impl ConfiguredDevice {
     }
 
     pub fn names_graphics(&self, profile: crate::config::MachineProfile) -> bool {
-        matches!(self.device, DeviceModel::Board(_) | DeviceModel::Empty) && self.at.as_deref().is_none_or(|at| profile.is_graphics_slot(at))
+        let board = match &self.device {
+            DeviceModel::Board(b) => Some(b.model),
+            DeviceModel::Empty => None,
+            _ => return false,
+        };
+        self.at.as_deref().is_none_or(|at| profile.is_graphics_slot(at, board))
     }
 
     /// The entry's keys in the order a file lists them: `type`, `name`, `at`, then the options.

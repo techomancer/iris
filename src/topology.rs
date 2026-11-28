@@ -100,6 +100,8 @@ pub struct MachineSlot {
     /// Boards that go here only when an entry names the slot.
     pub named: &'static [GraphicsBoard],
     pub default: Option<GraphicsBoard>,
+    /// A board of `boards` is the machine's own here too, as in the slot called `graphics`.
+    pub own: bool,
 }
 
 impl MachineSlot {
@@ -131,7 +133,7 @@ fn insert_slot(slots: &mut Vec<MachineSlot>, path: MachineSlotPath, kind: Machin
     assert!(!slots.iter().any(|s| s.path == path), "{path} declared twice");
     let parent = path.parent().unwrap_or_default();
     let i = slots.iter().rposition(|s| s.path.starts_with(&parent)).map_or(slots.len(), |i| i + 1);
-    slots.insert(i, MachineSlot { path, kind, aliases, boards: &[], named: &[], default: None });
+    slots.insert(i, MachineSlot { path, kind, aliases, boards: &[], named: &[], default: None, own: false });
 }
 
 fn names(aliases: &[&str]) -> Vec<String> {
@@ -146,6 +148,10 @@ pub fn open_slot(slots: &mut Vec<MachineSlot>, at: &str, families: &'static [Dev
 pub fn boards(slots: &mut [MachineSlot], at: &str, boards: &'static [GraphicsBoard], default: Option<GraphicsBoard>) {
     let slot = slots.iter_mut().find(|s| s.path == slot_path(at)).expect("a declared slot");
     (slot.boards, slot.default) = (boards, default);
+}
+
+pub fn own_boards(slots: &mut [MachineSlot], at: &str) {
+    slots.iter_mut().find(|s| s.path == slot_path(at)).expect("a declared slot").own = true;
 }
 
 pub fn named_boards(slots: &mut [MachineSlot], at: &str, named: &'static [GraphicsBoard]) {
@@ -289,28 +295,47 @@ impl MachineProfile {
         s
     }
 
-    /// The machine's graphics slot, built once: a front end asks every frame.
-    fn graphics_slot(self) -> Option<&'static MachineSlot> {
-        static SLOTS: std::sync::OnceLock<Vec<(MachineProfile, Option<MachineSlot>)>> = std::sync::OnceLock::new();
+    /// The slots for the machine's own board, the `graphics` slot first, built once: a front end asks every frame.
+    fn main_slots(self) -> &'static [MachineSlot] {
+        static SLOTS: std::sync::OnceLock<Vec<(MachineProfile, Vec<MachineSlot>)>> = std::sync::OnceLock::new();
         let all = SLOTS.get_or_init(|| {
-            let find = |p: MachineProfile| p.slots().into_iter().find(|s| s.aliases.iter().any(|a| a == "graphics"));
+            let find = |p: MachineProfile| {
+                let mut slots = p.slots();
+                slots.retain(|s| s.own || s.aliases.iter().any(|a| a == "graphics"));
+                slots.sort_by_key(|s| !s.aliases.iter().any(|a| a == "graphics"));
+                slots
+            };
             MachineProfile::EVERY.into_iter().map(|p| (p, find(p))).collect()
         });
-        all.iter().find(|(p, _)| *p == self).and_then(|(_, s)| s.as_ref())
+        all.iter().find(|(p, _)| *p == self).map_or(&[], |(_, s)| s)
     }
 
-    /// Whether `at` names the machine's graphics slot: `graphics`, its path or another alias.
-    pub fn is_graphics_slot(self, at: &str) -> bool {
-        self.graphics_slot().is_some_and(|s| s.aliases.iter().any(|a| a == at) || s.path.to_string() == at)
+    fn graphics_slot(self) -> Option<&'static MachineSlot> {
+        self.main_slots().iter().find(|s| s.aliases.iter().any(|a| a == "graphics"))
     }
 
-    pub fn graphics_boards(self) -> &'static [GraphicsBoard] {
-        self.graphics_slot().map_or(&[], |s| s.boards)
+    /// Whether `at` names a graphics slot that `board` (any, for `none`) is the machine's own board in.
+    pub fn is_graphics_slot(self, at: &str, board: Option<GraphicsBoard>) -> bool {
+        names_main_slot(self.main_slots(), at, board)
+    }
+
+    /// The boards the machine's own board slots take, the `graphics` slot's first.
+    pub fn graphics_boards(self) -> Vec<GraphicsBoard> {
+        self.main_slots().iter().flat_map(|s| s.boards.iter().copied()).collect()
     }
 
     pub fn default_board(self) -> Option<GraphicsBoard> {
         self.graphics_slot().and_then(|s| s.default)
     }
+}
+
+/// Whether `at` is a slot for the machine's own board and `board` is not one that goes there only by name, as a second does.
+/// Any board named at the `graphics` slot takes the place of its default, so it is the machine's own.
+fn names_main_slot(slots: &[MachineSlot], at: &str, board: Option<GraphicsBoard>) -> bool {
+    slots.iter().filter(|s| s.own || s.aliases.iter().any(|a| a == "graphics")).any(|s| {
+        let graphics = s.aliases.iter().any(|a| a == "graphics");
+        (s.path.to_string() == at || s.aliases.iter().any(|a| a == at)) && board.is_none_or(|b| graphics || s.boards.contains(&b) || !s.named.contains(&b))
+    })
 }
 
 /// A config placed on its machine's slots: where each device went, the slots grown by what devices brought, and the PCI buses
@@ -345,10 +370,10 @@ impl DevicePlacement {
         }
         let mut devices = devices.to_vec();
         for slot in slots.iter().filter(|s| s.default.is_some()) {
-            let at_slot = |at: &str| expand(machine, &slots, at, &mut |_| Ok(None)).is_ok_and(|p| p == slot.path);
+            let at_slot = |at: &str, board| expand(machine, &slots, at, &mut |_| Ok(None)).is_ok_and(|p| p == slot.path) || names_main_slot(&slots, at, board);
             let named = devices.iter().any(|d| match &d.device {
-                DeviceModel::Board(_) => d.at.as_deref().is_none_or(at_slot),
-                DeviceModel::Empty => d.at.as_deref().is_some_and(at_slot),
+                DeviceModel::Board(b) => d.at.as_deref().is_none_or(|at| at_slot(at, Some(b.model))),
+                DeviceModel::Empty => d.at.as_deref().is_some_and(|at| at_slot(at, None)),
                 _ => false,
             });
             if let (false, Some(model)) = (named, slot.default) {
@@ -1149,14 +1174,14 @@ mod tests {
     fn an_option_board_cannot_take_the_graphics_port() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::OctaneIp30;
-        cfg.devices = vec![dev("pci_shoehorn", None, Some("xio11"))];
+        cfg.devices = vec![dev("pci_shoehorn", None, Some("xio12"))];
         let e = DevicePlacement::new(&cfg).err().expect("refused");
-        assert!(e.contains("xio11 is the graphics board's port, taken by the pci_shoehorn"), "{e}");
+        assert!(e.contains("xio12 is the graphics board's port, taken by the pci_shoehorn"), "{e}");
         cfg.devices = (0..4).map(|_| dev("pci_shoehorn", None, None)).collect();
         let e = DevicePlacement::new(&cfg).err().expect("refused");
         assert!(e.contains("no free slot for xio boards"), "{e}");
         cfg.devices.pop();
         let p = DevicePlacement::new(&cfg).ok().expect("placed");
-        assert_eq!(p.graphics().map(|g| g.to_string()).as_deref(), Some("xio11"));
+        assert_eq!(p.graphics().map(|g| g.to_string()).as_deref(), Some("xio12"));
     }
 }
