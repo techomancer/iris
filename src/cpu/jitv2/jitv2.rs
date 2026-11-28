@@ -378,6 +378,25 @@ pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 /// waits seconds behind that compile's backlog, measured with jitcov on IP28).
 pub const HOT_PROMOTE_ARRIVALS: u32 = 256;
 
+/// How many arrivals the dispatch gate folds into a page's shared hot-lane
+/// counter at a time.
+///
+/// The counter lives in the page, and the page is shared with the compile
+/// worker: writing it on every arrival put a shared atomic write on the CPU
+/// thread's hot path, where it ping-ponged with the worker's copy of the same
+/// cache line. The CPU counts arrivals in a field of its own instead and
+/// folds the total in batches, so every arrival is still counted — the
+/// promotion threshold is unchanged — and the shared line is written once
+/// per batch.
+///
+/// One bounded exception: a batch that spans a wait boundary (the page's
+/// request completes while the CPU still holds part of a batch) carries at
+/// most `HOT_ARRIVAL_BATCH - 1` arrivals into the *next* wait, so the page
+/// can be promoted a few arrivals early out of `HOT_PROMOTE_ARRIVALS`. The
+/// threshold is a heuristic — how hard a page is being executed — so a few
+/// arrivals either way do not change what it is for.
+pub const HOT_ARRIVAL_BATCH: u32 = 16;
+
 /// Requests the hot lane holds (see `CompileQueue::hot`), shared by every CPU
 /// and worker of the machine. A tunable: few, so a page that turns hot waits
 /// behind few compiles, not pages that were hot a backlog ago; a refused
@@ -668,11 +687,6 @@ fn new_bitmap_all_set() -> EntryBitmap {
 #[inline]
 fn bitmap_test(bm: &EntryBitmap, offset: usize, order: Ordering) -> bool {
     bm[offset >> 6].load(order) & (1u64 << (offset & 63)) != 0
-}
-
-#[inline]
-fn bitmap_set(bm: &EntryBitmap, offset: usize, order: Ordering) {
-    bm[offset >> 6].fetch_or(1u64 << (offset & 63), order);
 }
 
 /// Test-and-set a single bit; returns `true` iff this call is the one that
@@ -1734,8 +1748,20 @@ impl PhysicalCodePage {
     /// compile time — a page is normally dispatched in its pinned mode, and
     /// re-deriving unconditionally would let an unrelated dispatch re-pin a
     /// page that was never mismatched.
+    ///
+    /// The read-only fast path is the steady state: nothing is outstanding
+    /// and the page is pinned, so the mode is simply the pinned one. Both
+    /// swaps below wrote shared state on every arrival, which ping-ponged
+    /// their cache lines with the compile worker; a re-pin requested between
+    /// the fast path's load and its return is not lost — it stays outstanding
+    /// and the next arrival consumes it.
     #[inline]
     pub fn take_fr_repin(&self, live_fr1: bool) -> bool {
+        if self.fr_repin.load(Ordering::Relaxed) == FR_REPIN_NONE
+            && !self.fr_unpinned.load(Ordering::Relaxed)
+        {
+            return self.fr1.load(Ordering::Relaxed);
+        }
         match self.fr_repin.swap(FR_REPIN_NONE, Ordering::Relaxed) {
             FR_REPIN_FR0 => { self.fr1.store(false, Ordering::Relaxed); false }
             FR_REPIN_FR1 => { self.fr1.store(true, Ordering::Relaxed); true }
@@ -2076,16 +2102,29 @@ impl PhysicalCodePage {
         self.compiled[offset_word >> 6].fetch_and(!(1u64 << (offset_word & 63)), Ordering::Release);
     }
 
-    /// Mark `offset_word` as a requested entry point (§13.2) — unconditional,
-    /// not a test-and-set: unlike the old per-offset `ENTRY_SCHEDULED` flag,
-    /// `requested` bits are meant to accumulate and stay set across however
-    /// many compile passes it takes to eventually get covered (§13.3's
-    /// coalescing), not be claimed by a single "first caller" and cleared
-    /// per-offset once decided. Idempotent — setting an already-set bit is a
-    /// no-op.
+    /// Mark `offset_word` as a requested entry point (§13.2) — the bit
+    /// accumulates and stays set across however many compile passes it takes
+    /// to eventually get covered (§13.3's coalescing); it is not claimed by a
+    /// single "first caller" and cleared per-offset once decided. Idempotent
+    /// — setting an already-set bit is a no-op.
+    ///
+    /// Test-then-set, not an unconditional `fetch_or`: the steady state is
+    /// an arrival at an offset that is *already* requested (the compile that
+    /// would cover it has not run yet), and the unconditional read-modify-
+    /// write put a shared cache-line write on the CPU thread's hot path
+    /// there. That write invalidates the compile worker's copy of the same
+    /// line — the worker clears these very bits when it publishes — and the
+    /// two then ping-pong the line for every arrival. The load below is
+    /// enough to skip the write; the `fetch_or` still does the actual set,
+    /// so two CPUs racing on a fresh offset both end up with it requested.
     #[inline]
     pub fn mark_requested(&self, offset_word: usize) {
-        bitmap_set(&self.requested, offset_word, Ordering::Relaxed);
+        let word = offset_word >> 6;
+        let bit = 1u64 << (offset_word & 63);
+        if self.requested[word].load(Ordering::Relaxed) & bit != 0 {
+            return;
+        }
+        self.requested[word].fetch_or(bit, Ordering::Relaxed);
     }
 
     /// Whether `offset_word` currently has a live `requested` bit — i.e. some
@@ -2107,8 +2146,17 @@ impl PhysicalCodePage {
     /// triggered this particular call. Distinct from `mark_requested`: this
     /// gate is purely about not flooding the queue with redundant page-level
     /// sends, not about tracking which offsets are wanted.
+    ///
+    /// The plain load first is an optimization, not the decision: the steady
+    /// state is "a request is already in flight", and the unconditional
+    /// `swap` wrote the shared flag on every arrival (ping-ponging its cache
+    /// line with the compile worker that clears it). The `swap` below is
+    /// still the test-and-set that picks the one caller that sends.
     #[inline]
     pub fn try_schedule_page(&self) -> bool {
+        if self.page_scheduled.load(Ordering::Relaxed) {
+            return false;
+        }
         !self.page_scheduled.swap(true, Ordering::Relaxed)
     }
 
@@ -2156,6 +2204,47 @@ impl PhysicalCodePage {
     #[inline]
     pub fn note_waiting_arrival(&self) -> bool {
         self.hot_wait.fetch_add(1, Ordering::Relaxed) + 1 >= HOT_PROMOTE_ARRIVALS
+            && !self.promoted.swap(true, Ordering::Relaxed)
+    }
+
+    /// Count `n` arrivals at this page while its request is already queued.
+    ///
+    /// The dispatch gate counts arrivals here so a page that is executed
+    /// hard while its request sits in a full FIFO gets promoted to the hot
+    /// lane. Counting them one at a time put a shared atomic write on the
+    /// CPU thread's hot path, where it ping-ponged with the compile worker's
+    /// copy of the same cache line. The caller counts per CPU instead (a
+    /// field of its own, not shared) and folds the total in here, so the
+    /// total counted is the same — the promotion threshold is unchanged —
+    /// but the shared line is written once per batch instead of once per
+    /// arrival.
+    ///
+    /// The one bounded exception is a batch that spans a wait boundary: if
+    /// the page's request completes while the CPU still holds part of a
+    /// batch, those arrivals are folded into the *next* wait, so the page
+    /// can be promoted a few arrivals early out of `HOT_PROMOTE_ARRIVALS`.
+    ///
+    /// This only counts. The promotion is a separate step
+    /// ([`Self::take_hot_promotion`]): the caller that counts the arrivals
+    /// is the one that can put the request on the hot lane, and it must be
+    /// the page it is on.
+    #[inline]
+    pub fn note_waiting_arrivals(&self, n: u32) {
+        self.hot_wait.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Whether this page is due for the hot lane: its arrival count has
+    /// reached [`HOT_PROMOTE_ARRIVALS`] and it has not been promoted yet.
+    ///
+    /// Returns `true` exactly once per wait — the caller then puts a copy of
+    /// the request on the hot lane.
+    #[inline]
+    pub fn take_hot_promotion(&self) -> bool {
+        // `promoted` first: it stays set for the rest of the wait, so the
+        // steady state is one load and no write. The count is read second,
+        // and the swap below only happens when the page is actually due.
+        !self.promoted.load(Ordering::Relaxed)
+            && self.hot_wait.load(Ordering::Relaxed) >= HOT_PROMOTE_ARRIVALS
             && !self.promoted.swap(true, Ordering::Relaxed)
     }
 
@@ -4959,6 +5048,45 @@ mod tests {
             assert!(!page.note_waiting_arrival());
         }
         assert!(page.note_waiting_arrival(), "re-arms after the compile");
+    }
+
+    /// The batched counter must reach the same threshold as the one-at-a-time
+    /// one, and promote exactly once per wait: the dispatch gate counts
+    /// arrivals per CPU and folds them in batches, so the shared counter
+    /// moves in steps and the promotion lands on the first check after the
+    /// threshold is reached.
+    #[test]
+    fn a_batch_of_arrivals_reaches_the_same_promotion_threshold() {
+        let page = PhysicalCodePage::new(1, std::ptr::null());
+        assert!(page.try_schedule_page(), "first request queues");
+        // Every batch but the last stays short of the threshold.
+        let mut counted = 0u32;
+        while counted + HOT_ARRIVAL_BATCH < HOT_PROMOTE_ARRIVALS {
+            page.note_waiting_arrivals(HOT_ARRIVAL_BATCH);
+            counted += HOT_ARRIVAL_BATCH;
+            assert!(!page.take_hot_promotion(), "not hot yet");
+        }
+        // The last batch crosses it.
+        page.note_waiting_arrivals(HOT_PROMOTE_ARRIVALS - counted);
+        assert!(page.take_hot_promotion(), "promoted at the threshold");
+        assert!(!page.take_hot_promotion(), "and only once per wait");
+        page.clear_scheduled(); // a compile for the page completed
+        page.note_waiting_arrivals(HOT_PROMOTE_ARRIVALS);
+        assert!(page.take_hot_promotion(), "re-arms after the compile");
+    }
+
+    /// A batch that does not cross the threshold must not promote, and the
+    /// count it folds in must be the count the one-at-a-time path would
+    /// have reached — the threshold is on arrivals, not on calls.
+    #[test]
+    fn a_batch_below_the_threshold_does_not_promote() {
+        let page = PhysicalCodePage::new(1, std::ptr::null());
+        assert!(page.try_schedule_page());
+        page.note_waiting_arrivals(HOT_PROMOTE_ARRIVALS - 1);
+        assert!(!page.take_hot_promotion());
+        // The next arrival reaches the threshold exactly.
+        page.note_waiting_arrivals(1);
+        assert!(page.take_hot_promotion(), "the threshold counts arrivals");
     }
 
     #[test]

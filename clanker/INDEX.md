@@ -82,6 +82,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [deliver-exception-clears-in-delay-slot.md](jitv2/deliver-exception-clears-in-delay-slot.md) | rule | `deliver_exception_at` clears `in_delay_slot` itself |
 | [dev-trace-stub-must-not-split-entry-block.md](jitv2/dev-trace-stub-must-not-split-entry-block.md) | rule | `developer` trace stubs must not be filled before the dispatch switch is emitted |
 | [dirty-cache-page-probe.md](jitv2/dirty-cache-page-probe.md) | history | jitv2: the dirty-cache blind spot, and the probe that closes it |
+| [dispatch-gate-shared-writes.md](jitv2/dispatch-gate-shared-writes.md) | rule | The dispatch gate must not write shared per-page state on every arrival: five atomic RMWs per arrival ping-ponged with the compile worker; test-then-set, count per CPU, reuse the gate's translation |
 | [emit_absolute_pc_exit-in_delay_slot-followup.md](jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md) | open | Follow-up: `emit_absolute_pc_exit` should own its own `in_delay_slot=false` clear |
 | [entry-word-bail-must-not-touch-pc-or-bd.md](jitv2/entry-word-bail-must-not-touch-pc-or-bd.md) | rule | An entry-word bail must not touch `pc` or `in_delay_slot` |
 | [flush-preserved-entry-point-inflation.md](jitv2/flush-preserved-entry-point-inflation.md) | rule | Flush-preserved pages inherited the previous program's entry points |

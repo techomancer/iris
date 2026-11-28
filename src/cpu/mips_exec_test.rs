@@ -8928,4 +8928,79 @@ mod tests {
             check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true);
         });
     }
+
+    /// The dispatch gate counts hot-lane arrivals per CPU and folds them into
+    /// the page's shared counter in batches, so the CPU thread's hot path
+    /// keeps no shared write at all (see `jitv2_note_arrival`). The batch
+    /// must still count every arrival: the promotion threshold is on
+    /// arrivals, not on calls, so a page that is executed hard while its
+    /// request waits must still be promoted to the hot lane.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn hot_lane_arrivals_are_counted_per_cpu_and_folded_in_batches() {
+        use crate::cpu::jitv2::jitv2::{PhysicalCodePage, HOT_ARRIVAL_BATCH, HOT_PROMOTE_ARRIVALS};
+
+        let (mut exec, _mem) = create_executor();
+        let page = PhysicalCodePage::new(1, std::ptr::null());
+        assert!(page.try_schedule_page(), "the page's request is queued");
+
+        // Nothing is promoted before the threshold: the per-CPU count is
+        // folded in every batch of arrivals, so the shared counter only
+        // moves in batches, and the promotion lands on the first arrival
+        // after a fold reaches the threshold.
+        let folds = HOT_PROMOTE_ARRIVALS.div_ceil(HOT_ARRIVAL_BATCH);
+        for _ in 0..(folds * HOT_ARRIVAL_BATCH - 1) {
+            assert!(!exec.jitv2_note_arrival(&page), "not hot yet");
+        }
+        assert!(exec.jitv2_note_arrival(&page), "promoted once the batch crosses the threshold");
+        assert!(!exec.jitv2_note_arrival(&page), "and only once per wait");
+    }
+
+    /// The arrivals counted for a page the CPU leaves belong to that page:
+    /// the count is folded into its shared counter when the CPU moves on, so
+    /// a page the CPU visits in short bursts still reaches the promotion
+    /// threshold.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn hot_lane_arrivals_are_folded_into_the_page_the_cpu_leaves() {
+        use crate::cpu::jitv2::jitv2::{PhysicalCodePage, HOT_ARRIVAL_BATCH, HOT_PROMOTE_ARRIVALS};
+
+        let (mut exec, _mem) = create_executor();
+        let mut page = PhysicalCodePage::new(1, std::ptr::null());
+        let mut other = PhysicalCodePage::new(2, std::ptr::null());
+        assert!(page.try_schedule_page(), "the page's request is queued");
+        assert!(other.try_schedule_page(), "the other page's request is queued");
+
+        // Fewer arrivals at the first page than a batch: the count would be
+        // lost if it were not folded in when the CPU leaves.
+        for _ in 0..(HOT_ARRIVAL_BATCH - 1) {
+            assert!(!exec.jitv2_note_arrival(&page), "not hot yet");
+        }
+        // The CPU moves to the other page: the count for the first page is
+        // folded into it.
+        exec.jitv2_fold_arrivals(&mut other as *mut _);
+        // The first page's counter now holds the arrivals, so the promotion
+        // lands as soon as the CPU is back on it.
+        let mut promoted = false;
+        for _ in 0..HOT_PROMOTE_ARRIVALS {
+            exec.jitv2_fold_arrivals(&mut page as *mut _);
+            promoted |= exec.jitv2_note_arrival(&page);
+        }
+        assert!(promoted, "the page reached the threshold across the fold");
+    }
+
+    /// A page whose request has already been served must not collect the
+    /// arrivals counted for it: the shared counter is reset with the
+    /// request, so folding them in afterwards would count them against the
+    /// *next* wait.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn hot_lane_arrivals_are_dropped_when_the_page_is_no_longer_scheduled() {
+        use crate::cpu::jitv2::jitv2::PhysicalCodePage;
+
+        let (mut exec, _mem) = create_executor();
+        let page = PhysicalCodePage::new(1, std::ptr::null());
+        // The page has no request in flight.
+        assert!(!exec.jitv2_note_arrival(&page), "an unscheduled page is never promoted");
+    }
 }
