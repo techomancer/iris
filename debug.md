@@ -663,7 +663,7 @@ accesses, one counter read in 256 with the host's clock, and every
 interrupt vector raised or lowered, and on the Octane every access nothing
 answers. `o2audio` logs the O2's audio register accesses and codec writes.
 Mask categories: `pdma` —
-`hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
+`hal enet scsi`; `mips` — `insn tlb mem fpu`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
 every module also takes `on`/`all`, `off`/`none` or a hex mask.
 `bedrock` covers the devices of the Bedrock node (Fuel, Tezro, Origin 3200,
