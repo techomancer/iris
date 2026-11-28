@@ -691,7 +691,7 @@ fn complete_editor(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     ui.collapsing(t!("extra-complete"), |ui| {
         ui.label(t!("extra-complete-help"));
         let id = ui.id().with("complete_config");
-        let current = crate::machines::to_toml(cfg).unwrap_or_default();
+        let current = cfg.to_toml(iris::config::Dump::Full).unwrap_or_default();
         let mut draft = ui
             .data_mut(|d| d.get_temp::<Draft>(id))
             .unwrap_or_else(|| Draft {
@@ -730,7 +730,7 @@ fn complete_editor(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 match parse_complete(&draft.text) {
                     Ok(next) => {
                         *cfg = next;
-                        draft.baseline = crate::machines::to_toml(cfg).unwrap_or_default();
+                        draft.baseline = cfg.to_toml(iris::config::Dump::Full).unwrap_or_default();
                         draft.text = draft.baseline.clone();
                         draft.error.clear();
                     }

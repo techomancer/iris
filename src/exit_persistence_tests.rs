@@ -630,6 +630,28 @@ fn plain_main_return_then_drop() {
     round_trip(Machine::Indy, &[Exit::MainReturn, Exit::Drop], false, false)
 }
 
+/// A built machine's monitor answers `devices` and `config show` from the config the machine was built with.
+#[test]
+fn a_built_machines_monitor_answers_devices_and_config_show() {
+    use std::io::{Read, Write};
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("monitor-devices");
+        make_images(&dir);
+        let m = build(config(Machine::Indy, &dir, false));
+        let monitor = m.monitor().clone();
+        monitor.clone().start_server("127.0.0.1:0".to_string());
+        let addr = (0..500).find_map(|_| monitor.bound_addr().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(10)); None })).expect("bound");
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        s.write_all(b"devices\nconfig show\nquit\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        monitor.shutdown();
+        assert!(out.contains("c0 (scsi0)") && out.contains("built-in") && out.contains("SCC channel B (console)") && out.contains("profile = \"indy_ip24\""), "{out}");
+    });
+}
+
 /// A `--ci` run boots its disks from the images, not from an overlay an
 /// earlier run of the same process ID left in the temporary directory.
 #[test]
@@ -795,7 +817,7 @@ fn no_process_exit_bypasses_the_flush() {
         // The bare-metal test device ends the run with the guest's exit code.
         ("dev/testdev.rs", 1, "bare-metal test device, a harness only"),
         // Command-line and configuration front ends: nothing is running yet.
-        ("config.rs", 12, "command-line and configuration errors, the --validate result, --machine, --device and --list-slots"),
+        ("config.rs", 13, "command-line and configuration errors, the --validate result, --machine, --device, --list-slots and --config-dump"),
         ("iris_ci_main.rs", 1, "the iris-ci client"),
         ("crash_diag.rs", 1, "fatal-signal handler: the process is already dying"),
     ];

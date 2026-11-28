@@ -761,10 +761,10 @@ impl App {
             Ok(mut cfg) => {
                 // Files added by hand can contain absolute paths; normalize them
                 // before either the GUI or the emulator uses the saved config.
-                let before = crate::machines::to_toml(&cfg).unwrap_or_default();
+                let before = cfg.to_toml(iris::config::Dump::Full).unwrap_or_default();
                 let dir = self.prefs.machine_dir(&name).unwrap();
                 if let Err(e) = machines::make_relative(&mut cfg, &dir) { self.toast(e); return; }
-                if crate::machines::to_toml(&cfg).unwrap_or_default() != before {
+                if cfg.to_toml(iris::config::Dump::Full).unwrap_or_default() != before {
                     if let Err(e) = self.prefs.save_machine(&name, &mut cfg) { self.toast(e); return; }
                 }
                 self.cfg = cfg;
@@ -2445,7 +2445,7 @@ impl App {
         let banks_before = self.cfg.banks;
         let banks_set_before = self.cfg.banks_set;
         let debug_before = self.cfg.debug.clone();
-        let cfg_before = crate::machines::to_toml(&self.cfg).unwrap_or_default();
+        let cfg_before = self.cfg.to_toml(iris::config::Dump::Full).unwrap_or_default();
         let out = show_tab(
             ui,
             self.tab,
@@ -2497,7 +2497,7 @@ impl App {
         // than discovering at exit that the disk can't be compacted.
         if out.disk_picked { self.check_chd_folder_grants(); }
         if out.net.changed { self.mark_dirty(); }
-        if crate::machines::to_toml(&self.cfg).unwrap_or_default() != cfg_before {
+        if self.cfg.to_toml(iris::config::Dump::Full).unwrap_or_default() != cfg_before {
             self.mark_dirty();
         }
         if out.net.forwards_changed && self.emu.is_running() {

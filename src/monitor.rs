@@ -60,7 +60,7 @@ impl Monitor {
     pub fn command_names(&self) -> Vec<String> {
         let devs = self.devices.lock();
         let own = devs.iter().flat_map(|d| d.register_commands()).map(|(name, _)| name);
-        let mut names: Vec<String> = own.chain(["help", "quit", "exit", "watch", "ports", "devices"].map(String::from)).collect();
+        let mut names: Vec<String> = own.chain(["help", "quit", "exit", "watch", "ports", "devices", "config"].map(String::from)).collect();
         names.sort();
         names.dedup();
         names
@@ -256,6 +256,12 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>, c
             let _ = writer.flush();
             continue;
         }
+        if cmd == "config" {
+            let cfg = config.lock().clone();
+            let _ = write!(writer, "{}> ", config_report(cfg.as_deref(), args));
+            let _ = writer.flush();
+            continue;
+        }
         if cmd == "devices" {
             let cfg = config.lock().clone();
             let _ = write!(writer, "{}> ", devices_report(cfg.as_deref()));
@@ -274,6 +280,7 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>, c
                 let _ = writeln!(writer, "{:12} - {}", "watch", WATCH_HELP);
                 let _ = writeln!(writer, "{:12} - {}", "ports", "ports: the host sockets iris listens on (monitor, telnet and other port forwards, VNC, GDB, CI, serial and virtio sockets)");
                 let _ = writeln!(writer, "{:12} - {}", "devices", DEVICES_HELP);
+                let _ = writeln!(writer, "{:12} - {}", "config", CONFIG_HELP);
                 if !cmds.iter().any(|(c, _)| c == "audio") {
                     let _ = writeln!(writer, "{:12} - {}", "audio", "audio status: each sound card's frames moved and skipped, and its host stream");
                 }
@@ -335,6 +342,19 @@ fn devices_report(cfg: Option<&MachineConfig>) -> String {
         Some(cfg) => crate::tree::render(cfg, crate::tree::Look::PLAIN, true).unwrap_or_else(|e| format!("Error: {e}\n")),
         None => "No machine.\n".into(),
     }
+}
+
+const CONFIG_HELP: &str = "config show: the config this machine was built from, as an iris.toml with only what differs from the machine's defaults; config dump PATH: write it to a new file";
+
+/// What `config show` and `config dump PATH` answer.
+fn config_report(cfg: Option<&MachineConfig>, args: &[&str]) -> String {
+    let Some(cfg) = cfg else { return "No machine.\n".into() };
+    let done = match args {
+        ["show"] => cfg.to_toml(crate::config::Dump::Minimal),
+        ["dump", path @ ..] if !path.is_empty() => cfg.dump_to(&path.join(" ")).map(|()| format!("Wrote {}\n", path.join(" "))),
+        _ => Err("config show | config dump PATH".into()),
+    };
+    done.unwrap_or_else(|e| format!("Error: {e}\n"))
 }
 
 const WATCH_HELP: &str = "watch [-n SECONDS] <command> [args]: run a command again every second (or SECONDS), its answer redrawn on one line, until Enter";
@@ -437,6 +457,21 @@ mod tests {
         assert_eq!(devices_report(None), "No machine.\n");
         let text = devices_report(Some(&MachineConfig::default().resolved().unwrap()));
         assert!(text.contains("|-- ") && !text.contains('\x1b') && text.is_ascii(), "{text}");
+    }
+
+    /// `config show` prints the minimal file and `config dump` writes it to a new path, once.
+    #[test]
+    fn config_show_and_dump_answer_from_the_machines_config() {
+        assert_eq!(config_report(None, &["show"]), "No machine.\n");
+        let cfg = MachineConfig::default().resolved().unwrap();
+        assert!(config_report(Some(&cfg), &["show"]).contains("[machine]"));
+        let path = std::env::temp_dir().join(format!("iris-monitor-dump-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path = path.to_str().unwrap();
+        assert_eq!(config_report(Some(&cfg), &["dump", path]), format!("Wrote {path}\n"));
+        assert!(config_report(Some(&cfg), &["dump", path]).starts_with("Error:"));
+        assert!(config_report(Some(&cfg), &["dump"]).starts_with("Error: config show"));
+        std::fs::remove_file(path).unwrap();
     }
 
     /// A dropped Machine's monitor must give the port back, or the next Machine

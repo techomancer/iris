@@ -8,6 +8,8 @@ use crate::devices::{ConfiguredDevice, DeviceModel};
 use crate::topology::{scsi_target, DevicePlacement};
 
 pub(crate) mod legacy;
+mod write;
+pub use write::Dump;
 
 /// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
 /// which of them a machine takes.
@@ -4021,6 +4023,14 @@ pub struct Cli {
     #[arg(long = "list-slots", default_value_t = false)]
     pub list_slots: bool,
 
+    /// Print the config as an iris.toml with only what differs from the machine's defaults, then exit
+    #[arg(long = "config-show", default_value_t = false)]
+    pub config_show: bool,
+
+    /// Write that iris.toml to FILE, which must not exist, then exit
+    #[arg(long = "config-dump", value_name = "FILE")]
+    pub config_dump: Option<String>,
+
     /// Additional ISO images for CD-ROM ID 4 (can be specified multiple times)
     #[arg(long = "cdrom4-extra", value_name = "ISO")]
     pub cdrom4_extra: Vec<String>,
@@ -4444,6 +4454,16 @@ pub fn load_config() -> (MachineConfig, u32) {
     if cli.list_slots {
         anstream::print!("{}", crate::tree::render(&cfg, crate::tree::Look::stdout(), false).expect("resolve_slots checked every slot"));
         std::process::exit(0);
+    }
+    if cli.config_show || cli.config_dump.is_some() {
+        let done = match &cli.config_dump {
+            Some(path) => cfg.dump_to(path),
+            None => cfg.to_toml(Dump::Minimal).map(|text| print!("{text}")),
+        };
+        if let Err(e) = &done {
+            eprintln!("iris: {e}");
+        }
+        std::process::exit(i32::from(done.is_err()));
     }
     let scale = cfg.scale;
     if let Err(e) = cfg.validate() {

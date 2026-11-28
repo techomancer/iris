@@ -215,7 +215,7 @@ Defaults below are **core schema/runtime defaults**, not this checkout's
 sample iris.toml or the GUI New Machine dialog. GUI IP28 creation selects
 R10000/Solid IMPACT and the embedded IP28 PROM; changing `machine.profile` in TOML
 does not automatically replace every other hardware setting. Omit optional
-keys to use defaults; TOML has no `null` value. Put top-level scalars before
+keys to use defaults; `--config-show` and `--config-dump FILE` write the minimal file for what a run is set to, and the GUI saves the same writer's whole form; TOML has no `null` value. Put top-level scalars before
 the first `[section]`, because TOML tables continue until the next header.
 
 ### Top-level scalars
@@ -639,6 +639,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--jitv2-compile MODE` | Where jitv2 compiles: `async` on the pool's threads (default) or `sync` on the CPU thread, so a run executes the same host code every time. One CPU only. Sets `jitv2.compile`. |
 | `--device SPEC` | Place a device: `[NAME:]TYPE[@SLOT][,KEY=VALUE]...`, as a `[[devices]]` entry (`hdd@scsi0/t1,path=irix65.raw`; a value is read as TOML when it parses as one). A named one replaces the file's device of that name. |
 | `--list-slots` | Print the machine's slots as a tree, their aliases, what is in each and what it takes, then exit. |
+| `--config-show` | Print the effective config as an iris.toml with only what differs from the machine's defaults, each device at its resolved slot, then exit. |
+| `--config-dump FILE` | Write that file to `FILE`, which must not exist, then exit. |
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
 | `--headless` | Suppress the standalone window (platform-specific graphics/console behavior, as `headless`; audio unaffected) |
 | `--noaudio` | Disable host audio output, as `no_audio`; graphics is unaffected |

@@ -746,6 +746,12 @@ one is an error). All paths are relative to that directory. Unknown keys are a
 hard parse error, so a misplaced setting is reported instead of silently
 ignored. The checked-in `iris.toml` is a commented example of everything in this section.
 
+To get a short file for a machine you have set up, run it with the options you want and add
+`--config-show` (print it) or `--config-dump FILE` (write a new file; an existing one is never
+replaced). The file holds only what differs from the machine's defaults, with each device at the
+slot it took: `iris --machine octane_ip30 --device hostserial@serial1,path=/dev/ttyUSB0 --config-dump octane.toml`.
+In the monitor, `config show` and `config dump PATH` do the same for the running machine.
+
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
@@ -1026,6 +1032,8 @@ Storage
   --device <SPEC>             Place a device: [NAME:]TYPE[@SLOT][,KEY=VALUE]..., as a [[devices]]
                               entry (hdd@scsi0/t1,path=irix65.raw). A named one replaces the file's
   --list-slots                Print the machine's slots as a tree, what is in each and where it came from
+  --config-show               Print the config as an iris.toml holding only what differs from the machine's defaults, then exit
+  --config-dump <FILE>        Write that iris.toml to FILE (which must not exist), then exit
   --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 

@@ -95,6 +95,7 @@ accepted in every build but do nothing without the feature; `si`, the CPU's
 
 | Command | Description |
 |---|---|
+| `config show` / `config dump PATH` | The config the machine was built from as an iris.toml with only what differs from the machine's defaults; `dump` writes it to a new file and refuses to replace one |
 | `machine-start` | Start the CPU and all peripherals. Idempotent: prints the transition it performed, e.g. `machine-start: halted -> starting -> running`, or `machine-start: running (no change)` |
 | `machine-stop` | Stop the CPU and all peripherals. Idempotent: prints `machine-stop: running -> halted` |
 | `machine-status [json]` | Guest state (`idle`, `starting`, `running`, `halted`) and whether the monitor is accepting commands; `json` emits one object |

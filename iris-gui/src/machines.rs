@@ -76,35 +76,6 @@ pub fn read(path: &Path) -> Result<MachineConfig, String> {
     parse(&text).map_err(|e| file_error(path, e))
 }
 
-/// The TOML a machine is saved as. Keys the config left to the machine are
-/// left out, so they keep their meaning after a reload: an automatic
-/// `[jitv2] threads` (one per guest CPU, fewer on a small host), and
-/// `banks` when not chosen and
-/// still at the generic default (the Tezro and IP35 machines then fit their
-/// own memory, as the core does for an unset `banks`).
-pub fn to_toml(cfg: &MachineConfig) -> Result<String, String> {
-    // Through text: `toml::Table::try_from` refuses the integer-keyed maps
-    // (`[scsi.N]`) that the document writer accepts.
-    let text = toml::to_string_pretty(&cfg.for_writing()).map_err(|e| e.to_string())?;
-    let unset_banks = !cfg.banks_set && cfg.banks == MachineConfig::default().banks;
-    if !unset_banks && cfg.jitv2_threads_set {
-        return Ok(text);
-    }
-    let mut table: toml::Table = toml::from_str(&text).map_err(|e| e.to_string())?;
-    if unset_banks {
-        table.remove("banks");
-    }
-    if !cfg.jitv2_threads_set {
-        if let Some(toml::Value::Table(jit)) = table.get_mut("jitv2") {
-            jit.remove("threads");
-            if jit.is_empty() {
-                table.remove("jitv2");
-            }
-        }
-    }
-    toml::to_string_pretty(&table).map_err(|e| e.to_string())
-}
-
 /// A file that couldn't be read or written, as shown to the user.
 pub fn file_error(path: &Path, error: impl std::fmt::Display) -> String {
     t!("machines-file-error", path = path.display(), error = error.to_string())
@@ -227,7 +198,7 @@ pub fn make_relative(cfg: &mut MachineConfig, dir: &Path) -> Result<(), String> 
 pub fn save(root: &Path, name: &str, cfg: &mut MachineConfig) -> Result<(), String> {
     let dir = directory(root, name)?;
     make_relative(cfg, &dir)?;
-    let text = to_toml(cfg)?;
+    let text = cfg.to_toml(iris::config::Dump::Full)?;
     std::fs::create_dir_all(dir.join("disks")).map_err(|e| e.to_string())?;
     write(&config_path(root, name)?, &text)
 }
@@ -566,7 +537,7 @@ pub(crate) mod tests {
             std::fs::write(config_path(&root.0, "indy").unwrap(), text).unwrap();
             let cfg = read(&config_path(&root.0, "indy").unwrap()).unwrap();
             assert!(cfg.has_device(card), "{card}");
-            assert!(to_toml(&cfg).unwrap().contains(&format!("type = \"{card}\"")), "{card}: saved as the card");
+            assert!(cfg.to_toml(iris::config::Dump::Full).unwrap().contains(&format!("type = \"{card}\"")), "{card}: saved as the card");
         }
     }
 

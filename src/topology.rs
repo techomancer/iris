@@ -291,6 +291,15 @@ impl DevicePlacement {
         self.at[i].as_ref().ok()
     }
 
+    /// How a config file writes device `i`'s slot: with its machine alias where it has one, else the full path.
+    pub fn at_text(&self, i: usize) -> Option<String> {
+        let at = self.at(i)?;
+        let alias = |p: &MachineSlotPath| self.slot(p)?.aliases.first().cloned();
+        let step = at.to_string();
+        let step = step.rsplit('/').next().unwrap_or_default();
+        Some(alias(at).or_else(|| Some(format!("{}/{step}", alias(&at.parent()?)?))).unwrap_or_else(|| at.to_string()))
+    }
+
     /// The devices that have a slot, with it, in config order.
     pub fn placed(&self) -> impl Iterator<Item = (&ConfiguredDevice, &MachineSlotPath)> {
         self.devices.iter().zip(&self.at).filter_map(|(d, at)| Some((d, at.as_ref().ok()?)))

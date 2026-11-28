@@ -56,6 +56,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   built-in, a default or from your config, and what each serial port is connected to. It
   replaces `serial map`. `iris --list-slots` prints the same tree before a machine runs, in
   box characters and colour on a terminal that shows them, plain ASCII otherwise.
+- `--config-show` prints, and `--config-dump FILE` writes, the effective config as a short
+  iris.toml holding only what differs from the machine's defaults, with every device at the
+  slot it took; the monitor's `config show` and `config dump PATH` do the same for a running
+  machine. The GUI saves machines with the same writer.
 - `screen hash` prints a blake3 of the composed screen on any machine with a
   display, so two runs can be compared without a PNG.
 
