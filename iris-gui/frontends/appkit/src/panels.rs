@@ -445,13 +445,83 @@ pub struct BenchWindow {
     save: Retained<NSButton>,
     progress: Retained<NSProgressIndicator>,
     line: Retained<NSTextField>,
+    /// The finished run's figures (`BenchController::results`), above the console.
+    results: Retained<NSStackView>,
+    shown_results: Option<iris_gui_core::controller::bench::Results>,
     text: Retained<NSTextView>,
     shown: usize,
 }
 
+/// A label column's width in the results' tables.
+const RESULT_LABEL: f64 = 130.0;
+
+/// Rows of the results as a two-column table: the label, then the value
+/// with its note (a reference ratio) in secondary text beside it.
+fn result_rows(mtm: MainThreadMarker, rows: &[iris_gui_core::controller::bench::ResultRow]) -> Retained<NSView> {
+    let lines: Vec<Retained<NSView>> = rows
+        .iter()
+        .map(|r| {
+            let name = secondary(mtm, &r.label);
+            name.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+            name.widthAnchor().constraintEqualToConstant(RESULT_LABEL).setActive(true);
+            let value = label(mtm, &r.value);
+            value.setSelectable(true);
+            let mut parts = vec![view(&name), view(&value)];
+            if !r.note.is_empty() {
+                parts.push(view(&secondary(mtm, &r.note)));
+            }
+            let line = stack(mtm, &parts, false, 10.0);
+            line.setAlignment(NSLayoutAttribute::FirstBaseline);
+            if let Some(tip) = &r.tip {
+                line.setToolTip(Some(&ns(tip)));
+            }
+            view(&line)
+        })
+        .collect();
+    view(&stack(mtm, &lines, true, 4.0))
+}
+
+/// A finished run: the headline figures large, each with its tooltip, then
+/// the categories, the caveats and the machine it ran on.
+fn results_view(mtm: MainThreadMarker, r: &iris_gui_core::controller::bench::Results) -> Vec<Retained<NSView>> {
+    let mut out = Vec::new();
+    let figures: Vec<Retained<NSView>> = r
+        .headline
+        .iter()
+        .map(|f| {
+            let value = heading(mtm, &f.value, 20.0);
+            let cell = stack(mtm, &[view(&secondary(mtm, &f.label)), view(&value)], true, 2.0);
+            cell.setAlignment(NSLayoutAttribute::Leading);
+            if let Some(tip) = &f.tip {
+                cell.setToolTip(Some(&ns(tip)));
+                value.setToolTip(Some(&ns(tip)));
+            }
+            set_id(&cell, &format!("bench.figure.{}", f.label));
+            view(&cell)
+        })
+        .collect();
+    out.push(view(&stack(mtm, &figures, false, 28.0)));
+    if !r.categories.is_empty() {
+        out.push(view(&heading(mtm, &t!("bench-results"), 13.0)));
+        out.push(result_rows(mtm, &r.categories));
+    }
+    for c in &r.caveats {
+        let l = label(mtm, c);
+        l.setTextColor(Some(&NSColor::systemOrangeColor()));
+        l.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
+        l.setPreferredMaxLayoutWidth(700.0);
+        out.push(view(&l));
+    }
+    if !r.machine.is_empty() {
+        out.push(view(&heading(mtm, &t!("bench-machine"), 13.0)));
+        out.push(result_rows(mtm, &r.machine));
+    }
+    out
+}
+
 impl BenchWindow {
     pub fn new(mtm: MainThreadMarker, notify: std::sync::Arc<dyn iris_gui_core::controller::Notify>) -> Self {
-        let (window, d) = panel(mtm, &t!("bench-heading"), NSSize::new(760.0, 560.0), Which::Bench);
+        let (window, d) = panel(mtm, &t!("bench-heading"), NSSize::new(760.0, 760.0), Which::Bench);
         let ctl = BenchController::new(notify);
         let (names, sel) = ctl.cpus();
         // The shared popup: its items carry the indexes the controller takes.
@@ -469,12 +539,17 @@ impl BenchWindow {
         progress.widthAnchor().constraintEqualToConstant(260.0).setActive(true);
         let line = secondary(mtm, "");
         let mid = stack(mtm, &[view(&progress), view(&line)], false, 10.0);
+        let results = stack(mtm, &[], true, 8.0);
+        results.setAlignment(NSLayoutAttribute::Leading);
+        results.setHidden(true);
+        set_id(&results, "bench.results");
         let (scroll, text) = text_area(mtm, "bench.text");
-        let page = stack(mtm, &[view(&top), view(&mid), view(&scroll)], true, 10.0);
+        scroll.heightAnchor().constraintGreaterThanOrEqualToConstant(140.0).setActive(true);
+        let page = stack(mtm, &[view(&top), view(&mid), view(&results), view(&scroll)], true, 10.0);
         page.setAlignment(NSLayoutAttribute::Width);
         insets(&page, 14.0);
         fill(&window, &page);
-        Self { window, _d: d, ctl, cpu, quick, start, save, progress, line, text, shown: usize::MAX }
+        Self { window, _d: d, ctl, cpu, quick, start, save, progress, line, results, shown_results: None, text, shown: usize::MAX }
     }
 
     pub fn refresh(&mut self, machine_running: bool) {
@@ -501,18 +576,31 @@ impl BenchWindow {
             None => {
                 self.progress.setHidden(true);
                 let done = match self.ctl.last() {
-                    Some(Ok(r)) => BenchController::report_text(r).lines().next().unwrap_or_default().to_string(),
+                    Some(Ok(_)) => String::new(),
                     Some(Err(e)) => t!("bench-failed", error = e.as_str()),
                     None => t!("bench-run-tip", secs = if self.ctl.quick() { 35 } else { 60 }),
                 };
                 self.line.setStringValue(&ns(&done));
             }
         }
-        let lines = self.ctl.lines();
-        let text = match (running, self.ctl.last()) {
-            (false, Some(Ok(r))) => BenchController::report_text(r),
-            _ => lines.join("\n"),
-        };
+        // The figures of the last finished run, drawn again only when they change.
+        let results = if running { None } else { self.ctl.results() };
+        if results != self.shown_results {
+            for v in self.results.arrangedSubviews().iter() {
+                self.results.removeArrangedSubview(&v);
+                v.removeFromSuperview();
+            }
+            if let Some(r) = &results {
+                let mtm = MainThreadMarker::from(&*self.window);
+                for v in results_view(mtm, r) {
+                    self.results.addArrangedSubview(&v);
+                }
+            }
+            self.results.setHidden(results.is_none());
+            self.shown_results = results;
+        }
+        // The console: the run's own lines.
+        let text = self.ctl.lines().join("\n");
         if text.len() != self.shown {
             set_text(&self.text, &text, running);
             self.shown = text.len();
