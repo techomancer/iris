@@ -127,13 +127,17 @@ fn set_or_hide(label: &gtk::Label, text: Option<&str>) {
 /// badge for a copy-on-write disk's dirty sectors.
 fn light(l: &DeviceLight, app: &AppController) -> gtk::Widget {
     let image = icons::image(l.icon, 16, &l.tooltip);
-    image.add_css_class(match l.state {
-        LightState::Off => "dim-label",
-        LightState::Idle => "",
-        LightState::Reading | LightState::Active => "success",
-        LightState::Writing => "warning",
-        LightState::Fault => "error",
-    });
+    // Idle takes the bar's own colour, so it gets no class at all (GTK
+    // refuses an empty one).
+    if let Some(class) = match l.state {
+        LightState::Off => Some("dim-label"),
+        LightState::Idle => None,
+        LightState::Reading | LightState::Active => Some("success"),
+        LightState::Writing => Some("warning"),
+        LightState::Fault => Some("error"),
+    } {
+        image.add_css_class(class);
+    }
     let child: gtk::Widget = match &l.badge {
         Some(badge) => {
             let b = gtk::Box::new(gtk::Orientation::Horizontal, 3);

@@ -13,6 +13,10 @@ extern crate iris_gui_core;
 #[cfg(target_os = "linux")]
 mod app;
 #[cfg(target_os = "linux")]
+mod display;
+#[cfg(target_os = "linux")]
+mod keys;
+#[cfg(target_os = "linux")]
 mod effects;
 #[cfg(target_os = "linux")]
 mod icons;

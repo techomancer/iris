@@ -16,6 +16,7 @@ use iris_gui_core::controller::icons::Icon;
 use iris_gui_core::controller::ids;
 use libadwaita as adw;
 
+use crate::display::Screen;
 use crate::icons;
 use crate::library::Library;
 use crate::status::StatusBar;
@@ -29,6 +30,11 @@ pub struct MainWindow {
     library: Rc<Library>,
     toolbar: Toolbar,
     status: StatusBar,
+    /// The guest's screen, and the scroller that holds it at Actual Size.
+    pub screen: Screen,
+    screen_scroll: gtk::ScrolledWindow,
+    /// Whether the pane is showing the display rather than the page.
+    showing_display: bool,
     /// Holds the machine page (and later the guest display).
     pane: adw::ToolbarView,
     /// The overview the page was built from, so it is rebuilt only on a change.
@@ -68,6 +74,13 @@ impl MainWindow {
         content.add_top_bar(&header);
         let status = StatusBar::new();
         content.add_bottom_bar(&status.root);
+        let screen = Screen::new();
+        let screen_scroll = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&screen.view)
+            .build();
+        screen_scroll.add_css_class("iris-screen");
 
         let library = Library::new(app);
         let split = adw::OverlaySplitView::builder()
@@ -120,6 +133,9 @@ impl MainWindow {
             library,
             toolbar,
             status,
+            screen,
+            screen_scroll,
+            showing_display: false,
             pane: content,
             shown: None,
             tab: summary::TAB_DETAILS.to_string(),
@@ -132,6 +148,24 @@ impl MainWindow {
         self.library.refresh(app.library());
         self.toolbar.refresh(app);
         self.status.refresh(app);
+        // A running machine shows its screen; a stopped one its page.
+        let running = app.session().is_running();
+        self.screen.view.set_look(
+            iris_gui_core::controller::display::sizing(app.prefs()),
+            iris_gui_core::controller::display::nearest(app.prefs(), true),
+        );
+        if running != self.showing_display {
+            self.showing_display = running;
+            if running {
+                self.pane.set_content(Some(&self.screen_scroll));
+                self.screen.view.grab_focus();
+            } else {
+                self.shown = None;
+            }
+        }
+        if running {
+            return;
+        }
         let o = app.overview();
         if self.shown.as_ref() != Some(&o) {
             let gtk_app = crate::app::application();

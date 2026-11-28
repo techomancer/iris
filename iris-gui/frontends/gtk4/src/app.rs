@@ -87,6 +87,26 @@ pub fn set_summary_tab(tab: &str) {
     }
 }
 
+/// Input and capture for the display: applied at once, without a full
+/// redraw (motion arrives many times a second).
+pub fn display(action: iris_gui_core::controller::display::DisplayAction) {
+    // GTK reports focus and motion while the shell is changing views
+    // (inside its borrow): apply them after, not never.
+    if SHELL.with(|s| s.try_borrow_mut().is_err()) {
+        return later(move || display(action));
+    }
+    let lost_focus = matches!(action, iris_gui_core::controller::display::DisplayAction::Focus(false));
+    let fx = with(|s| s.app.apply(AppAction::Display(action)));
+    if let Some(fx) = fx {
+        run_effects(fx);
+    }
+    // Losing focus starts the release grace: refresh, so a tick is due when
+    // it runs out (nothing else may wake the shell).
+    if lost_focus {
+        refresh();
+    }
+}
+
 /// A library row's own menu, or `None` while the shell is busy.
 pub fn machine_menu(name: &str) -> Option<Vec<Vec<iris_gui_core::controller::commands::MenuEntry>>> {
     with(|s| s.app.machine_menu(name))
@@ -178,6 +198,8 @@ fn script_step() {
         crate::effects::script_answer(r);
     } else if step == "dump:menu" {
         menu::dump();
+    } else if let Some(name) = step.strip_prefix("select:") {
+        select_machine(name.to_string());
     } else if let Some(tab) = step.strip_prefix("tab:") {
         set_summary_tab(tab);
     } else if step == "dump:library" {
@@ -208,8 +230,15 @@ pub fn tick() {
     let fx = with(|s| {
         s.wake.ticked();
         let fx = s.app.tick();
-        // Drained so they do not pile up; the display slice acts on them.
-        let _ = s.app.take_session_events();
+        for e in s.app.take_session_events() {
+            if e == iris_gui_core::controller::session::SessionEvent::Started {
+                s.win.screen.clear();
+            }
+        }
+        if s.app.session().is_running() {
+            let (sink, _) = s.app.session().frame_sinks();
+            s.win.screen.take(sink);
+        }
         fx
     });
     match fx {
