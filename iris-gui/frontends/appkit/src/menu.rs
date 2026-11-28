@@ -226,6 +226,7 @@ pub fn build(mtm: MainThreadMarker) {
             o(t!("mb-diagnostics"), m::DIAGNOSTICS),
             None,
             o(t!("mb-reset-nvram"), m::RESET_NVRAM),
+            o(t!("mb-set-mac"), m::SET_MAC),
         ],
     );
     let window = submenu(
