@@ -940,7 +940,7 @@ pub fn console_backends(
             .0
         }
     };
-    let console = crate::dev::serial_map::mapped(tag, ports[0], Some(1), true, cfg, console);
+    let console = crate::dev::serial_map::mapped(ports[0], Some(1), true, cfg, console);
     let label = format!("{tag} serial port 2");
     let log = open_log_at(cfg, cfg.serial_log_b.as_deref(), &label);
     let second = match crate::dev::serial_dev::peripheral(cfg, 2, log.clone())? {
@@ -960,7 +960,7 @@ pub fn console_backends(
             if served { second } else { null_serial_backend() }
         }
     };
-    Ok((console, crate::dev::serial_map::mapped(tag, ports[1], Some(2), false, cfg, second)))
+    Ok((console, crate::dev::serial_map::mapped(ports[1], Some(2), false, cfg, second)))
 }
 
 #[cfg(test)]

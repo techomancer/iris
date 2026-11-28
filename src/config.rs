@@ -4017,7 +4017,7 @@ pub struct Cli {
     #[arg(long = "device", value_name = "SPEC")]
     pub device: Vec<String>,
 
-    /// Print every slot on the machine, what is in it and what it takes, then exit
+    /// Print the machine's slots as a tree, what is in each and where it came from, then exit
     #[arg(long = "list-slots", default_value_t = false)]
     pub list_slots: bool,
 
@@ -4442,7 +4442,7 @@ pub fn load_config() -> (MachineConfig, u32) {
         std::process::exit(1);
     }
     if cli.list_slots {
-        print!("{}", DevicePlacement::new(&cfg).expect("resolve_slots checked every slot").list_slots());
+        anstream::print!("{}", crate::tree::render(&cfg, crate::tree::Look::stdout(), false).expect("resolve_slots checked every slot"));
         std::process::exit(0);
     }
     let scale = cfg.scale;
@@ -5212,8 +5212,8 @@ mod export_tests {
             assert!(none.is_empty());
         }
         let cfg = MachineConfig::from_toml_str("devices = []\n[machine]\nprofile = \"octane_ip30\"\n").unwrap();
-        let listing = DevicePlacement::new(&cfg).unwrap().list_slots();
-        assert!(listing.lines().any(|l| l.starts_with("xio11 ") && l.contains("graphics")), "{listing}");
+        let listing = crate::tree::render(&cfg, crate::tree::Look::PLAIN, false).unwrap();
+        assert!(listing.lines().any(|l| l.contains("xio11 ") && l.contains("graphics")), "{listing}");
     }
 
     /// Each IP27 product reads the table named for it, and only that one.

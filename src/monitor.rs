@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::thread;
 use std::net::{TcpListener, TcpStream};
 use std::io::{Write, BufReader, BufRead, BufWriter, Read};
+use crate::config::MachineConfig;
 use crate::traits::Device;
 
 /// The monitor's TCP port on 127.0.0.1 when the config names none.
@@ -16,6 +17,8 @@ const MAX_LINE: usize = 4096;
 
 pub struct Monitor {
     devices: Arc<Mutex<Vec<Arc<dyn Device>>>>,
+    /// The resolved config the machine was built from, for `devices`.
+    config: Arc<Mutex<Option<Arc<MachineConfig>>>>,
     /// Set by `shutdown`; the accept loop exits (dropping its listener, which
     /// frees the port) the next time it wakes.
     shutdown: Arc<AtomicBool>,
@@ -28,6 +31,7 @@ impl Monitor {
     pub fn new() -> Self {
         Self {
             devices: Arc::new(Mutex::new(Vec::new())),
+            config: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             bound: Mutex::new(None),
         }
@@ -40,6 +44,7 @@ impl Monitor {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.devices.lock().clear();
+        self.config.lock().take();
         if let Some(addr) = self.bound.lock().take() {
             let _ = TcpStream::connect(addr); // wake the blocking accept()
         }
@@ -55,10 +60,15 @@ impl Monitor {
     pub fn command_names(&self) -> Vec<String> {
         let devs = self.devices.lock();
         let own = devs.iter().flat_map(|d| d.register_commands()).map(|(name, _)| name);
-        let mut names: Vec<String> = own.chain(["help", "quit", "exit", "watch", "ports", "serial"].map(String::from)).collect();
+        let mut names: Vec<String> = own.chain(["help", "quit", "exit", "watch", "ports", "devices"].map(String::from)).collect();
         names.sort();
         names.dedup();
         names
+    }
+
+    /// The config the machine was built from, which `devices` draws.
+    pub fn set_config(&self, cfg: Arc<MachineConfig>) {
+        *self.config.lock() = Some(cfg);
     }
 
     pub fn register_device(&self, device: Arc<dyn Device>) {
@@ -138,9 +148,9 @@ impl Monitor {
                 }
                 match stream {
                     Ok(stream) => {
-                        let devices = self.devices.clone();
+                        let (devices, config) = (self.devices.clone(), self.config.clone());
                         thread::spawn(move || {
-                            handle_client(stream, devices);
+                            handle_client(stream, devices, config);
                         });
                     }
                     Err(e) => eprintln!("Monitor accept error: {}", e),
@@ -156,7 +166,7 @@ fn audio_status(devices: &[Arc<dyn Device>]) -> String {
     if reports.is_empty() { "No audio device.\n".to_string() } else { reports }
 }
 
-fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
+fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>, config: Arc<Mutex<Option<Arc<MachineConfig>>>>) {
     // Register this connection with DevLog so log output is broadcast here.
     // Wrap in CrlfWriter so bare \n from log messages renders as CRLF on the
     // telnet client side.
@@ -246,15 +256,13 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
             let _ = writer.flush();
             continue;
         }
-        // `serial` and `serial map`: every serial port and what it is
-        // connected to. Other `serial` subcommands (the Indy's `serial
-        // status`) go to the devices that offer them.
-        if cmd == "serial" && (args.is_empty() || args == ["map"]) {
-            let _ = write!(writer, "{}> ", crate::dev::serial_map::report());
+        if cmd == "devices" {
+            let cfg = config.lock().clone();
+            let _ = write!(writer, "{}> ", devices_report(cfg.as_deref()));
             let _ = writer.flush();
             continue;
         }
-        
+
         if cmd == "help" {
             is_help = true;
         }
@@ -265,13 +273,12 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
                 let cmds: Vec<_> = devs.iter().flat_map(|d| d.register_commands()).collect();
                 let _ = writeln!(writer, "{:12} - {}", "watch", WATCH_HELP);
                 let _ = writeln!(writer, "{:12} - {}", "ports", "ports: the host sockets iris listens on (monitor, telnet and other port forwards, VNC, GDB, CI, serial and virtio sockets)");
-                let _ = writeln!(writer, "{:12} - {}", "serial", "serial [map]: each serial port, its IRIX name (ttydN), the console, and what it is connected to (sockets and clients, CI, log, a host serial port and its line); serial status: the SCC's registers (Indy, Indigo2)");
+                let _ = writeln!(writer, "{:12} - {}", "devices", DEVICES_HELP);
                 if !cmds.iter().any(|(c, _)| c == "audio") {
                     let _ = writeln!(writer, "{:12} - {}", "audio", "audio status: each sound card's frames moved and skipped, and its host stream");
                 }
                 // Several devices may offer one command (`pci`, one per host): list it once.
                 let mut seen = std::collections::HashSet::new();
-                seen.insert("serial".to_string());
                 for (c, h) in cmds {
                     if seen.insert(c.clone()) {
                         let _ = writeln!(writer, "{:12} - {}", c, h);
@@ -318,6 +325,16 @@ fn handle_client(stream: TcpStream, devices: Arc<Mutex<Vec<Arc<dyn Device>>>>) {
     // writer a command was given, whose handle keeps the connection open,
     // and the console client waits for it to close before it exits.
     let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+const DEVICES_HELP: &str = "devices: the machine's slots as a tree, what is in each, where it came from (built-in, default, config) and what the serial ports are connected to";
+
+/// What `devices` prints: ASCII with no colour, since the monitor cannot know what its client shows.
+fn devices_report(cfg: Option<&MachineConfig>) -> String {
+    match cfg {
+        Some(cfg) => crate::tree::render(cfg, crate::tree::Look::PLAIN, true).unwrap_or_else(|e| format!("Error: {e}\n")),
+        None => "No machine.\n".into(),
+    }
 }
 
 const WATCH_HELP: &str = "watch [-n SECONDS] <command> [args]: run a command again every second (or SECONDS), its answer redrawn on one line, until Enter";
@@ -412,6 +429,14 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// The monitor is a socket, so `devices` draws plain ASCII, and says so when it has no machine.
+    #[test]
+    fn devices_draws_plain_ascii_on_a_socket() {
+        assert_eq!(devices_report(None), "No machine.\n");
+        let text = devices_report(Some(&MachineConfig::default().resolved().unwrap()));
+        assert!(text.contains("|-- ") && !text.contains('\x1b') && text.is_ascii(), "{text}");
     }
 
     /// A dropped Machine's monitor must give the port back, or the next Machine

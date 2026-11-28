@@ -52,6 +52,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   rates, on machines with or without a display), `ports` (every host socket
   iris listens on), and `watch <command>` to keep any command's answer
   updating on one line.
+- The monitor's `devices` prints the machine's slots as a tree: what is in each, whether it is
+  built-in, a default or from your config, and what each serial port is connected to. It
+  replaces `serial map`. `iris --list-slots` prints the same tree before a machine runs, in
+  box characters and colour on a terminal that shows them, plain ASCII otherwise.
 - `screen hash` prints a blake3 of the composed screen on any machine with a
   display, so two runs can be compared without a PNG.
 

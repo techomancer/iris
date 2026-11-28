@@ -164,6 +164,7 @@ pub mod config;
 pub mod devices;
 pub mod slot_path;
 pub mod topology;
+pub mod tree;
 pub mod identity;
 pub mod traits;
 #[macro_use]

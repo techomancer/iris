@@ -536,7 +536,7 @@ serial device always names its port. Most machines have `serial1` and
 `serial2`; on the Indy and Indigo2, `serial1` is SCC channel B, the console,
 and `serial2` channel A. The Tezro's are `serial3` and `serial4`, the IOC4's
 first two ports (its `ttyd1` is the L1 console, and IRIX makes no devices for
-the IOC4's other two ports). `iris --list-slots` shows them. A port with a
+the IOC4's other two ports). `iris --list-slots` shows them, and `devices` in the monitor shows what each is connected to. A port with a
 device serves no TCP or Unix socket; its serial log, if set, still records
 what the guest sends.
 
@@ -587,7 +587,7 @@ In the guest, start MIDI on the port as on the real machine, from the
 System Manager's serial device panel or with `startmidi`; a plain RS-232
 port needs `-p rs232` (`startmidi -n synth -d /dev/ttyd3 -p rs232`), and the
 interface then shows in `startmidi`'s list for MIDI programs to use.
-`serial` in the monitor counts the messages and notes the synth has played.
+`devices` in the monitor counts the messages and notes the synth has played.
 
 ### Connect to a serial port
 
@@ -824,8 +824,9 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 # `at` is a slot: scsi0/t1 is target 1 of the first SCSI controller, scsi1/t4 target 4
 # of the second (the Indigo2 and O2 have two), gio0 a GIO slot, or a full path such as
 # xio15/pci0/0/t1. Left out, a device takes the first free slot that fits, in file
-# order. `iris --list-slots` prints every slot on the machine, its aliases, what is in it and
-# what it takes. Valid targets: 1–7 (1–15 on the Octane); the controller is target 0.
+# order. `iris --list-slots` prints the machine's slots as a tree with their aliases, what is in
+# each and what it takes; the monitor's `devices` prints the same tree with the serial ports' host ends.
+# Valid targets: 1–7 (1–15 on the Octane); the controller is target 0.
 [[devices]]
 type    = "hdd"
 at      = "scsi0/t1"
@@ -1024,7 +1025,7 @@ Configuration
 Storage
   --device <SPEC>             Place a device: [NAME:]TYPE[@SLOT][,KEY=VALUE]..., as a [[devices]]
                               entry (hdd@scsi0/t1,path=irix65.raw). A named one replaces the file's
-  --list-slots                Print every slot on the machine, what is in it and what it takes
+  --list-slots                Print the machine's slots as a tree, what is in each and where it came from
   --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 

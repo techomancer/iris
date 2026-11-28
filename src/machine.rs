@@ -485,7 +485,7 @@ impl Machine {
             );
             console
         };
-        ioc.scc().set_backend_b(crate::dev::serial_map::mapped(tag, "SCC channel B", Some(1), true, &cfg, console));
+        ioc.scc().set_backend_b(crate::dev::serial_map::mapped("SCC channel B", Some(1), true, &cfg, console));
         let label = format!("{tag} serial channel A");
         let log_a = crate::dev::serial_host::open_log_at(&cfg, cfg.serial_log_a.as_deref(), &label);
         let channel_a = if let Some(b) = peripheral(2, log_a.clone())? {
@@ -504,7 +504,7 @@ impl Machine {
             );
             channel_a
         };
-        ioc.scc().set_backend_a(crate::dev::serial_map::mapped(tag, "SCC channel A", Some(2), false, &cfg, channel_a));
+        ioc.scc().set_backend_a(crate::dev::serial_map::mapped("SCC channel A", Some(2), false, &cfg, channel_a));
         ioc.set_heartbeat(heartbeat.clone());
         ioc.set_clock_ticks(fasttick_count.clone(), status.cpu(0).board_tick_rate());
         // Attach SCSI devices from config, each at its slot in the slot

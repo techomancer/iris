@@ -41,7 +41,7 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
             if index == console {
                 log::warn!("{tag}: this is the console port; the console now goes to the peripheral");
             }
-            (port.connect)(crate::dev::serial_map::mapped(name, port.label, port.ttyd, index == console, cfg, b));
+            (port.connect)(crate::dev::serial_map::mapped(port.label, port.ttyd, index == console, cfg, b));
             continue;
         }
         let line = SerialLine {
@@ -52,7 +52,7 @@ pub(crate) fn connect_serial_ports(cfg: &MachineConfig, name: &str, ports: &[Ser
             socket_setting: port.socket.as_ref().map_or("", |(_, setting)| setting),
         };
         let (backend, _) = serial_line(&line, log, (cfg.ci && index == console).then_some(&port.ci));
-        (port.connect)(crate::dev::serial_map::mapped(name, port.label, port.ttyd, index == console, cfg, backend));
+        (port.connect)(crate::dev::serial_map::mapped(port.label, port.ttyd, index == console, cfg, backend));
     }
     Ok(())
 }

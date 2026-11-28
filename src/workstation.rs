@@ -45,7 +45,8 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
     if let Some(line) = host_id_line(&cfg) {
         eprintln!("iris: {line}");
     }
-    match cfg.machine.profile {
+    let shown = Arc::new(cfg.clone());
+    let machine: Result<Box<dyn Workstation>, String> = match cfg.machine.profile {
         crate::config::MachineProfile::FuelIp34 => {
             Ok(Box::new(crate::ip35::machine(&cfg, crate::ip34_machine::node_specs, crate::ip34_machine::build_io)?))
         }
@@ -66,7 +67,10 @@ pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
             Ok(Box::new(crate::ip27::machine(&cfg, crate::ip27_machine::node_specs, crate::ip27_machine::build_io)?))
         }
         _ => Ok(Box::new(Machine::try_new(cfg)?)),
-    }
+    };
+    let machine = machine?;
+    machine.monitor().set_config(shown);
+    Ok(machine)
 }
 
 #[cfg(test)]

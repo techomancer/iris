@@ -73,7 +73,7 @@ impl MachineSlotKind {
         }
     }
 
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             MachineSlotKind::Extra { .. } => DeviceFamily::Virtio.label().into(),
             MachineSlotKind::Open([]) => "nothing modelled".into(),
@@ -343,55 +343,6 @@ impl DevicePlacement {
             None => Ok(()),
         }
     }
-
-    /// `--list-slots`: every slot, what is in it and what it takes. Runs of
-    /// free targets on one bus share a line.
-    pub fn list_slots(&self) -> String {
-        let has = |at: &MachineSlotPath| (0..self.devices.len()).find(|&i| self.at(i) == Some(at)).map(|i| {
-            let d = &self.devices[i];
-            let name = d.name.as_ref().map(|n| format!("{n}: ")).unwrap_or_default();
-            let note = if d.default { " (default)" } else { "" };
-            format!("{name}{}{note}", d.device.summary())
-        });
-        let alias = |s: &MachineSlot| -> String {
-            if !s.aliases.is_empty() {
-                return s.aliases.join(", ");
-            }
-            let parent = s.path.parent().and_then(|p| self.slot(&p).and_then(|p| p.aliases.first().cloned()));
-            parent.map(|p| format!("{p}/{}", s.path.to_string().rsplit('/').next().unwrap_or(""))).unwrap_or_else(|| "-".into())
-        };
-        let mut lines = vec![["SLOT".to_string(), "ALIAS".into(), "HAS".into(), "TAKES".into()]];
-        let mut free: Option<(usize, u8)> = None; // the line of a run of free targets and its first id
-        for s in &self.slots {
-            let line = match &s.kind {
-                MachineSlotKind::Fixed(part) | MachineSlotKind::ScsiBus { part, .. } => [s.path.to_string(), alias(s), format!("{part} (onboard)"), "-".into()],
-                MachineSlotKind::PciBus(name) => [s.path.to_string(), alias(s), name.to_string(), "-".into()],
-                MachineSlotKind::Open(_) | MachineSlotKind::Extra { .. } => match has(&s.path) {
-                    Some(h) => [s.path.to_string(), alias(s), h, "-".into()],
-                    // A slot with its own name, or at the root, has a line to itself.
-                    None if !s.aliases.is_empty() || s.path.depth() < 2 => [s.path.to_string(), alias(s), "-".into(), s.kind.label()],
-                    None => {
-                        let id = s.path.last_number().unwrap_or(0);
-                        let (at, al) = (s.path.to_string(), alias(s));
-                        let target = s.path.target_id().or(s.path.loop_number()).is_some();
-                        if let Some((n, first)) = free.filter(|&(n, _)| target && lines[n][0].rsplit_once('/').map(|p| p.0) == at.rsplit_once('/').map(|p| p.0)) {
-                            lines[n][0] = format!("{}-{id}", at_first(&at, first));
-                            lines[n][1] = if al == "-" { al } else { format!("{}-{id}", at_first(&al, first)) };
-                            free = Some((n, first));
-                            continue;
-                        }
-                        free = target.then_some((lines.len(), id));
-                        lines.push([at, al, "-".into(), s.kind.label()]);
-                        continue;
-                    }
-                },
-            };
-            free = None;
-            lines.push(line);
-        }
-        let w: Vec<usize> = (0..3).map(|c| lines.iter().map(|l| l[c].len()).max().unwrap_or(0)).collect();
-        lines.iter().map(|l| format!("{:w0$}  {:w1$}  {:w2$}  {}\n", l[0], l[1], l[2], l[3], w0 = w[0], w1 = w[1], w2 = w[2])).collect()
-    }
 }
 
 /// How a device claims a slot: by a full path, by naming a bus, or anywhere.
@@ -538,13 +489,6 @@ fn check_name(name: &str, machine: &str, slots: &[MachineSlot]) -> Result<(), St
     Ok(())
 }
 
-/// `a/b/tN` with its last step's number set to `first`.
-fn at_first(at: &str, first: u8) -> String {
-    let (head, last) = at.rsplit_once('/').unwrap_or(("", at));
-    let tag: String = last.chars().take_while(|c| !c.is_ascii_digit()).collect();
-    if head.is_empty() { format!("{tag}{first}") } else { format!("{head}/{tag}{first}") }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +531,7 @@ mod tests {
     fn list_slots(devs: &[ConfiguredDevice], map: &Map) -> Result<String, String> {
         let mut cfg = map.0.clone();
         cfg.devices = devs.to_vec();
-        DevicePlacement::new(&cfg).map(|p| p.list_slots())
+        crate::tree::render(&cfg, crate::tree::Look::PLAIN, false)
     }
 
     fn hdd(at: &str, path: &str) -> ConfiguredDevice {
@@ -818,9 +762,9 @@ mod tests {
         let e = place(&[dev("nvme", None, Some("xio13/pci0/1"))], &fill(octane)).unwrap_err();
         assert!(e.contains("has no slot xio13/pci0/1"), "no module, no slot: {e}");
         let text = list_slots(&devs, &fill(octane)).unwrap();
-        let at = |s: &str| text.lines().position(|l| l.starts_with(s)).unwrap_or_else(|| panic!("{s} in\n{text}"));
-        assert!(at("xio13 ") < at("xio13/pci0 ") && at("xio13/pci0/1 ") < at("xio13/pci0/2 "), "{text}");
-        assert!(text.lines().any(|l| l.starts_with("xio13/pci0/2/pci0/0") && l.contains("nvme n.img")), "{text}");
+        let at = |s: &str| text.lines().position(|l| l.contains(s)).unwrap_or_else(|| panic!("{s} in\n{text}"));
+        assert!(at("xio13 (") < at("-- 2 (br)") && at("-- 2 (br)") < at("`-- 0 "), "{text}");
+        assert!(text.lines().any(|l| l.contains("`-- 0 ") && l.contains("nvme n.img")), "{text}");
     }
 
     #[test]
@@ -837,29 +781,6 @@ mod tests {
         assert!(r.bind_pci("xio13/pci0", bus()).unwrap_err().contains("does not declare"));
         r.check_pci().unwrap();
         assert!(r.pci(&loc("xio15/pci0")).is_some());
-    }
-
-    #[test]
-    fn list_slots_shows_aliases_contents_and_free_runs() {
-        let mut cd = hdd("scsi0/t4", "");
-        cd.device = DeviceModel::Scsi(crate::config::ScsiDeviceConfig { cdrom: true, kind_field: crate::config::ScsiKind::Cdrom, ..Default::default() });
-        cd.default = true;
-        let text = list_slots(&[hdd("scsi0/t1", "irix.img"), cd], &fill(MachineProfile::IndyIp24)).unwrap();
-        let rows: Vec<Vec<&str>> = text.lines().map(|l| l.split("  ").map(str::trim).filter(|s| !s.is_empty()).collect()).collect();
-        assert_eq!(rows, [
-            vec!["SLOT", "ALIAS", "HAS", "TAKES"],
-            vec!["hpc3", "-", "hpc3 (onboard)", "-"],
-            vec!["hpc3/c0", "scsi0", "wd33c93a (onboard)", "-"],
-            vec!["hpc3/c0/t1", "scsi0/t1", "hdd irix.img", "-"],
-            vec!["hpc3/c0/t2-3", "scsi0/t2-3", "-", "scsi devices"],
-            vec!["hpc3/c0/t4", "scsi0/t4", "cdrom (default)", "-"],
-            vec!["hpc3/c0/t5-7", "scsi0/t5-7", "-", "scsi devices"],
-            vec!["gfx", "-", "-", "a graphics board"],
-            vec!["gio1", "-", "-", "virtio devices"],
-            vec!["gio0", "-", "-", "gio cards, virtio devices"],
-            vec!["serial1", "-", "-", "serial devices"],
-            vec!["serial2", "-", "-", "serial devices"],
-        ]);
     }
 
     fn card(ty: &str, at: Option<&str>) -> ConfiguredDevice {
@@ -945,10 +866,10 @@ mod tests {
         let cd = ConfiguredDevice::new("xio15/pci0/1/l3", DeviceModel::Scsi(crate::config::ScsiDeviceConfig { cdrom: true, kind_field: crate::config::ScsiKind::Cdrom, ..Default::default() }));
         assert!(place(&[cd], &map).unwrap_err().contains("does not take a cdrom"));
         let text = list_slots(&[hdd("xio15/pci0/1/l3", "d.img")], &map).unwrap();
-        for want in ["xio15/pci0/1/l0-2 ", "xio15/pci0/1/l3 ", "xio15/pci0/1/l4-125 "] {
-            assert!(text.lines().any(|l| l.starts_with(want)), "{want} in\n{text}");
+        for want in ["-- l0-2 ", "-- l3 ", "-- l4-125 "] {
+            assert!(text.lines().any(|l| l.contains(want)), "{want} in\n{text}");
         }
-        assert!(text.lines().any(|l| l.starts_with("xio15/pci0/2 ") && l.contains("bus1-slot2") && l.ends_with("pci cards")), "{text}");
+        assert!(text.lines().any(|l| l.contains("-- 2 (bus1-slot2)") && l.ends_with("takes: pci cards")), "{text}");
     }
 
     /// The card brings its loop with it, wherever it is placed, and a disk names the card.

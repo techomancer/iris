@@ -388,7 +388,7 @@ SCSI controller), `pci0/3` (the O2's PCI option slot) or `gio1`. Each machine al
 aliases, such as `scsi0/t1`, `scsi1/t4`, `pci_slot`, `io2` or `bus1-slot2`. Left out, or naming a bus
 (`xio13/pci0`), `at` picks the first free slot that fits: devices with a full slot claim first, then
 those that name a bus, then the rest, each in file order. A SCSI disk with no slot takes the first free
-target. `iris --list-slots` prints every slot of a machine with its aliases, what is in it and what it
+target. `iris --list-slots` prints the machine's slots as a tree with their aliases, what is in each and what it
 takes; `--device [NAME:]TYPE[@SLOT][,KEY=VALUE]...` adds or replaces one from the command line.
 
 | `type` | Goes in | Keys |
@@ -638,7 +638,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--jitv2-threads` | jitv2 compile-pool threads (default: one per guest CPU, at most 4, capped by the host's usable CPUs; see jitv2.threads) |
 | `--jitv2-compile MODE` | Where jitv2 compiles: `async` on the pool's threads (default) or `sync` on the CPU thread, so a run executes the same host code every time. One CPU only. Sets `jitv2.compile`. |
 | `--device SPEC` | Place a device: `[NAME:]TYPE[@SLOT][,KEY=VALUE]...`, as a `[[devices]]` entry (`hdd@scsi0/t1,path=irix65.raw`; a value is read as TOML when it parses as one). A named one replaces the file's device of that name. |
-| `--list-slots` | Print every slot on the machine, its aliases, what is in it and what it takes, then exit. |
+| `--list-slots` | Print the machine's slots as a tree, their aliases, what is in each and what it takes, then exit. |
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
 | `--headless` | Suppress the standalone window (platform-specific graphics/console behavior, as `headless`; audio unaffected) |
 | `--noaudio` | Disable host audio output, as `no_audio`; graphics is unaffected |
