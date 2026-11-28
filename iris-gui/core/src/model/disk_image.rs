@@ -71,12 +71,48 @@ impl Read for Zeroes {
     }
 }
 
+/// Whether anything sits at `path`, or at a sidecar a disk there would pick
+/// up at its first start: a copy-on-write overlay or a CHD diff left by an
+/// earlier image of the same name. A new image there would read as the old
+/// one, so the name counts as taken.
+pub fn taken(path: &Path) -> bool {
+    let sidecar = |s: &str| {
+        let mut p = path.as_os_str().to_owned();
+        p.push(s);
+        PathBuf::from(p)
+    };
+    [path.to_path_buf(), sidecar(".overlay"), sidecar(".overlay.dirty"), sidecar(".diff.chd"), iris::chd_disk::diff_path_for(path)]
+        .iter()
+        .any(|p| std::fs::symlink_metadata(p).is_ok())
+}
+
+/// The temporary file an image is written as, beside `path`, so a cancel or
+/// a crash never leaves a half-written image under the name asked for.
+fn temporary(path: &Path) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!(".{name}.creating-{}", std::process::id()))
+}
+
+/// Removes the temporary file unless it was published by a rename.
+struct Cleanup(PathBuf, bool);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if !self.1 {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
 /// Write a blank image of `mb` MiB at `path`.
 ///
-/// Fails rather than replacing anything: an existing file, even an old
-/// overlay sidecar, keeps its contents and the caller is told to choose
-/// another name. `progress` is called with a fraction in `0.0..=1.0`;
-/// returning true from `cancel` stops it and leaves nothing behind.
+/// Fails rather than replacing anything: an existing file, or an old
+/// overlay or diff a disk of that name would pick up ([`taken`]), keeps its
+/// contents and the caller is told to choose another name. The image is
+/// written beside `path` and published with a hard link, which fails if
+/// something took the name meanwhile. `progress` is called with a fraction
+/// in `0.0..=1.0`; returning true from `cancel` stops it and leaves nothing
+/// behind.
 pub fn create(
     path: &Path,
     format: Format,
@@ -86,28 +122,27 @@ pub fn create(
 ) -> Result<(), String> {
     let mb = mb.clamp(MIN_MB, MAX_MB);
     let bytes = mb * 1024 * 1024;
-    if path.exists() {
-        return Err(t!("create-disk-exists", file = path.display().to_string()));
+    let exists = || t!("create-disk-exists", file = path.display().to_string());
+    if taken(path) {
+        return Err(exists());
     }
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
     }
+    let tmp = temporary(path);
+    let mut cleanup = Cleanup(tmp.clone(), false);
     match format {
         Format::Raw => {
-            // create_new: the file must not be there, so nothing is truncated.
+            // create_new: nothing is ever truncated.
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(path)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            f.set_len(bytes).map_err(|e| {
-                let _ = std::fs::remove_file(path);
-                e.to_string()
-            })?;
-            progress(1.0);
-            Ok(())
+                .open(&tmp)
+                .map_err(|e| format!("{}: {e}", tmp.display()))?;
+            f.set_len(bytes).map_err(|e| e.to_string())?;
+            f.sync_all().map_err(|e| e.to_string())?;
         }
         Format::Chd => {
             use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
@@ -123,12 +158,25 @@ pub fn create(
                 let total = if p.bytes_total > 0 { p.bytes_total } else { bytes.max(1) };
                 progress((p.bytes_done.min(total) as f64 / total as f64) as f32);
             };
-            create_from_reader(Zeroes { left: bytes }, path, opts, &mut report, cancel).map_err(|e| {
-                let _ = std::fs::remove_file(path);
-                format!("{e:?}")
-            })
+            create_from_reader(Zeroes { left: bytes }, &tmp, opts, &mut report, cancel)
+                .map_err(|e| format!("{e:?}"))?;
         }
     }
+    if cancel() {
+        return Err("cancelled".into());
+    }
+    match std::fs::hard_link(&tmp, path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(exists()),
+        // A filesystem without hard links: rename, having just checked.
+        Err(_) if !taken(path) => {
+            std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
+            cleanup.1 = true;
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    progress(1.0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -146,6 +194,28 @@ mod tests {
         let err = create(&path, Format::Raw, 8, &mut |_| {}, &|| false).expect_err("refused");
         assert!(err.contains("new.img"), "{err}");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 4 * 1024 * 1024);
+    }
+
+    /// An old overlay or diff would make a new image read as the old disk,
+    /// so its name counts as taken; nothing but the finished image is left.
+    #[test]
+    fn a_name_with_an_old_sidecar_is_taken_and_nothing_is_left_behind() {
+        let root = TempRoot::new("disk-image-sidecar");
+        let path = root.0.join("old.img");
+        std::fs::write(root.0.join("old.img.overlay"), b"old overlay").unwrap();
+        assert!(taken(&path));
+        assert!(create(&path, Format::Raw, 1, &mut |_| {}, &|| false).is_err());
+        assert!(!path.exists());
+        let chd = root.0.join("new.chd");
+        let mut last = 0.0;
+        create(&chd, Format::Chd, 4, &mut |f| last = f, &|| false).expect("created");
+        assert!(last > 0.99, "progress reached the end: {last}");
+        let c = libchdman_rs::Chd::open(chd.to_str().unwrap(), false, None).unwrap();
+        assert_eq!(c.info().unwrap().logical_bytes, 4 * 1024 * 1024);
+        assert!(create(&root.0.join("gone.chd"), Format::Chd, 64, &mut |_| {}, &|| true).is_err());
+        let mut names: Vec<_> = std::fs::read_dir(&root.0).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["new.chd", "old.img.overlay"], "no temporary or cancelled image left");
     }
 
     #[test]

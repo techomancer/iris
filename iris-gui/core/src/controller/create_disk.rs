@@ -142,7 +142,7 @@ impl CreateDiskController {
             return Enabled::No(t!("create-disk-needs-size"));
         }
         let full = self.full_path();
-        if full.exists() {
+        if disk_image::taken(&full) {
             return Enabled::No(t!("create-disk-exists", file = full.display().to_string()));
         }
         Enabled::Yes
@@ -231,6 +231,11 @@ impl CreateDiskController {
         let mut fx = Vec::new();
         let Some(job) = &self.job else { return fx };
         if job.is_running() {
+            return fx;
+        }
+        // Cancelled: the form stays up for another go, with nothing to report.
+        if job.snapshot().status == crate::model::job::Status::Cancelled {
+            self.job = None;
             return fx;
         }
         match job.outcome() {
