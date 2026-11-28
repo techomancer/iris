@@ -1990,9 +1990,6 @@ impl BusDevice for Hpc3 {
             let reg = offset % 0x2000;
             let val = self.pdma_ops[idx].read(&mut self.pdma_channels[idx].lock(), reg);
             dlog_dev!(LogModule::Hpc3, "HPC3: Read PDMA addr {:08x} = {:08x}", addr, val);
-//            if idx == 0 {
-                //eprintln!("HPC3: PDMA[0] read reg={:04x} val={:08x}", reg, val);
-            //}
             return BusRead32::ok(val);
         }
 

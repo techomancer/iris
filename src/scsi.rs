@@ -441,12 +441,6 @@ impl ScsiDevice {
             data[8..16].copy_from_slice(&self.identity.vendor);
             data[16..32].copy_from_slice(&self.identity.product);
             data[32..36].copy_from_slice(&self.identity.revision);
-
-            /*println!("SCSI: INQUIRY LUN={} AllcLen={} Type={:02x} Vendor={} Product={} Rev={}",
-                lun, alloc_len, data[0],
-                String::from_utf8_lossy(&data[8..16]),
-                String::from_utf8_lossy(&data[16..32]),
-                String::from_utf8_lossy(&data[32..36]))*/
         } else {
             // SPC-2 8.2.5: PQ=011b (device server not capable of supporting a physical
             // device on this LUN), PDT=0x1F (unknown/no device type). Linux's
@@ -1124,8 +1118,6 @@ impl ScsiDevice {
 
         // TOC LBAs are always in physical CD sectors (2048 bytes each).
         let total_lba = (self.size() / self.phys_block_size) as u32;
-        //eprintln!("SCSI READ TOC: format={} msf={} total_lba={} (current block_size={})",
-        //    format, msf, total_lba, self.logical_block_size);
 
         match format {
             0 => {
@@ -1203,7 +1195,6 @@ impl ScsiDevice {
     /// (drives power on as HDD to support older SGI systems that can't boot from CD).
     /// Block size is NOT changed — that is controlled by MODE SELECT only.
     fn exec_sgi_hd2cdrom(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        //eprintln!("SCSI SGI_HD2CDROM: no-op");
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 

@@ -10003,3 +10003,12 @@ fn rexget_clears_the_sign_extension() {
     // Writing then reading a negative coordinate leaves its 23-bit form.
     assert_eq!((-0x80i32 as u32).rexset(9, 7).rexget(9, 7), 0x007F_FF80);
 }
+
+#[test]
+fn an_unhandled_register_is_reported_a_few_times_and_the_next_one_still_is() {
+    let mut seen = std::collections::HashMap::new();
+    let polled: Vec<bool> = (0..10).map(|_| super::first_few(&mut seen, "read32", 0x1000)).collect();
+    assert_eq!(polled.iter().filter(|&&p| p).count(), 8);
+    assert!(super::first_few(&mut seen, "read32", 0x1004));
+    assert!(super::first_few(&mut seen, "write", 0x1000));
+}

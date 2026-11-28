@@ -76,7 +76,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
         // that a branch/jump was just taken and its delay slot hasn't run
         // yet — status codes carry no PC-related information of their own
         // (every handler sets core.pc itself before returning).
-        //eprintln!("GDB: step_one: PC={:#018x}", exec.core.pc);
         let mut status = exec.step_int();
         let mut retries = 0u32;
         while status == EXEC_RETRY && retries < MAX_STEP_RETRIES {
@@ -98,7 +97,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
             exec.skip_breakpoints = true;
             status = exec.step_int();
         }
-        //eprintln!("GDB: step_one: after step status={:#010x} PC={:#018x}", status, exec.core.pc);
         let reason = if status == EXEC_BREAKPOINT {
             drop(exec);
             return StopReason::SwBreakpoint;
@@ -121,10 +119,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
     fn run_blocking(&self, count: Option<usize>) -> StopReason {
         // run_debug_loop with wait=true blocks until the CPU stops.
         // We discard the text output (sink writer).
-        //eprintln!("GDB: run_blocking: calling run_debug_loop");
         let sink = Box::new(std::io::sink());
         self.cpu.run_debug_loop(count, true, sink);
-        //eprintln!("GDB: run_blocking: run_debug_loop returned, is_running={}", self.cpu.is_running());
 
         // Inspect executor state to determine stop reason.
         let reason = if let Some(exec) = self.cpu.executor.try_lock() {
@@ -304,7 +300,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
         };
         let mut exec = self.cpu.executor.lock();
         exec.add_breakpoint(id, addr, kind);
-        //eprintln!("GDB: add_bp id={} addr={:#018x} kind={:?} pc_bp_count={}", id, addr, kind, exec.pc_bp_count);
         id
     }
 
