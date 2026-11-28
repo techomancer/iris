@@ -659,7 +659,7 @@ const ODSY_IDENTITY: u64 = 0x00;
 
 fn config_with_vpro(dir: &TempPath, cpus: u8) -> MachineConfig {
     let mut cfg = tezro_config(dir, cpus);
-    cfg.graphics.board = Some(GraphicsBoard::V12);
+    cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V12)));
     cfg
 }
 

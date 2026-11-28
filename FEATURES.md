@@ -280,7 +280,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)), origin3200_ip35 (configured by `[origin3200]`, see [the Origin 3200 guide](docs/origin3200-ip35.md)), onyx3000_ip35 (the Origin 3200 with a G-brick or a V-brick; `[graphics] board` picks it, see [the Onyx 3000 guide](docs/onyx3000-ip35.md)). |
+| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (configured by `[onyx2]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)), tezro_ip53 (configured by `[tezro]`, see [the Tezro guide](docs/tezro-ip53.md)), origin3200_ip35 (configured by `[origin3200]`, see [the Origin 3200 guide](docs/origin3200-ip35.md)), onyx3000_ip35 (the Origin 3200 with a G-brick or a V-brick; a graphics `[[devices]]` entry picks it, see [the Onyx 3000 guide](docs/onyx3000-ip35.md)). |
 | `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`), meaning the machine's part of that family, or a part (`r14000_600`); independent of build features. With `test_device` set (the bare-metal benchmark rig) any part is accepted on any machine, `r14000_500` and the R16000 parts among them. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`); Tezro: r16000 (a bare `r16000` is `r16000_700`; `r16000_800`, `r16000_900` and `r16000_1000` are the other parts it ships with); Origin 3200: r12000 (`r12000_400`, with 8 MiB of secondary cache). The first listed is the default. |
 | `machine.cache` | `auto` | How the CPU caches are modelled: `full` (tags, line data, LRU and write-back, as on a real R4400 or R5000; transparent in a `tcache` or `jitv2` build, which keeps tags and states but writes through to memory), `shadow` (memory is the only store; tag arrays only answer CACHE instructions, the faster model under jitv2) or `auto` (`shadow` in a `jitv2` build, `full` otherwise). The R10000 family always uses `shadow`. `--cache` overrides. |
 | `machine.cpus` | `1`; `4` on the Tezro | Processors fitted on each node board, each run on its own host thread. 2 on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). 1, 2 or 4 on the Tezro; one selects the one-processor board with one PIC, two or four the board with two PICs. 1, 2 or 4 on each C-brick of the Origin 3200 and Onyx 3000, so two C-bricks run up to eight. 1 or 2 on each node board of the Origin 200, Origin 2000 and Onyx2, so a two-board deskside runs four. |
@@ -331,7 +331,7 @@ Fuel settings apply when `machine.profile = "fuel_ip34"`.
 
 The machine has one 500 MHz R14000 and 512 MiB of RAM in two 256 MiB
 banks (`banks` must be `[256, 256]`), and runs on a serial console unless
-`[graphics] board` fits a VPro. A `[fuel]` table is written to a
+a `vpro` device entry adds a VPro. A `[fuel]` table is written to a
 saved config only when one of these keys is set. See the
 [Fuel guide](docs/fuel-ip34.md).
 
@@ -387,11 +387,10 @@ one of them is set. See [the Onyx 3000 guide](docs/onyx3000-ip35.md).
 
 ### [graphics]
 
+How the host draws the graphics board. The board itself is a `[[devices]]` entry, [below](#graphics-boards).
+
 | Key | Default | Values and behavior |
 |---|---|---|
-| `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none. `ir2` and `ir2:2rm` are the Onyx2 deskside's InfiniteReality2 pipe with one or two raster managers; `ir2e` and `ir2e:2rm` are the InfiniteReality2E (GE16-4, RM9, 64 MB texture per raster manager), which also fits the deskside. The Onyx2 takes only the first four or `none`; the default is `none`. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI), `v6`, `v8`, `v10`, `v12` (the VPro boards, also `vpro:v12` and so on; need an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision) or `none` (no board: the machine runs on its serial console, with no window). The Fuel takes `v12` or `v10` in its graphics slot, or `none`, its default. The Tezro takes `v12` at widget 12, or `none`, its default. The Onyx 3000 (`onyx3000_ip35`) takes `ir3`, its default, an InfiniteReality3 pipe on a G-brick at widget 11 of the I-brick, or `v12`, on a V-brick with a second C-brick (widget 8, an approximation) or with one C-brick at widget 11 of the I-brick; it has no `none`. |
-| `graphics.flash` | unset | InfiniteReality2: the file that keeps the pipe's 512 KiB flash EEPROM between runs; created when absent. Unset keeps it in memory. |
-| `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 | `graphics.threads` | `2` | Worker threads the board's fragment pipeline draws on, at least 1. VPro and InfiniteReality: the screen tiles' owners, besides its front-end and raster threads; more help on a host with cores to spare. |
 | `graphics.tile` | `32` | VPro and InfiniteReality: the fragment pipeline's screen tile size in pixels, a power of two from 8 to 256. Each tile's work runs in order on one worker at a time; with many threads, 64 can be faster. |
 | `graphics.raster` | `cpu` | VPro, IMPACT and Newport: where the raster unit runs. `cpu` keeps the existing board path; `wgpu` draws on the host GPU through wgpu compute (needs a build with the `wgpu` feature). Newport's experimental production mode makes its complete RGB and auxiliary planes GPU-authoritative and has no unsupported-operation CPU fallback. An IMPACT board then has one raster engine, whatever `IRIS_MGRAS_ENGINES` says. |
@@ -427,11 +426,34 @@ takes; `--device [NAME:]TYPE[@SLOT][,KEY=VALUE]...` adds or replaces one from th
 | `pci_bridge` | a PCI slot | A PCI-to-PCI bridge, with one slot behind it at `BRIDGE/pci0/0`. |
 | `virtio_serial` | a spare slot (a GIO slot on the Indy and Indigo2) | `port` tables, `[[devices.port]]`, at most 31: `name`, `console`, and `tcp_port` (raw TCP on 127.0.0.1) or `socket` (a Unix socket, exclusive with `tcp_port`); one console on TCP 8890 when none. See [docs/dev/virtio-serial.md](docs/dev/virtio-serial.md). |
 | `virtio_9p` | a spare slot | `path` (required), `tag` (`"share"`), `readonly`, `owners` (`"squash"` or `"passthrough"`), `uid`, `gid`, `uid_map`, `gid_map`. Needs a Unix host; see [docs/dev/virtio-9p.md](docs/dev/virtio-9p.md). |
-| `ultra64`, `test_device`, `newport` | `gio0` | The N64 development board (needs an external gopher64 peer), the bare-metal test device (`dump`, `run_config` as `time_pct=N,repeats=N,groups=MASK`; with `cheritest_dump_hook`) and the Indy's or Indigo2's second Newport head. |
+| `ultra64`, `test_device` | `gio0` | The N64 development board (needs an external gopher64 peer), the bare-metal test device (`dump`, `run_config` as `time_pct=N,repeats=N,groups=MASK`; with `cheritest_dump_hook`) and the Indy's or Indigo2's second Newport head. |
 | `hostserial` | a serial port, `serialN` (IRIX's `/dev/ttydN`: `serial1` and `serial2`, on the Tezro `serial3` and `serial4`); `at` is required | `path` (required): a host serial port such as `"/dev/ttyUSB0"`. Its rate, framing, DTR, RTS and break follow the guest; its CTS, DCD, DSR and RI are the guest's modem inputs. Linux and macOS. See the serial ports section of [HELP.md](HELP.md). |
 | `midi_synth` | a serial port, as `hostserial` | `path` (required): a General MIDI SoundFont (`.sf2`), loaded at start. `gain` (`1.0`, 0 to 16): times the synth's own level, which leaves room for many voices; the host mix clips above full scale. Plays into the host's audio as a stream of its own (muted by `no_audio`); with `[audio] file`, into a file beside it (`out.wav` → `out-midi.wav`); `IRIS_MIDI_CAPTURE=file.wav` also records it. |
 | `midi_raw` | a serial port, as `hostserial` | `path` (required): a host MIDI port. A raw MIDI device (Linux: `"/dev/snd/midiC1D0"` or `"/dev/midi1"`) passes the bytes as they are, both ways; a host serial port with a MIDI interface (`"/dev/ttyUSB0"`) is set up as `hostserial` does. |
-| `graphics` | a graphics port or slot (`gfx`, `xio11`, `node1/xio8`) | Where the board goes; which board it is stays `[graphics] board`. Left out, the machine places it. |
+| `newport`, `express`, `impact`, `vpro`, `kona` | the graphics slot (alias `graphics`) | A graphics board; see [Graphics boards](#graphics-boards). |
+| `none` | any slot; `at` is required | Leaves the slot empty, so the default for it is not placed. |
+
+<a id="graphics-boards"></a>
+
+#### Graphics boards
+
+The graphics board is an entry whose `type` is its family and whose `model` picks the board in it. Each
+machine's slot list (`iris --list-slots`) says which boards go where: `graphics` is the alias of its main
+graphics slot, and the board that slot holds when nothing says otherwise is in the HAS column. An entry with
+no `at`, or `at = "graphics"`, replaces that board; an entry at another slot adds to it. `type = "none"` at
+`graphics` leaves the slot empty.
+
+| `type` | `model` | Other keys | Machines |
+|---|---|---|---|
+| `newport` | none: the XL24 | `resolution`: `guest` (default), `1024x768`, `1280x960` or `1280x1024` | Indy, Indigo2, IP28 (default); a second head at `gio0` |
+| `express` | `xz`, `elan`, `extreme` | | Indy and Indigo2: `xz` (2 GE7 on an Indigo2, 4 on an Indy), `elan` (4 GE7) and `extreme` (8 GE7) on the Indigo2 only |
+| `impact` | `solid`, `high`, `max` (`solidimpact`, `highimpact` and `maximpact` also work) | | Octane (default `solid`), Indy, Indigo2, IP28 |
+| `vpro` | `v6`, `v8`, `v10`, `v12` | | Octane (needs an IRIX install with the VPro driver, IRIX 6.5.10 or later and PROM 4.0, or 4.5 for the V10 and V12, which shipped only in the Octane2 and so give the machine the Octane2's Crossbow 1.4 and Bridge revision); Fuel `v10`, `v12`; Tezro `v12` at widget 12; Onyx 3000 `v12` in a V-brick on a second C-brick (widget 8, an approximation); an Octane takes more in any XIO slot (`slot_cd`, as the Octane2's Dual Head module has it) |
+| `kona` | `ir2`, `ir2e`, `ir3` | `raster_managers` (1 or 2, default 1), `flash`: the file that keeps the pipe's 512 KiB flash EEPROM between runs, created when absent; unset keeps it in memory | Onyx2 deskside: `ir2` (InfiniteReality2) and `ir2e` (GE16-4, RM9, 64 MB texture per raster manager); Onyx 3000: `ir3` (default), a G-brick at widget 11 of the I-brick |
+
+The Fuel, Tezro and Onyx2 have a graphics slot and no default board, so they run on their serial console
+until an entry places one. The Onyx 3000 needs a board. The Origin 200, Origin 2000 and Origin 3200 have no
+graphics slot, and the O2's built-in CRIME/GBE (alias `graphics`) takes no entry.
 
 virtio devices take only the spare slots a board has for them, never a real slot (the Octane's Bridge
 devices 7, 5 and 6, the Tezro's IO9 bus 1); `at` can name any slot. A snapshot records each device at its slot: see [Snapshots](#snapshots).
@@ -440,12 +462,13 @@ devices 7, 5 and 6, the Tezro's IO9 bus 1); `at` can name any slot. A snapshot r
 
 The keys iris wrote before `[[devices]]` still load, each with a warning saying what it became, and will be
 removed in a later release: `[scsi.N]` tables (with `controller`, `kind` and `cdrom`), `[ultra64]`,
-`[virtio_serial]` and `[virtio_9p]` (with `slot`), `graphics.heads = 2`, `test_device` and its two companions,
+`[virtio_serial]` and `[virtio_9p]` (with `slot`), `test_device` and its two companions,
 and the command-line `--scsi1`/`--cdrom4` family and `--test-device`.
 
 `[nvme]`, `[[xio_board]]`, `[fibre_channel]`, `[machine] audio_card`, the `audio` flags, `[graphics] node` and
-`widget`, and `bridge_slot` no longer load. A file with one is refused, and the error names the `[[devices]]`
-entry to write instead.
+`widget`, `[graphics] board`, `heads`, `resolution` and `flash`, `--graphics` and `bridge_slot` no longer load. A file with one is refused, and the error says where to look; for the graphics
+keys, [HELP.md](HELP.md#graphics-boards) maps each old spelling to its entry. iris-gui reads an older
+machine's `[graphics]` keys as the entries they stand for.
 
 ### Snapshots
 
@@ -602,14 +625,14 @@ DS1685's NVRAM, behind IOC3, its clock in `<nvram>.clock`), `banks` (the MB in e
 512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
 `headless`, `[clock] fixed_mhz` (CP0 Count; 97.5 for the 195 MHz R10000),
-`[network]`, `[[port_forward]]`, `nat_subnet`, `[[devices]]` (`scsi0` is the internal bus, `scsi1` the external) and `[graphics] board`. See [the Octane guide](docs/octane-ip30.md).
+`[network]`, `[[port_forward]]`, `nat_subnet` and `[[devices]]` (`scsi0` is the internal bus, `scsi1` the external; the board is one too). See [the Octane guide](docs/octane-ip30.md).
 
 | Key | Default | Values and behavior |
 |---|---|---|
 | `octane.flash` | unset | Boot flash file, keeping the PROM's records between runs. Created from `prom` when missing and then used as it is, so delete it after changing `prom`; a file of another size is refused. Unset, the flash is in memory and every start is from `prom`. |
 
 `octane.graphics` is retired: a config that still has it is refused with a
-message naming `[graphics] board`, where the board is now set.
+message saying the board is a `[[devices]]` entry.
 
 ### Hardware constraints and precedence
 
@@ -624,9 +647,8 @@ the 180 MHz R10000, whose PROM disables them); the Fuel takes exactly
 Fuel uses two banks, Tezro and IP35 brick machines use up to eight, and
 the other profiles use four. Entries beyond the profile's bank count must be 0.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
-two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
-`heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
-embedded fallback.
+two-bank 1 GB layout. Extreme requires IP22. A second Newport head needs a Newport
+main board. IP28 IRIX needs IMPACT; its PROM has an embedded fallback.
 The config validator permits SCSI controller 1 only on the machines with two
 controllers: IP22, the O2, the Octane, the Origin 200, Origin 2000 and Onyx2,
 the Fuel and the Tezro.
@@ -677,7 +699,6 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--no-write-cache` | Turn every hard disk's write cache off (`write_cache = false` in each `hdd` and `nvme` device): slower, but a host crash loses no completed write. |
 | `--cpu` | Emulated CPU: a family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`, `r16000`) or a part (`r14000_600`) the machine takes. Overrides `[machine] cpu`. |
 | `--cache MODEL` | Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`), `full` or `shadow`. Overrides `[machine] cache`. The R10000 family is always `shadow`. |
-| `--graphics` | Graphics board: `newport` (default), `xz` (2 GE7 on Indigo2, 4 on Indy), `elan` (4 GE7, Indigo2), `extreme` (8 GE7, Indigo2), `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12` (`vpro:v12` and so on, Octane; `v10` and `v12` on the Fuel, `v12` on the Tezro and Onyx 3000), `ir2`, `ir2:2rm`, `ir2e`, `ir2e:2rm` (Onyx2), `ir3` (Onyx 3000) or `none`. Overrides `[graphics] board`. |
 | `--raster` | VPro, IMPACT and Newport: `cpu` (default) or `wgpu`, the raster unit on the host GPU (`[graphics] raster`; needs a build with the `wgpu` feature). |
 | `--renderer` | What draws the window: `gl` (default) or `wgpu` (`renderer`; needs a build with the `wgpu` feature). |
 | `--gdb-port` | Enable GDB stub on the given TCP port (e.g. --gdb-port 1234). Connect with: target remote localhost:<port> |
@@ -704,14 +725,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--clock-fixed-mhz` | Override CP0 Count MHz (default half the part's clock: 75 on an R4400 Indy, 97.5 on the IP28's R10000). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |
 | `--help`, `-h` | Display parser help. |
 
-`--graphics` has visible aliases `--board` and `--graphics-board`.
-Board aliases include `xl`, `gr2`, `gr2_xz`, `gr2-xz`, `gr2_extreme`,
-`gr2-extreme`, `impact:solid`, `solid_impact`, `impact:high`, `high_impact`,
-`impact:max`, `max_impact`, `vpro:v6` and `vpro_v6` (likewise for V8, V10 and
-V12), `ir2:1rm`, `ir2_1rm`, `infinitereality2`, `ir2_2rm`, `ir2x2` and
-`infinitereality3`. TOML board parsing also accepts hyphenated IMPACT, VPro
-and InfiniteReality2 names and `solid`, `high`, `max`, `maximumimpact`;
-canonical values are in the table. A `--config` file named on the command line
+`--graphics BOARD` (and its aliases `--board` and `--graphics-board`) is refused: use `--device vpro@graphics,model=v12`. A `--config` file named on the command line
 must exist; the default `iris.toml` may be missing, and the defaults are used.
 See [debug.md](debug.md) for monitor commands and [STORAGE.md](STORAGE.md) for iris-ci; they are runtime tools,
 not Cargo build features.

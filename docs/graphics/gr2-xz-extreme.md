@@ -10,10 +10,9 @@ There is no separate Elan setting in the configuration.
 [machine]
 profile = "indigo2_ip22"    # indy_ip24 also supports xz
 
-[graphics]
-board = "xz"               # extreme is restricted to indigo2_ip22
-heads = 1
-resolution = "guest"
+[[devices]]
+type  = "express"
+model = "xz"               # elan and extreme are restricted to indigo2_ip22
 ```
 
 Select **GR2 XZ** or **GR2 Extreme** in iris-gui's General tab. No graphics

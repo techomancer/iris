@@ -368,7 +368,11 @@ pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>, profile: MachineP
             0 if profile == MachineProfile::Origin2000Ip27 => crate::topology::fixed_slot(s, at, "BaseIO", &[&alias]),
             0 => crate::topology::fixed_slot(s, at, "BaseIO-G", &[&alias]),
             // The Onyx2's graphics slot, the only one of its board classes modelled.
-            _ => crate::topology::open_slot(s, at, if *at == "xio8" { &[DeviceFamily::Gfx] } else { &[] }, &[&alias]),
+            _ if *at == "xio8" && profile == MachineProfile::Onyx2Ip27 => {
+                crate::topology::open_slot(s, at, &[DeviceFamily::Gfx], &[&alias, "graphics"]);
+                crate::topology::boards(s, at, &[crate::config::GraphicsBoard::Ir2, crate::config::GraphicsBoard::Ir2e], None);
+            }
+            _ => crate::topology::open_slot(s, at, &[], &[&alias]),
         }
     }
     // The BaseIO Bridge's widget: 8 on the Origin 200 and 2000, 15 on the Onyx2's BaseIO-G.

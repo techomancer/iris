@@ -134,7 +134,7 @@ space, the eight device windows and the flash; see §7.
 
 A GM10 (SI with texture: HQ4 in front of IMPACT) on snorlax. The register
 block is at the start of the widget's space (OpenBSD's `impact_xbow.c` maps
-2 MB at offset 0). iris fits its IMPACT or VPro board at widget 11 instead.
+2 MB at offset 0). iris puts its IMPACT board there too and a VPro at widget 11.
 
 ## 4. HEART's processor-side registers (0x0FF0_0000)
 
@@ -489,8 +489,8 @@ Where IRIS differs from the notes above, or settles what they leave open:
   counters, so code rewritten at the exception vectors is recompiled. Whether
   bus masters reach 0x2000_0000..+16 KB is not known; the DMA view does. See
   `clanker/devices/ip30-low-memory-aliases-sdram.md`.
-- The graphics board is Solid IMPACT by default, on widget 11, not snorlax's
-  GM10 on widget 12; the other IMPACT and VPro boards sit there too. The
+- The graphics board is Solid IMPACT by default, on widget 12 like snorlax's
+  GM10; the other IMPACT boards sit there too and a VPro on widget 11. The
   Crossbow link to it is up when a board is fitted.
 - The Crossbow reports revision 1.3 where snorlax's is 1.2, or 1.4 with a V10
   or V12, which shipped only in the Octane2.

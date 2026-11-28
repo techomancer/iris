@@ -10,10 +10,9 @@ serial_log = "ip28/console-ip28.log"
 [machine]
 profile = "indigo2_ip28"
 cpu     = "r10000"
-[graphics]
-board = "solidimpact"
-heads = 1
-resolution = "guest"
+[[devices]]
+type  = "impact"
+model = "solid"
 [[devices]]
 type = "hdd"
 at   = "scsi0/t1"

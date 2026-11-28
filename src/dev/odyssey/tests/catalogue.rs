@@ -197,7 +197,7 @@ fn a_destination_beyond_the_reported_memory_is_dropped() {
     assert!(!s.diag.board_oob_reported);
 }
 
-/// Each name the configuration accepts selects a board, VPro boards are
+/// Each model name selects a board, VPro boards are
 /// offered on the Octane only, and the PROM revision check the upgrade kit
 /// calls for is a property of the board.
 ///
@@ -209,14 +209,14 @@ fn vpro_boards_are_offered_on_the_octane_only() {
 
     for (name, board) in [
         ("v6", GraphicsBoard::V6),
-        ("vpro:v8", GraphicsBoard::V8),
-        ("vpro_v10", GraphicsBoard::V10),
+        ("v8", GraphicsBoard::V8),
+        ("v10", GraphicsBoard::V10),
         ("V12", GraphicsBoard::V12),
     ] {
         assert_eq!(name.parse::<GraphicsBoard>().unwrap(), board, "{name}");
         assert!(board.is_vpro());
-        assert!(board.supports(MachineProfile::OctaneIp30));
-        assert!(!board.supports(MachineProfile::Indigo2Ip22));
+        assert!(MachineProfile::OctaneIp30.graphics_boards().contains(&board));
+        assert!(!MachineProfile::Indigo2Ip22.graphics_boards().contains(&board));
     }
     assert!(!GraphicsBoard::SolidImpact.is_vpro());
     assert!("v14".parse::<GraphicsBoard>().is_err());

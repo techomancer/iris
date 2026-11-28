@@ -310,9 +310,9 @@ fn a_bridge_interrupt_aimed_at_the_other_nodes_number_reaches_that_node() {
     });
 }
 const WIDGET_PIPE: u8 = 8;
-fn onyx2_with(dir: &Path, nodes: u8, board: crate::config::GraphicsBoard) -> MachineConfig {
+fn onyx2_with(dir: &Path, nodes: u8, board: crate::devices::BoardConfig) -> MachineConfig {
     let mut cfg = config(ONYX2_PROFILE, dir, nodes);
-    cfg.graphics.board = Some(board);
+    cfg.set_graphics(Some(board));
     cfg
 }
 /// A store to the pipe's aperture through a Hub's I/O space, retried while the pipe's ring is full.
@@ -335,17 +335,18 @@ fn pipe_commands(hub: &Arc<Hub>, words: &[u32]) {
 fn a_two_node_onyx2_builds_with_a_pipe_that_answers_its_widget_identity() {
     use crate::config::GraphicsBoard;
     big_stack(|| {
-        for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2x2] {
+        for raster_managers in [1, 2] {
+            let board = crate::devices::BoardConfig { model: GraphicsBoard::Ir2, raster_managers, ..Default::default() };
             let dir = TempPath::dir("ip27-pipe");
             let m = test_support::machine(&onyx2_with(&dir, 2, board)).unwrap();
             assert!(crate::workstation::Workstation::get_display(&m).is_some());
             for (node, board_node) in m.nodes.iter().enumerate() {
                 let io = board_node.chip.cpu_view(crate::sn::UncachedSpace::Io);
                 let id = io.read32((u64::from(WIDGET_PIPE) << 24) + 4);
-                assert_eq!(id.status, BUS_OK, "{board:?} from node {node}");
+                assert_eq!(id.status, BUS_OK, "{raster_managers} RMs from node {node}");
                 // Revision in the top nibble; part, manufacturer and the
                 // presence bit under it.
-                assert_eq!(id.data & 0x0fff_ffff, 0x0c10_2555, "{board:?} from node {node}");
+                assert_eq!(id.data & 0x0fff_ffff, 0x0c10_2555, "{raster_managers} RMs from node {node}");
                 assert_ne!(id.data, TEST_WIDGET_ID);
             }
         }
@@ -358,35 +359,22 @@ fn without_a_board_the_graphics_slot_holds_the_test_widget() {
         assert!(crate::workstation::Workstation::get_display(&m).is_none());
     });
 }
+/// The deskside's pipe is a `kona` entry: the model, with one or two raster managers, and only the Onyx2 has a slot for it.
 #[test]
-fn the_pipe_names_its_boards_by_the_graphics_key() {
-    use crate::config::GraphicsBoard;
-    for (name, board) in [("ir2", GraphicsBoard::Ir2), ("ir2:1rm", GraphicsBoard::Ir2), ("ir2:2rm", GraphicsBoard::Ir2x2)] {
-        assert_eq!(name.parse::<GraphicsBoard>(), Ok(board), "{name}");
-    }
-    for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2x2] {
-        assert!(board.supports(MachineProfile::Onyx2Ip27));
-        for other in [MachineProfile::OctaneIp30, MachineProfile::Origin2000Ip27, MachineProfile::Origin200Ip29, MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22] {
-            assert!(!board.supports(other), "{board:?} on {other:?}");
-        }
-        assert_eq!(board.as_str().parse::<GraphicsBoard>(), Ok(board));
-    }
-    assert_eq!(GraphicsBoard::Ir2.rm_count(), Some(1));
-    assert_eq!(GraphicsBoard::Ir2x2.rm_count(), Some(2));
-}
-/// The 2E is the deskside under the names `ir2e` and `ir2e:2rm`.
-#[test]
-fn the_deskside_takes_the_2e() {
+fn the_deskside_takes_an_ir2_or_ir2e_pipe_with_one_or_two_raster_managers() {
     use crate::config::{GraphicsBoard, MachineConfig};
-    for (name, board, rms) in [("ir2e", GraphicsBoard::Ir2e, 1), ("ir2e:2rm", GraphicsBoard::Ir2ex2, 2)] {
-        assert_eq!(name.parse::<GraphicsBoard>(), Ok(board), "{name}");
-        assert_eq!(board.rm_count(), Some(rms));
-        assert!(board.supports(MachineProfile::Onyx2Ip27), "{name}");
-        assert_eq!(board.as_str(), name);
+    use crate::devices::{ConfiguredDevice, DeviceModel};
+    for (arg, model, rms) in [("kona,model=ir2", GraphicsBoard::Ir2, 1), ("kona,model=ir2,raster_managers=2", GraphicsBoard::Ir2, 2), ("kona,model=ir2e,raster_managers=2", GraphicsBoard::Ir2e, 2)] {
+        let DeviceModel::Board(b) = ConfiguredDevice::from_arg(arg).unwrap().device else { panic!("{arg}") };
+        assert_eq!((b.model, b.raster_managers), (model, rms), "{arg}");
+    }
+    assert_eq!(MachineProfile::Onyx2Ip27.graphics_boards(), [GraphicsBoard::Ir2, GraphicsBoard::Ir2e]);
+    for other in [MachineProfile::OctaneIp30, MachineProfile::Origin2000Ip27, MachineProfile::Origin200Ip29, MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22] {
+        assert!(other.graphics_boards().iter().all(|b| b.kona().is_none()), "{other:?}");
     }
     let mut cfg = MachineConfig::default();
     cfg.machine.profile = MachineProfile::Onyx2Ip27;
-    cfg.graphics.board = Some(GraphicsBoard::Ir2e);
+    cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Ir2e)));
     assert!(cfg.validate().is_ok());
 }
 /// The driver's adaptor reset writes the Crossbow's link reset of the pipe's port, and the pipe
@@ -401,7 +389,7 @@ fn a_crossbow_link_reset_of_the_pipes_port_resets_its_interface_registers() {
     const LINK7_RESET: u64 = 0x100 + 0x40 * 7 + 0x30 + 4;
     big_stack(|| {
         let dir = TempPath::dir("ip27-linkreset");
-        let mut m = test_support::machine(&onyx2_with(&dir, 1, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let mut m = test_support::machine(&onyx2_with(&dir, 1, crate::devices::BoardConfig::new(crate::config::GraphicsBoard::Ir2))).unwrap();
         m.restart_peripherals();
         let hub = &m.nodes[0].chip;
         let io = hub.cpu_view(crate::sn::UncachedSpace::Io);
@@ -441,7 +429,7 @@ fn the_pipe_sends_dma_and_interrupts_to_the_hub_the_guest_names() {
     const REASON_PAGE: u64 = 0x30_0000;
     big_stack(|| {
         let dir = TempPath::dir("ip27-route");
-        let mut m = test_support::machine(&onyx2_with(&dir, 2, crate::config::GraphicsBoard::Ir2)).unwrap();
+        let mut m = test_support::machine(&onyx2_with(&dir, 2, crate::devices::BoardConfig::new(crate::config::GraphicsBoard::Ir2))).unwrap();
         m.restart_peripherals();
         let memory = |i: usize| m.nodes[i].chip.decode.physical().read32(REASON_PAGE).data;
         let pending = |i: usize| m.nodes[i].chip.read64(regs::PI_INT_PEND0::OFFSET).data;

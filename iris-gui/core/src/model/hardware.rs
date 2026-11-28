@@ -3,7 +3,7 @@
 //! is refitted when the profile changes. No UI.
 
 use iris::config::*;
-use iris::devices::DeviceModel;
+use iris::devices::{BoardConfig, DeviceModel};
 use iris::topology::{scsi_target, scsi_target_slot, DeviceFamily, DevicePlacement, MachineSlotKind};
 
 /// The Indy and Indigo2 family: the machines built around the MC memory
@@ -71,12 +71,22 @@ pub fn scsi_name(key: u8) -> String {
     if key < 16 { key.to_string() } else { format!("{}:{}", key / 16, key % 16) }
 }
 
-/// Choices reflect the boards actually fitted by machine constructors. The O2
-/// has a fixed GBE display; its shared board field is only a placeholder.
-pub fn board_supported(board: GraphicsBoard, profile: MachineProfile) -> bool {
-    board.supports(profile)
-        && (profile != MachineProfile::O2Ip32 || board == GraphicsBoard::Newport)
-        && (profile != MachineProfile::Onyx2Ip27 || board != GraphicsBoard::Ir3)
+/// The picker's choices: each board the graphics slot takes (an IR2 with one or two raster managers), then none.
+pub fn board_choices(profile: MachineProfile) -> Vec<Option<BoardConfig>> {
+    let boards = profile.graphics_boards();
+    let pipes = |m: GraphicsBoard| 1..=if matches!(m, GraphicsBoard::Ir2 | GraphicsBoard::Ir2e) { 2 } else { 1 };
+    let each = boards.iter().flat_map(|&m| pipes(m).map(move |raster_managers| BoardConfig { model: m, raster_managers, ..Default::default() }));
+    each.map(Some).chain((!boards.is_empty()).then_some(None)).collect()
+}
+
+pub fn board_label(board: &Option<BoardConfig>) -> String {
+    board.as_ref().map_or_else(|| "None".into(), BoardConfig::label)
+}
+
+/// Where `board` is among `choices`: the same model and raster managers.
+pub fn board_position(choices: &[Option<BoardConfig>], board: &Option<BoardConfig>) -> usize {
+    let key = |b: &Option<BoardConfig>| b.as_ref().map(|b| (b.model, b.raster_managers));
+    choices.iter().position(|c| key(c) == key(board)).unwrap_or(0)
 }
 
 /// Refit hardware when the user explicitly changes profiles from `from`. Do
@@ -89,16 +99,14 @@ pub fn switch_profile(cfg: &mut MachineConfig, from: MachineProfile) {
     cfg.clock.fixed_mhz = None;
     cfg.banks = distribute_ram(crate::model::ram::ram_presets(p)[0], p);
     cfg.banks_set = true;
-    cfg.graphics.board = Some(if p.ip28() {
-        GraphicsBoard::SolidImpact
-    } else {
-        GraphicsBoard::default_for(p)
-    });
+    cfg.devices.retain(|d| !d.names_graphics(p));
+    if p.ip28() {
+        cfg.set_graphics(Some(BoardConfig::new(GraphicsBoard::SolidImpact)));
+    }
     // `compile = "sync"` needs one CPU; the new machine may start with more.
     if cfg.machine.cpus() > 1 {
         cfg.jitv2.compile = JitCompile::Async;
     }
-    cfg.graphics.resolution = Default::default();
     cfg.octane.graphics = None;
     // SN0 rejects another product's private table, even when it is inactive.
     cfg.origin200 = Default::default();
@@ -106,8 +114,8 @@ pub fn switch_profile(cfg: &mut MachineConfig, from: MachineProfile) {
     cfg.onyx2 = Default::default();
     rehome_disks(cfg, from);
     // Cards need a GIO slot; a second head also needs a Newport board.
-    if !mc_machine(p) || cfg.graphics_board() != GraphicsBoard::Newport {
-        cfg.set_device("newport", false);
+    if !mc_machine(p) || cfg.graphics_board() != Some(GraphicsBoard::Newport) {
+        cfg.set_dual_head(false);
     }
     // What `MachineConfig::validate` refuses on the new machine, and the
     // Advanced tab no longer shows for it.

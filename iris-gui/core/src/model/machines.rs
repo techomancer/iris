@@ -136,7 +136,7 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
     visit(&mut cfg.nvram);
     visit(&mut cfg.nveeprom);
     for path in [
-        &mut cfg.octane.flash, &mut cfg.graphics.flash,
+        &mut cfg.octane.flash,
         &mut cfg.origin200.flash, &mut cfg.origin200.controller_store, &mut cfg.origin200.io_prom,
         &mut cfg.origin2000.flash, &mut cfg.origin2000.controller_store, &mut cfg.origin2000.io_prom,
         &mut cfg.onyx2.flash, &mut cfg.onyx2.controller_store, &mut cfg.onyx2.io_prom,
@@ -186,7 +186,8 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
             DeviceModel::Virtio9p(v) => visit(&mut v.path),
             DeviceModel::Serial(s) => visit(&mut s.path),
             DeviceModel::VirtioSerial(v) => v.ports.iter_mut().filter_map(|p| p.socket.as_mut()).for_each(&mut visit),
-            DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Newport | DeviceModel::Graphics => {}
+            DeviceModel::Board(b) => b.flash.iter_mut().for_each(&mut visit),
+            DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Empty => {}
         }
     }
     if let Some(nfs) = &mut cfg.nfs {

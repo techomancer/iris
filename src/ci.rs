@@ -68,8 +68,7 @@ pub struct CiServer {
     ci_serial: Arc<CiSerialBackend>,
     /// Optional in case --headless is also passed (no REX3). Screenshot
     /// commands return an error in that case.
-    display: Option<Arc<dyn GfxDisplay>>,
-    display_head1: Option<Arc<dyn GfxDisplay>>,
+    displays: Vec<Arc<dyn GfxDisplay>>,
     /// In-flight command connections; bounded so long waits cannot exhaust
     /// threads/file descriptors.
     connections: AtomicUsize,
@@ -129,8 +128,7 @@ pub fn start_server(
 ) -> Result<Arc<CiServer>, String> {
     let ci_serial = machine.get_ci_serial()
         .ok_or_else(|| "CI mode: CiSerialBackend not installed on the machine".to_string())?;
-    let display = machine.get_display();
-    let display_head1 = machine.get_display_head1();
+    let displays: Vec<_> = (0..).map_while(|n| machine.display(n)).collect();
 
     let path = socket_path.to_string();
     // Bind before the server exists: its drop removes the socket file, and a
@@ -155,8 +153,7 @@ pub fn start_server(
         socket_path: path.clone(),
         machine: machine.machine_slot(),
         ci_serial,
-        display,
-        display_head1,
+        displays,
         connections: AtomicUsize::new(0),
     });
 
@@ -651,16 +648,8 @@ fn cmd_serial_read(server: &CiServer) -> Response {
 
 fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
     let head = args.get("head").and_then(|v| v.as_u64()).unwrap_or(0);
-    let display = match head {
-        0 => server.display.as_ref(),
-        1 => server.display_head1.as_ref(),
-        _ => return Response::err("screenshot: head must be 0 or 1"),
-    };
-    let Some(display) = display else {
-        return Response::err(format!(
-            "screenshot: display head {} not present (headless or graphics.heads < 2?)",
-            head
-        ));
+    let Some(display) = server.displays.get(head as usize) else {
+        return Response::err(format!("screenshot: display head {head} not present (headless, or the machine has fewer heads)"));
     };
     let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
         return Response::err("screenshot: missing 'path' arg");

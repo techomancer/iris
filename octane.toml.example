@@ -15,7 +15,7 @@ serial_log = "octane-console.log"
 profile = "octane_ip30"
 cpu     = "r10000"
 flash    = "octane-flash.bin"  # keep the PROM's flash records between runs (optional)
-# (the graphics board is [graphics] board: "none" for a serial console and no window)
+# (the graphics board is a [[devices]] entry: type = "none" at = "graphics" for a serial console and no window)
 
 [[devices]]
 type = "hdd"

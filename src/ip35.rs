@@ -168,7 +168,7 @@ pub(crate) fn attach_vpro(
 ) -> Result<Arc<Odyssey>, String> {
     let vpro = Odyssey::new_widget_relative(
         widget,
-        cfg.graphics_board().as_str(),
+        cfg.graphics_board().ok_or("no graphics board is placed")?.as_str(),
         packets,
         bedrock.inbound(widget),
         status.clone(),

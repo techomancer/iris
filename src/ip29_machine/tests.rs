@@ -41,8 +41,8 @@ fn the_profile_takes_an_r10000_or_r12000_and_fills_banks_from_zero() {
     cfg.banks = [128, 128, 0, 0, 0, 0, 0, 0];
     assert_eq!(cfg.validate(), Ok(()));
     cfg.banks = [64, 0, 0, 0, 0, 0, 0, 0];
-    cfg.graphics.board = Some(GraphicsBoard::V12);
-    assert!(cfg.validate().unwrap_err().contains("not modelled on the Origin 200"));
+    cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V12)));
+    assert!(cfg.validate().unwrap_err().contains("no free slot for a graphics board on the Origin 200"));
 }
 
 #[test]

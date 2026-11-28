@@ -6,8 +6,8 @@ Iris models InfiniteReality2 and InfiniteReality2E pipes with one or two
 Raster Managers in the [Onyx2 deskside](../onyx2-ip27.md), and an
 InfiniteReality3 pipe with one Raster Manager on the
 [Onyx 3000 G-brick](../onyx3000-ip35.md). The pipe's window is the machine's
-display. Select the product with `[graphics] board`: `ir2`, `ir2:2rm`, `ir2e`
-or `ir2e:2rm` on Onyx2, and `ir3` on Onyx 3000.
+display. Select the product with the `model` of a `kona` device entry: `ir2` or `ir2e`
+on Onyx2 (`raster_managers` 1 or 2), and `ir3` on Onyx 3000.
 
 The pipe is a crosstalk widget. The processor stores commands to one command page, in one of three grammars that share the page: the PROM's textport, the kernel and X server's commands, and the GL client's. A Host Interface Processor takes the words, answers the commands about the board itself (identity, configuration, flash, DMA, display lists) and passes everything that draws or changes display state on. The Geometry Distributor, Geometry Engines, Raster Managers and Display Generator behind it are the back end.
 
@@ -171,23 +171,25 @@ saved Hub/node state and Onyx 3000 lacks saved Bedrock/node state.
 
 ## Fitting the board
 
-Use the Onyx2 profile and name the board in `[graphics]`:
+Use the Onyx2 profile and add a `kona` device entry:
 
 ```toml
 [machine]
 profile = "onyx2_ip27"
 
-[graphics]
-board = "ir2"            # one Raster Manager; "ir2:2rm" for two; "ir2e", "ir2e:2rm" for the 2E
-flash = "kona-flash.bin" # optional; keeps the pipe's flash between runs
+[[devices]]
+type  = "kona"
+model = "ir2"             # or "ir2e" for the 2E
+# raster_managers = 2     # one Raster Manager by default
+flash = "kona-flash.bin"  # optional; keeps the pipe's flash between runs
 
 # [onyx2]
 # io_prom = "io6prom.img" # optional; the I/O PROM is built in
 ```
 
-`board` defaults to `none`, which leaves a test widget in the slot. `flash` names a file of exactly the flash's size (512 KiB), made blank when absent. Unset, the flash lives in memory. The BaseIO's boot flash holds the I/O PROM built into iris, or the image `[onyx2] io_prom` names. The graphics console needs that PROM, because the node PROM's own copy has none. `threads` and `tile` set the tile workers. The [Onyx2 guide](../onyx2-ip27.md) and `FEATURES.md` have the rest.
+With no entry the slot holds a test widget. `flash` names a file of exactly the flash's size (512 KiB), made blank when absent. Unset, the flash lives in memory. The BaseIO's boot flash holds the I/O PROM built into iris, or the image `[onyx2] io_prom` names. The graphics console needs that PROM, because the node PROM's own copy has none. `threads` and `tile` set the tile workers. The [Onyx2 guide](../onyx2-ip27.md) and `FEATURES.md` have the rest.
 
-For an Onyx 3000, select `profile = "onyx3000_ip35"` and `board = "ir3"`.
+For an Onyx 3000, select `profile = "onyx3000_ip35"` and a `kona` entry with `model = "ir3"`.
 That profile defaults to IR3 and uses the I-brick rather than an Onyx2 BaseIO
 card. Its firmware, storage and graphics-console setup are described in the
 [Onyx 3000 guide](../onyx3000-ip35.md).

@@ -968,8 +968,8 @@ impl<C: Device + Resettable + 'static, F: Device + Resettable + 'static> Worksta
     fn set_lifecycle(&mut self, state: GuestState) {
         self.lifecycle = state;
     }
-    fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        self.io.display.clone()
+    fn display(&self, n: usize) -> Option<Arc<dyn GfxDisplay>> {
+        self.io.display.clone().filter(|_| n == 0)
     }
     // The chips and node memory keep no saved state, so a snapshot would not restore the machine.
     fn snapshot_refusal(&self) -> Option<String> {
