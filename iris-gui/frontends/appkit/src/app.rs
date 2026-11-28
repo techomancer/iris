@@ -221,7 +221,8 @@ fn start(mtm: MainThreadMarker) {
     // puts the pointer on a guest pixel in Follow mode,
     // "split:W" moves the sidebar's divider to W points,
     // "dump:devices" prints the Devices menu, "dump:display" the display's
-    // heads and where each is drawn, "dump:browser" the browser's
+    // heads and where each is drawn, "dump:controls" every visible window's
+    // controls by id with their values, "dump:browser" the browser's
     // folder, "drop:PATH" drops a host file on it. IRIS_APPKIT_ANSWERS (see
     // effects.rs) answers the prompts these raise.
     if let Ok(script) = std::env::var("IRIS_APPKIT_SCRIPT") {
@@ -325,6 +326,8 @@ pub fn script_step() {
         });
     } else if step == "dump:display" {
         with(|s| eprintln!("{}", s.win.display.describe()));
+    } else if step == "dump:controls" {
+        crate::ui::dump_controls(mtm());
     } else if step == "dump:devices" {
         crate::menu::dump_devices(mtm());
     } else if let Some(w) = step.strip_prefix("split:").and_then(|w| w.parse::<f64>().ok()) {
