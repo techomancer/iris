@@ -1098,7 +1098,6 @@ impl BusDevice for Ioc {
     }
 
     fn read32(&self, addr: u64) -> BusRead32 {
-        //println!("IOC: Read32 addr {:08x}", addr);
         let aligned_addr = addr & !3;
         let offset = (aligned_addr - IOC_BASE as u64) as u32;
         // HPC3_EXT_IO_ADDR: IRIX reads this specific register as a 32-bit
@@ -1116,7 +1115,6 @@ impl BusDevice for Ioc {
     }
 
     fn write32(&self, addr: u64, val: u32) -> u32 {
-        //println!("IOC: Write32 addr {:08x} val {:08x}", addr, val);
         let aligned_addr = addr & !3;
         let offset = (aligned_addr - IOC_BASE as u64) as u32;
         if offset == IOC_EXT_IO {

@@ -598,90 +598,6 @@ impl Wd33c93a {
                 state.asr &= !asr::LCI;
                 let had_int = (state.asr & asr::INT) != 0;
                 state.update_irq();
-/*
-                let status_name = match val {
-                    0x00 => "RESET",
-                    0x01 => "RESET_EAF",
-                    0x10 => "RESELECT_SUCCESS",
-                    0x11 => "SELECT_SUCCESS",
-                    0x13 => "COMMAND_SUCCESS",
-                    0x14 => "COMMAND_ATN_SUCCESS",
-                    0x15 => "TRANSLATE_SUCCESS",
-                    0x16 => "SELECT_TRANSFER_SUCCESS",
-                    0x18 => "TRANSFER_DATA_OUT",
-                    0x19 => "TRANSFER_DATA_IN",
-                    0x1B => "TRANSFER_STATUS_IN",
-                    0x1F => "TRANSFER_MSG_IN",
-                    0x20 => "TRANSFER_PAUSE",
-                    0x21 => "SAVE_DATA_POINTERS",
-                    0x22 => "SELECTION_ABORTED",
-                    0x23 => "RECEIVE_SEND_ABORTED",
-                    0x24 => "RECEIVE_SEND_ABORTED_ATN",
-                    0x25 => "ABORT_DURING_SELECTION",
-                    0x27 => "RESELECTED_AFTER_DISC",
-                    0x28 => "TRANSFER_ABORTED",
-                    0x40 => "INVALID_COMMAND",
-                    0x41 => "UNEXPECTED_DISCONNECT",
-                    0x42 => "SELECTION_TIMEOUT",
-                    0x43 => "PARITY_ERROR",
-                    0x44 => "PARITY_ERROR_ATN",
-                    0x45 => "LOGICAL_ADDRESS_TOO_LARGE",
-                    0x46 => "RESELECTION_MISMATCH",
-                    0x47 => "INCORRECT_STATUS_BYTE",
-                    0x48 => "UNEXPECTED_RECV_DATA",
-                    0x49 => "UNEXPECTED_SEND_DATA",
-                    0x4A => "UNEXPECTED_CMD_PHASE",
-                    0x4B => "UNEXPECTED_SEND_STATUS",
-                    0x4E => "UNEXPECTED_REQ_MSG_OUT",
-                    0x4F => "UNEXPECTED_SEND_MSG_IN",
-                    0x80 => "RESELECTED",
-                    0x81 => "RESELECTED_EAF",
-                    0x82 => "SELECTED",
-                    0x83 => "SELECTED_ATN",
-                    0x84 => "ATN",
-                    0x85 => "DISCONNECT",
-                    0x87 => "UNKNOWN_GROUP",
-                    0x88 => "REQ_DATA_OUT",
-                    0x89 => "REQ_DATA_IN",
-                    0x8A => "REQ_CMD_PHASE",
-                    0x8B => "REQ_STATUS",
-                    0x8E => "REQ_SEND_MSG_OUT",
-                    0x8F => "REQ_MSG_IN",
-                    _    => "?",
-                };
-                let cmd_name = match state.last_cmd & 0x7F {
-                    0x00 => "RESET",
-                    0x01 => "ABORT",
-                    0x02 => "ASSERT_ATN",
-                    0x03 => "NEGATE_ACK",
-                    0x04 => "DISCONNECT",
-                    0x05 => "RESELECT",
-                    0x06 => "SELECT_ATN",
-                    0x07 => "SELECT",
-                    0x08 => "SELECT_ATN_XFER",
-                    0x09 => "SELECT_XFER",
-                    0x0A => "RESELECT_RECEIVE",
-                    0x0B => "RESELECT_SEND",
-                    0x0C => "WAIT_SELECT_RECEIVE",
-                    0x10 => "SEND_STATUS",
-                    0x11 => "SEND_DISCONNECT",
-                    0x12 => "SET_IDI",
-                    0x13 => "RECEIVE_COMMAND",
-                    0x14 => "RECEIVE_DATA",
-                    0x15 => "RECEIVE_MSG_OUT",
-                    0x16 => "RECEIVE_INFO",
-                    0x17 => "SEND_COMMAND",
-                    0x18 => "SEND_DATA",
-                    0x19 => "SEND_MSG_IN",
-                    0x1A => "SEND_INFO",
-                    0x20 => "TRANSFER_INFO",
-                    _    => "?",
-                };
-                eprintln!("SCSI INT: status={:#04x} ({}) cmd={:#04x} ({}{})",
-                    val, status_name,
-                    state.last_cmd, cmd_name,
-                    if state.last_cmd & 0x80 != 0 { "+SBT" } else { "" });
-*/                    
             }
 
             wdt!("R REG[{:02x}] -> {:02x} (phase={:02x} stat={:02x} asr={:02x})",
@@ -1516,8 +1432,6 @@ impl Wd33c93aState {
                         if !self.pending_data.is_empty() {
                             let data = std::mem::take(&mut self.pending_data);
                             wdt!("CONSUME tgt={} pending_data=0x{:x} bytes CTRL={:02x} use_dma={} phase={:02x}", self.target_id, data.len(), self.regs[regs::CONTROL as usize], self.use_dma(), self.regs[regs::COMMAND_PHASE as usize]);
-                            //eprintln!("WD33C93A: TRANSFER_COUNT 0x{:x} bytes CTRL={:02x} use_dma={} dma={}",
-                            //    data.len(), self.regs[regs::CONTROL as usize], self.use_dma(), dma.is_some());
                             if self.use_dma() {
                                 // DMA path: CONTROL register now valid, driver has set up DMA.
                                 dlog!(self.log_module(), "WD33C93A({}): XFER_INFO DATA_IN DMA, {} bytes", self.id, data.len());
@@ -1884,8 +1798,6 @@ impl Wd33c93aState {
                 // XIE (irq without eox): descriptor boundary, chain continues — keep writing.
                 let pause = (st.eox() || st.refused()) && !is_last;
                 if pause {
-                    //eprintln!("WD33C93A: send_data_chunked pause: EOX={} XIE={} refused={} offset=0x{:x} remaining=0x{:x}",
-                    //    st.eox(), st.irq(), st.refused(), i, total - i);
                     dlog!(self.log_module(), "WD33C93A({}): EOX={} XIE={} refused={} at offset=0x{:x}, remaining=0x{:x} — pausing", self.id,
                         st.eox(), st.irq(), st.refused(), i, total - i);
                     self.xfer_data = data;
@@ -1977,7 +1889,6 @@ impl Wd33c93aState {
                                 if !got {
                                     ARM_WAITS.record(polls, start.elapsed(), false);
                                     dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — giving up", self.id);
-                                    //eprintln!("WD33C93A: receive_data_chunked: DMA not active after 100ms");
                                     wdt!("DMA_IN wait TIMEOUT: channel never became active");
                                     break;
                                 }

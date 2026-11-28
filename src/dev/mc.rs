@@ -639,7 +639,6 @@ impl MemoryControllerState {
             // Watchdog is 20-bit
             if dogc > 0xFFFFF {
                  // In a real system this resets the machine. For now we just wrap/clamp or log.
-                 // println!("MC: Watchdog Timer Expired!"); 
                  self.regs[dogc_idx] = 0; 
             } else {
                 self.regs[dogc_idx] = dogc as u32;
