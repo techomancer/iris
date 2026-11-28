@@ -1,8 +1,9 @@
 //! The smaller windows. Each mirrors a controller: Preferences
 //! (`controller::preferences`), Check Networking (`app.network()`), the
 //! serial console (`app.serial()`), the camera test (`app.camera()`) and the
-//! benchmark (a `BenchController` the shell owns, as egui does). A window is
-//! shown while its controller is open; its close button asks the controller.
+//! benchmark (a `BenchController` the shell owns, as egui does) and the
+//! blank-image form (`app.create_disk()`). A window is shown while its
+//! controller is open; its close button asks the controller.
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
@@ -32,6 +33,8 @@ pub mod id {
     pub const BENCH_QUICK: &str = "panel.bench-quick";
     pub const BENCH_START: &str = "panel.bench-start";
     pub const BENCH_SAVE: &str = "panel.bench-save";
+    pub const CREATE_DISK_CREATE: &str = "panel.create-disk-create";
+    pub const CREATE_DISK_CANCEL: &str = "panel.create-disk-cancel";
 }
 
 /// Which window a close button belongs to.
@@ -42,6 +45,7 @@ pub enum Which {
     Serial,
     Camera,
     Bench,
+    CreateDisk,
 }
 
 pub struct CloseIvars {
@@ -531,6 +535,88 @@ impl BenchWindow {
             (id::BENCH_SAVE, _) => BenchAction::SaveReport,
             _ => return None,
         })
+    }
+}
+
+// ---- Blank disk image --------------------------------------------------------
+
+/// The blank-image form: the controller's fields (drawn as the settings
+/// draw theirs, reporting `create-disk.*` ids), a progress bar with Cancel
+/// while the image is written, and Create.
+pub struct CreateDiskWindow {
+    pub window: Retained<NSWindow>,
+    _d: Retained<CloseAsk>,
+    /// Holds the form; replaced when the fields change.
+    body: Retained<NSStackView>,
+    create: Retained<NSButton>,
+    cancel: Retained<NSButton>,
+    progress: Retained<NSProgressIndicator>,
+    line: Retained<NSTextField>,
+    shown: Vec<iris_gui_core::controller::settings::Field>,
+}
+
+impl CreateDiskWindow {
+    pub fn new(mtm: MainThreadMarker, name: &str) -> Self {
+        let title = format!("{} — {name}", t!("create-disk-title"));
+        let (window, d) = panel(mtm, &title, NSSize::new(600.0, 220.0), Which::CreateDisk);
+        let body = stack(mtm, &[], true, 10.0);
+        let progress = NSProgressIndicator::new(mtm);
+        progress.setStyle(NSProgressIndicatorStyle::Bar);
+        progress.setIndeterminate(false);
+        progress.widthAnchor().constraintEqualToConstant(260.0).setActive(true);
+        let line = secondary(mtm, "");
+        let cancel = button(mtm, &t!("common-cancel"), id::CREATE_DISK_CANCEL);
+        let create = button(mtm, &t!("create-disk-create"), id::CREATE_DISK_CREATE);
+        create.setKeyEquivalent(&ns("\r"));
+        let spacer = NSView::new(mtm);
+        spacer.setContentHuggingPriority_forOrientation(1.0, objc2_app_kit::NSLayoutConstraintOrientation::Horizontal);
+        let bottom = stack(mtm, &[view(&progress), view(&line), view(&spacer), view(&cancel), view(&create)], false, 10.0);
+        let page = stack(mtm, &[view(&body), view(&bottom)], true, 16.0);
+        page.setAlignment(NSLayoutAttribute::Width);
+        insets(&page, 18.0);
+        fill(&window, &page);
+        Self { window, _d: d, body, create, cancel, progress, line, shown: Vec::new() }
+    }
+
+    pub fn refresh(&mut self, mtm: MainThreadMarker, c: &iris_gui_core::controller::create_disk::CreateDiskController) {
+        let fields = c.fields();
+        if fields != self.shown {
+            for v in self.body.arrangedSubviews().iter() {
+                self.body.removeArrangedSubview(&v);
+                v.removeFromSuperview();
+            }
+            let mut toml = None;
+            for f in &fields {
+                self.body.addArrangedSubview(&field_view(mtm, f, &mut toml));
+            }
+            self.shown = fields;
+        }
+        let can = c.can_create();
+        self.create.setEnabled(can.is_yes());
+        self.create.setToolTip(can.reason().map(ns).as_deref());
+        match c.job() {
+            Some(job) => {
+                self.progress.setHidden(false);
+                self.cancel.setHidden(false);
+                match job.progress.fraction() {
+                    Some(f) => {
+                        self.progress.setIndeterminate(false);
+                        self.progress.setDoubleValue(f as f64 * 100.0);
+                    }
+                    None => {
+                        self.progress.setIndeterminate(true);
+                        // SAFETY: a plain AppKit call on the main thread.
+                        unsafe { self.progress.startAnimation(None) };
+                    }
+                }
+                self.line.setStringValue(&ns(&job.label));
+            }
+            None => {
+                self.progress.setHidden(true);
+                self.cancel.setHidden(true);
+                self.line.setStringValue(&ns(""));
+            }
+        }
     }
 }
 
