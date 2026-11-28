@@ -103,6 +103,8 @@ pub enum SessionAction {
     SynchronizeDisks,
     /// Factory-reset the PROM settings (NVRAM and EEPROM).
     ResetNvram,
+    /// Set the Ethernet address the machine's NVRAM or EEPROM holds.
+    SetMac,
     /// Ask now about CHD folders the app cannot write (after a disk is picked).
     CheckFolderGrants,
     /// Grant the app a whole folder (App Store sandbox): disks, CHD merge
@@ -263,6 +265,7 @@ pub(crate) const ROLL_BACK: &str = "session.roll-back";
 pub(crate) const INSERT_DISC: &str = "session.insert-disc";
 pub(crate) const SCREENSHOT: &str = "session.screenshot";
 pub(crate) const RESET_NVRAM: &str = "session.reset-nvram";
+pub(crate) const SET_MAC: &str = "session.set-mac";
 
 impl SessionController {
     pub(crate) fn spawn(notify: Arc<dyn Notify>) -> Self {
@@ -355,6 +358,25 @@ impl SessionController {
         (&self.emu.frame_sink, &self.emu.frame_sink_head1)
     }
 
+    /// Whether the machine draws a second display head, so a shell shows both
+    /// side by side. The second Newport is a `[[devices]]` entry
+    /// (clanker/gui/gui-disks-and-cards-are-devices-by-slot.md), and the
+    /// machine it is running with decides, not the config being edited.
+    pub fn dual_head(&self) -> bool {
+        match &self.started {
+            Some(cfg) => cfg.has_device("newport"),
+            // Not running: the second sink only ever holds the last run's
+            // picture, so one head is all a shell can show.
+            None => false,
+        }
+    }
+
+    /// Whether head 1 has published anything yet, so a shell can say the head
+    /// is waiting rather than draw an empty frame.
+    pub fn head1_live(&self) -> bool {
+        self.emu.frame_sink_head1.seq() > 0
+    }
+
     /// Whether `action` can run now, and if not why (a disabled control's tooltip).
     pub fn enabled(&self, action: &SessionAction, cfg: &MachineConfig) -> Enabled {
         let running = self.is_running();
@@ -390,6 +412,9 @@ impl SessionController {
                     Enabled::when(!running, need_stopped)
                 }
             }
+            // The address lives in the chip the machine reads at power on,
+            // so it is set while it is stopped.
+            SessionAction::SetMac => Enabled::when(!running, need_stopped),
             SessionAction::Answer(_) => Enabled::Yes,
         }
     }

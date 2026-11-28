@@ -30,6 +30,8 @@ struct Shell {
     settings: Option<crate::settings::SettingsWindow>,
     new_machine: Option<crate::new_machine::NewMachineWindow>,
     browser: Option<crate::browser::BrowserWindow>,
+    /// The blank-image form, shown exactly while the controller has one.
+    create_disk: Option<crate::panels::CreateDiskWindow>,
     prefs: Option<crate::panels::PrefsWindow>,
     net: Option<crate::panels::NetWindow>,
     serial: Option<crate::panels::SerialWindow>,
@@ -207,7 +209,7 @@ fn start(mtm: MainThreadMarker) {
     head1.set_wake(wake.clone());
     win.window.makeKeyAndOrderFront(None);
     let empty = app.is_empty();
-    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app, win, wake, may_quit: false, settings: None, new_machine: None, browser: None, prefs: None, net: None, serial: None, camera: None, bench: None, help: Vec::new(), busy: None }));
+    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app, win, wake, may_quit: false, settings: None, new_machine: None, browser: None, prefs: None, net: None, serial: None, camera: None, bench: None, create_disk: None, help: Vec::new(), busy: None }));
     activate_app(mtm);
     refresh();
     tick();
@@ -218,7 +220,9 @@ fn start(mtm: MainThreadMarker) {
     // "type:TEXT" fills the browser's editor (\n for a newline), "at:X,Y[,B]"
     // puts the pointer on a guest pixel in Follow mode,
     // "split:W" moves the sidebar's divider to W points,
-    // "dump:devices" prints the Devices menu, "dump:browser" the browser's
+    // "dump:devices" prints the Devices menu, "dump:display" the display's
+    // heads and where each is drawn, "dump:controls" every visible window's
+    // controls by id with their values, "dump:browser" the browser's
     // folder, "drop:PATH" drops a host file on it. IRIS_APPKIT_ANSWERS (see
     // effects.rs) answers the prompts these raise.
     if let Ok(script) = std::env::var("IRIS_APPKIT_SCRIPT") {
@@ -320,6 +324,10 @@ pub fn script_step() {
                 }
             }
         });
+    } else if step == "dump:display" {
+        with(|s| eprintln!("{}", s.win.display.describe()));
+    } else if step == "dump:controls" {
+        crate::ui::dump_controls(mtm());
     } else if step == "dump:devices" {
         crate::menu::dump_devices(mtm());
     } else if let Some(w) = step.strip_prefix("split:").and_then(|w| w.parse::<f64>().ok()) {
@@ -373,10 +381,22 @@ pub fn tick() {
             }
         }
         if s.app.session().is_running() {
-            let (sink, _) = s.app.session().frame_sinks();
-            if s.win.display.take(sink) {
+            // A second Newport draws a second head beside the first; head 0
+            // keeps the input, and head 1 says so until it draws.
+            let dual = s.app.session().dual_head();
+            let heads = if dual { 2 } else { 1 };
+            s.win.display.set_heads(heads);
+            s.win.display.set_head1_waiting(mtm(), dual && !s.app.session().head1_live());
+            let (sink, sink1) = s.app.session().frame_sinks();
+            let mut took = s.win.display.take(sink);
+            if heads > 1 {
+                took |= s.win.display.take_head(1, sink1);
+            }
+            if took {
                 s.win.display.draw();
             }
+        } else {
+            s.win.display.set_head1_waiting(mtm(), false);
         }
         fx
     });
@@ -538,11 +558,17 @@ fn refresh_panels(m: MainThreadMarker, s: &mut Shell) {
     if let Some(w) = &mut s.bench {
         w.refresh(running);
     }
+    let name = s.app.create_disk().map(|c| c.name.clone()).unwrap_or_default();
+    mirror(&mut s.create_disk, s.app.create_disk().is_some(), || CreateDiskWindow::new(m, &name), |w| w.window.clone());
+    if let (Some(w), Some(c)) = (&mut s.create_disk, s.app.create_disk()) {
+        w.refresh(m, c);
+    }
 }
 
 /// A panel's close button.
 pub fn panel_closed(which: crate::panels::Which) {
     use crate::panels::Which;
+    use iris_gui_core::controller::create_disk::CreateDiskAction;
     use iris_gui_core::controller::{camera::CameraAction, network::NetworkAction, serial::SerialAction};
     match which {
         Which::Prefs => {
@@ -553,6 +579,7 @@ pub fn panel_closed(which: crate::panels::Which) {
         Which::Network => dispatch(AppAction::Network(NetworkAction::CloseCheck)),
         Which::Serial => dispatch(AppAction::Serial(SerialAction::Close)),
         Which::Camera => dispatch(AppAction::Camera(CameraAction::Close)),
+        Which::CreateDisk => dispatch(AppAction::CreateDisk(CreateDiskAction::Close)),
         Which::Bench => {
             // A run keeps going until stopped; the window waits for it.
             let busy = with(|s| s.bench.as_ref().is_some_and(|b| b.ctl.is_running())).unwrap_or(false);
@@ -569,6 +596,7 @@ pub fn panel_closed(which: crate::panels::Which) {
 fn panel_control(id: &str, value: iris_gui_core::controller::settings::Value) {
     use crate::panels::id as p;
     use iris_gui_core::controller::settings::Value;
+    use iris_gui_core::controller::create_disk::CreateDiskAction;
     use iris_gui_core::controller::{network::NetworkAction, serial::SerialAction};
     match id {
         p::NET_ADOPT => {
@@ -585,6 +613,8 @@ fn panel_control(id: &str, value: iris_gui_core::controller::settings::Value) {
         }
         p::SERIAL_CLEAR => dispatch(AppAction::Serial(SerialAction::Clear)),
         p::SERIAL_CTRL_C => dispatch(AppAction::Serial(SerialAction::SendBytes(vec![3]))),
+        p::CREATE_DISK_CREATE => dispatch(AppAction::CreateDisk(CreateDiskAction::Create)),
+        p::CREATE_DISK_CANCEL => dispatch(AppAction::CreateDisk(CreateDiskAction::Cancel)),
         _ => {
             let fx = with(|s| {
                 let running = s.app.session().is_running();
@@ -628,6 +658,9 @@ pub fn setting(id: String, value: iris_gui_core::controller::settings::Value) {
     if id.starts_with("new-machine.") {
         return new_machine_control(id, value);
     }
+    if id.starts_with("create-disk.") {
+        return create_disk_control(&id, value);
+    }
     if id.starts_with("browser.") {
         let on = matches!(value, iris_gui_core::controller::settings::Value::Bool(true));
         return browser_control(&id, on);
@@ -649,6 +682,19 @@ pub fn setting(id: String, value: iris_gui_core::controller::settings::Value) {
         Some(Then::Page) => refresh(),
         Some(Then::Act(a)) => dispatch(AppAction::Settings(a)),
         None => {}
+    }
+}
+
+/// A control on the blank-image form: a field's value, or its File row's
+/// Browse.
+fn create_disk_control(id: &str, value: iris_gui_core::controller::settings::Value) {
+    use iris_gui_core::controller::create_disk::{field as f, CreateDiskAction as C};
+    use iris_gui_core::controller::settings::{control_id, part};
+    if id == control_id(f::FILE, None, Some(part::BROWSE)) {
+        return dispatch(AppAction::CreateDisk(C::Pick));
+    }
+    if let Some(field) = [f::FORMAT, f::SIZE, f::FILE].into_iter().find(|x| *x == id) {
+        dispatch(AppAction::CreateDisk(C::Set { field, value }));
     }
 }
 
@@ -744,7 +790,10 @@ fn run_effects(fx: Vec<Effect>) {
         open_settings(Some(page));
     }
     for a in out.answers {
-        if a.purpose().starts_with("bench.") {
+        if a.purpose() == iris_gui_core::controller::create_disk::PICK {
+            use iris_gui_core::controller::create_disk::CreateDiskAction;
+            dispatch(AppAction::CreateDisk(CreateDiskAction::Answer(a)));
+        } else if a.purpose().starts_with("bench.") {
             let fx = with(|s| {
                 let running = s.app.session().is_running();
                 s.bench.as_mut().map(|w| w.ctl.apply(iris_gui_core::controller::bench::BenchAction::Answer(a), running))

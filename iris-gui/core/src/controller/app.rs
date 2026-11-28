@@ -88,6 +88,8 @@ pub enum AppAction {
     Browser(super::disk_browser::BrowserAction),
     /// Close the disk browser (cancels its job).
     CloseBrowser,
+    /// Making a blank image for a SCSI target.
+    CreateDisk(super::create_disk::CreateDiskAction),
     /// Ask which format `[scsi.KEY]`, a compressed CHD, converts to.
     ConvertDisk { key: u8 },
     /// Stop the running disk conversion; the disk stays as it was.
@@ -144,6 +146,8 @@ pub struct AppController {
     camera: super::camera::CameraTestController,
     /// The disk browser, while its window is open.
     browser: Option<super::disk_browser::DiskBrowserController>,
+    /// The blank-image form, while one is open.
+    create_disk: Option<super::create_disk::CreateDiskController>,
     /// A disk being converted, and a format question waiting for its answer.
     pub(crate) conversion: Option<super::convert::Conversion>,
     pub(crate) pending_convert: Option<super::convert::Asked>,
@@ -237,6 +241,7 @@ impl AppController {
             network: super::network::NetworkController::new(),
             camera: Default::default(),
             browser: None,
+            create_disk: None,
             conversion: None,
             pending_convert: None,
             attach_checks: Vec::new(),
@@ -355,6 +360,25 @@ impl AppController {
     /// while this is `Some`.
     pub fn browser(&self) -> Option<&super::disk_browser::DiskBrowserController> {
         self.browser.as_ref()
+    }
+
+    /// The blank-image form, while one is open.
+    pub fn create_disk(&self) -> Option<&super::create_disk::CreateDiskController> {
+        self.create_disk.as_ref()
+    }
+
+    /// Open the form for the target `key`, suggesting a name beside the
+    /// machine's other disks.
+    pub(crate) fn open_create_disk(&mut self, key: u8) {
+        let name = crate::model::hardware::scsi_name(key);
+        let suggested = crate::model::settings::GuiSettings::default_disk_path(key);
+        self.create_disk = Some(super::create_disk::CreateDiskController::new(
+            key,
+            t!("ov-scsi", id = name.as_str()),
+            self.machine_dir(),
+            &suggested,
+            self.notify(),
+        ));
     }
 
     /// The selected machine's disks and CD-ROMs the browser can open, by key.
@@ -990,6 +1014,10 @@ impl Controller for AppController {
                 let disks_before = self.disk_paths();
                 let (changed, more) = self.settings.apply(a, &mut self.cfg, dir);
                 fx.extend(more);
+                // "New disk…" on a target opens the blank-image form.
+                if let Some(key) = self.settings.take_new_disk() {
+                    self.open_create_disk(key);
+                }
                 if changed {
                     self.watch_attached(&disks_before);
                     fx.extend(self.mark_dirty());
@@ -1035,6 +1063,21 @@ impl Controller for AppController {
             AppAction::Browser(a) => {
                 if let Some(b) = &mut self.browser {
                     fx.extend(b.apply(a));
+                }
+            }
+            AppAction::CreateDisk(a) => {
+                use super::create_disk::CreateDiskAction as C;
+                let close = matches!(a, C::Close);
+                if let Some(c) = &mut self.create_disk {
+                    fx.extend(c.apply(a));
+                }
+                if close {
+                    // A run in progress keeps the window: cancel it first.
+                    if self.create_disk.as_ref().is_some_and(|c| c.is_running()) {
+                        fx.push(Effect::Toast(t!("create-disk-running", file = String::new())));
+                    } else {
+                        self.create_disk = None;
+                    }
                 }
             }
             AppAction::CloseBrowser => {
@@ -1091,6 +1134,25 @@ impl Controller for AppController {
                 fx.push(Effect::Toast(t!("toast-guest-halted")));
             }
             self.display.force_release();
+        }
+        // A finished blank image attaches itself to the target that asked.
+        if let Some(c) = &mut self.create_disk {
+            fx.extend(c.tick());
+            if let Some(path) = c.take_done() {
+                let key = c.key;
+                // Inside the machine's folder it stays relative, as every
+                // other path the GUI writes does.
+                let shown = self
+                    .machine_dir()
+                    .and_then(|d| crate::model::machines::relative(&d, &path))
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                fx.extend(self.apply(AppAction::Settings(super::settings::SettingsAction::Disk(
+                    super::settings::DiskEdit::SetPath { key, path: shown },
+                ))));
+                self.create_disk = None;
+            }
         }
         let ps2 = self.session.ps2();
         self.display.tick(ps2.as_deref().map(|p| p as &dyn super::display::GuestInput));

@@ -144,3 +144,21 @@ browser-editor-close = Close
 browser-editor-read-only = Read-only
 browser-empty = This folder is empty.
 browser-closed-stopped = The machine stopped, so the disk browser closed. Browse Files again to edit the disk.
+
+## New blank disk images (model::disk_image).
+
+# $file is the path that is already there.
+create-disk-exists = { $file } already exists. Choose another name; IRIS never replaces an image.
+create-disk-sidecar = An earlier disk named { $file } left its copy-on-write overlay or CHD diff beside it, so a new image there would read as the old one. Choose another name.
+create-disk-title = New disk image
+create-disk-format = Format
+create-disk-format-raw = Raw image
+create-disk-format-chd = CHD (compressed)
+create-disk-size = Size
+create-disk-size-unit = MB
+create-disk-file = File
+create-disk-create = Create
+create-disk-running = Creating { $file }
+create-disk-done = Created { $file }
+create-disk-needs-file = Choose where to put the image.
+create-disk-needs-size = Sizes run from 1 MB to 1 TB.

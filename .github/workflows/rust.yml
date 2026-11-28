@@ -60,7 +60,10 @@ jobs:
       run: rustup show
     - name: Install dependencies
       if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev ${{ matrix.os == 'ubuntu-24.04' && 'pulseaudio pulseaudio-utils' || '' }}
+      # libgtk-4-dev and libadwaita-1-dev: the workspace holds the GTK front
+      # end (iris-gui/frontends/gtk4), whose toolkit is a Linux-only
+      # dependency, so `cargo build --workspace` needs them here.
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libgtk-4-dev libadwaita-1-dev ${{ matrix.os == 'ubuntu-24.04' && 'pulseaudio pulseaudio-utils' || '' }}
     # Pull requests restore main's cache but never save their own, so they
     # cannot push main's entries out of the repository's 10 GB cache quota.
     - uses: Swatinem/rust-cache@v2

@@ -28,6 +28,135 @@ pub enum BenchAction {
     Answer(Answer),
 }
 
+/// One line of the results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultRow {
+    pub label: String,
+    pub value: String,
+    /// A comparison beside the value, or empty.
+    pub note: String,
+    pub tip: Option<String>,
+}
+
+impl ResultRow {
+    fn plain(label: String, value: String) -> Self {
+        Self { label, value, note: String::new(), tip: None }
+    }
+
+    fn tipped(label: String, value: String, tip: String) -> Self {
+        Self { label, value, note: String::new(), tip: Some(tip) }
+    }
+}
+
+/// A finished run, laid out for a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Results {
+    /// The figures that stand on their own: DMIPS, guest MIPS, accuracy.
+    pub headline: Vec<ResultRow>,
+    /// Each category's rate, with the reference ratio as its note.
+    pub categories: Vec<ResultRow>,
+    /// What to read the numbers with.
+    pub caveats: Vec<String>,
+    /// The machine the run was made on.
+    pub machine: Vec<ResultRow>,
+}
+
+/// How this run compares with a stored row, per category. The stored row
+/// keeps per-kernel rates, so the category is rebuilt from them the same
+/// way, weighted by this run's own times: close enough for "roughly this
+/// much faster", which is all it claims.
+fn category_ratio(run: &Run, reference: &ReferenceEntry, category: &str) -> Option<(f64, String)> {
+    let c = CATEGORIES.iter().find(|c| c.label == category)?;
+    let mine = run.category_rate(c)?;
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for r in &run.rows {
+        if r.status == "SKIP" || r.unit != c.unit || r.ns == 0 {
+            continue;
+        }
+        if !c.prefixes.iter().any(|p| r.name.starts_with(p)) {
+            continue;
+        }
+        let Some(their_rate) = reference.kernels.get(&r.name) else { continue };
+        if *their_rate <= 0.0 {
+            continue;
+        }
+        num += *their_rate * r.ns as f64;
+        den += r.ns as f64;
+    }
+    if den <= 0.0 {
+        return None;
+    }
+    let theirs = num / den;
+    (theirs > 0.0).then(|| (mine / theirs, reference.label.clone()))
+}
+
+/// The machine a run was made on, as rows.
+fn machine_rows(run: &Run) -> Vec<ResultRow> {
+    let m = &run.machine;
+    let mut rows = vec![ResultRow::plain(
+        t!("bench-machine-cpu"),
+        if m.rev.is_empty() {
+            t!("bench-machine-cpu-value", cpu = m.cpu.as_str(), prid = m.prid.as_str())
+        } else {
+            t!("bench-machine-cpu-rev-value", cpu = m.cpu.as_str(), rev = m.rev.as_str(), prid = m.prid.as_str())
+        },
+    )];
+    if !m.cache.is_empty() {
+        let c = &m.cache;
+        rows.push(ResultRow::plain(
+            t!("bench-machine-l1"),
+            t!(
+                "bench-machine-l1-value",
+                icache = fmt_bytes(c.l1i_bytes),
+                iline = c.l1i_line,
+                dcache = fmt_bytes(c.l1d_bytes),
+                dline = c.l1d_line
+            ),
+        ));
+        rows.push(ResultRow::plain(
+            t!("bench-machine-l2"),
+            if !c.l2_present {
+                t!("bench-machine-l2-absent")
+            } else if c.l2_bytes > 0 {
+                t!("bench-machine-l2-value", size = fmt_bytes(c.l2_bytes), line = c.l2_line)
+            } else {
+                // Nothing but a Triton exposes the size; the PROM reads it.
+                t!("bench-machine-l2-unsized", line = c.l2_line)
+            },
+        ));
+    }
+    if !m.memory.is_empty() {
+        let banks: Vec<String> = m
+            .memory
+            .banks
+            .iter()
+            .map(|b| t!("bench-machine-bank", index = b.index, size = b.mb, base = format!("{:#010x}", b.base)))
+            .collect();
+        rows.push(ResultRow::plain(
+            t!("bench-machine-memory"),
+            t!("bench-machine-memory-value", total = m.memory.total_mb, banks = banks.join("  ")),
+        ));
+    }
+    if !m.sysid.is_empty() {
+        rows.push(ResultRow::plain(t!("bench-machine-board"), t!("bench-machine-board-value", sysid = m.sysid.as_str())));
+    }
+    rows.push(ResultRow::plain(
+        t!("bench-machine-emulator"),
+        if run.features.is_empty() { t!("bench-machine-no-features") } else { run.features.join(" ") },
+    ));
+    rows.push(ResultRow::plain(
+        t!("bench-machine-host"),
+        t!(
+            "bench-machine-host-value",
+            cpu = if run.host.cpu_model.is_empty() { t!("bench-machine-unknown-cpu") } else { run.host.cpu_model.clone() },
+            os = run.host.os.as_str(),
+            arch = run.host.arch.as_str(),
+            cores = run.host.cores
+        ),
+    ));
+    rows
+}
+
 /// A run in progress, for its progress bar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BenchProgressView {
@@ -236,6 +365,75 @@ impl BenchController {
             self.job = None;
             self.last = Some(outcome);
         }
+    }
+
+    /// The results as a shell shows them: the figures that stand on their
+    /// own, the per-category rates with the reference ratio beside them, the
+    /// caveats, and the machine the run was made on. Built here so every
+    /// shell draws the same list rather than reaching into `Run`.
+    pub fn results(&mut self) -> Option<Results> {
+        let reference = self.reference();
+        let run = match self.last()? {
+            Ok(run) => run.clone(),
+            Err(_) => return None,
+        };
+        let headline = vec![
+            ResultRow::tipped(
+                t!("bench-dmips"),
+                t!("bench-dmips-value", value = format!("{:.0}", run.dmips().unwrap_or(0.0))),
+                t!("bench-dmips-tip"),
+            ),
+            ResultRow::tipped(
+                t!("bench-mips"),
+                t!("bench-mips-value", value = format!("{:.0}", run.mips())),
+                t!("bench-mips-tip"),
+            ),
+            ResultRow::tipped(
+                t!("bench-accuracy"),
+                t!(
+                    "bench-accuracy-value",
+                    percent = format!("{:.0}", run.accuracy()),
+                    matched = run.matched,
+                    checked = run.checked
+                ),
+                t!("bench-accuracy-tip"),
+            ),
+        ];
+        let mut categories = Vec::new();
+        for c in CATEGORIES {
+            let Some(rate) = run.category_rate(c) else { continue };
+            let note = reference
+                .as_ref()
+                .and_then(|r| category_ratio(&run, r, c.label))
+                .map(|(ratio, label)| t!("bench-ratio", ratio = format!("{ratio:.2}"), reference = label))
+                .unwrap_or_default();
+            categories.push(ResultRow {
+                label: c.label.to_string(),
+                value: format!("{}{}", fmt_rate(rate), c.suffix),
+                note,
+                tip: None,
+            });
+        }
+        let mut caveats = Vec::new();
+        if let Some(why) = run.settings.shortened_because() {
+            caveats.push(t!("bench-caveat-quick", reason = why));
+        }
+        if !run.features.iter().any(|f| f == "jitv2") {
+            caveats.push(t!("bench-caveat-interpreter"));
+        }
+        let unexpected: Vec<&str> = run
+            .rows
+            .iter()
+            .filter(|r| r.exc > 0 && !iris::bench_report::EXPECT_EXC.contains(&r.name.as_str()))
+            .map(|r| r.name.as_str())
+            .collect();
+        if !unexpected.is_empty() {
+            caveats.push(t!("bench-caveat-exceptions", kernels = unexpected.join(", ")));
+        }
+        if reference.is_none() {
+            caveats.push(t!("bench-no-reference"));
+        }
+        Some(Results { headline, categories, caveats, machine: machine_rows(&run) })
     }
 
     /// The report as plain text, for copying.

@@ -293,6 +293,10 @@ impl SettingsWindow {
                 _ => {}
             }
         }
+        // A changer disc's Remove: an empty path takes it out.
+        if let Some(slot) = id.strip_suffix(CLEAR_DISC) {
+            return action_for(slot, Value::Text(String::new()), &disk_keys, &forwards);
+        }
         let value = match value {
             // A bank's popup lists the sizes; the action takes megabytes.
             Value::Index(i) if id.starts_with(&format!("{}/", fid::BANKS)) => Value::Number(*sizes.get(i)? as f64),
@@ -567,32 +571,98 @@ pub fn field_view(mtm: MainThreadMarker, f: &Field, toml: &mut Option<Retained<N
     view(&line)
 }
 
+/// A changer disc's Remove button: its slot's id with this suffix, which
+/// [`SettingsWindow::action`] turns into an empty path (out of the changer).
+const CLEAR_DISC: &str = "#clear";
+
 fn disk_table(mtm: MainThreadMarker, id: &'static str, rows: &[DiskRow]) -> Retained<NSView> {
     let kinds = disk_kind_labels();
     let mut lines: Vec<Retained<NSView>> = Vec::new();
+    let indent = || {
+        let v = NSView::new(mtm);
+        v.widthAnchor().constraintEqualToConstant(56.0).setActive(true);
+        v
+    };
+    let tip = |v: &NSView, t: String| v.setToolTip(Some(&ns(&t)));
     for (r, d) in rows.iter().enumerate() {
+        let at = |p: &str| control_id(id, Some(r), Some(p));
         let name = secondary(mtm, &format!("SCSI {}", d.name));
         name.widthAnchor().constraintEqualToConstant(56.0).setActive(true);
-        let kind = popup(mtm, &control_id(id, Some(r), Some(part::KIND)), &kinds, disk_kind_index(d));
-        let path = text_field(mtm, &control_id(id, Some(r), Some(part::PATH)), &d.path, "", 360.0);
-        let pick = push(mtm, &control_id(id, Some(r), Some(part::PICK)), &t!("settings-choose"));
-        let remove = push(mtm, &control_id(id, Some(r), Some(part::REMOVE)), &t!("config-remove"));
-        // Two lines: what the target is, then its image. Copy-on-write only
-        // for what IRIX can write to: a CD-ROM is read-only.
+        let kind = popup(mtm, &at(part::KIND), &kinds, disk_kind_index(d));
+        let remove = push(mtm, &at(part::REMOVE), &t!("config-remove"));
+        // The first line: what the target is. Copy-on-write only for what
+        // IRIX writes to an image: not a CD-ROM, not a DaynaPort.
         let mut first = vec![view(&name), view(&kind)];
-        if d.can_overlay() {
-            let overlay = checkbox(mtm, &control_id(id, Some(r), Some(part::OVERLAY)), &t!("settings-overlay"), d.overlay);
-            overlay.setToolTip(Some(&ns(&t!("settings-overlay-tip"))));
+        if d.can_overlay() && !d.is_daynaport() {
+            let overlay = checkbox(mtm, &at(part::OVERLAY), &t!("settings-overlay"), d.overlay);
+            tip(&overlay, t!("settings-overlay-tip"));
             first.push(view(&overlay));
         }
         first.push(view(&remove));
         if d.scratch {
             first.insert(2, view(&secondary(mtm, &t!("settings-scratch"))));
         }
-        let indent = NSView::new(mtm);
-        indent.widthAnchor().constraintEqualToConstant(56.0).setActive(true);
-        let second = [indent, view(&path), view(&pick)];
-        let mut line = vec![view(&stack(mtm, &first, false, 6.0)), view(&stack(mtm, &second, false, 6.0))];
+        let mut line = vec![view(&stack(mtm, &first, false, 6.0))];
+        if d.is_daynaport() {
+            // An Ethernet card on the bus: its address and its own NAT
+            // network, both optional.
+            let mac = text_field(mtm, &at(part::MAC), &d.mac, "", 150.0);
+            tip(&mac, t!("config-scsi-mac-tip"));
+            let subnet = text_field(mtm, &at(part::SUBNET), &d.subnet, "192.168.10.0/24", 140.0);
+            tip(&subnet, t!("config-scsi-subnet-tip"));
+            line.push(view(&stack(
+                mtm,
+                &[indent(), view(&secondary(mtm, &t!("config-scsi-mac"))), view(&mac)],
+                false,
+                6.0,
+            )));
+            line.push(view(&stack(
+                mtm,
+                &[indent(), view(&secondary(mtm, &t!("config-scsi-subnet"))), view(&subnet)],
+                false,
+                6.0,
+            )));
+        } else {
+            let path = text_field(mtm, &at(part::PATH), &d.path, "", 360.0);
+            let pick = push(mtm, &at(part::PICK), &t!("settings-choose"));
+            let mut second = vec![indent(), view(&path), view(&pick)];
+            if d.is_disk() {
+                second.push(view(&push(mtm, &at(part::NEW_DISK), &t!("scsi-create-blank"))));
+            }
+            line.push(view(&stack(mtm, &second, false, 6.0)));
+        }
+        if d.is_disk() {
+            // A scratch volume is made empty at every start, so it has a
+            // size instead of an image.
+            let scratch = checkbox(mtm, &at(part::SCRATCH), &t!("config-scsi-scratch"), d.scratch);
+            let mut third = vec![indent(), view(&scratch)];
+            if d.scratch {
+                let size = number_field(mtm, &at(part::SCRATCH_MB), d.scratch_mb as f64, 1.0, 1_048_576.0, false);
+                third.push(view(&size));
+                third.push(view(&secondary(mtm, &t!("create-disk-size-unit"))));
+            }
+            let cache = checkbox(mtm, &at(part::WRITE_CACHE), &t!("config-scsi-write-cache"), d.write_cache);
+            tip(&cache, t!("config-scsi-write-cache-tip"));
+            third.push(view(&cache));
+            line.push(view(&stack(mtm, &third, false, 6.0)));
+        }
+        if d.is_cdrom() {
+            // The changer: the discs behind the one loaded now, each a slot
+            // that reports `disc:<n>` (a path, or Choose for a picker).
+            for (n, disc) in d.discs.iter().enumerate() {
+                let slot = format!("{}{n}", part::DISC);
+                let label = secondary(mtm, &t!("config-scsi-changer-slot", n = n + 1));
+                label.widthAnchor().constraintEqualToConstant(56.0).setActive(true);
+                let field = text_field(mtm, &at(&slot), disc, "", 300.0);
+                let pick = push(mtm, &at(&slot), &t!("settings-choose"));
+                let drop = push(mtm, &format!("{}{CLEAR_DISC}", at(&slot)), &t!("config-remove"));
+                tip(&drop, t!("config-scsi-disc-remove-tip"));
+                line.push(view(&stack(mtm, &[view(&label), view(&field), view(&pick), view(&drop)], false, 6.0)));
+            }
+            let add = push(mtm, &at(part::ADD_DISC), &t!("config-scsi-add-disc"));
+            tip(&add, t!("config-scsi-changer"));
+            line.push(view(&stack(mtm, &[indent(), view(&add)], false, 6.0)));
+        }
         if let Some(p) = &d.problem {
             let l = label(mtm, p);
             l.setTextColor(Some(&NSColor::systemOrangeColor()));

@@ -24,6 +24,7 @@ pub mod bench;
 pub mod camera;
 pub mod commands;
 pub mod convert;
+pub mod create_disk;
 pub mod debug;
 pub mod disk_browser;
 pub mod display;

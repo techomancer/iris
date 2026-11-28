@@ -52,16 +52,20 @@ pub fn running_other() -> Option<i32> {
     is_iris_front_end(pid).then_some(pid)
 }
 
+/// Whether a process name is one of our front ends. Every shell is listed
+/// here: a name missing from it lets two front ends run at once, fighting
+/// over the monitor and serial ports and over the same library.
+fn is_front_end_name(name: &str) -> bool {
+    ["iris-gui", "iris-appkit", "iris-gtk"].iter().any(|n| name.contains(n))
+}
+
 /// Whether `pid` is alive and is one of our front ends (a dead PID may have
 /// been reused by an unrelated program).
 fn is_iris_front_end(pid: i32) -> bool {
     #[cfg(unix)]
     {
         let comm = std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output();
-        matches!(&comm, Ok(o) if o.status.success() && {
-            let name = String::from_utf8_lossy(&o.stdout);
-            name.contains("iris-gui") || name.contains("iris-appkit")
-        })
+        matches!(&comm, Ok(o) if o.status.success() && is_front_end_name(&String::from_utf8_lossy(&o.stdout)))
     }
     #[cfg(not(unix))]
     {
@@ -93,7 +97,7 @@ fn reclaim_previous(pid: i32) {
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output();
     let is_iris = matches!(&comm, Ok(o) if o.status.success()
-        && String::from_utf8_lossy(&o.stdout).contains("iris-gui"));
+        && is_front_end_name(&String::from_utf8_lossy(&o.stdout)));
     if !is_iris {
         return;
     }

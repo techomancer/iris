@@ -13,6 +13,26 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Front ends
+
+- A native Linux front end, `iris-gtk`, built with GTK 4 and libadwaita over
+  the same controllers the Mac app uses: the machine library as a sidebar,
+  the machine page with its last screen and saved states, the status bar's
+  device lights, the guest display, the machine settings, the New Machine
+  wizard, Preferences, the serial console, Check Networking, the camera test
+  and the help pages. It needs GTK 4.12 and libadwaita 1.5. Build it with
+  `cargo run -p iris-gui-gtk --release`; the Linux packages still ship the
+  egui app.
+- The mouse follows the host pointer over the Linux app's display instead of
+  being captured: GTK 4 offers no pointer lock, and Wayland only through
+  protocols it does not expose.
+- The Linux and Mac apps can do what only the egui app could: make a blank
+  disk image (raw or CHD, in the background, never replacing a file), set a machine's
+  Ethernet address, keep a CD changer's discs, make a disk a scratch volume,
+  turn its write cache off, give a DaynaPort its address and subnet, shift
+  the guest's clock, serve a folder over TFTP or rsh, and read the
+  benchmark's figures as a table rather than a block of text. A dual Newport
+  draws both heads again: the native shells had been showing only the first.
 ### Snapshots
 
 - A failed snapshot load leaves the machine stopped, on every machine, and a snapshot of

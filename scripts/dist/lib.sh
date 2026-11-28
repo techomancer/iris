@@ -154,6 +154,34 @@ build_appkit() {  # <target> <features>: the macOS app
     group_end
 }
 
+# The iris-gui features the Linux app (iris-gtk) also has; the others are
+# dropped with a note instead of failing the build, as for the Mac app.
+gtk_features() {  # <features>
+    local f kept=() have
+    have=$(sed -n '/^\[features\]/,/^\[dependencies\]/s/^\([a-z0-9_-]*\) *=.*/\1/p' "$DIST_ROOT/iris-gui/frontends/gtk4/Cargo.toml")
+    IFS=',' read -ra list <<< "$1"
+    for f in "${list[@]}"; do
+        f="${f// /}"
+        [ -n "$f" ] || continue
+        if [[ "$f" == iris/* ]] || grep -qx "$f" <<< "$have"; then
+            kept+=("$f")
+        else
+            warn "the Linux app has no feature '$f': left out of its build"
+        fi
+    done
+    local IFS=,
+    echo "${kept[*]}"
+}
+
+build_gtk() {  # <target> <features>: the Linux app
+    [ "$SKIP_BUILD" = 1 ] && return 0
+    ensure_target "$1"
+    set -- "$1" "$(gtk_features "$2")"
+    group_start "cargo build iris-gui-gtk ($1) features=$2"
+    cargo build --release --target "$1" -p iris-gui-gtk --features "$2"
+    group_end
+}
+
 build_cli() {  # <target> <features>
     [ "$SKIP_BUILD" = 1 ] && return 0
     ensure_target "$1"

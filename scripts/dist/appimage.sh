@@ -35,7 +35,7 @@ TOOLS="https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLI
 if [ "$INSTALL_DEPS" = 1 ]; then
     group_start "pacman dependencies"
     pacman -Syu --noconfirm \
-        base-devel cmake rust clang alsa-lib gtk3 openssl pkgconf v4l-utils \
+        base-devel cmake rust clang alsa-lib gtk3 gtk4 libadwaita openssl pkgconf v4l-utils \
         wget curl git \
         libxcb libxcursor libxi libxkbcommon libxkbcommon-x11 libxrandr libxtst \
         wayland wayland-protocols mesa vulkan-icd-loader \

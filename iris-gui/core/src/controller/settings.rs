@@ -59,6 +59,17 @@ pub mod field {
     pub const VNC_LISTEN: &str = "settings.performance.vnc-listen";
     pub const VNC_FPS: &str = "settings.performance.vnc-fps";
     pub const VNC_PASSWORD: &str = "settings.performance.vnc-password";
+    /// The guest clock's offset from the host's, one field per unit.
+    pub const RTC_YEARS: &str = "settings.clock.years";
+    pub const RTC_MONTHS: &str = "settings.clock.months";
+    pub const RTC_DAYS: &str = "settings.clock.days";
+    pub const RTC_HOURS: &str = "settings.clock.hours";
+    pub const RTC_MINUTES: &str = "settings.clock.minutes";
+    pub const RTC_SECONDS: &str = "settings.clock.seconds";
+    pub const RTC_RESET: &str = "settings.clock.reset";
+    /// The gateway's TFTP and rsh servers.
+    pub const TFTP_DIR: &str = "settings.network.tftp-dir";
+    pub const RSH_DIR: &str = "settings.network.rsh-dir";
     pub const TOML: &str = "settings.advanced.toml";
     pub const NOTE: &str = "settings.note";
 }
@@ -79,7 +90,18 @@ pub struct DiskRow {
     pub kind: ScsiKind,
     pub path: String,
     pub overlay: bool,
+    /// A scratch volume: made empty at every start, never read back, so a
+    /// missing image is not a problem.
     pub scratch: bool,
+    /// A scratch volume's size in MB.
+    pub scratch_mb: u32,
+    /// The guest's write cache: off means every write reaches the image.
+    pub write_cache: bool,
+    /// A DaynaPort's Ethernet address and subnet, empty for the default.
+    pub mac: String,
+    pub subnet: String,
+    /// The other discs in a CD-ROM's changer, after the one loaded now.
+    pub discs: Vec<String>,
     /// Missing or unreadable image, said in words.
     pub problem: Option<String>,
 }
@@ -89,6 +111,19 @@ impl DiskRow {
     /// write to (a CD-ROM is read-only).
     pub fn can_overlay(&self) -> bool {
         self.kind != ScsiKind::Cdrom
+    }
+
+    /// What the row is, without a shell naming the emulator's enum.
+    pub fn is_cdrom(&self) -> bool {
+        self.kind == ScsiKind::Cdrom
+    }
+
+    pub fn is_disk(&self) -> bool {
+        self.kind == ScsiKind::Disk
+    }
+
+    pub fn is_daynaport(&self) -> bool {
+        self.kind == ScsiKind::Daynaport
     }
 }
 
@@ -244,7 +279,21 @@ pub enum DiskEdit {
     /// Ask for an image file.
     Pick(u8),
     SetKind { key: u8, kind: ScsiKind },
+    /// Open the blank-image form for this target.
+    New(u8),
     SetOverlay { key: u8, on: bool },
+    /// A scratch volume: emptied at every start, with a size in MB.
+    SetScratch { key: u8, on: bool },
+    SetScratchMb { key: u8, mb: u32 },
+    SetWriteCache { key: u8, on: bool },
+    /// A DaynaPort's Ethernet address and subnet; empty clears them.
+    SetMac { key: u8, mac: String },
+    SetSubnet { key: u8, subnet: String },
+    /// The changer: set disc `index`, clear it with an empty path, or ask
+    /// for another to add.
+    SetDisc { key: u8, index: usize, path: String },
+    PickDisc { key: u8, index: usize },
+    AddDisc(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +323,10 @@ pub enum SettingsAction {
 }
 
 pub(crate) const PICK: &str = "settings.pick";
+pub(crate) const PICK_DISC: &str = "settings.pick-disc";
+
+/// A scratch volume's size when one is first asked for.
+pub const DEFAULT_SCRATCH_MB: u32 = 512;
 
 /// The parts of a table row a control can be.
 pub mod part {
@@ -286,6 +339,17 @@ pub mod part {
     pub const HOST: &str = "host";
     pub const GUEST: &str = "guest";
     pub const ANY: &str = "any";
+    /// Make a blank image for this target.
+    pub const NEW_DISK: &str = "new-disk";
+    pub const SCRATCH: &str = "scratch";
+    pub const SCRATCH_MB: &str = "scratch-mb";
+    pub const WRITE_CACHE: &str = "write-cache";
+    pub const MAC: &str = "mac";
+    pub const SUBNET: &str = "subnet";
+    /// A disc in a CD-ROM's changer: `.../<row>/disc:<n>` to set or clear it,
+    /// `add-disc` to put another in the changer.
+    pub const DISC: &str = "disc:";
+    pub const ADD_DISC: &str = "add-disc";
     pub const ADD_DISK: &str = "add-disk";
     pub const ADD_CDROM: &str = "add-cdrom";
     pub const ADD: &str = "add";
@@ -332,6 +396,8 @@ pub fn action_for(id: &str, value: Value, disk_keys: &[u8], forwards: &[ForwardR
         field::VINO_CAMERA, field::AFFINITY, field::CPU_CORE, field::REX3_CORE, field::REFRESH_CORE,
         field::JIT_THREADS_AUTO, field::JIT_THREADS, field::JIT_CACHE, field::JIT_CACHE_DIR, field::VNC_LISTEN,
         field::VNC_FPS, field::VNC_PASSWORD, field::NFS_ENABLE, field::NFS_DIR, field::NFS_VERSION, field::NFS_PCAP_IP,
+        field::RTC_YEARS, field::RTC_MONTHS, field::RTC_DAYS, field::RTC_HOURS, field::RTC_MINUTES,
+        field::RTC_SECONDS, field::RTC_RESET, field::TFTP_DIR, field::RSH_DIR,
     ]
     .into_iter()
     .find(|x| *x == f)?;
@@ -341,11 +407,25 @@ pub fn action_for(id: &str, value: Value, disk_keys: &[u8], forwards: &[ForwardR
         (field::DISKS, None, Some(part::ADD_CDROM), _) => SettingsAction::Disk(DiskEdit::Add(ScsiKind::Cdrom)),
         (field::DISKS, Some(r), Some(p), v) => {
             let key = *disk_keys.get(r)?;
+            // A changer slot carries its index in the part (`disc:2`).
+            if let Some(index) = p.strip_prefix(part::DISC).and_then(|i| i.parse().ok()) {
+                return Some(SettingsAction::Disk(match v {
+                    Value::Text(path) => DiskEdit::SetDisc { key, index, path },
+                    _ => DiskEdit::PickDisc { key, index },
+                }));
+            }
             SettingsAction::Disk(match (p, v) {
                 (part::KIND, Value::Index(i)) => DiskEdit::SetKind { key, kind: *DISK_KINDS.get(i)? },
                 (part::PATH, Value::Text(path)) => DiskEdit::SetPath { key, path },
                 (part::PICK, _) => DiskEdit::Pick(key),
                 (part::OVERLAY, Value::Bool(on)) => DiskEdit::SetOverlay { key, on },
+                (part::SCRATCH, Value::Bool(on)) => DiskEdit::SetScratch { key, on },
+                (part::SCRATCH_MB, Value::Number(mb)) => DiskEdit::SetScratchMb { key, mb: mb as u32 },
+                (part::WRITE_CACHE, Value::Bool(on)) => DiskEdit::SetWriteCache { key, on },
+                (part::MAC, Value::Text(mac)) => DiskEdit::SetMac { key, mac },
+                (part::SUBNET, Value::Text(subnet)) => DiskEdit::SetSubnet { key, subnet },
+                (part::ADD_DISC, _) => DiskEdit::AddDisc(key),
+                (part::NEW_DISK, _) => DiskEdit::New(key),
                 (part::REMOVE, _) => DiskEdit::Remove(key),
                 _ => return None,
             })
@@ -378,6 +458,10 @@ pub fn action_for(id: &str, value: Value, disk_keys: &[u8], forwards: &[ForwardR
 #[derive(Debug, Default)]
 pub struct SettingsController {
     picking: Option<(&'static str, Option<u8>)>,
+    /// The changer slot a disc picker is for.
+    picking_disc: Option<(u8, usize)>,
+    /// A target asked for a blank image; the app opens the form.
+    new_disk_for: Option<u8>,
     toml_error: Option<String>,
     /// "Use built-in PROM" was switched off: show the PROM image field even
     /// while the config still resolves to the built-in PROM (no file chosen
@@ -550,6 +634,58 @@ impl SettingsController {
             fields: f,
         });
 
+        // The guest clock: a signed amount per unit, and what the machine
+        // would start at now.
+        {
+            let o = &cfg.rtc_offset;
+            let units: [(&'static str, String, i64); 6] = [
+                (field::RTC_YEARS, t!("config-rtc-years"), o.years),
+                (field::RTC_MONTHS, t!("config-rtc-months"), o.months),
+                (field::RTC_DAYS, t!("config-rtc-days"), o.days),
+                (field::RTC_HOURS, t!("config-rtc-hours"), o.hours),
+                (field::RTC_MINUTES, t!("config-rtc-minutes"), o.minutes),
+                (field::RTC_SECONDS, t!("config-rtc-seconds"), o.seconds),
+            ];
+            let mut clock: Vec<Field> = units
+                .into_iter()
+                .map(|(id, label, value)| Field {
+                    id,
+                    label,
+                    help: None,
+                    kind: FieldKind::Number {
+                        value: value as f64,
+                        min: -9999.0,
+                        max: 9999.0,
+                        step: 1.0,
+                        unit: String::new(),
+                    },
+                    enabled: at_power_on(),
+                })
+                .collect();
+            let host = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let (guest, clamped) = o.apply_clamped(host);
+            clock.push(Field {
+                id: field::NOTE,
+                label: t!("config-rtc"),
+                help: None,
+                kind: FieldKind::Note(
+                    if clamped { Severity::Warning } else { Severity::Info },
+                    if clamped { t!("config-rtc-clamped") } else { t!("config-rtc-preview", time = iris::config::format_unix_utc(guest)) },
+                ),
+                enabled: Enabled::Yes,
+            });
+            out.push(Section {
+                id: super::ids::settings::CLOCK,
+                title: t!("config-rtc"),
+                summary: if o.is_zero() { t!("common-default") } else { iris::config::format_unix_utc(guest) },
+                icon: Icon::Info,
+                fields: clock,
+            });
+        }
+
         // Disks.
         if !p.is_ip35_bricks() {
             // By controller and ID, so rows (and the ids that name them)
@@ -563,11 +699,16 @@ impl SettingsController {
                     path: d.path.clone(),
                     overlay: d.overlay,
                     scratch: d.scratch,
+                    scratch_mb: d.size_mb.unwrap_or(DEFAULT_SCRATCH_MB),
+                    write_cache: d.write_cache,
+                    mac: d.mac.clone().unwrap_or_default(),
+                    subnet: d.subnet.clone().unwrap_or_default(),
+                    discs: d.discs.clone(),
                     problem: (d.kind() == ScsiKind::Disk && !d.scratch && !readable(&d.path))
                         .then(|| t!("settings-disk-missing")),
                 })
                 .collect();
-            let n = rows.iter().filter(|r| r.kind == ScsiKind::Disk).count();
+            let n = rows.iter().filter(|r| r.is_disk()).count();
             out.push(Section {
                 id: super::ids::settings::DISKS,
                 title: t!("settings-section-disks"),
@@ -682,6 +823,19 @@ impl SettingsController {
                         enabled: at_power_on(),
                     });
                 }
+            }
+            // The gateway's own servers, beside the share.
+            for (id, label, help, value) in [
+                (field::TFTP_DIR, t!("config-tftp"), t!("config-tftp-subtitle"), cfg.network.tftp_dir.clone()),
+                (field::RSH_DIR, t!("config-rsh"), t!("config-rsh-subtitle"), cfg.network.rsh_dir.clone()),
+            ] {
+                f.push(Field {
+                    id,
+                    label,
+                    help: Some(help),
+                    kind: FieldKind::Path { value: value.unwrap_or_default(), pick: PickKind::Folder },
+                    enabled: at_power_on(),
+                });
             }
         }
         out.push(Section {
@@ -950,6 +1104,97 @@ impl SettingsController {
                     }
                     _ => false,
                 },
+                DiskEdit::SetScratch { key, on } => match cfg.disk_mut(key) {
+                    Some(d) if d.scratch != on => {
+                        d.scratch = on;
+                        // A scratch volume is made at every start, so it has
+                        // a size instead of an image, and never an overlay.
+                        if on {
+                            d.overlay = false;
+                            d.size_mb.get_or_insert(DEFAULT_SCRATCH_MB);
+                        }
+                        true
+                    }
+                    _ => false,
+                },
+                DiskEdit::SetScratchMb { key, mb } => match cfg.disk_mut(key) {
+                    Some(d) if d.size_mb != Some(mb.max(1)) => {
+                        d.size_mb = Some(mb.max(1));
+                        true
+                    }
+                    _ => false,
+                },
+                DiskEdit::SetWriteCache { key, on } => match cfg.disk_mut(key) {
+                    Some(d) if d.write_cache != on => {
+                        d.write_cache = on;
+                        true
+                    }
+                    _ => false,
+                },
+                DiskEdit::SetMac { key, mac } => {
+                    let want = (!mac.trim().is_empty()).then(|| mac.trim().to_string());
+                    match cfg.disk_mut(key) {
+                        Some(d) if d.mac != want => {
+                            d.mac = want;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                DiskEdit::SetSubnet { key, subnet } => {
+                    let want = (!subnet.trim().is_empty()).then(|| subnet.trim().to_string());
+                    match cfg.disk_mut(key) {
+                        Some(d) if d.subnet != want => {
+                            d.subnet = want;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                DiskEdit::SetDisc { key, index, path } => match cfg.disk_mut(key) {
+                    Some(d) => {
+                        let trimmed = path.trim().to_string();
+                        match (d.discs.get(index), trimmed.is_empty()) {
+                            // Clearing takes the disc out of the changer.
+                            (Some(_), true) => {
+                                d.discs.remove(index);
+                                true
+                            }
+                            (Some(old), false) if *old != trimmed => {
+                                d.discs[index] = trimmed;
+                                true
+                            }
+                            (None, false) => {
+                                d.discs.push(trimmed);
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    None => false,
+                },
+                DiskEdit::PickDisc { key, index } => {
+                    self.picking_disc = Some((key, index));
+                    fx.push(Effect::PickFile(
+                        PickSpec { filters: disk_filters(), ..PickSpec::open(PICK_DISC, t!("scsi-insert-disc-picker")) }
+                            .in_dir(dir.map(|d| d.to_path_buf())),
+                    ));
+                    false
+                }
+                // The app owns the form; the settings controller only says
+                // which target asked for it.
+                DiskEdit::New(key) => {
+                    self.new_disk_for = Some(key);
+                    false
+                }
+                DiskEdit::AddDisc(key) => {
+                    self.picking_disc = cfg.disk(key).map(|d| (key, d.discs.len()));
+                    fx.push(Effect::PickFile(
+                        PickSpec { filters: disk_filters(), ..PickSpec::open(PICK_DISC, t!("scsi-insert-disc-picker")) }
+                            .in_dir(dir.map(|d| d.to_path_buf())),
+                    ));
+                    false
+                }
             },
             SettingsAction::Forward(edit) => {
                 match edit {
@@ -1016,9 +1261,21 @@ impl SettingsController {
                     (f, _) => set(cfg, f, Value::Text(path)),
                 }
             }
+            SettingsAction::Answer(Answer::Picked { purpose: PICK_DISC, paths }) => {
+                let (Some((key, index)), Some(p)) = (self.picking_disc.take(), paths.into_iter().next()) else {
+                    return (false, fx);
+                };
+                let path = p.to_string_lossy().into_owned();
+                return self.apply(SettingsAction::Disk(DiskEdit::SetDisc { key, index, path }), cfg, None);
+            }
             SettingsAction::Answer(_) => false,
         };
         (changed, fx)
+    }
+
+    /// The target that asked for a blank image, taken once.
+    pub fn take_new_disk(&mut self) -> Option<u8> {
+        self.new_disk_for.take()
     }
 
     /// The live command a change needs on a running machine, if any: the NAT
@@ -1062,7 +1319,59 @@ fn set_num<T: PartialEq>(slot: &mut T, v: T) -> bool {
 
 fn set(cfg: &mut MachineConfig, field: &'static str, value: Value) -> bool {
     let p = cfg.machine.profile;
+    // The guest clock's offset: one signed amount per unit, and a reset.
+    if let Some(unit) = [
+        (field::RTC_YEARS, 0usize),
+        (field::RTC_MONTHS, 1),
+        (field::RTC_DAYS, 2),
+        (field::RTC_HOURS, 3),
+        (field::RTC_MINUTES, 4),
+        (field::RTC_SECONDS, 5),
+    ]
+    .into_iter()
+    .find_map(|(f, u)| (f == field).then_some(u))
+    {
+        let Value::Number(n) = value else { return false };
+        let o = &mut cfg.rtc_offset;
+        let slot = match unit {
+            0 => &mut o.years,
+            1 => &mut o.months,
+            2 => &mut o.days,
+            3 => &mut o.hours,
+            4 => &mut o.minutes,
+            _ => &mut o.seconds,
+        };
+        let n = n as i64;
+        if *slot == n {
+            return false;
+        }
+        *slot = n;
+        return true;
+    }
     match (field, value) {
+        (field::RTC_RESET, _) => {
+            if cfg.rtc_offset.is_zero() {
+                return false;
+            }
+            cfg.rtc_offset = Default::default();
+            true
+        }
+        (field::TFTP_DIR, Value::Text(dir)) => {
+            let want = (!dir.trim().is_empty()).then(|| dir.trim().to_string());
+            if cfg.network.tftp_dir == want {
+                return false;
+            }
+            cfg.network.tftp_dir = want;
+            true
+        }
+        (field::RSH_DIR, Value::Text(dir)) => {
+            let want = (!dir.trim().is_empty()).then(|| dir.trim().to_string());
+            if cfg.network.rsh_dir == want {
+                return false;
+            }
+            cfg.network.rsh_dir = want;
+            true
+        }
         (field::PROFILE, Value::Index(i)) => {
             let Some(&new) = super::profile::menu_order().get(i) else { return false };
             if new == p {

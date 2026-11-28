@@ -178,3 +178,45 @@ pub fn has_symbols() -> bool {
             patchVersion: 0,
         })
 }
+
+/// For the `dump:controls` script step: every visible window's title, then
+/// each control under it that has an id, with what it shows.
+pub fn dump_controls(mtm: MainThreadMarker) {
+    // Under a view whose id ends in `.results`, every label's text too.
+    fn walk(v: &objc2_app_kit::NSView, out: &mut Vec<String>, labels: bool) {
+        let id = objc2_app_kit::NSUserInterfaceItemIdentification::identifier(v).map(|i| i.to_string());
+        let labels = labels || id.as_deref().is_some_and(|i| i.ends_with(".results"));
+        if labels && id.is_none() {
+            if let Some(t) = v.downcast_ref::<NSTextField>() {
+                let tip = t.toolTip().or_else(|| unsafe { t.superview() }.and_then(|p| p.toolTip()));
+                out.push(format!("    {:?}{}", t.stringValue().to_string(), tip.map(|x| format!("  (tip: {x})")).unwrap_or_default()));
+            }
+        }
+        if let Some(id) = id.filter(|i| !i.starts_with('_')) {
+            let shown = if let Some(b) = v.downcast_ref::<objc2_app_kit::NSButton>() {
+                format!("button {:?} state={} enabled={}", b.title().to_string(), b.state(), b.isEnabled())
+            } else if let Some(p) = v.downcast_ref::<objc2_app_kit::NSPopUpButton>() {
+                format!("popup {:?}", p.titleOfSelectedItem().map(|t| t.to_string()).unwrap_or_default())
+            } else if let Some(t) = v.downcast_ref::<NSTextField>() {
+                format!("text {:?} enabled={}", t.stringValue().to_string(), t.isEnabled())
+            } else {
+                String::from("view")
+            };
+            out.push(format!("  {id}: {shown}"));
+        }
+        for sub in v.subviews().iter() {
+            walk(&sub, out, labels);
+        }
+    }
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    for w in app.windows().iter() {
+        if !w.isVisible() {
+            continue;
+        }
+        let mut out = vec![format!("window {:?}", w.title().to_string())];
+        if let Some(v) = w.contentView() {
+            walk(&v, &mut out, false);
+        }
+        eprintln!("{}", out.join("\n"));
+    }
+}

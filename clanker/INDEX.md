@@ -391,6 +391,8 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [01-overview.md](gui/01-overview.md) | design | iris-gui — overview |
 | [debug-builds-never-start-the-cpu.md](gui/debug-builds-never-start-the-cpu.md) | rule | Debug front-end builds park the CPU at reset; `start` on the monitor |
 | [a-sleeping-shell-needs-a-timed-tick-for-autosave.md](gui/a-sleeping-shell-needs-a-timed-tick-for-autosave.md) | rule | Shells that tick only on wakes must schedule a tick at `autosave_due_in()` |
+| [gtk4-has-no-pointer-lock-use-follow-mode.md](gui/gtk4-has-no-pointer-lock-use-follow-mode.md) | rule | GTK 4 exposes no pointer lock, confine or warp on either backend, so the Linux shell uses the core's Follow mode |
+| [drive-the-gtk-shell-and-screenshot-it.md](gui/drive-the-gtk-shell-and-screenshot-it.md) | howto | Driving `iris-gtk` with `IRIS_GTK_SCRIPT`, and the window painting itself into a PNG through its own GSK renderer (Wayland cannot grab another process's window) |
 | [disk-browser-xfs-log-replay.md](gui/disk-browser-xfs-log-replay.md) | rule | Disk browser: XFS opens read-only until Edit Anyway; fs-xfs 0.2 cannot see an unreplayed log |
 | [fs-xfs-deletes-leave-freed-inodes-half-cleared.md](gui/fs-xfs-deletes-leave-freed-inodes-half-cleared.md) | open | fs-xfs 0.2.3: a deleted file's inode keeps nlink/nblocks, and its log replay miscounts sb_fdblocks; how to check XFS edits with xfs_check against a baseline |
 | [disk-core-create-modes-carry-the-file-type.md](gui/disk-core-create-modes-carry-the-file-type.md) | rule | Disk browser: `create_file`/`create_directory` modes must include S_IFREG/S_IFDIR |
@@ -438,7 +440,7 @@ Mac App Store and sandbox constraints.
 | [ppmem-shm-open-is-refused-in-the-app-sandbox.md](macos/ppmem-shm-open-is-refused-in-the-app-sandbox.md) | rule | The App Sandbox refuses ppmem's POSIX shm_open; macOS falls back to Mach memory entries (`IRIS_PPMEM_BACKEND=mach` to test) |
 | [chd-fold-needs-folder-grant-not-file-grant.md](macos/chd-fold-needs-folder-grant-not-file-grant.md) | rule | macOS App Sandbox: the CHD on-exit fold needs a *folder* grant, not a file grant |
 | [test-the-app-sandbox-locally-without-the-app-store.md](macos/test-the-app-sandbox-locally-without-the-app-store.md) | howto | Test the macOS App Sandbox locally — no App Store round-trip needed |
-| [drive-the-appkit-shell-with-the-screen-locked.md](macos/drive-the-appkit-shell-with-the-screen-locked.md) | howto | Script steps, scripted prompt answers and window captures for the AppKit preview; what stalls a script |
+| [drive-the-appkit-shell-with-the-screen-locked.md](macos/drive-the-appkit-shell-with-the-screen-locked.md) | howto | Script steps, scripted prompt answers and window captures for the AppKit shell; what stalls a script |
 | [winit-030-window-handle-main-thread-only.md](macos/winit-030-window-handle-main-thread-only.md) | rule | winit 0.30 macOS: window_handle() only works on the main thread |
 
 ## snapshot/

@@ -30,3 +30,12 @@ status-audio-tip = Audio
 status-audio-playing-tip = Audio: playing
 status-serial-tip = Serial console
 status-serial-connected-tip = Serial console: connected
+
+# Setting the machine's Ethernet address (Tools > Set MAC Address).
+session-set-mac-title = Set MAC address
+# $chip is the NVRAM or EEPROM file the address is kept in.
+session-set-mac-body = The address the PROM reports, kept in { $chip }.
+session-set-mac-ok = Set
+session-set-mac-invalid = That is not an Ethernet address; use 08:00:69:xx:xx:xx.
+# $mac is the address written.
+session-set-mac-done = Ethernet address set to { $mac }.

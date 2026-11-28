@@ -36,6 +36,12 @@ settings-overlay = Copy-on-write
 settings-overlay-tip = Writes go to a separate file and the disk image stays unchanged.
 settings-scratch = Scratch disk
 settings-choose = Choose…
+settings-bank-empty = Empty
+settings-disk-kind = Kind
+settings-disk-image = Image
+settings-forward-protocol = Protocol
+# $host and $guest are port numbers.
+settings-forward-row = Host { $host } to guest { $guest }
 settings-window-title = { $name } Settings
 settings-no-machine = Select a machine to change its settings.
 

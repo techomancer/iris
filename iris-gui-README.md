@@ -301,6 +301,50 @@ PCAP-mode NFS IP).
 
 ---
 
+### The Linux app
+
+`iris-gtk` is the native Linux front end, written with GTK 4 and libadwaita
+instead of egui. It needs GTK 4.12 and libadwaita 1.5 or newer. Build and run
+it from a checkout with `cargo run -p iris-gui-gtk --release`; the Linux
+packages still ship the egui app for now.
+
+It has the library as a sidebar, with the machines grouped by family and by
+the folders you make, each row showing the machine's picture, its model and
+its own Start button; the header bar follows the machine, as the Mac app's
+toolbar does, with the machine's name and model in the middle and the list of
+machines under it. A stopped machine's page shows its last screen with Power
+On over it, then Details (the hardware, with Browse Files beside a disk) or
+Saved States. The status bar under it has the run state, the executor, and a
+light for every disk, CD-ROM, the network and audio, each opening what it
+stands for. Everything else is in the header bar's menu, as GNOME has no menu
+bar: the machine's power actions, the view, the library, the tools and the
+help pages, with the same shortcuts as elsewhere (Ctrl instead of Command).
+
+The machine settings, the New Machine wizard and Preferences are the same
+forms the Mac app draws, in libadwaita's rows. The guest's display is drawn
+at Actual Size, Scale to Fit or Stretch, sharp at whole multiples, and a
+dual-head Newport draws both heads side by side, head 0 taking the input.
+
+The settings also carry what only the egui app used to offer, as the Mac
+app's do: **New disk image** beside a
+SCSI target makes a blank raw or CHD image in the background, with progress
+and cancel, and never replaces a file; a disk can be a **scratch volume**
+with a size, or have its **write cache** turned off; a CD-ROM keeps a
+**changer** of further discs; a DaynaPort has its own **Ethernet address and
+subnet**; the **Real-time clock** page shifts the guest's clock and shows
+what it would start at; the Network page serves a folder over **TFTP** or
+**rsh** beside the NFS share; and **Tools > Set MAC Address** writes the
+address the PROM reports into the machine's NVRAM or EEPROM. The benchmark
+window shows DMIPS, guest MIPS and accuracy as figures, each category's rate
+against the reference, and the machine the run was made on.
+
+**The mouse follows the pointer** rather than being captured: GTK 4 has no
+pointer lock of its own, and Wayland offers one only through protocols it
+does not expose, so IRIS steers the guest's pointer to wherever yours is over
+the display — the same mode the Mac app offers for remote desktops. The
+keyboard reaches the guest while the display is focused, and the keys are
+sent by position, so the guest's own keyboard layout applies.
+
 ### The macOS app
 
 `IRIS.app` in the macOS downloads is the native front end, written with
@@ -314,7 +358,12 @@ page, the guest display (Metal), the machine settings, the new-machine
 window, saved states, the serial console, Check Networking, the benchmark,
 the camera test and Preferences, with SF Symbols and the system's light and
 dark appearance. The machine settings include Video In (the Indy's camera)
-and Performance (thread pinning, the JIT, the VNC server).
+and Performance (thread pinning, the JIT, the VNC server), and the rows the
+Linux app's section lists: blank disk images, scratch volumes, the write
+cache, CD changers, DaynaPort addresses, the Real-time clock page, TFTP and
+rsh, and **Tools > Set MAC Address**. A dual-head Newport draws both heads
+side by side, head 0 taking the input, and the benchmark shows its figures
+rather than a text report.
 
 The library is a sidebar, as in Finder, with its button next to the window
 buttons. After it, the machine capsule shows the machine's picture, name and
@@ -633,7 +682,7 @@ reclaims them at exit). The same bound is applied on **Quit**.
 
 ```
 iris/
-├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks, iris-prom, iris-gui/frontends/appkit; iris-hostgl and iris-audio excluded
+├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall, iris-checks, iris-prom, iris-gui/frontends/{appkit,gtk4}; iris-hostgl and iris-audio excluded
 ├── src/               iris library + CLI
 └── iris-gui/
     ├── Cargo.toml     the egui app; depends on iris with gpujit and on iris-gui-core
@@ -665,6 +714,8 @@ iris/
     │           └── single_instance.rs previous-instance reclaim
     ├── frontends/appkit/   iris-gui-appkit: the native macOS shell (binary iris-appkit)
     │   └── scripts/bundle.sh   builds the AppKit "IRIS.app" and its DMG
+    ├── frontends/gtk4/     iris-gui-gtk: the native Linux shell, GTK 4 and
+    │                       libadwaita (binary iris-gtk)
     └── src/           the egui shell
         ├── main.rs            App: control column, menus, modals, update loop
         ├── input.rs           capture, egui → PS/2 keyboard+mouse pump
@@ -683,7 +734,7 @@ iris/
 
 The front ends are moving onto shared controllers: `iris-gui-core` holds the
 model and one controller per task, and a shell (egui, and the native AppKit
-app) only draws, turns input into controller actions and carries out the
+and GTK apps) only draws, turns input into controller actions and carries out the
 effects a controller asks for (file pickers, confirmations, the clipboard).
 Forms such as the machine settings, the new-machine dialog and the
 preferences are lists of fields the controller builds; a shell draws each
