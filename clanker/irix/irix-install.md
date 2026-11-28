@@ -83,7 +83,7 @@ root: `iris-irix53.toml` for 5.3, `iris-irix65.toml` for 6.5.22.
 Launch with `--config <file> --ci --ci-display`.
 
 > ⚠️ **`headless = false` is mandatory for the install — both
-> versions.** With `headless = true`, iris doesn't map REX3 and
+> versions.** With no Newport (once `headless = true`, now `[graphics] board = "none"`), iris doesn't map REX3 and
 > miniroot's hinv records `GFXBOARD=SERVER`. Inst then applies its
 > `RGFXBOARD!=SERVER` tag filters and strips every Newport-specific
 > file — `Xsgi`, `gfxinit`, `/hw/gfx` autoconfig, board-specific

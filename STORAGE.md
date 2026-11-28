@@ -294,8 +294,8 @@ directory (`$TMPDIR`, else `/tmp`); on Windows it is TCP `127.0.0.1:19851`.
 default only when they run with the same `TMPDIR`; otherwise give both the
 path, `--ci-socket` to iris and `--socket` or `$IRIS_SOCKET` to iris-ci.
 `--ci` hides the host window unless you add `--ci-display`, while keeping
-offscreen graphics alive for screenshots. Explicit `--headless`
-disables Newport graphics. Use `--serial-log FILE` to keep a transcript of the
+offscreen graphics alive for screenshots. `--headless` also stores
+`console=d` in the NVRAM, so the PROM and IRIX use the serial console. Use `--serial-log FILE` to keep a transcript of the
 IRIX console.
 
 ```

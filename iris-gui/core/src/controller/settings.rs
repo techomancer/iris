@@ -520,7 +520,7 @@ impl SettingsController {
                 enabled: if boards.len() < 2 { Enabled::No(t!("settings-one-board")) } else { at_power_on() },
             });
         }
-        let newport = hardware::mc_machine(p) && board == GraphicsBoard::Newport && !cfg.headless;
+        let newport = hardware::mc_machine(p) && board == GraphicsBoard::Newport;
         if newport {
             f.push(Field {
                 id: field::RESOLUTION,

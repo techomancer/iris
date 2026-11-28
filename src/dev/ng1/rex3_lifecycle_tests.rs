@@ -358,7 +358,7 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
         .is_some_and(|name| name.starts_with("iris-resident-m7-head1-")));
     on_large_stack(|| {
         let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &crate::cpu::parts::R4400_150);
-        cfg.headless = false;
+        cfg.graphics.board = Some(crate::config::GraphicsBoard::Newport);
         cfg.set_device("newport", true);
         cfg.nvram.clear();
         cfg.nveeprom.clear();

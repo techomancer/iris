@@ -366,6 +366,21 @@ impl Timekeeper {
         self.st.lock().file = Some(path.to_path_buf());
         Ok(())
     }
+    /// Run `f` on the 32 KiB RAM, for a writer of the PROM's environment
+    /// (`baseio_nvram`); a change is saved to the file.
+    pub fn with_ram<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let (r, changed) = {
+            let mut st = self.st.lock();
+            let before = st.cells.clone();
+            (f(&mut st.cells), st.cells != before)
+        };
+        if changed {
+            if let Err(e) = self.flush_nvram() {
+                eprintln!("iris: timekeeper NVRAM: {e}");
+            }
+        }
+        r
+    }
     pub fn flush_nvram(&self) -> Result<(), String> {
         let st = self.st.lock();
         if let Some(path) = &st.file {

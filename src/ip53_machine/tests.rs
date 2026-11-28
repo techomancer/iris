@@ -630,6 +630,8 @@ fn a_store_through_the_ioc4_nvram_window_reaches_the_nvram_file() {
     let path = dir.join("nvram");
     let mut cfg = tezro_config(&dir, 1);
     cfg.nvram = path.to_string_lossy().into_owned();
+    // `headless` would reset the store the first run leaves with a stale checksum.
+    cfg.headless = false;
     let window = |offset: u64| widget(15, 0x20_0000 + 0x8_0000 + offset);
 
     let (written, path_in) = (cfg.clone(), path.clone());
@@ -927,4 +929,11 @@ fn virtio_takes_the_second_bus_of_the_io9() {
         let id = |device: u64| io.pio_read(widget(15, HEAD_OFFSET + 0x2_0000 + (device << 12)), 4).data;
         assert_eq!((id(1), id(2)), (0x1043_1af4, 0x1049_1af4));
     });
+}
+
+#[test]
+fn headless_stores_console_d() {
+    let dir = TempPath::dir("tezro-headless");
+    with_machine(tezro_config(&dir, 1), |_| ());
+    assert!(crate::sn::tests::baseio_console_is_serial(&dir));
 }

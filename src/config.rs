@@ -1073,8 +1073,8 @@ pub enum GraphicsBoard {
     /// only.
     #[clap(name = "ir3", alias = "infinitereality3")]
     Ir3,
-    /// No graphics board: the machine runs on its serial console. Octane
-    /// Fuel and the IP27 machines.
+    /// No graphics board: the machine has no display. The O2 and the Onyx 3000
+    /// always have one.
     #[clap(name = "none")]
     None,
 }
@@ -1185,7 +1185,8 @@ impl GraphicsBoard {
             // ships in an Onyx 3000 (`KonaProduct::check_host`), or a V12 on
             // a V-brick.
             MachineProfile::Onyx3000Ip35 => matches!(self, Self::Ir3 | Self::V12),
-            MachineProfile::Indigo2Ip22 => !self.is_vpro() && !self.is_kona() && self != Self::None,
+            MachineProfile::Indigo2Ip22 => !self.is_vpro() && !self.is_kona(),
+            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip28 => !self.is_vpro() && !self.is_kona() && !matches!(self, Self::Extreme | Self::Elan),
             _ => !self.is_vpro() && !self.is_kona() && !matches!(self, Self::Extreme | Self::Elan | Self::None),
         }
     }
@@ -1554,8 +1555,8 @@ impl MachineSection {
 /// What only an O2 has (`[o2]` section). The rest of an O2 is the shared
 /// keys: `prom` (an override of its built-in PROM image), `nvram` (the PROM's flash,
 /// which holds its environment), `banks` (the kit in each DIMM pair),
-/// `serial_port_a`/`serial_port_b`/`serial_log`, `headless` (a serial
-/// console instead of the graphics console), `[clock] fixed_mhz` (CP0 Count,
+/// `serial_port_a`/`serial_port_b`/`serial_log`, `headless` (no window,
+/// `console=d` in the flash), `[clock] fixed_mhz` (CP0 Count,
 /// half the CPU clock), `[network]`, `[[port_forward]]` and `[scsi.N]`. The
 /// deprecated keys below are the old O2-only spellings of those:
 /// [`MachineConfig::fold_deprecated`] moves them over when a file is loaded
@@ -2477,9 +2478,8 @@ pub struct MachineConfig {
     #[serde(default = "default_scale")]
     pub scale: u32,
 
-    /// Suppress the standalone window. Newport is not fitted in this mode;
-    /// O2 selects a serial console. Other graphics boards can remain fitted.
-    /// Use `no_audio` independently to suppress host audio output.
+    /// No window, and `console=d` in the guest's NVRAM. Hardware is unchanged;
+    /// `no_audio` is separate.
     #[serde(default)]
     pub headless: bool,
 
@@ -4037,7 +4037,7 @@ pub struct Cli {
     #[arg(long = "2x", default_value_t = false)]
     pub scale2x: bool,
 
-    /// Suppress the standalone window (platform-specific graphics/console behavior; audio unaffected)
+    /// No window, and `console=d` stored in the guest's NVRAM (hardware and audio unaffected)
     #[arg(long, default_value_t = false)]
     pub headless: bool,
 
@@ -4626,12 +4626,21 @@ mod export_tests {
         }
         let err = octane("[octane]\ngraphics = \"maximpact\"").validate().unwrap_err();
         assert!(err.contains("[graphics]"), "the retired key names its replacement: {err}");
-        // Elsewhere the default stays Newport, and none is the Octane's alone.
+        // Elsewhere the default stays Newport.
         let cfg: MachineConfig = toml::from_str("").expect("parse");
         assert_eq!(cfg.graphics_board(), GraphicsBoard::Newport);
-        assert!(!GraphicsBoard::None.supports(MachineProfile::IndyIp24));
         assert!(!GraphicsBoard::V12.supports(MachineProfile::IndyIp24));
         assert!(!GraphicsBoard::V12.supports(MachineProfile::Indigo2Ip22));
+    }
+
+    #[test]
+    fn indy_accepts_no_graphics_board() {
+        for profile in ["indy_ip24", "indigo2_ip22", "indigo2_ip28"] {
+            let cfg: MachineConfig = toml::from_str(&format!("[machine]\nprofile = \"{profile}\"\n[graphics]\nboard = \"none\"")).expect("parse");
+            assert_eq!(cfg.graphics_board(), GraphicsBoard::None);
+            assert!(cfg.graphics_board().supports(cfg.machine.profile), "{profile}");
+        }
+        assert!(!GraphicsBoard::None.supports(MachineProfile::O2Ip32));
     }
 
     #[test]

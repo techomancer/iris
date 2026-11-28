@@ -40,6 +40,7 @@
 
 use crate::config::{GraphicsBoard, MachineConfig};
 use crate::cpu::parts::{self, CpuModule, Part};
+use crate::dev::baseio_nvram;
 use crate::dev::bcm5701::{Bcm5701, Bcm5701Config};
 use crate::dev::bedrock::{Bedrock, Population, SLOTS};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
@@ -351,6 +352,8 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let running = Population::populated_cpus(cpus)?;
     let timekeeper = Arc::new(Ds1744::new(YearBase::From(1968), timers.clock().clone())?);
     timekeeper.set_nvram_file(Path::new(&cfg.nvram))?;
+    let (serial, layout) = (timekeeper.with_ram(|r| baseio_nvram::console_is_serial(r)), baseio_nvram::Layout::Ip35 { graphics_default: true });
+    crate::nv_storage::apply_headless_console(cfg.headless, cfg.machine.profile.product_name().unwrap_or_default(), &cfg.nvram, serial, || timekeeper.with_ram(|r| baseio_nvram::set_console_serial(r, layout)));
     let serial: [Arc<CiSerialBackend>; SERIAL_PORTS] = std::array::from_fn(|_| Arc::new(CiSerialBackend::new()));
     l1.set_serial_backend(serial[0].clone());
 

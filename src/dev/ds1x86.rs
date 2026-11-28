@@ -307,6 +307,18 @@ impl Ds1x86 {
         true
     }
 
+    /// Store `console=d` in the settings block (see `sgi_nvram`).
+    pub fn set_console_serial(&self, rev: u8) {
+        let mut data = self.data.lock();
+        let block: &mut [u8; 256] = (&mut data.regs[NVRAM_REGS_OFFSET..NVRAM_REGS_OFFSET + 256]).try_into().unwrap();
+        crate::dev::sgi_nvram::set_console_serial(block, rev);
+    }
+
+    pub fn console_is_serial(&self, rev: u8) -> bool {
+        let data = self.data.lock();
+        crate::dev::sgi_nvram::console_is_serial(data.regs[NVRAM_REGS_OFFSET..NVRAM_REGS_OFFSET + 256].try_into().unwrap(), rev)
+    }
+
     fn read(&self, addr: u32) -> BusRead8 {
         let offset = addr as usize;
         if offset >= self.size {
@@ -727,6 +739,17 @@ mod tests {
         assert_eq!(&nv[232..234], b"80", "volume");
         assert_eq!(&nv[0xfa..], &mac);
         assert_eq!(nv[0], crate::dev::sgi_nvram::checksum(nv.try_into().unwrap()));
+    }
+
+    #[test]
+    fn indy_nvram_takes_console_d_and_keeps_its_mac() {
+        let rtc = Ds1x86::new(8192, "test_indy_console_d.bin".to_string(), RtcOffset::default(), Clock::new());
+        let mac = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
+        rtc.backdoor_set_mac_if_blank(mac);
+        assert!(!rtc.console_is_serial(crate::dev::sgi_nvram::REV_IP22));
+        rtc.set_console_serial(crate::dev::sgi_nvram::REV_IP22);
+        assert!(rtc.console_is_serial(crate::dev::sgi_nvram::REV_IP22));
+        assert_eq!(&rtc.data.lock().regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6], &mac);
     }
 
     #[test]

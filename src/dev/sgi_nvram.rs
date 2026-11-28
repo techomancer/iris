@@ -21,6 +21,9 @@ pub const REV_IP28: u8 = 9;
 /// Offset of the Ethernet address within the block.
 pub const MAC_OFFSET: usize = 250;
 
+/// The `console` variable: offset 2, two bytes (`setenv console d` stores `d`, NUL).
+const CONSOLE: std::ops::Range<usize> = 2..4;
+
 /// `(offset, string)` pairs the PROM writes on a bad checksum, besides the
 /// checksum and revision. 232 is the volume, 116 the console baud rate.
 const DEFAULTS: [(usize, &str); 8] = [
@@ -63,6 +66,26 @@ pub fn write_defaults(block: &mut [u8; 256], rev: u8) {
     block[0] = checksum(block);
 }
 
+/// True when the checksum matches and the revision is the machine's `rev`.
+pub fn is_valid(block: &[u8; 256], rev: u8) -> bool {
+    block[1] == rev && block[0] == checksum(block)
+}
+
+/// True when the block is valid and `console` starts with `d`.
+pub fn console_is_serial(block: &[u8; 256], rev: u8) -> bool {
+    is_valid(block, rev) && block[CONSOLE.start] == b'd'
+}
+
+/// Store `console=d` as `setenv console d` does, after the PROM's defaults if
+/// the block would fail its check. The checksum covers the bytes stored.
+pub fn set_console_serial(block: &mut [u8; 256], rev: u8) {
+    if !is_valid(block, rev) {
+        write_defaults(block, rev);
+    }
+    block[CONSOLE].copy_from_slice(b"d\0");
+    block[0] = checksum(block);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +109,59 @@ mod tests {
         assert_eq!(block[235], 0);
         assert_eq!(block[0], checksum(&block));
         assert!(!is_erased(&block, 0));
+    }
+
+    fn defaults(rev: u8) -> [u8; 256] {
+        let mut block = [0u8; 256];
+        block[MAC_OFFSET..].copy_from_slice(&[8, 0, 0x69, 1, 2, 3]);
+        write_defaults(&mut block, rev);
+        block
+    }
+
+    #[test]
+    fn set_console_serial_keeps_a_valid_block_valid() {
+        let before = defaults(REV_IP22);
+        let mut block = before;
+        set_console_serial(&mut block, REV_IP22);
+        assert!(is_valid(&block, REV_IP22) && console_is_serial(&block, REV_IP22));
+        assert!(!console_is_serial(&before, REV_IP22));
+        let changed: Vec<usize> = (0..256).filter(|&i| block[i] != before[i]).collect();
+        assert_eq!(changed, [0, 2]);
+        assert_eq!(&block[2..4], b"d\0");
+    }
+
+    /// `setenv console d` turns `67 00` into `64 00` and XORs the checksum with 0x81.
+    #[test]
+    fn set_console_serial_matches_the_prom_delta() {
+        let before = defaults(REV_IP22);
+        let mut block = before;
+        set_console_serial(&mut block, REV_IP22);
+        assert_eq!(&before[2..4], b"g\0");
+        assert_eq!(block[0], before[0] ^ 0x81);
+    }
+
+    #[test]
+    fn set_console_serial_on_a_corrupt_block_starts_from_the_defaults() {
+        let mut block = defaults(REV_IP22);
+        block[100] ^= 0x10;
+        assert!(!is_valid(&block, REV_IP22));
+        set_console_serial(&mut block, REV_IP22);
+        let mut want = defaults(REV_IP22);
+        want[2] = b'd';
+        want[0] = checksum(&want);
+        assert_eq!(block, want);
+    }
+
+    #[test]
+    fn checksum_follows_bytes_after_the_terminator() {
+        let mut block = defaults(REV_IP22);
+        set_console_serial(&mut block, REV_IP22);
+        block[3] = b'x';
+        assert!(!is_valid(&block, REV_IP22));
+        block[0] = checksum(&block);
+        assert!(console_is_serial(&block, REV_IP22));
+        set_console_serial(&mut block, REV_IP22);
+        assert!(console_is_serial(&block, REV_IP22));
+        assert_eq!(block[3], 0);
     }
 }

@@ -351,6 +351,27 @@ impl Ds1685 {
         }
     }
 
+    /// Run `f` on the PROM's environment store: registers 0x0e..0x7f, then the
+    /// extended RAM (242 bytes). A change is saved at the next timer pass.
+    pub fn with_env_store<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let mut rtc = self.st.lock();
+        let mut img = rtc.image();
+        let mut store = [&img[0x0e..NVRAM_OFF_EXT], &img[NVRAM_OFF_XRAM..]].concat();
+        let before = store.clone();
+        let r = f(&mut store);
+        if store != before {
+            let (low, high) = store.split_at(NVRAM_OFF_EXT - 0x0e);
+            img[0x0e..NVRAM_OFF_EXT].copy_from_slice(low);
+            img[NVRAM_OFF_XRAM..].copy_from_slice(high);
+            rtc.load(&img);
+            if rtc.file.is_some() {
+                rtc.dirty_since = Some(0);
+                self.dirty.store(encode(rtc.dirty_since), Ordering::SeqCst);
+            }
+        }
+        r
+    }
+
     /// The clock and its RAM for a snapshot, as the chip's `rtc` key.
     pub fn save_state(&self) -> toml::Value {
         let r = self.st.lock();

@@ -41,6 +41,7 @@ use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::parts::CpuModule;
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu};
+use crate::dev::baseio_nvram;
 use crate::dev::bridge::Bridge;
 use crate::dev::elsc::ModuleOutput;
 use crate::clock::Clock;
@@ -403,6 +404,8 @@ pub(crate) fn pci_devices(
     pci.attach(slot(SCSI_DEVICES[1]), scsi[1].clone());
     // The Fuel's M48T35 Timekeeper is the same part; IRIX on the IP27 adds 1970 to its year cell.
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), YearBase::From(1970), timers.clock().clone())?);
+    let serial = timekeeper.with_ram(|r| baseio_nvram::console_is_serial(r));
+    crate::nv_storage::apply_headless_console(cfg.headless, name, &cfg.nvram, serial, || timekeeper.with_ram(|r| baseio_nvram::set_console_serial(r, baseio_nvram::Layout::Ip27)));
     let ioc3 = Arc::new(Ioc3::new(timers, ioc3_board, cfg.network().mac, ByteBus::M48t35(timekeeper.clone())));
     ioc3.set_heartbeat(heartbeat);
     let eth = ioc3.eth().expect("an IP27 I/O board's IOC3 has Ethernet").clone();

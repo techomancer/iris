@@ -515,7 +515,7 @@ impl App {
         self.toast(t!("toast-ci-test-starting"));
         std::thread::spawn(move || {
             let _child = std::process::Command::new(iris)
-                .args(["--config", path.to_string_lossy().as_ref(), "--ci", "--headless"])
+                .args(["--config", path.to_string_lossy().as_ref(), "--ci"])
                 .current_dir(&dir).spawn();
             std::thread::sleep(std::time::Duration::from_secs(8));
             let out = std::process::Command::new(client)
@@ -2875,7 +2875,7 @@ mod machine_storage_integration {
         let mut cfg = iris::config::MachineConfig::default();
         cfg.banks = iris::config::banks_from4([8, 8, 0, 0]);
         cfg.devices.clear();
-        cfg.headless = true;
+        cfg.graphics.board = Some(iris::config::GraphicsBoard::None);
         cfg.monitor_port = Some(0);
         cfg.serial_port_a = Some(0);
         cfg.serial_port_b = Some(0);

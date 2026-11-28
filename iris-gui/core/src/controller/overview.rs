@@ -85,9 +85,7 @@ impl AppController {
             HardwareRow {
                 icon: Icon::DisplayScale,
                 label: t!("ov-graphics"),
-                value: if cfg.headless {
-                    t!("ov-headless")
-                } else if cfg.machine.profile == iris::config::MachineProfile::O2Ip32 {
+                value: if cfg.machine.profile == iris::config::MachineProfile::O2Ip32 {
                     // The O2's display is built in; the board key does not apply.
                     t!("extra-gbe")
                 } else {

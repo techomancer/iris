@@ -102,7 +102,7 @@ fn indy_hal2_chime() {
 
 #[test]
 fn o2_mace_chime() {
-    let (rate, frames) = boot(MachineProfile::O2Ip32, "r5000", 34000, |_| {});
+    let (rate, frames) = boot(MachineProfile::O2Ip32, "r5000", 34000, |c| c.headless = true);
     check(rate, 34000, &frames, "9:100 9:104 9:101 9:60 10:104 10:62 9:62 9:62 8:62 8:62 7:62 7:62 6:62 6:62 6:62 6:62 5:62 5:63");
 }
 

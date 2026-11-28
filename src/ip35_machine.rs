@@ -48,6 +48,7 @@
 
 use crate::config::{MachineConfig, MachineProfile};
 use crate::cpu::parts::{self, Part};
+use crate::dev::baseio_nvram;
 use crate::dev::bedrock::{Bedrock, Population};
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash, Header};
 use crate::clock::Clock;
@@ -225,6 +226,8 @@ fn build_baseio(
     let l1 = &l1s[0];
     // IRIX on the IP35 machines counts the Timekeeper's year cell from 1968.
     let timekeeper = Arc::new(Timekeeper::with_nvram_file(Path::new(&cfg.nvram), YearBase::From(1968), timers.clock().clone())?);
+    let (serial, layout) = (timekeeper.with_ram(|r| baseio_nvram::console_is_serial(r)), baseio_nvram::Layout::Ip35 { graphics_default: false });
+    crate::nv_storage::apply_headless_console(cfg.headless, cfg.machine.profile.product_name().unwrap_or_default(), &cfg.nvram, serial, || timekeeper.with_ram(|r| baseio_nvram::set_console_serial(r, layout)));
     let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
     for head in [HEAD_E, HEAD_F] {
         resolved.bind_pci(&format!("xio{head}/pci0"), xbridge.bus(head).clone())?;

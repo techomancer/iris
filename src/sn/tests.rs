@@ -30,6 +30,11 @@ pub(crate) fn headless(dir: &std::path::Path, profile: crate::config::MachinePro
     cfg
 }
 
+/// Whether the base I/O store a `headless` build left in `dir` has `console=d`.
+pub(crate) fn baseio_console_is_serial(dir: &std::path::Path) -> bool {
+    crate::dev::baseio_nvram::console_is_serial(&std::fs::read(dir.join("nvram.bin")).unwrap())
+}
+
 /// Build the machine `cfg` describes with `build` on a big stack, as `main` does, run `body` on it,
 /// and drop it there.
 pub(crate) fn with_machine<M: 'static, R: Send + 'static>(

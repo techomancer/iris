@@ -23,14 +23,14 @@ DUMP="${DUMP:-build/dump.json}"
 mkdir -p "$(dirname "$LOG")"
 rm -f "$LOG" "$DUMP"
 
-# --headless: no window. --noaudio: no cpal device in CI.
+# --noaudio: no cpal device in CI. The bare machine has no graphics board, so no window.
 # --test-device: PUTC/DUMP/EXIT, and the exit code we propagate.
 # --config run/bare.toml: a bare-metal binary touches no disk, and bare.toml's
 # present-but-empty [scsi] keeps SCSI out. Without it the default config
 # attaches scsi1.raw and startup is fatal when that file is absent, which is
 # always — nothing in this suite creates one.
 #
-# The log is a tee of stdout, not --serial-log: headless IRIS already writes
+# The log is a tee of stdout, not --serial-log: IRIS already writes
 # the guest's console to its own stdout, and --serial-log tees the channel-B
 # *backend*, which in non-CI mode is the TCP listener nothing is attached to —
 # so it produced an empty file and the diagnostics below had nothing to show.
@@ -39,7 +39,7 @@ timeout "$TIMEOUT" "$IRIS" \
     --config run/bare.toml \
     --load-elf "$ELF" \
     --test-device --test-device-dump "$DUMP" \
-    --headless --noaudio \
+    --noaudio \
     "$@" 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 

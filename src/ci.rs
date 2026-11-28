@@ -66,7 +66,7 @@ pub struct CiServer {
     /// machine is dropped, so a CI command can never reach a freed machine.
     machine: MachineSlot,
     ci_serial: Arc<CiSerialBackend>,
-    /// Optional in case --headless is also passed (no REX3). Screenshot
+    /// Optional in case the machine has no graphics board. Screenshot
     /// commands return an error in that case.
     display: Option<Arc<dyn GfxDisplay>>,
     display_head1: Option<Arc<dyn GfxDisplay>>,
@@ -658,7 +658,7 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
     };
     let Some(display) = display else {
         return Response::err(format!(
-            "screenshot: display head {} not present (headless or graphics.heads < 2?)",
+            "screenshot: display head {} not present (no graphics board or graphics.heads < 2?)",
             head
         ));
     };

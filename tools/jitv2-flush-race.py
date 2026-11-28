@@ -36,6 +36,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -131,7 +132,10 @@ def main():
     random.seed(a.seed)
 
     env = dict(os.environ, IRIS_JIT_ARENA_FLUSH_MB=str(a.arena_mb))
-    argv = [a.iris, "--config", a.config, "--ci", "--headless", "--monitor-port", str(a.monitor_port)]
+    # --headless stores console=d in the NVRAM; keep that off the config's own file.
+    nv = tempfile.mkdtemp(prefix="jitv2-flush-race-")
+    argv = [a.iris, "--config", a.config, "--ci", "--headless", "--monitor-port", str(a.monitor_port),
+            "--nvram", os.path.join(nv, "nvram.bin"), "--nveeprom", os.path.join(nv, "nveeprom.bin")]
     if a.ci_socket:
         argv += ["--ci-socket", a.ci_socket]
     proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

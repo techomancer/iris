@@ -448,7 +448,7 @@ impl HostInput {
     /// board did not compose a new one within 250 ms, so it is the last one
     /// it did.
     pub fn frame(&self) -> Result<(usize, usize, Vec<u32>, bool), String> {
-        let d = self.display.as_ref().ok_or("no display (headless)")?;
+        let d = self.display.as_ref().ok_or("no display (no graphics board)")?;
         let fresh = crate::gfx_display::wait_fresh_frame(&**d, Duration::from_millis(250));
         let mut px = Vec::new();
         let (w, h, _) = crate::gfx_display::copy_frame(&**d, &mut px).ok_or("the display has no video mode yet")?;

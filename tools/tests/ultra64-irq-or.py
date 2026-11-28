@@ -48,6 +48,7 @@ def main():
     log = open(os.path.join(work, "iris.log"), "w")
     iris = subprocess.Popen(
         [os.path.abspath(a.iris), "--config", cfg, "--headless",
+         "--nvram", os.path.join(work, "nvram.bin"),
          "--monitor-port", str(a.port),
          "--serial-port-a", str(a.port + 1), "--serial-port-b", str(a.port + 2)],
         cwd=work, stdout=log, stderr=subprocess.STDOUT)

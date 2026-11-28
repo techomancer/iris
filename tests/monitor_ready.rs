@@ -67,7 +67,9 @@ fn write_config(dir: &Path, monitor: u16, serial_a: u16, serial_b: u16, ci_socke
          \n\
          # No disk: the embedded PROM is enough for this test, and the default\n\
          # scsi1.raw would otherwise abort startup when it is absent.\n\
-         scsi = {{}}\n",
+         scsi = {{}}\n\n\
+         [graphics]\n\
+         board = \"none\"\n",
         ci_socket.display()
     );
     std::fs::write(dir.join("iris.toml"), text).expect("write test config");

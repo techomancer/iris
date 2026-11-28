@@ -149,7 +149,8 @@ The console is IOC3's first serial port on TCP 127.0.0.1 (`serial_port_a`,
 8880 unless set), and `serial_log` copies what it sends to a file, adding to
 an existing log unless `serial_log_overwrite` is set; the second port is
 `serial_port_b`. The PROM's `console` variable picks between the
-serial and graphics consoles; `headless` only removes the window.
+serial and graphics consoles; `headless` removes the window and stores
+`console=d` there.
 
 A PS/2 keyboard and mouse are always plugged into IOC3's two PS/2 ports;
 the iris window (or iris-gui) and the monitor's `ps2` commands type and

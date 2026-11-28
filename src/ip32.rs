@@ -322,6 +322,11 @@ pub struct O2Flash {
 }
 
 impl O2Flash {
+    /// Run `f` on the flash image, for a writer of the PROM's environment (`o2_env`).
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        f(&mut self.bytes.lock().unwrap())
+    }
+
     fn read(&self, addr: u64, n: usize) -> u64 {
         let p = self.bytes.lock().unwrap();
         let i = (addr as u32).wrapping_sub(PROM_BASE) as usize;

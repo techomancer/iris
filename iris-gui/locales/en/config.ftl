@@ -153,7 +153,6 @@ config-ram-total = Total: { $ram }
 config-scale = Window scale
 # $scale is a whole number, such as 2 for double size.
 config-scale-factor = { $scale }×
-config-headless = Headless mode
 config-no-audio = No audio
 config-keyboard = Keyboard
 config-keyboard-tip = The physical shape of your keyboard. Set the language layout in the PROM.
