@@ -200,3 +200,19 @@ fn the_octane_stops_its_disks_before_its_graphics() {
     assert!(probe.stopped.load(SeqCst), "the display thread released its renderer");
     assert!(!overlap.load(SeqCst), "a disk controller was still running when the graphics stopped");
 }
+
+/// A recording opened before `start` replays: the fixed video mode is already
+/// on the board when its starting state is saved.
+#[cfg(feature = "gputrace")]
+#[test]
+fn a_recording_opened_before_start_replays_with_a_fixed_video_mode() {
+    let dir = scratch("rec-before-start");
+    let rec = dir.join("rec").to_string_lossy().into_owned();
+    let cfg = config(&dir, MachineProfile::IndyIp24, GraphicsBoard::Newport);
+    let mut m = big_stack(move || crate::workstation::build(cfg).expect("machine"));
+    m.monitor().run("rex", &["rec", &rec]);
+    m.start();
+    m.monitor().run("rex", &["rec", "off"]);
+    m.stop();
+    crate::dev::ng1::rex3::rec::tests::replay(&rec, None).unwrap();
+}
