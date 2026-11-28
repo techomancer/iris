@@ -545,8 +545,7 @@ impl MemoryController {
         if abort_en {
             state.regs[(REG_GIO_ERROR_STAT / 4) as usize] = 1u32 << 10; // TIME: GIO bus timeout
         }
-        dlog_dev!(LogModule::Mc, "MC: GIO Timeout at {:08x} (abort_en={})", addr, abort_en);
-        eprintln!("MC: GIO Timeout at {:08x}", addr);
+        dlog!(LogModule::Mc, "MC: GIO Timeout at {:08x} (abort_en={})", addr, abort_en);
         abort_en
     }
 
@@ -846,18 +845,12 @@ impl BusDevice for MemoryController {
                 BUS_OK
             }
             REG_MEMCFG0 => {
-                if self.base_shift != 22 {
-                    eprintln!("iris: ip28: guest writes MEMCFG0 = {val:#010x}");
-                }
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG0 = {:08x}", val);
                 state.regs[(REG_MEMCFG0 / 4) as usize] = val;
                 self.on_memcfg_updated(&mut state);
                 BUS_OK
             }
             REG_MEMCFG1 => {
-                if self.base_shift != 22 {
-                    eprintln!("iris: ip28: guest writes MEMCFG1 = {val:#010x}");
-                }
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG1 = {:08x}", val);
                 state.regs[(REG_MEMCFG1 / 4) as usize] = val;
                 self.on_memcfg_updated(&mut state);

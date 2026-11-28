@@ -65,6 +65,11 @@ hashes are given where a change is easiest to understand by reading the commit.
     (`gputrace` builds) writes the same register writes from the moment it
     starts. It has no look-back: the old variable kept the last N writes to
     dump after a glitch, and nothing replaces that.
+- Some default console lines are quiet now. `MC: GIO Timeout` (stderr) is shown
+  by `log mc`, and `Rex3: Resolution changed` (stdout) by `log rex3`. The IP28
+  `guest writes MEMCFG0/1` stderr lines are deleted. `MC: CPU Error` still
+  prints on stderr. REX3's "unhandled" stderr lines now stop after 8 per
+  register and access kind.
 - One pattern names trace points everywhere: `log heart,l1d.*,-l1d.hit on`,
   `--log PATTERN` and `[debug] log`. `IRIS_DEBUG_LOG` and `[debug] debug_log`
   are replaced by `--log` and `[debug] log` (the old key still loads), and
