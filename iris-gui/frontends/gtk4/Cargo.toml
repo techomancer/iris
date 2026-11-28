@@ -39,3 +39,7 @@ iris = { path = "../../..", features = ["gpujit"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk4 = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
+# Draws the shared icon set (iris-gui/assets/icons/*.svg); line art only, so
+# no text, fonts or embedded images. GTK's own SVG support goes through
+# gdk-pixbuf's loader, which is not installed everywhere.
+resvg = { version = "0.50", default-features = false }

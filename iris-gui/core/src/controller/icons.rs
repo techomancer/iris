@@ -103,6 +103,60 @@ impl Icon {
         }
     }
 
+    /// The SVG itself: 24x24 line art, black on transparent, so a shell can
+    /// use it as a mask or template and colour it (the machine pictures in
+    /// [`crate::controller::profile::MachineIcon::svg`] work the same way, on
+    /// a 64x64 grid because they are drawn much larger).
+    pub fn svg(self) -> &'static str {
+        macro_rules! art {
+            ($stem:literal) => {
+                include_str!(concat!("../../../assets/icons/", $stem, ".svg"))
+            };
+        }
+        match self {
+            Icon::ShowLibrary => art!("sidebar"),
+            Icon::PowerOn => art!("power-on"),
+            Icon::ShutDownGuest => art!("shut-down"),
+            Icon::PowerOff => art!("power-off"),
+            Icon::Restart => art!("restart"),
+            Icon::Reset => art!("reset"),
+            Icon::SaveState => art!("save-state"),
+            Icon::SavedStates => art!("saved-states"),
+            Icon::Screenshot => art!("screenshot"),
+            Icon::InsertDisc => art!("insert-disc"),
+            Icon::BrowseFiles => art!("browse-files"),
+            Icon::DetachDisplay => art!("detach"),
+            Icon::FullScreen => art!("full-screen"),
+            Icon::SerialConsole => art!("terminal"),
+            Icon::MachineSettings => art!("settings"),
+            Icon::NewMachine => art!("new-machine"),
+            Icon::NewFolder => art!("new-folder"),
+            Icon::Folder => art!("folder"),
+            Icon::Disk => art!("disk"),
+            Icon::CdRom => art!("cdrom"),
+            Icon::Network => art!("network"),
+            Icon::Audio => art!("audio"),
+            Icon::Camera => art!("camera"),
+            Icon::InputCapture => art!("capture"),
+            Icon::DisplayScale => art!("scale"),
+            Icon::Warning => art!("warning"),
+            Icon::Error => art!("error"),
+            Icon::Info => art!("info"),
+            Icon::Delete => art!("delete"),
+            Icon::Duplicate => art!("duplicate"),
+            Icon::Rename => art!("rename"),
+            Icon::Restore => art!("restore"),
+            Icon::Export => art!("export"),
+            Icon::Import => art!("import"),
+            Icon::Edit => art!("edit"),
+            Icon::Permissions => art!("permissions"),
+            Icon::Check => art!("check"),
+            Icon::Up => art!("up"),
+            Icon::Refresh => art!("refresh"),
+            Icon::Cancel => art!("cancel"),
+        }
+    }
+
     /// Every meaning, for tests and icon-set checks.
     pub const ALL: &'static [Icon] = &[
         Icon::ShowLibrary, Icon::PowerOn, Icon::ShutDownGuest, Icon::PowerOff, Icon::Restart, Icon::Reset,
@@ -119,6 +173,17 @@ impl Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_meaning_has_its_art() {
+        for icon in Icon::ALL {
+            let svg = icon.svg();
+            assert!(svg.starts_with("<svg"), "{} is not an SVG", icon.svg_name());
+            assert!(svg.contains("viewBox=\"0 0 24 24\""), "{} is not on the 24x24 grid", icon.svg_name());
+            // Tinted by the shell, so the art carries no colour of its own.
+            assert!(!svg.contains("stroke=\"#0") || svg.contains("stroke=\"#000\""), "{} is coloured", icon.svg_name());
+        }
+    }
 
     #[test]
     fn svg_names_are_unique() {
