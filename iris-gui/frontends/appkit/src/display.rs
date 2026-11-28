@@ -82,7 +82,13 @@ fn gpu() -> Option<Gpu> {
 pub struct State {
     gpu: Option<Gpu>,
     layer: Retained<CAMetalLayer>,
-    texture: RefCell<Option<(Retained<ProtocolObject<dyn MTLTexture>>, usize, usize)>>,
+    /// Each head's picture: head 0, and head 1 with a second Newport.
+    textures: [RefCell<Option<(Retained<ProtocolObject<dyn MTLTexture>>, usize, usize)>>; 2],
+    /// How many heads to draw: two while the session has a second Newport
+    /// (`SessionController::dual_head`).
+    heads: Cell<usize>,
+    /// Over head 1 until it has drawn anything (`head1_live`).
+    head1_label: RefCell<Option<Retained<objc2_app_kit::NSTextField>>>,
     /// The scale cap (points per guest pixel), integer-only and filter, from
     /// the app-wide display preferences.
     /// How the picture is sized, and a forced filter (`None`: sharp at
@@ -121,6 +127,7 @@ define_class!(
             // SAFETY: NSView's own setter.
             let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
             self.resize_drawable();
+            self.place_head1_label();
             self.draw();
         }
 
@@ -279,6 +286,29 @@ fn other_bit(e: &NSEvent) -> u8 {
     }
 }
 
+/// The gap between two heads, in points.
+const HEAD_GAP: f32 = 8.0;
+
+/// Where each head is drawn in a view of `avail` points, as (origin, size)
+/// from the top left: one head fills the view; two sit side by side in equal
+/// columns, [`HEAD_GAP`] apart, as egui's `framebuffer_panel_dual` lays them
+/// out. Each picture is then sized and centred in its area. Only head 0
+/// takes the pointer.
+fn head_areas(avail: (f32, f32), heads: usize) -> Vec<((f32, f32), (f32, f32))> {
+    if heads < 2 {
+        return vec![((0.0, 0.0), avail)];
+    }
+    let w = ((avail.0 - HEAD_GAP) / 2.0).max(0.0);
+    vec![((0.0, 0.0), (w, avail.1)), ((w + HEAD_GAP, 0.0), (w, avail.1))]
+}
+
+/// The view size Actual Size wants for heads of these pixel sizes: side by
+/// side, [`HEAD_GAP`] apart, as tall as the taller.
+fn actual_size(heads: &[(f32, f32)]) -> (f32, f32) {
+    let w: f32 = heads.iter().map(|h| h.0).sum::<f32>() + HEAD_GAP * heads.len().saturating_sub(1) as f32;
+    (w, heads.iter().map(|h| h.1).fold(0.0, f32::max))
+}
+
 fn mods(e: &NSEvent) -> Mods {
     let f = e.modifierFlags();
     Mods {
@@ -301,7 +331,9 @@ impl DisplayView {
         let state = State {
             gpu,
             layer: layer.clone(),
-            texture: RefCell::new(None),
+            textures: [RefCell::new(None), RefCell::new(None)],
+            heads: Cell::new(1),
+            head1_label: RefCell::new(None),
             sizing: Cell::new((iris_gui_core::controller::display::Sizing::Actual, None)),
             captured: Cell::new(false),
             follow: Cell::new(false),
@@ -340,9 +372,65 @@ impl DisplayView {
         self.ivars().layer.setDrawableSize(NSSize::new((b.width * scale).max(1.0), (b.height * scale).max(1.0)));
     }
 
-    /// Take the newest frame from `sink` and upload its damaged band.
-    /// Returns whether there was one.
+    /// How many heads to draw, side by side ([`head_areas`]).
+    pub fn set_heads(&self, n: usize) {
+        let n = n.clamp(1, 2);
+        if self.ivars().heads.replace(n) != n {
+            if n == 1 {
+                *self.ivars().textures[1].borrow_mut() = None;
+            }
+            self.fit();
+            self.place_head1_label();
+            self.draw();
+        }
+    }
+
+    /// Say over head 1 that it has drawn nothing yet, or take that away.
+    pub fn set_head1_waiting(&self, mtm: MainThreadMarker, waiting: bool) {
+        let mut slot = self.ivars().head1_label.borrow_mut();
+        match (waiting, slot.as_ref()) {
+            (true, None) => {
+                let l = crate::ui::label(mtm, &t!("fb-head-waiting"));
+                l.setTextColor(Some(&objc2_app_kit::NSColor::lightGrayColor()));
+                l.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(15.0)));
+                crate::ui::set_id(&l, "display.head1-waiting");
+                self.addSubview(&l);
+                *slot = Some(l);
+            }
+            (false, Some(l)) => {
+                l.removeFromSuperview();
+                *slot = None;
+            }
+            _ => {}
+        }
+        drop(slot);
+        self.place_head1_label();
+    }
+
+    /// Centre the head-1 label in head 1's area (the view's y grows up).
+    fn place_head1_label(&self) {
+        let st = self.ivars();
+        let slot = st.head1_label.borrow();
+        let Some(l) = slot.as_ref() else { return };
+        let b = self.bounds().size;
+        let areas = head_areas((b.width as f32, b.height as f32), st.heads.get());
+        l.setHidden(areas.len() < 2);
+        let Some(&((ax, ay), (aw, ah))) = areas.get(1) else { return };
+        l.sizeToFit();
+        let s = l.frame().size;
+        let x = ax as f64 + (aw as f64 - s.width) / 2.0;
+        let y = b.height - (ay as f64 + (ah as f64 + s.height) / 2.0);
+        l.setFrameOrigin(NSPoint::new(x.round(), y.round()));
+    }
+
+    /// Take head 0's newest frame from `sink`; see [`DisplayView::take_head`].
     pub fn take(&self, sink: &FrameSink) -> bool {
+        self.take_head(0, sink)
+    }
+
+    /// Take the newest frame of head `head` from `sink` and upload its
+    /// damaged band. Returns whether there was one.
+    pub fn take_head(&self, head: usize, sink: &FrameSink) -> bool {
         let Some(frame) = sink.take() else { return false };
         let st = self.ivars();
         let Some(g) = &st.gpu else {
@@ -354,7 +442,7 @@ impl DisplayView {
             sink.recycle(frame);
             return false;
         }
-        let mut tex = st.texture.borrow_mut();
+        let mut tex = st.textures[head.min(1)].borrow_mut();
         let full = match tex.as_ref() {
             Some((_, tw, th)) => *tw != w || *th != h,
             None => true,
@@ -404,8 +492,40 @@ impl DisplayView {
 
     /// Forget the picture (a new run starts with the placeholder).
     pub fn clear(&self) {
-        *self.ivars().texture.borrow_mut() = None;
+        for t in &self.ivars().textures {
+            *t.borrow_mut() = None;
+        }
         self.draw();
+    }
+
+    /// What the view draws, for the `dump:display` script step: the head
+    /// count, then each head's picture size and its rectangle in the view.
+    pub fn describe(&self) -> String {
+        let st = self.ivars();
+        let b = self.bounds().size;
+        let mut out = format!("display: {} head(s) in {:.0}x{:.0} pt", st.heads.get(), b.width, b.height);
+        for head in 0..st.heads.get() {
+            match st.textures[head].borrow().as_ref() {
+                Some((_, w, h)) => {
+                    let ((x, y), (dw, dh), _) = self.picture_rect(head, *w as f32, *h as f32);
+                    out.push_str(&format!("\n  head {head}: {w}x{h} px at ({x:.0},{y:.0}) {dw:.0}x{dh:.0} pt"));
+                }
+                None => out.push_str(&format!("\n  head {head}: no picture yet")),
+            }
+        }
+        if let Some(l) = st.head1_label.borrow().as_ref() {
+            out.push_str(&format!("\n  head 1 label: {:?}", l.stringValue().to_string()));
+        }
+        out
+    }
+
+    /// The pixel size of each head that has a picture, in head order.
+    fn head_sizes(&self) -> Vec<(f32, f32)> {
+        let st = self.ivars();
+        st.textures[..st.heads.get()]
+            .iter()
+            .filter_map(|t| t.borrow().as_ref().map(|(_, w, h)| (*w as f32, *h as f32)))
+            .collect()
     }
 
     pub fn set_sizing(&self, sizing: iris_gui_core::controller::display::Sizing, nearest: Option<bool>) {
@@ -425,9 +545,16 @@ impl DisplayView {
         // SAFETY: a plain getter; the view is on the main thread.
         let Some(clip) = (unsafe { self.superview() }) else { return };
         let c = clip.bounds().size;
-        let want = match (self.ivars().sizing.get().0, self.ivars().texture.borrow().as_ref()) {
-            (iris_gui_core::controller::display::Sizing::Actual, Some((_, w, h))) => {
-                NSSize::new(c.width.max(*w as f64), c.height.max(*h as f64))
+        let mut sizes = self.head_sizes();
+        // A head with no picture yet is given the other's size, so the one
+        // drawn already keeps its whole column.
+        while !sizes.is_empty() && sizes.len() < self.ivars().heads.get() {
+            sizes.push(sizes[0]);
+        }
+        let want = match self.ivars().sizing.get().0 {
+            iris_gui_core::controller::display::Sizing::Actual if !sizes.is_empty() => {
+                let (w, h) = actual_size(&sizes);
+                NSSize::new(c.width.max(w as f64), c.height.max(h as f64))
             }
             _ => c,
         };
@@ -443,14 +570,16 @@ impl DisplayView {
         }
     }
 
-    /// The picture's rectangle in the view, in points: origin and size.
-    fn picture_rect(&self, w: f32, h: f32) -> ((f32, f32), (f32, f32), bool) {
+    /// Head `head`'s picture rectangle in the view, in points from the top
+    /// left: origin and size, centred in the head's area.
+    fn picture_rect(&self, head: usize, w: f32, h: f32) -> ((f32, f32), (f32, f32), bool) {
         let b = self.bounds().size;
+        let areas = head_areas((b.width as f32, b.height as f32), self.ivars().heads.get());
+        let ((ax, ay), (aw, ah)) = areas.get(head).copied().unwrap_or(areas[0]);
         let scale = self.ivars().layer.contentsScale() as f32;
         let (sizing, _) = self.ivars().sizing.get();
-        let ((dw, dh), integer) =
-            iris_gui_core::controller::display::picture_size(sizing, (b.width as f32, b.height as f32), (w, h), scale);
-        (((b.width as f32 - dw) / 2.0, (b.height as f32 - dh) / 2.0), (dw, dh), integer)
+        let ((dw, dh), integer) = iris_gui_core::controller::display::picture_size(sizing, (aw, ah), (w, h), scale);
+        ((ax + (aw - dw) / 2.0, ay + (ah - dh) / 2.0), (dw, dh), integer)
     }
 
     /// Draw the texture into the layer's next drawable.
@@ -476,9 +605,11 @@ impl DisplayView {
         ca.setClearColor(MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0 });
         let Some(cmd) = g.queue.commandBuffer() else { return };
         let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&pass) else { return };
-        if let Some((tex, w, h)) = st.texture.borrow().as_ref() {
+        for head in 0..st.heads.get() {
+            let slot = st.textures[head].borrow();
+            let Some((tex, w, h)) = slot.as_ref() else { continue };
             let scale = st.layer.contentsScale() as f32;
-            let ((x, y), (dw, dh), integer) = self.picture_rect(*w as f32, *h as f32);
+            let ((x, y), (dw, dh), integer) = self.picture_rect(head, *w as f32, *h as f32);
             let nearest = st.sizing.get().1.unwrap_or(integer);
             // Centre on the device-pixel grid.
             let ox = (x * scale).round() as f64;
@@ -562,13 +693,14 @@ impl DisplayView {
     /// The guest pixel under the event's location, clamped to the picture.
     fn guest_point(&self, e: &NSEvent) -> Option<(i32, i32)> {
         let st = self.ivars();
-        let tex = st.texture.borrow();
+        // Only head 0 takes the pointer.
+        let tex = st.textures[0].borrow();
         let (_, w, h) = tex.as_ref()?;
         let (w, h) = (*w as f32, *h as f32);
         let p = self.convertPoint_fromView(e.locationInWindow(), None);
         let b = self.bounds().size;
         drop(tex);
-        let ((ox, oy), (dw, dh), _) = self.picture_rect(w, h);
+        let ((ox, oy), (dw, dh), _) = self.picture_rect(0, w, h);
         if dw <= 0.0 || dh <= 0.0 {
             return None;
         }

@@ -218,7 +218,8 @@ fn start(mtm: MainThreadMarker) {
     // "type:TEXT" fills the browser's editor (\n for a newline), "at:X,Y[,B]"
     // puts the pointer on a guest pixel in Follow mode,
     // "split:W" moves the sidebar's divider to W points,
-    // "dump:devices" prints the Devices menu, "dump:browser" the browser's
+    // "dump:devices" prints the Devices menu, "dump:display" the display's
+    // heads and where each is drawn, "dump:browser" the browser's
     // folder, "drop:PATH" drops a host file on it. IRIS_APPKIT_ANSWERS (see
     // effects.rs) answers the prompts these raise.
     if let Ok(script) = std::env::var("IRIS_APPKIT_SCRIPT") {
@@ -320,6 +321,8 @@ pub fn script_step() {
                 }
             }
         });
+    } else if step == "dump:display" {
+        with(|s| eprintln!("{}", s.win.display.describe()));
     } else if step == "dump:devices" {
         crate::menu::dump_devices(mtm());
     } else if let Some(w) = step.strip_prefix("split:").and_then(|w| w.parse::<f64>().ok()) {
@@ -373,10 +376,22 @@ pub fn tick() {
             }
         }
         if s.app.session().is_running() {
-            let (sink, _) = s.app.session().frame_sinks();
-            if s.win.display.take(sink) {
+            // A second Newport draws a second head beside the first; head 0
+            // keeps the input, and head 1 says so until it draws.
+            let dual = s.app.session().dual_head();
+            let heads = if dual { 2 } else { 1 };
+            s.win.display.set_heads(heads);
+            s.win.display.set_head1_waiting(mtm(), dual && !s.app.session().head1_live());
+            let (sink, sink1) = s.app.session().frame_sinks();
+            let mut took = s.win.display.take(sink);
+            if heads > 1 {
+                took |= s.win.display.take_head(1, sink1);
+            }
+            if took {
                 s.win.display.draw();
             }
+        } else {
+            s.win.display.set_head1_waiting(mtm(), false);
         }
         fx
     });
