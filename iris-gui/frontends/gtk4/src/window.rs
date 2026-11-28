@@ -243,19 +243,28 @@ impl MainWindow {
         self.split.set_show_sidebar(!self.split.shows_sidebar());
     }
 
+    /// Draw any window into a PNG, the way `shot:` does the main one.
+    pub fn shoot(window: &impl IsA<gtk::Widget>, path: &str) -> Result<(), String> {
+        let window = window.as_ref();
+        let renderer = window.native().and_then(|n| n.renderer()).ok_or("the window has no renderer yet")?;
+        let (w, h) = (window.width() as f64, window.height() as f64);
+        if w < 1.0 || h < 1.0 {
+            return Err("the window has no size yet".into());
+        }
+        let paintable = gtk::WidgetPaintable::new(Some(window));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, w, h);
+        let node = snapshot.to_node().ok_or("the window drew nothing")?;
+        renderer.render_texture(&node, None).save_to_png(path).map_err(|e| e.to_string())
+    }
+
     /// Draw the window into a PNG, for a test script's `shot:` step.
     ///
     /// The window paints itself through its own GSK renderer, so this needs
     /// no compositor permission, no screenshot tool and no unlocked screen —
     /// on Wayland there is no way to grab another process's window anyway.
     pub fn screenshot(&self, path: &str) -> Result<(), String> {
-        let renderer = self.window.native().and_then(|n| n.renderer()).ok_or("the window has no renderer yet")?;
-        let (w, h) = (self.window.width() as f64, self.window.height() as f64);
-        let paintable = gtk::WidgetPaintable::new(Some(&self.window));
-        let snapshot = gtk::Snapshot::new();
-        paintable.snapshot(&snapshot, w, h);
-        let node = snapshot.to_node().ok_or("the window drew nothing")?;
-        renderer.render_texture(&node, None).save_to_png(path).map_err(|e| e.to_string())
+        Self::shoot(&self.window, path)
     }
 
     pub fn toast(&mut self, text: &str) {

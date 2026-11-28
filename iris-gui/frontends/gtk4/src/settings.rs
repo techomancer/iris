@@ -70,11 +70,15 @@ impl Form {
                 finish(group, &row, enabled, tip.as_deref());
             }
             FieldKind::GroupedChoice { groups, selected } => {
-                // One flat list with the group in each label: GTK's combo row
-                // has no sections.
-                let options: Vec<String> =
-                    groups.iter().flat_map(|(title, v)| v.iter().map(move |o| format!("{title} — {o}"))).collect();
+                // GTK's combo row has no sections, so the groups become the
+                // rows' subtitles: the Mac's pop-up has Workstations and
+                // Servers as headings, and prefixing every label with its
+                // group just truncates the model's own name away.
+                let options: Vec<String> = groups.iter().flat_map(|(_, v)| v.clone()).collect();
                 let row = self.combo(f.id, &f.label, &options, *selected);
+                let of_group: Vec<String> =
+                    groups.iter().flat_map(|(title, v)| v.iter().map(move |_| title.clone())).collect();
+                row.set_subtitle(of_group.get(*selected).map(String::as_str).unwrap_or(""));
                 finish(group, &row, enabled, tip.as_deref());
             }
             FieldKind::Toggle(on) => {

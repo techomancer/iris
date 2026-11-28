@@ -545,6 +545,14 @@ fn script_step() {
                 }
             }
         });
+    } else if let Some(path) = step.strip_prefix("shotw:") {
+        // The window in front: a dialog or the browser, not the main one.
+        let front = APP.with(|a| a.borrow().as_ref().and_then(|app| app.active_window()));
+        match front.map(|w| crate::window::MainWindow::shoot(&w, path)) {
+            Some(Ok(())) => eprintln!("iris-gtk script: wrote {path}"),
+            Some(Err(e)) => eprintln!("iris-gtk script: no screenshot: {e}"),
+            None => eprintln!("iris-gtk script: no window in front"),
+        }
     } else if step == "quit" {
         dispatch(AppAction::RequestQuit);
     } else {

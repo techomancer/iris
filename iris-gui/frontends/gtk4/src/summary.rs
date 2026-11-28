@@ -88,6 +88,10 @@ pub const TAB_SWITCHER: &str = "summary.tab";
 fn screen(app: Option<&adw::Application>, o: &Overview) -> gtk::Widget {
     let backdrop = gtk::Box::new(gtk::Orientation::Vertical, 18);
     backdrop.add_css_class("iris-screen");
+    // Fills the page's width: inside an overlay a box keeps its natural
+    // width, which left the panel a narrow black band in the middle.
+    backdrop.set_hexpand(true);
+    backdrop.set_halign(gtk::Align::Fill);
     backdrop.set_height_request(260);
     backdrop.set_overflow(gtk::Overflow::Hidden);
 
@@ -120,22 +124,20 @@ fn screen(app: Option<&adw::Application>, o: &Overview) -> gtk::Widget {
             frame.upcast()
         }
         None => {
-            let art = icons::machine(o.icon, 110);
+            // As on the Mac: the machine's own picture stands in for the
+            // screen, with Power On over it.
+            let art = icons::machine(o.icon, 150);
             art.set_halign(gtk::Align::Center);
-            art.set_valign(gtk::Align::End);
+            art.set_valign(gtk::Align::Center);
             art.set_vexpand(true);
             art.add_css_class("iris-screen-art");
             backdrop.append(&art);
-            match button {
-                Some(button) => {
-                    button.set_margin_bottom(18);
-                    button.set_vexpand(true);
-                    button.set_valign(gtk::Align::Start);
-                    backdrop.append(&button);
-                }
-                None => art.set_valign(gtk::Align::Center),
+            let frame = gtk::Overlay::new();
+            frame.set_child(Some(&backdrop));
+            if let Some(button) = button {
+                frame.add_overlay(&button);
             }
-            backdrop.upcast()
+            frame.upcast()
         }
     }
 }
