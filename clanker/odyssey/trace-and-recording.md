@@ -25,8 +25,8 @@ Where the hooks are, and which thread writes:
 | `cpu` | `BoardLocks::taken`: every bus access that is not a command store, front registers included; a repeat of one (dir, offset, size, value) extends a run, closed by the next line of any class or a flush | processors |
 | `dma` | `Board::dma_descriptor`, once the header is read | board |
 
-The sink is a `Mutex<TraceSink>` behind `Board::trace` (an `Arc` the
-`BoardLocks` share). It is a leaf lock: nothing is taken while it is held,
+The sink is a `Mutex<TraceFile<CpuRun, 4>>` behind `Board::trace` (an
+`Arc` the `BoardLocks` share). It is a leaf lock: nothing is taken while it is held,
 so a hook can run on any thread. The display thread flushes it every frame,
 at most twice a second (`Odyssey::frame`); `vpro trace flush` forces it.
 

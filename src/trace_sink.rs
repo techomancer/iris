@@ -15,6 +15,50 @@ pub trait TraceRun {
     fn emit(&self, seq: u64, line: impl FnOnce(fmt::Arguments));
 }
 
+/// A run of CPU accesses to a board's registers and memories. A bulk region
+/// (a memory) collapses any offsets; a register only identical repeats.
+pub struct RegionRun {
+    write: bool,
+    kind: &'static str,
+    bulk: bool,
+    first: u32,
+    last: u32,
+    val: u64,
+    count: u64,
+    /// Names an offset.
+    detail: fn(u32) -> String,
+}
+
+impl RegionRun {
+    pub fn new(write: bool, (kind, bulk): (&'static str, bool), off: u32, val: u64, detail: fn(u32) -> String) -> Self {
+        Self { write, kind, bulk, first: off, last: off, val, count: 1, detail }
+    }
+}
+
+impl TraceRun for RegionRun {
+    fn merge(&mut self, n: &Self) -> bool {
+        let same = self.write == n.write && self.kind == n.kind && (n.bulk || (self.first == n.first && self.val == n.val));
+        if same {
+            self.count += 1;
+            self.last = n.first;
+            self.val = n.val;
+        }
+        same
+    }
+
+    fn emit(&self, seq: u64, line: impl FnOnce(fmt::Arguments)) {
+        let dir = if self.write { "wr" } else { "rd" };
+        let (first, count, val) = ((self.detail)(self.first), self.count, self.val);
+        if count == 1 {
+            line(format_args!("CPU #{seq:06} {dir} {first} = {val:#010x}"));
+        } else if self.bulk {
+            line(format_args!("CPU #{seq:06} {dir} {} x{count} ({first} .. {}) last={val:#010x}", self.kind, (self.detail)(self.last)));
+        } else {
+            line(format_args!("CPU #{seq:06} {dir} {first} = {val:#010x}  (x{count})"));
+        }
+    }
+}
+
 /// A board's trace state behind its lock: the file, the clock, one
 /// counter per line class and the pending collapsed run.
 pub struct TraceFile<R, const N: usize> {

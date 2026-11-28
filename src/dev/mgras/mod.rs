@@ -670,7 +670,7 @@ impl Mgras {
             addr_of_mut!((*p).timing_stale).write(AtomicBool::new(true));
             addr_of_mut!((*p).scan).write(Mutex::new(disp::Scan::new()));
             addr_of_mut!((*p).status).write(status);
-            addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new()));
+            addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new(["hq", "rss", "cpu"], 2)));
             a.assume_init()
         };
         let head: Arc<dyn crate::display::Head> = m.clone();
