@@ -7,7 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 
 use crate::dev::serial_dev::{SerialDeviceConfig, SerialKind};
-use crate::config::{MachineConfig, NvmeConfig, ScsiDeviceConfig, ScsiKind, Virtio9pConfig, VirtioSerialConfig};
+use crate::config::{GraphicsBoard, MachineConfig, NvmeConfig, ScsiDeviceConfig, ScsiKind, Virtio9pConfig, VirtioSerialConfig};
+use crate::dev::ng1::vc2_timings::NewportResolution;
 use crate::dev::ice1724::{Ice1724, Variant};
 use crate::dev::isp2200::{card::Loop, Isp2200};
 use crate::dev::nvme::Nvme;
@@ -35,10 +36,9 @@ pub enum DeviceModel {
     Ultra64,
     /// The bare-metal harness's console, dump and exit register.
     TestDevice(TestDeviceConfig),
-    /// A second Newport board, beside the one in the graphics slot.
-    Newport,
-    /// The machine's graphics board, which `[graphics] board` names; the entry says where it goes.
-    Graphics,
+    Board(BoardConfig),
+    /// `none`: the slot stays empty, with no default.
+    Empty,
     VirtioSerial(VirtioSerialConfig),
     Virtio9p(Virtio9pConfig),
     /// A device on a serial port: `hostserial`, `midi_synth` or `midi_raw`, by its kind.
@@ -59,6 +59,43 @@ pub struct TestDeviceConfig {
 impl TestDeviceConfig {
     pub fn run(&self) -> Result<crate::dev::testdev::RunConfig, String> {
         self.run_config.as_deref().map_or(Ok(crate::dev::testdev::RunConfig::ALL), |s| s.parse().map_err(|e| format!("run_config {s:?}: {e}")))
+    }
+}
+
+/// A graphics board's options; the entry's type is the family, `model` the board in it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoardConfig {
+    #[serde(default)]
+    pub model: GraphicsBoard,
+    #[serde(default = "one")]
+    pub raster_managers: u8,
+    #[serde(default)]
+    pub resolution: NewportResolution,
+    /// The pipe's flash EEPROM file, kept between runs; unset is volatile.
+    #[serde(default)]
+    pub flash: Option<String>,
+}
+
+fn one() -> u8 {
+    1
+}
+
+impl Default for BoardConfig {
+    fn default() -> Self {
+        BoardConfig { model: GraphicsBoard::default(), raster_managers: 1, resolution: NewportResolution::default(), flash: None }
+    }
+}
+
+impl BoardConfig {
+    pub fn new(model: GraphicsBoard) -> BoardConfig {
+        BoardConfig { model, ..Default::default() }
+    }
+
+    pub fn label(&self) -> String {
+        match self.model.kona() {
+            Some(_) => format!("{} ({} RM)", self.model.label(), self.raster_managers),
+            None => self.model.label().to_string(),
+        }
     }
 }
 
@@ -103,9 +140,12 @@ pub const DEVICE_TYPES: &[DeviceTypeSpec] = &[
         parse: |_, o| options::<TestDeviceConfig>(o).and_then(|c| c.run().map(|_| DeviceModel::TestDevice(c))),
         slots: None,
     },
-    DeviceTypeSpec { name: "newport", family: DeviceFamily::Gio, keys: &[], parse: |_, _| Ok(DeviceModel::Newport), slots: None },
-    // Where the board goes; which board it is stays a `[graphics]` setting.
-    DeviceTypeSpec { name: "graphics", family: DeviceFamily::Gfx, keys: &[], parse: |_, _| Ok(DeviceModel::Graphics), slots: None },
+    DeviceTypeSpec { name: "newport", family: DeviceFamily::Gfx, keys: &["resolution"], parse: board, slots: None },
+    DeviceTypeSpec { name: "express", family: DeviceFamily::Gfx, keys: &["model"], parse: board, slots: None },
+    DeviceTypeSpec { name: "impact", family: DeviceFamily::Gfx, keys: &["model"], parse: board, slots: None },
+    DeviceTypeSpec { name: "vpro", family: DeviceFamily::Gfx, keys: &["model"], parse: board, slots: None },
+    DeviceTypeSpec { name: "kona", family: DeviceFamily::Gfx, keys: &["model", "raster_managers", "flash"], parse: board, slots: None },
+    DeviceTypeSpec { name: "none", family: DeviceFamily::Empty, keys: &[], parse: |_, _| Ok(DeviceModel::Empty), slots: None },
     DeviceTypeSpec {
         name: "virtio_serial",
         family: DeviceFamily::Virtio,
@@ -126,6 +166,15 @@ pub const DEVICE_TYPES: &[DeviceTypeSpec] = &[
     DeviceTypeSpec { name: "midi_synth", family: DeviceFamily::Serial, keys: &["path", "gain"], parse: serial_device, slots: None },
     DeviceTypeSpec { name: "midi_raw", family: DeviceFamily::Serial, keys: &["path"], parse: serial_device, slots: None },
 ];
+
+fn board(t: &DeviceTypeSpec, opts: toml::Table) -> Result<DeviceModel, String> {
+    let b: BoardConfig = options(opts)?;
+    if b.model.family() != t.name {
+        let models: Vec<_> = GraphicsBoard::ALL.into_iter().filter(|m| m.family() == t.name).map(GraphicsBoard::as_str).collect();
+        return Err(format!("model must be one of {}", models.join(", ")));
+    }
+    Ok(DeviceModel::Board(b))
+}
 
 fn serial_device(t: &DeviceTypeSpec, opts: toml::Table) -> Result<DeviceModel, String> {
     let kind = SerialKind::from_name(t.name).expect("a serial type");
@@ -176,8 +225,8 @@ impl DeviceModel {
             DeviceModel::Qla2200 => "qla2200",
             DeviceModel::Ultra64 => "ultra64",
             DeviceModel::TestDevice(_) => "test_device",
-            DeviceModel::Newport => "newport",
-            DeviceModel::Graphics => "graphics",
+            DeviceModel::Board(b) => b.model.family(),
+            DeviceModel::Empty => "none",
             DeviceModel::VirtioSerial(_) => "virtio_serial",
             DeviceModel::Virtio9p(_) => "virtio_9p",
             DeviceModel::Serial(d) => d.kind.name(),
@@ -212,6 +261,7 @@ impl DeviceModel {
             DeviceModel::Scsi(ScsiDeviceConfig { path, .. }) | DeviceModel::Nvme(NvmeConfig { path, .. }) | DeviceModel::Serial(SerialDeviceConfig { path, .. }) if !path.is_empty() => {
                 format!("{} {path}", self.spec().name)
             }
+            DeviceModel::Board(b) if b.model != GraphicsBoard::Newport => format!("{} {}", self.spec().name, b.model),
             _ => self.spec().name.to_string(),
         }
     }
@@ -231,7 +281,8 @@ impl DeviceModel {
             DeviceModel::VirtioSerial(d) => changed(d, keys),
             DeviceModel::Virtio9p(d) => changed(d, keys),
             DeviceModel::Serial(d) => changed(d, keys),
-            DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Newport | DeviceModel::Graphics => toml::Table::new(),
+            DeviceModel::Board(b) => changed(b, keys),
+            DeviceModel::XioBoard(_) | DeviceModel::PciBridge | DeviceModel::Ice1724 | DeviceModel::Qla2200 | DeviceModel::Ultra64 | DeviceModel::Empty => toml::Table::new(),
         }
     }
 }
@@ -256,7 +307,14 @@ impl ConfiguredDevice {
             return Err(format!("{name} takes no key {key} (keys: type, name, at, {})", ty.keys.join(", ")));
         }
         let device = (ty.parse)(ty, t).map_err(|e| format!("{name}: {e}"))?;
+        if matches!(device, DeviceModel::Empty) && at.is_none() {
+            return Err("none: needs an at, the slot to leave empty".into());
+        }
         Ok(ConfiguredDevice { name: local, at, device, default: false })
+    }
+
+    pub fn names_graphics(&self, profile: crate::config::MachineProfile) -> bool {
+        matches!(self.device, DeviceModel::Board(_) | DeviceModel::Empty) && self.at.as_deref().is_none_or(|at| profile.is_graphics_slot(at))
     }
 
     /// The entry's keys in the order a file lists them: `type`, `name`, `at`, then the options.
@@ -526,6 +584,38 @@ mod tests {
         assert!(entry("type = \"hdd\"\ncontroller = 1").unwrap_err().contains("no key controller"));
         assert!(entry("type = \"floppy\"").unwrap_err().contains("types: hdd, cdrom, daynaport, pci_cage"));
         assert!(entry("at = \"scsi0/t1\"").unwrap_err().contains("needs a type"));
+    }
+
+    #[test]
+    fn a_board_is_its_family_with_a_model_and_round_trips() {
+        for (text, family, model) in [
+            ("type = \"vpro\"\nmodel = \"v12\"", "vpro", GraphicsBoard::V12),
+            ("type = \"impact\"\nmodel = \"maximpact\"", "impact", GraphicsBoard::MaxImpact),
+            ("type = \"express\"\nmodel = \"elan\"", "express", GraphicsBoard::Elan),
+            ("type = \"newport\"", "newport", GraphicsBoard::Newport),
+        ] {
+            let e = entry(text).unwrap();
+            assert_eq!(e.device.spec().name, family);
+            let DeviceModel::Board(b) = &e.device else { panic!("{text}") };
+            assert_eq!(b.model, model);
+            let back = ConfiguredDevice::from_table(toml::Table::try_from(&e).unwrap()).unwrap();
+            assert_eq!(back.device.summary(), e.device.summary());
+        }
+        let k = entry("type = \"kona\"\nmodel = \"ir2e\"\nraster_managers = 2\nflash = \"p.bin\"").unwrap();
+        let DeviceModel::Board(b) = &k.device else { panic!() };
+        assert_eq!((b.raster_managers, b.flash.as_deref()), (2, Some("p.bin")));
+        assert_eq!(toml::to_string(&k).unwrap(), "type = \"kona\"\nflash = \"p.bin\"\nmodel = \"ir2e\"\nraster_managers = 2\n");
+        assert!(entry("type = \"newport\"\nresolution = \"1280x1024\"").is_ok());
+    }
+
+    #[test]
+    fn a_board_needs_a_model_of_its_family_and_none_needs_a_slot() {
+        assert!(entry("type = \"vpro\"").unwrap_err().contains("model must be one of v6, v8, v10, v12"));
+        assert!(entry("type = \"vpro\"\nmodel = \"xz\"").unwrap_err().contains("model must be one of v6"));
+        assert!(entry("type = \"vpro\"\nmodel = \"v14\"").unwrap_err().contains("unknown graphics model"));
+        assert!(entry("type = \"vpro\"\nmodel = \"v12\"\nraster_managers = 2").unwrap_err().contains("vpro takes no key raster_managers"));
+        assert!(entry("type = \"newport\"\nmodel = \"newport\"").unwrap_err().contains("newport takes no key model"));
+        assert!(entry("type = \"none\"").unwrap_err().contains("none: needs an at"));
     }
 
     #[test]

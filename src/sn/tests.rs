@@ -417,7 +417,7 @@ fn a_machine_starts_its_board_devices_in_order_and_stops_them_in_reverse() {
     let dir = TempPath::dir("sn-device-order");
     let origin200 = crate::ip27::test_support::config(MachineProfile::Origin200Ip29, &dir, 1);
     let mut tezro = crate::ip35::test_support::tezro_config(&dir, 2);
-    tezro.graphics.board = Some(GraphicsBoard::V12);
+    tezro.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V12)));
     crate::display_stop_tests::big_stack(move || {
         let mut m = crate::ip27::test_support::machine(&origin200).unwrap();
         let watch = m.io.devices.last().unwrap().clone();

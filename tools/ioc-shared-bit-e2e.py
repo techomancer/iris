@@ -84,10 +84,6 @@ serial_log = "console.log"
 [machine]
 profile = "indigo2_ip22"
 
-[graphics]
-board = "newport"
-heads = 1
-
 [scsi.1]
 path = "blank.raw"
 overlay = true

@@ -147,7 +147,7 @@ fn loads(fixture: &str, profile: &str, prom_bytes: usize, banks: &str, older: Op
              monitor_port = 0\nserial_port_a = 0\nserial_port_b = 0\nscsi = {{}}\n\
              [machine]\nprofile = \"{profile}\"\ncache = \"{cache}\"\n{}",
             // Only the Octane has a graphics board to leave out.
-            if profile == "octane_ip30" { "[graphics]\nboard = \"none\"\n" } else { "" }
+            if profile == "octane_ip30" { "[[devices]]\ntype = \"none\"\nat = \"graphics\"\n" } else { "" }
         ),
     )
     .unwrap();

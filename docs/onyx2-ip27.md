@@ -3,11 +3,11 @@
 The Onyx2 deskside is one or two IP27 node boards on the 4P1G5 midplane. Both
 Hubs are hosts of the one Crossbow, which carries the BaseIO-G at widget 15 and
 the graphics slot at widget 8. Two nodes are joined by the direct cable. The
-machine runs on the IOC3's first serial port. With `[graphics] board = "none"`
-(the default) the graphics slot holds a test widget that answers its
-identification word and nothing else; with `"ir2"`, `"ir2:2rm"`, `"ir2e"` or `"ir2e:2rm"` it holds an
-InfiniteReality2 or 2E pipe with one or two raster managers (`src/dev/kona`), whose
-window is the machine's display. `[graphics] flash` names a file that keeps the
+machine runs on the IOC3's first serial port. With no graphics entry
+the graphics slot holds a test widget that answers its
+identification word and nothing else; a `kona` entry with `model = "ir2"` or `"ir2e"` puts an
+InfiniteReality2 or 2E pipe there, with `raster_managers` one or two (`src/dev/kona`), whose
+window is the machine's display. Its `flash` names a file that keeps the
 pipe's flash EEPROM between runs.
 
 ## Configuration

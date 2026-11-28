@@ -331,10 +331,10 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     } else {
         show_board_picker(ui, cfg, mem_ctx.running);
     }
-    if !o2 && !octane && cfg.graphics_board() == GraphicsBoard::Newport {
-        let mut dual = cfg.has_device("newport");
+    if !o2 && !octane && cfg.graphics_board() == Some(GraphicsBoard::Newport) {
+        let mut dual = cfg.dual_head();
         if ui.checkbox(&mut dual, t!("config-newport-heads")).changed() {
-            cfg.set_device("newport", dual);
+            cfg.set_dual_head(dual);
         }
         if dual {
             subtitle(ui, t!("config-newport-dual-subtitle"));
@@ -564,30 +564,30 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
         ui.label(t!("extra-gbe"));
         return;
     }
-    let before = cfg.graphics_board();
-    let mut choice = before;
+    let before = cfg.graphics_entry();
+    let mut picked = None;
     ui.horizontal(|ui| {
         ui.label(t!("config-graphics-board"));
         ui.add_enabled_ui(!running, |ui| {
             ComboBox::from_id_salt("graphics_board")
-                .selected_text(choice.label())
+                .selected_text(crate::extra_ui::board_label(&before))
                 .show_ui(ui, |ui| {
-                    for c in GraphicsBoard::ALL {
-                        if crate::extra_ui::board_supported(c, cfg.machine.profile) {
-                            ui.selectable_value(&mut choice, c, c.label());
+                    for c in crate::extra_ui::board_choices(cfg.machine.profile) {
+                        let same = c.as_ref().map(|b| (b.model, b.raster_managers)) == before.as_ref().map(|b| (b.model, b.raster_managers));
+                        if ui.selectable_label(same, crate::extra_ui::board_label(&c)).clicked() && !same {
+                            picked = Some(c);
                         }
                     }
                 });
         });
     });
-    // Every non-Newport choice is single-head with no VC2 presets;
-    // clear those so the config still passes `validate()`.
-    if choice != before {
-        cfg.graphics.board = Some(choice);
-        if choice != GraphicsBoard::Newport {
-            cfg.set_device("newport", false);
-            cfg.graphics.resolution = NewportResolution::Guest;
+    // A second head needs a Newport board; clear it so the config still passes `validate()`.
+    let choice = picked.clone().unwrap_or_else(|| before.clone());
+    if let Some(c) = picked {
+        if c.as_ref().map(|b| b.model) != Some(GraphicsBoard::Newport) {
+            cfg.set_dual_head(false);
         }
+        cfg.set_graphics(c);
     }
     if running {
         ui.label(
@@ -596,10 +596,11 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 .small(),
         );
     }
-    if matches!(choice, GraphicsBoard::Xz | GraphicsBoard::Extreme) {
+    let choice = choice.map(|b| b.model);
+    if matches!(choice, Some(GraphicsBoard::Xz | GraphicsBoard::Extreme)) {
         subtitle(ui, t!("config-graphics-gr2-subtitle"));
     }
-    if choice.is_impact() {
+    if choice.is_some_and(GraphicsBoard::is_impact) {
         subtitle(ui, if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
             t!("config-graphics-impact-ip28-subtitle")
         } else {
@@ -614,7 +615,8 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = crate::extra_ui::mc_machine(cfg.machine.profile) && cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
+    let board = cfg.graphics_entry().filter(|b| b.model == GraphicsBoard::Newport);
+    let newport = crate::extra_ui::mc_machine(cfg.machine.profile) && board.is_some() && !cfg.headless;
     ui.horizontal(|ui| {
         let label = ui.label(t!("config-resolution"));
         if !newport {
@@ -622,13 +624,18 @@ fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
             subtitle(ui, t!("config-resolution-newport-only-subtitle"));
             return;
         }
+        let mut board = board.expect("newport implies a board");
+        let before = board.resolution;
         ComboBox::from_id_salt("graphics_resolution")
-            .selected_text(cfg.graphics.resolution.label())
+            .selected_text(board.resolution.label())
             .show_ui(ui, |ui| {
                 for mode in NewportResolution::ALL {
-                    ui.selectable_value(&mut cfg.graphics.resolution, mode, mode.label());
+                    ui.selectable_value(&mut board.resolution, mode, mode.label());
                 }
             });
+        if board.resolution != before {
+            cfg.set_graphics(Some(board));
+        }
     });
     if newport {
         subtitle(ui, t!("config-resolution-subtitle"));

@@ -52,7 +52,7 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 With **Guest** display resolution, iris bootstraps **1280×1024** on fullhouse at Start so the GUI shows a framebuffer before IRIX programs VC2 (the PROM often delays or skips graphics initialisation on Indigo2-class hardware).
 
-7. Dual-head (`graphics.heads = 2`): guest `hinv` shows two XL boards; iris-gui shows side-by-side heads; CI `screenshot` accepts `"head": 0` or `1`
+7. Dual-head (a `newport` device entry at `gio0`): guest `hinv` shows two XL boards; iris-gui shows side-by-side heads; CI `screenshot` accepts `"head": 0` or `1`
 
 ## Headless smoke (CI)
 
@@ -88,11 +88,10 @@ Shared GIO interrupt lines (FIFO full, graphics, retrace) are latched in the IOC
 
 ## GR2 and IMPACT graphics
 
-Set `[graphics] board` to `xz`, `extreme`, `solidimpact`, `highimpact`, or
-`maximpact`. The GUI exposes the same choices in General. GR2 and IMPACT have
+Add a `[[devices]]` entry of type `express` (`model` `xz`, `elan` or `extreme`) or
+`impact` (`model` `solid`, `high` or `max`). The GUI exposes the same choices in General. GR2 and IMPACT have
 command interpreters, software rasterizers, and a display path; they are no
-longer preview stubs. Require `heads = 1` and `resolution = "guest"` for these
-boards. There is no separate `[impact]` section. See
+longer preview stubs. Neither takes a Newport resolution preset or a second head. There is no separate `[impact]` section. See
 [GR2 graphics](graphics/gr2-xz-extreme.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
 
 For the R10000 Indigo2 profile and larger RAM banks, see

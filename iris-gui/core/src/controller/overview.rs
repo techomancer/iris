@@ -91,7 +91,7 @@ impl AppController {
                     // The O2's display is built in; the board key does not apply.
                     t!("extra-gbe")
                 } else {
-                    cfg.graphics_board().label().to_string()
+                    crate::model::hardware::board_label(&cfg.graphics_entry())
                 },
                 note: String::new(),
                 target: None,

@@ -2,7 +2,7 @@
 //! `--cdromN` and the bare drive number live only here; the card flags keep their fields in `config.rs`.
 
 use super::*;
-use crate::devices::{ConfiguredDevice, DeviceModel, TestDeviceConfig};
+use crate::devices::{BoardConfig, ConfiguredDevice, DeviceModel, TestDeviceConfig};
 use crate::topology::{slots_take, DeviceFamily, DevicePlacement};
 
 /// The older `[ultra64]` section.
@@ -20,28 +20,17 @@ pub enum VirtioGioSlot {
     Exp1,
 }
 
-/// The older GIO flags (`[ultra64]`, `graphics.heads`, `test_device`) as
+/// The older GIO flags (`[ultra64]`, `test_device`) as
 /// `[[devices]]` entries in the slot they named, once the machine is known.
 pub(super) fn gio_cards(cfg: &mut MachineConfig) -> Result<(), String> {
-    if cfg.graphics.heads != 1 && cfg.graphics.heads != 2 {
-        return Err(format!("graphics.heads {} is invalid (valid: 1, 2)", cfg.graphics.heads));
-    }
     if cfg.test_device_run_config.is_some() && !cfg.test_device {
         return Err("test_device_run_config needs test_device".into());
     }
-    let slots = cfg.machine.profile.slots();
-    if !slots_take(&slots, DeviceFamily::Gio) {
-        return match cfg.graphics.heads == 2 {
-            true => Err(format!("graphics.heads = 2: the {} has no GIO slot for a second head", cfg.machine.profile.product_name().unwrap_or(cfg.machine.profile.label()))),
-            false => Ok(()),
-        };
+    if !slots_take(&cfg.machine.profile.slots(), DeviceFamily::Gio) {
+        return Ok(());
     }
     let mut cards: Vec<(&str, DeviceModel)> = Vec::new();
     let mut moved: Vec<&str> = Vec::new();
-    if cfg.graphics.heads == 2 && !cfg.headless {
-        cards.push(("gio0", DeviceModel::Newport));
-        moved.push("graphics.heads = 2 -> newport");
-    }
     if cfg.ultra64.enabled {
         cards.push(("gio0", DeviceModel::Ultra64));
         moved.push("[ultra64] -> ultra64");
@@ -51,7 +40,6 @@ pub(super) fn gio_cards(cfg: &mut MachineConfig) -> Result<(), String> {
         run.run()?;
         cards.push(("gio0", DeviceModel::TestDevice(run)));
     }
-    cfg.graphics.heads = 1;
     cfg.ultra64.enabled = false;
     (cfg.test_device, cfg.test_device_dump, cfg.test_device_run_config) = (false, None, None);
     cfg.devices.extend(cards.into_iter().map(|(at, d)| ConfiguredDevice::new(at, d)));
@@ -89,8 +77,8 @@ const DROPPED: &[(&str, &[&str], &str)] = &[
     ("fibre_channel", &[], "a `qla2200` [[devices]] entry, with its disks as `hdd` entries at CARD/lN"),
     ("audio_card", &[], "an `ice1724` [[devices]] entry"),
     ("audio", &["fuel", "tezro", "origin3200", "onyx3000"], "an `ice1724` [[devices]] entry"),
-    ("node", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
-    ("widget", &["graphics"], "the `at` of a `graphics` [[devices]] entry"),
+    ("node", &["graphics"], "the `at` of the board's [[devices]] entry"),
+    ("widget", &["graphics"], "the `at` of the board's [[devices]] entry"),
     ("bridge_slot", &[], "the `at` of the virtio [[devices]] entry"),
 ];
 
@@ -106,6 +94,69 @@ pub(super) fn name_replacement(e: toml::de::Error, text: &str) -> toml::de::Erro
         Some((key, _, instead)) => <toml::de::Error as serde::de::Error>::custom(format!("{e}\n`{key}` is no longer read: write {instead}")),
         None => e,
     }
+}
+
+/// The board an older `[graphics] board` name stands for and its raster managers; the inner none is `none`.
+fn old_board(name: &str) -> Option<Option<(GraphicsBoard, u8)>> {
+    let k = name.trim().to_ascii_lowercase().replace(['_', '-'], ":");
+    let k = k.strip_prefix("vpro:").unwrap_or(&k);
+    let (k, rms) = match (k.strip_suffix(":2rm"), k) {
+        (Some(k), _) => (k, 2),
+        (_, "ir2x2") => ("ir2", 2),
+        _ => (k.strip_suffix(":1rm").unwrap_or(k), 1),
+    };
+    let model = match k {
+        "none" => return Some(None),
+        "xl" => "newport",
+        "gr2" | "gr2:xz" => "xz",
+        "gr2:elan" => "elan",
+        "gr2:extreme" => "extreme",
+        "impact:solid" | "solid:impact" => "solid",
+        "impact:high" | "high:impact" => "high",
+        "impact:max" | "max:impact" | "maximum:impact" | "maximumimpact" => "max",
+        "infinitereality2" => "ir2",
+        "infinitereality3" => "ir3",
+        k => k,
+    };
+    Some(Some((model.parse().ok()?, rms)))
+}
+
+pub(crate) const GRAPHICS_MOVED: &str = "moved to [[devices]] entries (--device on the command line); see HELP.md \"Graphics boards\"";
+
+/// Refuse the old `[graphics]` board keys, or for the GUI that wrote them turn them into entries.
+pub(super) fn graphics(cfg: &mut MachineConfig, migrate: bool) -> Result<(), String> {
+    let impact = cfg.impact.take().and_then(|i| i.gfx).filter(|g| ["solid", "high", "max"].contains(&g.to_ascii_lowercase().as_str()));
+    let g = &mut cfg.graphics;
+    let from_impact = g.board.is_none() && impact.is_some();
+    let (board, heads, res, flash) = (g.board.take().or(impact), g.heads.take().filter(|&h| h != 1), g.resolution.take().filter(|r| !r.is_guest()), g.flash.take());
+    if board.is_none() && heads.is_none() && res.is_none() && flash.is_none() {
+        return Ok(());
+    }
+    // An `[impact]` section, which no older iris refused, still loads.
+    if !migrate && !from_impact {
+        return Err(format!("[graphics] board, heads, resolution and flash {GRAPHICS_MOVED}"));
+    }
+    if !matches!(heads, None | Some(2)) {
+        return Err("graphics.heads must be 1 or 2".into());
+    }
+    // What the GUI wrote for every machine: the machine's own board, or a board for a machine with no slot, is no entry.
+    let profile = cfg.machine.profile;
+    let default = profile.default_board().map(|m| (m, 1));
+    let named = board.as_deref().map(|b| old_board(b).ok_or_else(|| format!("[graphics] board \"{b}\" is not a graphics board"))).transpose()?;
+    let want = named.unwrap_or(default);
+    if want.is_none() && named.is_none() && (res.is_some() || flash.is_some()) {
+        return Err("[graphics] resolution and flash need a board".into());
+    }
+    if !profile.graphics_boards().is_empty() && (want != default || res.is_some() || flash.is_some()) {
+        cfg.devices.push(match want {
+            Some((model, raster_managers)) => ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::Board(BoardConfig { model, raster_managers, resolution: res.unwrap_or_default(), flash })) },
+            None => ConfiguredDevice::new("graphics", DeviceModel::Empty),
+        });
+    }
+    if heads.is_some() {
+        cfg.devices.push(ConfiguredDevice::new("gio0", DeviceModel::Board(BoardConfig { resolution: res.unwrap_or_default(), ..Default::default() })));
+    }
+    Ok(())
 }
 
 /// A bare drive id (`16 * controller + id`), the only way older versions
@@ -190,18 +241,6 @@ pub(super) fn fold(cfg: &mut MachineConfig) -> Result<(), String> {
         let forwards = std::mem::take(&mut cfg.o2.forwards);
         cfg.port_forward.extend(forwards);
         moved.push("o2.forwards -> [[port_forward]]");
-    }
-    if let Some(impact) = cfg.impact.take() {
-        let board = match impact.gfx.as_deref().map(str::to_ascii_lowercase).as_deref() {
-            Some("solid") => Some(GraphicsBoard::SolidImpact),
-            Some("high") => Some(GraphicsBoard::HighImpact),
-            Some("max") => Some(GraphicsBoard::MaxImpact),
-            _ => None,
-        };
-        if let Some(board) = board {
-            if cfg.graphics.board.is_none() { cfg.graphics.board = Some(board); }
-            eprintln!("iris: deprecated [impact] gfx folded into [graphics] board = \"{}\"; move it in the config to silence this", board.as_str());
-        }
     }
     if !moved.is_empty() {
         eprintln!(
@@ -454,17 +493,56 @@ mod tests {
         assert_eq!(cfg.validate().unwrap_err(), e);
         let mut cfg = MachineConfig::from_toml_str("test_device = true\n[graphics]\nheads = 2\n").unwrap();
         assert!(cfg.resolve_slots().unwrap_err().contains("gio0 is taken by the newport"));
-        // Without a window there is no second head to take the slot.
-        let mut cfg = MachineConfig::from_toml_str("test_device = true\nheadless = true\n[graphics]\nheads = 2\n").unwrap();
-        cfg.resolve_slots().unwrap();
+    }
+
+    /// The GUI's reader turns the old keys into entries; `heads = 1` and `resolution = "guest"` are no keys.
+    #[test]
+    fn the_older_graphics_keys_are_refused_and_the_gui_reads_them_as_entries() {
+        for (text, entry) in [
+            ("[graphics]\nboard = \"ir2:2rm\"\n", "[[devices]]\ntype = \"kona\"\nmodel = \"ir2\"\nraster_managers = 2\n"),
+            ("[graphics]\nboard = \"v12\"\n", "[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n"),
+            ("[graphics]\nboard = \"solidimpact\"\n", "[[devices]]\ntype = \"impact\"\nmodel = \"solid\"\n"),
+            ("[graphics]\nboard = \"xz\"\n", "[[devices]]\ntype = \"express\"\nmodel = \"xz\"\n"),
+            ("[graphics]\nboard = \"none\"\n", "[[devices]]\ntype = \"none\"\nat = \"graphics\"\n"),
+            ("[graphics]\nheads = 2\n", "[[devices]]\ntype = \"newport\"\nat = \"gio0\"\n"),
+            ("[graphics]\nresolution = \"1024x768\"\n", "[[devices]]\ntype = \"newport\"\nresolution = \"1024x768\"\n"),
+            ("[machine]\nprofile = \"onyx2_ip27\"\n[graphics]\nboard = \"ir2\"\nflash = \"p.bin\"\n", "[[devices]]\ntype = \"kona\"\nflash = \"p.bin\"\nmodel = \"ir2\"\n"),
+        ] {
+            let e = MachineConfig::parse_toml(text).unwrap_err().to_string();
+            assert!(e.contains("moved to [[devices]] entries") && e.contains("HELP.md"), "{text}:\n{e}");
+            let cfg = MachineConfig::from_toml_str(text).unwrap();
+            let entries: String = cfg.devices.iter().filter(|d| matches!(d.device, DeviceModel::Board(_) | DeviceModel::Empty)).map(|d| format!("[[devices]]\n{}", toml::to_string(d).unwrap())).collect();
+            assert!(entries.contains(entry), "{text}:\n{entries}");
+        }
+        let defaults = "[graphics]\nheads = 1\nresolution = \"guest\"\n";
+        assert!(MachineConfig::parse_toml(defaults).unwrap().devices.iter().all(|d| !matches!(d.device, DeviceModel::Board(_))));
+        assert!(MachineConfig::from_toml_str("[graphics]\nboard = \"v14\"\n").unwrap_err().to_string().contains("not a graphics board"));
+    }
+
+    /// What the GUI wrote for every machine still loads: its own default board or a board for a machine with no slot is no
+    /// entry, `flash` alone belongs on the default board, and a V12 with one C-brick goes on the I-brick.
+    #[test]
+    fn the_guis_saved_boards_load_on_every_machine() {
+        let load = |profile: &str, graphics: &str| MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"{profile}\"\n[graphics]\n{graphics}")).unwrap();
+        for (profile, board) in [("o2_ip32", "newport"), ("origin200_ip29", "none"), ("origin2000_ip27", "none"), ("origin3200_ip35", "none"), ("indy_ip24", "newport"), ("octane_ip30", "solidimpact")] {
+            let cfg = load(profile, &format!("board = \"{board}\"\nheads = 1\nresolution = \"guest\"\n"));
+            assert!(cfg.devices.iter().all(|d| !matches!(d.device, DeviceModel::Board(_) | DeviceModel::Empty)), "{profile}");
+            DevicePlacement::new(&cfg).unwrap_or_else(|e| panic!("{profile}: {e}"));
+        }
+        let kona = load("onyx3000_ip35", "flash = \"p.bin\"\n").graphics_entry().unwrap();
+        assert_eq!((kona.model, kona.flash.as_deref()), (GraphicsBoard::Ir3, Some("p.bin")));
+        let cfg = MachineConfig::from_toml_str("[machine]\nprofile = \"onyx3000_ip35\"\nnodes = 1\n[graphics]\nboard = \"v12\"\n").unwrap();
+        assert_eq!(DevicePlacement::new(&cfg).unwrap().graphics().map(|at| at.to_string()).as_deref(), Some("xio11"));
+        for name in ["xl", "gr2_xz", "vpro:v12", "impact:solid", "ir2x2", "maximumimpact"] {
+            assert!(MachineConfig::from_toml_str(&format!("[graphics]\nboard = \"{name}\"\n")).is_ok(), "{name}");
+        }
     }
 
     #[test]
     fn a_machine_without_gio_slots_refuses_a_second_head() {
         let octane = "[machine]\nprofile = \"octane_ip30\"\n";
         let mut cfg = MachineConfig::from_toml_str(&format!("{octane}[graphics]\nheads = 2\n")).unwrap();
-        assert!(cfg.resolve_slots().unwrap_err().contains("no GIO slot"));
-        let mut three = MachineConfig::from_toml_str("[graphics]\nheads = 3\n").unwrap();
-        assert!(three.resolve_slots().unwrap_err().contains("heads 3 is invalid"));
+        assert!(cfg.resolve_slots().unwrap_err().contains("has no slot gio0"));
+        assert!(MachineConfig::from_toml_str("[graphics]\nheads = 3\n").unwrap_err().to_string().contains("heads must be 1 or 2"));
     }
 }

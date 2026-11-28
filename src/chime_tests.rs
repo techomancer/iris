@@ -109,7 +109,7 @@ fn o2_mace_chime() {
 // With the graphics board off the PROM stops at a keypress prompt.
 #[test]
 fn octane_rad1_chime() {
-    let (rate, frames) = boot(MachineProfile::OctaneIp30, "r10000", 4000, |c| c.graphics.board = Some(GraphicsBoard::None));
+    let (rate, frames) = boot(MachineProfile::OctaneIp30, "r10000", 4000, |c| c.set_graphics(None));
     check(rate, 32000, &frames, "12:37 12:52 12:52 12:52 12:76 13:76 12:52 12:52 12:52 12:60 12:60 12:55 12:55 12:55 12:55 11:60 10:60 8:60 6:60");
 }
 

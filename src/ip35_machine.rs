@@ -328,12 +328,20 @@ pub(crate) const VPRO_WIDGET: u8 = 8;
 /// C-brick's.
 const V_BRICK: AttachedBrick = AttachedBrick { bay: 11, type_code: b'X' as u32, graphics_bay: None };
 
-/// Where the Onyx 3000's graphics board can go: the I-brick's port B on the first C-brick, or a
-/// free port of a graphics brick's XBridge on the second.
+/// With no slot named a V12 takes the V-brick's port, else the I-brick's, and a pipe the I-brick's; the other boards need the slot named.
 fn graphics_slots(s: &mut Vec<crate::topology::MachineSlot>) {
-    crate::topology::open_slot(s, &format!("xio{PIPE_WIDGET}"), &[DeviceFamily::Gfx], &[]);
-    for widget in (8..HEAD_E).filter(|&w| w != HOST_WIDGET) {
-        crate::topology::open_slot(s, &format!("node1/xio{widget}"), &[DeviceFamily::Gfx], &[]);
+    use crate::config::GraphicsBoard::{Ir3, V12};
+    let at = format!("node1/xio{VPRO_WIDGET}");
+    crate::topology::open_slot(s, &at, &[DeviceFamily::Gfx], &[]);
+    crate::topology::boards(s, &at, &[V12], None);
+    crate::topology::named_boards(s, &at, &[Ir3]);
+    let at = format!("xio{PIPE_WIDGET}");
+    crate::topology::open_slot(s, &at, &[DeviceFamily::Gfx], &["graphics"]);
+    crate::topology::boards(s, &at, &[Ir3, V12], Some(Ir3));
+    for widget in (8..HEAD_E).filter(|&w| w != HOST_WIDGET && w != VPRO_WIDGET) {
+        let at = format!("node1/xio{widget}");
+        crate::topology::open_slot(s, &at, &[DeviceFamily::Gfx], &[]);
+        crate::topology::named_boards(s, &at, &[Ir3, V12]);
     }
 }
 
@@ -350,14 +358,8 @@ pub(crate) fn graphics_port(cfg: &MachineConfig) -> Result<GraphicsPort, String>
     let (node, widget) = at.and_then(|at| at.xio_port()).unwrap_or((0, PIPE_WIDGET));
     match usize::from(node) < cfg.c_bricks() {
         true => Ok(GraphicsPort { node: node.into(), widget }),
-        false => Err(format!("graphics at node{node}: the machine has {} C-brick(s), numbered from 0", cfg.c_bricks())),
+        false => Err(format!("graphics at node{node}: the machine has {} C-brick(s), numbered from 0; the I-brick's port is `at = \"graphics\"`", cfg.c_bricks())),
     }
-}
-
-/// Where a V12 goes when none is named: a V-brick of its own on the last C-brick, when there is a
-/// second.
-pub(crate) fn default_at(cfg: &MachineConfig) -> Option<String> {
-    (cfg.graphics_board().is_vpro() && cfg.c_bricks() > 1).then(|| format!("node{}/xio{VPRO_WIDGET}", cfg.c_bricks() - 1))
 }
 
 /// The machine's one or two C-bricks. The first has the I-brick. On the Onyx 3000 the C-brick the
@@ -371,7 +373,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let graphics = AttachedBrick { graphics_bay: Some(G_BRICK_BAY), ..I_BRICK };
     if graphics_port(cfg)?.node == 0 {
         c_bricks(cfg, count, graphics, None)
-    } else if cfg.graphics_board().is_vpro() {
+    } else if cfg.graphics_board().is_some_and(|b| b.is_vpro()) {
         c_bricks(cfg, count, I_BRICK, Some(V_BRICK))
     } else {
         c_bricks(cfg, count, I_BRICK, Some(AttachedBrick { graphics_bay: Some(G_BRICK_BAY), ..V_BRICK }))
@@ -428,9 +430,10 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
     // What a link reset of the board's port does, what a machine reset does, and the board's
     // entries in the machine's lists.
     type Hook = Arc<dyn Fn() + Send + Sync>;
-    let (link_reset, power_on, fit): (Hook, Hook, Box<dyn FnOnce(&mut BoardIo)>) = if cfg.graphics_board().is_vpro() {
+    let board = cfg.graphics_entry().ok_or("the Onyx 3000 needs a graphics board")?;
+    let (link_reset, power_on, attach_board): (Hook, Hook, Box<dyn FnOnce(&mut BoardIo)>) = if board.model.is_vpro() {
         let vpro = attach_vpro(cfg, bedrock, widget, bedrock.interrupt_sender(widget, None), &status, |vpro| Ok(bridge.attach_widget(widget, vpro)))?;
-        eprintln!("iris: {} at widget {widget} of {brick}", cfg.graphics_board().label());
+        eprintln!("iris: {} at widget {widget} of {brick}", board.label());
         // A link reset of the V12's port resets the board behind it.
         let (weak, reset) = (Arc::downgrade(&vpro), vpro.clone());
         (
@@ -447,11 +450,8 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
             }),
         )
     } else {
-        let (product, rm_count) = cfg
-            .graphics_board()
-            .kona()
-            .ok_or_else(|| format!("graphics.board \"{}\" is not a board of the Onyx 3000", cfg.graphics_board().as_str()))?;
-        let pipe = attach_ir3(bedrock, &bridge, cfg, KonaConfig::new(product, rm_count)?, &status, widget)?;
+        let product = board.model.kona().ok_or_else(|| format!("{} is not a board of the Onyx 3000", board.model))?;
+        let pipe = attach_ir3(bedrock, &bridge, cfg, KonaConfig::new(product, board.raster_managers.into())?, &board, &status, widget)?;
         eprintln!("iris: {} on the G-brick at widget {widget} of {brick}", product.spec().label);
         // A link reset of the pipe's port resets the widget's Crosstalk registers, not the board.
         let (weak, reset) = (Arc::downgrade(&pipe), pipe.clone());
@@ -481,7 +481,7 @@ fn build_bricks(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>], l1s: &
         bridge.register_locks();
         build_baseio(cfg, l1s, &xbridge, timers, clock, heartbeat, |_| {})?
     };
-    fit(&mut io);
+    attach_board(&mut io);
     io.status = Some(status);
     let base_reset = std::mem::replace(&mut io.reset, Box::new(|| {}));
     let own_bridge = (!on_ibrick).then_some(bridge);
@@ -503,11 +503,12 @@ fn attach_ir3(
     xbridge: &Arc<XBridge>,
     cfg: &MachineConfig,
     kona: KonaConfig,
+    board: &crate::devices::BoardConfig,
     status: &Arc<crate::status::MachineStatus>,
     widget: u8,
 ) -> Result<Arc<Kona>, String> {
     let kona = kona.with_host_widget(HOST_WIDGET)?.with_widget(widget)?.with_pool(cfg.graphics.threads, cfg.graphics.tile);
-    let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
+    let flash = board.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
     // Its interrupt packets are the chip's inbound writes from that widget, to
     // the address the driver programmed.
     let pipe = Kona::new(kona, bedrock.inbound(widget), bedrock.inbound(widget), status.clone(), flash)?;

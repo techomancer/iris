@@ -25,10 +25,9 @@ banks = [512, 512, 0, 0]
 profile = "indigo2_ip28"
 cpu = "r10000"
 
-[graphics]
-board = "highimpact"       # also solidimpact or maximpact
-heads = 1
-resolution = "guest"
+[[devices]]
+type  = "impact"
+model = "high"             # also solid or max
 
 [[devices]]
 type = "hdd"
@@ -68,8 +67,8 @@ defaults, including a boot-tune volume; existing settings are retained. See
 
 IMPACT uses HQ3/GE11 command interpretation, RSS software rasterization, TE1
 texturing, and VC3/XMAP/colormap/DAC display composition. The GUI and CLI use
-the same `GfxDisplay` interface. Select Solid, High, or Maximum through
-`[graphics] board`; there is no separate `[impact]` config section. The model
+the same `GfxDisplay` interface. Select Solid, High, or Maximum with the
+`model` of an `impact` device entry; there is no separate `[impact]` config section. The model
 defaults to 1280×1024 before the guest programs VC3; scanout then follows the
 guest's timing and DID tables, backed by 2048×2048 raster storage. Newport
 resolution presets and dual-head mode do not apply. IMPACT board state is not

@@ -61,7 +61,7 @@ machine; a power down turns it off.
 
 ## Graphics
 
-`[graphics] board = "v12"` (or `"v10"`) fits a VPro board in the graphics
+A `vpro` device entry with `model = "v12"` (or `"v10"`) puts a VPro board in the graphics
 slot, crossbar widget 13: a Fuel IRIX inventory lists its board under
 xtalk/13, and Fuels have been reported with both the V12 and the V10. It is
 the Octane's VPro model. Its interrupt packets reach Bedrock as the PCI

@@ -267,7 +267,7 @@ toast-nat-subnet-next-start = NAT subnet set to { $network }. It takes effect th
 
 fb-waiting = Waiting for the display…
 fb-head-waiting = Waiting…
-# $head is the screen number, starting at 0.
+# $head is the screen number, starting at 1.
 fb-head = Head { $head }
 fb-powered-off = Powered off
 toast-guest-halted = IRIX halted. Mouse and keyboard released; click the display to capture them again.

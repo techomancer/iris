@@ -154,6 +154,7 @@ pub const CPUS: &[&Part] = &[&parts::R5000_180, &parts::R10000_250, &parts::R120
 /// The O2's slots.
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
     crate::topology::pci_bus_slots(s, "pci0", "O2 system board", crate::ip32::PCI0_SLOTS);
+    crate::topology::fixed_slot(s, "gbe", "CRIME/GBE", &["graphics"]);
 }
 
 
@@ -703,7 +704,7 @@ impl Workstation for O2Machine {
     fn lifecycle(&self) -> crate::machine_state::GuestState { self.lifecycle }
     fn set_lifecycle(&mut self, state: crate::machine_state::GuestState) { self.lifecycle = state; }
 
-    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Some(O2Machine::get_display(self)) }
+    fn display(&self, n: usize) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { (n == 0).then(|| O2Machine::get_display(self)) }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { O2Machine::get_ps2(self) }
     fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_timer_manager(&self) -> Arc<TimerManager> { O2Machine::get_timer_manager(self) }
@@ -1117,7 +1118,7 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
 #[cfg(test)]
 mod drop_tests {
     use super::*;
-    use crate::config::{GraphicsBoard, MachineProfile};
+    use crate::config::MachineProfile;
     use crate::display_stop_tests::{big_stack, config, scratch};
     use crate::workstation::Workstation;
 
@@ -1126,7 +1127,7 @@ mod drop_tests {
     #[test]
     fn a_dropped_o2_frees_its_bus_and_decode_table() {
         let dir = scratch("o2-drop");
-        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let cfg = config(&dir, MachineProfile::O2Ip32, None);
         let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
         let phys = Arc::downgrade(&machine.bus.phys);
         drop(machine);
@@ -1141,7 +1142,7 @@ mod drop_tests {
     #[test]
     fn the_installer_prom_image_fills_the_flash_and_a_short_raw_one_is_refused() {
         let dir = scratch("o2-installer-prom");
-        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let cfg = config(&dir, MachineProfile::O2Ip32, None);
         let mut image = vec![0u8; 0x100];
         image[..4].copy_from_slice(b"PROM");
         image[12..16].copy_from_slice(&0x1000u32.to_be_bytes());
@@ -1165,7 +1166,7 @@ mod drop_tests {
     #[test]
     fn rtc_save_writes_the_flash_to_the_nvram_file() {
         let dir = scratch("o2-save-nvram");
-        let cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let cfg = config(&dir, MachineProfile::O2Ip32, None);
         let nvram = std::path::PathBuf::from(&cfg.nvram);
         let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
         assert!(!nvram.exists());
@@ -1199,7 +1200,7 @@ mod drop_tests {
         let dir = std::path::PathBuf::from(dir);
         let disk = dir.join("disk.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
-        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, None);
         cfg.set_disk(1, crate::config::ScsiDeviceConfig {
             path: disk.to_string_lossy().into_owned(), overlay: true, ..Default::default()
         });
@@ -1257,7 +1258,7 @@ mod drop_tests {
         let dir = scratch("o2-nvme");
         let disk = dir.join("nvme.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
-        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, None);
         let card = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, ..Default::default() };
         cfg.devices.push(crate::devices::ConfiguredDevice::new("pci_slot", crate::devices::DeviceModel::Nvme(card)));
         let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
@@ -1273,7 +1274,7 @@ mod drop_tests {
     #[test]
     fn an_audio_card_takes_the_option_slot() {
         let dir = scratch("o2-audio");
-        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, None);
         cfg.no_audio = true;
         cfg.devices.push(crate::devices::ConfiguredDevice::from_table(toml::from_str("type = \"ice1724\"").unwrap()).unwrap());
         let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
@@ -1291,7 +1292,7 @@ mod drop_tests {
         let dir = scratch("o2-bar-drop");
         let disk = dir.join("nvme.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
-        let mut cfg = config(&dir, MachineProfile::O2Ip32, GraphicsBoard::Newport);
+        let mut cfg = config(&dir, MachineProfile::O2Ip32, None);
         let card = crate::config::NvmeConfig { path: disk.to_string_lossy().into_owned(), overlay: true, ..Default::default() };
         cfg.devices.push(crate::devices::ConfiguredDevice::new("pci_slot", crate::devices::DeviceModel::Nvme(card)));
         let machine = big_stack(move || O2Machine::new(&cfg).expect("O2"));
