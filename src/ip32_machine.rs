@@ -216,6 +216,8 @@ impl O2Machine {
             rtc_offset: cfg.rtc_offset,
         };
         let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::cpu_or_host()));
+        // CRIME's engine and the AIC-7880 run inline where the build counts, which needs a counting manager.
+        debug_assert!(!crate::clock::COUNTING || timer_manager.clock().is_counting());
         let bus = Ip32Bus::with_options(mem, prom, opts, &timer_manager);
         // On a counting clock the service pass runs from the timers, on the CPU's instructions.
         if timer_manager.clock().is_counting() {

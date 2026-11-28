@@ -714,6 +714,10 @@ impl crate::traits::Device for Aic7880 {
         if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
+        // A counting clock has no worker: `kick` does the work in the access that raised it.
+        if crate::clock::COUNTING {
+            return;
+        }
         let me = self.me.clone();
         *worker = Some(
             std::thread::Builder::new()
@@ -1339,7 +1343,7 @@ impl Aic7880 {
     /// Tell the sequencer there may be work: wake the worker, or, with no
     /// worker running (unit tests, the harness), do the work here.
     fn kick(&self) {
-        if self.running.load(Ordering::Acquire) {
+        if self.running.load(Ordering::Acquire) && !crate::clock::COUNTING {
             if let Some(w) = self.worker.lock().unwrap().as_ref() {
                 w.thread().unpark();
             }

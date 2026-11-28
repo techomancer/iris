@@ -118,6 +118,8 @@ fn stop_as(name: &str, mut machine: Box<dyn Workstation>, last: bool) -> Option<
     finished.recv_timeout(BOUND).ok()
 }
 
+// A ci_clock machine's CPU draws the frames, so one that never started presents none.
+#[cfg(not(feature = "ci_clock"))]
 #[test]
 fn stopping_from_the_main_thread_never_waits_on_the_renderer() {
     let dir = scratch("main-thread");

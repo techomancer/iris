@@ -1263,13 +1263,17 @@ impl Default for Rex3Config {
     }
 }
 
+/// How long a DCB command holds BACKBUSY up, in nanoseconds of the head's clock.
+const BACKBUSY_NS: u64 = 1_000_000;
+
 #[derive(Debug)]
 pub struct Rex3DcbState {
     pub dcbmode: u32,
     pub dcbdata0: u32,
     pub dcbdata1: u32,
-    /// Set by DCB addr=12 write/read. Read during STATUS read (CPU thread only — same thread as DCB).
-    pub backbusy_until: Option<std::time::Instant>,
+    /// Set by DCB addr=12 write/read, as `head.now_ns()` plus `BACKBUSY_NS`. Read during STATUS
+    /// read (CPU thread only — same thread as DCB).
+    pub backbusy_until: Option<u64>,
 }
 
 impl Rex3DcbState {
@@ -2842,7 +2846,7 @@ impl Rex3 {
                 }
             }
             12 => {
-                dcb.backbusy_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
+                dcb.backbusy_until = Some(self.head.now_ns() + BACKBUSY_NS);
                 drop(dcb);
                 self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
                 return;
@@ -2917,7 +2921,7 @@ impl Rex3 {
                 }
             }
             12 => {
-                dcb.backbusy_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
+                dcb.backbusy_until = Some(self.head.now_ns() + BACKBUSY_NS);
                 drop(dcb);
                 self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
                 return 0;
@@ -3001,6 +3005,14 @@ impl Rex3 {
     // get subtly wrong.
 
     fn wake_gfifo_processor(&self) {
+        // A started REX3 on a counting clock has no processor thread: the write runs its loop
+        // until the GFIFO is empty.
+        if crate::clock::COUNTING {
+            if self.running.load(Ordering::Relaxed) {
+                self.register_processor();
+            }
+            return;
+        }
         if !self.processor_parked.load(Ordering::Acquire) {
             return;
         }
@@ -3324,7 +3336,7 @@ impl Rex3 {
                         self.flush_resident_if_due();
                     }
                 }
-            } else if !lingered {
+            } else if !lingered && !crate::clock::COUNTING {
                 // Linger before going idle. A consumer that keeps pace with
                 // the producer reads the tail and each slot just after the
                 // producer writes them, so every push pays a cache-line
@@ -3357,6 +3369,9 @@ impl Rex3 {
                     //self.update_gfifo_irqs();
                 }
                 self.gfifo.flush_head();
+                if crate::clock::COUNTING {
+                    return;
+                }
                 // Nothing in the ring — back off. Spin-hint/yield while a burst
                 // might still be in flight; once emptiness is *sustained*
                 // (crossbeam's backoff completes), stop burning a host core on
@@ -4386,10 +4401,13 @@ impl Device for Rex3 {
         // arguments the compiled shader does instead of a `&Rex3`.
         unsafe { (*self.context.get()).host = rex3 as *const Rex3; }
 
-        *self.processor_thread.lock() = Some(thread::Builder::new().name(self.tag("REX3-Processor")).spawn(move || {
-            crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Processor);
-            rex3.register_processor()
-        }).unwrap());
+        // A counting clock has no processor thread: a push runs `register_processor` itself.
+        if !crate::clock::COUNTING {
+            *self.processor_thread.lock() = Some(thread::Builder::new().name(self.tag("REX3-Processor")).spawn(move || {
+                crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Processor);
+                rex3.register_processor()
+            }).unwrap());
+        }
 
         let shim = self.head_shim.get_or_init(|| Arc::new(Rex3Head(rex3)));
         let head: Arc<dyn crate::display::Head> = shim.clone();
@@ -4979,7 +4997,7 @@ impl Rex3 {
                     }
                     let dcb = self.dcb.lock();
                     if let Some(until) = dcb.backbusy_until {
-                        if std::time::Instant::now() < until { val |= STATUS_BACKBUSY; }
+                        if self.head.now_ns() < until { val |= STATUS_BACKBUSY; }
                     }
                 }
                 BusRead32::ok(val & 0xFFFFF)

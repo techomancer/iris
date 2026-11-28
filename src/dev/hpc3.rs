@@ -378,7 +378,8 @@ struct PdmaChannel {
     cbp_log_t0: Option<std::time::Instant>,
     /// Device reads when the guest last read CBP, and when.
     reads_at_poll: u64,
-    last_poll: Option<std::time::Instant>,
+    last_poll: Option<u64>,
+    clock: crate::clock::Clock,
     cbp: u32,
     nbdp: u32,
     bc: u32,
@@ -448,6 +449,7 @@ impl PdmaChannel {
             cbp_log_t0: None,
             reads_at_poll: 0,
             last_poll: None,
+            clock: crate::clock::Clock::new(),
             width_16: false,
             crbdp: 0, cpfxbdp: 0, ppfxbdp: 0, tx_new_packet: true, rx_filled: std::collections::VecDeque::new(), last_rx_ctrl: 0xFFFFFFFF,
         }
@@ -876,11 +878,9 @@ impl DmaClient for PdmaClientImpl {
     fn read_ahead_of_poll(&self) -> Option<u64> {
         let c = self.channel.lock();
         // A guest that has not read CBP for a while is not steering by it.
-        match c.last_poll {
-            Some(t) if t.elapsed() < std::time::Duration::from_millis(50) =>
-                Some(c.dev_reads.saturating_sub(c.reads_at_poll)),
-            _ => None,
-        }
+        const WINDOW_NS: u64 = 50_000_000;
+        let recent = c.last_poll.is_some_and(|t| c.clock.now().saturating_sub(t) < WINDOW_NS);
+        recent.then(|| c.dev_reads.saturating_sub(c.reads_at_poll))
     }
     fn write(&self, val: u32, eop: bool) -> DmaStatus {
         self.channel.lock().dma_write(val, eop)
@@ -929,7 +929,7 @@ impl PdmaChannelOps for PbusDmaOps {
             HPC3_PDMA_CBP => {
                 chan.cbp_polls += 1;
                 chan.reads_at_poll = chan.dev_reads;
-                chan.last_poll = Some(std::time::Instant::now());
+                chan.last_poll = Some(chan.clock.now());
                 let t0 = *chan.cbp_log_t0.get_or_insert_with(std::time::Instant::now);
                 if chan.cbp_log.len() == 64 { chan.cbp_log.pop_front(); }
                 let entry = (t0.elapsed().as_micros() as u64, chan.cbp, chan.dev_reads * 4);
@@ -1309,6 +1309,7 @@ impl Hpc3 {
         let mut dma_clients: Vec<Arc<dyn DmaClient>> = Vec::new();
         for i in 0..12 {
             let mut chan = PdmaChannel::new(i, pdma_dump.clone());
+            chan.clock = tm.clock().clone();
             if i == HPC3_PDMA_CHAN_SCSI0 as usize || i == HPC3_PDMA_CHAN_SCSI1 as usize {
                 chan.active_mask = SCSI_CTRL_ACTIVE; // 0x10 for SCSI
             } else if i == HPC3_PDMA_CHAN_ENET_RX as usize || i == HPC3_PDMA_CHAN_ENET_TX as usize {
@@ -2476,6 +2477,21 @@ impl Saveable for Hpc3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-ahead cap's 50 ms window is machine time: host time neither ends it nor keeps it open.
+    #[test]
+    fn the_dma_read_ahead_window_is_machine_time() {
+        let clock = crate::clock::Clock::stepped();
+        let channel = Arc::new(Mutex::new(PdmaChannel::new(0, Arc::new(AtomicU32::new(0)))));
+        channel.lock().clock = clock.clone();
+        let client = PdmaClientImpl::new(channel.clone());
+        assert_eq!(client.read_ahead_of_poll(), None, "never polled");
+        channel.lock().last_poll = Some(clock.now());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(client.read_ahead_of_poll().is_some(), "host time does not end the window");
+        clock.step(51_000_000);
+        assert_eq!(client.read_ahead_of_poll(), None);
+    }
 
     /// INTSTAT as a controller: each SCSI channel's chip and DMA bits are
     /// ORed onto its IOC line; a chip-INT ack also settles the paired PDMA

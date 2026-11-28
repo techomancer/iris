@@ -13,6 +13,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Repeatable runs with `ci_clock`
+
+- On the Indy and the O2, a `ci_clock` build now runs the timers, the display
+  refresh and the device engines (MC DMA, REX3, CRIME's engine, both SCSI
+  controllers) on CPU 0's instructions, so two runs of one PROM give the same
+  serial output, flash or NVRAM, screen and monitor state. Every battery clock
+  starts at 2026-01-01.
+- Sound follows machine time there, so a chime takes about ten times the
+  guest instructions it does on host time: `chime_tests` is slow under
+  `ci_clock` (about 110 s for the O2's in a dev build, against 9 s).
+- A driver that starts an HPC3 SCSI transfer before it arms the channel (the
+  BSD manual flow) is paused at once under `ci_clock`, not after 100 ms.
+- In every build, HAL2's read-ahead window and REX3's BACKBUSY count machine
+  time, so they hold still while the machine is stopped.
+
 ### Serial ports
 
 - A serial port can carry a device in place of its socket, on every machine:

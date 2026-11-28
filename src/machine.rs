@@ -395,6 +395,8 @@ impl Machine {
         }
 
         let timer_manager = Arc::new(TimerManager::with_clock(crate::clock::Clock::cpu_or_host()));
+        // The MC, REX3 and WD33C93A run inline where the build counts, which needs a counting manager.
+        debug_assert!(!crate::clock::COUNTING || timer_manager.clock().is_counting());
         // 1. Create all devices first
         // Memory Controller
         let mc_banks: [u32; 4] = cfg.banks[..4].try_into().expect("the MC has four banks");

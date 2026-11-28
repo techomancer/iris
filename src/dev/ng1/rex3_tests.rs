@@ -9830,6 +9830,46 @@ fn legacy_gfifo_register_traffic_marks_framebuffer_dirty() {
     assert!(rex.fb_dirty.swap(false, Ordering::Acquire));
 }
 
+/// Under `ci_clock` the GFIFO is carried out as it is written: STATUS reads idle with nothing
+/// queued after a draw.
+#[cfg(feature = "ci_clock")]
+#[test]
+fn ci_clock_status_reads_idle_after_a_draw() {
+    let rex = &make_rex3_reset();
+    assert!(rex.processor_thread.lock().is_none(), "no processor thread");
+    reg(rex, REX3_COLORRED, 0x0012_3400);
+    reg(rex, REX3_COLORRED, 0x0056_7800);
+    let status = rex.read32(set_addr(REX3_STATUS)).data;
+    assert_eq!(status & (STATUS_GFXBUSY | STATUS_GFIFOLEVEL_MASK), 0, "idle at once, nothing queued");
+}
+
+/// A DCB command raises BACKBUSY for 1 ms of machine time, not host time: a run reads the same
+/// STATUS however long the host took.
+#[cfg(feature = "ci_clock")]
+#[test]
+fn ci_clock_backbusy_lasts_a_millisecond_of_machine_time() {
+    let (tm, step) = crate::test_board::counting();
+    let status = crate::status::MachineStatus::detached();
+    status.refresh().set_timers(tm);
+    let rex = &with_big_stack(move || {
+        let rex = TestBoard::new(Arc::new(Rex3::new(status)));
+        rex.power_on();
+        rex
+    });
+    // DCB address 12 raises BACKBUSY.
+    w32(rex, set_addr(REX3_DCBMODE), 12 << DCBMODE_DCBADDR_SHIFT);
+    w32(rex, set_addr(REX3_DCBDATA0), 0);
+    assert!(rex.dcb.lock().backbusy_until.is_some(), "the command armed BACKBUSY");
+    let busy = |rex: &Rex3| rex.read32(set_addr(REX3_STATUS)).data & STATUS_BACKBUSY != 0;
+    assert!(busy(rex));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(busy(rex), "host time does not end it");
+    step(999_000);
+    assert!(busy(rex));
+    step(2_000);
+    assert!(!busy(rex), "a millisecond of machine time ended it");
+}
+
 /// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
 /// 32, and STATUS reports only the last 32 slots of it.
 ///

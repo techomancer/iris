@@ -446,6 +446,19 @@ impl Wd33c93a {
         }
     }
 
+    /// On a counting clock there is no worker: do the command just written, then raise what it
+    /// queued, in the access that wrote it. A deferred interrupt comes at once, as with
+    /// `--no-scsi-deferred-int`.
+    fn run_pending(&self, st: &mut Wd33c93aState) {
+        if let Some(cmd_reg) = st.pending_command.take() {
+            st.process_wd_command(cmd_reg, self.dma.as_deref());
+            crate::status::scsi_blink(&self.heartbeat, st.target_id as u32);
+        }
+        if !st.irq_fifo.is_empty() {
+            st.update_irq();
+        }
+    }
+
     /// Wire up the CPU cycle counter — called from `Machine::new` once
     /// `MipsCpu` exists (this device is constructed before it does, so this
     /// can't be a constructor parameter; see `MipsCpu::cycles_ptr`). Must be
@@ -766,6 +779,9 @@ impl Wd33c93a {
                             dlog!(state.log_module(), "WD33C93A({}): PIO xfer complete phase=0x{:02x}, waking worker ({} bytes)", state.id, cmd_phase, state.fifo.len());
                             state.update_asr(asr::DBR, 0);
                             state.pending_command = Some(state.regs[regs::COMMAND as usize]);
+                            if crate::clock::COUNTING {
+                                self.run_pending(&mut state);
+                            }
                             drop(state);
                             self.cond.notify_one();
                             return BUS_OK;
@@ -839,6 +855,9 @@ impl Wd33c93a {
                 }
 
                 state.pending_command = Some(val);
+                if crate::clock::COUNTING {
+                    self.run_pending(&mut state);
+                }
                 self.cond.notify_one();
                 // COMMAND register does not auto-increment
             } else if ar != regs::AUX_STATUS_DIRECT {
@@ -881,6 +900,10 @@ impl Device for Wd33c93a {
         // Re-arm any DaynaPort backend a previous stop() shut down. No-op on
         // first boot — add_daynaport() already started them.
         self.bus.for_each(|_, dev| dev.start());
+        // A counting clock has no worker: `run_pending` does its work in the access.
+        if crate::clock::COUNTING {
+            return;
+        }
         let state = self.state.clone();
         let cond = self.cond.clone();
         let running = self.running.clone();
@@ -1872,7 +1895,8 @@ impl Wd33c93aState {
             while i < total {
                 let is_last = i == last_idx;
                 let mut st = dma_dev.write(data[i] as u32, is_last);
-                if i == 0 && st.not_active() {
+                // A counting clock cannot wait: inline, the CPU that would arm the channel is this one.
+                if i == 0 && st.not_active() && !crate::clock::COUNTING {
                     // Driver calls wdsc_dmago *after* writing TRANSFER_INFO, so the channel
                     // may not be active yet. Wait up to 100ms for the CPU thread to arm it.
                     // `wait_active` blocks until the arming write wakes us (HPC3), with no
@@ -1902,7 +1926,7 @@ impl Wd33c93aState {
                 // EOX mid-transfer: chain exhausted early (device sent less than allocated).
                 // Pause so IRIX can re-arm via SELECT_ATN_XFER for the next chunk.
                 // XIE (irq without eox): descriptor boundary, chain continues — keep writing.
-                let pause = (st.eox() || st.refused()) && !is_last;
+                let pause = (st.eox() || st.refused()) && (!is_last || crate::clock::COUNTING && st.not_active());
                 if pause {
                     //eprintln!("WD33C93A: send_data_chunked pause: EOX={} XIE={} refused={} offset=0x{:x} remaining=0x{:x}",
                     //    st.eox(), st.irq(), st.refused(), i, total - i);
@@ -1955,7 +1979,7 @@ impl Wd33c93aState {
                     None => {
                         let remaining = total - data.len();
                         if remaining > 0 {
-                            if data.is_empty() {
+                            if data.is_empty() && !crate::clock::COUNTING {
                                 // Channel not yet active — driver issues TRANSFER_INFO before dmago
                                 // (NetBSD: SET_SBIC_cmd then sc_dmago on same CPU thread).
                                 // Wait up to 100ms for the CPU thread to call dmago, woken
@@ -2099,11 +2123,34 @@ mod tests {
         Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)))
     }
 
+    /// On a counting clock no worker runs: a command is carried out by the write that gives it, and
+    /// a deferred interrupt is raised with it.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_a_command_completes_when_written() {
+        let wd = make_scsi();
+        wd.start();
+        wd.write(0, regs::COMMAND);
+        wd.write(1, cmd::RESET);
+        assert!(wd.state.lock().pending_command.is_none(), "taken at once, by no worker");
+        assert_eq!(wd.read(0).data & asr::INT, asr::INT, "the reset interrupt is up when the write returns");
+        {
+            let mut st = wd.state.lock();
+            st.irq_fifo.push_back((scsi_status::RESET, None, true));
+            st.set_asr(asr::CIP | asr::DBR);
+            wd.run_pending(&mut st);
+            assert_eq!(st.asr & asr::INT, asr::INT, "a deferred interrupt is not held back");
+        }
+        wd.stop();
+    }
+
     /// A command written before the worker first waits is still run. The
     /// worker takes the state lock when it starts; a COMMAND write and its
     /// notify that land first used to be lost, because the worker then waited
     /// without looking at `pending_command` and slept until some later write.
     /// Hold the lock across `start()` so the write is guaranteed to come first.
+    // The worker thread's wait: a counting controller runs each command inline and has no worker.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn a_command_written_before_the_worker_waits_is_not_lost() {
         let wd = make_scsi();
@@ -2373,6 +2420,7 @@ mod data_out_phase_tests {
 
     /// Data in before the driver arms the channel: the chip waits for the
     /// arming, is woken by it rather than polling, and takes every byte.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn data_in_waits_for_a_late_arming_and_is_woken_by_it() {
         let dma = LateDma::new(&[1, 2, 3, 4]);
@@ -2383,6 +2431,7 @@ mod data_out_phase_tests {
     }
 
     /// The same for data out.
+    #[cfg(not(feature = "ci_clock"))]
     #[test]
     fn data_out_waits_for_a_late_arming_and_is_woken_by_it() {
         let dma = LateDma::new(&[]);
@@ -2391,5 +2440,26 @@ mod data_out_phase_tests {
         assert!(done);
         assert_eq!(*dma.taken.lock(), vec![5, 6, 7, 8]);
         assert_eq!(dma.waits.load(Ordering::Relaxed), 1, "the chip polled instead of waiting for the arming");
+    }
+
+    /// On a counting clock the CPU that would arm the channel is the one running the chip, so a
+    /// data phase on an unarmed channel pauses at once, with the interrupt, and never waits. A
+    /// one-byte transfer pauses too instead of retrying.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn ci_clock_data_on_an_unarmed_channel_pauses_without_waiting() {
+        for data in [vec![5, 6, 7, 8], vec![5]] {
+            let dma = LateDma::new(&[]);
+            let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
+            let mut s = dev.state.lock();
+            assert!(!s.send_data_chunked(data.clone(), 0, Some(&*dma as &dyn DmaClient)));
+            assert_eq!(s.xfer_data, data, "kept for the resume");
+            assert_eq!(s.irq_fifo.len(), 1, "the driver is told");
+            assert_eq!(dma.waits.load(Ordering::Relaxed), 0, "no wait on the CPU thread");
+        }
+        let dma = LateDma::new(&[1, 2, 3, 4]);
+        let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
+        assert_eq!(dev.state.lock().receive_data_chunked(4, Some(&*dma as &dyn DmaClient)), None);
+        assert_eq!(dma.waits.load(Ordering::Relaxed), 0);
     }
 }
