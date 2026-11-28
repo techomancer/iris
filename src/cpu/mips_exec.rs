@@ -1209,6 +1209,20 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// lazily rather than cached across a flush.
     #[cfg(feature = "jitv2")]
     pub(crate) pcp: *mut crate::cpu::jitv2::PhysicalCodePage,
+    /// The page [`Self::jitv2_arrival_count`] is counting arrivals for —
+    /// null when there is none. Compared by pointer: a different page has
+    /// its own counter, so the count restarts there.
+    ///
+    /// The count is per CPU on purpose: this executor belongs to this
+    /// thread alone (§6.1.3), so the counter needs no atomics, and the
+    /// CPU thread's hot path keeps no shared write at all (see
+    /// [`Self::jitv2_note_arrival`]).
+    #[cfg(feature = "jitv2")]
+    jitv2_arrival_page: *const crate::cpu::jitv2::PhysicalCodePage,
+    /// Arrivals at [`Self::jitv2_arrival_page`] since the last fold into the
+    /// page's shared hot-lane counter.
+    #[cfg(feature = "jitv2")]
+    jitv2_arrival_count: u32,
     /// `jitv2_smc_check` dedup set, keyed `(pc, target code pfn)` — see
     /// [`Self::smc_check_report`].
     #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
@@ -3042,6 +3056,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_stats,
             #[cfg(feature = "jitv2")]
             pcp: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            jitv2_arrival_page: std::ptr::null(),
+            #[cfg(feature = "jitv2")]
+            jitv2_arrival_count: 0,
             #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
             smc_seen: std::collections::HashSet::new(),
             #[cfg(feature = "jitv2_lockstep")]
@@ -4295,6 +4313,41 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let pc = self.core.pc;
 
         let fetch = self.fetch_instr(pc);
+        self.step_int_finish(pc, fetch)
+    }
+
+    /// `step_int`, but reusing a fetch translation the caller already
+    /// computed for `pre_pc`.
+    ///
+    /// The jitv2 dispatch gate translates the fetch before it decides
+    /// whether the instruction runs on the CPU or in compiled code; every
+    /// interpreter fallback used to translate the same address a second
+    /// time (`fetch_instr` → `nanotlb_translate`). The translation is only
+    /// reused when `core.pc` still names the same address after the
+    /// preamble — an interrupt delivered by the preamble moves the PC — so
+    /// this can never run an instruction against a stale translation.
+    #[cfg(feature = "jitv2")]
+    fn step_int_pretranslated(&mut self, pre_pc: u64, t: TranslateResult) -> ExecStatus {
+        step_preamble!(self);
+        let pc = self.core.pc;
+
+        let fetch = if pre_pc == pc {
+            self.fetch_instr_pretranslated(pc, t)
+        } else {
+            self.fetch_instr(pc)
+        };
+        self.step_int_finish(pc, fetch)
+    }
+
+    /// The second half of [`Self::step_int`]: decode the fetched
+    /// instruction and run it.
+    ///
+    /// `inline(always)`: this used to be the body of `step_int` itself, and
+    /// the interpreter's per-instruction path paid a call (and a
+    /// `FetchInstrResult` round-trip) that the old code did not have — a
+    /// measurable slowdown in a build with the dispatch gate off.
+    #[inline(always)]
+    fn step_int_finish(&mut self, pc: u64, fetch: FetchInstrResult) -> ExecStatus {
         let result = if fetch.status == EXEC_COMPLETE {
             {
                 let slot = fetch.instr as *mut DecodedInstr;
@@ -4350,6 +4403,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // below fetches for itself, so a full fetch here would run twice for
         // each interpreted instruction.
         let t = self.nanotlb_translate::<{ AccessType::Fetch as u8 }>(pc);
+        // The arrivals counted for the page the CPU was on belong to that
+        // page: fold them into its counter when the fetch moves to another
+        // page, so that the page's total stays exact.
+        self.jitv2_fold_arrivals(self.pcp);
         // Retired AFTER the translation, not before: it is what runs
         // jitv2_track_pcp, the thing that sets `core.jit_trigger = true` on
         // a fresh page's first arrival. Reading/clearing it earlier captured
@@ -4362,7 +4419,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.handle_exception(t.status)
         } else if self.pcp.is_null() {
             // Fetched from above the JIT's pfn map (`jitv2_track_pcp`).
-            self.step_int()
+            self.step_int_pretranslated(pc, t)
         } else {
             // Shared: another CPU may be on this page too.
             let page = unsafe { &*self.pcp };
@@ -4380,6 +4437,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     { page.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                     let jit_fn: crate::cpu::jitv2::JitFn = unsafe { std::mem::transmute(func) };
                     let status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
+                    // The compiled code may have moved the PC, so this
+                    // fallback cannot reuse the gate's translation.
                     break 'gate if status != EXEC_FALLBACK { status } else { self.step_int() };
                 }
                 // A denylisted offset has nothing to compile against these
@@ -4393,7 +4452,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // `current_gen`), the next publish resets `denied`, so the
                 // arrival asks again as before.
                 if page.is_denylisted(entry_offset) && page.entry_gen() == page.current_gen() {
-                    break 'gate self.step_int();
+                    break 'gate self.step_int_pretranslated(pc, t);
                 }
                 let inline_compile = self.jitv2_inline_compile;
                 self.core.jit_trigger = false;
@@ -4420,7 +4479,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     if !page.has_code() || page.note_waiting_arrival() {
                         break 'gate self.jitv2_compile_inline(req, trigger);
                     }
-                    break 'gate self.step_int();
+                    break 'gate self.step_int_pretranslated(pc, t);
                 } else {
                     #[cfg(feature = "developer")]
                     page.mark_schedule_attempt();
@@ -4450,7 +4509,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                             crate::pf_level!(crate::perfetto::events::JIT_QUEUE_FULL_LEVEL, crate::perfetto::events::JIT_QUEUE_FULL, false);
                             crate::pf_instant!(crate::perfetto::events::JIT_REQUEST, pc);
                         }
-                    } else if page.note_waiting_arrival() {
+                    } else if self.jitv2_note_arrival(page) {
                         // Already queued, and being executed hard while it
                         // waits: jump the queue (`CompileQueue::hot`).
                         crate::pf_instant!(crate::perfetto::events::JIT_HOT_REQUEST, pc);
@@ -4458,10 +4517,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                             page.rearm_promotion();
                         }
                     }
-                    break 'gate self.step_int();
+                    break 'gate self.step_int_pretranslated(pc, t);
                 }
             }
-            self.step_int()
+            self.step_int_pretranslated(pc, t)
             }
         };
 
@@ -4469,6 +4528,85 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.skip_breakpoints = false;
         }
         result
+    }
+
+    /// Count one arrival at `page` for the hot lane, in per-CPU batches.
+    ///
+    /// The page's shared arrival counter is what decides when a page that
+    /// is being executed hard while its request sits in a full FIFO gets
+    /// promoted to the hot lane (`HOT_PROMOTE_ARRIVALS`). Writing that
+    /// counter on every arrival put a shared atomic write on the CPU
+    /// thread's hot path, where it ping-ponged with the compile worker's
+    /// copy of the same cache line. This counts per CPU instead — a field
+    /// of this executor, which belongs to this thread alone — and folds the
+    /// total into the page's counter in batches, so every arrival is still
+    /// counted and the promotion threshold is unchanged.
+    ///
+    /// The count belongs to the page it was made at, so the count for the
+    /// page the CPU leaves is folded in by [`Self::jitv2_fold_arrivals`]
+    /// before the CPU starts counting at the next one.
+    ///
+    /// The one bounded exception: a batch that spans a wait boundary (the
+    /// page's request completes while the CPU still holds part of a batch)
+    /// carries at most `HOT_ARRIVAL_BATCH - 1` arrivals into the *next*
+    /// wait, so the page can be promoted a few arrivals early out of
+    /// `HOT_PROMOTE_ARRIVALS`.
+    ///
+    /// Returns `true` when the page is due for the hot lane, i.e. when the
+    /// caller should put a copy of the request on it.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    pub(crate) fn jitv2_note_arrival(&mut self, page: &crate::cpu::jitv2::PhysicalCodePage) -> bool {
+        /// Arrivals folded into the page's shared counter at a time. The
+        /// shared counter is written once per batch instead of once per
+        /// arrival; the total counted is the same.
+        const BATCH: u32 = crate::cpu::jitv2::jitv2::HOT_ARRIVAL_BATCH;
+
+        if !page.is_scheduled() {
+            // The page's request is over and its shared counter went with
+            // it: this arrival belongs to no wait.
+            return false;
+        }
+        self.jitv2_arrival_count += 1;
+        if self.jitv2_arrival_count >= BATCH {
+            let n = self.jitv2_arrival_count;
+            self.jitv2_arrival_count = 0;
+            page.note_waiting_arrivals(n);
+        }
+        page.take_hot_promotion()
+    }
+
+    /// Fold the arrivals counted for the page the CPU was on into that
+    /// page's shared counter, if the CPU has moved to another page.
+    ///
+    /// The count is per CPU and per page; the page's own counter is what
+    /// the hot lane's threshold is measured against. Folding it in when the
+    /// CPU leaves the page keeps the page's total exact — a page the CPU
+    /// visits in short bursts would otherwise never reach the threshold.
+    ///
+    /// `page` is the page the CPU is on now, or null when it is not on a
+    /// JIT page at all.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    pub(crate) fn jitv2_fold_arrivals(&mut self, page: *mut crate::cpu::jitv2::PhysicalCodePage) {
+        let old = self.jitv2_arrival_page;
+        if old == page as *const crate::cpu::jitv2::PhysicalCodePage {
+            return;
+        }
+        let n = self.jitv2_arrival_count;
+        self.jitv2_arrival_count = 0;
+        self.jitv2_arrival_page = page as *const crate::cpu::jitv2::PhysicalCodePage;
+        if n == 0 || old.is_null() {
+            return;
+        }
+        // The page's slot is stable for the process's lifetime (the pool
+        // never moves or resizes), so the pointer still names the page.
+        let page = unsafe { &*old };
+        if !page.is_scheduled() {
+            // Its request is over and its counter went with it.
+            return;
+        }
+        page.note_waiting_arrivals(n);
     }
 
     /// What entering compiled code at `pc` still needs from the fetch once
@@ -5397,6 +5535,20 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         } else {
             self.nanotlb_translate::<{AccessType::Fetch as u8}>(virt_addr)
         };
+        self.fetch_instr_translated::<DEBUG>(virt_addr, translate_result)
+    }
+
+    /// The second half of the fetch: everything after the address
+    /// translation. Split out so a caller that already translated the
+    /// address can hand the result in instead of translating it twice.
+    ///
+    /// `inline(always)`: this is the fetch's hot half, and it used to be the
+    /// body of `fetch_instr_impl` itself. Left as a plain call, the
+    /// interpreter's per-instruction fetch paid a call and a
+    /// `TranslateResult` round-trip that the old code did not have — a
+    /// measurable slowdown in a build with the dispatch gate off.
+    #[inline(always)]
+    fn fetch_instr_translated<const DEBUG: bool>(&mut self, virt_addr: u64, translate_result: TranslateResult) -> FetchInstrResult {
         if translate_result.is_exception() { return FetchInstrResult::exception(translate_result.status); }
         let phys_addr = translate_result.phys;
         if translate_result.is_cached() {
@@ -5431,6 +5583,25 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 FetchInstrResult::fault(r.status)
             }
         }
+    }
+
+    /// `fetch_instr` with the fetch translation already done by the caller.
+    ///
+    /// The jitv2 dispatch gate translates the fetch before it decides
+    /// whether the instruction runs on the CPU or in compiled code; when it
+    /// falls back to the interpreter, the instruction used to be translated
+    /// a second time. The virtual-address breakpoint check still runs here,
+    /// in the same order as in `fetch_instr_impl` — before the instruction
+    /// is fetched — so a breakpoint on an address whose fetch would fault
+    /// still reports the breakpoint rather than the fault.
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    fn fetch_instr_pretranslated(&mut self, virt_addr: u64, t: TranslateResult) -> FetchInstrResult {
+        #[cfg(not(feature = "lightning"))]
+        if self.bp_enabled() && self.check_breakpoint::<{ BpType::VirtFetch as u8 }>(virt_addr) {
+            return FetchInstrResult::exception(EXEC_BREAKPOINT);
+        }
+        self.fetch_instr_translated::<false>(virt_addr, t)
     }
 
     /// Production data read (with breakpoints, updates CP0 state on exceptions).

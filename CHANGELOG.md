@@ -880,6 +880,10 @@ image) where the guest test suites showed they differed:
   and atomchild); `j2 gprcache [N]` or `IRIS_GPRCACHE` sets how many, 0 is off.
 - A jitv2 build no longer runs PROM code slower than the interpreter: a Tezro
   or Fuel reaches the System Maintenance Menu sooner.
+- A jitv2 build no longer runs code slower than the interpreter while it waits
+  for the compiler: the dispatch gate no longer writes shared per-page state on
+  every instruction, so code that has not been compiled yet runs at
+  interpreter speed. All machines.
 - `[jitv2] cache = true` stores and reuses compiled pages with the default
   settings; it stored nothing before.
 - On Windows a jitv2 machine no longer reserves 512 MiB of the commit limit
