@@ -47,7 +47,6 @@ Diagnostics that remain, all off unless set (`IRIS_IP32_HOT`, `IRIS_IP32_MEC_TRA
 
 | variable | what it does |
 |---|---|
-| `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the monitor's `o2 retrace` |
 | `IRIS_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling (every sound card) |
 | `IRIS_O2_AUDIO_CAPTURE=file` | what the host device is given, after rate conversion (a WAV; was raw 16-bit stereo before iris-audio) |
 

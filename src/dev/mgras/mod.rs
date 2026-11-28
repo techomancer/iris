@@ -25,7 +25,7 @@
 //! The model scans its framebuffer out through the colormap and DAC gamma into
 //! the same window and status bar Newport uses (`GfxDisplay`).
 //!
-//! `IRIS_MGRAS_TRACE=<file>` logs every access to the board.
+//! `--startup "mgras trace <file>"` logs every access to the board.
 
 //!
 //! Threads (clanker/mgras/DESIGN.md): the CPU thread owns the host-side
@@ -675,20 +675,6 @@ impl Mgras {
         };
         let head: Arc<dyn crate::display::Head> = m.clone();
         m.head.attach(Arc::downgrade(&head));
-        if let Some(path) = std::env::var_os("IRIS_MGRAS_REC") {
-            let path = path.to_string_lossy();
-            match m.set_recording(Some(&path)) {
-                Ok(()) => eprintln!("mgras: recording to {path}"),
-                Err(e) => eprintln!("mgras: cannot record to {path}: {e}"),
-            }
-        }
-        if let Some(path) = std::env::var_os("IRIS_MGRAS_TRACE") {
-            let path = path.to_string_lossy();
-            match m.start_trace(&path, debug::TRACE_ALL) {
-                Ok(()) => eprintln!("mgras: tracing to {path}"),
-                Err(e) => eprintln!("mgras: cannot trace to {path}: {e}"),
-            }
-        }
         Ok(m)
     }
 

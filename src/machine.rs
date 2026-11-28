@@ -949,7 +949,7 @@ impl Machine {
 
         crate::thread_affinity::init(perf);
 
-        Ok(Self {
+        let machine = Self {
             memory,            cpu,
             board,
             mc,
@@ -974,7 +974,10 @@ impl Machine {
             controller_slot: None,
             controller_registered: false,
             lifecycle: GuestState::Idle,
-        })
+        };
+        // Before `--startup "rex rec"` opens, so the recording starts on this state; `start` applies it again.
+        machine.apply_host_display_resolution();
+        Ok(machine)
     }
 
     fn apply_host_display_resolution(&self) {

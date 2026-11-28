@@ -48,6 +48,22 @@ hashes are given where a change is easiest to understand by reading the commit.
   `bp add ADDR if REG==VAL` breaks at a PC on a register value, but nothing
   reports every write to a register, so it replaces `IRIS_IP28_WATCHGPR`
   only in part.
+- `--startup COMMAND` (repeatable) and `[debug] startup = [...]` run monitor
+  commands once the machine is built, before the CPU starts. A command that
+  fails fails the build; a reset or a snapshot load does not run them again.
+  They replace the board trace and recording variables, which are gone:
+  - `IRIS_REX3_TRACE` and `IRIS_REX3_REC`: `--startup "rex trace FILE"` and
+    `--startup "rex rec FILE"`.
+  - `IRIS_MGRAS_TRACE` and `IRIS_MGRAS_REC`: `--startup "mgras trace FILE"`
+    and `--startup "mgras rec FILE"`.
+  - `IRIS_ODSY_TRACE` and `IRIS_ODSY_REC`: `--startup "vpro trace FILE"` and
+    `--startup "vpro rec FILE"`. The replay tests' trace is now
+    `VPRO_REPLAY_TRACE`.
+  - `IRIS_O2_TRACE`: `--startup "re trace FILE"`.
+  - `IRIS_IP32_RE_TRACE` and `o2 retrace PATH`: `--startup "re rec FILE"`
+    (`gputrace` builds) writes the same register writes from the moment it
+    starts. It has no look-back: the old variable kept the last N writes to
+    dump after a glitch, and nothing replaces that.
 
 - One pattern names trace points everywhere: `log heart,l1d.*,-l1d.hit on`,
   `--log PATTERN` and `[debug] log`. `IRIS_DEBUG_LOG` and `[debug] debug_log`

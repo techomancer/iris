@@ -65,19 +65,34 @@ impl Monitor {
         self.devices.lock().push(device);
     }
 
+    fn offering(&self, cmd: &str) -> Vec<Arc<dyn Device>> {
+        self.devices.lock().iter().filter(|d| d.register_commands().iter().any(|(c, _)| c == cmd)).cloned().collect()
+    }
+
+    /// Run a command line as a client would type it, on the devices that offer
+    /// the command; what it printed, or the first error (a client session goes
+    /// on to the next device).
+    pub fn run_line(&self, line: &str) -> Result<String, String> {
+        let mut words = line.split_whitespace();
+        let cmd = words.next().ok_or("empty command")?;
+        let args: Vec<&str> = words.collect();
+        let devs = self.offering(cmd);
+        if devs.is_empty() {
+            return Err(format!("unknown command {cmd}"));
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        for d in devs {
+            d.execute_command(cmd, &args, Box::new(Capture(out.clone())))?;
+        }
+        let text = String::from_utf8_lossy(&out.lock()).into_owned();
+        Ok(text)
+    }
+
     /// What `cmd args` prints, from every device that offers it.
     #[cfg(test)]
     pub(crate) fn run(&self, cmd: &str, args: &[&str]) -> String {
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-        impl Write for Capture {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-        }
         let out = Arc::new(Mutex::new(Vec::new()));
-        let devs: Vec<_> = self.devices.lock().iter().filter(|d| d.register_commands().iter().any(|(c, _)| c == cmd)).cloned().collect();
+        let devs = self.offering(cmd);
         for d in devs {
             if let Err(e) = d.execute_command(cmd, args, Box::new(Capture(out.clone()))) {
                 out.lock().extend_from_slice(format!("Error: {e}\n").as_bytes());
@@ -441,6 +456,27 @@ mod tests {
         for want in ["ping", "help", "quit"] {
             assert!(names.iter().any(|n| n == want), "{want} missing from {names:?}");
         }
+    }
+
+    #[test]
+    fn run_line_runs_a_command_and_refuses_an_unknown_one() {
+        struct Echo;
+        impl Device for Echo {
+            fn step(&self, _: u64) {}
+            fn stop(&self) {}
+            fn start(&self) {}
+            fn is_running(&self) -> bool { true }
+            fn register_commands(&self) -> Vec<(String, String)> { vec![("echo".into(), "echo".into())] }
+            fn execute_command(&self, _: &str, args: &[&str], mut w: Box<dyn Write + Send>) -> Result<(), String> {
+                if args == ["bad"] { return Err("no".into()) }
+                writeln!(w, "{}", args.join(" ")).map_err(|e| e.to_string())
+            }
+        }
+        let monitor = Monitor::new();
+        monitor.register_device(Arc::new(Echo));
+        assert_eq!(monitor.run_line(" echo a  b "), Ok("a b\n".into()));
+        assert_eq!(monitor.run_line("echo bad"), Err("no".into()));
+        assert_eq!(monitor.run_line("nope"), Err("unknown command nope".into()));
     }
 
     /// A command two devices both offer runs on each, and `help` lists it once.

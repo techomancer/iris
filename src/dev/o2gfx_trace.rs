@@ -15,7 +15,7 @@
 //! register collapsed and runs through a table merged.
 //!
 //! All three devices share one sink so that their lines interleave in time.
-//! `IRIS_O2_TRACE=<file>` starts a full trace at power-on. All of it needs
+//! `--startup "re trace <file>"` starts a full trace at power-on. All of it needs
 //! the `gputrace` feature; without it `on` is a constant false.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -35,7 +35,7 @@ pub const TRACE_CRIME: u32 = 8;
 /// CRIME's interrupt registers: IRIX writes the mask on every spl change, so
 /// this outweighs everything else and `all` leaves it out.
 pub const TRACE_IRQ: u32 = 16;
-/// The categories `all` and `IRIS_O2_TRACE` mean.
+/// The categories `all` means.
 pub const TRACE_ALL: u32 = TRACE_RE | TRACE_CPU | TRACE_GBE | TRACE_CRIME;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,15 +171,6 @@ impl O2Trace {
     pub fn stop(&self) -> Option<String> {
         self.mask.store(0, Ordering::SeqCst);
         self.s.lock().unwrap().stop()
-    }
-
-    /// `IRIS_O2_TRACE=<file>`: a full trace from power-on.
-    pub fn start_from_env(&self) {
-        if let Ok(path) = std::env::var("IRIS_O2_TRACE") {
-            if let Err(e) = self.start(&path, TRACE_ALL) {
-                eprintln!("IRIS_O2_TRACE {path}: {e}");
-            }
-        }
     }
 
     /// `re trace ...`, `gbe trace ...`, `crime trace ...`.

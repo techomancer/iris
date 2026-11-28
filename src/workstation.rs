@@ -34,11 +34,21 @@ use crate::monitor::Monitor;
 use crate::net::NatControl;
 use crate::traits::{Device, MachineEvent, MachineEventQueue, MachineFatal};
 
-/// Build the machine `cfg` describes, or say why it cannot be built.
+/// Build the machine `cfg` describes, or say why it cannot be built. The
+/// `[debug] startup` commands have run by the time it returns.
 ///
 /// Construction can put more than a megabyte on the stack, so call this from
 /// a thread with a large one, as `main.rs` and iris-gui do.
 pub fn build(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
+    let startup = cfg.debug.startup.clone();
+    let machine = build_machine(cfg)?;
+    for line in &startup {
+        eprint!("{}", machine.monitor().run_line(line).map_err(|e| format!("startup {line}: {e}"))?);
+    }
+    Ok(machine)
+}
+
+fn build_machine(cfg: MachineConfig) -> Result<Box<dyn Workstation>, String> {
     let cfg = cfg.resolved()?;
     cfg.validate_newport_raster_gate()?;
     crate::machine::set_emulator_profile(cfg.machine.profile);

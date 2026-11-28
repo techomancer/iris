@@ -17,7 +17,7 @@ debug_cache = []
 developer = ["gputrace"]
 # Graphics bus taps: REX3 annotated trace (`rex trace`) and replayable
 # recording (`rex rec`, src/dev/ng1/rex3_rec.rs), and the GR2 and IMPACT
-# annotated traces (`gr2 trace`, `mgras trace`, IRIS_MGRAS_TRACE). Without it
+# annotated traces (`gr2 trace`, `mgras trace`). Without it
 # every bus access and FIFO entry goes straight to the device, with not even
 # the relaxed load that checks whether a trace runs. On with `developer`; opt
 # in for plain and `lightning` builds with `--features gputrace`.

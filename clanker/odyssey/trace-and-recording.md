@@ -6,7 +6,7 @@ Same monitor syntax as gr2/mgras/rex:
 
     vpro trace <file> [fifo,draw,cpu,dma|all]   vpro trace flush|off   vpro trace (state)
     vpro rec <file>                           vpro rec mark|off      vpro rec (state)
-    IRIS_ODSY_TRACE=<file>  IRIS_ODSY_REC=<file>   from power-on
+    --startup "vpro trace <file>"   --startup "vpro rec <file>"   from power-on
     VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture
 
 ## The trace
@@ -68,7 +68,7 @@ reached and lists marks as checkpoints beside the every-500,000-records
 ones. A first mark a fresh board does not reach means the recording started
 mid-session (`Report::mid_session`): its marks are then reported, not
 failed, and its blessed checkpoints pin the model's determinism under those
-stores, not the live screen. Only a power-on recording (`IRIS_ODSY_REC`)
+stores, not the live screen. Only a power-on recording (`--startup "vpro rec <file>"`)
 reproduces what the guest saw.
 
 What a `vpro rec` start cannot catch: a front-register access on another

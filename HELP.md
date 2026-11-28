@@ -1068,6 +1068,9 @@ Automation and debugging
                               capped by the host's usable CPUs)
   --jitv2-compile <MODE>      async (default) or sync (compile on the CPU thread; one CPU only)
   --log <POINTS>              Turn trace points on from startup, e.g. heart,l1d.*,-l1d.hit (to stderr)
+  --startup <COMMAND>         Run a monitor command once the machine is built, before the CPU
+                              starts, e.g. "rex trace /tmp/rex.txt"; repeatable; replaces
+                              the config's list
   --perfetto <FILE>           Record a Perfetto trace from startup (--features perfetto);
                               --perfetto-cats and --perfetto-clock as for the monitor's perfetto start
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry

@@ -35,6 +35,5 @@ width. Linear-to-frame-buffer transfers (the X server's) keep the old path.
 
 **Repro.** A GLX program that clears a 64x64 window, draws quads of known
 colours and reads single pixels and a 4x2 block back with `glReadPixels`.
-`IRIS_IP32_RE_TRACE=400000` plus the monitor's `o2 retrace PATH` records the
-register writes; the read-backs are the transfers into buffer 4 with DrawMode
+`--startup "re rec FILE"` records the register writes; the read-backs are the transfers into buffer 4 with DrawMode
 bit 22 set.

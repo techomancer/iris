@@ -300,3 +300,4 @@ mode           = "nat"
 #no_idle        = false      # IRIS_NO_IDLE: disable idle park (idle-pause builds)
 #gui_gl_capture = false      # IRIS_GUI_GL: iris-gui GL capture renderer
 #log            = "scsi,net" # trace points to enable at startup (--log); was debug_log
+#startup        = ["rex trace /tmp/rex.txt"] # monitor commands to run before the CPU starts

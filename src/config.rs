@@ -1759,6 +1759,9 @@ pub struct DebugConfig {
     /// Trace points to turn on at startup, as for the monitor's `log`.
     #[serde(default, skip_serializing_if = "String::is_empty", alias = "debug_log")]
     pub log: String,
+    /// Monitor commands to run once the machine is built, before the CPU starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub startup: Vec<String>,
 }
 
 impl Default for DebugConfig {
@@ -1767,6 +1770,7 @@ impl Default for DebugConfig {
             gui_gl_capture: false,
             no_idle: false,
             log: String::new(),
+            startup: Vec::new(),
         }
     }
 }
@@ -4204,6 +4208,11 @@ pub struct Cli {
     #[arg(long = "log", value_name = "POINTS")]
     pub log: Option<String>,
 
+    /// A monitor command to run once the machine is built, before the CPU starts, e.g.
+    /// `--startup "rex trace /tmp/rex.txt"`. May be repeated.
+    #[arg(long = "startup", value_name = "COMMAND")]
+    pub startup: Vec<String>,
+
     /// Perfetto categories, e.g. `irq,gfx` or `all,-jit` [default: all]
     #[arg(long = "perfetto-cats", value_name = "LIST")]
     pub perfetto_cats: Option<String>,
@@ -4354,6 +4363,7 @@ impl Cli {
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref p) = self.perfetto { cfg.perfetto = Some(p.clone()); }
         if let Some(ref p) = self.log { cfg.debug.log = p.clone(); }
+        if !self.startup.is_empty() { cfg.debug.startup = self.startup.clone(); }
         if let Some(ref p) = self.perfetto_cats { cfg.perfetto_cats = Some(p.clone()); }
         if let Some(ref p) = self.perfetto_clock { cfg.perfetto_clock = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
