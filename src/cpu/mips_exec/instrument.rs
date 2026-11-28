@@ -47,6 +47,9 @@ pub(super) struct CpuSnapshot {
     pub(super) cp0_count: u64,
     pub(super) cp0_entryhi: u64,
     pub(super) cp0_compare: u64,
+    /// `MipsCore::count_last_guest_read`: what a later Compare write is
+    /// classified against, so it rewinds with Count.
+    pub(super) count_last_guest_read: u32,
     pub(super) cp0_status: u32,
     pub(super) cp0_cause: u32,
     pub(super) cp0_epc: u64,

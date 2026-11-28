@@ -60,7 +60,7 @@ DEPS   := $(OBJS:.o=.d)
 # ever does appear, the link fails loudly rather than pulling in the wrong ABI.
 LIBGCC :=
 
-.PHONY: all clean run dis syms image check-size vectors
+.PHONY: all clean run dis syms image check-size vectors e2e
 all: $(TARGET)
 
 # Regenerate the IEEE-754 expectation tables in tests/fpu/. Needs python3, and
@@ -112,6 +112,16 @@ run: $(TARGET)
 # Judging a run against expected-failures.txt is a cargo test, which builds
 # the emulator for the engine it names:
 #   cargo test --release [--features jitv2] --test cpu_tests -- --ignored
+
+# ── end-to-end programs ──────────────────────────────────────────────────────
+# Single-purpose guests in e2e/, each driven by its own script in run/ that
+# talks to the running emulator (see e2e/README.md). Not part of cputest.elf.
+E2E_ELF := $(patsubst e2e/%.c,$(BUILD)/e2e/%.elf,$(wildcard e2e/*.c))
+
+e2e: $(E2E_ELF)
+
+$(BUILD)/e2e/%.elf: $(BUILD)/e2e/%.o $(BUILD)/harness/start.o $(BUILD)/harness/console.o harness/link.ld
+	$(LD) $(LDFLAGS) -o $@ $(filter %.o,$^)
 
 # ── bootable image ───────────────────────────────────────────────────────────
 MKVH ?= ../target/release/mkvh

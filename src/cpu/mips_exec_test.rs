@@ -8208,6 +8208,162 @@ mod tests {
         assert_ne!(exec.core.cp0_status & STATUS_EXL, 0, "no interrupt taken");
     }
 
+    /// The core of a stopped `MipsCpu`, for a test to set up or inspect.
+    fn stopped_core(cpu: &crate::cpu::mips_exec::MipsCpu<PassthroughTlb, PassthroughCache>) -> &mut crate::cpu::mips_core::MipsCore {
+        assert!(!cpu.is_running());
+        // SAFETY: the CPU thread is not running, and the executor outlives
+        // the test's use of the reference.
+        unsafe { &mut *(cpu.core_ptr() as *mut crate::cpu::mips_core::MipsCore) }
+    }
+
+    /// The monitor's `cop0` dump reads Count the way a debugger does: the
+    /// guest's last read, which a later Compare write is classified against,
+    /// stays what the guest read (issue 302).
+    #[test]
+    fn the_monitor_cop0_dump_is_not_a_guest_count_read() {
+        let cpu = nop_cpu();
+        let core = stopped_core(&cpu);
+        core.count_last_guest_read = 0x1234;
+        core.cp0_count = 0x8000;
+        core.reanchor_count_and_reschedule();
+        let (r, out) = mon(&cpu, "cop0");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("Count"), "{}", out);
+        assert_eq!(stopped_core(&cpu).count_last_guest_read, 0x1234);
+    }
+
+    /// A snapshot carries the guest's last Count read, so a Compare write
+    /// right after the restore is classified as it would have been without
+    /// the snapshot. A snapshot without it takes the restored Count.
+    #[test]
+    fn a_snapshot_keeps_the_guests_last_count_read() {
+        use crate::traits::Saveable;
+        let cpu = nop_cpu();
+        stopped_core(&cpu).count_last_guest_read = 0x1234;
+        stopped_core(&cpu).cp0_count = 0x2000;
+        let saved = cpu.save_state();
+        stopped_core(&cpu).count_last_guest_read = 0xdead_beef;
+        cpu.load_state(&saved).unwrap();
+        assert_eq!(stopped_core(&cpu).count_last_guest_read, 0x1234);
+
+        let mut old = saved.clone();
+        old.get_mut("cp0").unwrap().as_table_mut().unwrap().remove("count_last_guest_read");
+        stopped_core(&cpu).count_last_guest_read = 0xdead_beef;
+        cpu.load_state(&old).unwrap();
+        assert_eq!(stopped_core(&cpu).count_last_guest_read, 0x2000);
+    }
+
+    /// `mfc0 t0, Count` in a loop, with Compare armed 1 ms ahead and no
+    /// timer thread at all: only the Count read can see Count step over
+    /// Compare. It must raise IP7, and the loop must take the interrupt,
+    /// interpreted and (under jitv2) compiled.
+    #[cfg(not(feature = "ci_clock"))]
+    fn count_read_loop_takes_the_timer(jit: bool) {
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_IE, STATUS_IM_SHIFT};
+        use crate::cpu::smp::HOST_PARK_BIT;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        // Compiling expects the default jitv2 enable table.
+        #[cfg(feature = "jitv2")]
+        let _table = crate::cpu::jitv2::opcode_support::table_stable();
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, PassthroughCache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        #[cfg(feature = "jitv2")]
+        {
+            exec.jitv2_inline_compile = true;
+            exec.install_jit_hooks();
+        }
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
+        // A native entry word, so the region does not start on the CP0 head.
+        mem.set_word(0x1000, 0); // nop
+        mem.set_word(0x1004, (OP_COP0 << 26) | (RS_MFC0 << 21) | (8 << 16) | (9 << 11)); // mfc0 t0, Count
+        mem.set_word(0x1008, (OP_BEQ << 26) | 0xFFFD); // beq $0, $0, 0x1000
+        mem.set_word(0x100C, 0);
+        exec.core.pc = 0xffff_ffff_8000_1000;
+        // IE stays off until the deadline is armed: nothing may be taken
+        // while the loop gets compiled.
+        exec.core.cp0_status = 1 << (STATUS_IM_SHIFT + 7);
+        exec.core.set_count_hz(90_000_000); // the O2's Count
+        exec.core.write_cp0(9, 0);
+        // Out of reach while the loop gets compiled.
+        exec.core.write_cp0(11, 0x8000_0000);
+
+        let parked = |exec: &MipsExecutor<PassthroughTlb, PassthroughCache>| {
+            exec.core.hot.interrupts.load(Ordering::SeqCst) & HOST_PARK_BIT != 0
+        };
+        let step = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>| {
+            #[cfg(feature = "jitv2")]
+            if jit { exec.step_jit(); return; }
+            let _ = jit;
+            exec.step_int();
+        };
+
+        #[cfg(feature = "jitv2")]
+        if jit {
+            let jv = exec.jitv2.clone();
+            let compiled = || {
+                let mut jv = jv.lock();
+                let slot = jv.page_for(1, 0x1000, mem.as_ref(), false).expect("page for the loop");
+                unsafe { (*jv.page_ptr(slot)).is_runnable(0) }
+            };
+            // Arrive at the loop head with a compile request, as a page
+            // crossing does.
+            for _ in 0..16 {
+                if compiled() { break; }
+                exec.core.pc = 0xffff_ffff_8000_1000;
+                exec.core.in_delay_slot = false;
+                exec.core.jit_trigger = true;
+                step(&mut exec);
+            }
+            assert!(compiled(), "the loop was never compiled");
+            exec.core.pc = 0xffff_ffff_8000_1000;
+            exec.core.in_delay_slot = false;
+        }
+
+        // A failed run loops for good; the park bit, which compiled code does
+        // see, gets it out so the test fails instead.
+        struct Irq(*const std::sync::atomic::AtomicU64);
+        unsafe impl Send for Irq {}
+        let irq = Irq(exec.interrupts_ptr());
+        let (done, stop) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let irq = irq;
+            if stop.recv_timeout(Duration::from_secs(5)).is_err() {
+                // SAFETY: the executor outlives this thread, which is joined below.
+                unsafe { &*irq.0 }.fetch_or(HOST_PARK_BIT, Ordering::SeqCst);
+            }
+        });
+
+        let now = exec.core.count_now();
+        exec.core.write_cp0(11, now.wrapping_add(90_000) as u64);
+        exec.core.cp0_status |= STATUS_IE;
+        assert_eq!(exec.core.hot.interrupts.load(Ordering::SeqCst) & crate::cpu::mips_core::CAUSE_IP7 as u64, 0);
+        let t0 = Instant::now();
+        while exec.core.cp0_status & STATUS_EXL == 0 && !parked(&exec) {
+            step(&mut exec);
+        }
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        assert!(!parked(&exec), "the loop ran 5 s past a 1 ms Compare deadline (jit = {jit})");
+        assert_ne!(exec.core.cp0_status & STATUS_EXL, 0, "no interrupt taken");
+        assert!(t0.elapsed() >= Duration::from_micros(900), "taken before Count reached Compare");
+    }
+
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn an_interpreted_count_read_past_compare_takes_the_timer() {
+        count_read_loop_takes_the_timer(false);
+    }
+
+    #[cfg(all(feature = "jitv2", not(feature = "ci_clock")))]
+    #[test]
+    fn a_compiled_count_read_past_compare_takes_the_timer() {
+        count_read_loop_takes_the_timer(true);
+    }
+
     #[test]
     fn bad_conditions_are_refused_and_lists_round_trip() {
         let cpu = nop_cpu();

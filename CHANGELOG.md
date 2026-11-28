@@ -555,6 +555,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 - Without a saved clock, the Octane and O2 now start at `[rtc_offset]`.
 - Windows hosts: the guest's 1000 Hz clock no longer runs slow, which made
   everything IRIX paces by its clock take about ten times as long.
+- The monitor's `cop0` dump, and restoring a snapshot, can no longer make the
+  guest's next clock tick wait a whole Count wrap (about 48 s on the O2,
+  issue 302). All MIPS machines.
 
 ### Stopping a machine
 

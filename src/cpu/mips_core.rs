@@ -3319,6 +3319,70 @@ mod ip7_ticket_tests {
         assert!(ip7(&core), "a deadline Count reached before the write must be pending");
     }
 
+    /// A slow Count without Count-write sampling: the O2's and the Indy's
+    /// setting. `elapse_ticks` moves Count explicitly.
+    #[cfg(not(feature = "ci_clock"))]
+    fn sampling_off_core() -> MipsCore {
+        let mut core = MipsCore::default();
+        core.set_count_hz(1_000);
+        core
+    }
+
+    /// Issue 302's shape: the guest reads Count, a stall carries Count past
+    /// the deadline it then writes, and something read Count in between. A
+    /// debugger's read (the monitor's `cop0`) leaves the guest's reference
+    /// alone, so the late deadline is raised at once. A guest read in the
+    /// same place moves the reference past the deadline, which makes the
+    /// write a match a whole Count wrap away, as it is on hardware.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn a_debugger_count_read_does_not_hide_a_missed_deadline() {
+        for debugger in [true, false] {
+            let mut core = sampling_off_core();
+            core.write_cp0(9, 0x1000);
+            core.hot.cycles += 1;
+            let read = core.read_cp0(9) as u32;
+            elapse_ticks(&mut core, 0x40);
+            if debugger {
+                assert!(core.read_cp0_debug(9) as u32 >= read + 0x40, "the debugger sees the live Count");
+                assert_eq!(core.count_last_guest_read, read, "a debugger read is not the guest's");
+            } else {
+                core.read_cp0(9);
+            }
+            core.hot.cycles += 1;
+            core.write_cp0(11, read.wrapping_add(0x10) as u64);
+            assert_eq!(ip7(&core), debugger, "debugger read = {debugger}");
+        }
+    }
+
+    /// Count carried far past Compare in one materialization (a long host
+    /// stall at the O2's 90 MHz) raises IP7 on that read, once: after the
+    /// guest acknowledges, more Count does not raise it again.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn a_count_jump_far_past_compare_raises_ip7_once() {
+        let mut core = MipsCore::default();
+        core.set_count_hz(90_000_000);
+        core.write_cp0(9, 0x1000);
+        core.hot.cycles += 1;
+        // 0.19 s ahead: the host cannot get there between two statements.
+        let compare = 0x1000u32 + 0x0100_0000;
+        core.write_cp0(11, compare as u64);
+        assert!(!ip7(&core), "the deadline is still ahead");
+        // About 12 s of Count in one step.
+        elapse_ticks(&mut core, 0x4000_0000);
+        let count = core.read_cp0(9) as u32;
+        assert!(count.wrapping_sub(compare) < 0x8000_0000, "Count {count:#x} should be past {compare:#x}");
+        assert!(ip7(&core), "a Count read that stepped over Compare must raise IP7");
+
+        core.hot.cycles += 1;
+        core.write_cp0(11, count as u64); // write_c0_compare(read_c0_count())
+        assert!(!ip7(&core), "the acknowledgement clears IP7");
+        elapse_ticks(&mut core, 0x100);
+        core.read_cp0(9);
+        assert!(!ip7(&core), "the next match is a Count wrap away");
+    }
+
     /// IRIX on the Octane writes Count and then, a few instructions later,
     /// a Compare a short way ahead. A host stall between them that carries
     /// Count past the target and across the wrap still delivers the tick.
