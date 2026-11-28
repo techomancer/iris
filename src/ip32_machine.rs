@@ -853,6 +853,21 @@ impl Drop for O2Machine {
 
 /// The O2 as the front ends see it. `--load-elf` is not there yet; the
 /// trait's default says so.
+impl O2Machine {
+    /// Disk bus `bus` in the order of `disk_activity`: the AIC-7880s, then
+    /// each NVMe card.
+    fn with_disk_bus<R>(&self, bus: usize, f: impl FnOnce(&crate::scsi::ScsiBus) -> R) -> Option<R> {
+        use crate::scsi_monitor::ScsiTargets;
+        let controllers = self.bus.scsi.lock().unwrap().clone();
+        if let Some(c) = controllers.get(bus) {
+            return Some(f(c.bus()));
+        }
+        let cards = self.bus.cards.get()?;
+        let card = cards.nvme.get(bus - controllers.len())?;
+        Some(f(card.nvme.scsi_bus()))
+    }
+}
+
 impl Workstation for O2Machine {
     fn start(&mut self) { O2Machine::start(self) }
     fn stop(&mut self) { O2Machine::stop(self) }
@@ -928,6 +943,13 @@ impl Workstation for O2Machine {
         controllers.iter().map(|c| c.bus().activity())
             .chain(self.bus.cards.get().into_iter().flat_map(|c| &c.nvme).map(|c| c.nvme.scsi_bus().activity()))
             .collect()
+    }
+    fn read_disk(&self, bus: usize, id: u8, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.with_disk_bus(bus, |b| b.read_media(id, offset, buf))
+            .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such disk bus")))
+    }
+    fn disk_size(&self, bus: usize, id: u8) -> Option<u64> {
+        self.with_disk_bus(bus, |b| b.media_size(id)).flatten()
     }
     fn flush_disks(&self) -> std::io::Result<()> {
         self.bus.flush_disks()

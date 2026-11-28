@@ -18,6 +18,16 @@
 //! `O_CREAT | O_EXCL` with a unique name (never reuse a stale object),
 //! `shm_unlink` immediately (the fd keeps it alive; nothing persists to be
 //! found later), then exactly one `ftruncate` before any mapping exists.
+//!
+//! ## The App Sandbox refuses `shm_open`
+//!
+//! A sandboxed macOS app (the Mac App Store build) may only open POSIX shm
+//! under a name starting with an application-group ID, and a shm name is at
+//! most 31 bytes, so `shm_open` fails with `EPERM` there. macOS then backs the
+//! object with a Mach memory entry instead (`MAP_MEM_NAMED_CREATE`, mapped with
+//! `mach_vm_map`): anonymous, zero-filled, the same pages at every mapping, no
+//! name and no file. `IRIS_PPMEM_BACKEND=mach` picks it outside the sandbox,
+//! for testing.
 
 use super::{oserr, Prot};
 use std::io;
@@ -30,8 +40,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// processes, and reclaimed when the fd closes. Nothing reaches the disk —
 /// this is tmpfs/RAM on both platforms.
 pub struct SharedMem {
-    fd: libc::c_int,
+    backing: Backing,
     len: usize,
+}
+
+/// What holds a [`SharedMem`]'s pages.
+enum Backing {
+    /// An unlinked POSIX shm object.
+    Fd(libc::c_int),
+    /// A named Mach memory entry (macOS, where `shm_open` is refused).
+    #[cfg(target_os = "macos")]
+    Mach(mach::Port),
 }
 
 // The fd is just a handle; sharing it across threads is fine.
@@ -48,7 +67,33 @@ impl SharedMem {
             super::is_aligned(len),
             "ppmem: SharedMem length {len:#x} is not granularity-aligned"
         );
+        #[cfg(target_os = "macos")]
+        {
+            if mach::forced() {
+                return Self::new_mach(len);
+            }
+            match Self::new_shm(len) {
+                Ok(m) => Ok(m),
+                // The App Sandbox: no POSIX shm without an app-group name.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    mach::note_fallback(&e);
+                    Self::new_mach(len)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self::new_shm(len)
+    }
 
+    /// A Mach memory entry of `len` bytes, zero-filled.
+    #[cfg(target_os = "macos")]
+    pub fn new_mach(len: usize) -> io::Result<Self> {
+        Ok(Self { backing: Backing::Mach(mach::create(len)?), len })
+    }
+
+    /// A POSIX shm object of `len` bytes, zero-filled.
+    fn new_shm(len: usize) -> io::Result<Self> {
         // Unique per process *and* per object, so O_EXCL can never collide with
         // one of our own live objects.
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -79,7 +124,7 @@ impl SharedMem {
             return Err(e);
         }
 
-        Ok(Self { fd, len })
+        Ok(Self { backing: Backing::Fd(fd), len })
     }
 
     /// Length in bytes.
@@ -97,8 +142,9 @@ impl SharedMem {
     pub fn discard(&self) -> bool {
         #[cfg(target_os = "linux")]
         unsafe {
+            let Backing::Fd(fd) = self.backing;
             libc::fallocate(
-                self.fd,
+                fd,
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
                 0,
                 self.len as libc::off_t,
@@ -113,7 +159,13 @@ impl SharedMem {
 
 impl Drop for SharedMem {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
+        match self.backing {
+            Backing::Fd(fd) => unsafe {
+                libc::close(fd);
+            },
+            #[cfg(target_os = "macos")]
+            Backing::Mach(port) => mach::release(port),
+        }
     }
 }
 
@@ -219,17 +271,25 @@ impl AddrSpace {
         // MAP_FIXED replaces the reservation atomically — there is no window in
         // which the range is unmapped and could be handed to someone else.
         let want = self.base.add(at);
-        let got = libc::mmap(
-            want as *mut libc::c_void,
-            len,
-            prot_bits,
-            libc::MAP_SHARED | libc::MAP_FIXED,
-            mem.fd,
-            offset as libc::off_t,
-        );
-        if got == libc::MAP_FAILED {
-            return Err(oserr("mmap(MAP_FIXED)"));
-        }
+        let got = match mem.backing {
+            Backing::Fd(fd) => {
+                let got = libc::mmap(
+                    want as *mut libc::c_void,
+                    len,
+                    prot_bits,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    fd,
+                    offset as libc::off_t,
+                );
+                if got == libc::MAP_FAILED {
+                    return Err(oserr("mmap(MAP_FIXED)"));
+                }
+                got
+            }
+            // VM_FLAGS_OVERWRITE is MAP_FIXED's atomic replacement.
+            #[cfg(target_os = "macos")]
+            Backing::Mach(port) => mach::map(want, len, port, offset, prot_bits)? as *mut libc::c_void,
+        };
         // MAP_FIXED guarantees placement, but assert rather than trust: the
         // Windows backend has no such guarantee and shares this contract, and
         // a silently misplaced mapping is the exact failure mode that makes
@@ -323,6 +383,126 @@ impl Drop for AddrSpace {
     }
 }
 
+/// Mach memory entries: the macOS backing where POSIX shm is refused.
+#[cfg(target_os = "macos")]
+mod mach {
+    use std::io;
+
+    pub type Port = u32;
+    type KernReturn = i32;
+    const KERN_SUCCESS: KernReturn = 0;
+    const VM_PROT_READ: i32 = 0x1;
+    const VM_PROT_WRITE: i32 = 0x2;
+    const VM_FLAGS_FIXED: i32 = 0x0000;
+    const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+    const VM_INHERIT_NONE: u32 = 2;
+    /// <mach/memory_object_types.h>: a new anonymous object, not a view of
+    /// existing memory.
+    const MAP_MEM_NAMED_CREATE: i32 = 0x02_0000;
+
+    // libc marks `mach_vm_map` deprecated (it points at the `mach2` crate) and
+    // has no `mach_make_memory_entry_64`, so these three are declared here.
+    unsafe extern "C" {
+        static mach_task_self_: Port;
+        fn mach_make_memory_entry_64(
+            target_task: Port,
+            size: *mut u64,
+            offset: u64,
+            permission: i32,
+            object_handle: *mut Port,
+            parent_entry: Port,
+        ) -> KernReturn;
+        fn mach_vm_map(
+            target_task: Port,
+            address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: i32,
+            object: Port,
+            offset: u64,
+            copy: i32,
+            cur_protection: i32,
+            max_protection: i32,
+            inheritance: u32,
+        ) -> KernReturn;
+        fn mach_port_deallocate(task: Port, name: Port) -> KernReturn;
+    }
+
+    fn task() -> Port {
+        // SAFETY: set by libSystem before main and never changed.
+        unsafe { mach_task_self_ }
+    }
+
+    fn err(what: &str, kr: KernReturn) -> io::Error {
+        io::Error::other(format!("ppmem: {what}: kern_return_t {kr}"))
+    }
+
+    /// `IRIS_PPMEM_BACKEND=mach`: use Mach memory entries even where POSIX shm
+    /// works, to test this path outside the sandbox. Read once.
+    pub fn forced() -> bool {
+        static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FORCED.get_or_init(|| std::env::var("IRIS_PPMEM_BACKEND").is_ok_and(|v| v == "mach"))
+    }
+
+    /// Say once why the fallback is in use.
+    pub fn note_fallback(e: &io::Error) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("{e}; using Mach memory entries (the App Sandbox allows no unnamed POSIX shm)"));
+    }
+
+    /// A new zero-filled object of `len` bytes.
+    pub fn create(len: usize) -> io::Result<Port> {
+        let mut size = len as u64;
+        let mut port: Port = 0;
+        // SAFETY: plain out-parameters; a parent of 0 (MACH_PORT_NULL) with
+        // MAP_MEM_NAMED_CREATE makes a fresh object.
+        let kr = unsafe {
+            mach_make_memory_entry_64(task(), &mut size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &mut port, 0)
+        };
+        if kr != KERN_SUCCESS {
+            return Err(err("mach_make_memory_entry_64", kr));
+        }
+        if (size as usize) < len {
+            release(port);
+            return Err(err("mach_make_memory_entry_64 (short object)", -1));
+        }
+        Ok(port)
+    }
+
+    /// Map `[offset, offset+len)` of `port` at `at`, replacing what is there.
+    ///
+    /// # Safety
+    ///
+    /// As `AddrSpace::map`: `at..at+len` must be address space the caller owns.
+    pub unsafe fn map(at: *mut u8, len: usize, port: Port, offset: u64, prot: libc::c_int) -> io::Result<*mut u8> {
+        let mut addr = at as u64;
+        let cur = (if prot & libc::PROT_READ != 0 { VM_PROT_READ } else { 0 })
+            | (if prot & libc::PROT_WRITE != 0 { VM_PROT_WRITE } else { 0 });
+        let kr = mach_vm_map(
+            task(),
+            &mut addr,
+            len as u64,
+            0,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            port,
+            offset,
+            0, // shared, not a copy
+            cur,
+            VM_PROT_READ | VM_PROT_WRITE,
+            VM_INHERIT_NONE,
+        );
+        if kr != KERN_SUCCESS {
+            return Err(err("mach_vm_map", kr));
+        }
+        Ok(addr as *mut u8)
+    }
+
+    pub fn release(port: Port) {
+        // SAFETY: `port` is a send right this process owns.
+        unsafe { mach_port_deallocate(task(), port) };
+    }
+}
+
 pub fn granularity() -> usize {
     // Unix has no separate allocation granularity; the page size is the
     // alignment mmap requires for both address and file offset.
@@ -390,6 +570,40 @@ mod tests {
             *space.base() = 0x11;
             *space.base().add(g) = 0x22;
             assert_eq!(*space.base(), 0x11, "distinct objects are aliasing");
+        }
+    }
+
+    /// The Mach backing (the App Sandbox's) keeps the shm backing's
+    /// contract: zero-filled, every mapping the same pages, objects
+    /// independent, and a scrub or an unmap over it holds the claim.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mach_backing_behaves_like_shm() {
+        let g = super::super::granularity();
+        let len = 4 * g;
+        let a = SharedMem::new_mach(len).unwrap();
+        let b = SharedMem::new_mach(g).unwrap();
+        let space = AddrSpace::reserve(len * 2 + g).unwrap();
+        unsafe {
+            space.map(0, len, &a, 0, Prot::ReadWrite).unwrap();
+            space.map(len, len, &a, 0, Prot::ReadWrite).unwrap();
+            space.map(2 * len, g, &b, 0, Prot::ReadWrite).unwrap();
+            for i in (0..len).step_by(g / 4) {
+                assert_eq!(*space.base().add(i), 0, "byte {i} not zero-filled");
+            }
+            *space.base().add(7) = 0x5A;
+            assert_eq!(*space.base().add(len + 7), 0x5A, "aliases not coherent");
+            *space.base().add(len + 2 * g) = 0x33;
+            assert_eq!(*space.base().add(2 * g), 0x33, "aliases not coherent the other way");
+            *space.base().add(2 * len) = 0x11;
+            assert_eq!(*space.base(), 0, "distinct objects are aliasing");
+            // A mapping at an offset into the object.
+            space.map(len, g, &a, (2 * g) as u64, Prot::ReadOnly).unwrap();
+            assert_eq!(*space.base().add(len), 0x33, "offset mapping sees the object's page");
+            space.scrub(len, g).unwrap();
+            assert_eq!(*space.base().add(len), 0, "scrub left private zeroes");
+            assert_eq!(*space.base().add(2 * g), 0x33, "scrubbing one view leaves the object");
+            space.unmap(len + g, g).unwrap();
         }
     }
 

@@ -1,5 +1,5 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
-use iris::config::{MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
+use iris::config::{MachineConfig, MachineProfile, VALID_BANK_SIZES};
 use iris::cpu::parts::{self, Part};
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
@@ -62,28 +62,7 @@ impl Default for NewMachineDialog {
     }
 }
 
-/// The name a new machine of `profile` gets until the user types one:
-/// the profile's name up to its board number (`o2`, `octane`, `indigo2`).
-pub fn default_name(profile: MachineProfile) -> &'static str {
-    let name = profile.name();
-    name.split_once('_').map_or(name, |(model, _)| model)
-}
-
-/// Fill the profile's banks largest first, without gaps.
-pub fn distribute_ram(total: u32, profile: MachineProfile) -> [u32; iris::config::MAX_BANKS] {
-    let mut remaining = total;
-    let mut banks = [0u32; iris::config::MAX_BANKS];
-    for slot in banks.iter_mut().take(profile.memory_banks()) {
-        // Pick the largest size in VALID_BANK_SIZES that is <= remaining.
-        let pick = VALID_BANK_SIZES.iter()
-            .filter(|&&s| s > 0 && s <= remaining && profile.bank_sizes().contains(&s))
-            .max().copied().unwrap_or(0);
-        *slot = pick;
-        remaining -= pick;
-        if remaining == 0 { break; }
-    }
-    banks
-}
+pub use iris_gui_core::model::hardware::{default_name, distribute_ram};
 
 impl NewMachineDialog {
     pub fn open(&mut self) { self.open = true; self.result = None; }
@@ -272,33 +251,6 @@ impl NewMachineDialog {
                     ui.end_row();
                 });
 
-                if self.profile == MachineProfile::Indigo2Ip28 {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(t!("dialog-new-machine-ip28-note"))
-                        .color(Color32::from_rgb(220, 170, 90))
-                        .small(),
-                    );
-                }
-
-                if self.profile == MachineProfile::OctaneIp30 {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(t!("dialog-new-machine-octane-note"))
-                        .color(Color32::from_rgb(220, 170, 90))
-                        .small(),
-                    );
-                }
-
-                if self.profile == MachineProfile::O2Ip32 {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(t!("dialog-new-machine-o2-note"))
-                        .color(Color32::from_rgb(220, 170, 90))
-                        .small(),
-                    );
-                }
-
                 ui.separator();
                 ui.label(RichText::new(t!("dialog-new-machine-disks")).strong());
                 Grid::new("new_machine_disk").num_columns(2).striped(true).show(ui, |ui| {
@@ -355,47 +307,24 @@ impl NewMachineDialog {
                     if let Err(e) = &valid { ui.colored_label(Color32::from_rgb(230, 140, 70), e); }
                     if ui.add_enabled(valid.is_ok(), crate::extra_ui::filled_button(RichText::new(t!("dialog-new-machine-create")).strong(), Color32::from_rgb(60, 110, 60))).clicked()
                     {
-                        let mut cfg = MachineConfig::default();
-                        cfg.machine.profile = self.profile;
-                        cfg.set_cpu(self.cpu);
-                        cfg.banks_set = true;
-                        cfg.graphics.board = Some(self.graphics);
-                        cfg.graphics.resolution = if self.graphics == iris::config::GraphicsBoard::Newport { self.resolution } else { NewportResolution::Guest };
-                        cfg.prom = if self.use_embedded_prom { String::new() } else { self.prom_path.clone() };
-                        // "(embedded)" names the PROM built into iris.
-                        if cfg.prom.is_empty() { cfg.prom = "(embedded)".into(); }
-                        cfg.nvram = self.nvram_path.clone();
-                        cfg.nveeprom = self.nveeprom_path.clone();
-                        cfg.banks = if self.ram_advanced {
-                            self.ram_banks
-                        } else {
-                            distribute_ram(self.ram_total_mb, self.profile)
+                        let spec = iris_gui_core::controller::new_machine::NewMachineSpec {
+                            name: self.name.clone(),
+                            profile: self.profile,
+                            cpu: self.cpu,
+                            graphics: self.graphics,
+                            resolution: self.resolution,
+                            use_embedded_prom: self.use_embedded_prom,
+                            prom_path: self.prom_path.clone(),
+                            nvram_path: self.nvram_path.clone(),
+                            nveeprom_path: self.nveeprom_path.clone(),
+                            ram_total_mb: self.ram_total_mb,
+                            ram_advanced: self.ram_advanced,
+                            ram_banks: self.ram_banks,
+                            disk_path: self.scsi1_path.clone(),
+                            cdrom_path: self.cdrom4_path.clone(),
+                            attach_cdrom: self.attach_cdrom,
                         };
-                        // Keep the PROM's flash records between runs.
-                        if self.profile == MachineProfile::OctaneIp30 {
-                            cfg.octane.flash = Some("flash-ip30.bin".into());
-                        }
-                        // SCSI defaults: drop the built-in entries unless the
-                        // user explicitly opted in.
-                        cfg.devices.clear();
-                        if self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
-                            // On the I-brick's loop, at loop ID 1.
-                            let disk = ScsiDeviceConfig { path: self.scsi1_path.clone(), ..Default::default() };
-                            cfg.devices.push(iris::devices::ConfiguredDevice::new("xio15/pci0/1/l1", iris::devices::DeviceModel::Scsi(disk)));
-                        }
-                        if !self.profile.is_ip35_bricks() && !self.scsi1_path.is_empty() {
-                            cfg.set_disk(1, ScsiDeviceConfig {
-                                path: self.scsi1_path.clone(),
-                                ..Default::default()
-                            });
-                        }
-                        if !self.profile.is_ip35_bricks() && self.attach_cdrom && !self.cdrom4_path.is_empty() {
-                            cfg.set_disk(4, ScsiDeviceConfig {
-                                path: self.cdrom4_path.clone(),
-                                cdrom: true,
-                                ..Default::default()
-                            });
-                        }
+                        let cfg = spec.build();
                         let name = if self.name.trim().is_empty() { default_name(self.profile) } else { self.name.trim() }.to_string();
                         self.result = Some(NewMachineResult { name, cfg });
                         close = true;

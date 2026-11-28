@@ -54,11 +54,7 @@ assets = [
 [features]
 # Distributed build. Hides source-checkout tools such as premiere preparation.
 # Machine TOML storage is shared by source, Release, and App Store builds.
-bundled = []
-# Mac App Store distribution build. Implies `bundled`, and additionally hides
-# the CI/Automation config tab (the iris-ci socket is a developer automation
-# feature unusable in the sandbox). Set by .github/workflows/appstore.yml.
-appstore = ["bundled"]
+bundled = ["iris-gui-core/bundled"]
 # PCAP bridged networking. Off by default because it adds a hard build-time
 # dependency on a pcap library (libpcap headers on Unix, a WinPcap-compatible
 # `wpcap` SDK on Windows). When enabled, the Network tab can enumerate host
@@ -85,18 +81,18 @@ perfetto = ["iris/perfetto"]
 # Opt-in Newport framebuffer damage tracking and partial GL uploads.
 rex-dirty-upload = ["iris/rex-dirty-upload"]
 # Experimental GPU-authoritative raster backends in the embedded core.
-wgpu = ["iris/wgpu"]
+wgpu = ["iris/wgpu", "iris-gui-core/wgpu"]
 
 [dependencies]
 # The GUI always enables the graphics JITs (`gpujit`: REX3 draw shaders and
-# IMPACT raster pipelines); the `appstore` build turns both off at run time
-# with IRIS_NO_JIT. CHD, camera, DaynaPort, and Ultra64 device support are
+# IMPACT raster pipelines). CHD, camera, DaynaPort, and Ultra64 device support are
 # unconditional in the core and selected at runtime; Ultra64 requires an
 # external gopher64 bridge peer.
 iris = { path = "..", features = ["gpujit"] }
+# The toolkit-free model and controllers every shell shares.
+iris-gui-core = { path = "core" }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.36"
-crossbeam-channel = "0.5"
 parking_lot = "0.12"
 # Match iris's winit version — Ps2Controller::push_kb takes
 # winit::keyboard::KeyCode.
@@ -109,27 +105,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 dirs = "6"
-# fs::canonicalize without the \\?\ prefix Windows file dialogs never use.
-dunce = "1"
 log = "0.4"
 env_logger = "0.11"
-# Read the host's own interface addresses (Networking tab: first-free subnet
-# presets + overlap warnings). Reads addresses via getifaddrs — no entitlement,
-# and it does not trigger the macOS 15 Local Network prompt (that's for talking
-# *to* LAN peers, not enumerating your own NICs).
-if-addrs = "0.15"
-# GUI text catalogs (locales/<language>/*.ftl, see src/i18n.rs). Fluent handles
-# plurals and argument formatting per language; sys-locale picks the system
-# language when the user hasn't chosen one.
-fluent-bundle = "0.16"
-fluent-syntax = "0.12"
-unic-langid = "0.9"
-sys-locale = "0.3"
 
-# macOS App Sandbox: NSURL security-scoped bookmarks let the App Store build
-# reopen user-selected disk images / PROMs / ISOs across launches. These crates
-# are already in the build graph (eframe/winit/rfd pull them in); we enable a
-# few extra type features and use them only under `feature = "appstore"`.
+# macOS: these crates are already in the build graph (eframe/winit/rfd pull
+# them in); a few extra type features for the host helpers (host.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [

@@ -2,7 +2,7 @@
 
 ## New machine
 
-dialog-new-machine-title = New machine
+dialog-new-machine-title = New Machine
 dialog-new-machine-subtitle =
 dialog-new-machine-name = Name
 dialog-new-machine-model = Model
@@ -26,7 +26,6 @@ dialog-new-machine-ram-banks = Set each memory bank
 dialog-new-machine-mb = { $size } MB
 # $bank is the bank number, 0 to 3.
 dialog-new-machine-bank = Bank { $bank }
-dialog-new-machine-ip28-note = Indigo2 R10000 support is experimental. The machine gets IMPACT graphics, because the IRIX kernel for this model has no Newport driver. The built-in PROM is used unless you choose a PROM file.
 dialog-new-machine-disks = Disks
 dialog-new-machine-hdd = Hard disk (SCSI 1)
 dialog-new-machine-hdd-picker = Choose hard disk image
@@ -53,5 +52,16 @@ dialog-create-disk-subtitle =
 dialog-create-disk-exists = ⚠ { $file } already exists ({ $size } MB). Creating the image erases it.
 dialog-create-disk-overwrite = Erase the existing image
 dialog-create-disk-create = Create
-dialog-new-machine-octane-note = The Octane runs the built-in IP30 PROM unless you choose an image. Choose a compatible processor and IMPACT or VPro graphics above.
-dialog-new-machine-o2-note = The O2 runs the built-in IP32 PROM unless you choose an image. Choose an R5000, R10000 or R12000 module above. Its memory uses DIMM-pair kits of 32, 64, 128 or 256 MB.
+
+## The New Machine wizard
+
+wizard-step-type = Choose the machine
+wizard-step-hardware = Name and hardware
+wizard-step-disks = Disks
+wizard-step-summary = Ready to create
+# $n and $total count the steps.
+wizard-step-of = Step { $n } of { $total }
+wizard-back = Back
+wizard-continue = Continue
+wizard-none = None
+wizard-no-disc = Empty drive

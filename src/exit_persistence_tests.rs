@@ -594,6 +594,53 @@ macro_rules! machines {
     )*};
 }
 
+/// The front-end's read hook sees each disk as the guest left it, diffs and
+/// overlays included, from any byte offset, and knows its size.
+fn read_hook(machine: Machine) {
+    let _serial = serial();
+    let tag = format!("{machine:?}-read-hook");
+    on_big_stack(move || {
+        let dir = Dir::new(&tag);
+        make_images(&dir);
+        let mut m = build(config(machine, &dir, true));
+        let mut expect = Expect::new();
+        expect.write_wave(&mut *m, 1);
+        for (i, (id, kind)) in DISKS.iter().enumerate() {
+            // The CHDs are bigger than the part the waves write.
+            let size = match kind {
+                Kind::ChdDiff | Kind::ChdCow => 256 * 1024,
+                _ => BLOCKS * BLOCK,
+            };
+            assert_eq!(m.disk_size(0, *id), Some(size as u64), "{machine:?} id {id} ({kind:?})");
+            for (at, len) in [(0, BLOCKS * BLOCK), (3, 1000), (BLOCK - 1, 2 * BLOCK + 2)] {
+                let mut got = vec![0u8; len];
+                m.read_disk(0, *id, at as u64, &mut got).unwrap();
+                assert!(got == expect.0[i][at..at + len], "{machine:?} id {id} ({kind:?}): {len} bytes at {at}");
+            }
+        }
+        assert!(m.read_disk(0, 9, 0, &mut [0u8; 4]).is_err(), "nothing at id 9");
+        assert!(m.read_disk(7, 1, 0, &mut [0u8; 4]).is_err(), "no bus 7");
+        end_session(m, Exit::Drop, &dir);
+    });
+}
+
+macro_rules! read_hooks {
+    ($($name:ident: $machine:expr;)*) => {$(
+        #[test]
+        fn $name() {
+            read_hook($machine)
+        }
+    )*};
+}
+
+read_hooks! {
+    indy_read_hook: Machine::Indy;
+    indigo2_read_hook: Machine::Indigo2;
+    o2_read_hook: Machine::O2;
+    octane_read_hook: Machine::Octane;
+    tezro_read_hook: Machine::Tezro;
+}
+
 machines! {
     indy_power_off_then_drop: Machine::Indy;
     indigo2_power_off_then_drop: Machine::Indigo2;

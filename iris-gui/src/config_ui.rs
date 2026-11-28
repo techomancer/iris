@@ -115,9 +115,7 @@ impl Tab {
         if !build_features::LIGHTNING {
             tabs.push(Tab::Debug);
         }
-        if !cfg!(feature = "appstore") {
-            tabs.push(Tab::Ci);
-        }
+        tabs.push(Tab::Ci);
         // The benchmark runs entirely inside this process — the guest image is
         // linked in and the emulated machine is one this app builds itself — so
         // unlike the CI tab it works in a sandbox and ships to everyone. Its
@@ -190,7 +188,6 @@ pub fn show_tab(
     tab: Tab,
     cfg: &mut MachineConfig,
     host: &[crate::netplan::HostIface],
-    disk_folders: &[String],
     pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
     mem_ctx: MemoryUiContext,
     bench: &mut crate::bench_ui::BenchState,
@@ -199,7 +196,7 @@ pub fn show_tab(
         Tab::General => TabOutcome { action: show_general(ui, cfg, mem_ctx), ..Default::default() },
         Tab::Disks   => { let (e, a) = show_disks(ui, cfg); TabOutcome { action: a, disks_changed: e.changed, disk_picked: e.picked, ..Default::default() } }
         Tab::Network => {
-            let net = show_network(ui, cfg, host, disk_folders, pcap_ifaces, mem_ctx.running);
+            let net = show_network(ui, cfg, host, pcap_ifaces, mem_ctx.running);
             TabOutcome { action: net.action.clone(), net, ..Default::default() }
         }
         Tab::Memory  => { show_memory(ui, cfg, mem_ctx); TabOutcome::default() }
@@ -431,7 +428,6 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     // read once at VM start. The toggle is never shown in App Store builds:
     // the sandbox can't open the named shm or run the external gopher64
     // process it talks to.
-    #[cfg(not(feature = "appstore"))]
     {
         ui.separator();
         let mut on = cfg.has_device("ultra64");
@@ -448,7 +444,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
 /// The monitor console's loopback port, default filled in.
 pub fn monitor_port(cfg: &MachineConfig) -> u16 {
-    cfg.monitor_port.unwrap_or(iris::monitor::DEFAULT_PORT)
+    iris_gui_core::controller::debug::monitor_port(cfg)
 }
 
 /// `monitor_port`, `serial_port_a`, `serial_port_b`: the loopback TCP ports of
@@ -943,11 +939,14 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                         ui.end_row();
                     }
 
-                    ui.label(t!("config-scsi-cow"))
-                        .tip(t!("config-scsi-cow-tip"));
-                    ui.checkbox(&mut dev.overlay, "")
-                        .tip(t!("config-scsi-cow-check-tip"));
-                    ui.end_row();
+                    // Copy-on-write only for what IRIX can write: a CD-ROM is read-only.
+                    if !dev.is_cdrom() {
+                        ui.label(t!("config-scsi-cow"))
+                            .tip(t!("config-scsi-cow-tip"));
+                        ui.checkbox(&mut dev.overlay, "")
+                            .tip(t!("config-scsi-cow-check-tip"));
+                        ui.end_row();
+                    }
 
                     // `write_cache`: hard disks only; a CD-ROM is read-only and
                     // a scratch volume is written straight through.
@@ -1031,7 +1030,6 @@ fn show_network(
     ui: &mut Ui,
     cfg: &mut MachineConfig,
     host: &[crate::netplan::HostIface],
-    disk_folders: &[String],
     pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
     running: bool,
 ) -> NetworkOutcome {
@@ -1290,40 +1288,15 @@ fn show_network(
     let has_port = |p: u16| cfg.port_forward.iter().any(|f| f.guest_port == p);
     let mut add: Option<PortForwardConfig> = None;
     ui.menu_button(t!("config-forward-add"), |ui| {
-        if ui.add_enabled(!has_port(23), egui::Button::new(t!("config-forward-telnet")))
-            .tip(t!("config-forward-telnet-tip"))
-            .clicked()
-        {
-            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2323, guest_port: 23, bind: ForwardBind::Localhost });
-            ui.close();
-        }
-        if ui.add_enabled(!has_port(21), egui::Button::new(t!("config-forward-ftp")))
-            .tip(t!("config-forward-ftp-tip"))
-            .clicked()
-        {
-            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2121, guest_port: 21, bind: ForwardBind::Localhost });
-            ui.close();
-        }
-        if ui.add_enabled(!has_port(22), egui::Button::new(t!("config-forward-ssh")))
-            .tip(t!("config-forward-ssh-tip"))
-            .clicked()
-        {
-            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2222, guest_port: 22, bind: ForwardBind::Localhost });
-            ui.close();
-        }
-        if ui.add_enabled(!has_port(5900), egui::Button::new(t!("config-forward-vnc")))
-            .tip(t!("config-forward-vnc-tip"))
-            .clicked()
-        {
-            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 5901, guest_port: 5900, bind: ForwardBind::Localhost });
-            ui.close();
-        }
-        if ui.add_enabled(!has_port(177), egui::Button::new(t!("config-forward-xdmcp")))
-            .tip(t!("config-forward-xdmcp-tip"))
-            .clicked()
-        {
-            add = Some(PortForwardConfig { proto: ForwardProto::Udp, host_port: 11177, guest_port: 177, bind: ForwardBind::Any });
-            ui.close();
+        // The suggestions are the controller's, as the Mac app's.
+        for preset in iris_gui_core::controller::settings::forward_presets() {
+            if ui.add_enabled(!has_port(preset.row.guest_port), egui::Button::new(&preset.label))
+                .tip(preset.tip.clone())
+                .clicked()
+            {
+                add = Some(preset.config());
+                ui.close();
+            }
         }
         if ui.button(t!("config-forward-custom")).clicked() {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 0, guest_port: 0, bind: ForwardBind::Localhost });
@@ -1377,27 +1350,6 @@ fn show_network(
             ui.end_row();
         });
 
-        // App Store: the in-core NFS server can only reach a folder the sandbox
-        // has granted. Easiest path — put the share inside a granted disk folder,
-        // whose recursive grant flows down to it (you can also pick any folder
-        // above; the folder picker grants that one directly).
-        if cfg!(feature = "appstore") {
-            ui.add_space(4.0);
-            if disk_folders.is_empty() {
-                ui.label(RichText::new(t!("config-nfs-appstore-grant")).weak());
-            } else {
-                ui.label(RichText::new(t!("config-nfs-appstore-shared")).weak());
-                for folder in disk_folders {
-                    let shared = std::path::Path::new(folder).join("shared");
-                    if ui.button(t!("config-use", value = shared.display())).clicked()
-                        && std::fs::create_dir_all(&shared).is_ok()
-                    {
-                        nfs.shared_dir = shared.to_string_lossy().into_owned();
-                        out.changed = true;
-                    }
-                }
-            }
-        }
 
         // Live mount command — the server IP fills in to match the backend. The
         // export is the single root, so the path is just "/". NAT: the gateway IP
@@ -2214,8 +2166,8 @@ pub(crate) enum Pick {
 pub fn reveal_in_file_manager(path: &str) {
     #[cfg(target_os = "macos")]
     {
-        // NSWorkspace, not `open` — sandbox-safe (see macos_sandbox::reveal_in_finder).
-        crate::macos_sandbox::reveal_in_finder(&crate::abs_path(path));
+        // NSWorkspace, not `open` — sandbox-safe (see host::reveal_in_finder).
+        crate::host::reveal_in_finder(&crate::abs_path(path));
     }
     #[cfg(target_os = "windows")]
     {

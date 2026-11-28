@@ -135,7 +135,9 @@ jobs:
   # Each macOS architecture builds on its own runner, at the same time, like
   # the Windows and Linux matrices; `macos` below glues the two slices into
   # universal binaries and signs, notarizes and packages them. x86_64 is
-  # cross-compiled on the arm64 runner, as it always was.
+  # cross-compiled on the arm64 runner, as it always was. The macOS app is the
+  # native AppKit one ("IRIS.app", iris-gui/frontends/appkit); the
+  # egui IRIS.app is no longer built for macOS.
   macos-build:
     name: macOS build (${{ matrix.arch }})
     needs: version
@@ -175,7 +177,7 @@ jobs:
         with:
           name: macos-slice-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/iris-gui
+            target/${{ matrix.target }}/release/iris-appkit
             target/${{ matrix.target }}/release/iris
             target/${{ matrix.target }}/release/iris-ci
           if-no-files-found: error
@@ -185,9 +187,9 @@ jobs:
     name: macOS (universal)
     needs: [version, macos-build]
     runs-on: ${{ inputs.macos_runner || 'macos-26' }}
-    # Three notarization round trips. The ceiling leaves room for an
-    # Apple-side queue without hiding a hang.
-    timeout-minutes: 60
+    # Three notarization round trips, each retrying a dropped connection. The
+    # ceiling leaves room for an Apple-side queue without hiding a hang.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
         with:
@@ -204,8 +206,8 @@ jobs:
           path: target/x86_64-apple-darwin/release
       - name: Check the slices
         run: |
-          chmod +x target/*-apple-darwin/release/{iris-gui,iris,iris-ci}
-          lipo -info target/*-apple-darwin/release/{iris-gui,iris,iris-ci}
+          chmod +x target/*-apple-darwin/release/{iris-appkit,iris,iris-ci}
+          lipo -info target/*-apple-darwin/release/{iris-appkit,iris,iris-ci}
 
       # Signing and notarization switch on when the secrets exist. Without
       # them the app is signed ad hoc and Gatekeeper warns on first launch.

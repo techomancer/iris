@@ -373,6 +373,24 @@ Use this sequence on **both** Unix platforms so the tested path and the shipped
 macOS path are identical. (`memfd_create` may be used on Linux as an
 optimisation later, but it is not needed and diverges the code paths.)
 
+The macOS App Sandbox (the Mac App Store build) refuses this `shm_open`: a
+sandboxed app may only open POSIX shared memory under an application-group
+name, and the 31-byte name limit leaves no room for one. There, and only
+there, macOS backs the object with a Mach memory entry instead:
+
+```c
+mach_make_memory_entry_64(task, &size, 0,
+    MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
+/* each view: */
+mach_vm_map(task, &at, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            entry, offset, FALSE /* shared */, prot, VM_PROT_READ | VM_PROT_WRITE,
+            VM_INHERIT_NONE);
+```
+
+It is anonymous and zero-filled, every view is the same pages, and
+`VM_FLAGS_OVERWRITE` replaces the range atomically, as `MAP_FIXED` does.
+`IRIS_PPMEM_BACKEND=mach` selects it outside the sandbox, for testing.
+
 ### 7.3 Windows — placeholders, not plain VirtualAlloc
 
 The intuitive approach — `VirtualAlloc(MEM_RESERVE)` 4GB then map views inside

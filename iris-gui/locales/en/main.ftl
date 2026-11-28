@@ -71,15 +71,13 @@ menu-file-needs-edit = { $name } (needs editing)
 menu-file-rename-machine = Rename machine…
 menu-file-rename-machine-disabled-tip = No machine is selected.
 menu-file-delete-machine = Delete machine
+menu-file-duplicate-machine = Duplicate machine
+menu-file-duplicate-machine-tip = Copy the machine's settings and NVRAM. The copy uses the same disk images.
+menu-file-show-folder = Show machine folder
+menu-file-open-config = Open config file
 menu-file-premiere = Prepare for Premiere…
-menu-file-folders-heading = Disk folder access
 menu-file-grant-folder = Grant a disk folder…
 menu-file-grant-folder-tip = Choose the folder that holds your disk images so IRIS can save disk changes there.
-menu-file-no-folders = No folders granted
-menu-file-folder-active-tip = IRIS can read and write this folder.
-menu-file-folder-lapsed-tip = Access has lapsed. Grant this folder again.
-menu-file-folder-reveal-tip = Show in Finder
-menu-file-folder-revoke-tip = Remove access
 menu-file-quit = Quit
 
 ## Machine menu
@@ -96,7 +94,7 @@ menu-machine-reset-nvram-tip =
     { $nveeprom }
 toast-nvram-reset-failed = Couldn't reset the NVRAM: { $error }
 toast-nveeprom-reset-failed = Couldn't reset the NVRAM EEPROM: { $error }
-toast-nvram-reset = NVRAM reset. New Ethernet address: { $mac }
+toast-nvram-reset = NVRAM reset. Ethernet address: { $mac }
 # $cpu is a processor name such as R4400.
 menu-machine-processor = Processor: { $cpu }
 toast-cpu-set = Processor set to { $cpu }. It takes effect the next time the machine starts.
@@ -108,7 +106,6 @@ menu-machine-restore-state = Restore state
 menu-machine-restore = Restore
 menu-machine-screenshot = Screenshot…
 # Title of the save dialog.
-menu-machine-screenshot-title = Save screenshot
 menu-machine-serial-console = Serial console…
 menu-machine-serial-console-tip = Shows the IRIX serial console.
 
@@ -205,6 +202,8 @@ status-halted = Halted, safe to stop
 status-prom = PROM
 status-running = IRIX running
 status-stopped = Stopped
+status-stopping = Stopping…
+status-syncing = Applying disk changes…
 # $mips is a whole number.
 status-mips = { $mips } MIPS
 status-mips-tip = Emulation speed in millions of guest instructions per second.
@@ -273,6 +272,8 @@ fb-head = Head { $head }
 fb-powered-off = Powered off
 toast-guest-halted = IRIX halted. Mouse and keyboard released; click the display to capture them again.
 toast-guest-off-syncing = IRIX powered off. Synchronizing disks…
+toast-stopping = Stopping the machine…
+toast-stopping-sync = Stopping the machine and applying its disk changes. A compressed CHD is rebuilt in full, which can take a few minutes.
 
 ## Machines
 
@@ -280,6 +281,13 @@ toast-rename-failed = Couldn't rename the machine: { $error }
 toast-renamed = Renamed to { $name }.
 toast-delete-failed = Couldn't delete the machine: { $error }
 toast-deleted = Deleted { $name }. Its disk images and NVRAM files were kept.
+toast-duplicated = Made { $name }, a copy.
+toast-duplicated-shared = Made { $name }, a copy. It shares { $count ->
+    [one] one disk image
+   *[other] { $count } disk images
+} with the original; run only one of them at a time.
+toast-duplicate-failed = Couldn't copy the machine: { $error }
+toast-no-machine = No machine is selected.
 main-settings-no-machine = Default
 # $name is the machine's name.
 main-settings-heading = Settings: { $name }
@@ -312,6 +320,7 @@ window-license-chd = CHD disk support comes from libchdman-rs, which is also BSD
 window-license-source = Source:
 window-license-iris-heading = IRIS: BSD 3-Clause License
 window-license-chd-heading = CHD support (libchdman-rs): BSD 3-Clause License
+window-license-rb-heading = Disk browser filesystem crates (MIT)
 window-privacy-title = Privacy policy
 
 ## Help: camera and networking
@@ -481,7 +490,8 @@ modal-stop-title = Stop the machine?
 modal-stop-body = Stopping now could damage the disk image:
 modal-stop-halt = Shut down IRIX
 modal-stop-force = Force stop
-toast-halt-sent = Shutting down IRIX. Stop the machine once it has halted.
+toast-halt-sent = Asked IRIX to shut down on the serial console. If nothing happens, log in on the console first, or use Power Off.
+toast-reboot-sent = Asked IRIX to restart on the serial console. If nothing happens, log in on the console first, or use Reset.
 modal-prom-title = Use the built-in PROM?
 modal-prom-body = Replace the selected PROM with the built-in one?
 modal-prom-confirm = Use built-in PROM
@@ -504,15 +514,15 @@ modal-missing-title = Missing disk images
 modal-missing-body = These disk images are missing or can't be read:
 modal-missing-cdrom = SCSI { $id } (CD-ROM): { $path }
 modal-missing-disk = SCSI { $id } (disk): { $path }
+modal-missing-cdrom-none = SCSI { $id } (CD-ROM): none of its discs can be read
+modal-missing-disk-none = SCSI { $id } (disk): no image chosen
 modal-missing-sandbox = If a file exists but is listed here, macOS has withdrawn access to it. Choose it again on the Disks tab.
-modal-missing-subtitle =
 modal-missing-edit = Open Disks tab
 modal-missing-detach = Remove missing and start
 modal-grant-title = Allow access to disk folders
 modal-grant-body = IRIS can't write to the folders holding these CHD disks:
 modal-grant-disk = SCSI { $id }: { $path }
 modal-grant-why = A compressed CHD keeps this session's changes in a separate file and merges them into the disk when you quit. That needs write access to the disk's folder. Without it, the change file keeps growing.
-modal-grant-subtitle =
 modal-grant-sandbox = Grant access to the folder so IRIS can merge changes on quit:
 modal-grant-folder = Grant { $path }…
 modal-grant-tcc = macOS is blocking access to these folders. Allow IRIS in System Settings > Privacy & Security, under Files and Folders or Full Disk Access, then check again. Full Disk Access may need IRIS to be reopened.

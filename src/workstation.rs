@@ -325,6 +325,20 @@ pub trait Workstation: Send {
     fn disk_activity(&self) -> Vec<Vec<crate::scsi::DiskCounts>> {
         Vec::new()
     }
+    /// Read `buf.len()` bytes at byte `offset` of the disk or disc at SCSI
+    /// `id` on disk bus `bus` (the order of [`Workstation::disk_activity`]),
+    /// as the guest sees it, for a front-end browsing a running machine's
+    /// disk. Any byte range, aligned or not. Read-only: there is no write
+    /// counterpart. Holds the bus lock in short pieces, so the guest's own
+    /// commands wait at most one piece, and the result is still one picture
+    /// of the disk (see [`crate::scsi::ScsiBus::read_media`]).
+    fn read_disk(&self, _bus: usize, _id: u8, _offset: u64, _buf: &mut [u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "this machine has no disk read hook"))
+    }
+    /// The size of that disk or disc in bytes; `None` when there is none.
+    fn disk_size(&self, _bus: usize, _id: u8) -> Option<u64> {
+        None
+    }
     /// Frames the machine's sound cards have moved, for a front-end's audio
     /// light; `None` with no sound card. Compare two samples.
     fn audio_frames(&self) -> Option<u64> {

@@ -1,14 +1,14 @@
-# Mac App Store build and submission pipeline for IRIS.
+# Mac App Store build and submission pipeline for IRIS: the native AppKit app
+# (iris-gui/frontends/appkit), sandboxed. The egui app is not built here.
 #
 # Manual trigger only — run this when you're ready to submit a new build,
 # not on every commit.
 #
-# Version: the App Store build carries the same X.Y.Z as the matching release
-# (release.yml). By default that is the newest vX.Y.Z tag reachable from the
-# commit being built; set the `version` input to pick another. The About window
-# and CFBundleShortVersionString show X.Y.Z; CFBundleVersion is a UTC
-# timestamp (YYYYMMDD.HHMM), because App Store Connect needs every uploaded
-# build number to be new.
+# Version: App Store builds are numbered by date, YYYYMMDD.HHMM in UTC, as
+# they always have been (20260831.2042), for both CFBundleShortVersionString
+# and CFBundleVersion: App Store Connect wants a version above the last one it
+# approved and a new build number per upload. Set the `version` input to pick
+# another (YYYYMMDD.HHMM or X.Y.Z).
 #
 # Required repository secrets:
 #   APP_STORE_APP_CERT          base64-encoded Mac App Distribution .p12
@@ -41,7 +41,7 @@ on:
         required: false
         default: ''
       version:
-        description: Release version X.Y.Z (leave empty for the newest vX.Y.Z tag on the built commit)
+        description: Version YYYYMMDD.HHMM or X.Y.Z (leave empty for the UTC time, YYYYMMDD.HHMM)
         required: false
         default: ''
       validate_only:
@@ -88,16 +88,17 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.build_branch || 'main' }}
-          fetch-depth: 0   # the version comes from the newest vX.Y.Z tag
+          fetch-depth: 0
       - name: Generate version
         id: version
         env:
           VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
-          # X.Y.Z, the same version the matching release ships as.
-          VERSION=$(scripts/dist/version.sh appstore "$VERSION_INPUT")
-          # App Store Connect wants a new, numeric build number per upload.
+          # One clock reading for both: the version and the build number are
+          # the same YYYYMMDD.HHMM unless a version is given. App Store Connect
+          # wants a new, numeric build number per upload.
           BUNDLE_VERSION=$(date -u +"%Y%m%d.%H%M")
+          VERSION=$(scripts/dist/version.sh appstore "${VERSION_INPUT:-$BUNDLE_VERSION}")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "bundle_version=$BUNDLE_VERSION" >> $GITHUB_OUTPUT
           echo "App Store build $VERSION ($BUNDLE_VERSION)" >> $GITHUB_STEP_SUMMARY
@@ -331,16 +332,18 @@ jobs:
             echo "::warning::${unpatched} winit copy/copies resolve from the registry and are NOT covered by [patch.crates-io] (it matches the 0.30.x requirement only). Their set_blur still calls the private SkyLight API; it is dead-stripped today, but this is the condition that regressed on 2026-08-03. Unifying the graph on winit 0.30.13 removes the risk — see clanker/macos/appstore-private-api.md."
           fi
 
-      - name: Build iris-gui for both arches (lightning + CHD, App Store)
+      - name: Build the Mac app for both arches (lightning, App Store)
         env:
-          # Baked into APP_VERSION by iris-gui/build.rs and shown in About.
-          # Must equal the CFBundleShortVersionString the packaging job writes.
+          # Shown in About. Must equal the CFBundleShortVersionString the
+          # packaging job writes.
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          # macOS 11 is the app's floor (LSMinimumSystemVersion).
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
-          cargo build --release --target aarch64-apple-darwin -p iris-gui \
-            --features iris/lightning,appstore
-          cargo build --release --target x86_64-apple-darwin  -p iris-gui \
-            --features iris/lightning,appstore
+          cargo build --release --target aarch64-apple-darwin -p iris-gui-appkit \
+            --features appstore,lightning
+          cargo build --release --target x86_64-apple-darwin  -p iris-gui-appkit \
+            --features appstore,lightning
 
       # ── App Store gate: no private SkyLight API in the linked binaries ───────
       # eframe → egui-winit → winit calls the private `_CGSSetWindowBackgroundBlurRadius`
@@ -351,9 +354,10 @@ jobs:
       # proves the stub actually took effect, on the linked binary, before we
       # spend a job signing and uploading something Apple will bounce.
       #
-      # `_CGShieldingWindowLevel` is PUBLIC CoreGraphics and legitimately appears
-      # in `nm -u` — never match on it. It is used here as a positive control: a
-      # silently-broken `nm` returning nothing would otherwise grep "clean".
+      # The AppKit app links no winit, but the emulator crate still depends on
+      # it, so the gate stays. `_objc_msgSend` is a public import every AppKit
+      # binary has: a positive control, so a silently-broken `nm` returning
+      # nothing cannot grep "clean".
       # Do NOT try to attribute the symbol by running `nm` over rlibs in
       # target/*/release/deps — the release profile is `lto = "fat"`, so those
       # hold LLVM bitcode and `nm` reports "no symbols", which proves nothing.
@@ -370,8 +374,8 @@ jobs:
               echo "::error::nm -u failed on $bin — failing rather than passing a check that did not run."
               fail=1; return
             fi
-            if ! printf '%s\n' "$undef" | grep -q '_CGShieldingWindowLevel'; then
-              echo "::error::$bin: nm -u returned $(printf '%s\n' "$undef" | wc -l | tr -d ' ') lines but not the expected PUBLIC _CGShieldingWindowLevel import. The control failed, so a clean private-API result can't be trusted — investigate before shipping."
+            if ! printf '%s\n' "$undef" | grep -qx '_objc_msgSend'; then
+              echo "::error::$bin: nm -u returned $(printf '%s\n' "$undef" | wc -l | tr -d ' ') lines but not the expected PUBLIC _objc_msgSend import. The control failed, so a clean private-API result can't be trusted — investigate before shipping."
               fail=1; return
             fi
             if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then
@@ -381,21 +385,21 @@ jobs:
             fi
             echo "OK: no private SkyLight symbols in $bin"
           }
-          check target/aarch64-apple-darwin/release/iris-gui
-          check target/x86_64-apple-darwin/release/iris-gui
+          check target/aarch64-apple-darwin/release/iris-appkit
+          check target/x86_64-apple-darwin/release/iris-appkit
           exit $fail
 
       - name: Upload arm64 binary
         uses: actions/upload-artifact@v7
         with:
-          name: iris-gui-arm64
-          path: target/aarch64-apple-darwin/release/iris-gui
+          name: iris-appkit-arm64
+          path: target/aarch64-apple-darwin/release/iris-appkit
 
       - name: Upload x86_64 binary
         uses: actions/upload-artifact@v7
         with:
-          name: iris-gui-x64
-          path: target/x86_64-apple-darwin/release/iris-gui
+          name: iris-appkit-x64
+          path: target/x86_64-apple-darwin/release/iris-appkit
 
   # ── Package and submit ───────────────────────────────────────────────────────
 
@@ -427,11 +431,11 @@ jobs:
 
       - name: Create universal binary with lipo
         run: |
-          chmod +x bins/iris-gui-arm64/iris-gui bins/iris-gui-x64/iris-gui
-          lipo -create -output iris-gui-universal \
-            bins/iris-gui-arm64/iris-gui \
-            bins/iris-gui-x64/iris-gui
-          lipo -info iris-gui-universal
+          chmod +x bins/iris-appkit-arm64/iris-appkit bins/iris-appkit-x64/iris-appkit
+          lipo -create -output iris-appkit-universal \
+            bins/iris-appkit-arm64/iris-appkit \
+            bins/iris-appkit-x64/iris-appkit
+          lipo -info iris-appkit-universal
 
       - name: Import certificates
         env:
@@ -493,9 +497,9 @@ jobs:
           echo "App identity:       $APP_ID"
           echo "Installer identity: $INSTALLER_ID"
 
-      # scripts/dist/macos-bundle.sh assembles every IRIS.app, this one
-      # included; --appstore adds the export-compliance key. Signing stays in
-      # the next step, with the App Store entitlements.
+      # The AppKit bundle script assembles the app, as for the downloads;
+      # --appstore adds the export-compliance key. Signing stays in the next
+      # step, with the App Store entitlements.
       - name: Embed provisioning profile and build .app bundle
         env:
           APP_STORE_PROVISIONING_PROFILE: ${{ secrets.APP_STORE_PROVISIONING_PROFILE }}
@@ -503,8 +507,8 @@ jobs:
           BUNDLE_VER: ${{ steps.version.outputs.bundle_version }}
         run: |
           echo "$APP_STORE_PROVISIONING_PROFILE" | base64 --decode > "$RUNNER_TEMP/embedded.provisionprofile"
-          scripts/dist/macos-bundle.sh --appstore --no-sign \
-            --binary iris-gui-universal --out . \
+          iris-gui/frontends/appkit/scripts/bundle.sh --appstore --no-sign \
+            --binary iris-appkit-universal --out . \
             --bundle-id "${{ env.BUNDLE_ID }}" \
             --version "$VER" --short-version "$VER" --build-version "$BUNDLE_VER" \
             --provisioning-profile "$RUNNER_TEMP/embedded.provisionprofile"
@@ -529,10 +533,10 @@ jobs:
       # lists both slices' undefined symbols.
       - name: Re-check the signed bundle for private SkyLight symbols
         run: |
-          BIN="IRIS.app/Contents/MacOS/iris-gui"
+          BIN="IRIS.app/Contents/MacOS/iris-appkit"
           undef=$(nm -u "$BIN") || { echo "::error::nm -u failed on $BIN"; exit 1; }
-          if ! printf '%s\n' "$undef" | grep -q '_CGShieldingWindowLevel'; then
-            echo "::error::$BIN: the public _CGShieldingWindowLevel control import is missing, so this check can't be trusted."
+          if ! printf '%s\n' "$undef" | grep -qx '_objc_msgSend'; then
+            echo "::error::$BIN: the public _objc_msgSend control import is missing, so this check can't be trusted."
             exit 1
           fi
           if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then

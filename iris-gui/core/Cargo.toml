@@ -1,0 +1,71 @@
+[package]
+name = "iris-gui-core"
+version = "0.1.0"
+edition = "2021"
+description = "IRIS front-end core: the model and controllers every GUI shell shares (no toolkit)"
+license = "BSD-3-Clause"
+publish = false
+build = "build.rs"
+
+# The toolkit-free half of the GUI (clanker/plans/iris-newgui-plan.md). The egui
+# shell (iris-gui) and the native shells (frontends/*) depend on this crate and
+# reach the emulator only through `controller`. Nothing here may name a UI
+# toolkit; scripts/check-boundaries.sh enforces that.
+
+[features]
+# Distributed build (see iris-gui/Cargo.toml); shells forward theirs here.
+bundled = []
+# Mac App Store build: security-scoped bookmarks, container storage.
+appstore = ["bundled"]
+# Experimental GPU-authoritative raster backends (see iris-gui/Cargo.toml).
+wgpu = ["iris/wgpu"]
+# Bridged networking (libpcap), for shells that build with it.
+iris-pcap = ["iris/pcap"]
+
+[dependencies]
+# Same features as iris-gui asks for, so building this crate alone does not
+# compile a second copy of the emulator with a different feature set.
+iris = { path = "../..", features = ["gpujit"] }
+log = "0.4"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+# Match iris's winit version: Ps2Controller::push_kb takes
+# winit::keyboard::KeyCode. Only its key codes are used here.
+winit = "0.30"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+dirs = "6"
+dunce = "1"
+if-addrs = "0.15"
+fluent-bundle = "0.16"
+fluent-syntax = "0.12"
+unic-langid = "0.9"
+sys-locale = "0.3"
+
+# The disk browser (D23): rusty-backup's published, MIT-licensed filesystem
+# crates. Released versions only, minimal features; never rusty-backup's main
+# crate (AGPL-3.0) and never fs-xfs 0.1.x (GPL; 0.2 is MIT). See the plan's
+# "Disk browser".
+sgi-disk = { version = "0.1.0", default-features = false, features = ["xfs"] }
+# Opened directly for XFS so the browser can read the log's state (0.2.1).
+fs-xfs = { version = "0.2.2", default-features = false }
+disk-core = { version = "0.3.0", default-features = false, features = ["fs"] }
+fs-unix = { version = "0.3.0", default-features = false, features = ["efs", "ext"] }
+rb-fsexporter = { version = "0.2.0", default-features = false }
+rb-fsimporter = { version = "0.2.0", default-features = false, features = ["native-zstd"] }
+fs-tar = { version = "0.3.1", default-features = false, features = ["native-zstd"] }
+part-tables = { version = "0.2.0", default-features = false, features = ["sgi"] }
+# Converting a machine's CHD disk to a quicker format (model::chd_convert):
+# the CHD library the emulator itself uses, same version and features.
+libchdman-rs = { version = "0.289.2", features = ["prebuilt"] }
+libc = "0.2"
+
+# Security-scoped bookmarks (Foundation, not a UI toolkit) for the App Store
+# build; see model/macos_sandbox.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSURL", "NSData", "NSError", "NSString", "NSArray", "NSPathUtilities",
+] }

@@ -170,6 +170,41 @@ hashes are given where a change is easiest to understand by reading the commit.
   IRIX 6.5.30 boots with all of them online on each; 6.5.22 also on the
   Origin 2000.
 
+### iris-gui
+
+- A machine can be duplicated from the library: its settings and small files
+  are copied and its disk images shared.
+- The status bar shows disk, CD-ROM and audio activity; clicking a CD-ROM's
+  light asks for a disc.
+- The macOS downloads (release and nightly dmg and zip) are now a native
+  AppKit **IRIS.app** instead of the egui one. It uses the same machines and
+  needs macOS 11 or later; the command-line tarball is unchanged. See
+  `iris-gui-README.md`.
+- The Mac App Store build is the native Mac app too, sandboxed, and needs
+  macOS 11 or later; the egui app is no longer built for the App Store. Its
+  builds are numbered by date (YYYYMMDD.HHMM), as the App Store has always
+  had them.
+- Sandboxed macOS builds can start machines again: guest RAM no longer needs
+  POSIX shared memory, which the App Sandbox refuses (it failed at Power On
+  since ppmem became the only RAM, on 2026-10-01).
+- The Mac app's window: a Finder-style library sidebar with a drawing of
+  each machine, a toolbar capsule that switches machines, and status-bar disk
+  and CD-ROM icons that open their device's menu.
+- The Mac app's disk browser exports, imports and edits files on EFS and XFS
+  disks, replays an unclean XFS log, and reads a running machine's disks
+  read-only, on every profile.
+- The Mac app shows the guest at a sharp Actual Size by default (Scale to
+  Fit and Stretch in the View menu), and its mouse can follow the Mac pointer
+  instead of capturing it, for RustDesk and other remote desktops.
+- The Mac app offers to convert CHD disks whose compression makes every
+  stop slow to zlib or uncompressed.
+- The Mac app has Shut Down / Power Off and Restart / Reset, stops the
+  machine when IRIX powers off, creates machines with a wizard, and offers a
+  machine's commands on a right-click in the library.
+- Quitting while a machine runs now asks first, in both front ends.
+- Inserting or ejecting a disc on a running machine no longer reports itself
+  as an error.
+
 ### jitv2 flushes
 
 - Under jitv2 the guest no longer stops when compiled code fills its arena or

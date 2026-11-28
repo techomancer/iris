@@ -69,7 +69,10 @@ shared logic every machine wants the same way (`status`, and the idempotent
 `start_guest`/`stop_guest` behind `machine-start`/`machine-stop`, see
 `src/machine_state.rs`) or optional facilities (snapshots, CHD folding, the
 scratch volume, disc changes, the NAT controls, the `disk_activity` and
-`audio_frames` counters behind a front-end's activity lights) that default to "not
+`audio_frames` counters behind a front-end's activity lights, the read-only
+`read_disk`/`disk_size` hook a front-end browses a running machine's disk with,
+which holds the bus lock 64 KiB at a time and starts a read again when the
+guest changed the medium between two pieces) that default to "not
 supported on this machine". `Machine` implements all of it. A machine built
 around a different chipset implements the same trait and gets the window,
 iris-ci, iris-gui and the monitor's `reset`/`save`/`load`/`machine-status`

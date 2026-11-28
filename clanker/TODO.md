@@ -237,7 +237,7 @@ guide and changelog when it lands.
   clipping or stale rows. Custom physical IMPACT VFO compatibility remains
   a separate hardware question.
   Sources: [display interface](../src/gfx_display.rs),
-  [IMPACT sizing](../src/dev/mgras/frame.rs), [GUI capture](../iris-gui/src/framebuffer.rs).
+  [IMPACT sizing](../src/dev/mgras/frame.rs), [GUI capture](../iris-gui/core/src/model/framebuffer.rs).
 
 ## Audio, video, and peripheral registers
 
@@ -317,7 +317,7 @@ guide and changelog when it lands.
   port forwards survive a stop/reset on every NIC
   ([note](net/a-nic-restart-must-join-its-old-backend.md)).
   Sources: [NAT/services](../src/net/mod.rs), [NFS](../src/net/nfsudp.rs),
-  [PCAP](../src/net/net_pcap.rs), [GUI capture access](../iris-gui/src/capture_access.rs).
+  [PCAP](../src/net/net_pcap.rs), [GUI capture access](../iris-gui/core/src/model/capture_access.rs).
 - [ ] **Validation/implementation — DaynaPort and Ultra64 bridges.** Verify
   DaynaPort command/status fidelity (including placeholder counters) and
   transfers under load. Test Ultra64 with its actual gopher64 peer: protocol
@@ -355,8 +355,8 @@ guide and changelog when it lands.
   currently preserve variables set by a previous machine Start, so an unchecked
   option can remain active. Define explicit override/clear behavior and verify
   switching between machines.
-  Sources: [GUI guide](../iris-gui-README.md), [worker](../iris-gui/src/handle.rs),
-  [configuration](../iris-gui/src/config_ui.rs), [safe stop](../iris-gui/src/safe_stop.rs).
+  Sources: [GUI guide](../iris-gui-README.md), [worker](../iris-gui/core/src/model/handle.rs),
+  [configuration](../iris-gui/src/config_ui.rs), [safe stop](../iris-gui/core/src/model/safe_stop.rs).
 - [ ] **Validation — host and release matrix.** Observe macOS/Linux/Windows
   GUI and CLI behavior, x86_64/aarch64/RISC-V builds where supported, Windows
   ppmem mapping, installers, AppImage, and App Store bookmark/sandbox paths.
@@ -365,7 +365,7 @@ guide and changelog when it lands.
   live smoke results are recorded separately with remaining limitations.
   Sources: [Windows ppmem](../src/ppmem/map_windows.rs),
   [GDB](../src/gdb_stub.rs), [packaging workflows](../.github/workflows),
-  [sandbox integration](../iris-gui/src/macos_sandbox.rs).
+  [sandbox integration](../iris-gui/core/src/model/macos_sandbox.rs).
 - [ ] **Maintenance — prevent documentation drift.** Check build-feature
   examples, source links, command help, configuration defaults, repository
   URLs, and changelog landing dates whenever those contracts change. Keep

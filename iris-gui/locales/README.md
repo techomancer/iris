@@ -10,7 +10,7 @@ subtitle(ui, t!("config-cpu-subtitle"));            // hidden when empty
 ui.button(t!("common-browse")).tip(t!("config-prom-browse-tip"));
 ```
 
-`t!` is defined in `src/i18n.rs`, along with `subtitle` and `ResponseExt::tip`.
+`t!` is defined in `core/src/model/i18n.rs`; the egui helpers `subtitle` and `ResponseExt::tip` are in `src/i18n.rs`.
 
 ## Editing English text
 
@@ -53,7 +53,7 @@ A missing id falls back to the base language (`pt-BR` to `pt`) and then to
 English, so a translation can be finished gradually. An empty value in a
 translation is an intentional blank; delete the line to fall back to English.
 
-`cargo test -p iris-gui i18n` checks that every id the code uses exists in
+`cargo test -p iris-gui-core i18n` checks that every id the code uses exists in
 English with the arguments the code passes, that every English id is used, and
 that every translation's ids and arguments match English.
 

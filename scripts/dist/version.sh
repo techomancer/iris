@@ -3,8 +3,9 @@
 #
 #   version.sh nightly [YYYY-MM-DD]   nightly.YYYY.MM.DD (UTC today by default)
 #   version.sh release vX.Y.Z         X.Y.Z  (accepts the tag or the bare version)
-#   version.sh appstore [vX.Y.Z]      X.Y.Z of the given tag, or of the newest
-#                                     vX.Y.Z tag reachable from HEAD
+#   version.sh appstore [V]           V (vX.Y.Z, X.Y.Z or YYYYMMDD.HHMM), or the
+#                                     UTC time as YYYYMMDD.HHMM, as every App
+#                                     Store build has been numbered
 #   version.sh dev                    dev.<short commit>
 #
 # The same string goes into the About window, iris/iris-ci --version, the macOS
@@ -38,13 +39,15 @@ case "$channel" in
         echo "$v"
         ;;
     appstore)
+        # App Store Connect only takes a version above the last one it
+        # approved, and the App Store builds have always been numbered by
+        # date (20260831.2042): a vX.Y.Z tag would now be lower.
         if [ $# -gt 0 ] && [ -n "$1" ]; then
+            v="${1#v}"
+            [[ "$v" =~ ^[0-9]{8}\.[0-9]{4}$ ]] && { echo "$v"; exit 0; }
             exec "$0" release "$1"
         fi
-        tag=$(git tag --merged HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
-              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
-        [ -n "$tag" ] || { echo "no vX.Y.Z tag is reachable from HEAD; tag a release first or pass a version" >&2; exit 1; }
-        exec "$0" release "$tag"
+        date -u +%Y%m%d.%H%M
         ;;
     dev)
         sha=$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)

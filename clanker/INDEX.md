@@ -389,6 +389,11 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | Note | Kind | Title |
 |---|---|---|
 | [01-overview.md](gui/01-overview.md) | design | iris-gui — overview |
+| [debug-builds-never-start-the-cpu.md](gui/debug-builds-never-start-the-cpu.md) | rule | Debug front-end builds park the CPU at reset; `start` on the monitor |
+| [a-sleeping-shell-needs-a-timed-tick-for-autosave.md](gui/a-sleeping-shell-needs-a-timed-tick-for-autosave.md) | rule | Shells that tick only on wakes must schedule a tick at `autosave_due_in()` |
+| [disk-browser-xfs-log-replay.md](gui/disk-browser-xfs-log-replay.md) | rule | Disk browser: XFS opens read-only until Edit Anyway; fs-xfs 0.2 cannot see an unreplayed log |
+| [fs-xfs-deletes-leave-freed-inodes-half-cleared.md](gui/fs-xfs-deletes-leave-freed-inodes-half-cleared.md) | open | fs-xfs 0.2.3: a deleted file's inode keeps nlink/nblocks, and its log replay miscounts sb_fdblocks; how to check XFS edits with xfs_check against a baseline |
+| [disk-core-create-modes-carry-the-file-type.md](gui/disk-core-create-modes-carry-the-file-type.md) | rule | Disk browser: `create_file`/`create_directory` modes must include S_IFREG/S_IFDIR |
 | [cdrom-hot-insert-remount.md](gui/cdrom-hot-insert-remount.md) | rule | GUI CD-ROM insert must hot-load + remount /CDROM |
 | [cmd-q-bypasses-close-intercept-fold-on-poweroff.md](gui/cmd-q-bypasses-close-intercept-fold-on-poweroff.md) | rule | macOS Cmd+Q bypasses the close-intercept — fold CHD overlays on power-off, not just quit |
 | [cycles-ptr-must-be-cleared-before-dropping-the-machine.md](gui/cycles-ptr-must-be-cleared-before-dropping-the-machine.md) | rule | iris-gui: clear the cached `CyclesPtr` before dropping the Machine |
@@ -400,7 +405,8 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [gui-owns-the-winit-event-loop.md](gui/gui-owns-the-winit-event-loop.md) | rule | iris-gui must not create a `winit::EventLoop` — eframe owns the process's one, which is why `IRIS_GUI_GL` always fell back |
 | [gl-teardown-must-run-on-the-refresh-thread.md](gui/gl-teardown-must-run-on-the-refresh-thread.md) | rule | GL teardown must run on the REX3-Refresh thread |
 | [gui_mouse_integration.md](gui/gui_mouse_integration.md) | design | GUI mouse integration — current approach, and the classic-Mac absolute-mouse pattern |
-| [gui-reads-configs-through-core-parse.md](gui/gui-reads-configs-through-core-parse.md) | rule | iris-gui must read configs with `MachineConfig::from_toml_str` and write them with `machines::to_toml`, or automatic thread counts and unset banks are lost |
+| [gui-reads-configs-through-core-parse.md](gui/gui-reads-configs-through-core-parse.md) | rule | iris-gui must read configs with `machines::parse` (`from_toml_str` + `fold_cards`) and write them with `machines::to_toml`, or automatic thread counts, unset banks and older card flags are lost |
+| [gui-disks-and-cards-are-devices-by-slot.md](gui/gui-disks-and-cards-are-devices-by-slot.md) | rule | Disks and cards are `[[devices]]` keyed by `scsi_slot`; use `disk`/`set_disk`/`disks()`; the folded card flags (`graphics.heads`, `ultra64.enabled`, ...) compile but are dead |
 | [i18n-catalog-gotchas.md](gui/i18n-catalog-gotchas.md) | rule | GUI text catalogs (i18n) gotchas |
 | [keyboard-capture-egui-steals-tab-arrows-esc-and-ctrl-cxv.md](gui/keyboard-capture-egui-steals-tab-arrows-esc-and-ctrl-cxv.md) | rule | Keyboard capture: egui steals Tab/arrows/Esc, and egui-winit eats Ctrl+C/X/V |
 | [keyboard-layout-send-physical-keys-not-logical.md](gui/keyboard-layout-send-physical-keys-not-logical.md) | rule | Non-US keyboard layouts: send physical key positions, never logical keys |
@@ -427,8 +433,12 @@ Mac App Store and sandbox constraints.
 | Note | Kind | Title |
 |---|---|---|
 | [appstore-private-api.md](macos/appstore-private-api.md) | rule | Mac App Store rejects winit's private SkyLight blur API (`CGSSetWindowBackgroundBlurRadius`) |
+| [app-nap-throttles-background-work.md](macos/app-nap-throttles-background-work.md) | rule | App Nap slowed a background CHD conversion 4x; the Mac app holds an NSProcessInfo activity while a machine runs, disks sync or a disk converts |
+| [split-view-controller-and-window-size-gotchas.md](macos/split-view-controller-and-window-size-gotchas.md) | rule | Under NSSplitViewController page constraints above 500 grow the window; the split autosave restores a stale collapse; debug builds wait for the monitor's `start` |
+| [ppmem-shm-open-is-refused-in-the-app-sandbox.md](macos/ppmem-shm-open-is-refused-in-the-app-sandbox.md) | rule | The App Sandbox refuses ppmem's POSIX shm_open; macOS falls back to Mach memory entries (`IRIS_PPMEM_BACKEND=mach` to test) |
 | [chd-fold-needs-folder-grant-not-file-grant.md](macos/chd-fold-needs-folder-grant-not-file-grant.md) | rule | macOS App Sandbox: the CHD on-exit fold needs a *folder* grant, not a file grant |
 | [test-the-app-sandbox-locally-without-the-app-store.md](macos/test-the-app-sandbox-locally-without-the-app-store.md) | howto | Test the macOS App Sandbox locally — no App Store round-trip needed |
+| [drive-the-appkit-shell-with-the-screen-locked.md](macos/drive-the-appkit-shell-with-the-screen-locked.md) | howto | Script steps, scripted prompt answers and window captures for the AppKit preview; what stalls a script |
 | [winit-030-window-handle-main-thread-only.md](macos/winit-030-window-handle-main-thread-only.md) | rule | winit 0.30 macOS: window_handle() only works on the main thread |
 
 ## snapshot/
@@ -458,6 +468,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [gfifo-consumer-that-catches-up-slows-the-producer.md](perf/gfifo-consumer-that-catches-up-slows-the-producer.md) | rule | A GFIFO consumer that keeps pace makes every push a cache-line transfer; the Newport processor lingers (256 entries / 20 us) before going idle |
 | [decode-cache-conflicts-vary-by-boot.md](perf/decode-cache-conflicts-vary-by-boot.md) | measure | The shadow cache's 64-page decode cache conflicts differently on every boot: up to 25% interpreter variance per boot, gone with 256 pages; compare builds over several boots |
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
+| [chd-codecs-compressed-disks-sync-on-every-stop.md](perf/chd-codecs-compressed-disks-sync-on-every-stop.md) | measure | A compressed CHD rebuilds the whole disk on every stop (lzma 143 s, zstd ~110 s for a 4.3 GB IRIX disk); uncompressed never syncs and boots fastest |
 | [guest-compiler-changes-the-benchmark.md](perf/guest-compiler-changes-the-benchmark.md) | measure | The guest compiler is part of the benchmark: GCC 14.2 against 16.2.1 changes Dhrystone and rotate90 by 37% in guest instructions, and the pin that fixes it |
 | [gfifo-backend-experiment.md](perf/gfifo-backend-experiment.md) | history | GFIFO backend: swappable ring for benchmarking — 2026-09-14 |
 | [gui-idle-refresh.md](perf/gui-idle-refresh.md) | rule | Status-bar-only heartbeat refresh skips the compose and (in iris-gui) publishes nothing; iris-gui uploads only the damaged scanlines |
@@ -519,6 +530,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | [b9600-is-a-number-not-a-cflag-bit.md](irix/b9600-is-a-number-not-a-cflag-bit.md) | rule | IRIX 6.5's `B9600` is 9600: OR-ing it into `c_cflag` sets PARENB and HUPCL; use `cfsetospeed` |
 | [telnet-lines-are-cut-at-256.md](irix/telnet-lines-are-cut-at-256.md) | rule | A command line sent over telnet is cut at 256 characters (tty canonical mode): keep `irix-sh.py run` commands short or push a script; some images' xdm grabs the server until a console login |
 | [backgrounded-shutdown-dies-with-its-telnet-session.md](irix/backgrounded-shutdown-dies-with-its-telnet-session.md) | rule | `shutdown ... &` over irix-sh.py dies with the telnet session when the guest is busy, so it looks like a hang; run it in the foreground or under `nohup` |
+| [fx-label-create-writes-root-and-swap.md](irix/fx-label-create-writes-root-and-swap.md) | measure | `fx` `label/create/all` on a blank disk writes root (XFS type) and a 128 MB swap as well as the volume header and sgiinfo, and nothing else; the miniroot does not create swap, so iris does not pre-provision disks |
 | [cdrom-changer-eject-no-mediad-remount.md](irix/cdrom-changer-eject-no-mediad-remount.md) | open | CD changer `cdrom-eject` does not trigger a `mediad` remount |
 | [delay-loop-calibrated-cold.md](irix/delay-loop-calibrated-cold.md) | open | IRIX calibrates its microsecond delay loop cold, so JIT runs make every delay short (Octane "RAD UST not incrementing") |
 | [default-visual-24bit.md](irix/default-visual-24bit.md) | rule | The ip28 guest's X server defaults to 24-bit TrueColor |
@@ -572,6 +584,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [GPUTodo.md](plans/GPUTodo.md) | plan | REX3 proper GPU mode: merged gated foundation, unmerged M2-M10 candidate stack and planned upstream PRs, with presenter/CI coordination |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |
 | [kona-tile-handoff-race.md](plans/kona-tile-handoff-race.md) | open | KONA tile scheduler strands a job when a tile changes hands (tail store `Release` / load `Acquire` in a store-then-load hand-over): `a_tiled_run_is_bit_exact_with_the_inline_one` hangs on Apple silicon and is ignored; stuck-state dump, cause, candidate two-line `SeqCst` fix with measurements |
+| [iris-newgui-plan.md](plans/iris-newgui-plan.md) | plan | Working brief for the new iris-gui: a shared MVC core (`iris-gui/core`: model + controllers, Action/Effect) with egui rewired onto it and native shells on top, AppKit first; where the branches stand, decisions D1-D20, VMware Workstation layout, settings as data from the core hardware tables, status-bar lights and the core disk/audio counters behind them, macOS menu bar, the 2026-11-21 community feedback, the disk browser on the rusty-backup crates (EFS, XFS, ext; import, export, edit; read-only rules; no provisioning), phases, open questions |
 | [iris-daynaport-target.md](plans/iris-daynaport-target.md) | plan | Task: add a DaynaPort SCSI/Link target to the IRIS emulator |
 | [origin-octane-o2-landing-review.md](plans/origin-octane-o2-landing-review.md) | plan | Review of James Braid's SGI series (547 commits to 2026-11-11, two passes): Origin/Onyx2 two-node, Octane, O2, Fuel/Tezro (IP35), InfiniteReality (KONA); cache-as-RAM, DMA and interrupt paths per machine; ranked findings with status (KONA texture-bind race, Origin node-1 code never JIT-compiled, cross-node IRQs land on node 0, byte-wise DMA on Origin/IP35, BCM5701 lost coalescing wake) |
 | [irix7-fork-review.md](plans/irix7-fork-review.md) | plan | The `irix7/iris` fork — change inventory and triage |

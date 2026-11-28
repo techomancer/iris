@@ -33,7 +33,7 @@
 
     <!-- Persist access to user-selected disk images / PROMs / ISOs across
          launches via app-scoped security-scoped bookmarks (see
-         iris-gui/src/macos_sandbox.rs). Required for the bookmark create/resolve
+         iris-gui/core/src/model/macos_sandbox.rs). Required for the bookmark create/resolve
          to succeed under the sandbox; without it they fail silently. -->
     <key>com.apple.security.files.bookmarks.app-scope</key>
     <true/>

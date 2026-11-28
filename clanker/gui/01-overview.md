@@ -19,7 +19,7 @@ easy to break.
   `../macos/winit-030-window-handle-main-thread-only.md`).
 - **GL teardown belongs to the refresh thread** that owns the context
   (`gl-teardown-must-run-on-the-refresh-thread.md`).
-- A worker thread (`iris-gui/src/handle.rs`) owns a `Box<dyn Workstation>`, with a 64 MB
+- A worker thread (`iris-gui/core/src/model/handle.rs`) owns a `Box<dyn Workstation>`, with a 64 MB
   stack because machine construction builds large objects on the stack. GUI ↔
   worker communication is via `crossbeam_channel` (`Cmd` and `Evt`); every
   machine command dispatch on the worker is wrapped in `catch_unwind`.
@@ -60,7 +60,7 @@ PS/2 input flows through `input.rs::pump`, only while captured:
   Ctrl+Alt+F11 sends F11 to the guest.
 - Mouse capture details: `gui_mouse_integration.md`.
 
-## Safe-stop logic (`iris-gui/src/safe_stop.rs`)
+## Safe-stop logic (`iris-gui/core/src/model/safe_stop.rs`)
 
 The config-based heuristic considers `Status::cpu_halted` (including zero
 measured throughput), then `[scsi]` entries. It warns for plain writable disks,

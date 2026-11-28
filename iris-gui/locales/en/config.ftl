@@ -240,7 +240,7 @@ config-forward-host = Host port
 config-forward-guest = to guest port
 config-forward-bind-local = This computer only
 config-forward-bind-any = All interfaces
-config-forward-add = Add forward
+config-forward-add = Add Forward
 config-forward-telnet = Telnet (host 2323 to guest 23)
 config-forward-telnet-tip = Log in with telnet localhost 2323. The guest needs telnetd running.
 config-forward-ftp = FTP (host 2121 to guest 21)
@@ -252,6 +252,9 @@ config-forward-vnc-tip = The host side is 5901 because macOS Screen Sharing uses
 config-forward-xdmcp = XDMCP (host 11177 to guest 177, UDP)
 config-forward-xdmcp-tip = Remote X login. Open to your whole network, and X servers must be pointed at port 11177.
 config-forward-custom = Custom
+config-forward-taken = This guest port is forwarded already.
+config-forward-port-zero = A port is a number from 1 to 65535.
+config-forward-host-taken = Host port { $port } is already forwarded.
 config-forwards-subtitle =
 
 config-tftp = TFTP server
@@ -280,8 +283,6 @@ config-nfs-dir = Shared folder
 config-nfs-version = NFS version
 config-nfs-v2 = v2 (IRIX 5.3)
 config-nfs-v3 = v3 (IRIX 6.x)
-config-nfs-appstore-grant = The shared folder must be one the app can access. Grant a disk folder first (File > Grant a disk folder…), or choose a folder above.
-config-nfs-appstore-shared = Or use a “shared” folder inside a granted disk folder:
 # Stands in for the server address in the mount command until one is set.
 config-nfs-ip-placeholder = <NFS IP>
 config-nfs-mount = On the guest, mount it with:

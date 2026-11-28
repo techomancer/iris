@@ -79,7 +79,6 @@ turn off those dependency defaults.
 | GUI feature | Purpose | Enables |
 |---|---|---|
 | `bundled` | Distribution UI: hides source-checkout tools; machine TOML storage is shared by all builds. | — |
-| `appstore` | Mac App Store UI, sandbox bookmarks, private-API patch, CHD diff redirection, and REX3 JIT disabled at startup; hides CI/Ultra64 controls. | `bundled` |
 | `pcap` | Expose PCAP NIC selection and bridge support in the embedded core. | `iris/pcap` |
 | `premiere` | Performance bundle for the embedded core; lightning plus idle parking. | `iris/lightning`, `iris/idle-pause` |
 | `hostcall` | Enable private guest syscall services in the embedded core. | `iris/hostcall` |
@@ -102,6 +101,19 @@ serial, rendering and diagnostic settings. Its **Complete configuration (TOML)**
 editor accepts any supported key in the inventory below, validates before
 applying, and requires the machine to be stopped. Optional build features still
 need to be enabled when compiling; a saved setting does not compile them in.
+
+### iris-gui-appkit (the Mac app)
+
+`cargo build -p iris-gui-appkit`; `iris-gui/frontends/appkit/scripts/bundle.sh`
+makes `IRIS.app`.
+
+| Feature | Effect | Implies |
+|---|---|---|
+| `bundled` | Distribution UI, as for `iris-gui`. | `iris-gui-core/bundled` |
+| `appstore` | Mac App Store build: the App Sandbox's security-scoped bookmarks, the container's data folder, CHD diffs in the container, the JITs off at startup (`IRIS_NO_JIT`), and Devices > Grant a disk folder. `bundle.sh --appstore` builds it with `lightning`. | `bundled`, `iris-gui-core/appstore` |
+| `pcap` | Bridged networking, as for `iris-gui`. | `iris-gui-core/iris-pcap` |
+| `lightning`, `jitv2`, `idle-pause` | The emulator's speed features. | `iris/...` |
+| `hostgl` | Host OpenGL for IRIX programs. | `iris/hostgl`, `iris/hostcall` |
 
 ### iris-audio
 
@@ -708,7 +720,7 @@ Each prints its own usage with `--help` (or with no arguments).
 
 ## iris-gui persisted settings inventory
 
-Source: [iris-gui/src/settings.rs](iris-gui/src/settings.rs). These keys belong
+Source: [iris-gui/core/src/model/settings.rs](iris-gui/core/src/model/settings.rs). These keys belong
 to GUI JSON rather than machine TOML files. View controls update the scales;
 the GUI saves machine TOMLs and sandbox access state for you.
 
@@ -723,6 +735,12 @@ the GUI saves machine TOMLs and sandbox access state for you.
 | `last_config` | unset | Legacy TOML migration source; cleared after conversion. |
 | `bookmarks` | empty map | macOS sandbox security-scoped bookmarks by absolute path. |
 | `disk_folders` | empty list | Granted recursive sandbox disk-folder access. |
+| `library_folders` | empty list | The library's own folders, in order, each with its machines; a machine in none is listed under its family. |
+| `display_mode` | `"actual"` | Guest display size: `actual` (one guest pixel to a point; `scale` is read as this), `fit` (keep the aspect ratio) or `stretch`. |
+| `integer_only` | `false` | With `fit`, draw only at whole multiples of the guest's pixels. |
+| `display_filter` | `"auto"` | Scaling filter: `auto` (sharp at whole multiples, smooth otherwise), `nearest` or `linear`. |
+| `pointer_mode` | `"capture"` | Guest mouse: `capture` it, or `follow` the host pointer (for remote desktops). |
+| `convert_declined` | empty set | Absolute paths of compressed CHDs the user chose to keep: no more suggestions to convert them. |
 
 eframe also persists its own viewport/window state. These framework preferences
 are separate from the shared machine schema. First-launch fallback window size
@@ -745,6 +763,7 @@ mistaken for GUI settings.
 | `IRIS_BAKE_HOOKS` | Any presence bakes callout hook addresses into JIT code (experimental). | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_AUDIO_DUMP` | File to record what every sound card plays (HAL2, MACE audio, RAD1, ICE1724) at the card's own rate, before conversion. RAD1 and ICE1724 record only with `[audio]` enabled. The layout is in the module. | [src/dev/audio_dump.rs](src/dev/audio_dump.rs) |
 | `IRIS_BREAK_CPU` | 1 stops CPU after exception handling for diagnostic inspection. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
+| `IRIS_PPMEM_BACKEND` | `mach` backs guest RAM with Mach memory entries instead of POSIX shared memory (macOS), as the App Sandbox build does; for testing that path. | [src/ppmem/map_unix.rs](src/ppmem/map_unix.rs) |
 | `IRIS_CHD_DIFF_DIR` | Redirect CHD diff sidecars; GUI App Store sets a writable container directory. | [src/chd_disk.rs](src/chd_disk.rs) |
 | `IRIS_CRASH_DIAG` | off disables Windows crash handler installation. | [src/crash_diag.rs](src/crash_diag.rs) |
 | `IRIS_CRASH_SELFTEST` | Standalone crash diagnostic self-test selector; deliberately crashes. | [src/main.rs](src/main.rs) |
@@ -755,7 +774,7 @@ mistaken for GUI settings.
 | `IRIS_GPRCACHE_EVERYWHERE` | Presence caches registers in functions without a loop too. For test runs: slower to compile, no faster to run. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_GR2_JIT` | Starting mode of the GR2 span JIT (`gr2-jit` builds): `off` or `0`, `sync` (compile on first use and wait), `async`, `on` or `1` (the default). `gr2 jit` changes it later. | [src/dev/gr2/re3_jit/mod.rs](src/dev/gr2/re3_jit/mod.rs) |
 | `IRIS_GR4_JIT` | Starting mode of the IMPACT raster JIT (`gr4-jit` builds): `off` or `0`, `sync`, `async`, `on` or `1` (the default). `mgras jit` changes it later. | [src/dev/mgras/rss_jit/mod.rs](src/dev/mgras/rss_jit/mod.rs) |
-| `IRIS_GUI_GL` | 1 selects the GUI GL capture path. | [iris-gui/src/framebuffer.rs](iris-gui/src/framebuffer.rs) |
+| `IRIS_GUI_GL` | 1 selects the GUI GL capture path. | [iris-gui/core/src/model/framebuffer.rs](iris-gui/core/src/model/framebuffer.rs) |
 | `IRIS_HAL2_CAPTURE` | HAL2 host audio capture: a WAV of what the host device is given, at the device's rate. | [src/dev/hal2.rs](src/dev/hal2.rs) |
 | `IRIS_HOSTGL_CALLS` | Substring filter for HostGL call logging (bounded log). | [iris-hostgl/src/service.rs](iris-hostgl/src/service.rs) |
 | `IRIS_HOSTGL_INLINE` | 1 runs the HostGL service on the CPU thread instead of its own (for comparison; the CPU stalls while a buffer replays). | [iris-hostgl/src/lib.rs](iris-hostgl/src/lib.rs) |

@@ -44,6 +44,22 @@ pub trait ScsiTarget: Send {
     /// writes it carries out. A target that moves no blocks ignores them.
     fn set_activity(&mut self, _activity: Arc<DiskActivity>) {}
 
+    /// Read `buf.len()` bytes of the medium at byte `offset`, as the guest
+    /// would see them (a copy-on-write overlay or a CHD diff included), for a
+    /// front-end that browses a running machine's disk. Read-only; a target
+    /// with no block medium says `Unsupported`.
+    fn read_media(&mut self, _offset: u64, _buf: &mut [u8]) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "this target has no block medium"))
+    }
+
+    /// The medium's size in bytes, `None` with no block medium or no disc.
+    fn media_size(&self) -> Option<u64> { None }
+
+    /// A count that moves whenever what [`ScsiTarget::read_media`] returns
+    /// may have changed (a write, a disc change, a rolled-back overlay), so
+    /// a read made in pieces can tell that it saw one medium throughout.
+    fn media_generation(&self) -> u64 { 0 }
+
     /// Whether READ(6) and WRITE(6) move packets, not blocks, so a
     /// controller must not read their count as a number of sectors.
     fn moves_packets(&self) -> bool { false }
@@ -190,6 +206,13 @@ impl DiskActivity {
     }
 }
 
+/// The most [`ScsiBus::read_media`] reads under one hold of the bus lock.
+pub const READ_MEDIA_CHUNK: usize = 64 * 1024;
+
+/// How many times [`ScsiBus::read_media`] reads in pieces before it holds the
+/// bus lock for the whole read instead.
+pub const READ_MEDIA_TRIES: usize = 3;
+
 /// The targets on a bus by SCSI id, `None` where nothing answers.
 pub type Targets = Vec<Option<Box<dyn ScsiTarget>>>;
 
@@ -331,6 +354,56 @@ impl ScsiBus {
     /// stays at zero.
     pub fn activity(&self) -> Vec<DiskCounts> {
         self.activity.iter().map(|a| a.counts()).collect()
+    }
+
+    /// Read the medium of the target at `id` (see [`ScsiTarget::read_media`]).
+    /// The bus lock is held for at most [`READ_MEDIA_CHUNK`] bytes at a time,
+    /// so a large read never stalls the guest's own commands for long. The
+    /// read is still one picture of the medium: when the guest changed it
+    /// between two pieces, the read starts again, and after
+    /// [`READ_MEDIA_TRIES`] such tries it is made under one hold.
+    pub fn read_media(&self, id: u8, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.len() > READ_MEDIA_CHUNK {
+            for _ in 0..READ_MEDIA_TRIES {
+                if self.read_media_in_pieces(id, offset, buf)? {
+                    return Ok(());
+                }
+            }
+        }
+        let mut targets = self.targets.lock();
+        Self::media_target(&mut targets, id)?.read_media(offset, buf)
+    }
+
+    /// One try of a read in pieces: `false` when the medium changed under it.
+    fn read_media_in_pieces(&self, id: u8, offset: u64, buf: &mut [u8]) -> io::Result<bool> {
+        let mut seen = None;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = (buf.len() - done).min(READ_MEDIA_CHUNK);
+            let mut targets = self.targets.lock();
+            let target = Self::media_target(&mut targets, id)?;
+            let generation = target.media_generation();
+            if seen.is_some_and(|g| g != generation) {
+                return Ok(false);
+            }
+            seen = Some(generation);
+            target.read_media(offset + done as u64, &mut buf[done..done + n])?;
+            drop(targets);
+            done += n;
+        }
+        Ok(true)
+    }
+
+    fn media_target<'a>(targets: &'a mut Targets, id: u8) -> io::Result<&'a mut Box<dyn ScsiTarget>> {
+        targets
+            .get_mut(id as usize)
+            .and_then(|t| t.as_mut())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no target at SCSI id {id}")))
+    }
+
+    /// The size of the medium of the target at `id`.
+    pub fn media_size(&self, id: u8) -> Option<u64> {
+        self.targets.lock().get(id as usize).and_then(|t| t.as_ref()).and_then(|t| t.media_size())
     }
 
     pub fn has_target(&self, id: u8) -> bool {
@@ -497,6 +570,85 @@ mod tests {
         let r = b.request(3, &inquiry()).expect("target answers").unwrap();
         assert_eq!(&r.data[8..16], b"TEST    ");
         assert!(b.request(2, &inquiry()).is_none(), "an empty id does not answer");
+    }
+
+    /// The read hook returns what the medium holds, across the bus's chunk
+    /// size, and refuses an empty id and a read past the end.
+    #[test]
+    fn read_media_reads_the_disk_in_pieces() {
+        let dir = TempPath::dir("scsibus");
+        let b = bus(8);
+        let p = dir.join("img");
+        let blocks = (READ_MEDIA_CHUNK * 3) / 512;
+        let data: Vec<u8> = (0..blocks * 512).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(&p, &data).unwrap();
+        attach(&b, 2, &p, false).unwrap();
+        assert_eq!(b.media_size(2), Some(data.len() as u64));
+        let mut buf = vec![0u8; READ_MEDIA_CHUNK * 2 + 100];
+        b.read_media(2, 300, &mut buf).unwrap();
+        assert_eq!(buf, data[300..300 + buf.len()]);
+        assert!(b.read_media(5, 0, &mut [0u8; 4]).is_err(), "nothing at id 5");
+        assert!(b.read_media(2, data.len() as u64 - 2, &mut [0u8; 4]).is_err(), "past the end");
+    }
+
+    /// A medium the "guest" rewrites, every byte to the same new value, after
+    /// each of the first `writes` pieces read from it.
+    struct Rewritten {
+        data: Vec<u8>,
+        generation: u64,
+        writes: usize,
+    }
+
+    impl ScsiTarget for Rewritten {
+        fn request(&mut self, _req: &ScsiRequest) -> io::Result<ScsiResponse> {
+            unreachable!()
+        }
+        fn read_media(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+            buf.copy_from_slice(&self.data[offset as usize..offset as usize + buf.len()]);
+            if self.writes > 0 {
+                self.writes -= 1;
+                let next = self.data[0].wrapping_add(1);
+                self.data.fill(next);
+                self.generation += 1;
+            }
+            Ok(())
+        }
+        fn media_size(&self) -> Option<u64> {
+            Some(self.data.len() as u64)
+        }
+        fn media_generation(&self) -> u64 {
+            self.generation
+        }
+    }
+
+    /// A read in pieces never mixes two versions of the medium: it starts
+    /// again when the medium changed between pieces, and once the guest has
+    /// kept changing it for every try, it reads under one hold.
+    #[test]
+    fn read_media_is_one_picture_of_the_medium() {
+        for writes in [0, 1, 2, READ_MEDIA_TRIES, 1000] {
+            let b = bus(8);
+            b.attach(1, Box::new(Rewritten { data: vec![0; READ_MEDIA_CHUNK * 4], generation: 0, writes })).unwrap();
+            let mut buf = vec![0xEEu8; READ_MEDIA_CHUNK * 3 + 5];
+            b.read_media(1, 7, &mut buf).unwrap();
+            assert!(buf.iter().all(|&x| x == buf[0]), "{writes} writes: a torn read");
+        }
+    }
+
+    /// A disk's generation stays put through reads and moves with a write.
+    #[test]
+    fn a_write_moves_the_media_generation() {
+        let dir = TempPath::dir("scsibus");
+        let b = bus(8);
+        attach(&b, 2, &image(&dir, 8), false).unwrap();
+        let generation = |b: &ScsiBus| b.with_targets(|t| t[2].as_ref().unwrap().media_generation());
+        let req = |cdb: Vec<u8>, data_in| ScsiRequest { cdb, data_len: crate::scsi::ScsiDataLength::Unlimited, data_in };
+        let before = generation(&b);
+        b.request(2, &req(vec![scsi_cmd::READ_10, 0, 0, 0, 0, 0, 0, 0, 1, 0], None)).unwrap().unwrap();
+        b.request(2, &inquiry()).unwrap().unwrap();
+        assert_eq!(generation(&b), before, "reads leave it");
+        b.request(2, &req(vec![scsi_cmd::WRITE_10, 0, 0, 0, 0, 0, 0, 0, 1, 0], Some(vec![1; 512]))).unwrap().unwrap();
+        assert_ne!(generation(&b), before, "a write moves it");
     }
 
     /// A controller's register path can look at the bus while a command

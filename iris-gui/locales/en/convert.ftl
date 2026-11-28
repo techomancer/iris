@@ -1,0 +1,33 @@
+# Converting a compressed CHD disk for quicker stops (controller::convert).
+
+convert-disk-label = SCSI { $id }
+convert-title = Convert { $disk } for quicker stops?
+convert-intro = { $disk } is a CHD compressed with { $codecs } ({ $size }). A compressed disk can't be written in place, so every stop rebuilds the whole file, and with these codecs that takes minutes.
+convert-zlib-body = zlib: about the same size (up to { $size }). The rebuild after each stop is quicker, and every version of chdman and MAME can read it.
+convert-uncompressed-body = Uncompressed: no rebuild after a stop at all, but the file grows to the space the disk uses, up to { $size }.
+convert-outro = The file keeps its name, and the machine's settings stay the same. Converting takes a few minutes; the machine can't start until it is done.
+convert-to-zlib = Convert to zlib
+convert-to-uncompressed = Convert to Uncompressed
+convert-menu = Convert for Quicker Stops…
+convert-menu-tip = Rewrite this compressed CHD as zlib or uncompressed, so stopping the machine takes less time.
+convert-busy = A disk is being converted.
+convert-disk-changed = That disk is no longer attached here. Convert it from the Devices menu.
+convert-needs-stopped = Stop the machine to convert its disk.
+convert-not-compressed = This disk isn't a compressed CHD.
+convert-no-room = Not enough free space to convert: it needs up to { $need }, and { $free } is free.
+convert-running = Converting { $disk }
+convert-format-zlib = zlib
+convert-format-uncompressed = uncompressed
+convert-done = { $disk } is now { $format }: { $size } (was { $before }).
+convert-cancelled = Converting { $disk } was cancelled; the disk is unchanged.
+convert-failed = Couldn't convert { $disk }: { $error }. The disk is unchanged.
+convert-cancel = Cancel
+ov-convert = Convert…
+ov-convert-suggest = { $disk } is a compressed CHD: every stop rebuilds the whole disk, which takes minutes. Converting it to zlib makes stops quicker.
+app-busy-reason = Running a machine or working on its disks
+convert-keep = Keep As Is
+convert-keep-body = Keep As Is leaves the disk compressed and stops suggesting this; Devices > Convert for Quicker Stops… still converts it later.
+convert-keep-tip = Don't suggest converting this disk again. Devices > Convert for Quicker Stops… still converts it.
+convert-start-title = Convert { $disk } before starting?
+convert-start-body = Start Without Converting keeps the disk as it is and won't ask again; Devices > Convert for Quicker Stops… still converts it later. After a conversion, the machine starts by itself.
+convert-start-anyway = Start Without Converting

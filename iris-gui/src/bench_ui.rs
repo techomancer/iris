@@ -20,159 +20,62 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::i18n::{subtitle, ResponseExt};
 use eframe::egui::{self, Color32, RichText, ScrollArea, Ui};
-use iris::bench_report::{fmt_rate, ReferenceEntry, ReferenceTable, Run, CATEGORIES};
-use iris::bench_runner::{self, BenchOptions, Progress};
+use iris_gui_core::controller::bench::{fmt_rate, BenchAction, BenchController, ReferenceEntry, Run, CATEGORIES};
 
-/// How many console lines to keep. The suite prints a few hundred; the cap is
-/// there for a run that goes wrong and starts repeating itself.
+
+/// How many console lines the developer runner keeps.
 const MAX_LINES: usize = 4000;
 
-/// What the two modes cost on a plain interpreter build, for the button's
-/// tooltip. Measured on the reference host — treated as an order of
-/// magnitude, not a promise, which is why the UI also shows real elapsed time.
-const QUICK_SECS: u64 = 35;
-const FULL_SECS: u64 = 60;
-
 pub struct BenchState {
-    live: Option<Live>,
-    /// The last finished run, kept so the panel still says something once the
-    /// worker is gone.
-    last: Option<Result<Box<Run>, String>>,
-    quick: bool,
-    /// Which CPU to benchmark. Runtime config, so this needs no separate build.
-    cpu: &'static iris::cpu::parts::Part,
-    /// Parsed once. Normally empty — see `iris::bench_report::bundled_reference`.
-    reference: Option<ReferenceTable>,
+    ctl: BenchController,
     dev: DevRunner,
+    /// Effects for the app's effect host (the report's save panel).
+    pub effects: Vec<iris_gui_core::controller::Effect>,
+    machine_running: bool,
 }
-
-impl Default for BenchState {
-    fn default() -> Self {
-        Self {
-            live: None,
-            last: None,
-            // Quick by default. It reports the same figures to within a couple
-            // of percent for about half the wall clock, and it gives up no
-            // accuracy at all — every kernel still runs and still verifies. A
-            // full run is one click away for anyone who wants the tighter
-            // number, and is required before a result can go in the reference
-            // table.
-            quick: true,
-            cpu: &iris::cpu::parts::R4400_150,
-            reference: None,
-            dev: DevRunner::default(),
-        }
-    }
-}
-
-/// A run in flight. Everything here is written by the worker thread and read by
-/// the UI thread once a frame.
-struct Live {
-    lines: Arc<Mutex<Vec<String>>>,
-    state: Arc<Mutex<LiveState>>,
-    cancel: Arc<AtomicBool>,
-    done: Arc<Mutex<Option<Result<Box<Run>, String>>>>,
-    started: Instant,
-    quick: bool,
-}
-
-#[derive(Default, Clone)]
-struct LiveState {
-    /// Kernels the guest said it would run. 0 until it says.
-    total: usize,
-    done: usize,
-    current: String,
-}
-
-impl LiveState {
-    fn fraction(&self) -> f32 {
-        if self.total == 0 { return 0.0; }
-        (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
-    }
-}
-
-// ─── running ─────────────────────────────────────────────────────────────────
 
 impl BenchState {
+    pub fn new(notify: std::sync::Arc<dyn iris_gui_core::controller::Notify>) -> Self {
+        Self { ctl: BenchController::new(notify), dev: DevRunner::default(), effects: Vec::new(), machine_running: false }
+    }
+
     pub fn is_running(&self) -> bool {
-        self.live.is_some() || self.dev.is_running()
+        self.ctl.is_running() || self.dev.is_running()
     }
 
-    fn start(&mut self, quick: bool, cpu: &'static iris::cpu::parts::Part) {
-        if self.is_running() { return; }
-
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let state = Arc::new(Mutex::new(LiveState::default()));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(Mutex::new(None));
-
-        let opts = BenchOptions {
-            quick,
-            cpu,
-            label: iris::bench_report::cpu_model(),
-            cancel: Some(cancel.clone()),
-            ..Default::default()
-        };
-
-        let (l, s, d) = (lines.clone(), state.clone(), done.clone());
-        std::thread::spawn(move || {
-            let result = bench_runner::run(&opts, move |p| match p {
-                Progress::Started { total } => s.lock().unwrap().total = total,
-                Progress::Kernel { name, index } => {
-                    let mut st = s.lock().unwrap();
-                    st.done = index;
-                    st.current = name;
-                }
-                Progress::Line(line) => {
-                    let mut v = l.lock().unwrap();
-                    v.push(line);
-                    if v.len() > MAX_LINES {
-                        let drop_n = v.len() - MAX_LINES;
-                        v.drain(..drop_n);
-                    }
-                }
-            });
-            *d.lock().unwrap() = Some(result.map(Box::new));
-        });
-
-        self.last = None;
-        self.live = Some(Live {
-            lines, state, cancel, done,
-            started: Instant::now(),
-            quick,
-        });
+    fn act(&mut self, a: BenchAction) {
+        let fx = self.ctl.apply(a, self.machine_running);
+        self.effects.extend(fx);
     }
 
-    /// Move a finished worker's result into `last`. Called once a frame.
-    fn poll(&mut self) {
-        let Some(live) = &self.live else { return };
-        let finished = live.done.lock().unwrap().take();
-        if let Some(result) = finished {
-            self.last = Some(result);
-            self.live = None;
-        }
+    /// An answer to a question the benchmark asked (the save panel).
+    pub fn answer(&mut self, a: iris_gui_core::controller::Answer) {
+        self.act(BenchAction::Answer(a));
     }
 
     fn stop(&mut self) {
-        if let Some(live) = &self.live {
-            live.cancel.store(true, Ordering::Relaxed);
-        }
+        self.act(BenchAction::Stop);
         self.dev.stop();
     }
+}
 
-    fn reference(&mut self) -> &ReferenceTable {
-        self.reference.get_or_insert_with(iris::bench_report::bundled_reference)
-    }
+fn report_text(run: &Run) -> String {
+    BenchController::report_text(run)
 }
 
 // ─── the screen ──────────────────────────────────────────────────────────────
 
 pub fn show(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
-    st.poll();
+    st.machine_running = machine_running;
+    st.ctl.tick();
+    if st.is_running() {
+        // The run reports through shared state; follow it while it moves.
+        ui.ctx().request_repaint_after(Duration::from_millis(200));
+    }
 
     ui.heading(t!("bench-heading"));
     subtitle(ui, t!("bench-subtitle"));
@@ -180,90 +83,90 @@ pub fn show(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
 
     controls(ui, st, machine_running);
 
-    if let Some(live) = &st.live {
+    if let Some(p) = st.ctl.progress() {
         ui.add_space(8.0);
-        running_view(ui, live);
+        ui.add(egui::ProgressBar::new(p.fraction).show_percentage().animate(true));
+        ui.horizontal(|ui| {
+            ui.label(&p.line);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(&p.time).weak());
+            });
+        });
     }
 
-    match st.last.take() {
+    let reference = st.ctl.reference();
+    let mut save = false;
+    match st.ctl.last() {
         Some(Ok(run)) => {
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(6.0);
-            let reference = st.reference().matching(&run).cloned();
-            results_view(ui, &run, reference.as_ref());
-            st.last = Some(Ok(run));
+            save = results_view(ui, run, reference.as_ref());
         }
         Some(Err(e)) => {
             ui.add_space(8.0);
             if e == "stopped" {
                 ui.label(RichText::new(t!("bench-stopped")).weak());
             } else {
-                ui.label(RichText::new(t!("bench-failed", error = &e))
+                ui.label(RichText::new(t!("bench-failed", error = e.as_str()))
                     .color(Color32::from_rgb(220, 170, 90)));
             }
-            st.last = Some(Err(e));
         }
         None => {}
+    }
+    if save {
+        st.act(BenchAction::SaveReport);
     }
 
     details(ui, st);
 
-    #[cfg(not(feature = "appstore"))]
     developer_tools(ui, st);
 }
 
 fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
     let busy = st.is_running();
-
+    let mut actions = Vec::new();
     ui.horizontal(|ui| {
-        // Two machines at once would measure the wrong thing: the emulator
-        // would be sharing the host with itself, and every number would be a
-        // reading of whatever IRIX happened to be doing. Refusing is also
-        // simpler than explaining the result afterwards.
-        ui.add_enabled_ui(!busy && !machine_running, |ui| {
-            let secs = if st.quick { QUICK_SECS } else { FULL_SECS };
-            if ui
-                .button(RichText::new(primary_label()).strong())
-                .tip(t!("bench-run-tip", secs = secs))
-                .clicked()
-            {
-                let (quick, cpu) = (st.quick, st.cpu);
-                st.start(quick, cpu);
+        // Two machines at once would measure the wrong thing.
+        let start = st.ctl.can_start(machine_running);
+        ui.add_enabled_ui(start.is_yes() && !st.dev.is_running(), |ui| {
+            let secs = if st.ctl.quick() { iris_gui_core::controller::bench::QUICK_SECS } else { iris_gui_core::controller::bench::FULL_SECS };
+            if ui.button(RichText::new(primary_label()).strong()).tip(t!("bench-run-tip", secs = secs)).clicked() {
+                actions.push(BenchAction::Start);
             }
         });
-
         ui.add_enabled_ui(!busy, |ui| {
-            // The CPU is a machine setting, not a build, so the suite can measure
-            // either one from this binary. IRIX-visible: different PRId, cache
-            // geometry and ISA level, so treat the two scores as different machines.
+            // The CPU is a machine setting, not a build, so the suite measures
+            // either from this binary.
+            let (labels, mut chosen) = st.ctl.cpus();
             egui::ComboBox::from_id_salt("bench_cpu")
-                .selected_text(st.cpu.label())
+                .selected_text(st.ctl.cpu_label())
                 .show_ui(ui, |ui| {
-                    for &m in iris::bench_runner::BENCH_CPUS {
-                        ui.selectable_value(&mut st.cpu, m, m.label());
+                    for (i, l) in labels.iter().enumerate() {
+                        if ui.selectable_value(&mut chosen, i, l).clicked() {
+                            actions.push(BenchAction::SetCpu(i));
+                        }
                     }
                 })
                 .response
                 .tip(t!("bench-cpu-tip"));
         });
-
         ui.add_enabled_ui(!busy, |ui| {
-            ui.checkbox(&mut st.quick, t!("bench-quick"))
-                .tip(t!("bench-quick-tip"));
+            let mut quick = st.ctl.quick();
+            if ui.checkbox(&mut quick, t!("bench-quick")).tip(t!("bench-quick-tip")).changed() {
+                actions.push(BenchAction::SetQuick(quick));
+            }
         });
-
         if busy && ui.button(t!("bench-stop")).clicked() {
-            st.stop();
+            actions.push(BenchAction::Stop);
         }
     });
-
+    for a in actions {
+        if a == BenchAction::Stop { st.stop(); } else { st.act(a); }
+    }
     if machine_running && !busy {
         ui.add_space(4.0);
-        ui.label(
-            RichText::new(t!("bench-machine-running"))
-                .weak(),
-        );
+        ui.label(RichText::new(t!("bench-machine-running")).weak());
     }
 }
 
@@ -273,47 +176,11 @@ fn primary_label() -> String {
     if cfg!(target_os = "macos") { t!("bench-run-mac") } else { t!("bench-run-pc") }
 }
 
-fn running_view(ui: &mut Ui, live: &Live) {
-    let st = live.state.lock().unwrap().clone();
-    let elapsed = live.started.elapsed();
-
-    ui.add(egui::ProgressBar::new(st.fraction()).show_percentage().animate(true));
-    ui.horizontal(|ui| {
-        ui.label(if st.current.is_empty() {
-            t!("bench-starting")
-        } else {
-            t!("bench-progress", kernel = &st.current, done = st.done, total = st.total)
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(remaining(&st, elapsed, live.quick)).weak());
-        });
-    });
-
-    // The worker writes into shared state; without this the panel only updates
-    // when the pointer moves over it.
-    ui.ctx().request_repaint_after(Duration::from_millis(200));
-}
-
-/// Elapsed, plus an estimate once there is enough evidence for one.
-///
-/// Extrapolating from kernels-completed is only honest after a few of them:
-/// the first rows are the cheap integer kernels and the last are the expensive
-/// codec ones, so an estimate from row two is confidently wrong. Before that,
-/// say only what is known.
-fn remaining(st: &LiveState, elapsed: Duration, quick: bool) -> String {
-    let e = elapsed.as_secs();
-    if st.done < 4 || st.total == 0 {
-        let guess = if quick { QUICK_SECS } else { FULL_SECS };
-        return t!("bench-time-total", elapsed = e, total = guess);
-    }
-    let per = elapsed.as_secs_f64() / st.done as f64;
-    let left = (per * (st.total - st.done) as f64).round() as u64;
-    t!("bench-time-left", elapsed = e, left = left)
-}
-
 // ─── results ─────────────────────────────────────────────────────────────────
 
-fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
+/// Returns whether Save report was clicked.
+fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) -> bool {
+    let mut save = false;
     ui.heading(t!("bench-results"));
     ui.add_space(4.0);
 
@@ -371,9 +238,10 @@ fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
             ui.ctx().copy_text(report_text(run));
         }
         if ui.button(t!("bench-save-report")).clicked() {
-            save_report(run);
+            save = true;
         }
     });
+    save
 }
 
 /// The machine that was measured, as the guest found it.
@@ -508,109 +376,35 @@ fn caveats(ui: &mut Ui, run: &Run) {
 // ─── details, export ─────────────────────────────────────────────────────────
 
 fn details(ui: &mut Ui, st: &mut BenchState) {
-    let lines = st.live.as_ref().map(|l| l.lines.clone());
-    let has_output = lines.is_some() || st.dev.has_output();
-    if !has_output && st.last.is_none() {
+    let lines = st.ctl.lines();
+    let dev = st.dev.lines();
+    if lines.is_empty() && dev.is_none() && st.ctl.last().is_none() {
         return;
     }
-
     ui.add_space(8.0);
     egui::CollapsingHeader::new(t!("bench-details"))
         .default_open(false)
         .show(ui, |ui| {
-            // The guest's own console, which is where the per-kernel table and
-            // any complaint from the harness appear. Secondary on purpose: a
-            // wall of monospace as the primary surface reads as "something went
-            // wrong" to a reader who did not ask for a log.
-            let buf = lines.or_else(|| st.dev.lines());
+            // The guest's own console, where the per-kernel table and any
+            // complaint from the harness appear.
+            let buf: Vec<String> = if !lines.is_empty() {
+                lines
+            } else {
+                dev.map(|b| b.lock().unwrap().clone()).unwrap_or_default()
+            };
             ScrollArea::vertical()
                 .max_height(320.0)
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    match buf {
-                        Some(b) => {
-                            let v = b.lock().unwrap();
-                            if v.is_empty() {
-                                ui.label(RichText::new(t!("bench-details-empty")).weak());
-                            }
-                            for l in v.iter() {
-                                ui.label(RichText::new(l).monospace().size(11.0));
-                            }
-                        }
-                        None => { ui.label(RichText::new(t!("bench-details-empty")).weak()); }
+                    if buf.is_empty() {
+                        ui.label(RichText::new(t!("bench-details-empty")).weak());
+                    }
+                    for l in &buf {
+                        ui.label(RichText::new(l).monospace().size(11.0));
                     }
                 });
         });
-}
-
-fn report_text(run: &Run) -> String {
-    let mut s = String::new();
-    s.push_str(&format!("IRIS benchmark — {}\n", run.host.cpu_model));
-    s.push_str(&format!("  emulated CPU      {} ({})\n", run.machine.cpu,
-                        iris::bench_report::engine_of(run)));
-    s.push_str(&format!("  build features    {}\n",
-                        if run.features.is_empty() { "(none)".into() } else { run.features.join(" ") }));
-    s.push_str(&format!("  host              {} {} · {} cores\n",
-                        run.host.os, run.host.arch, run.host.cores));
-    if !run.machine.rev.is_empty() {
-        s.push_str(&format!("  emulated PRId     {} rev {}\n", run.machine.prid, run.machine.rev));
-    }
-    if !run.machine.cache.is_empty() {
-        let c = &run.machine.cache;
-        s.push_str(&format!("  L1 cache          {} I ({} B) / {} D ({} B)\n",
-                            fmt_bytes(c.l1i_bytes), c.l1i_line,
-                            fmt_bytes(c.l1d_bytes), c.l1d_line));
-        s.push_str(&format!("  L2 cache          {}\n", if !c.l2_present {
-            "absent".to_string()
-        } else if c.l2_bytes > 0 {
-            format!("{}, {} B lines", fmt_bytes(c.l2_bytes), c.l2_line)
-        } else {
-            format!("present, {} B lines, size not reported", c.l2_line)
-        }));
-    }
-    if !run.machine.memory.is_empty() {
-        s.push_str(&format!("  memory            {} MB in {} bank(s)\n",
-                            run.machine.memory.total_mb, run.machine.memory.banks.len()));
-    }
-    s.push('\n');
-    s.push_str(&format!("  Emulated Indy     {:.1} DMIPS\n", run.dmips().unwrap_or(0.0)));
-    s.push_str(&format!("  Throughput        {:.1} MIPS\n", run.mips()));
-    s.push_str(&format!("  Accuracy          {:.1}%  ({}/{})\n",
-                        run.accuracy(), run.matched, run.checked));
-    s.push('\n');
-    for c in CATEGORIES {
-        if let Some(rate) = run.category_rate(c) {
-            s.push_str(&format!("  {:<16}  {}{}\n", c.label, fmt_rate(rate), c.suffix));
-        }
-    }
-    s.push('\n');
-    s.push_str(&format!("  suite             {}\n", run.suite_id));
-    if let Some(why) = run.settings.shortened_because() {
-        s.push_str(&format!("  quick run         {}\n", why));
-    }
-    s.push_str(&format!("  wall clock        {:.1} s\n", run.wall_s));
-    s
-}
-
-fn save_report(run: &Run) {
-    // An explicit save panel, so the only place this ever lands outside the
-    // app's own container is one the user picked. Nothing is uploaded.
-    let name = format!("iris-benchmark-{}.json", run.cell.replace(['/', ' '], "-"));
-    let Some(path) = crate::filedialog::dialog_with(
-        &t!("bench-save-report-picker"), &name, crate::filedialog::Anchor::Data,
-        crate::filedialog::Purpose::Save, &[(t!("bench-save-report-filter").as_str(), &["json"])]).save_file()
-    else {
-        return;
-    };
-    match serde_json::to_string_pretty(run) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                log::warn!("saving the benchmark report to {}: {e}", path.display());
-            }
-        }
-        Err(e) => log::warn!("serialising the benchmark report: {e}"),
-    }
 }
 
 // ─── developer tools (source builds only) ────────────────────────────────────
@@ -624,29 +418,24 @@ fn save_report(run: &Run) {
 /// from a distributed build.
 #[derive(Default)]
 struct DevRunner {
-    #[cfg(not(feature = "appstore"))]
     inner: dev::State,
 }
 
 impl DevRunner {
     fn is_running(&self) -> bool {
-        #[cfg(not(feature = "appstore"))] { self.inner.is_running() }
-        #[cfg(feature = "appstore")] { false }
+        self.inner.is_running()
     }
     fn stop(&mut self) {
-        #[cfg(not(feature = "appstore"))] { self.inner.stop(); }
+        self.inner.stop();
     }
     fn has_output(&self) -> bool {
-        #[cfg(not(feature = "appstore"))] { self.inner.has_output() }
-        #[cfg(feature = "appstore")] { false }
+        self.inner.has_output()
     }
     fn lines(&self) -> Option<Arc<Mutex<Vec<String>>>> {
-        #[cfg(not(feature = "appstore"))] { self.inner.lines() }
-        #[cfg(feature = "appstore")] { None }
+        self.inner.lines()
     }
 }
 
-#[cfg(not(feature = "appstore"))]
 fn developer_tools(ui: &mut Ui, st: &mut BenchState) {
     ui.add_space(12.0);
     ui.separator();
@@ -685,7 +474,6 @@ fn developer_tools(ui: &mut Ui, st: &mut BenchState) {
     });
 }
 
-#[cfg(not(feature = "appstore"))]
 mod dev {
     use super::*;
     use std::io::{BufRead, BufReader};
@@ -902,28 +690,6 @@ mod tests {
         assert!(ratio(&run(), &r, "Integer").is_none());
         // And a category this run has no rows for.
         assert!(ratio(&run(), &reference(100.0, 100.0), "Codec").is_none());
-    }
-
-    #[test]
-    fn the_time_estimate_waits_for_evidence_before_making_one() {
-        let early = LiveState { total: 46, done: 2, current: "int/alu".into() };
-        let s = remaining(&early, Duration::from_secs(3), true);
-        assert_eq!(s, t!("bench-time-total", elapsed = 3u64, total = QUICK_SECS),
-                   "must not extrapolate from two rows");
-
-        // Halfway through 40s of a 46-kernel run: about 40s more to go.
-        let later = LiveState { total: 46, done: 23, current: "mem/copy".into() };
-        let s = remaining(&later, Duration::from_secs(40), true);
-        assert_eq!(s, t!("bench-time-left", elapsed = 40u64, left = 40u64),
-                   "expected an estimate near 40s");
-    }
-
-    #[test]
-    fn progress_is_a_fraction_even_before_the_guest_says_how_many() {
-        assert_eq!(LiveState::default().fraction(), 0.0);
-        assert_eq!(LiveState { total: 4, done: 1, ..Default::default() }.fraction(), 0.25);
-        // A guest that somehow reports past its own plan must not overflow the bar.
-        assert_eq!(LiveState { total: 4, done: 9, ..Default::default() }.fraction(), 1.0);
     }
 
     #[test]

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Build and package IRIS for macOS as universal (arm64 + x86_64) binaries:
-# IRIS.app as a .dmg and a .zip, plus the CLI tarball holding iris and iris-ci.
+# the native AppKit app, "IRIS.app" (iris-gui/frontends/appkit), as a
+# .dmg and a .zip, plus the CLI tarball holding iris and iris-ci. The egui
+# IRIS.app is no longer packaged for macOS (scripts/dist/macos-bundle.sh still
+# builds it by hand).
 #
 #   scripts/dist/package-macos.sh [options]
 #
@@ -17,7 +20,7 @@
 # Set REQUIRE_NOTARIZATION=1 to fail instead of shipping unnotarized files.
 #
 # CI builds each architecture on its own runner: `--build-only --target T`
-# builds T's iris-gui, iris and iris-ci into target/T/release and stops; the
+# builds T's iris-appkit, iris and iris-ci into target/T/release and stops; the
 # packaging run then gets both slices there and runs with --skip-build.
 source "$(dirname "$0")/lib.sh"
 
@@ -36,9 +39,9 @@ esac
 if [ "$BUILD_ONLY" = 1 ]; then
     [ "$SKIP_BUILD" = 1 ] && die "--build-only and --skip-build are opposites"
     # The same features the bundle and the CLI steps below build with.
-    build_gui "$TARGET" "$(with_bundled "$GUI_FEATURES")"
+    build_appkit "$TARGET" "$(with_bundled "$GUI_FEATURES")"
     build_cli "$TARGET" "$CLI_FEATURES"
-    ls -l "$(release_dir "$TARGET")"/{iris-gui,iris,iris-ci} >&2
+    ls -l "$(release_dir "$TARGET")"/{iris-appkit,iris,iris-ci} >&2
     exit 0
 fi
 need lipo codesign hdiutil ditto
@@ -63,19 +66,51 @@ elif [ "${#NOTARY[@]}" = 0 ]; then
     warn "$msg"
 fi
 
-# Submit a file and wait. notarytool exits 0 even for a rejected submission, so
-# read the status and print Apple's log when it is not Accepted.
+# Submit a file and wait for Apple's verdict, printing Apple's log when it is
+# not Accepted. The notary service sometimes drops a connection (a TLS error
+# while `notarytool submit --wait` polls), which used to fail the build with
+# the submission still in progress: submit, then poll, retrying both.
+# Only notarytool's standard output is read as JSON (its warnings go to the
+# log), and a status query that keeps failing (a revoked key, a wrong team)
+# stops after a few minutes instead of spending the whole deadline.
 notarize() {  # <file>
     [ "${#NOTARY[@]}" -gt 0 ] || return 0
-    local out id status
-    group_start "notarize $(basename "$1")"
-    out=$(xcrun notarytool submit "$1" "${NOTARY[@]}" --wait --output-format json)
+    local out="" id="" status="" try deadline name err fails=0
+    name=$(basename "$1")
+    err=$(mktemp "${TMPDIR:-/tmp}/notarytool.XXXXXX")
+    group_start "notarize $name"
+    for try in 1 2 3; do
+        if out=$(xcrun notarytool submit "$1" "${NOTARY[@]}" --output-format json 2>"$err"); then
+            id=$(printf '%s' "$out" | plutil -extract id raw -o - - 2>/dev/null || true)
+            [ -n "$id" ] && break
+        fi
+        warn "submitting $name for notarization failed (try $try): $out $(cat "$err")"
+        [ "$try" -lt 3 ] && sleep 30
+    done
+    [ -n "$id" ] || { rm -f "$err"; die "could not submit $name for notarization"; }
+    echo "submitted $name: $id"
+    deadline=$(( $(date +%s) + 40 * 60 ))
+    while :; do
+        if out=$(xcrun notarytool info "$id" "${NOTARY[@]}" --output-format json 2>"$err"); then
+            fails=0
+            status=$(printf '%s' "$out" | plutil -extract status raw -o - - 2>/dev/null || true)
+            [ -n "$status" ] && [ "$status" != "In Progress" ] && break
+        else
+            fails=$((fails + 1))
+            warn "asking for the notarization status of $name failed ($fails in a row): $(cat "$err")"
+            if [ "$fails" -ge 8 ]; then
+                out=$(cat "$err"); rm -f "$err"
+                die "the notarization status of $name ($id) could not be read: $out"
+            fi
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] || { rm -f "$err"; die "notarization of $name ($id) did not finish within 40 minutes"; }
+        sleep 20
+    done
+    rm -f "$err"
     echo "$out"
-    id=$(printf '%s' "$out" | plutil -extract id raw -o - - 2>/dev/null || true)
-    status=$(printf '%s' "$out" | plutil -extract status raw -o - - 2>/dev/null || true)
     if [ "$status" != "Accepted" ]; then
-        [ -n "$id" ] && xcrun notarytool log "$id" "${NOTARY[@]}" || true
-        die "notarization of $(basename "$1") finished as '${status:-unknown}'"
+        xcrun notarytool log "$id" "${NOTARY[@]}" || true
+        die "notarization of $name finished as '${status:-unknown}'"
     fi
     group_end
 }
@@ -98,11 +133,11 @@ trap 'rm -rf "$WORK"' EXIT
 # ── GUI ──────────────────────────────────────────────────────────────────────
 BUNDLE_ARGS=(--features "$(with_bundled "$GUI_FEATURES")" --version "$VERSION" --out "$WORK" --sign "$IDENTITY")
 if [ "$SKIP_BUILD" = 1 ]; then
-    lipo -create -output "$WORK/iris-gui" \
-        "$(release_dir aarch64-apple-darwin)/iris-gui" "$(release_dir x86_64-apple-darwin)/iris-gui"
-    BUNDLE_ARGS+=(--binary "$WORK/iris-gui")
+    lipo -create -output "$WORK/iris-appkit" \
+        "$(release_dir aarch64-apple-darwin)/iris-appkit" "$(release_dir x86_64-apple-darwin)/iris-appkit"
+    BUNDLE_ARGS+=(--binary "$WORK/iris-appkit")
 fi
-"$DIST_ROOT/scripts/dist/macos-bundle.sh" "${BUNDLE_ARGS[@]}"
+"$DIST_ROOT/iris-gui/frontends/appkit/scripts/bundle.sh" "${BUNDLE_ARGS[@]}"
 APP="$WORK/IRIS.app"
 
 if [ "${#NOTARY[@]}" -gt 0 ]; then
