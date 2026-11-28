@@ -225,6 +225,7 @@ pub mod dev;
 pub mod gfifo;
 #[cfg(feature = "wgpu")]
 pub mod wgpu;
+pub mod trace_sink;
 pub mod trace_writer;
 pub mod gfx_display;
 pub mod display;

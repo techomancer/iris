@@ -1684,7 +1684,7 @@ impl Rex3 {
             #[cfg(feature = "gputrace")]
             rec: Mutex::new(None),
             #[cfg(feature = "gputrace")]
-            trace: Mutex::new(trace::Rex3Trace::new()),
+            trace: Mutex::new(trace::Rex3Trace::new(["gfifo", "cpu"], 1)),
             show_cmap: AtomicBool::new(false),
             show_disp_debug: AtomicBool::new(false),
         }
@@ -1717,7 +1717,7 @@ impl Rex3 {
         #[cfg(feature = "gputrace")]
         if self.tap.load(Ordering::Acquire) != 0
             || self.rec.lock().is_some()
-            || self.trace.lock().is_active()
+            || self.trace.lock().is_open()
         {
             return Err(ResidentError::InvalidState("REX3 cannot attach while recording or tracing"));
         }

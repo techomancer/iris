@@ -18,9 +18,8 @@
 //! `IRIS_REX3_TRACE=<file>` starts a full trace when the board starts.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
-use crate::trace_writer::TraceWriter;
+use crate::trace_sink::{trace_command, Classes, TraceFile, TraceRun};
 
 use super::*;
 
@@ -31,7 +30,7 @@ pub const TRACE_CPU: u32 = 2;
 pub const TRACE_ALL: u32 = TRACE_GFIFO | TRACE_CPU;
 
 /// Pending run of identical CPU accesses, collapsed into one line.
-struct CpuRun {
+pub struct CpuRun {
     write: bool,
     bits: u32,
     off: u32,
@@ -41,48 +40,29 @@ struct CpuRun {
     count: u64,
 }
 
-/// Trace sink state; lives in `Rex3::trace`.
-pub struct Rex3Trace {
-    out: Option<TraceWriter>,
-    start: Option<Instant>,
-    gf_seq: u64,
-    cpu_seq: u64,
-    run: Option<CpuRun>,
-    last_flush: Option<Instant>,
-}
-
-impl Rex3Trace {
-    pub const fn new() -> Self {
-        Self { out: None, start: None, gf_seq: 0, cpu_seq: 0, run: None, last_flush: None }
+impl TraceRun for CpuRun {
+    fn merge(&mut self, n: &Self) -> bool {
+        let same = (self.write, self.bits, self.off, self.val, self.dcb) == (n.write, n.bits, n.off, n.val, n.dcb);
+        self.count += same as u64;
+        same
     }
 
-    #[cfg(feature = "wgpu")]
-    pub(super) fn is_active(&self) -> bool {
-        self.out.is_some()
-    }
-
-    /// Emit the pending collapsed CPU run, if any.
-    fn close_run(&mut self) {
-        let Some(r) = self.run.take() else { return };
-        let dir = if r.write { "wr" } else { "rd" };
-        let seq = self.cpu_seq;
-        let name = reg_label(r.off & !0x0800, r.dcb);
-        let go = if r.off & 0x0800 != 0 { " GO" } else { "" };
-        let val = if r.bits > 32 { format!("{:#018x}", r.val) } else { format!("{:#010x}", r.val) };
-        if r.count == 1 {
-            self.line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}"));
+    fn emit(&self, seq: u64, line: impl FnOnce(std::fmt::Arguments)) {
+        let dir = if self.write { "wr" } else { "rd" };
+        let name = reg_label(self.off & !0x0800, self.dcb);
+        let go = if self.off & 0x0800 != 0 { " GO" } else { "" };
+        let val = if self.bits > 32 { format!("{:#018x}", self.val) } else { format!("{:#010x}", self.val) };
+        if self.count == 1 {
+            line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}"));
         } else {
-            self.line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}  (x{})", r.count));
-        }
-    }
-
-    fn line(&mut self, text: std::fmt::Arguments) {
-        let t = self.start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
-        if let Some(f) = self.out.as_mut() {
-            f.line(format_args!("{t:12.6} {text}"));
+            line(format_args!("CPU #{seq:06} {dir} {name}{go} = {val}  (x{})", self.count));
         }
     }
 }
+
+/// Trace state; lives in `Rex3::trace`. Counters: GFIFO entries, then CPU
+/// and DMA lines.
+pub type Rex3Trace = TraceFile<CpuRun, 2>;
 
 /// Register name, with the DCB target for DCBDATA accesses.
 fn reg_label(reg: u32, dcbmode: Option<u32>) -> String {
@@ -121,10 +101,11 @@ pub(crate) fn dcb_target(mode: u32) -> String {
     format!("{dev} crs {crs} dw{width}")
 }
 
-/// Parse a trace category list: `gfifo,cpu` or `all`.
-pub fn trace_mask(s: &str) -> Result<u32, String> {
-    crate::devlog::select(s, &[("gfifo", TRACE_GFIFO), ("gf", TRACE_GFIFO), ("cpu", TRACE_CPU), ("dma", TRACE_CPU)], TRACE_ALL)
-}
+/// `gfifo,cpu` or `all`.
+const CLASSES: Classes = Classes {
+    names: &[("gfifo", TRACE_GFIFO), ("gf", TRACE_GFIFO), ("cpu", TRACE_CPU), ("dma", TRACE_CPU)],
+    all: TRACE_ALL,
+};
 
 impl Rex3 {
     #[inline]
@@ -136,25 +117,12 @@ impl Rex3 {
     /// value read or written; `dcbmode` as it was before a DCBDATA access).
     pub(crate) fn trace_cpu(&self, write: bool, bits: u32, off: u32, val: u64, dcbmode: Option<u32>) {
         let dcb = dcbmode.map(|m| m & (DCBMODE_DCBADDR_MASK | DCBMODE_DCBCRS_MASK | DCBMODE_DATAWIDTH_MASK));
-        let mut t = self.trace.lock();
-        if let Some(r) = t.run.as_mut() {
-            if (r.write, r.bits, r.off, r.val, r.dcb) == (write, bits, off, val, dcb) {
-                r.count += 1;
-                return;
-            }
-        }
-        t.close_run();
-        t.cpu_seq += 1;
-        t.run = Some(CpuRun { write, bits, off, val, dcb, count: 1 });
+        self.trace.lock().access(CpuRun { write, bits, off, val, dcb, count: 1 });
     }
 
     /// A DMA engine transfer.
     pub(crate) fn trace_dma(&self, text: std::fmt::Arguments) {
-        let mut t = self.trace.lock();
-        t.close_run();
-        t.cpu_seq += 1;
-        let seq = t.cpu_seq;
-        t.line(format_args!("DMA #{seq:06} {text}"));
+        self.trace.lock().event(1, "DMA", text);
     }
 
     /// One GFIFO entry, after `process_register` applied it and before its
@@ -196,11 +164,7 @@ impl Rex3 {
                 }
             }
         };
-        let mut t = self.trace.lock();
-        t.close_run();
-        t.gf_seq += 1;
-        let seq = t.gf_seq;
-        t.line(format_args!("GF  #{seq:06} {text}"));
+        self.trace.lock().event(0, "GF ", text);
     }
 
     /// Hand the trace to its writer thread (called every frame from the
@@ -209,28 +173,15 @@ impl Rex3 {
         if self.tap.load(Ordering::Relaxed) & TRACE_ALL == 0 && !force {
             return;
         }
-        let mut t = self.trace.lock();
-        let due = t.last_flush.map_or(true, |l| l.elapsed().as_millis() >= 500);
-        if force || due {
-            t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                f.flush();
-            }
-            t.last_flush = Some(Instant::now());
-        }
+        self.trace.lock().flush(force);
     }
 
     /// Start the annotated trace into `path` for the categories in `mask`.
     pub fn start_trace(&self, path: &str, mask: u32) -> std::io::Result<()> {
         #[cfg(feature = "wgpu")]
         self.reject_resident_operation("tracing").map_err(std::io::Error::other)?;
-        let f = TraceWriter::create(path)?;
         let mut t = self.trace.lock();
-        t.out = Some(f);
-        t.start = Some(Instant::now());
-        t.gf_seq = 0;
-        t.cpu_seq = 0;
-        t.run = None;
+        t.open(path)?;
         t.line(format_args!("REX3 trace started (mask {mask:#x})"));
         drop(t);
         self.tap.fetch_and(!TRACE_ALL, Ordering::SeqCst);
@@ -242,37 +193,11 @@ impl Rex3 {
     /// when no trace was running.
     pub fn stop_trace(&self) -> Option<String> {
         self.tap.fetch_and(!TRACE_ALL, Ordering::SeqCst);
-        let mut t = self.trace.lock();
-        t.close_run();
-        let f = t.out.take()?;
-        let path = f.path.clone();
-        let res = f.finish();
-        Some(match res {
-            Ok(bytes) => format!("{path} (gfifo {} / cpu {} entries, {bytes} bytes)", t.gf_seq, t.cpu_seq),
-            Err(e) => format!("{path}: write failed: {e}"),
-        })
+        self.trace.lock().stop()
     }
 
     /// `rex trace ...`.
     pub(super) fn cmd_trace(&self, args: &[&str], w: &mut dyn std::io::Write) -> Result<(), String> {
-        let e = |r: std::io::Result<()>| r.map_err(|e| e.to_string());
-        match args {
-            ["flush"] => {
-                self.trace_flush(true);
-                if let Some(f) = self.trace.lock().out.as_mut() {
-                    f.sync();
-                }
-                e(writeln!(w, "trace flushed"))
-            }
-            [] | ["off"] => e(match self.stop_trace() {
-                Some(s) => writeln!(w, "trace closed: {s}"),
-                None => writeln!(w, "trace not active"),
-            }),
-            [path, rest @ ..] => {
-                let mask = trace_mask(rest.first().copied().unwrap_or("all")).map_err(|e| format!("rex trace: {e}"))?;
-                self.start_trace(path, mask).map_err(|e| format!("rex trace: cannot create {path}: {e}"))?;
-                e(writeln!(w, "tracing to {path} (mask {mask:#x})"))
-            }
-        }
+        trace_command(args, "rex trace", &CLASSES, w, || self.trace_flush(true), || self.stop_trace(), |p, m| self.start_trace(p, m))
     }
 }
