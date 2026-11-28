@@ -322,7 +322,21 @@ help pages, with the same shortcuts as elsewhere (Ctrl instead of Command).
 
 The machine settings, the New Machine wizard and Preferences are the same
 forms the Mac app draws, in libadwaita's rows. The guest's display is drawn
-at Actual Size, Scale to Fit or Stretch, sharp at whole multiples.
+at Actual Size, Scale to Fit or Stretch, sharp at whole multiples, and a
+dual-head Newport draws both heads side by side, head 0 taking the input.
+
+The settings also carry what only the egui app used to offer, which the Mac
+app will draw as soon as it is taught the rows: **New disk image** beside a
+SCSI target makes a blank raw or CHD image in the background, with progress
+and cancel, and never replaces a file; a disk can be a **scratch volume**
+with a size, or have its **write cache** turned off; a CD-ROM keeps a
+**changer** of further discs; a DaynaPort has its own **Ethernet address and
+subnet**; the **Real-time clock** page shifts the guest's clock and shows
+what it would start at; the Network page serves a folder over **TFTP** or
+**rsh** beside the NFS share; and **Tools > Set MAC Address** writes the
+address the PROM reports into the machine's NVRAM or EEPROM. The benchmark
+window shows DMIPS, guest MIPS and accuracy as figures, each category's rate
+against the reference, and the machine the run was made on.
 
 **The mouse follows the pointer** rather than being captured: GTK 4 has no
 pointer lock of its own, and Wayland offers one only through protocols it
