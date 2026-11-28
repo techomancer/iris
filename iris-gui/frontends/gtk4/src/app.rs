@@ -32,6 +32,17 @@ struct Shell {
     wake: Arc<GlibWake>,
     /// The controller agreed to quit: the next close goes through.
     may_quit: bool,
+    /// The machine settings, while they are open.
+    settings: Option<std::rc::Rc<crate::settings::SettingsDialog>>,
+    /// The application preferences, while they are open.
+    prefs: Option<std::rc::Rc<crate::prefs::PrefsDialog>>,
+    /// The New Machine wizard, while it is open.
+    new_machine: Option<std::rc::Rc<crate::new_machine::NewMachineDialog>>,
+    /// The windows that follow a controller of their own.
+    serial: Option<std::rc::Rc<crate::panels::SerialWindow>>,
+    net: Option<std::rc::Rc<crate::panels::NetWindow>>,
+    camera: Option<std::rc::Rc<crate::panels::CameraWindow>>,
+    help: Vec<crate::panels::HelpWindow>,
 }
 
 thread_local! {
@@ -76,6 +87,152 @@ pub fn application() -> Option<adw::Application> {
 /// Select `name` and show it.
 pub fn select_machine(name: String) {
     dispatch(AppAction::Select(name));
+}
+
+/// A command id that reports a settings control from a menu:
+/// `setting:<control id>#<value>`.
+pub const SETTING_PREFIX: &str = "setting:";
+
+/// Open the machine settings, at `page` when one is named.
+fn open_settings(page: Option<&str>) {
+    let dialog = with(|s| {
+        let d = s.settings.get_or_insert_with(crate::settings::SettingsDialog::new).clone();
+        d.refresh(&s.app);
+        d
+    });
+    let Some(dialog) = dialog else { return later(move || open_settings(None)) };
+    if let Some(page) = page {
+        dialog.show_page(page);
+    }
+    if let Some(window) = window() {
+        dialog.dialog.present(Some(&window));
+    }
+}
+
+/// A settings control reported a new value.
+pub fn setting(id: String, value: iris_gui_core::controller::settings::Value) {
+    // A text field commits when a redraw takes its focus away, which happens
+    // inside the shell's borrow: report it once the redraw is done instead
+    // of dropping what was typed.
+    if SHELL.with(|s| s.try_borrow_mut().is_err()) {
+        return later(move || setting(id, value));
+    }
+    let action = with(|s| s.settings.as_ref().and_then(|d| d.action(&id, value))).flatten();
+    if let Some(a) = action {
+        dispatch(AppAction::Settings(a));
+    }
+}
+
+/// A serial console action.
+pub fn dispatch_serial(action: iris_gui_core::controller::serial::SerialAction) {
+    later(move || dispatch(AppAction::Serial(action)));
+}
+
+/// A networking action.
+pub fn dispatch_network(action: iris_gui_core::controller::network::NetworkAction) {
+    later(move || dispatch(AppAction::Network(action)));
+}
+
+/// The camera test window closed.
+pub fn dispatch_camera() {
+    later(|| dispatch(AppAction::Camera(iris_gui_core::controller::camera::CameraAction::Close)));
+}
+
+/// Show a help page, built now from the selected machine (it carries live
+/// values); an open window for the page is rebuilt and brought forward.
+fn show_help(page: iris_gui_core::controller::help::HelpPage) {
+    let dialog = with(|s| {
+        if let Some(i) = s.help.iter().position(|h| h.page == page) {
+            s.help.remove(i).dialog.close();
+        }
+        let doc = s.app.help(page, env!("APP_VERSION"), env!("APP_COMMIT"));
+        let w = crate::panels::HelpWindow::new(page, &doc);
+        let dialog = w.dialog.clone();
+        s.help.push(w);
+        dialog
+    });
+    let Some(dialog) = dialog else { return later(move || show_help(page)) };
+    if let Some(window) = window() {
+        dialog.present(Some(&window));
+    }
+}
+
+/// The panels follow their controllers: shown while open, gone after.
+fn refresh_panels(s: &mut Shell) {
+    fn mirror<W>(slot: &mut Option<std::rc::Rc<W>>, open: bool, make: impl FnOnce() -> std::rc::Rc<W>, dialog: impl Fn(&W) -> adw::Dialog) {
+        match (open, slot.is_some()) {
+            (true, false) => {
+                let w = make();
+                let d = dialog(&w);
+                *slot = Some(w);
+                if let Some(window) = window() {
+                    d.present(Some(&window));
+                }
+            }
+            (false, true) => {
+                if let Some(w) = slot.take() {
+                    dialog(&w).close();
+                }
+            }
+            _ => {}
+        }
+    }
+    mirror(&mut s.serial, s.app.serial().is_open(), crate::panels::SerialWindow::new, |w| w.dialog.clone());
+    mirror(&mut s.net, s.app.network().check_open(), crate::panels::NetWindow::new, |w| w.dialog.clone());
+    mirror(&mut s.camera, s.app.camera().is_open(), crate::panels::CameraWindow::new, |w| w.dialog.clone());
+    if let Some(w) = &s.serial {
+        w.refresh(&s.app);
+    }
+    if let Some(w) = &s.net {
+        let check = s.app.net_check();
+        w.refresh(check);
+    }
+    if let Some(w) = &s.camera {
+        w.refresh(&s.app);
+    }
+}
+
+/// Open the application preferences.
+fn open_prefs() {
+    let dialog = with(|s| {
+        let d = s.prefs.get_or_insert_with(crate::prefs::PrefsDialog::new).clone();
+        d.refresh(&s.app);
+        d
+    });
+    let Some(dialog) = dialog else { return later(open_prefs) };
+    if let Some(window) = window() {
+        dialog.dialog.present(Some(&window));
+    }
+}
+
+/// A preferences control reported a new value.
+pub fn prefs_control(id: &str, value: iris_gui_core::controller::settings::Value) {
+    if let Some(a) = iris_gui_core::controller::preferences::action_for(id, value) {
+        dispatch(a);
+    }
+}
+
+/// Open a fresh New Machine wizard.
+fn open_new_machine() {
+    let dialog = with(|s| {
+        let d = crate::new_machine::NewMachineDialog::new();
+        s.new_machine = Some(d.clone());
+        d
+    });
+    let Some(dialog) = dialog else { return later(open_new_machine) };
+    if let Some(window) = window() {
+        dialog.dialog.present(Some(&window));
+    }
+}
+
+/// A control in the New Machine wizard reported a value.
+pub fn new_machine_control(id: String, value: iris_gui_core::controller::settings::Value) {
+    if SHELL.with(|s| s.try_borrow_mut().is_err()) {
+        return later(move || new_machine_control(id, value));
+    }
+    if let Some(d) = with(|s| s.new_machine.clone()).flatten() {
+        d.control(&id, value);
+    }
 }
 
 /// The machine page's tab changed; the shell keeps it across refreshes.
@@ -162,7 +319,7 @@ fn start(app: &adw::Application) {
     menu::window_actions(app);
     let win = MainWindow::new(app);
     win.window.present();
-    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app: ctl, win, wake, may_quit: false }));
+    SHELL.with(|s| *s.borrow_mut() = Some(Shell { app: ctl, win, wake, may_quit: false, settings: None, prefs: None, new_machine: None, serial: None, net: None, camera: None, help: Vec::new() }));
     STARTED.with(|f| f.set(true));
     refresh();
     tick();
@@ -198,6 +355,21 @@ fn script_step() {
         crate::effects::script_answer(r);
     } else if step == "dump:menu" {
         menu::dump();
+    } else if let Some((id, v)) = step.strip_prefix("set:").and_then(|s| s.split_once('=')) {
+        // set:ID=i:N | b:0/1 | t:TEXT | n:NUMBER, as the control would report.
+        use iris_gui_core::controller::settings::Value;
+        let value = match v.split_once(':') {
+            Some(("i", n)) => n.parse().ok().map(Value::Index),
+            Some(("b", b)) => Some(Value::Bool(b == "1")),
+            Some(("t", t)) => Some(Value::Text(t.to_string())),
+            Some(("n", n)) => n.parse().ok().map(Value::Number),
+            _ => None,
+        };
+        if let Some(value) = value {
+            setting(id.to_string(), value);
+        }
+    } else if let Some(page) = step.strip_prefix("page:") {
+        open_settings(Some(page));
     } else if let Some(name) = step.strip_prefix("select:") {
         select_machine(name.to_string());
     } else if let Some(tab) = step.strip_prefix("tab:") {
@@ -261,9 +433,21 @@ fn timed_tick() {
 pub fn refresh() {
     let due = with(|s| {
         s.win.refresh(&s.app);
+        if let Some(d) = s.settings.clone() {
+            d.refresh(&s.app);
+        }
+        if let Some(d) = s.prefs.clone() {
+            d.refresh(&s.app);
+        }
+        refresh_panels(s);
+        // The camera preview has no wake of its own: poll it while it runs.
+        let camera = s.app.camera().is_open().then(|| Duration::from_millis(66));
         let app = &s.app;
         menu::refresh_enabled(|id| app.command_enabled(id) == Enabled::Yes);
-        app.wake_due_in()
+        match (app.wake_due_in(), camera) {
+            (Some(a), Some(c)) => Some(a.min(c)),
+            (a, c) => a.or(c),
+        }
     })
     .flatten();
     // Nothing wakes a quiet shell, so the autosave pause and the stop after
@@ -300,8 +484,7 @@ pub fn run_effects(fx: Vec<Effect>) {
     }
     let out = crate::effects::run(fx);
     if let Some(page) = out.open_settings {
-        // The settings window arrives with its own slice.
-        eprintln!("iris-gtk: no settings window yet (page {page})");
+        open_settings(Some(page));
     }
     if out.quit {
         quit();
@@ -326,6 +509,11 @@ const DIAGNOSTICS: &str = "shell.diagnostics";
 /// scripted answers from inside `run_effects`.
 pub fn answer(a: Answer) {
     later(move || {
+        if let Some(d) = with(|s| s.new_machine.clone()).flatten() {
+            if d.picked(&a) {
+                return;
+            }
+        }
         if a.purpose() == DIAGNOSTICS {
             if let Answer::Chose { index: 1, .. } = a {
                 run_effects(vec![Effect::CopyToClipboard(iris_gui_core::controller::debug::diagnostics_text())]);
@@ -342,10 +530,18 @@ pub fn command(id: &str) {
     if let Some(name) = id.strip_prefix(crate::toolbar::SELECT_MACHINE) {
         return select_machine(name.to_string());
     }
+    // A settings control a menu item stands for (Add Forward's suggestions).
+    if let Some(rest) = id.strip_prefix(SETTING_PREFIX) {
+        use iris_gui_core::controller::settings::Value;
+        let (control, arg) = rest.split_once('#').unwrap_or((rest, ""));
+        let value = match arg.parse::<usize>() {
+            Ok(i) => Value::Index(i),
+            Err(_) => Value::Bool(true),
+        };
+        return setting(control.to_string(), value);
+    }
     if let Some(page) = iris_gui_core::controller::help::HelpPage::from_id(id) {
-        // The help windows arrive with their own slice.
-        eprintln!("iris-gtk: no help window yet ({})", page.id());
-        return;
+        return show_help(page);
     }
     let Some(routed) = with(|s| s.app.command(id)) else {
         return later({
@@ -383,12 +579,12 @@ fn shell_command(c: ShellCommand) {
         ShellCommand::ToggleLibrary => {
             with(|s| s.win.toggle_library());
         }
-        ShellCommand::Settings
-        | ShellCommand::SavedStates
+        ShellCommand::Settings => open_settings(None),
+        ShellCommand::AppSettings => open_prefs(),
+        ShellCommand::NewMachine => open_new_machine(),
+        ShellCommand::SavedStates
         | ShellCommand::DiscMenu
-        | ShellCommand::NewMachine
         | ShellCommand::About
-        | ShellCommand::AppSettings
         | ShellCommand::Benchmark => eprintln!("iris-gtk: {c:?} has no window yet"),
     }
 }

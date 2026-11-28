@@ -1,0 +1,253 @@
+//! The windows that follow a controller of their own: the serial console,
+//! Check Networking, the camera test, and the Help pages.
+//!
+//! Each is an `AdwDialog` over the main window, shown exactly while its
+//! controller says it is open, so closing one is an action like any other.
+
+use std::cell::{Cell, RefCell};
+
+use adw::prelude::*;
+use gtk::{gdk, glib};
+use gtk4 as gtk;
+use iris_gui_core::controller::app::AppController;
+use iris_gui_core::controller::help::{HelpDoc, HelpPage, Line};
+use iris_gui_core::controller::network::{CheckLine, NetCheck, NetworkAction};
+use iris_gui_core::controller::serial::SerialAction;
+use libadwaita as adw;
+
+/// A dialog with a header bar and a scrolling body.
+fn shell_dialog(title: &str, width: i32, height: i32) -> (adw::Dialog, adw::ToolbarView, gtk::Box) {
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new(title, "")));
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    let scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&body).build();
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&header);
+    view.set_content(Some(&scroll));
+    let dialog = adw::Dialog::builder().title(title).content_width(width).content_height(height).build();
+    dialog.set_child(Some(&view));
+    (dialog, view, body)
+}
+
+// ---- the serial console ----------------------------------------------------
+
+pub struct SerialWindow {
+    pub dialog: adw::Dialog,
+    text: gtk::TextView,
+    status: gtk::Label,
+    entry: gtk::Entry,
+    seq: Cell<u64>,
+}
+
+impl SerialWindow {
+    pub fn new() -> std::rc::Rc<Self> {
+        let (dialog, view, body) = shell_dialog(&t!("tb-serial-console"), 760, 520);
+        let text = gtk::TextView::builder().editable(false).monospace(true).wrap_mode(gtk::WrapMode::WordChar).build();
+        let scroll = gtk::ScrolledWindow::builder().vexpand(true).child(&text).build();
+        scroll.add_css_class("card");
+        scroll.set_size_request(-1, 320);
+        body.append(&scroll);
+
+        let status = gtk::Label::new(None);
+        status.set_xalign(0.0);
+        status.add_css_class("dim-label");
+        body.append(&status);
+
+        let entry = gtk::Entry::builder().placeholder_text(t!("window-serial-send")).hexpand(true).build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.append(&entry);
+        let ctrl_c = gtk::Button::with_label("Ctrl+C");
+        ctrl_c.connect_clicked(|_| crate::app::dispatch_serial(SerialAction::SendBytes(vec![3])));
+        row.append(&ctrl_c);
+        let clear = gtk::Button::with_label(&t!("window-serial-clear"));
+        clear.connect_clicked(|_| crate::app::dispatch_serial(SerialAction::Clear));
+        row.append(&clear);
+        let bar = adw::ToolbarView::new();
+        let _ = &bar;
+        view.add_bottom_bar(&row);
+
+        let me = std::rc::Rc::new(Self { dialog, text, status, entry, seq: Cell::new(u64::MAX) });
+        let w = std::rc::Rc::downgrade(&me);
+        me.entry.connect_activate(move |e| {
+            let line = e.text().to_string();
+            e.set_text("");
+            let _ = &w;
+            crate::app::dispatch_serial(SerialAction::SendLine(line));
+        });
+        me.dialog.connect_closed(|_| crate::app::dispatch_serial(SerialAction::Close));
+        me
+    }
+
+    pub fn refresh(&self, app: &AppController) {
+        let Some(view) = app.serial().view() else { return };
+        if self.seq.replace(view.seq) != view.seq {
+            let buffer = self.text.buffer();
+            buffer.set_text(&view.text);
+            // Follow the tail, as a console does.
+            let end = buffer.end_iter();
+            self.text.scroll_to_iter(&mut end.clone(), 0.0, false, 0.0, 1.0);
+        }
+        self.status.set_label(&view.status);
+        if view.error {
+            self.status.add_css_class("error");
+        } else {
+            self.status.remove_css_class("error");
+        }
+        self.entry.set_sensitive(view.connected);
+    }
+}
+
+// ---- Check Networking ------------------------------------------------------
+
+pub struct NetWindow {
+    pub dialog: adw::Dialog,
+    body: gtk::Box,
+    shown: RefCell<Option<NetCheck>>,
+}
+
+impl NetWindow {
+    pub fn new() -> std::rc::Rc<Self> {
+        let (dialog, _view, body) = shell_dialog(&t!("mb-check-network"), 640, 560);
+        let me = std::rc::Rc::new(Self { dialog, body, shown: RefCell::default() });
+        me.dialog.connect_closed(|_| crate::app::dispatch_network(NetworkAction::CloseCheck));
+        me
+    }
+
+    pub fn refresh(&self, check: NetCheck) {
+        if self.shown.borrow().as_ref() == Some(&check) {
+            return;
+        }
+        while let Some(child) = self.body.first_child() {
+            self.body.remove(&child);
+        }
+        for line in &check.lines {
+            self.body.append(&check_line(line));
+        }
+        if let Some(cidr) = &check.adopt {
+            let button = gtk::Button::with_label(&t!("window-net-use-guest-subnet", network = cidr.as_str()));
+            button.add_css_class("suggested-action");
+            let cidr = cidr.clone();
+            button.connect_clicked(move |_| crate::app::dispatch_network(NetworkAction::AdoptSubnet(cidr.clone())));
+            self.body.append(&button);
+        }
+        *self.shown.borrow_mut() = Some(check);
+    }
+}
+
+fn check_line(line: &CheckLine) -> gtk::Widget {
+    let (text, class) = match line {
+        CheckLine::Good(t) => (t, Some("success")),
+        CheckLine::Bad(t) => (t, Some("error")),
+        CheckLine::Text(t) => (t, None),
+        CheckLine::Weak(t) => (t, Some("dim-label")),
+        CheckLine::Code(t) => (t, Some("monospace")),
+        CheckLine::Strong(t) => (t, Some("heading")),
+    };
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_selectable(matches!(line, CheckLine::Code(_)));
+    if let Some(class) = class {
+        label.add_css_class(class);
+    }
+    label.upcast()
+}
+
+// ---- the camera test -------------------------------------------------------
+
+pub struct CameraWindow {
+    pub dialog: adw::Dialog,
+    picture: gtk::Picture,
+    status: gtk::Label,
+    seq: Cell<u64>,
+}
+
+impl CameraWindow {
+    pub fn new() -> std::rc::Rc<Self> {
+        let (dialog, _view, body) = shell_dialog(&t!("mb-camera-test"), 680, 560);
+        let picture = gtk::Picture::builder().vexpand(true).content_fit(gtk::ContentFit::Contain).build();
+        picture.add_css_class("iris-screen");
+        picture.set_size_request(-1, 360);
+        body.append(&picture);
+        let status = gtk::Label::new(None);
+        status.set_wrap(true);
+        status.set_xalign(0.0);
+        body.append(&status);
+        let me = std::rc::Rc::new(Self { dialog, picture, status, seq: Cell::new(0) });
+        me.dialog.connect_closed(|_| crate::app::dispatch_camera());
+        me
+    }
+
+    pub fn refresh(&self, app: &AppController) {
+        if let Some((status, bad)) = app.camera().status() {
+            self.status.set_label(&status);
+            if bad {
+                self.status.add_css_class("error");
+            } else {
+                self.status.remove_css_class("error");
+            }
+        }
+        let mut seq = self.seq.get();
+        if let Some((w, h, rgba)) = app.camera().take_new_frame(&mut seq) {
+            self.seq.set(seq);
+            let bytes = glib::Bytes::from_owned(rgba);
+            let texture = gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &bytes, w as usize * 4);
+            self.picture.set_paintable(Some(&texture));
+        }
+    }
+}
+
+// ---- Help ------------------------------------------------------------------
+
+pub struct HelpWindow {
+    pub dialog: adw::Dialog,
+    pub page: HelpPage,
+}
+
+impl HelpWindow {
+    pub fn new(page: HelpPage, doc: &HelpDoc) -> Self {
+        let (dialog, _view, body) = shell_dialog(&doc.title, 680, 620);
+        for line in &doc.lines {
+            body.append(&help_line(line));
+        }
+        Self { dialog, page }
+    }
+}
+
+fn help_line(line: &Line) -> gtk::Widget {
+    match line {
+        Line::Rule => gtk::Separator::new(gtk::Orientation::Horizontal).upcast(),
+        Line::Link { label, url } => {
+            let button = gtk::LinkButton::with_label(url, label);
+            button.set_halign(gtk::Align::Start);
+            button.upcast()
+        }
+        other => {
+            let (text, class) = match other {
+                Line::Heading(t) => (t, Some("title-4")),
+                Line::Strong(t) => (t, Some("heading")),
+                Line::Text(t) => (t, None),
+                Line::Weak(t) => (t, Some("dim-label")),
+                Line::Warn(t) => (t, Some("warning")),
+                Line::Error(t) => (t, Some("error")),
+                Line::Code(t) => (t, Some("monospace")),
+                Line::Rule | Line::Link { .. } => unreachable!("handled above"),
+            };
+            let label = gtk::Label::new(Some(text));
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            label.set_selectable(true);
+            if let Some(class) = class {
+                label.add_css_class(class);
+            }
+            if matches!(other, Line::Code(_)) {
+                label.add_css_class("iris-code");
+            }
+            label.upcast()
+        }
+    }
+}

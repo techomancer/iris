@@ -25,6 +25,14 @@ mod library;
 #[cfg(target_os = "linux")]
 mod menu;
 #[cfg(target_os = "linux")]
+mod new_machine;
+#[cfg(target_os = "linux")]
+mod panels;
+#[cfg(target_os = "linux")]
+mod prefs;
+#[cfg(target_os = "linux")]
+mod settings;
+#[cfg(target_os = "linux")]
 mod status;
 #[cfg(target_os = "linux")]
 mod style;
