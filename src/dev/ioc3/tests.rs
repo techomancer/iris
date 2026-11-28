@@ -1827,6 +1827,7 @@ fn the_receive_timer_fires_with_no_guest_access() {
     r.w32(reg::INT_ENABLE_SET, int::serial(0, int::RX_TIMER));
     r.c.start();
     r.wire[0].inp.lock().unwrap().extend(b"hi");
+    crate::net::wake::host_io().wake.notify();
     assert!(until(|| r.superio.level()), "the expiry raised the line");
     // `int_status` is a plain read of the latch: it catches nothing up.
     assert_ne!(r.c.int_status() & int::serial(0, int::RX_TIMER), 0);
@@ -1844,7 +1845,8 @@ fn a_uart_receive_timeout_comes_from_a_timer() {
     r.w8(reg::SERIAL_A + 1, 1);
     r.c.start();
     r.wire[0].inp.lock().unwrap().push_back(b'x');
-    assert!(until(|| r.c.sh.deadlines()[K_UART].is_some()), "the receive thread took the character");
+    crate::net::wake::host_io().wake.notify(); // a test wire cannot wake the thread itself
+    assert!(until(|| r.c.sh.deadlines()[K_UART].is_some()), "the receive pump took the character");
     let due = r.c.sh.deadlines()[K_UART].unwrap();
     assert_eq!(due, r.c.sh.sio.as_ref().unwrap().lock().uart[0].core.char_time().as_nanos() as u64 * 4);
     r.step(due - 1);
@@ -1922,16 +1924,16 @@ fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
     r.c.stop();
 }
 
-/// `stop` leaves no thread, no timer and no host input taken; `start` brings
+/// `stop` leaves no pump, no timer and no host input taken; `start` brings
 /// them back, and both can be repeated.
 #[test]
-fn stop_joins_the_threads_and_removes_the_timers() {
+fn stop_removes_the_pumps_and_the_timers() {
     let r = running_rig();
     assert!(!r.c.is_running());
     r.c.start();
     r.c.start();
     assert!(r.c.is_running());
-    assert_eq!(r.c.threads.lock().len(), 2, "two receive threads");
+    assert_eq!(r.c.pumps.lock().len(), 2, "two receive pumps");
     assert!(r.c.rtc().is_running(), "and the clock's NVRAM writer");
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
@@ -1939,11 +1941,11 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     r.c.stop();
     r.c.stop();
     assert!(!r.c.is_running());
-    assert!(r.c.threads.lock().is_empty());
+    assert!(r.c.pumps.lock().is_empty());
     assert!(!r.c.rtc().is_running());
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
-    // The threads are joined, so nothing can take the character: it is
+    // The pumps are gone, so nothing can take the character: it is
     // still in the backend, not in the UART.
     assert_eq!(r.wire[0].inp.lock().unwrap().len(), 1);
     assert!(r.c.rx_pending(0) == 0);
@@ -2234,13 +2236,12 @@ fn a_reset_racing_the_receive_thread_leaves_no_stale_interrupt() {
     let r = running_rig();
     r.w32(reg::INT_ENABLE_SET, int::SERIAL_A);
     r.c.start();
-    let rx: Vec<_> = r.c.threads.lock().iter().map(|t| t.thread().clone()).collect();
     let stop = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
             while !stop.load(Ordering::Relaxed) {
                 r.wire[0].inp.lock().unwrap().push_back(b'x');
-                rx.iter().for_each(|t| t.unpark());
+                crate::net::wake::host_io().wake.notify();
                 std::thread::yield_now();
             }
         });

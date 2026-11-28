@@ -55,7 +55,5 @@ PIC bus 1, device 1, `fbcbedde`; the `slot` setting does not apply there).
 - **Snapshots:** `VirtioCore` has no `Saveable`. The Octane refuses to save or
   load a snapshot with virtio-serial fitted (`084ed672`): the Bridge would
   restore the function's enabled PCI header over a device the load reset.
-- **Input latency:** the console pump polls (5/50 ms) because the socket
-  backends are non-blocking with nothing to wait on.
 - **IP22 interrupt:** Indy uses `GioExp0/1`; Indigo2/IP28 use the
   `GIO_SLOT_MAP` `retrace` entry (`GioS0/S1Graphics`). Untested with a guest.

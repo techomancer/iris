@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use crate::net::wake::{host_io, Watched};
+
 pub trait PortBackend: Send + Sync {
     /// Guest output. May drop it when nobody is listening.
     fn write(&self, data: &[u8]);
@@ -158,13 +160,14 @@ pub fn tcp_port(port: u16) -> io::Result<(Arc<dyn PortBackend>, u16)> {
     let l = TcpListener::bind(("127.0.0.1", port))?;
     l.set_nonblocking(true)?;
     let bound = l.local_addr()?.port();
+    let l = Watched::new(l, &host_io().wake, true, false)?;
     let port = crate::ports::register("tcp", format!("127.0.0.1:{bound}"), "virtio console");
     let accept: Accept = Box::new(move || {
         let _port = &port;
         let (s, _) = l.accept()?;
         s.set_nonblocking(true)?;
         let _ = s.set_nodelay(true);
-        Ok(Box::new(s) as Box<dyn Conn>)
+        Ok(Box::new(Watched::new(s, &host_io().wake, true, false)?) as Box<dyn Conn>)
     });
     Ok((Arc::new(SocketPort { accept, client: Mutex::new(None) }), bound))
 }
@@ -173,25 +176,15 @@ pub fn tcp_port(port: u16) -> io::Result<(Arc<dyn PortBackend>, u16)> {
 /// one, or any other kind of file, is an error and left alone.
 #[cfg(unix)]
 pub fn unix_port(path: &str) -> io::Result<Arc<dyn PortBackend>> {
-    use std::os::unix::net::{UnixListener, UnixStream};
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        use std::os::unix::fs::FileTypeExt;
-        if !meta.file_type().is_socket() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{path} exists and is not a socket")));
-        }
-        if UnixStream::connect(path).is_ok() {
-            return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("{path} is in use")));
-        }
-        std::fs::remove_file(path)?;
-    }
-    let l = UnixListener::bind(path)?;
+    let l = crate::dev::serial_host::bind_unix_socket(std::path::Path::new(path)).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
     l.set_nonblocking(true)?;
+    let l = Watched::new(l, &host_io().wake, true, false)?;
     let port = crate::ports::register("unix", path, "virtio console");
     let accept: Accept = Box::new(move || {
         let _port = &port;
         let (s, _) = l.accept()?;
         s.set_nonblocking(true)?;
-        Ok(Box::new(s) as Box<dyn Conn>)
+        Ok(Box::new(Watched::new(s, &host_io().wake, true, false)?) as Box<dyn Conn>)
     });
     Ok(Arc::new(SocketPort { accept, client: Mutex::new(None) }))
 }

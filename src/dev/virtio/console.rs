@@ -16,14 +16,12 @@
 //! `transmitq`.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use super::backend::PortBackend;
+use crate::net::wake::{host_io, HostPump};
 use super::{Cx, VirtioDevice, Waker};
 
 pub const DEVICE_ID: u32 = 3;
@@ -80,8 +78,7 @@ pub struct Console {
     /// Control messages for the guest, waiting for a control receive buffer.
     ctrl_out: VecDeque<Vec<u8>>,
     waker: Arc<Waker>,
-    stop: Arc<AtomicBool>,
-    pump: Option<JoinHandle<()>>,
+    pump: Option<HostPump>,
 }
 
 fn ctrl(id: u32, event: u16, value: u16) -> Vec<u8> {
@@ -114,50 +111,34 @@ impl Console {
                 host_open_sent: false,
             })
             .collect();
-        Self { ports, multiport: false, ctrl_out: VecDeque::new(), waker, stop: Arc::new(AtomicBool::new(false)), pump: None }
+        Self { ports, multiport: false, ctrl_out: VecDeque::new(), waker, pump: None }
     }
 
-    /// Start the thread that reads the ports' host ends and wakes the
-    /// service thread when input arrives. It polls every 5 ms while there is
-    /// traffic and backs off to 50 ms when idle: the backends are
-    /// non-blocking sockets with nothing to wait on.
+    /// Have the host-IO thread read the ports' host ends and wake the service
+    /// thread when input arrives or a client comes or goes.
     pub fn start_pump(&mut self) {
         if self.pump.is_some() {
             return;
         }
         let ios: Vec<_> = self.ports.iter().map(|p| p.io.clone()).collect();
         let waker = self.waker.clone();
-        let stop = self.stop.clone();
-        self.pump = Some(
-            std::thread::Builder::new()
-                .name("virtio-console".into())
-                .spawn(move || {
-                    let mut busy_until = Instant::now();
-                    let mut connected: Vec<bool> = ios.iter().map(|_| false).collect();
-                    while !stop.load(Ordering::Acquire) {
-                        let mut activity = false;
-                        for (i, io) in ios.iter().enumerate() {
-                            activity |= Self::pump_port(io);
-                            let c = io.backend.connected();
-                            if c != connected[i] {
-                                connected[i] = c;
-                                activity = true;
-                            }
-                        }
-                        if activity {
-                            busy_until = Instant::now() + Duration::from_secs(2);
-                            waker.wake();
-                        }
-                        let nap = if Instant::now() < busy_until { 5 } else { 50 };
-                        std::thread::sleep(Duration::from_millis(nap));
-                    }
-                })
-                .expect("spawn virtio-console pump"),
-        );
+        let mut connected = vec![false; ios.len()];
+        self.pump = Some(host_io().add(move || {
+            let mut activity = false;
+            for (io, was) in ios.iter().zip(&mut connected) {
+                activity |= Self::pump_port(io);
+                let now = io.backend.connected();
+                activity |= std::mem::replace(was, now) != now;
+            }
+            if activity {
+                waker.wake();
+            }
+            activity
+        }));
     }
 
     /// Move whatever the backend has into the staging queue. True if any.
-    /// This runs on the pump thread and in `poll`, so the lock is held across
+    /// This runs on the host-IO thread and in `poll`, so the lock is held across
     /// the read and the append: chunks stay in order, and a backend that has
     /// reported the end of its input has nothing left on the way to the queue.
     fn pump_port(io: &PortIo) -> bool {
@@ -248,15 +229,6 @@ impl Console {
                 }
             }
             _ => {}
-        }
-    }
-}
-
-impl Drop for Console {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.pump.take() {
-            let _ = h.join();
         }
     }
 }
@@ -449,6 +421,26 @@ mod tests {
     use crate::dev::virtio::{
         GuestMemory, VecMemory, VirtioCore, F_VERSION_1, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK,
     };
+
+    /// Host input is staged as the socket becomes readable. Nothing ticks for a port, so a
+    /// socket the host-IO thread was not watching would never be read.
+    #[test]
+    fn a_byte_typed_at_a_tcp_port_is_staged_at_once() {
+        use std::io::Write;
+        use std::time::Duration;
+        let (backend, port) = crate::dev::virtio::backend::tcp_port(0).unwrap();
+        let waker = Waker::new();
+        let mut console = Console::new(vec![PortConfig { name: None, console: true, backend }], waker.clone());
+        console.start_pump();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert!(waker.wait(Duration::from_secs(10)), "the client's arrival");
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(70));
+            client.write_all(b"x").unwrap();
+            assert!(waker.wait(Duration::from_secs(10)), "the byte");
+            assert_eq!(console.ports[0].io.staged.lock().pop_front(), Some(b'x'));
+        }
+    }
 
     const RING: u16 = 8;
     /// Each queue gets 0x4000 bytes: descriptors, avail, used, then buffers.

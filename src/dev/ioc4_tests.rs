@@ -1190,9 +1190,10 @@ fn a_uart_receive_timeout_comes_from_a_timer() {
     r.uw(0, 1, 1);
     r.c.start();
     r.wire[0].inp.lock().unwrap().push_back(b'x');
+    crate::net::wake::host_io().wake.notify();
     let until = |f: &dyn Fn() -> bool| crate::test_board::until(f);
     let due = || r.c.sh.st.lock().uart[0].timeout_due();
-    assert!(until(&|| due().is_some()), "the receive thread took the character");
+    assert!(until(&|| due().is_some()), "the receive pump took the character");
     assert_eq!(due(), Some(r.c.sh.st.lock().uart[0].char_time().as_nanos() as u64 * 4));
     r.clock.step(due().unwrap() - 1);
     assert!(r.c.sh.timers[K_UART].is_armed() && !r.c.sh.st.lock().uart[0].irq());
