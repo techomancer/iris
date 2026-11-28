@@ -18,8 +18,12 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use toml::Value;
+
+use crate::chunk_store::{get_chunks_as_words, put_words_as_chunks, ChunkHash, ChunkStore};
+use crate::machine_state::GuestState;
+use crate::workstation::Workstation;
 
 /// On-disk schema version for the snapshot directory layout. Bumped when a
 /// device's save_state format changes incompatibly. Old snapshots without a
@@ -151,11 +155,9 @@ pub fn enabled_features() -> Vec<String> {
     push_if!("ci_clock");
     push_if!("tlbvmap");
     push_if!("developer");
-    push_if!("developer_ip7");
     push_if!("tlbstats");
     push_if!("tlbcheck");
     push_if!("instr_stats");
-    push_if!("debug_cache");
     f.sort();
     f
 }
@@ -170,8 +172,9 @@ pub fn check_schema(name: &str, found: u32) -> Result<(), String> {
 
 /// Check that a snapshot fits this build, CPU and disks: the same build
 /// features, CPU model and cache model, and every disk it recorded configured
-/// at the same size. `IRIS_SNAPSHOT_SKIP_CHECK=1` makes a mismatch a warning.
-pub fn check_provenance(m: &Manifest, cpu_model: &str, cache_kind: &str, disks: &[DiskRef]) -> Result<(), String> {
+/// at the same size. A moved disk or NVRAM file, or another iris revision, only
+/// warns. `IRIS_SNAPSHOT_SKIP_CHECK=1` makes a mismatch a warning.
+pub fn check_provenance(m: &Manifest, want: &Layout) -> Result<(), String> {
     let mut fatal = Vec::new();
     let features: Vec<String> = m.features.iter()
         .filter(|f| !RETIRED_FEATURES.contains(&f.as_str())).cloned().collect();
@@ -179,18 +182,28 @@ pub fn check_provenance(m: &Manifest, cpu_model: &str, cache_kind: &str, disks: 
         fatal.push(format!("build features differ: snapshot [{}] vs current [{}]",
             m.features.join(","), enabled_features().join(",")));
     }
-    if let Some(e) = cpu_model_mismatch(m.cpu_model.as_deref(), cpu_model) {
+    if let Some(e) = cpu_model_mismatch(m.cpu_model.as_deref(), &want.cpu.0) {
         fatal.push(e);
     }
-    if let Some(e) = cache_model_mismatch(m.cpu_cache.as_deref(), m.cpu_model.as_deref(), cache_kind) {
+    if let Some(e) = cache_model_mismatch(m.cpu_cache.as_deref(), m.cpu_model.as_deref(), &want.cpu.1) {
         fatal.push(e);
     }
     for d in &m.disks {
-        match disks.iter().find(|c| c.at == d.at) {
+        match want.disks.iter().find(|c| c.at == d.at) {
             None => fatal.push(format!("snapshot disk at {} ('{}') is not configured in this run", d.at, d.path)),
             Some(c) if c.size_bytes != d.size_bytes => fatal.push(format!(
                 "disk at {} ('{}') size differs: snapshot {} bytes vs current {}", d.at, d.path, d.size_bytes, c.size_bytes)),
+            Some(c) if c.path != d.path => eprintln!(
+                "load_snapshot: disk at {} path differs: snapshot '{}' vs current '{}' (same size; continuing)", d.at, d.path, c.path),
             Some(_) => {}
+        }
+    }
+    if m.nvram.is_some() && m.nvram != want.nvram {
+        eprintln!("load_snapshot: nvram differs: snapshot {:?} vs current {:?} (continuing)", m.nvram, want.nvram);
+    }
+    if let (Some(rev), Some(mine)) = (&m.iris_git_rev, option_env!("IRIS_GIT_REV")) {
+        if rev != mine {
+            eprintln!("load_snapshot: snapshot was captured at iris {rev} but current build is {mine}");
         }
     }
     if !fatal.is_empty() {
@@ -604,9 +617,297 @@ impl Snapshot {
     }
 }
 
-// ---- ChunksManifest: per-bank / per-framebuffer chunk hash lists (v3+) ----
+// ---- One save, load and rollback for every machine, over the `Workstation` snapshot hooks ----
 
-use crate::chunk_store::ChunkHash;
+/// Present while a save is under way, so `read` refuses a directory a save died in.
+/// The second name is an older build's.
+const INCOMPLETE: [&str; 2] = ["snapshot_incomplete", "resident_snapshot_incomplete"];
+
+/// A machine's state as a snapshot holds it.
+#[derive(Default)]
+pub struct Image<'a> {
+    /// Device tables in load order, kept as `<name>.bin`.
+    pub states: Vec<(String, Value)>,
+    /// Raw files: the boot flash, a second head's planes.
+    pub files: Vec<(String, Vec<u8>)>,
+    /// RAM as words, by `bank_chunks` list. Parts of one list are joined.
+    pub memory: Vec<(usize, std::borrow::Cow<'a, [u32]>)>,
+    /// The first head's RGB and aux planes.
+    pub framebuffer: Option<(Vec<u32>, Vec<u32>)>,
+    pub boards: Vec<Board>,
+}
+
+impl Image<'_> {
+    pub fn state(&self, name: &str) -> Result<&Value, String> {
+        self.states.iter().find(|s| s.0 == name).map(|s| &s.1).ok_or_else(|| format!("snapshot has no state {name}"))
+    }
+
+    pub fn file(&self, name: &str) -> Result<&[u8], String> {
+        self.files.iter().find(|f| f.0 == name).map(|f| &f.1[..]).ok_or_else(|| format!("snapshot has no file {name}"))
+    }
+
+    pub fn board(&self, state: &str) -> Option<&Board> {
+        self.boards.iter().find(|b| b.state == state)
+    }
+}
+
+/// A graphics board's state: its metadata, kept as `<state>.bin`, and its large named parts.
+pub struct Board {
+    pub state: &'static str,
+    pub list: BoardList,
+    pub metadata: String,
+    pub parts: Vec<(String, Vec<u32>)>,
+}
+
+impl Board {
+    pub fn new(state: &'static str, list: BoardList, (metadata, parts): (String, Vec<(String, Vec<u32>)>)) -> Self {
+        Self { state, list, metadata, parts }
+    }
+}
+
+/// The list of `chunks.bin` that holds a kind of board's parts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BoardList { Impact, Vpro, Gr2 }
+
+impl BoardList {
+    fn label(self) -> &'static str {
+        match self { Self::Impact => "IMPACT", Self::Vpro => "VPro", Self::Gr2 => "GR2" }
+    }
+
+    fn of(self, c: &mut ChunksManifest) -> &mut Vec<NamedChunk> {
+        match self { Self::Impact => &mut c.mgras_chunks, Self::Vpro => &mut c.odyssey_chunks, Self::Gr2 => &mut c.gr2_chunks }
+    }
+}
+
+/// What a machine expects of a snapshot: its identity for the manifest and the
+/// checks, and what the snapshot must hold, so `read` can refuse one before the machine is touched.
+#[derive(Default)]
+pub struct Layout {
+    /// The manifest's `machine`; None for the Indy and Indigo2.
+    pub machine: Option<&'static str>,
+    pub disks: Vec<DiskRef>,
+    pub slots: Vec<(String, crate::slot_path::MachineSlotPath)>,
+    pub nvram: Option<String>,
+    /// CPU model and cache kind.
+    pub cpu: (String, String),
+    pub states: Vec<String>,
+    /// Raw files and the length each must have; 0 for any.
+    pub files: Vec<(String, usize)>,
+    /// Words in each `bank_chunks` list.
+    pub memory: Vec<usize>,
+    pub framebuffer: bool,
+    pub boards: Vec<(&'static str, BoardList)>,
+}
+
+/// What the last load left for `parent` and `rollback`.
+#[derive(Default)]
+pub struct Restored {
+    name: Option<String>,
+    kept: Option<Box<Kept>>,
+}
+
+/// A snapshot read and checked, ready to put into a machine.
+pub struct Kept {
+    pub image: Image<'static>,
+    dir: PathBuf,
+    /// Every disk's copy-on-write sets, by the disk's slot.
+    overlays: OverlaySets,
+}
+
+/// Save to `saves/<name>/`, then run on if the machine was running.
+pub fn save_in<W: Workstation + ?Sized>(m: &mut W, saves: &Path, name: &str) -> Result<(), String> {
+    if let Some(why) = m.snapshot_refusal() {
+        return Err(why);
+    }
+    let parent = m.snapshots().and_then(|r| r.name.clone());
+    let (lifecycle, was_running) = (m.lifecycle(), m.cpu_is_running());
+    m.stop();
+    let saved = write(&*m, saves, name, parent);
+    if lifecycle != GuestState::Idle {
+        m.restart_peripherals();
+    }
+    if was_running {
+        m.cpu_start();
+    }
+    m.set_lifecycle(lifecycle);
+    saved?;
+    println!("Snapshot saved to {}/{name}", saves.display());
+    Ok(())
+}
+
+fn write<W: Workstation + ?Sized>(m: &W, saves: &Path, name: &str, parent: Option<String>) -> Result<(), String> {
+    let io = |e: std::io::Error| e.to_string();
+    let (layout, image) = (m.snapshot_layout(), m.capture()?);
+    let snap = Snapshot::new(saves.join(name));
+    snap.ensure_dir().map_err(io)?;
+    let marker = snap.dir.join(INCOMPLETE[0]);
+    fs::write(&marker, b"snapshot is incomplete\n").map_err(io)?;
+    let mut manifest = Manifest::for_current_save();
+    manifest.machine = layout.machine.map(Into::into);
+    manifest.parent = parent;
+    manifest.disks = layout.disks;
+    manifest.devices = layout.slots;
+    manifest.nvram = layout.nvram;
+    (manifest.cpu_model, manifest.cpu_cache) = (Some(layout.cpu.0), Some(layout.cpu.1));
+    snap.write_manifest(&manifest).map_err(io)?;
+    for (name, state) in &image.states {
+        snap.write_state(name, state).map_err(io)?;
+    }
+    for (name, bytes) in &image.files {
+        snap.write_bin(name, bytes).map_err(io)?;
+    }
+    let store = ChunkStore::new(saves);
+    let put = |words: &[u32], what: &str| put_words_as_chunks(&store, words).map_err(|e| format!("CAS {what} put: {e}"));
+    let mut chunks = ChunksManifest::default();
+    for (list, words) in &image.memory {
+        chunks.bank_chunks[*list].extend(put(words, "memory")?);
+    }
+    if let Some((rgb, aux)) = &image.framebuffer {
+        chunks.framebuffer_chunks = Some((put(rgb, "framebuffer rgb")?, put(aux, "framebuffer aux")?));
+    }
+    for b in &image.boards {
+        snap.write_state(b.state, &Value::String(b.metadata.clone())).map_err(io)?;
+        for (part, words) in &b.parts {
+            let hashes = put(words, &format!("{} {part}", b.list.label()))?;
+            b.list.of(&mut chunks).push(NamedChunk { name: part.clone(), words: words.len(), hashes });
+        }
+    }
+    snap.write_chunks_manifest(&chunks).map_err(io)?;
+    m.with_disk_buses(&mut |buses| export_overlays(&snap, buses))?;
+    fs::remove_file(marker).map_err(io)
+}
+
+/// Read `saves/<name>/` and check it against the machine, which is left as it was.
+pub fn read<W: Workstation + ?Sized>(m: &W, saves: &Path, name: &str) -> Result<Kept, String> {
+    if let Some(why) = m.snapshot_refusal() {
+        return Err(why);
+    }
+    let want = m.snapshot_layout();
+    let snap = Snapshot::new(saves.join(name));
+    if INCOMPLETE.iter().any(|f| snap.dir.join(f).exists()) {
+        return Err(format!("snapshot {name} is incomplete"));
+    }
+    let man = snap.read_manifest()?.ok_or_else(|| format!("{}/{name}: no snapshot.toml", saves.display()))?;
+    if man.machine.as_deref() != want.machine {
+        return Err(format!("snapshot {name} is of another machine ({})", man.machine.as_deref().unwrap_or("Indy or Indigo2")));
+    }
+    if man.host_arch != std::env::consts::ARCH {
+        return Err(format!("snapshot host_arch '{}' does not match current host '{}'", man.host_arch, std::env::consts::ARCH));
+    }
+    check_schema(name, man.schema_version)?;
+    check_provenance(&man, &want)?;
+    check_slots(&man, &want.slots)?;
+    let mut image = Image::default();
+    for base in &want.states {
+        image.states.push((base.clone(), snap.read_state(base).map_err(|e| format!("{base}: {e}"))?));
+    }
+    for (file, len) in &want.files {
+        let bytes = snap.read_bin(file).map_err(|e| format!("{file}: {e}"))?;
+        if *len != 0 && bytes.len() != *len {
+            return Err(format!("saved {file} is {} bytes, this machine's holds {len}", bytes.len()));
+        }
+        image.files.push((file.clone(), bytes));
+    }
+    let store = ChunkStore::new(saves);
+    let get = |hashes: &[ChunkHash], what: &str| get_chunks_as_words(&store, hashes).map_err(|e| format!("CAS {what} get: {e}"));
+    let mut chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
+    for (list, expect) in want.memory.iter().enumerate() {
+        let words = get(&chunks.bank_chunks[list], "memory")?;
+        if words.len() != *expect {
+            return Err(format!("snapshot memory is {} MiB, this machine has {} MiB", words.len() >> 18, expect >> 18));
+        }
+        image.memory.push((list, words.into()));
+    }
+    image.framebuffer = match (want.framebuffer, chunks.framebuffer_chunks.take()) {
+        (true, Some((rgb, aux))) => Some((get(&rgb, "framebuffer rgb")?, get(&aux, "framebuffer aux")?)),
+        (true, None) => return Err("snapshot has no framebuffer for the configured graphics board".into()),
+        (false, _) => None,
+    };
+    for list in [BoardList::Impact, BoardList::Vpro, BoardList::Gr2] {
+        let label = list.label();
+        let saved = std::mem::take(list.of(&mut chunks));
+        match (want.boards.iter().find(|b| b.1 == list), saved.is_empty()) {
+            (Some(&(state, _)), false) => {
+                let metadata = snap.read_state(state).map_err(|e| format!("{state}: {e}"))?;
+                let metadata = metadata.as_str().ok_or_else(|| format!("{label} snapshot metadata is not a string"))?.to_string();
+                let mut parts = Vec::with_capacity(saved.len());
+                for p in &saved {
+                    let words = get(&p.hashes, &format!("{label} {}", p.name))?;
+                    if words.len() != p.words {
+                        return Err(format!("CAS {label} {} has {} words, expected {}", p.name, words.len(), p.words));
+                    }
+                    parts.push((p.name.clone(), words));
+                }
+                image.boards.push(Board { state, list, metadata, parts });
+            }
+            (Some(_), true) => return Err(format!("snapshot has no state for the configured {label} board")),
+            (None, false) => return Err(format!("snapshot contains {label} state but this machine has no {label} board")),
+            (None, true) => {}
+        }
+    }
+    let overlays = snap.read_toml("cow.toml").map(|t| parse_cow_table(&t)).map_err(|e| format!("cow.toml: {e}"))?;
+    Ok(Kept { image, dir: snap.dir, overlays })
+}
+
+/// Put a read snapshot into the machine, with its disks' overlays. The machine runs on only if `run`.
+/// A failure leaves it stopped, with its devices reset or part loaded, wanting a reset or another load.
+pub fn restore<W: Workstation + ?Sized>(m: &mut W, kept: &Kept, run: bool) -> Result<(), String> {
+    m.stop();
+    m.apply_image(&kept.image)?;
+    m.with_disk_buses(&mut |buses| import_overlays(&kept.dir, buses, &kept.overlays))?;
+    m.restart_peripherals();
+    if run {
+        m.cpu_start();
+    }
+    Ok(())
+}
+
+/// Load `saves/<name>/` and run. The name is the parent of the next save and what `rollback`
+/// returns to; `keep` also holds the image, so that rollback need not read it again.
+fn load<W: Workstation + ?Sized>(m: &mut W, saves: &Path, name: &str, keep: bool) -> Result<(), String> {
+    let kept = read(m, saves, name)?;
+    restore(m, &kept, true)?;
+    if let Some(r) = m.snapshots() {
+        *r = Restored { name: Some(name.into()), kept: keep.then(|| Box::new(kept)) };
+    }
+    println!("Snapshot loaded from {}/{name}", saves.display());
+    Ok(())
+}
+
+pub fn load_in<W: Workstation + ?Sized>(m: &mut W, saves: &Path, name: &str) -> Result<(), String> {
+    load(m, saves, name, false)
+}
+
+/// The CI socket's `restore`: load, and keep the image and name for `rollback`.
+/// What the guest printed before is dropped, so the next command reads no stale output.
+pub fn ci_restore<W: Workstation + ?Sized>(m: &mut W, saves: &Path, name: &str) -> Result<(), String> {
+    if let Some(ci) = m.get_ci_serial() {
+        ci.reset();
+    }
+    load(m, saves, name, true)
+}
+
+/// The CI socket's `rollback`: back to the last `ci_restore`'s image. Its disks' overlays are
+/// imported again from the snapshot's directory, which the guest's writes since have not touched.
+pub fn ci_rollback<W: Workstation + ?Sized>(m: &mut W, saves: &Path) -> Result<(), String> {
+    if let Some(ci) = m.get_ci_serial() {
+        ci.reset();
+    }
+    let r = m.snapshots().ok_or(crate::workstation::NOT_HERE)?;
+    let Some(name) = r.name.clone() else {
+        return Err("no previous restore to roll back to".into());
+    };
+    let Some(kept) = r.kept.take() else {
+        return ci_restore(m, saves, &name);
+    };
+    let result = restore(m, &kept, true).map_err(|e| format!("rollback to {name}: {e}"));
+    if let Some(r) = m.snapshots() {
+        r.kept = Some(kept);
+    }
+    result
+}
+
+// ---- ChunksManifest: per-bank / per-framebuffer chunk hash lists (v3+) ----
 
 /// Per-snapshot pointer into the content-addressable chunk store. Every bank
 /// and (optionally) each framebuffer is split into 64 KB chunks; this
@@ -625,29 +926,16 @@ pub struct ChunksManifest {
     /// The KONA pipe's pixel store and cursor memory; empty when the machine has none.
     pub kona_chunks: Vec<crate::dev::kona::KonaChunk>,
     /// Named IMPACT architectural state; empty when the machine has no IMPACT board.
-    pub mgras_chunks: Vec<MgrasChunk>,
+    pub mgras_chunks: Vec<NamedChunk>,
     /// Named VPro architectural state and VRAM; empty when the machine has no VPro board.
-    pub odyssey_chunks: Vec<OdysseyChunk>,
+    pub odyssey_chunks: Vec<NamedChunk>,
     /// Named GR2 architectural state, VRAM, and Z-buffer; empty without GR2.
-    pub gr2_chunks: Vec<Gr2Chunk>,
+    pub gr2_chunks: Vec<NamedChunk>,
 }
 
+/// One named part of a graphics board's state: its length in words and the chunks that hold it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MgrasChunk {
-    pub name: String,
-    pub words: usize,
-    pub hashes: Vec<ChunkHash>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OdysseyChunk {
-    pub name: String,
-    pub words: usize,
-    pub hashes: Vec<ChunkHash>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Gr2Chunk {
+pub struct NamedChunk {
     pub name: String,
     pub words: usize,
     pub hashes: Vec<ChunkHash>,
@@ -993,17 +1281,17 @@ mod tests {
             name: "state-9".into(),
             hashes: vec![[9; 32]],
         });
-        m.mgras_chunks.push(MgrasChunk {
+        m.mgras_chunks.push(NamedChunk {
             name: "front".into(),
             words: 17,
             hashes: vec![[10; 32]],
         });
-        m.odyssey_chunks.push(OdysseyChunk {
+        m.odyssey_chunks.push(NamedChunk {
             name: "vram".into(),
             words: 23,
             hashes: vec![[11; 32]],
         });
-        m.gr2_chunks.push(Gr2Chunk {
+        m.gr2_chunks.push(NamedChunk {
             name: "zbuf".into(),
             words: 29,
             hashes: vec![[12; 32]],

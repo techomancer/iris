@@ -219,17 +219,8 @@ pub struct Ip32Options {
     pub rtc_offset: crate::config::RtcOffset,
 }
 
-/// Whether the per-register access counters (MACE's, GBE's, the rendering
-/// engine's) run: `IRIS_IP32_HOT`. They are for finding a driver polling a
-/// bit nothing sets, and each access took a lock and a map update, every
-/// status poll of a GL scene included.
-pub fn hot_counters() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("IRIS_IP32_HOT").is_some())
-}
-
-/// A register file that remembers what it is told, and counts accesses per
-/// offset. Stands in for MACE until there is a reason to build it properly.
+/// A register file that remembers what it is told. Stands in for MACE until
+/// there is a reason to build it properly.
 ///
 /// Storing matters more than it looks: the PROM does read-modify-write on
 /// several of these (the LED register among them), and a register that always
@@ -239,9 +230,6 @@ pub struct Stub {
     pub name: &'static str,
     reads: std::sync::atomic::AtomicU64,
     writes: std::sync::atomic::AtomicU64,
-    /// Per-offset access counts. A stub that is being polled hard is the guest
-    /// waiting on a bit we are not setting, and the offset says which.
-    hot: Mutex<std::collections::BTreeMap<u32, (u64, u64)>>,
     /// Per-offset stored value.
     cells: Mutex<std::collections::BTreeMap<u32, u64>>,
 }
@@ -252,19 +240,11 @@ impl Stub {
             name,
             reads: std::sync::atomic::AtomicU64::new(0),
             writes: std::sync::atomic::AtomicU64::new(0),
-            hot: Mutex::new(std::collections::BTreeMap::new()),
             cells: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
     pub fn counts(&self) -> (u64, u64) {
         (self.reads.load(Ordering::Relaxed), self.writes.load(Ordering::Relaxed))
-    }
-    /// Offsets by access count, busiest first: `(offset, reads, writes)`.
-    pub fn hottest(&self) -> Vec<(u32, u64, u64)> {
-        let mut v: Vec<(u32, u64, u64)> =
-            self.hot.lock().unwrap().iter().map(|(&o, &(r, w))| (o, r, w)).collect();
-        v.sort_by_key(|&(_, r, w)| std::cmp::Reverse(r + w));
-        v
     }
     // The totals are for the bring-up report; a `lightning` build keeps
     // none.
@@ -290,19 +270,9 @@ impl Stub {
     fn set_cell(&self, addr: u32, val: u64) {
         self.cells.lock().unwrap().insert(addr & 0x007f_ffff & !7, val);
     }
-    pub(crate) fn hit(&self, addr: u32, write: bool) {
-        if !hot_counters() {
-            return;
-        }
-        let off = addr & 0x007f_ffff & !3;
-        let mut h = self.hot.lock().unwrap();
-        let e = h.entry(off).or_insert((0, 0));
-        if write { e.1 += 1 } else { e.0 += 1 }
-    }
 }
 
-/// The values written, by offset; the access counts are for finding a
-/// driver waiting on a missing bit, not state.
+/// The values written, by offset; the access totals are not state.
 impl crate::traits::Saveable for Stub {
     fn save_state(&self) -> toml::Value {
         let mut t = toml::map::Map::new();
@@ -329,14 +299,14 @@ impl crate::traits::Saveable for Stub {
 }
 
 impl BusDevice for Stub {
-    fn read8(&self, a: u64) -> BusRead8 { self.r(); self.hit(a as u32, false); BusRead8::ok(self.cell(a as u32) as u8) }
-    fn read16(&self, a: u64) -> BusRead16 { self.r(); self.hit(a as u32, false); BusRead16::ok(self.cell(a as u32) as u16) }
-    fn read32(&self, a: u64) -> BusRead32 { self.r(); self.hit(a as u32, false); BusRead32::ok(self.cell(a as u32) as u32) }
-    fn read64(&self, a: u64) -> BusRead64 { self.r(); self.hit(a as u32, false); BusRead64::ok(self.cell(a as u32)) }
-    fn write8(&self, a: u64, v: u8) -> u32 { self.w(); self.hit(a as u32, true); self.set_cell(a as u32, v as u64); BUS_OK }
-    fn write16(&self, a: u64, v: u16) -> u32 { self.w(); self.hit(a as u32, true); self.set_cell(a as u32, v as u64); BUS_OK }
-    fn write32(&self, a: u64, v: u32) -> u32 { self.w(); self.hit(a as u32, true); self.set_cell(a as u32, v as u64); BUS_OK }
-    fn write64(&self, a: u64, v: u64) -> u32 { self.w(); self.hit(a as u32, true); self.set_cell(a as u32, v); BUS_OK }
+    fn read8(&self, a: u64) -> BusRead8 { self.r(); BusRead8::ok(self.cell(a as u32) as u8) }
+    fn read16(&self, a: u64) -> BusRead16 { self.r(); BusRead16::ok(self.cell(a as u32) as u16) }
+    fn read32(&self, a: u64) -> BusRead32 { self.r(); BusRead32::ok(self.cell(a as u32) as u32) }
+    fn read64(&self, a: u64) -> BusRead64 { self.r(); BusRead64::ok(self.cell(a as u32)) }
+    fn write8(&self, a: u64, v: u8) -> u32 { self.w(); self.set_cell(a as u32, v as u64); BUS_OK }
+    fn write16(&self, a: u64, v: u16) -> u32 { self.w(); self.set_cell(a as u32, v as u64); BUS_OK }
+    fn write32(&self, a: u64, v: u32) -> u32 { self.w(); self.set_cell(a as u32, v as u64); BUS_OK }
+    fn write64(&self, a: u64, v: u64) -> u32 { self.w(); self.set_cell(a as u32, v); BUS_OK }
 }
 
 /// The flash at [`PROM_BASE`]: the PROM and, behind it, the environment the

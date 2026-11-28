@@ -226,8 +226,6 @@ impl ScanMemo {
 
 pub struct Gbe {
     s: Mutex<GbeState>,
-    /// Reads per register offset, for finding a driver spinning on one.
-    pub hot: Mutex<BTreeMap<u32, u64>>,
     /// Time in microseconds (MACE UST).
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// The monitor's `o2 pixel X Y`: the point to describe on the next
@@ -324,7 +322,7 @@ impl Gbe {
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, vb: None, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new(), tr: Arc::new(O2Trace::default()) }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, vb: None, pending: Vec::new() }), now, probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new(), tr: Arc::new(O2Trace::default()) }
     }
 
     fn now(&self) -> u64 {
@@ -441,9 +439,6 @@ impl Gbe {
     }
 
     fn read_reg(&self, off: u32) -> u32 {
-        if crate::ip32::hot_counters() {
-            *self.hot.lock().unwrap().entry(off).or_insert(0) += 1;
-        }
         let mut s = self.s.lock().unwrap();
         self.latch(&mut s);
         let v = match off {
@@ -1632,8 +1627,6 @@ const WIDE: u32 = 1 << 31;
 
 pub struct CrimeRe {
     regs: Mutex<Vec<u32>>,
-    /// Reads per register offset, for finding a driver spinning on one.
-    pub hot: Mutex<BTreeMap<u32, u64>>,
     /// Memory, through the ppmem window: the engine draws without the
     /// memory's lock, as the CPU reads and writes it. Only the engine's
     /// thread takes this.
@@ -1789,7 +1782,6 @@ impl CrimeRe {
             pf_busy: crate::PfLevel::new(),
             pf_full: crate::PfLevel::new(),
             pf_level: crate::PfValue::new(),
-            hot: Mutex::new(BTreeMap::new()),
             win: Mutex::new(ram.window()),
             unhandled: Mutex::new(BTreeMap::new()),
             drawn: std::sync::atomic::AtomicU64::new(0),
@@ -2092,9 +2084,6 @@ impl CrimeRe {
     /// A CPU read: `None` (the CPU retries) for a register while the
     /// engine is busy.
     fn read_reg(&self, off: u32) -> Option<u32> {
-        if crate::ip32::hot_counters() {
-            *self.hot.lock().unwrap().entry(off & !3).or_insert(0) += 1;
-        }
         let v = self.read_reg_now(off);
         if self.tr.on(trc::TRACE_CPU) {
             if let Some(v) = v {

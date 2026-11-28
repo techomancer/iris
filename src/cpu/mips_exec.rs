@@ -26,19 +26,6 @@ pub const MIPS_LOG_FPU:  u32 = 0x0008; // FP compare/condmove/convert operand+re
 pub const MIPS_LOG_CP0:  u32 = 0x0010; // CP0 register traffic: EPC/EntryHi/XContext writes,
                                        // ECC and CacheErr accesses, Status.DE transitions
 
-/// Opt-in gate for the `developerx` Coprocessor-Unusable break (see the three
-/// `handle_exception*` wrappers). Off unless `IRIS_BREAK_CPU=1`.
-///
-/// Must be opt-in: a CpU exception is a perfectly ordinary event — lazy FPU
-/// enable raises one on purpose every time a process first touches the FPU —
-/// so breaking on all of them unconditionally stops the machine constantly and
-/// breaks any test that exercises the CU0/CU1 gates on purpose.
-#[cfg(feature = "developerx")]
-fn cpu_unusable_break_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("IRIS_BREAK_CPU").map(|v| v == "1").unwrap_or(false))
-}
-
 #[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
@@ -4804,57 +4791,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     fn handle_exception(&mut self, status: ExecStatus) -> ExecStatus {
         self.ip28_trace_exception(status);
-        // In developer builds, bus/address error exceptions break into the
-        // monitor at the fault site rather than dispatching to the MIPS
-        // vector — must be decided before deliver_exception runs, since that
-        // overwrites core.pc with the vector address. EPC's predicted value
-        // (what deliver_exception is about to write) is computed the same
-        // way deliver_exception itself computes it, just far enough ahead to
-        // decide whether to bail on vectoring at all.
-        #[cfg(feature = "developerx")]
-        {
-            let was_exl = (self.core.cp0_status & STATUS_EXL) != 0;
-            let epc = if was_exl {
-                self.core.cp0_epc // preserved from the first exception
-            } else if self.core.in_delay_slot {
-                self.core.pc.wrapping_sub(4)
-            } else {
-                self.core.pc
-            };
-            let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
-            if exc_code == EXC_IBE || exc_code == EXC_DBE {
-                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
-                    if exc_code == EXC_IBE { "IBE" } else { "DBE" },
-                    self.core.pc, epc);
-                return EXEC_BREAKPOINT;
-            }
-            if exc_code == EXC_ADEL || exc_code == EXC_ADES {
-                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
-                    if exc_code == EXC_ADEL { "ADEL" } else { "ADES" },
-                    self.core.pc, epc, self.core.cp0_badvaddr);
-                return EXEC_BREAKPOINT;
-            }
-            // Coprocessor Unusable. Worth breaking at the fault site: IRIX's
-            // `VEC_cpfault` panics "kernel used coprocessor" whenever a CpU
-            // arrives with SR_PREVMODE == 0, and it checks that *before*
-            // looking at Cause.CE — so the guest message names no coprocessor,
-            // and by the time it prints, the handler has rewritten Status.
-            // Stopping here preserves the state that actually caused it.
-            if exc_code == EXC_CPU && cpu_unusable_break_enabled() {
-                let ce = (self.core.cp0_cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT;
-                eprintln!("COPROCESSOR UNUSABLE (CE={}) at PC={:#018x} EPC={:#018x} Status={:#010x} Cause={:#010x} priv={:?}",
-                    ce, self.core.pc, epc, self.core.cp0_status, self.core.cp0_cause,
-                    self.core.get_privilege_mode());
-                return EXEC_BREAKPOINT;
-            }
-            if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
-                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
-                    if exc_code == EXC_TLBL { "TLBL" } else { "TLBS" },
-                    self.core.pc, epc, self.core.cp0_badvaddr);
-                return EXEC_BREAKPOINT;
-            }
-        }
-
         // Clear LLBit on any exception
         self.cache.set_llbit(false);
 
@@ -4892,59 +4828,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// this (it knows both as compile-time constants and would otherwise
     /// have to store them to memory purely to have them read straight back).
     ///
-    /// Identical in every other respect, including the `developerx`
-    /// bus/address-error monitor break, the LLBit clear, `syscall_pending`,
-    /// the nutlb flush, and the trailing `in_delay_slot = false`.
+    /// Identical in every other respect, including the LLBit clear,
+    /// `syscall_pending`, the nutlb flush, and the trailing `in_delay_slot = false`.
     #[cfg(feature = "jitv2")]
     fn handle_exception_at(&mut self, status: ExecStatus, fault_pc: u64, bd: bool) -> ExecStatus {
-        #[cfg(feature = "developerx")]
-        {
-            let was_exl = (self.core.cp0_status & STATUS_EXL) != 0;
-            let epc = if was_exl {
-                self.core.cp0_epc
-            } else if bd {
-                fault_pc.wrapping_sub(4)
-            } else {
-                fault_pc
-            };
-            let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
-            if exc_code == EXC_IBE || exc_code == EXC_DBE {
-                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
-                    if exc_code == EXC_IBE { "IBE" } else { "DBE" },
-                    fault_pc, epc);
-                return EXEC_BREAKPOINT;
-            }
-            if exc_code == EXC_ADEL || exc_code == EXC_ADES {
-                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
-                    if exc_code == EXC_ADEL { "ADEL" } else { "ADES" },
-                    fault_pc, epc, self.core.cp0_badvaddr);
-                return EXEC_BREAKPOINT;
-            }
-            // Coprocessor Unusable. Worth breaking at the fault site: IRIX's
-            // `VEC_cpfault` panics "kernel used coprocessor" whenever a CpU
-            // arrives with SR_PREVMODE == 0, and it checks that *before*
-            // looking at Cause.CE — so the guest message names no coprocessor,
-            // and by the time it prints, the handler has rewritten Status.
-            // Stopping here preserves the state that actually caused it.
-            if exc_code == EXC_CPU && cpu_unusable_break_enabled() {
-                let ce = (self.core.cp0_cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT;
-                // `fault_pc`, NOT `core.pc`: on this (jitv2) path compiled code
-                // supplies the faulting address explicitly and may not have
-                // materialized `core.pc` yet, so reading the field would report
-                // a stale or unrelated PC.
-                eprintln!("COPROCESSOR UNUSABLE (CE={}) at PC={:#018x} EPC={:#018x} Status={:#010x} Cause={:#010x} priv={:?} [jit]",
-                    ce, fault_pc, epc, self.core.cp0_status, self.core.cp0_cause,
-                    self.core.get_privilege_mode());
-                return EXEC_BREAKPOINT;
-            }
-            if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
-                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
-                    if exc_code == EXC_TLBL { "TLBL" } else { "TLBS" },
-                    fault_pc, epc, self.core.cp0_badvaddr);
-                return EXEC_BREAKPOINT;
-            }
-        }
-
         self.cache.set_llbit(false);
         self.core.syscall_pending = false;
 
@@ -4976,50 +4863,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// varies for them.
     #[cfg(feature = "jitv2")]
     fn handle_exception_syscall(&mut self, status: ExecStatus) -> ExecStatus {
-        #[cfg(feature = "developerx")]
-        {
-            let was_exl = (self.core.cp0_status & STATUS_EXL) != 0;
-            let epc = if was_exl {
-                self.core.cp0_epc
-            } else if self.core.in_delay_slot {
-                self.core.pc.wrapping_sub(4)
-            } else {
-                self.core.pc
-            };
-            let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
-            if exc_code == EXC_IBE || exc_code == EXC_DBE {
-                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
-                    if exc_code == EXC_IBE { "IBE" } else { "DBE" },
-                    self.core.pc, epc);
-                return EXEC_BREAKPOINT;
-            }
-            if exc_code == EXC_ADEL || exc_code == EXC_ADES {
-                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
-                    if exc_code == EXC_ADEL { "ADEL" } else { "ADES" },
-                    self.core.pc, epc, self.core.cp0_badvaddr);
-                return EXEC_BREAKPOINT;
-            }
-            // Coprocessor Unusable. Worth breaking at the fault site: IRIX's
-            // `VEC_cpfault` panics "kernel used coprocessor" whenever a CpU
-            // arrives with SR_PREVMODE == 0, and it checks that *before*
-            // looking at Cause.CE — so the guest message names no coprocessor,
-            // and by the time it prints, the handler has rewritten Status.
-            // Stopping here preserves the state that actually caused it.
-            if exc_code == EXC_CPU && cpu_unusable_break_enabled() {
-                let ce = (self.core.cp0_cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT;
-                eprintln!("COPROCESSOR UNUSABLE (CE={}) at PC={:#018x} EPC={:#018x} Status={:#010x} Cause={:#010x} priv={:?}",
-                    ce, self.core.pc, epc, self.core.cp0_status, self.core.cp0_cause,
-                    self.core.get_privilege_mode());
-                return EXEC_BREAKPOINT;
-            }
-            if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
-                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
-                    if exc_code == EXC_TLBL { "TLBL" } else { "TLBS" },
-                    self.core.pc, epc, self.core.cp0_badvaddr);
-                return EXEC_BREAKPOINT;
-            }
-        }
-
         self.cache.set_llbit(false);
         self.core.syscall_pending = true;
         crate::cpu::mips_core::deliver_exception(&mut self.core, status);
@@ -10840,9 +10683,7 @@ pub struct MipsCpu<T: Tlb, C: CpuModel> {
     /// Where another thread holds this CPU still.
     park: Arc<crate::cpu::smp::ParkSlot>,
     pub fasttick_count: Arc<AtomicU64>,
-    debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
-    trace_file: Arc<Mutex<Option<std::io::BufWriter<std::fs::File>>>>,
     #[cfg(feature = "idle-pause")]
     idle_profile_on: Arc<AtomicBool>,
     #[cfg(feature = "idle-pause")]
@@ -10913,9 +10754,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             ppmem_bitmap_ptr,
             park,
             fasttick_count,
-            debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
-            trace_file: Arc::new(Mutex::new(None)),
             #[cfg(feature = "idle-pause")]
             idle_profile_on,
             #[cfg(feature = "idle-pause")]

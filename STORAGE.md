@@ -235,7 +235,7 @@ storage model as Docker layers. A snapshot records which CPU it was taken on
 (R4400/R5000/R10000) and refuses to restore onto a different CPU model.
 
 Snapshots work on the Indy, Indigo2 (IP22 and IP28), O2 and Octane, and so
-does `iris-ci rollback`; on the Octane it reads the snapshot from disk again. The
+does `iris-ci rollback`. The
 Origin, Onyx, Fuel and Tezro machines refuse a save or load, since their node
 hardware has no saved state yet. The O2 and the Octane save in this format too.
 An Octane snapshot covers one processor and may include IMPACT or VPro

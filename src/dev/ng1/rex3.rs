@@ -1440,7 +1440,6 @@ pub struct Rex3 {
     pub gfifo_fence: AtomicU32,
     #[cfg(all(test, feature = "gputrace"))]
     fence_observer: Mutex<Option<Box<dyn Fn(&Rex3, u32) + Send>>>,
-    pub debug: Arc<AtomicBool>,
     #[cfg(feature = "developer")]
     pub block_debug: Arc<AtomicBool>,
     #[cfg(feature = "developer")]
@@ -1631,7 +1630,6 @@ impl Rex3 {
             gfifo_fence: AtomicU32::new(0),
             #[cfg(all(test, feature = "gputrace"))]
             fence_observer: Mutex::new(None),
-            debug: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "developer")]
             block_debug: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "developer")]
@@ -1953,7 +1951,7 @@ impl Rex3 {
     }
 
     #[cfg(feature = "wgpu")]
-    fn resident_fault(&self) -> Option<crate::dev::ng1::wgpu::resident::ResidentError> {
+    pub(crate) fn resident_fault(&self) -> Option<crate::dev::ng1::wgpu::resident::ResidentError> {
         match &*self.raster.lock() {
             RasterMode::Resident(raster) => raster.fault().cloned(),
             _ => None,
@@ -4424,12 +4422,11 @@ impl Device for Rex3 {
     fn register_commands(&self) -> Vec<(String, String)> {
         #[allow(unused_mut)]
         let mut cmds = vec![
-            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex trace <file> [gfifo,cpu|all] | rex trace off|flush | rex rec <file>[.txt] | rex rec mark|off | rex fbdump [DIR]".to_string()),
-            ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
-            ("vc2".to_string(), "VC2 commands: vc2 status | vc2 ramdump | vc2 debug <on|off> [DEV]".to_string()),
-            ("xmap".to_string(), "XMAP commands: xmap status | xmap debug <on|off> [DEV]".to_string()),
-            ("cmap".to_string(), "CMAP commands: cmap status | cmap debug <on|off> [DEV]".to_string()),
-            ("bt445".to_string(), "BT445 RAMDAC: bt445 status | bt445 identity (reset palette to linear ramp) | bt445 debug <on|off> [DEV]".to_string()),
+            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex cmap <on|off> | rex trace <file> [gfifo,cpu|all] | rex trace off|flush | rex rec <file>[.txt] | rex rec mark|off | rex fbdump [DIR]".to_string()),
+            ("vc2".to_string(), "VC2 commands: vc2 status | vc2 ramdump".to_string()),
+            ("xmap".to_string(), "XMAP commands: xmap status".to_string()),
+            ("cmap".to_string(), "CMAP commands: cmap status".to_string()),
+            ("bt445".to_string(), "BT445 RAMDAC: bt445 status | bt445 identity (reset palette to linear ramp)".to_string()),
             ("disp".to_string(), "Display debug: disp status | disp debug <on|off> | disp compositor <gl|sw>".to_string()),
         ];
         #[cfg(feature = "developer")]
@@ -4442,7 +4439,7 @@ impl Device for Rex3 {
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
         if args.is_empty() {
-            return Err(format!("Usage: {} debug <on|off> | {} status", cmd, cmd));
+            return Err(format!("Usage: {} status", cmd));
         }
 
         #[cfg(feature = "wgpu")]
@@ -4831,6 +4828,7 @@ impl Device for Rex3 {
             return Ok(());
         }
 
+        #[cfg(feature = "developer")]
         if args[0] == "debug" {
             let val = match args.get(1).map(|s| *s) {
                 Some("on") => true,
@@ -4839,16 +4837,6 @@ impl Device for Rex3 {
             };
 
             match cmd {
-                "rex" => {
-                    self.debug.store(val, Ordering::Relaxed);
-                    writeln!(writer, "REX3 debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
-                "dcb" => {
-                    if val { devlog().enable(LogModule::Dcb); } else { devlog().disable(LogModule::Dcb); }
-                    writeln!(writer, "DCB debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
                 #[cfg(feature = "developer")]
                 "block" => {
                     self.block_debug.store(val, Ordering::Relaxed);
@@ -4872,28 +4860,6 @@ impl Device for Rex3 {
                     writeln!(writer, "Draw debug overlay {}", if val { "enabled" } else { "disabled" }).unwrap();
                     return Ok(());
                 }
-                "vc2" => {
-                    if val { devlog().enable(LogModule::Vc2); } else { devlog().disable(LogModule::Vc2); }
-                    writeln!(writer, "VC2 debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
-                "xmap" => {
-                    if val { devlog().enable(LogModule::Xmap); } else { devlog().disable(LogModule::Xmap); }
-                    writeln!(writer, "XMAP debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
-                "cmap" => {
-                    if val { devlog().enable(LogModule::Cmap); } else { devlog().disable(LogModule::Cmap); }
-                    writeln!(writer, "CMAP debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
-                "bt445" => {
-                    self.bt445.lock().debug = val;
-                    if val { devlog().enable(LogModule::Bt445); } else { devlog().disable(LogModule::Bt445); }
-                    writeln!(writer, "BT445 debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
-
                 _ => {}
             }
         }

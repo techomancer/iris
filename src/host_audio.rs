@@ -633,55 +633,67 @@ mod tests {
         assert_eq!((rate, channels), (FILE_RATE, 6));
     }
 
-    /// Play stereo `pcm` at `rate` into an `[audio] file`; return the file
-    /// from its first sound. Paced by what the file has taken, not a clock.
-    fn played_into_a_file(name: &str, rate: u32, pcm: &[i16]) -> Vec<i16> {
-        let (mut cfg, path) = file_config(name);
-        cfg.prebuf_ms = 300;
-        let mut out = open_output(&cfg, "test", 2, rate, "IRIS_TEST_CAPTURE").expect("a file output opens");
-        let margin = u64::from(rate) * 2 * cfg.prebuf_ms / 1000;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut at = 0;
+    /// Play stereo `pcm` at `rate` into a detached stream whose device runs
+    /// at the file's rate with no rate adjustment, as an `[audio] file` does;
+    /// return what the device took, from its first sound. The test is the
+    /// device, so a busy host cannot starve it into an underrun.
+    fn played_through_a_stream(rate: u32, pcm: &[i16]) -> Vec<i16> {
+        use iris_audio::{DeviceFormat, Render, Sample};
+        let cfg = OutputConfig {
+            channels: 2,
+            rate,
+            prebuffer: Duration::from_millis(300),
+            max_latency: Duration::from_secs(2),
+            max_adjust: 0.0,
+            ..Default::default()
+        };
+        let (mut out, mut renderer) = iris_audio::Output::detached(&cfg).expect("a detached output");
+        renderer.configure(DeviceFormat { rate: FILE_RATE, channels: 2 });
+        let (mut heard, mut at) = (Vec::new(), 0);
+        // The device takes 5 ms of frames at a time.
+        let mut take = |out: &Output| {
+            let mut buf = vec![0f32; FILE_RATE as usize / 200 * 2];
+            renderer.render(&mut buf, &iris_audio::RenderInfo::default());
+            heard.extend(buf.into_iter().map(i16::from_f32));
+            out.stats()
+        };
+        let margin = u64::from(rate) * 600 / 1000;
         while at < pcm.len() {
-            assert!(Instant::now() < deadline, "the file stopped taking frames");
-            let s = out.stats();
-            let taken = s.played * u64::from(rate) / u64::from(FILE_RATE);
-            if s.written < taken + margin {
+            let s = take(&out);
+            if s.written < s.played * u64::from(rate) / u64::from(FILE_RATE) + margin {
                 let end = (at + 256 * 2).min(pcm.len());
                 at += out.write(&pcm[at..end]) * 2;
-            } else {
-                std::thread::sleep(Duration::from_millis(1));
             }
         }
         out.idle();
-        while { let s = out.stats(); s.played == 0 || s.playing || s.queued > Duration::ZERO } {
-            assert!(Instant::now() < deadline, "the file stopped taking frames");
-            std::thread::sleep(Duration::from_millis(1));
+        let mut s = take(&out);
+        for _ in 0..1000 {
+            if s.played != 0 && !s.playing && s.queued == Duration::ZERO {
+                break;
+            }
+            s = take(&out);
         }
-        let s = out.stats();
-        drop(out);
         assert_eq!((s.underruns, s.overruns, s.dropped), (0, 0, 0), "{s:?}");
-        let (file_rate, channels, heard) = read_wav(&path.0);
-        assert_eq!((file_rate, channels), (FILE_RATE, 2));
+        assert!(!s.playing && s.queued == Duration::ZERO, "the stream never played out: {s:?}");
         from_first_sound(&heard, 2).to_vec()
     }
 
-    /// At the file's rate the file holds the card's frames unchanged.
+    /// At the device's rate the device gets the card's frames unchanged.
     #[test]
-    fn a_file_at_the_cards_rate_holds_its_frames_exactly() {
+    fn a_stream_at_the_devices_rate_holds_its_frames_exactly() {
         // A ramp with no zero in it, so the first sound is the first frame.
         let sent: Vec<i16> = (0..FILE_RATE as i32 * 2).flat_map(|n| [(n % 20000 + 1) as i16, -((n * 7) % 20000 + 1) as i16]).collect();
-        let heard = played_into_a_file("file-exact", FILE_RATE, &sent);
-        assert!(heard[..sent.len()] == sent[..], "the file is not what was written");
+        let heard = played_through_a_stream(FILE_RATE, &sent);
+        assert!(heard[..sent.len()] == sent[..], "the device did not get what was written");
     }
 
-    /// At another rate the file holds a fixed-ratio conversion.
+    /// At another rate the device gets a fixed-ratio conversion.
     #[test]
-    fn a_file_at_another_rate_holds_a_fixed_ratio_conversion() {
+    fn a_stream_at_another_rate_holds_a_fixed_ratio_conversion() {
         use iris_audio::{MAX_CHANNELS, Sample};
         let rate = 44100;
         let sent = tones(rate as usize * 2, rate, 440.0, 880.0, 16000.0);
-        let heard = played_into_a_file("file-ratio", rate, &sent);
+        let heard = played_through_a_stream(rate, &sent);
 
         let mut conv = iris_audio::resample::Resampler::new(2, rate, FILE_RATE);
         let mut frames = sent.chunks_exact(2);
@@ -694,7 +706,7 @@ mod tests {
         );
         let want: Vec<i16> = want[..n * 2].iter().map(|&v| i16::from_f32(v)).collect();
         let want = from_first_sound(&want, 2);
-        assert!(heard[..want.len()] == want[..], "the file is not the fixed-ratio conversion");
+        assert!(heard[..want.len()] == want[..], "the device did not get the fixed-ratio conversion");
     }
 
     #[test]

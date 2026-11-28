@@ -276,6 +276,8 @@ const CODEC_A: usize = 0;
 const CODEC_B: usize = 1;
 const AES_TX: usize = 2;
 const AES_RX: usize = 3;
+const DMA_EN: [u16; 4] = [DMA_EN_CODECA, DMA_EN_CODECB, DMA_EN_AES_TX, DMA_EN_AES_RX];
+const ARM: [fn(&Hal2); 4] = [Hal2::arm_codeca, Hal2::arm_codecb, Hal2::arm_aestx, Hal2::arm_aesrx];
 
 // ─── HAL2 register state ──────────────────────────────────────────────────────
 
@@ -323,6 +325,7 @@ impl Hal2State {
     fn codecb_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.codecb_ctrl[0]) }
     fn aestx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aestx_ctrl[0]) }
     fn aesrx_cfg(&self) -> (usize, usize, usize) { decode_ctrl1(self.aesrx_ctrl[0]) }
+    fn channels(&self) -> [usize; 4] { [self.codeca_cfg().0, self.codecb_cfg().0, self.aestx_cfg().0, self.aesrx_cfg().0] }
 
     /// Combined output gain `(left_gain, right_gain)` in `0..=(32768 * 255)`,
     /// combining the CS4216 Codec A `MUTE` bit (IDR0 bit 10), 5-bit DAC
@@ -488,8 +491,6 @@ impl Hal2 {
     // ── Codec A output timer ──────────────────────────────────────────────────
 
     fn arm_codeca(&self) {
-        self.disarm(CODEC_A);
-
         let (dma_ch, mode, rate, pitch_rate) = {
             let s = self.state.lock();
             let (ch, clk, mode) = s.codeca_cfg();
@@ -576,19 +577,24 @@ impl Hal2 {
 
     /// Wake `engine` every `PACE_PERIOD` with a pacer counting `rate` frames a second on the machine clock.
     fn pace(&self, engine: usize, rate: u32, mut tick: impl FnMut(&mut Pacer) -> TimerReturn + Send + 'static) {
+        let mut timers = self.timers.lock();
+        if timers[engine].is_some() { return; }
         let mut pacer = Pacer::new(rate, self.tm.clock());
-        let id = self.tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || tick(&mut pacer));
-        self.timers.lock()[engine] = Some(id);
+        timers[engine] = Some(self.tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, move || tick(&mut pacer)));
     }
 
-    /// Stop `engine`'s timer and reset what it fed: codec A keeps its host
-    /// stream open, and the AES receive loopback is emptied.
-    fn disarm(&self, engine: usize) {
+    fn stop_timer(&self, engine: usize) {
         let id = self.timers.lock()[engine].take();
         if let Some(id) = id {
             self.tm.remove(id);
             crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, engine);
         }
+    }
+
+    /// Stop `engine`'s timer and reset what it fed: codec A keeps its host
+    /// stream open, and the AES receive loopback is emptied.
+    fn disarm(&self, engine: usize) {
+        self.stop_timer(engine);
         match engine {
             CODEC_A => self.ca_state.lock().reset_audio(),
             AES_RX => self.ar_state.lock().loopback.clear(),
@@ -596,11 +602,33 @@ impl Hal2 {
         }
     }
 
+    /// Enable `engine`: a fresh start, with a timer only while its channel is active.
+    fn enable(&self, engine: usize) {
+        self.disarm(engine);
+        let ch = self.state.lock().channels()[engine];
+        if self.dma_clients.get(ch).is_some_and(|c| c.is_active()) { ARM[engine](self); }
+    }
+
+    /// Wire each channel's start and stop to its engines' timers: a stopped channel moves nothing.
+    pub fn watch_dma(self: &Arc<Self>) {
+        for (ch, dma) in self.dma_clients.iter().enumerate() {
+            let me = Arc::downgrade(self);
+            dma.on_active_change(Box::new(move |active| if let Some(h) = me.upgrade() { h.dma_edge(ch, active) }));
+        }
+    }
+
+    /// Runs under the channel's lock: it takes `state`, `timers` and the timer manager,
+    /// none of which a thread holds while waiting for a channel, and never `ca_state`.
+    fn dma_edge(&self, ch: usize, active: bool) {
+        let (en, chans) = { let s = self.state.lock(); (s.dma_enable, s.channels()) };
+        for engine in (CODEC_A..=AES_RX).filter(|&e| en & DMA_EN[e] != 0 && chans[e] == ch) {
+            if active { ARM[engine](self); } else { self.stop_timer(engine); }
+        }
+    }
+
     // ── Codec B input (silence writer) timer ─────────────────────────────────
 
     fn arm_codecb(&self) {
-        self.disarm(CODEC_B);
-
         let (dma_ch, mode, rate) = {
             let s = self.state.lock();
             let (ch, clk, raw_mode) = s.codecb_cfg();
@@ -637,8 +665,6 @@ impl Hal2 {
     // ── AES TX drain timer (no host output) ──────────────────────────────────
 
     fn arm_aestx(&self) {
-        self.disarm(AES_TX);
-
         let (dma_ch, rate) = {
             let s = self.state.lock();
             let (ch, clk, _mode) = s.aestx_cfg();
@@ -666,8 +692,6 @@ impl Hal2 {
     // ── AES RX loopback write timer ───────────────────────────────────────────
 
     fn arm_aesrx(&self) {
-        self.disarm(AES_RX);
-
         let (dma_ch, rate) = {
             let s = self.state.lock();
             let (ch, clk, _mode) = s.aesrx_cfg();
@@ -700,7 +724,7 @@ impl Hal2 {
         if changed(DMA_EN_CODECA) {
             if enabled(DMA_EN_CODECA) {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A DMA enabled");
-                self.arm_codeca();
+                self.enable(CODEC_A);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A DMA disabled");
                 self.disarm(CODEC_A);
@@ -710,7 +734,7 @@ impl Hal2 {
         if changed(DMA_EN_CODECB) {
             if enabled(DMA_EN_CODECB) {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec B DMA enabled");
-                self.arm_codecb();
+                self.enable(CODEC_B);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: Codec B DMA disabled");
                 self.disarm(CODEC_B);
@@ -720,7 +744,7 @@ impl Hal2 {
         if changed(DMA_EN_AES_TX) {
             if enabled(DMA_EN_AES_TX) {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES TX DMA enabled");
-                self.arm_aestx();
+                self.enable(AES_TX);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES TX DMA disabled");
                 self.disarm(AES_TX);
@@ -730,7 +754,7 @@ impl Hal2 {
         if changed(DMA_EN_AES_RX) {
             if enabled(DMA_EN_AES_RX) {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES RX DMA enabled");
-                self.arm_aesrx();
+                self.enable(AES_RX);
             } else {
                 dlog_dev!(LogModule::Hal2, "HAL2: AES RX DMA disabled");
                 self.disarm(AES_RX);
@@ -894,10 +918,10 @@ impl Hal2 {
                     if rearm {
                         drop(state);
                         match num {
-                            IAR_NUM_CODECA => self.arm_codeca(),
-                            IAR_NUM_CODECB => self.arm_codecb(),
-                            IAR_NUM_AES_TX => self.arm_aestx(),
-                            IAR_NUM_AES_RX => self.arm_aesrx(),
+                            IAR_NUM_CODECA => self.enable(CODEC_A),
+                            IAR_NUM_CODECB => self.enable(CODEC_B),
+                            IAR_NUM_AES_TX => self.enable(AES_TX),
+                            IAR_NUM_AES_RX => self.enable(AES_RX),
                             _ => {}
                         }
                         return;
@@ -954,16 +978,16 @@ impl Hal2 {
         // Codec A re-arms when the generator it selected is reprogrammed. It
         // no longer re-arms on a codec B change: its period is its own now.
         if (dma_enable & DMA_EN_CODECA) != 0 && ca_clk == bres_idx {
-            self.arm_codeca();
+            self.enable(CODEC_A);
         }
         if (dma_enable & DMA_EN_CODECB) != 0 && cb_clk == bres_idx {
-            self.arm_codecb();
+            self.enable(CODEC_B);
         }
         if (dma_enable & DMA_EN_AES_TX) != 0 && at_clk == bres_idx {
-            self.arm_aestx();
+            self.enable(AES_TX);
         }
         if (dma_enable & DMA_EN_AES_RX) != 0 && ar_clk == bres_idx {
-            self.arm_aesrx();
+            self.enable(AES_RX);
         }
     }
 
@@ -1175,11 +1199,14 @@ mod host_tests {
     struct Looping {
         words: Vec<u32>,
         at: std::sync::atomic::AtomicUsize,
+        /// Every read, whether it gave a word or not.
+        polled: AtomicU64,
         late: AtomicBool,
     }
 
     impl DmaClient for Looping {
         fn read(&self) -> Option<(u32, DmaStatus)> {
+            self.polled.fetch_add(1, Ordering::Relaxed);
             if self.late.load(Ordering::Relaxed) && self.at.load(Ordering::Relaxed) % 2 == 0 {
                 return None;
             }
@@ -1191,12 +1218,63 @@ mod host_tests {
         }
     }
 
+    /// A channel the guest arms and stops by hand, telling its listener as HPC3 does.
+    #[derive(Default)]
+    struct Switch {
+        active: AtomicBool,
+        listener: Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
+    }
+
+    impl Switch {
+        fn set(&self, on: bool) {
+            let l = self.listener.lock();
+            self.active.store(on, Ordering::Relaxed);
+            if let Some(f) = l.as_ref() { f(on); }
+        }
+    }
+
+    impl DmaClient for Switch {
+        fn read(&self) -> Option<(u32, DmaStatus)> { None }
+        fn write(&self, _val: u32, _eop: bool) -> DmaStatus { DmaStatus::ok() }
+        fn is_active(&self) -> bool { self.active.load(Ordering::Relaxed) }
+        fn on_active_change(&self, f: Box<dyn Fn(bool) + Send + Sync>) { *self.listener.lock() = Some(f); }
+    }
+
+    /// An engine paces only while it is enabled and its channel is active, as on
+    /// an idle Indy where IRIX leaves the engines on over stopped channels.
+    #[test]
+    fn an_engine_paces_only_while_enabled_and_its_channel_is_active() {
+        let chans: Vec<Arc<Switch>> = (0..3).map(|_| Arc::default()).collect();
+        let h = Arc::new(Hal2::new(&Arc::new(TimerManager::new()), chans.iter().map(|c| c.clone() as Arc<dyn DmaClient>).collect()));
+        h.watch_dma();
+        {
+            let mut s = h.state.lock();
+            s.bres_clock_rate[0] = 48000;
+            let ctrl = |ch: u16| ch | 1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT;
+            (s.codeca_ctrl[0], s.codecb_ctrl[0], s.aestx_ctrl[0]) = (ctrl(0), ctrl(1), ctrl(2));
+            s.dma_enable = DMA_EN_CODECA | DMA_EN_CODECB | DMA_EN_AES_TX;
+        }
+        let timers = || h.timers.lock().map(|t| t.is_some());
+        h.apply_dma_enable(0, DMA_EN_CODECA | DMA_EN_CODECB | DMA_EN_AES_TX);
+        h.reclock_active(1);
+        assert_eq!(timers()[..3], [false; 3], "an engine paces over a stopped channel");
+
+        h.state.lock().dma_enable &= !DMA_EN_AES_TX;
+        h.apply_dma_enable(DMA_EN_AES_TX, 0);
+        chans.iter().for_each(|c| c.set(true));
+        assert_eq!(timers()[..3], [true, true, false], "arming a channel starts only its enabled engine");
+
+        chans[0].set(false);
+        assert_eq!(timers()[..3], [false, true, false], "stopping a channel stops its engine");
+        Device::stop(&*h);
+    }
+
     /// Codec A's timer hands the recorder the frames it read, as read, at
     /// the codec's rate. The wake is the host's, so the test waits for frames.
     #[test]
     fn codec_a_records_what_it_reads_at_its_rate() {
         let words: Vec<u32> = (1..=8).collect();
-        let dma = Arc::new(Looping { words: words.clone(), at: Default::default(), late: AtomicBool::new(false) });
+        let dma = Arc::new(Looping { words: words.clone(), at: Default::default(), polled: Default::default(), late: AtomicBool::new(false) });
         let (dump, bytes) = crate::dev::audio_dump::tests::dump();
         let mut h = Hal2::new(&Arc::new(TimerManager::new()), vec![dma]);
         h.dump = Some(dump);
@@ -1219,47 +1297,75 @@ mod host_tests {
         assert!(played.len() >= 128 && played == want, "{} samples", played.len());
     }
 
-    /// The whole way from the DMA channel to the host as a running machine
-    /// takes it: codec A on BRES1 at 48 kHz, its recurring timer pacing the
-    /// channel by the host's clock, and the host output `Device::start`
-    /// opens -- an `[audio] file`, so no sound card -- drained in real
-    /// time. The file holds the buffer's two tones, each on its own side
-    /// at full level, for about as long as the channel moved.
+    /// Codec A at 48 kHz stereo on a stepped machine clock, into a detached
+    /// host stream. The pace timer still wakes on the timer thread, so `run`
+    /// steps the clock and waits for the frames that step made due to land.
+    struct Played {
+        h: Hal2,
+        dma: Arc<Looping>,
+        host: TestHost,
+        clock: crate::clock::Clock,
+        _tm: Arc<TimerManager>,
+        pcm: Vec<i16>,
+        polls: u64,
+        written: u64,
+    }
+
+    impl Played {
+        fn new(tone: &[i16]) -> Self {
+            let clock = crate::clock::Clock::stepped();
+            let tm = Arc::new(TimerManager::with_clock(clock.clone()));
+            let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), polled: Default::default(), late: AtomicBool::new(false) });
+            let h = Hal2::new(&tm, vec![dma.clone()]);
+            let (out, host) = detached(48000, 2);
+            h.ca_state.lock().out = Some(out);
+            {
+                let mut s = h.state.lock();
+                s.bres_clock_rate[0] = 48000;
+                // DMA channel 0, CLKID 1, stereo.
+                s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
+                s.dma_enable = DMA_EN_CODECA;
+            }
+            h.apply_dma_enable(0, DMA_EN_CODECA);
+            Self { h, dma, host, clock, _tm: tm, pcm: Vec::new(), polls: 0, written: 0 }
+        }
+
+        /// 2 ms of machine time at a time, 96 frames each, which the host takes as it is due.
+        fn run(&mut self, ms: u64) {
+            for _ in 0..ms / 2 {
+                self.clock.step(2_000_000);
+                // A late channel reads once a frame and gets nothing; otherwise two words.
+                let late = self.dma.late.load(Ordering::Relaxed);
+                self.polls += if late { 96 } else { 192 };
+                self.written += if late { 0 } else { 96 };
+                let caught_up = || self.dma.polled.load(Ordering::Relaxed) >= self.polls
+                    && self.h.ca_state.lock().out.as_ref().is_some_and(|o| o.stats().written >= self.written);
+                assert!(crate::test_board::until(caught_up), "the pace timer never made the frames due");
+                self.pcm.extend(self.host.render(96));
+            }
+        }
+
+        fn frames(&self) -> f64 {
+            self.dma.at.load(Ordering::Relaxed) as f64 / 2.0
+        }
+    }
+
+    /// The whole way from the DMA channel to the host: codec A on BRES1 at
+    /// 48 kHz, its recurring timer pacing the channel by the machine clock.
+    /// The host hears the buffer's two tones, each on its own side at full
+    /// level, for as long as the channel moved.
     #[test]
-    fn a_tone_in_guest_memory_reaches_the_host_on_the_real_clock() {
+    fn a_tone_in_guest_memory_reaches_the_host_on_a_stepped_clock() {
         // Five and ten cycles fill the 512-frame buffer exactly.
         let (left, right) = (5.0 * 48000.0 / 512.0, 10.0 * 48000.0 / 512.0);
-        let tone = tones(512, 48000, left, right, 16000.0);
-        let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
-        let (cfg, path) = file_config("hal2-tone");
-        let h = Hal2::with_audio(&Arc::new(TimerManager::new()), vec![dma.clone()], cfg);
-        Device::start(&h);
-        {
-            let mut s = h.state.lock();
-            s.bres_clock_rate[0] = 48000;
-            // DMA channel 0, CLKID 1, stereo.
-            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
-            s.dma_enable = DMA_EN_CODECA;
-        }
-        let started = Instant::now();
-        h.apply_dma_enable(0, DMA_EN_CODECA);
-        std::thread::sleep(Duration::from_millis(800));
-        let st = h.ca_state.lock().out.as_ref().map(|o| o.stats()).expect("codec A has a host stream");
-        Device::stop(&h);
-        let wall = started.elapsed().as_secs_f64();
-        let moved = dma.at.load(Ordering::Relaxed) as u64 / 2;
-        let (rate, channels, pcm) = read_wav(&path.0);
-        assert_eq!((rate, channels), (48000, 2));
-        // Half at least: a timer held up by a busy host holds the clock back.
-        assert!(moved as f64 >= 0.5 * wall * 48000.0, "the clock ran: {moved} frames in {wall:.3} s");
-        let heard = sounding(&pcm, 2);
-        // A file thread held up by a busy host (a loaded CI runner) lets the
-        // queue pass its ceiling, and the stream skips ahead rather than
-        // play late. Those frames reached the host and were let go on
-        // purpose; the 200 ms is what was still queued at the stop.
-        let skipped = st.overruns + st.dropped;
-        assert!((heard.len() / 2) as u64 + skipped + 9600 >= moved,
-            "{} of {moved} frames reached the file ({skipped} skipped by the host stream)", heard.len() / 2);
+        let mut p = Played::new(&tones(512, 48000, left, right, 16000.0));
+        p.run(800);
+        let moved = p.frames() as u64;
+        assert_eq!(moved, 48000 * 800 / 1000, "the clock ran");
+        let heard = sounding(&p.pcm, 2);
+        // The tone's silent frames, two a lap, are not sounding.
+        let n = (heard.len() / 2) as u64;
+        assert!(n <= moved && n + 400 >= moved, "{n} of {moved} frames heard");
         assert_tones(&heard, 2, 48000, left, right, 15000);
     }
 
@@ -1268,41 +1374,24 @@ mod host_tests {
     /// catching up. Both sides of the gap must be the tone with each
     /// channel on its own side, as long as the channel moved, and the gap
     /// must count as an underrun. The stream's own underrun handling is tested in `host_audio`.
-    fn a_tone_survives_an_underrun(backend: Backend) {
-        let Some(ear) = Listener::new(backend, "hal2-underrun") else { return };
+    #[test]
+    fn a_tone_survives_an_underrun_on_a_stepped_clock() {
         // 11 and 22 cycles fill the 1200-frame buffer exactly.
-        let tone = tones(1200, 48000, 440.0, 880.0, 16000.0);
-        let dma = Arc::new(Looping { words: tone.iter().map(|&v| u32::from(v as u16)).collect(), at: Default::default(), late: AtomicBool::new(false) });
-        let h = Hal2::with_audio(&Arc::new(TimerManager::new()), vec![dma.clone()], ear.cfg.clone());
-        Device::start(&h);
-        {
-            let mut s = h.state.lock();
-            s.bres_clock_rate[0] = 48000;
-            s.codeca_ctrl[0] = (1 << CTRL1_CLOCK_SHIFT | (MODE_STEREO as u16) << CTRL1_MODE_SHIFT) as u16;
-            s.dma_enable = DMA_EN_CODECA;
-        }
-        let frames = || dma.at.load(Ordering::Relaxed) as f64 / 2.0;
-        h.apply_dma_enable(0, DMA_EN_CODECA);
-        std::thread::sleep(Duration::from_millis(600));
-        dma.late.store(true, Ordering::Relaxed);
-        let (first, before) = (frames(), h.underrun_count());
-        std::thread::sleep(Duration::from_millis(300));
-        let (paused, underran) = (frames(), h.underrun_count() - before);
-        dma.late.store(false, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(600));
-        dma.late.store(true, Ordering::Relaxed);
-        let second = frames() - paused;
+        let mut p = Played::new(&tones(1200, 48000, 440.0, 880.0, 16000.0));
+        p.run(600);
+        p.dma.late.store(true, Ordering::Relaxed);
+        let (first, before) = (p.frames(), p.h.underrun_count());
+        p.run(300);
+        let (paused, underran) = (p.frames(), p.h.underrun_count() - before);
+        p.dma.late.store(false, Ordering::Relaxed);
+        p.run(600);
+        p.dma.late.store(true, Ordering::Relaxed);
+        let second = p.frames() - paused;
         // What the host still holds plays out.
-        std::thread::sleep(Duration::from_millis(300));
-        Device::stop(&h);
-        let heard = ear.heard();
+        p.run(300);
+        let heard = Heard { rate: 48000, channels: 2, pcm: std::mem::take(&mut p.pcm) };
         assert_a_tone_either_side_of_a_pause(&heard, 440.0, 880.0, 8000, [first / 48000.0, second / 48000.0]);
         assert!(underran > 0, "the host stream ran dry while the guest was late");
-    }
-
-    #[test]
-    fn a_tone_survives_an_underrun_into_a_file() {
-        a_tone_survives_an_underrun(Backend::File);
     }
 }
 

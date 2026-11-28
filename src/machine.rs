@@ -39,7 +39,7 @@ use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
 use crate::dev::ng1::rex3::Rex3;
-use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, Gr2Chunk, MgrasChunk, enabled_features};
+use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, NamedChunk, enabled_features};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
 use crate::workstation::{MachineRef, MachineSlot, SystemController, Workstation};
@@ -137,15 +137,8 @@ pub struct Machine {
     /// The shared `--serial-log` sink, kept so `stop` can flush a final
     /// partial line (wall-timestamp mode holds one until its newline).
     serial_log: Option<Arc<crate::dev::serial_log::SerialLog>>,
-    /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
-    /// name as the fallback path if the in-memory checkpoint is absent.
-    last_restore: Option<String>,
-    /// In-memory copy of the just-loaded state, taken at the end of every
-    /// successful `ci_restore`. Lets `ci_rollback` skip disk IO and TOML
-    /// re-parsing — paste back the cached `toml::Value`s and `memcpy` the
-    /// bank/framebuffer buffers. Cleared on any explicit `load_snapshot`
-    /// outside the CI path.
-    last_restore_checkpoint: Option<RollbackCheckpoint>,
+    /// The last snapshot loaded, for `parent` and `rollback`.
+    restored: crate::snapshot::Restored,
     /// Path of the configured scratch SCSI volume, if any. The CI socket reads
     /// and writes this file directly (with the machine briefly stopped) to
     /// inject/exfiltrate files without going through the network. None when no
@@ -181,92 +174,6 @@ pub struct Machine {
 
 #[cfg(feature = "wgpu")]
 type ResidentCheckpoint = (toml::Value, (Vec<u32>, Vec<u32>));
-type MgrasCheckpoint = (String, Vec<(String, Vec<u32>)>);
-type Gr2Checkpoint = crate::dev::gr2::Gr2SnapshotParts;
-
-/// In-memory snapshot of the just-restored guest state. Populated at the end
-/// of `ci_restore`; consumed by `ci_rollback`. Trades ~270 MB of RSS for
-/// disk-IO-free rollback.
-struct RollbackCheckpoint {
-    /// Snapshot directory (saves/<name>/) — re-used by rollback to reflink
-    /// the COW overlays back into place.
-    overlay_dir: std::path::PathBuf,
-    /// Each disk's dirty sectors from cow.toml at the time of restore.
-    overlay_sets: crate::snapshot::OverlaySets,
-
-    /// Native-endian RAM bank words. `bank_words[i].len() ==
-    /// banks[i].size_bytes / 4` for present banks; populated for all four.
-    bank_words: [Vec<u32>; 4],
-
-    /// Framebuffer contents (RGB, aux). `None` when running headless.
-    framebuffers: Option<(Vec<u32>, Vec<u32>)>,
-    #[cfg(feature = "wgpu")]
-    resident_head1_framebuffers: Option<(Vec<u32>, Vec<u32>)>,
-
-    /// Parsed device save_state TOMLs. Holding `toml::Value` directly skips
-    /// the ~80 ms cpu.toml string-parse cost on every rollback.
-    cpu: toml::Value,
-    mc: toml::Value,
-    ioc: toml::Value,
-    scc: toml::Value,
-    pit: toml::Value,
-    ps2: toml::Value,
-    rtc: toml::Value,
-    eeprom: toml::Value,
-    scsi: toml::Value,
-    /// Second SCSI controller's state — fullhouse only. `None` on guinness.
-    scsi1: Option<toml::Value>,
-    seeq: toml::Value,
-    hpc3: toml::Value,
-    rex3: Option<toml::Value>,
-    rex3_head1: Option<toml::Value>,
-    mgras: Option<MgrasCheckpoint>,
-    gr2: Option<Gr2Checkpoint>,
-}
-
-/// Full-machine in-memory checkpoint captured from *live* running state
-/// (unlike `RollbackCheckpoint`, which is specifically "the state right
-/// after the most recent `ci_restore` from a named snapshot on disk" and
-/// re-reads that snapshot's `cow.toml` to reflink SCSI overlays back into
-/// place on rollback). Used by the interactive monitor's `j2 trace <n>` /
-/// `j2 replay` (`SystemController::execute_command`) to get a real,
-/// byte-exact rewind point — including device state, not just CPU
-/// registers — for comparing an interpreter-only reference run against a
-/// real-JIT-dispatch run of the same instruction window.
-///
-/// Deliberately does **not** capture SCSI controller or COW-overlay dirty-
-/// sector state — there is no "just loaded from snapshot X" name to
-/// reference here (this captures live, mid-session state, not a disk
-/// snapshot restore), and building a live-capture equivalent of
-/// `RollbackCheckpoint`'s overlay handling is real, correctness-sensitive
-/// work (get it wrong and it's disk corruption, not just a debugging
-/// inconvenience) that early-boot PROM debugging — the actual motivating
-/// use case — doesn't need at all (PROM hasn't touched SCSI yet). Restoring
-/// a `LiveCheckpoint` taken after the guest has performed real disk I/O
-/// will silently leave SCSI/disk state at whatever it drifted to during the
-/// replayed window, not rewound — safe for CPU/JIT correctness comparisons
-/// (nothing here reads disk contents), unsafe to treat as a general
-/// save-state substitute once boot reaches real disk access.
-pub(crate) struct LiveCheckpoint {
-    bank_words: [Vec<u32>; 4],
-    framebuffers: Option<(Vec<u32>, Vec<u32>)>,
-    #[cfg(feature = "wgpu")]
-    resident_head1_framebuffers: Option<(Vec<u32>, Vec<u32>)>,
-    cpu: toml::Value,
-    mc: toml::Value,
-    ioc: toml::Value,
-    scc: toml::Value,
-    pit: toml::Value,
-    ps2: toml::Value,
-    rtc: toml::Value,
-    eeprom: toml::Value,
-    seeq: toml::Value,
-    hpc3: toml::Value,
-    rex3: Option<toml::Value>,
-    rex3_head1: Option<toml::Value>,
-    mgras: Option<MgrasCheckpoint>,
-    gr2: Option<Gr2Checkpoint>,
-}
 
 /// One Newport head's monitor commands under numbered names: `rex1`,
 /// `vc21`, `xmap1`, `cmap1`, `bt4451`, `dcb1`, `disp1` for the second head.
@@ -1059,8 +966,7 @@ impl Machine {
             timer_manager,
             ci_serial,
             serial_log,
-            last_restore: None,
-            last_restore_checkpoint: None,
+            restored: Default::default(),
             scratch_path,
             disks: disk_provenance,
             gio_slots,
@@ -1421,11 +1327,6 @@ impl Machine {
         self.cpu.fasttick_count()
     }
 
-    /// The SCSI buses by slot, for a snapshot's overlays.
-    fn placed_disk_buses(&self) -> Vec<crate::snapshot::DiskBus<'_>> {
-        crate::snapshot::disk_buses((0..).map(Hpc3::scsi_at), self.scsi_buses(), None)
-    }
-
     /// Where the GIO card of `ty` sits, if there is one.
     fn gio_at(&self, ty: &str) -> Option<&crate::slot_path::MachineSlotPath> {
         self.gio_slots.iter().find(|(t, _)| t == ty).map(|(_, at)| at)
@@ -1518,57 +1419,6 @@ impl Machine {
         self.cpu.set_hw_read_fixup_replay(fixups)
     }
 
-    /// Full rewind: load the named snapshot, which now captures the COW
-    /// overlay too so the filesystem state is deterministic per snapshot.
-    /// The CPU resumes automatically (load_snapshot restarts it). After the
-    /// load, an in-memory checkpoint of the just-restored state is taken so
-    /// the next `ci_rollback` can run without touching disk.
-    pub fn ci_restore(&mut self, name: &str) -> Result<(), String> {
-        // Clear any leftover serial bytes from the previous run so the
-        // next command doesn't see stale output.
-        if let Some(ci) = &self.ci_serial {
-            ci.reset();
-        }
-
-        self.load_snapshot(name)?;
-        self.last_restore = Some(name.to_string());
-        // Capture the rollback checkpoint. If this fails, the restore still
-        // succeeded — rollback will fall back to the disk path.
-        match self.capture_rollback_checkpoint(name) {
-            Ok(cp) => self.last_restore_checkpoint = Some(cp),
-            Err(e) => {
-                eprintln!("ci_restore: rollback checkpoint capture failed: {} — rollback will use the disk path", e);
-                self.last_restore_checkpoint = None;
-            }
-        }
-        Ok(())
-    }
-
-    /// Roll back to the state captured at the last `ci_restore`. Uses the
-    /// in-memory checkpoint when present; falls back to a disk reload if it's
-    /// absent (legacy snapshot loaded outside CI, or capture failed).
-    pub fn ci_rollback(&mut self) -> Result<(), String> {
-        if let Some(ci) = &self.ci_serial {
-            ci.reset();
-        }
-
-        // Take the checkpoint out so the apply path can hold &cp without
-        // borrowing self at the same time. Restored after apply so repeated
-        // rollbacks work.
-        let cp = match self.last_restore_checkpoint.take() {
-            Some(cp) => cp,
-            None => {
-                let name = self.last_restore.clone()
-                    .ok_or_else(|| "no previous restore to roll back to".to_string())?;
-                eprintln!("ci_rollback: no in-memory checkpoint — falling back to disk reload");
-                return self.ci_restore(&name);
-            }
-        };
-        let result = self.apply_rollback_checkpoint(&cp);
-        self.last_restore_checkpoint = Some(cp);
-        result
-    }
-
     #[cfg(feature = "wgpu")]
     fn capture_resident_checkpoint(rex: Option<&Rex3>) -> Result<Option<ResidentCheckpoint>, String> {
         rex.filter(|rex| rex.resident_active())
@@ -1576,318 +1426,18 @@ impl Machine {
             .transpose()
     }
 
-    #[cfg(feature = "wgpu")]
-    fn validate_resident_primary_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
-        if self.board.rex3.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
-            return Err("resident REX3 checkpoint requires registers and both planes".into());
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "wgpu")]
-    fn validate_resident_head1_checkpoint(&self, registers: bool, planes: bool) -> Result<(), String> {
-        if self.board.rex3_head1.as_ref().is_some_and(|rex| rex.resident_active()) && (!registers || !planes) {
-            return Err("resident REX3 head 1 checkpoint requires registers and both planes".into());
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "wgpu")]
-    fn restore_resident_head1_framebuffers(
-        &self,
-        has_registers: bool,
-        planes: Option<&(Vec<u32>, Vec<u32>)>,
-    ) -> Result<(), String> {
-        if let Some(rex) = self.board.rex3_head1.as_ref().filter(|rex| rex.resident_active()) {
-            if !has_registers {
-                return Err("resident REX3 head 1 checkpoint has no registers".into());
-            }
-            let (rgb, aux) = planes.ok_or("resident REX3 head 1 checkpoint has no planes")?;
-            rex.try_restore_framebuffers_inmem(rgb, aux)
-                .map_err(|error| format!("restore resident REX3 head 1 framebuffers: {error}"))?;
-        }
-        Ok(())
-    }
-
-    /// Capture in-memory state for fast rollback. Stops the CPU briefly.
-    fn capture_rollback_checkpoint(&mut self, name: &str) -> Result<RollbackCheckpoint, String> {
+    /// The machine as it is, for `j2 trace` and `j2 replay` to rewind to: SCSI registers, not
+    /// disk contents. Leaves it stopped, as the restore that follows wants.
+    pub(crate) fn capture_live_checkpoint(&mut self) -> crate::snapshot::Image<'static> {
         self.stop();
-
-        #[cfg(feature = "wgpu")]
-        let resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())?;
-        #[cfg(feature = "wgpu")]
-        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())?;
-        let cpu = self.cpu.save_state();
-        let mc = self.mc.save_state();
-        let ioc = self.hpc3.ioc().save_state();
-        let scc = self.hpc3.ioc().scc().save_state();
-        let pit = self.hpc3.ioc().pit().save_state();
-        let ps2 = self.hpc3.ioc().ps2().save_state();
-        let rtc = self.hpc3.rtc().save_state();
-        let eeprom = self.hpc3.eeprom().lock().save_state_owned();
-        let scsi = self.hpc3.scsi().save_state();
-        let scsi1 = self.hpc3.scsi1().map(|dev| dev.save_state());
-        let seeq = self.hpc3.seeq().save_state();
-        let hpc3 = self.hpc3.save_state();
-        let rex3 = self.board.rex3.as_ref().map(|r| {
-            #[cfg(feature = "wgpu")]
-            if let Some((state, _)) = &resident_primary { return state.clone(); }
-            r.save_state()
-        });
-        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| {
-            #[cfg(feature = "wgpu")]
-            if let Some((state, _)) = &resident_head1 { return state.clone(); }
-            r.save_state()
-        });
-        let mgras = self.board.mgras.as_ref().map(|m| m.snapshot_parts()).transpose()?;
-        let gr2 = self.board.gr2.as_ref().map(|g| g.snapshot_parts()).transpose()?;
-
-        let bank_words: [Vec<u32>; 4] = [
-            self.board.phys.snapshot_bank_inmem(0),
-            self.board.phys.snapshot_bank_inmem(1),
-            self.board.phys.snapshot_bank_inmem(2),
-            self.board.phys.snapshot_bank_inmem(3),
-        ];
-
-        #[cfg(feature = "wgpu")]
-        let framebuffers = match resident_primary {
-            Some((_, planes)) => Some(planes),
-            None => self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem()),
-        };
-        #[cfg(not(feature = "wgpu"))]
-        let framebuffers = self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem());
-        #[cfg(feature = "wgpu")]
-        let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
-
-        // Re-read cow.toml so rollback knows which dirty sectors to import
-        // back. The file was just consumed by load_snapshot but it is tiny
-        // and re-reading from page cache is cheap (~µs).
-        let overlay_dir = std::path::PathBuf::from("saves").join(name);
-        let snap = Snapshot::new(&overlay_dir);
-        let overlay_sets = snap.read_toml("cow.toml").map(|v| crate::snapshot::parse_cow_table(&v)).unwrap_or_default();
-
-        self.restart_peripherals();
-        self.cpu.start();
-
-        Ok(RollbackCheckpoint {
-            overlay_dir,
-            overlay_sets,
-            bank_words,
-            framebuffers,
-            #[cfg(feature = "wgpu")]
-            resident_head1_framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, scsi1, seeq, hpc3, rex3, rex3_head1, mgras, gr2,
-        })
+        self.capture_image().unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// Apply an in-memory checkpoint, restoring the guest to the state at
-    /// the moment of capture. Skips disk IO and TOML string-parsing.
-    fn apply_rollback_checkpoint(&mut self, cp: &RollbackCheckpoint) -> Result<(), String> {
+    /// Put back a checkpoint of [`Machine::capture_live_checkpoint`]. The peripherals run on and
+    /// the CPU stays stopped, for the caller's inline single-stepping.
+    pub(crate) fn restore_live_checkpoint(&mut self, cp: &crate::snapshot::Image) -> Result<(), String> {
         self.stop();
-        #[cfg(feature = "wgpu")]
-        self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
-        #[cfg(feature = "wgpu")]
-        self.validate_resident_head1_checkpoint(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.is_some())?;
-        self.power_on_devices();
-
-        self.cpu.load_state(&cp.cpu)?;
-        self.mc.load_state(&cp.mc)?;
-        self.hpc3.ioc().load_state(&cp.ioc)?;
-        self.hpc3.ioc().scc().load_state(&cp.scc)?;
-        self.hpc3.ioc().pit().load_state(&cp.pit)?;
-        self.hpc3.ioc().ps2().load_state(&cp.ps2)?;
-        self.hpc3.rtc().load_state(&cp.rtc)?;
-        self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
-        self.hpc3.scsi().load_state(&cp.scsi)?;
-        if let (Some(dev), Some(scsi1_toml)) = (self.hpc3.scsi1(), &cp.scsi1) {
-            dev.load_state(scsi1_toml)?;
-        }
-        self.hpc3.seeq().load_state(&cp.seeq)?;
-        self.hpc3.load_state(&cp.hpc3)?;
-        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3, &cp.rex3) {
-            rex3.load_state(rex3_toml)?;
-        }
-        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3_head1, &cp.rex3_head1) {
-            rex3.load_state(rex3_toml)?;
-        }
-
-        for (i, words) in cp.bank_words.iter().enumerate() {
-            self.board.phys.restore_bank_inmem(i, words);
-        }
-        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
-            rex3.try_restore_framebuffers_inmem(rgb, aux)
-                .map_err(|error| format!("restore REX3 framebuffers: {error}"))?;
-        }
-        #[cfg(feature = "wgpu")]
-        self.restore_resident_head1_framebuffers(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.as_ref())?;
-        match (&self.board.mgras, &cp.mgras) {
-            (Some(mgras), Some((metadata, parts))) => mgras.restore_snapshot_parts(metadata, parts)?,
-            (Some(_), None) => return Err("rollback checkpoint has no state for the configured IMPACT board".into()),
-            (None, Some(_)) => return Err("rollback checkpoint contains IMPACT state but the machine has no IMPACT board".into()),
-            (None, None) => {}
-        }
-        match (&self.board.gr2, &cp.gr2) {
-            (Some(gr2), Some((metadata, parts))) => gr2.restore_snapshot_parts(metadata, parts)?,
-            (Some(_), None) => return Err("rollback checkpoint has no state for the configured GR2 board".into()),
-            (None, Some(_)) => return Err("rollback checkpoint contains GR2 state but the machine has no GR2 board".into()),
-            (None, None) => {}
-        }
-
-        // Reflink the overlay back into place. saves/<name>/scsi*.overlay is
-        // unchanged by guest writes (writes go to the live overlay), so this
-        // can re-import directly.
-        crate::snapshot::import_overlays(&cp.overlay_dir, &self.placed_disk_buses(), &cp.overlay_sets)
-            .map_err(|e| format!("rollback: {e}"))?;
-
-        self.restart_peripherals();
-        self.cpu.start();
-        Ok(())
-    }
-
-    /// Capture a `LiveCheckpoint` from the machine's current running state —
-    /// see that struct's doc comment for how this differs from
-    /// `capture_rollback_checkpoint` (no SCSI/overlay capture; no on-disk
-    /// snapshot name involved at all). Leaves the whole machine stopped on
-    /// return (CPU and peripherals) — every real caller immediately follows
-    /// this with a `restore_live_checkpoint` call anyway (which restarts
-    /// peripherals itself, CPU staying parked for inline single-stepping —
-    /// see its own doc comment), so there's no need to restart anything
-    /// here just to have it stopped again a moment later.
-    pub(crate) fn capture_live_checkpoint(&mut self) -> LiveCheckpoint {
-        self.stop();
-
-        #[cfg(feature = "wgpu")]
-        let resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())
-            .unwrap_or_else(|error| panic!("REX3 {error}"));
-        #[cfg(feature = "wgpu")]
-        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())
-            .unwrap_or_else(|error| panic!("REX3 {error}"));
-        let cpu = self.cpu.save_state();
-        let mc = self.mc.save_state();
-        let ioc = self.hpc3.ioc().save_state();
-        let scc = self.hpc3.ioc().scc().save_state();
-        let pit = self.hpc3.ioc().pit().save_state();
-        let ps2 = self.hpc3.ioc().ps2().save_state();
-        let rtc = self.hpc3.rtc().save_state();
-        let eeprom = self.hpc3.eeprom().lock().save_state_owned();
-        let seeq = self.hpc3.seeq().save_state();
-        let hpc3 = self.hpc3.save_state();
-        let rex3 = self.board.rex3.as_ref().map(|r| {
-            #[cfg(feature = "wgpu")]
-            if let Some((state, _)) = &resident_primary { return state.clone(); }
-            r.save_state()
-        });
-        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| {
-            #[cfg(feature = "wgpu")]
-            if let Some((state, _)) = &resident_head1 { return state.clone(); }
-            r.save_state()
-        });
-        let mgras = self
-            .board
-            .mgras
-            .as_ref()
-            .map(|m| m.snapshot_parts())
-            .transpose()
-            .unwrap_or_else(|error| panic!("IMPACT {error}"));
-        let gr2 = self
-            .board
-            .gr2
-            .as_ref()
-            .map(|g| g.snapshot_parts())
-            .transpose()
-            .unwrap_or_else(|error| panic!("GR2 {error}"));
-
-        let bank_words: [Vec<u32>; 4] = [
-            self.board.phys.snapshot_bank_inmem(0),
-            self.board.phys.snapshot_bank_inmem(1),
-            self.board.phys.snapshot_bank_inmem(2),
-            self.board.phys.snapshot_bank_inmem(3),
-        ];
-
-        #[cfg(feature = "wgpu")]
-        let framebuffers = match resident_primary {
-            Some((_, planes)) => Some(planes),
-            None => self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem()),
-        };
-        #[cfg(not(feature = "wgpu"))]
-        let framebuffers = self.board.rex3.as_ref().map(|r| r.snapshot_framebuffers_inmem());
-        #[cfg(feature = "wgpu")]
-        let resident_head1_framebuffers = resident_head1.map(|(_, planes)| planes);
-
-        // Deliberately NOT restart_peripherals()/cpu.start() here — see this
-        // function's own doc comment.
-
-        LiveCheckpoint {
-            bank_words,
-            framebuffers,
-            #[cfg(feature = "wgpu")]
-            resident_head1_framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, rex3, rex3_head1, mgras, gr2,
-        }
-    }
-
-    /// Restore a `LiveCheckpoint` captured by `capture_live_checkpoint`.
-    /// Does not touch SCSI controller state or disk contents at all — see
-    /// `LiveCheckpoint`'s doc comment. Leaves the CPU thread stopped on
-    /// return (so a caller doing its own inline single-stepping via
-    /// `cpu_step_one_inline_counting_instructions` doesn't race a
-    /// free-running CPU thread for the executor lock), but restarts
-    /// MC/HPC3/REX3 before returning — the full `self.stop()` below is only
-    /// needed transiently, to safely load device state without a live
-    /// device thread mutating it mid-load; there's no reason to leave
-    /// peripherals stopped after that's done, and every prior version of
-    /// this function that did was a real, repeatedly-hit bug (the rest of
-    /// the monitor console — symbol lookups, device register reads —
-    /// stayed unresponsive after every `jitcheck` for no reason).
-    pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
-        self.stop();
-        self.event_tx.powered_on();
-        #[cfg(feature = "wgpu")]
-        self.validate_resident_primary_checkpoint(cp.rex3.is_some(), cp.framebuffers.is_some())?;
-        #[cfg(feature = "wgpu")]
-        self.validate_resident_head1_checkpoint(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.is_some())?;
-
-        self.cpu.load_state(&cp.cpu)?;
-        self.mc.load_state(&cp.mc)?;
-        self.hpc3.ioc().load_state(&cp.ioc)?;
-        self.hpc3.ioc().scc().load_state(&cp.scc)?;
-        self.hpc3.ioc().pit().load_state(&cp.pit)?;
-        self.hpc3.ioc().ps2().load_state(&cp.ps2)?;
-        self.hpc3.rtc().load_state(&cp.rtc)?;
-        self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
-        self.hpc3.seeq().load_state(&cp.seeq)?;
-        self.hpc3.load_state(&cp.hpc3)?;
-        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3, &cp.rex3) {
-            rex3.load_state(rex3_toml)?;
-        }
-        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3_head1, &cp.rex3_head1) {
-            rex3.load_state(rex3_toml)?;
-        }
-
-        for (i, words) in cp.bank_words.iter().enumerate() {
-            self.board.phys.restore_bank_inmem(i, words);
-        }
-        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
-            rex3.try_restore_framebuffers_inmem(rgb, aux)
-                .map_err(|error| format!("restore REX3 framebuffers: {error}"))?;
-        }
-        #[cfg(feature = "wgpu")]
-        self.restore_resident_head1_framebuffers(cp.rex3_head1.is_some(), cp.resident_head1_framebuffers.as_ref())?;
-        match (&self.board.mgras, &cp.mgras) {
-            (Some(mgras), Some((metadata, parts))) => mgras.restore_snapshot_parts(metadata, parts)?,
-            (Some(_), None) => return Err("live checkpoint has no state for the configured IMPACT board".into()),
-            (None, Some(_)) => return Err("live checkpoint contains IMPACT state but the machine has no IMPACT board".into()),
-            (None, None) => {}
-        }
-        match (&self.board.gr2, &cp.gr2) {
-            (Some(gr2), Some((metadata, parts))) => gr2.restore_snapshot_parts(metadata, parts)?,
-            (Some(_), None) => return Err("live checkpoint has no state for the configured GR2 board".into()),
-            (None, Some(_)) => return Err("live checkpoint contains GR2 state but the machine has no GR2 board".into()),
-            (None, None) => {}
-        }
-
-        // Peripherals back up; CPU deliberately left stopped — see this
-        // function's own doc comment.
+        self.apply_image(cp)?;
         self.restart_peripherals();
         Ok(())
     }
@@ -1902,9 +1452,14 @@ impl Machine {
         self.timer_manager.clock().start();
         self.mc.start();
         self.hpc3.start();
-        if let Some(rex3) = &self.board.rex3 { rex3.start(); }
+        // A board whose resident raster has faulted panics in `start`; a failed save restarts too.
+        #[cfg(feature = "wgpu")]
+        let faulted = |r: &Rex3| r.resident_fault().is_some();
+        #[cfg(not(feature = "wgpu"))]
+        let faulted = |_: &Rex3| false;
+        if let Some(rex3) = self.board.rex3.as_ref().filter(|r| !faulted(r)) { rex3.start(); }
         if let Some(mgras) = &self.board.mgras { mgras.start_display(); }
-        if let Some(rex3) = &self.board.rex3_head1 { rex3.start(); }
+        if let Some(rex3) = self.board.rex3_head1.as_ref().filter(|r| !faulted(r)) { rex3.start(); }
         if let Some(gr2) = &self.board.gr2 { gr2.start(); }
         if let Some(u64) = &self.board.ultra64 { u64.start(); }
         if let Some(v) = &self.board.virtio { v.start(); }
@@ -1961,186 +1516,10 @@ impl Machine {
         self.restart_peripherals();
     }
 
-    /// Save full machine snapshot to `saves/<name>/`.
-    pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
-        if self.board.virtio_9p.is_some() {
-            return Err("a virtio-9p share keeps the guest's open files, which a snapshot does not hold".into());
-        }
-        self.stop();
-
-        #[cfg(feature = "wgpu")]
-        let mut resident_primary = Self::capture_resident_checkpoint(self.board.rex3.as_deref())?;
-        #[cfg(feature = "wgpu")]
-        let resident_head1 = Self::capture_resident_checkpoint(self.board.rex3_head1.as_deref())?;
-        let dir = std::path::PathBuf::from("saves").join(name);
-        let snap = Snapshot::new(&dir);
-        snap.ensure_dir().map_err(|e| e.to_string())?;
-        #[cfg(feature = "wgpu")]
-        let incomplete = dir.join("resident_snapshot_incomplete");
-        #[cfg(feature = "wgpu")]
-        let remove_incomplete = {
-            let resident = resident_primary.is_some() || resident_head1.is_some();
-            if resident {
-                std::fs::write(&incomplete, b"resident machine snapshot is incomplete\n")
-                    .map_err(|e| e.to_string())?;
-            }
-            resident || incomplete.try_exists().map_err(|e| e.to_string())?
-        };
-
-        // Write the manifest first so `read_manifest` succeeds even if a later
-        // step crashes — the partial snapshot is at least diagnosable.
-        let mut manifest = Manifest::for_current_save();
-        manifest.parent = self.last_restore.clone();
-        // Provenance: which disks + nvram this state was captured against, so a
-        // later restore can refuse a mismatched base disk / build. (features are
-        // filled by for_current_save.)
-        manifest.disks = self.disks.clone();
-        manifest.devices = self.gio_slots.clone();
-        manifest.nvram = Some(self.nvram_path.clone());
-        // The CPU is a runtime choice now, so it is state the restore must match.
-        manifest.cpu_model = Some(self.cpu.model_name().to_string());
-        manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
-        snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
-
-        snap.write_state("cpu",    &self.cpu.save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("mc",     &self.mc.save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("ioc",    &self.hpc3.ioc().save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("scc",    &self.hpc3.ioc().scc().save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("pit",    &self.hpc3.ioc().pit().save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("ps2",    &self.hpc3.ioc().ps2().save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("rtc",    &self.hpc3.rtc().save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("eeprom", &self.hpc3.eeprom().lock().save_state_owned()).map_err(|e| e.to_string())?;
-        snap.write_state("scsi",   &self.hpc3.scsi().save_state()).map_err(|e| e.to_string())?;
-        if let Some(dev) = self.hpc3.scsi1() {
-            snap.write_state("scsi1", &dev.save_state()).map_err(|e| e.to_string())?;
-        }
-        snap.write_state("seeq",   &self.hpc3.seeq().save_state()).map_err(|e| e.to_string())?;
-        snap.write_state("hpc3",   &self.hpc3.save_state()).map_err(|e| e.to_string())?;
-
-        // REX3 (optional — absent in headless config). Its framebuffers go in the chunks manifest below.
-        if let Some(rex3) = &self.board.rex3 {
-            #[cfg(feature = "wgpu")]
-            let resident_state = resident_primary.as_ref().map(|(state, _)| state);
-            #[cfg(not(feature = "wgpu"))]
-            let resident_state: Option<&toml::Value> = None;
-            match resident_state {
-                Some(state) => snap.write_state("rex3", state),
-                None => snap.write_state("rex3", &rex3.save_state()),
-            }.map_err(|e| e.to_string())?;
-        }
-        if let (Some(td), Some(at)) = (&self.board.testdev, self.gio_at("test_device")) {
-            snap.write_state(&at.to_string(), &td.save_state()).map_err(|e| e.to_string())?;
-        }
-        if let (Some(v), Some(at)) = (&self.board.virtio, self.gio_at("virtio_serial")) {
-            snap.write_state(&at.to_string(), &v.core().save_state()).map_err(|e| e.to_string())?;
-        }
-        if let Some(rex3) = &self.board.rex3_head1 {
-            #[cfg(feature = "wgpu")]
-            let resident_state = resident_head1.as_ref().map(|(state, _)| state);
-            #[cfg(not(feature = "wgpu"))]
-            let resident_state: Option<&toml::Value> = None;
-            match resident_state {
-                Some(state) => snap.write_state("rex3_head1", state),
-                None => snap.write_state("rex3_head1", &rex3.save_state()),
-            }.map_err(|e| e.to_string())?;
-            // The chunk manifest covers only the primary head. Keep the second head in named planes in every
-            // raster mode so overwriting a snapshot cannot retain stale resident planes.
-            let dir = &snap.dir;
-            #[cfg(feature = "wgpu")]
-            if let Some((_, (rgb, aux))) = &resident_head1 {
-                Rex3::write_captured_resident_framebuffers(dir, "rex3_head1", rgb, aux)
-                    .map_err(|e| e.to_string())?;
-            } else {
-                rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
-            }
-            #[cfg(not(feature = "wgpu"))]
-            rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
-        }
-        let gr2_snapshot = self.board.gr2.as_ref().map(|gr2| gr2.snapshot_parts()).transpose()?;
-        if let Some((metadata, _)) = &gr2_snapshot {
-            snap.write_state("gr2", &toml::Value::String(metadata.clone())).map_err(|e| e.to_string())?;
-        }
-        let mgras_snapshot = self.board.mgras.as_ref().map(|mgras| mgras.snapshot_parts()).transpose()?;
-        if let Some((metadata, _)) = &mgras_snapshot {
-            snap.write_state("mgras", &toml::Value::String(metadata.clone())).map_err(|e| e.to_string())?;
-        }
-
-        // Bulk memory goes to the content-addressable chunk store shared across all snapshots in `saves/.cas/`;
-        // the chunk hashes go in chunks.bin so load can walk the right chunks back out.
-        let store = ChunkStore::new("saves");
-        let mut chunks = ChunksManifest::default();
-        for i in 0..4 {
-            let words = self.board.phys.snapshot_bank_inmem(i);
-            chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
-                .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
-        }
-        if let Some(rex3) = &self.board.rex3 {
-            #[cfg(feature = "wgpu")]
-            let planes = resident_primary.take().map(|(_, planes)| planes);
-            #[cfg(not(feature = "wgpu"))]
-            let planes: Option<(Vec<u32>, Vec<u32>)> = None;
-            let (rgb, aux) = planes.unwrap_or_else(|| rex3.snapshot_framebuffers_inmem());
-            let rgb_chunks = put_words_as_chunks(&store, &rgb)
-                .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
-            let aux_chunks = put_words_as_chunks(&store, &aux)
-                .map_err(|e| format!("CAS rex3 aux put: {}", e))?;
-            chunks.framebuffer_chunks = Some((rgb_chunks, aux_chunks));
-        }
-        if let Some((_, parts)) = mgras_snapshot {
-            for (name, words) in parts {
-                let hashes = put_words_as_chunks(&store, &words)
-                    .map_err(|e| format!("CAS IMPACT {name} put: {e}"))?;
-                chunks.mgras_chunks.push(MgrasChunk { name, words: words.len(), hashes });
-            }
-        }
-        if let Some((_, parts)) = gr2_snapshot {
-            for (name, words) in parts {
-                let hashes = put_words_as_chunks(&store, &words)
-                    .map_err(|e| format!("CAS GR2 {name} put: {e}"))?;
-                chunks.gr2_chunks.push(Gr2Chunk { name, words: words.len(), hashes });
-            }
-        }
-        snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
-
-        // Each disk's copy-on-write overlay, by slot, with the dirty sectors in
-        // `cow.toml`: the filesystem state stays consistent with the captured RAM.
-        crate::snapshot::export_overlays(&snap, &self.placed_disk_buses())?;
-
-        #[cfg(feature = "wgpu")]
-        if remove_incomplete {
-            for rex3 in [self.board.rex3.as_ref(), self.board.rex3_head1.as_ref()].into_iter().flatten() {
-                if rex3.resident_active() {
-                    rex3.resident_status().map_err(|error| error.to_string())?;
-                }
-            }
-            std::fs::remove_file(incomplete).map_err(|e| e.to_string())?;
-        }
-        self.restart_peripherals();
-        // Resume execution so the session feels like it never paused.
-        // Without this the user sees JIT shutdown stats and a dead prompt
-        // after `save` — the CPU would otherwise stay stopped.
-        self.cpu.start();
-        println!("Snapshot saved to saves/{}", name);
-        Ok(())
-    }
-
-    /// Restore full machine snapshot from `saves/<name>/`. CPU is auto-started
-    /// at the end so the guest resumes from the snapshotted PC.
-    /// For determinism validation use `load_snapshot_paused` instead.
-    pub fn load_snapshot(&mut self, name: &str) -> Result<(), String> {
-        self.load_snapshot_inner(name)?;
-        self.cpu.start();
-        println!("Snapshot loaded from saves/{}", name);
-        Ok(())
-    }
-
-    /// Same body as `load_snapshot` but leaves CPU and peripheral threads
-    /// stopped on return. Used by the Phase 3.3 determinism validator which
-    /// must prevent any thread from running between load and digest, since
-    /// thread scheduling jitter would mask CPU determinism issues.
+    /// Load `saves/<name>/` and leave every thread stopped, for the determinism validator.
     pub fn load_snapshot_paused(&mut self, name: &str) -> Result<(), String> {
-        self.load_snapshot_inner(name)?;
-        // load_snapshot_inner restarted peripherals; stop them again.
+        let kept = crate::snapshot::read(self, std::path::Path::new("saves"), name)?;
+        crate::snapshot::restore(self, &kept, false)?;
         self.hpc3.stop();
         self.mc.stop();
         if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
@@ -2149,287 +1528,62 @@ impl Machine {
         Ok(())
     }
 
-    /// Restore full machine snapshot from `saves/<name>/`.
-    ///
-    /// JIT-cache invariant: `self.stop()` exits the CPU thread, which drops
-    /// the `CodeCache` owned by `run_jit_dispatch`. Subsequent `cpu.start()`
-    /// (in the public `load_snapshot` wrapper) builds a fresh cache. So no
-    /// explicit invalidation is needed here as long as that ownership
-    /// pattern holds. The persistent JIT profile uses content_hash to skip
-    /// stale entries (see `profile_stale` in dispatch.rs).
-    fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
-        self.stop();
-
-        let dir = std::path::PathBuf::from("saves").join(name);
-        #[cfg(feature = "wgpu")]
-        if dir.join("resident_snapshot_incomplete").try_exists().map_err(|e| e.to_string())? {
-            return Err("resident machine snapshot is incomplete".into());
+    /// Call `f` with each device kept as one table, by file name, in the order they load.
+    fn each_saved_device(&self, f: &mut dyn FnMut(&str, &dyn Saveable) -> Result<(), String>) -> Result<(), String> {
+        let (ioc, hpc3) = (self.hpc3.ioc(), &self.hpc3);
+        f("cpu", &*self.cpu)?;
+        f("mc", &self.mc)?;
+        f("ioc", ioc)?;
+        f("scc", ioc.scc())?;
+        f("pit", ioc.pit())?;
+        f("ps2", &*ioc.ps2())?;
+        f("rtc", &**hpc3.rtc())?;
+        f("eeprom", &**hpc3.eeprom())?;
+        f("scsi", &**hpc3.scsi())?;
+        if let Some(scsi1) = hpc3.scsi1() {
+            f("scsi1", &**scsi1)?;
         }
-
-        // Any prior in-memory rollback checkpoint is now stale (it described
-        // a different snapshot). ci_restore will recapture if reached via
-        // that path; the monitor `load` command leaves it cleared.
-        self.last_restore_checkpoint = None;
-
-        // Reset to clean state before loading
-        self.power_on_devices();
-
-        let snap = Snapshot::new(&dir);
-
-        // Validate the manifest before reading anything else. Legacy snapshots
-        // (no snapshot.toml) are accepted with a warning. Cross-arch loads are
-        // refused — FPU bit-layout differs between aarch64 and x86_64 and we
-        // don't have migration plumbing yet.
-        match snap.read_manifest()? {
-            Some(m) => {
-                if let Some(other) = &m.machine {
-                    return Err(format!("snapshot {name} is of another machine ({other})"));
-                }
-                if m.host_arch != std::env::consts::ARCH {
-                    return Err(format!(
-                        "snapshot host_arch '{}' does not match current host '{}'; cross-arch load is not supported",
-                        m.host_arch, std::env::consts::ARCH
-                    ));
-                }
-                crate::snapshot::check_schema(name, m.schema_version)?;
-                crate::snapshot::check_slots(&m, &self.gio_slots)?;
-                if let Some(rev) = &m.iris_git_rev {
-                    if let Some(my_rev) = option_env!("IRIS_GIT_REV") {
-                        if rev != my_rev {
-                            eprintln!("load_snapshot: snapshot was captured at iris {} but current build is {}", rev, my_rev);
-                        }
-                    }
-                }
-
-                // Provenance validation: build features + disk presence/size = hard
-                // error; disk path and nvram = warn. IRIS_SNAPSHOT_SKIP_CHECK=1
-                // downgrades the hard errors to warnings.
-                let skip_check = std::env::var("IRIS_SNAPSHOT_SKIP_CHECK")
-                    .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
-                let mut fatal: Vec<String> = Vec::new();
-
-                if m.features.is_empty() && m.disks.is_empty() {
-                    eprintln!("load_snapshot: snapshot {} predates provenance recording — skipping disk/feature checks", name);
-                } else {
-                    // Build features must match exactly.
-                    let cur_features = enabled_features();
-                    let snap_features: Vec<String> = m.features.iter()
-                        .filter(|f| !crate::snapshot::RETIRED_FEATURES.contains(&f.as_str()))
-                        .cloned().collect();
-                    if !m.features.is_empty() && snap_features != cur_features {
-                        fatal.push(format!(
-                            "build features differ: snapshot [{}] vs current [{}]",
-                            m.features.join(","), cur_features.join(",")
-                        ));
-                    }
-                    // The CPU model is guest-visible (PRId/FIR, cache geometry) and
-                    // no longer a build flag, so a mismatch is as fatal as a feature one.
-                    if let Some(e) = crate::snapshot::cpu_model_mismatch(
-                        m.cpu_model.as_deref(), self.cpu.model_name()) { fatal.push(e); }
-                    if let Some(e) = crate::snapshot::cache_model_mismatch(
-                        m.cpu_cache.as_deref(), m.cpu_model.as_deref(), self.cpu.cache_kind()) { fatal.push(e); }
-                    // Every recorded disk must still be configured at the same slot
-                    // with the same size. The host *path* is only where the file
-                    // happens to live (it moves when disks are relocated, e.g. into a
-                    // dist/ dir), so a path-only difference is a warning, not fatal —
-                    // a disk's identity for restore is its slot + size, not its path.
-                    for d in &m.disks {
-                        match self.disks.iter().find(|c| c.at == d.at) {
-                            None => fatal.push(format!(
-                                "snapshot disk at {} ('{}') is not configured in this run", d.at, d.path)),
-                            Some(cur) if cur.size_bytes != d.size_bytes => fatal.push(format!(
-                                "disk at {} ('{}') size differs: snapshot {} bytes vs current {} bytes",
-                                d.at, d.path, d.size_bytes, cur.size_bytes)),
-                            Some(cur) if cur.path != d.path => eprintln!(
-                                "load_snapshot: disk at {} path differs: snapshot '{}' vs current '{}' (same size — continuing)",
-                                d.at, d.path, cur.path),
-                            Some(_) => {}
-                        }
-                    }
-                    // nvram mismatch is non-fatal (eeprom state is in the snapshot).
-                    if let Some(nv) = &m.nvram {
-                        if nv != &self.nvram_path {
-                            eprintln!("load_snapshot: nvram differs: snapshot '{}' vs current '{}' (continuing)", nv, self.nvram_path);
-                        }
-                    }
-                }
-
-                if !fatal.is_empty() {
-                    let msg = format!("snapshot provenance mismatch:\n  - {}", fatal.join("\n  - "));
-                    if skip_check {
-                        eprintln!("load_snapshot: {} [IRIS_SNAPSHOT_SKIP_CHECK set — continuing anyway]", msg);
-                    } else {
-                        return Err(format!("{}\n(set IRIS_SNAPSHOT_SKIP_CHECK=1 to override)", msg));
-                    }
-                }
-            }
-            None => return Err(format!("saves/{name}: no snapshot.toml")),
-        }
-
-        let cpu = snap.read_state("cpu").map_err(|e| e.to_string())?;
-        self.cpu.load_state(&cpu)?;
-
-        let mc = snap.read_state("mc").map_err(|e| e.to_string())?;
-        self.mc.load_state(&mc)?;
-
-        let ioc = snap.read_state("ioc").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().load_state(&ioc)?;
-
-        let scc = snap.read_state("scc").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().scc().load_state(&scc)?;
-
-        let pit = snap.read_state("pit").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().pit().load_state(&pit)?;
-
-        let ps2 = snap.read_state("ps2").map_err(|e| e.to_string())?;
-        self.hpc3.ioc().ps2().load_state(&ps2)?;
-
-        let rtc = snap.read_state("rtc").map_err(|e| e.to_string())?;
-        self.hpc3.rtc().load_state(&rtc)?;
-
-        let eeprom = snap.read_state("eeprom").map_err(|e| e.to_string())?;
-        self.hpc3.eeprom().lock().load_state_mut(&eeprom)?;
-
-        let scsi = snap.read_state("scsi").map_err(|e| e.to_string())?;
-        self.hpc3.scsi().load_state(&scsi)?;
-
-        // scsi1.* is absent from snapshots saved before the second SCSI
-        // controller existed, and from guinness machines — both are
-        // legitimate "leave controller 1 untouched" cases, not errors.
-        if let Some(dev) = self.hpc3.scsi1() {
-            if let Ok(scsi1) = snap.read_state("scsi1") {
-                dev.load_state(&scsi1)?;
-            }
-        }
-
-        let seeq = snap.read_state("seeq").map_err(|e| e.to_string())?;
-        self.hpc3.seeq().load_state(&seeq)?;
-
-        let hpc3 = snap.read_state("hpc3").map_err(|e| e.to_string())?;
-        self.hpc3.load_state(&hpc3)?;
-
-        if let Some(rex3) = &self.board.rex3 {
-            let rex3_v = snap.read_state("rex3").map_err(|e| e.to_string())?;
-            rex3.load_state(&rex3_v)?;
-        }
+        f("seeq", &**hpc3.seeq())?;
+        f("hpc3", hpc3)?;
         if let (Some(td), Some(at)) = (&self.board.testdev, self.gio_at("test_device")) {
-            if let Ok(v) = snap.read_state(&at.to_string()) {
-                td.load_state(&v)?;
-            }
+            f(&at.to_string(), &**td)?;
         }
         if let (Some(v), Some(at)) = (&self.board.virtio, self.gio_at("virtio_serial")) {
-            let state = snap.read_state(&at.to_string()).map_err(|e| format!("{at}: {e}"))?;
-            v.core().load_state(&state).map_err(|e| format!("virtio_serial at {at}: {e}"))?;
+            f(&at.to_string(), v.core())?;
+        }
+        Ok(())
+    }
+
+    /// A Newport head's registers and planes, whichever raster holds them.
+    fn capture_rex3(rex3: &Rex3) -> Result<(toml::Value, (Vec<u32>, Vec<u32>)), String> {
+        #[cfg(feature = "wgpu")]
+        if let Some(resident) = Self::capture_resident_checkpoint(Some(rex3))? {
+            rex3.resident_status().map_err(|e| e.to_string())?;
+            return Ok(resident);
+        }
+        Ok((rex3.save_state(), rex3.snapshot_framebuffers_inmem()))
+    }
+
+    fn capture_image(&self) -> Result<crate::snapshot::Image<'static>, String> {
+        use crate::snapshot::{Board, BoardList};
+        let mut image = crate::snapshot::Image::default();
+        self.each_saved_device(&mut |name, dev| Ok(image.states.push((name.into(), dev.save_state()))))?;
+        if let Some(rex3) = &self.board.rex3 {
+            let (state, planes) = Self::capture_rex3(rex3)?;
+            image.states.push(("rex3".into(), state));
+            image.framebuffer = Some(planes);
         }
         if let Some(rex3) = &self.board.rex3_head1 {
-            let head1_state = snap.read_state("rex3_head1");
-            #[cfg(feature = "wgpu")]
-            if rex3.resident_active() {
-                if let Err(error) = &head1_state {
-                    return Err(format!("resident REX3 head 1 state: {error}"));
-                }
-            }
-            if let Ok(rex3_v) = head1_state {
-                rex3.load_state(&rex3_v)?;
-                let rgb_path = snap.dir.join("rex3_head1_rgb.bin");
-                let aux_path = snap.dir.join("rex3_head1_aux.bin");
-                let named_planes_present = rgb_path.try_exists().map_err(|e| e.to_string())?
-                    || aux_path.try_exists().map_err(|e| e.to_string())?;
-                #[cfg(feature = "wgpu")]
-                let load_planes = rex3.resident_active() || named_planes_present;
-                #[cfg(not(feature = "wgpu"))]
-                let load_planes = named_planes_present;
-                if load_planes {
-                    rex3.load_framebuffers_named(&snap.dir, "rex3_head1").map_err(|e| e.to_string())?;
-                }
-            }
+            let (state, (rgb, aux)) = Self::capture_rex3(rex3)?;
+            image.states.push(("rex3_head1".into(), state));
+            let be = |words: Vec<u32>| words.iter().flat_map(|w| w.to_be_bytes()).collect();
+            image.files = vec![("rex3_head1_rgb.bin".into(), be(rgb)), ("rex3_head1_aux.bin".into(), be(aux))];
         }
-        let gr2_metadata = if self.board.gr2.is_some() {
-            let value = snap.read_state("gr2").map_err(|e| e.to_string())?;
-            Some(value.as_str().ok_or("GR2 snapshot metadata is not a string")?.to_string())
-        } else {
-            None
-        };
-        let mgras_metadata = if self.board.mgras.is_some() {
-            let value = snap.read_state("mgras").map_err(|e| e.to_string())?;
-            Some(value.as_str().ok_or("mgras snapshot metadata is not a string")?.to_string())
-        } else {
-            None
-        };
-
-        // Bulk memory comes from the content-addressable chunk store shared across snapshots.
-        let store = ChunkStore::new("saves");
-        let chunks = snap.read_chunks_manifest()
-            .map_err(|e| format!("read chunks.bin: {}", e))?;
-        #[cfg(feature = "wgpu")]
-        self.validate_resident_primary_checkpoint(true, chunks.framebuffer_chunks.is_some())?;
-        for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
-            if hashes.is_empty() { continue; }
-            let words = get_chunks_as_words(&store, hashes)
-                .map_err(|e| format!("CAS bank{} get: {}", i, e))?;
-            self.board.phys.restore_bank_inmem(i, &words);
-        }
-        if let (Some(rex3), Some((rgb_h, aux_h))) = (&self.board.rex3, &chunks.framebuffer_chunks) {
-            let rgb = get_chunks_as_words(&store, rgb_h)
-                .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
-            let aux = get_chunks_as_words(&store, aux_h)
-                .map_err(|e| format!("CAS rex3 aux get: {}", e))?;
-            rex3.try_restore_framebuffers_inmem(&rgb, &aux)
-                .map_err(|error| format!("restore REX3 framebuffer chunks: {error}"))?;
-        }
-        match (&self.board.mgras, mgras_metadata.as_deref(), chunks.mgras_chunks.is_empty()) {
-            (Some(mgras), Some(metadata), false) => {
-                let mut parts = Vec::with_capacity(chunks.mgras_chunks.len());
-                for part in &chunks.mgras_chunks {
-                    let words = get_chunks_as_words(&store, &part.hashes)
-                        .map_err(|e| format!("CAS IMPACT {} get: {e}", part.name))?;
-                    if words.len() != part.words {
-                        return Err(format!(
-                            "CAS IMPACT {} has {} words, expected {}",
-                            part.name,
-                            words.len(),
-                            part.words
-                        ));
-                    }
-                    parts.push((part.name.clone(), words));
-                }
-                mgras.restore_snapshot_parts(metadata, &parts)?;
-            }
-            (Some(_), Some(_), true) => return Err("snapshot has IMPACT metadata but no IMPACT chunks".into()),
-            (Some(_), None, false) => return Err("snapshot has IMPACT chunks but no IMPACT metadata".into()),
-            (None, _, false) => return Err("snapshot contains IMPACT state but this machine has no IMPACT board".into()),
-            _ => {}
-        }
-        match (&self.board.gr2, gr2_metadata.as_deref(), chunks.gr2_chunks.is_empty()) {
-            (Some(gr2), Some(metadata), false) => {
-                let mut parts = Vec::with_capacity(chunks.gr2_chunks.len());
-                for part in &chunks.gr2_chunks {
-                    let words = get_chunks_as_words(&store, &part.hashes)
-                        .map_err(|e| format!("CAS GR2 {} get: {e}", part.name))?;
-                    if words.len() != part.words {
-                        return Err(format!(
-                            "CAS GR2 {} has {} words, expected {}",
-                            part.name,
-                            words.len(),
-                            part.words
-                        ));
-                    }
-                    parts.push((part.name.clone(), words));
-                }
-                gr2.restore_snapshot_parts(metadata, &parts)?;
-            }
-            (Some(_), Some(_), true) => return Err("snapshot has GR2 metadata but no GR2 chunks".into()),
-            (Some(_), None, false) => return Err("snapshot has GR2 chunks but no GR2 metadata".into()),
-            (Some(_), None, true) => return Err("snapshot has no state for the configured GR2 board".into()),
-            (None, _, false) => return Err("snapshot contains GR2 state but this machine has no GR2 board".into()),
-            _ => {}
-        }
-
-        let sets = snap.read_toml("cow.toml").map(|t| crate::snapshot::parse_cow_table(&t)).map_err(|e| format!("cow.toml: {e}"))?;
-        crate::snapshot::import_overlays(&snap.dir, &self.placed_disk_buses(), &sets)?;
-
-        self.restart_peripherals();
-        Ok(())
+        let mgras = self.board.mgras.as_ref().map(|m| m.snapshot_parts().map(|p| Board::new("mgras", BoardList::Impact, p)));
+        let gr2 = self.board.gr2.as_ref().map(|g| g.snapshot_parts().map(|p| Board::new("gr2", BoardList::Gr2, p)));
+        image.boards = mgras.into_iter().chain(gr2).collect::<Result<_, _>>()?;
+        image.memory = (0..4).map(|i| (i, self.board.phys.snapshot_bank_inmem(i).into())).collect();
+        Ok(image)
     }
 }
 
@@ -2499,10 +1653,63 @@ impl Workstation for Machine {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 
     fn load_elf(&self, path: &str) -> Result<String, String> { Machine::load_elf(self, path) }
-    fn save_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::save_snapshot(self, name) }
-    fn load_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::load_snapshot(self, name) }
-    fn ci_restore(&mut self, name: &str) -> Result<(), String> { Machine::ci_restore(self, name) }
-    fn ci_rollback(&mut self) -> Result<(), String> { Machine::ci_rollback(self) }
+    fn snapshot_refusal(&self) -> Option<String> {
+        self.board.virtio_9p.as_ref().map(|_| "a virtio-9p share keeps the guest's open files, which a snapshot does not hold".into())
+    }
+    fn snapshot_layout(&self) -> crate::snapshot::Layout {
+        use crate::snapshot::BoardList;
+        let mut states = Vec::new();
+        let _ = self.each_saved_device(&mut |name, _| Ok(states.push(name.to_string())));
+        states.extend(self.board.rex3.iter().map(|_| "rex3".to_string()));
+        states.extend(self.board.rex3_head1.iter().map(|_| "rex3_head1".to_string()));
+        let head1 = |f: &str| (f.to_string(), 0);
+        let boards = [self.board.mgras.is_some().then_some(("mgras", BoardList::Impact)), self.board.gr2.is_some().then_some(("gr2", BoardList::Gr2))];
+        crate::snapshot::Layout {
+            disks: self.disks.clone(),
+            slots: self.gio_slots.clone(),
+            nvram: Some(self.nvram_path.clone()),
+            cpu: (self.cpu.model_name().into(), self.cpu.cache_kind().into()),
+            states,
+            files: if self.board.rex3_head1.is_some() { vec![head1("rex3_head1_rgb.bin"), head1("rex3_head1_aux.bin")] } else { Vec::new() },
+            memory: self.board.phys.banks().iter().map(|b| b.size() / 4).collect(),
+            framebuffer: self.board.rex3.is_some(),
+            boards: boards.into_iter().flatten().collect(),
+            ..Default::default()
+        }
+    }
+    fn capture(&self) -> Result<crate::snapshot::Image<'_>, String> { self.capture_image() }
+    fn apply_image(&mut self, image: &crate::snapshot::Image) -> Result<(), String> {
+        self.power_on_devices();
+        self.each_saved_device(&mut |name, dev| dev.load_state(image.state(name)?).map_err(|e| format!("{name}: {e}")))?;
+        if let Some(rex3) = &self.board.rex3 {
+            rex3.load_state(image.state("rex3")?)?;
+        }
+        if let Some(rex3) = &self.board.rex3_head1 {
+            rex3.load_state(image.state("rex3_head1")?)?;
+            let planes = |f| image.file(f).map(|b| b.chunks_exact(4).map(|w| u32::from_be_bytes(w.try_into().unwrap())).collect::<Vec<u32>>());
+            rex3.try_restore_framebuffers_inmem(&planes("rex3_head1_rgb.bin")?, &planes("rex3_head1_aux.bin")?)
+                .map_err(|e| format!("restore REX3 head 1 framebuffers: {e}"))?;
+        }
+        for (bank, words) in &image.memory {
+            self.board.phys.restore_bank_inmem(*bank, words);
+        }
+        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &image.framebuffer) {
+            rex3.try_restore_framebuffers_inmem(rgb, aux).map_err(|e| format!("restore REX3 framebuffers: {e}"))?;
+        }
+        if let Some(mgras) = &self.board.mgras {
+            let b = image.board("mgras").ok_or("image has no state for the configured IMPACT board")?;
+            mgras.restore_snapshot_parts(&b.metadata, &b.parts)?;
+        }
+        if let Some(gr2) = &self.board.gr2 {
+            let b = image.board("gr2").ok_or("image has no state for the configured GR2 board")?;
+            gr2.restore_snapshot_parts(&b.metadata, &b.parts)?;
+        }
+        Ok(())
+    }
+    fn with_disk_buses(&self, f: &mut dyn FnMut(&[crate::snapshot::DiskBus]) -> Result<(), String>) -> Result<(), String> {
+        f(&crate::snapshot::disk_buses((0..).map(Hpc3::scsi_at), self.scsi_buses(), None))
+    }
+    fn snapshots(&mut self) -> Option<&mut crate::snapshot::Restored> { Some(&mut self.restored) }
 
     fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
         let rtc = self.hpc3.rtc();
@@ -3051,7 +2258,7 @@ mod gr2_checkpoint_tests {
     }
 
     #[test]
-    fn gr2_live_and_rollback_checkpoints_restore_complete_state() {
+    fn gr2_live_and_captured_checkpoints_restore_complete_state() {
         crate::display_stop_tests::big_stack(|| {
             let dir = crate::display_stop_tests::scratch("gr2-memory-checkpoints");
             let mut machine = Box::new(Machine::new(config(&dir, GraphicsBoard::Xz)));
@@ -3066,20 +2273,51 @@ mod gr2_checkpoint_tests {
             machine.stop();
 
             draw_test_pixel(&gr2, 0x52);
-            let rollback = machine.capture_rollback_checkpoint("gr2-memory-checkpoint").unwrap();
             machine.stop();
+            let image = machine.capture_image().unwrap();
             gr2.power_on();
             assert_eq!(gr2.vram()[20 * FB_W + 30], 0);
-            machine.apply_rollback_checkpoint(&rollback).unwrap();
+            machine.apply_image(&image).unwrap();
             assert_eq!(gr2.vram()[20 * FB_W + 30], 0x52);
             machine.stop();
 
             let mut missing = machine.capture_live_checkpoint();
-            missing.gr2 = None;
+            missing.boards.clear();
             assert!(machine
                 .restore_live_checkpoint(&missing)
                 .unwrap_err()
                 .contains("no state for the configured GR2 board"));
+            machine.stop();
+        });
+    }
+
+    /// A rollback puts back the image the restore read, and a snapshot of another machine
+    /// is refused before the running machine is touched.
+    #[test]
+    fn rollback_keeps_the_read_image_and_a_refused_load_leaves_the_machine_alone() {
+        crate::display_stop_tests::big_stack(|| {
+            let dir = crate::display_stop_tests::scratch("indy-rollback");
+            let saves = dir.join("saves");
+            let mut machine = Box::new(Machine::new(config(&dir, GraphicsBoard::Xz)));
+            let gr2 = machine.get_gr2().unwrap();
+            draw_test_pixel(&gr2, 0x31);
+            crate::snapshot::save_in(&mut *machine, &saves, "s").unwrap();
+            crate::snapshot::ci_restore(&mut *machine, &saves, "s").unwrap();
+            machine.stop();
+            std::fs::remove_file(saves.join("s/snapshot.toml")).unwrap();
+            draw_test_pixel(&gr2, 0x52);
+            crate::snapshot::ci_rollback(&mut *machine, &saves).unwrap();
+            machine.stop();
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0x31);
+
+            crate::snapshot::save_in(&mut *machine, &saves, "other").unwrap();
+            machine.stop();
+            let path = saves.join("other/snapshot.toml");
+            std::fs::write(&path, std::fs::read_to_string(&path).unwrap() + "machine = \"o2_ip32\"\n").unwrap();
+            draw_test_pixel(&gr2, 0x66);
+            let e = crate::snapshot::load_in(&mut *machine, &saves, "other").unwrap_err();
+            assert!(e.contains("another machine"), "{e}");
+            assert_eq!(gr2.vram()[20 * FB_W + 30], 0x66, "the machine is as it was");
             machine.stop();
         });
     }
@@ -3184,6 +2422,33 @@ mod virtio_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// The Indy keeps a virtio-serial device's state in a snapshot, and refuses one with a virtio-9p share.
+    #[test]
+    fn an_indy_snapshot_keeps_virtio_serial_and_refuses_9p() {
+        crate::display_stop_tests::big_stack(|| {
+            let dir = crate::display_stop_tests::scratch("indy-virtio");
+            let saves = dir.join("saves");
+            let cfg = |extra: String| {
+                let mut cfg = crate::display_stop_tests::config(&dir, MachineProfile::IndyIp24, crate::config::GraphicsBoard::Newport);
+                cfg.devices.push(card(&extra));
+                cfg
+            };
+            let mut m = Box::new(Machine::new(cfg("type = \"virtio_serial\"\nat = \"exp1\"\n[[port]]".into())));
+            crate::snapshot::save_in(&mut *m, &saves, "v").unwrap();
+            assert!(saves.join("v/gio1.bin").exists(), "the device's state is in the snapshot");
+            crate::snapshot::load_in(&mut *m, &saves, "v").unwrap();
+            m.stop();
+            drop(m);
+            // virtio-9p is refused at config time on Windows, so it cannot be built there.
+            #[cfg(unix)]
+            {
+                let share = format!("type = \"virtio_9p\"\nat = \"exp0\"\npath = {:?}\ntag = \"share\"", dir.to_str().unwrap());
+                let nine_p = Box::new(Machine::new(cfg(share)));
+                assert!(nine_p.snapshot_refusal().unwrap().contains("virtio-9p"));
+            }
+        });
     }
 
     /// IRIX looks for a second Newport only at 0x1F4F0000 (expansion slot 0)

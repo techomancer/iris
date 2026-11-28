@@ -42,14 +42,12 @@ variables (`IRIS_IP32_SCRIPT`, `_STEPS`, `_DISK`, `_DIS`, `ip32-view` and
 so on). That harness has since been removed; the findings stand, the
 commands no longer run.
 
-Diagnostics that remain, all off unless set:
+Diagnostics that remain, all off unless set (`IRIS_IP32_HOT`, `IRIS_IP32_MEC_TRACE` and
+`IRIS_O2_AUDIO_TRACE` are gone: use `log net` and `log o2audio`):
 
 | variable | what it does |
 |---|---|
-| `IRIS_IP32_HOT` | per-register access counters for MACE, GBE and the rendering engine (finding a driver polling a bit nothing sets) |
 | `IRIS_IP32_RE_TRACE=N` | keep the last N rendering-engine register writes; save with the monitor's `o2 retrace` |
-| `IRIS_IP32_MEC_TRACE` | Ethernet frames sent and received, and why a received one was dropped |
-| `IRIS_O2_AUDIO_TRACE` | audio output activity, and each time a ring ran dry between sounds |
 | `IRIS_AUDIO_DUMP=file` | every sample each output plays, at the guest's rate, before resampling (every sound card) |
 | `IRIS_O2_AUDIO_CAPTURE=file` | what the host device is given, after rate conversion (a WAV; was raw 16-bit stereo before iris-audio) |
 

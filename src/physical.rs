@@ -36,54 +36,46 @@ use crate::ppmem::devmap::{entry_eq, Entry, SparseDeviceMap, PHYS_MASK, SLOTS, S
 /// bus-path access keep working whether or not the 4GB window was reserved.
 pub type RamBank = PpMemory;
 
-// Error device: a bus error for every access, optionally logged.
-struct ErrorBus {
-    debug: AtomicBool,
-}
+// Error device: a bus error for every access, logged under `log phys`.
+struct ErrorBus;
 
 impl ErrorBus {
     fn new() -> Self {
-        Self {
-            debug: AtomicBool::new(false),
-        }
-    }
-
-    fn set_debug(&self, val: bool) {
-        self.debug.store(val, Ordering::Relaxed);
+        Self
     }
 }
 
 impl BusDevice for ErrorBus {
     fn read8(&self, addr: u64) -> BusRead8 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read8 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read8 {:08x}", addr);
         BusRead8::err()
     }
     fn write8(&self, addr: u64, val: u8) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write8 {:08x} val {:02x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write8 {:08x} val {:02x}", addr, val);
         crate::traits::BUS_ERR
     }
     fn read16(&self, addr: u64) -> BusRead16 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read16 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read16 {:08x}", addr);
         BusRead16::err()
     }
     fn write16(&self, addr: u64, val: u16) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write16 {:08x} val {:04x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write16 {:08x} val {:04x}", addr, val);
         crate::traits::BUS_ERR
     }
     fn read32(&self, addr: u64) -> BusRead32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read32 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read32 {:08x}", addr);
         BusRead32::err()
     }
     fn write32(&self, addr: u64, val: u32) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write32 {:08x} val {:08x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write32 {:08x} val {:08x}", addr, val);
         crate::traits::BUS_ERR
     }
     fn read64(&self, addr: u64) -> BusRead64 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read64 {:08x}", addr); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Read64 {:08x}", addr);
         BusRead64::err()
     }
     fn write64(&self, addr: u64, val: u64) -> u32 {
-        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write64 {:08x} val {:016x}", addr, val); }
+        crate::dlog!(crate::devlog::LogModule::Phys, "BusError: Write64 {:08x} val {:016x}", addr, val);
         crate::traits::BUS_ERR
     }
 }
@@ -331,7 +323,6 @@ pub struct Physical {
     black_hole: BlackHoleRegion,
     error_bus: ErrorBus,
 
-    trace: AtomicBool,
 }
 
 // Safety: the table's pointers point at devices this bus or its machine keeps
@@ -402,7 +393,6 @@ impl Physical {
             unmapped_ram: UnmappedRam,
             black_hole: BlackHoleRegion::new(),
             error_bus: ErrorBus::new(),
-            trace: AtomicBool::new(false),
         })
     }
 
@@ -492,7 +482,7 @@ impl Physical {
     }
 
     /// `base..end` reads as zero and ignores writes, logging both under
-    /// `phys hole on`.
+    /// `log phys on`.
     pub fn map_black_hole(&self, base: u64, end: u64) {
         let p: Entry = &self.black_hole;
         self.fill_range(base, end, p);
@@ -803,10 +793,9 @@ impl Device for Physical {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let cmds = vec![
-            ("phys".to_string(), "Physical Bus commands: mem, dis, map, trace, error <on|off>, hole <on|off>, bench".to_string()),
+            ("phys".to_string(), "Physical Bus commands: mem, dis, map, bench".to_string()),
             ("mm".to_string(), "Alias for phys mem".to_string()),
             ("md".to_string(), "Alias for phys dis".to_string()),
-            ("trace".to_string(), "Enable/disable tracing: trace <on|off>".to_string()),
             ("bench".to_string(), "Benchmark memory write performance".to_string()),
         ];
         cmds
@@ -873,48 +862,6 @@ impl Device for Physical {
                         r.start << SLOT_SHIFT, (r.end << SLOT_SHIFT) - 1, name).unwrap();
                 }
             }
-            "error" => {
-                if actual_args.is_empty() {
-                    return Err("Usage: error <on|off>".to_string());
-                }
-                let val = match actual_args[0] {
-                    "on" | "1" => true,
-                    "off" | "0" => false,
-                    _ => return Err("Usage: error <on|off>".to_string()),
-                };
-                self.error_bus.set_debug(val);
-                writeln!(writer, "Bus Error debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-            }
-            "hole" => {
-                if actual_args.is_empty() {
-                    return Err("Usage: hole <on|off>".to_string());
-                }
-                let val = match actual_args[0] {
-                    "on" | "1" => true,
-                    "off" | "0" => false,
-                    _ => return Err("Usage: hole <on|off>".to_string()),
-                };
-                self.black_hole.set_debug(val);
-                writeln!(writer, "Black Hole debug {}", if val { "enabled" } else { "disabled" }).unwrap();
-            }
-            "trace" => {
-                if actual_args.is_empty() {
-                    let state = if self.trace.load(Ordering::Relaxed) { "on" } else { "off" };
-                    writeln!(writer, "MC trace is {}", state).unwrap();
-                } else {
-                    match actual_args[0] {
-                        "on" | "1" => {
-                            self.trace.store(true, Ordering::Relaxed);
-                            writeln!(writer, "MC trace enabled").unwrap();
-                        }
-                        "off" | "0" => {
-                            self.trace.store(false, Ordering::Relaxed);
-                            writeln!(writer, "MC trace disabled").unwrap();
-                        }
-                        _ => return Err("Usage: trace <on|off|1|0>".to_string()),
-                    }
-                }
-            }
             "bench" => {
                 // The first region the window maps whole: RAM on every
                 // machine, wherever its memory controller put it. Overwrites it.
@@ -966,11 +913,8 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read8(addr) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            if r.is_ok() { println!("PHYS8 Read {:08x} -> {:02x}", addr, r.data); }
-            else { println!("PHYS8 Read {:08x} -> err {:08x}", addr, r.status); }
-        }
+        dlog_dev!(LogModule::Phys, "PHYS8 Read {:08x} -> {}", addr,
+                  if r.is_ok() { format!("{:02x}", r.data) } else { format!("err {:08x}", r.status) });
         r
     }
 
@@ -979,8 +923,7 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write8(addr, val) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) { println!("PHYS8 Write {:08x} val={:02x} -> {:08x}", addr, val, ws); }
+        dlog_dev!(LogModule::Phys, "PHYS8 Write {:08x} val={:02x} -> {:08x}", addr, val, ws);
         ws
     }
 
@@ -989,11 +932,8 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read16(addr) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            if r.is_ok() { println!("PHYS16 Read {:08x} -> {:04x}", addr, r.data); }
-            else { println!("PHYS16 Read {:08x} -> err {:08x}", addr, r.status); }
-        }
+        dlog_dev!(LogModule::Phys, "PHYS16 Read {:08x} -> {}", addr,
+                  if r.is_ok() { format!("{:04x}", r.data) } else { format!("err {:08x}", r.status) });
         r
     }
 
@@ -1002,8 +942,7 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write16(addr, val) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) { println!("PHYS16 Write {:08x} val={:04x} -> {:08x}", addr, val, ws); }
+        dlog_dev!(LogModule::Phys, "PHYS16 Write {:08x} val={:04x} -> {:08x}", addr, val, ws);
         ws
     }
 
@@ -1012,11 +951,8 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read32(addr) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            if r.is_ok() { println!("PHYS32 Read {:08x} -> {:08x}", addr, r.data); }
-            else { println!("PHYS32 Read {:08x} -> err {:08x}", addr, r.status); }
-        }
+        dlog_dev!(LogModule::Phys, "PHYS32 Read {:08x} -> {}", addr,
+                  if r.is_ok() { format!("{:08x}", r.data) } else { format!("err {:08x}", r.status) });
         r
     }
 
@@ -1025,8 +961,7 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write32(addr, val) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) { println!("PHYS32 Write {:08x} val={:08x} -> {:08x}", addr, val, ws); }
+        dlog_dev!(LogModule::Phys, "PHYS32 Write {:08x} val={:08x} -> {:08x}", addr, val, ws);
         ws
     }
 
@@ -1035,11 +970,8 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read64(addr) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            if r.is_ok() { println!("PHYS64 Read {:08x} -> {:016x}", addr, r.data); }
-            else { println!("PHYS64 Read {:08x} -> err {:08x}", addr, r.status); }
-        }
+        dlog_dev!(LogModule::Phys, "PHYS64 Read {:08x} -> {}", addr,
+                  if r.is_ok() { format!("{:016x}", r.data) } else { format!("err {:08x}", r.status) });
         r
     }
 
@@ -1048,8 +980,7 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write64(addr, val) };
-        #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) { println!("PHYS64 Write {:08x} val={:016x} -> {:08x}", addr, val, ws); }
+        dlog_dev!(LogModule::Phys, "PHYS64 Write {:08x} val={:016x} -> {:08x}", addr, val, ws);
         ws
     }
 

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient, DmaStatus, Resettable, Saveable};
-use crate::devlog::{LogModule, devlog};
+use crate::devlog::LogModule;
 use crate::snapshot::{get_field, toml_u8, toml_bool, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::scsi::{self, ScsiBus, ScsiIdentities, scsi_cmd, ScsiRequest, ScsiDataLength};
 use std::io::Write;
@@ -938,7 +938,7 @@ impl Device for Wd33c93a {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi armwait [reset] | scsi dayna | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV] | scsi defer <on|off>".to_string()),
+            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi armwait [reset] | scsi dayna | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi defer <on|off>".to_string()),
             ("cow".to_string(), "COW overlay: cow status | cow commit [id] | cow reset [id]".to_string()),
         ]
     }
@@ -1043,26 +1043,6 @@ impl Device for Wd33c93a {
                         state.get_transfer_count()).unwrap();
                     return Ok(());
                 }
-                Some("debug") => {
-                    let val = match args.get(1).copied() {
-                        Some("on")  => true,
-                        Some("off") => false,
-                        _ => return Err("Usage: scsi debug <on|off>".to_string()),
-                    };
-                    // Bare `scsi debug` toggles both controllers' logging;
-                    // `scsi0 debug`/`scsi1 debug` toggle only their own —
-                    // see LogModule::Scsi1's doc comment.
-                    let modules: &[LogModule] = match cmd {
-                        "scsi1" => &[LogModule::Scsi1],
-                        "scsi0" => &[LogModule::Scsi],
-                        _       => &[LogModule::Scsi, LogModule::Scsi1],
-                    };
-                    for m in modules {
-                        if val { devlog().enable(*m); } else { devlog().disable(*m); }
-                    }
-                    writeln!(writer, "SCSI debug {} ({})", if val { "enabled" } else { "disabled" }, cmd).unwrap();
-                    return Ok(());
-                }
                 Some("defer") => {
                     let val = match args.get(1).copied() {
                         Some("on")  => true,
@@ -1073,7 +1053,7 @@ impl Device for Wd33c93a {
                     writeln!(writer, "SCSI deferred interrupts {}", if val { "enabled" } else { "disabled" }).unwrap();
                     return Ok(());
                 }
-                _ => return Err(format!("Usage: {} | scsi regs | scsi wdt [N] | scsi defer <on|off> | scsi debug <on|off>", crate::scsi_monitor::SCSI_USAGE)),
+                _ => return Err(format!("Usage: {} | scsi regs | scsi wdt [N] | scsi defer <on|off>", crate::scsi_monitor::SCSI_USAGE)),
             }
         }
         if cmd == "cow" {
@@ -1171,8 +1151,8 @@ impl Saveable for Wd33c93a {
 
 impl Wd33c93aState {
     /// LogModule::Scsi for controller 0, LogModule::Scsi1 for controller 1 —
-    /// lets `scsi debug`/`scsi1 debug` toggle each chip's logging
-    /// independently. See `id`'s doc comment.
+    /// lets `log scsi` and `log scsi1` toggle each chip independently.
+    /// See `id`'s doc comment.
     fn log_module(&self) -> LogModule {
         if self.id == 0 { LogModule::Scsi } else { LogModule::Scsi1 }
     }

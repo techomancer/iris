@@ -104,7 +104,7 @@ section of [STORAGE.md](STORAGE.md) and the `block_node.rs` module docs: read
 them before writing a backend or changing a flush. `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
 subcommands and the run-time disc changes once, over the bus a controller hands
 out through `ScsiTargets::scsi_bus`; chip-specific subcommands (`regs`; the
-WD's `wdt`, `defer`, `debug`) stay with the chip, and `DiscChanger` is
+WD's `wdt`, `defer`) stay with the chip, and `DiscChanger` is
 implemented once for every `ScsiTargets`. Configuration is shared the same
 way: `scsi::attach_from_config` walks the SCSI `[[devices]]` entries for every machine,
 each at a slot in the slot list (`scsi0/t1`), and
@@ -210,7 +210,8 @@ Devices connect to each other through device-specific `connect()` /
 interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
 channel; `wait_active` lets a device thread block until the guest arms the
 channel, which HPC3 signals from the arming register write instead of being
-polled), `InterruptController`/`IrqLine` (below), `GfxDisplay` (a graphics board's screen, for the window and
+polled; `on_active_change` listeners run under the channel's lock, so a listener
+must not take that channel's lock), `InterruptController`/`IrqLine` (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 
 Serial lines have two halves. A UART model owns the registers: the Indy's

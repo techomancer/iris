@@ -244,9 +244,8 @@ To reach the Command Monitor on a machine that autoboots, press Esc while
 the PROM says "Starting up the system" (from the monitor console:
 `ps2 esc`). `test/tftp/` has a guest-side client and a test script.
 
-To see what the PROM or a client actually does, start iris with
-`IRIS_TFTP_TRACE=1`. It writes to stderr, in any build: what BOOTP was asked to
-boot, each read request and whether the file was found, and how each transfer
+To see what the PROM or a client actually does, turn on `log net` in the
+monitor. In any build it logs what BOOTP was asked to boot, each read request and whether the file was found, and how each transfer
 ended (bytes, blocks, retransmits, duplicate ACKs, the slowest ACK, total
 time), plus any ACK slower than 500 ms as it happens. A read request sent to
 the host's port 69 instead (no `tftp_dir`, or a server address other than the
@@ -282,11 +281,11 @@ to the guest from a reserved port, which `rcmd` insists on. With `rsh_dir` set,
 guest connections to gateway port 514 are answered here instead of being
 relayed to a host `rshd`. NAT mode only.
 
-To see what a client (IRIX `inst`, say) asks for, start iris with
-`IRIS_RSH_TRACE=1`. Each request is written to stderr when it arrives and again
-when it ends, with the bytes moved, the time taken, and whether it completed,
-was cut short by the guest, or never sent a whole request. This works in any
-build; the `net debug` logging needs a `developer` build.
+To see what a client (IRIX `inst`, say) asks for, turn on `log net` in the
+monitor. Each request is logged when it arrives and again when it ends, with
+the bytes moved, the time taken, and whether it completed, was cut short by the
+guest, or never sent a whole request. This works in any build; the per-packet
+detail needs a `developer` build.
 At startup iris prints `iris: rsh server ... serving DIR` when `rsh_dir` is on.
 Every guest connection to port 514 is also reported with where it went, so a
 trace with no requests means the guest never reached the built-in server (the
@@ -474,7 +473,7 @@ address on your LAN; the server answers there instead and the guest mounts
 ```
 net status           # show all NAT connections
 net status tcp       # TCP connections only
-net debug tcp on     # per-packet TCP trace
+log net on           # per-packet trace (developer build)
 seeq status          # Ethernet MAC / DMA state
 ```
 

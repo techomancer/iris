@@ -36,10 +36,8 @@ pub enum LogModule {
     L2c    = 22,  // L2 unified cache: fill, writeback, invalidate, cache ops
     Ultra  = 23,  // N64 dev board: shm reads/writes, interrupts, register traffic
     /// Second WD33C93A (fullhouse/Indigo2 SCSI controller 1). Kept as a
-    /// distinct module (rather than folding into `Scsi`) so `scsi1 debug`
-    /// can be toggled independently of controller 0's `scsi debug`; bare
-    /// `scsi debug` toggles both — see wd33c93a.rs's `scsi`/`scsi1` command
-    /// handling.
+    /// distinct module (rather than folding into `Scsi`) so it can be
+    /// toggled independently of controller 0.
     Scsi1  = 24,
     /// HPC3-side motherboard EEPROM (NVRAM/env vars/MAC @ words 0x7D-0x7F,
     /// `nveeprom` command). Kept distinct from `Eeprom` (MC-side CPU
@@ -64,7 +62,8 @@ pub enum LogModule {
     /// and transfers a function started that reached no memory.
     Bridge = 32,
     /// The Octane's HEART: processor-interface register accesses (not
-    /// counter reads) and interrupt vectors raised and lowered.
+    /// counter reads), interrupt vectors raised and lowered, and bus
+    /// accesses nothing answers.
     Heart = 33,
     /// The NVM Express controller: register writes, controller state
     /// changes, and the commands it runs (categories `NVME_LOG_*`).
@@ -81,10 +80,15 @@ pub enum LogModule {
     /// The ICE1724 audio controller: accesses and values nothing
     /// establishes.
     Ice1724 = 39,
+    /// The physical bus: accesses that hit the black hole or a bus-error
+    /// region, and in a developer build every access.
+    Phys = 40,
+    /// The O2's audio: every register access and codec operation.
+    O2Audio = 41,
 }
 
 // Mask bits shared by L1i / L1d / L2c
-pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path — verbose)
+pub const CACHE_LOG_HIT:  u32 = 0x1;  // log hits (hot path; developer builds only)
 pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
@@ -95,7 +99,7 @@ pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the
 pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 42;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -139,6 +143,8 @@ impl LogModule {
             "module" => Some(Self::Module),
             "kona" => Some(Self::Kona),
             "ice1724" => Some(Self::Ice1724),
+            "phys" => Some(Self::Phys),
+            "o2audio" => Some(Self::O2Audio),
             _        => None,
         }
     }
@@ -185,6 +191,8 @@ impl LogModule {
             Self::Module => "module",
             Self::Kona => "kona",
             Self::Ice1724 => "ice1724",
+            Self::Phys => "phys",
+            Self::O2Audio => "o2audio",
         }
     }
 
@@ -198,7 +206,7 @@ impl LogModule {
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
             Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
             Self::L1, Self::Usb, Self::Module, Self::Kona,
-            Self::Ice1724,
+            Self::Ice1724, Self::Phys, Self::O2Audio,
         ]
     }
 
@@ -342,33 +350,7 @@ impl DevLog {
         Self {
             any_active: AtomicBool::new(false),
             writers: Mutex::new(Vec::new()),
-            modules: [
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(),
-                ModuleLog::new(), ModuleLog::new(), // Bt445, Scc
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // Ps2, Rtc, Eeprom
-                ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // L1i, L1d, L2c
-                ModuleLog::new(), // Ultra
-                ModuleLog::new(), // Scsi1
-                ModuleLog::new(), // Nveeprom
-                ModuleLog::new(), // Gr2
-                ModuleLog::new(), // Rad1
-                ModuleLog::new(), // Odyssey
-                ModuleLog::new(), // Bedrock
-                ModuleLog::new(), // Hub
-                ModuleLog::new(), // Pci
-                ModuleLog::new(), // Bridge
-                ModuleLog::new(), // Heart
-                ModuleLog::new(), // Nvme
-                ModuleLog::new(), // L1
-                ModuleLog::new(), // Usb
-                ModuleLog::new(), // Module
-                ModuleLog::new(), // Kona
-                ModuleLog::new(), // Ice1724
-            ],
+            modules: std::array::from_fn(|_| ModuleLog::new()),
         }
     }
 

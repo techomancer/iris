@@ -433,9 +433,7 @@ impl NetBackend for PcapEngine {
                         continue;
                     }
                 }
-                if self.ctl.dbg_tcp() {
-                    dlog_dev!(LogModule::Net, "PCAP TX {}", eth_summary(&frame));
-                }
+                dlog_dev!(LogModule::Net, "PCAP TX {}", eth_summary(&frame));
                 if let Err(e) = cap.sendpacket(&frame[..]) {
                     dlog_dev!(LogModule::Net, "PCAP sendpacket failed: {}", e);
                 }
@@ -459,9 +457,7 @@ impl NetBackend for PcapEngine {
                         // Hand the raw frame to the enet thread; address filtering
                         // (station MAC / broadcast / multicast / promiscuous) is
                         // applied there in Seeq8003::pump_rx.
-                        if self.ctl.dbg_tcp() {
-                            dlog_dev!(LogModule::Net, "PCAP RX {}", eth_summary(frame));
-                        }
+                        dlog_dev!(LogModule::Net, "PCAP RX {}", eth_summary(frame));
                         if self.rx_prod.push(frame.to_vec()).is_ok() {
                             self.rx_wake.notify();
                         }

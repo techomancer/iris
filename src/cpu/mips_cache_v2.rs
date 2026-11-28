@@ -1337,13 +1337,6 @@ impl<TAG: Default + Copy, const SIZE: usize, const LINE: usize, const WAYS: usiz
 // R4000 Cache Implementation - Full 2-level hierarchy
 // =============================================================================
 
-
-// Debug configuration - set to Some(phys_addr) to enable cache line tracking
-#[cfg(feature = "debug_cache")]
-const DEBUG_TRACK_ADDR: Option<u64> = Some(0x080165d4);
-#[cfg(not(feature = "debug_cache"))]
-const DEBUG_TRACK_ADDR: Option<u64> = None;
-
 /// Primary data parity, as far as software can observe it: what Status.CE
 /// and the ECC register do to the D-cache's check bits, and the Cache Error
 /// exception a mismatch raises (R4000 UM ch. 5, VR5000 UM 7.2.9).
@@ -1494,22 +1487,6 @@ pub struct CpuCache<
     /// the guest just modified.
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut AtomicU64>,
-
-    // Debug tracking - cache line boundaries and indices for tracked address
-    #[cfg(feature = "debug_cache")]
-    debug_l1d_line: u64,
-    #[cfg(feature = "debug_cache")]
-    debug_l2_line: u64,
-    #[cfg(feature = "debug_cache")]
-    debug_companion_l1d_line: u64,
-    #[cfg(feature = "debug_cache")]
-    debug_companion_l2_line: u64,
-    #[cfg(feature = "debug_cache")]
-    debug_l1d_idx: usize,
-    #[cfg(feature = "debug_cache")]
-    debug_l2_idx: usize,
-    #[cfg(feature = "debug_cache")]
-    debug_companion_l2_idx: usize,
 }
 
 unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
@@ -1689,37 +1666,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         let dc = DCacheT::<DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA>::new();
         let l2 = L2CacheT::<L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS>::new();
 
-        #[cfg(feature = "debug_cache")]
-        let (debug_l1d_line, debug_l2_line, debug_companion_l1d_line, debug_companion_l2_line,
-             debug_l1d_idx, debug_l2_idx, debug_companion_l2_idx) = {
-            if let Some(addr) = DEBUG_TRACK_ADDR {
-                let l1_line_mask = Self::DC_LINE_MASK as u64;
-                let l2_line_mask = Self::L2_LINE_MASK as u64;
-                let companion_addr = addr ^ 0x00400000; // XOR with COMPANION_BIT
-
-                let target_l1d_line = addr & !l1_line_mask;
-                let target_l2_line = addr & !l2_line_mask;
-                let companion_l1d_line = companion_addr & !l1_line_mask;
-                let companion_l2_line = companion_addr & !l2_line_mask;
-
-                let target_l1d_idx = dc.get_index(addr);
-                let target_l2_idx = l2.get_index(addr);
-                let companion_l2_idx = l2.get_index(companion_addr);
-
-                println!("[CACHE DEBUG] Tracking setup:");
-                println!("  Target addr: 0x{:08x}, L1D line: 0x{:08x}, L1D idx: {}, L2 line: 0x{:08x}, L2 idx: {}",
-                         addr, target_l1d_line, target_l1d_idx, target_l2_line, target_l2_idx);
-                println!("  Companion addr: 0x{:08x}, L1D line: 0x{:08x}, L2 line: 0x{:08x}, L2 idx: {}",
-                         companion_addr, companion_l1d_line, companion_l2_line, companion_l2_idx);
-                println!("  L2 index collision: {}", target_l2_idx == companion_l2_idx);
-
-                (target_l1d_line, target_l2_line, companion_l1d_line, companion_l2_line,
-                 target_l1d_idx, target_l2_idx, companion_l2_idx)
-            } else {
-                (0, 0, 0, 0, 0, 0, 0)
-            }
-        };
-
         Self {
             downstream,
             ic,
@@ -1749,20 +1695,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             perr: UnsafeCell::new(ParityState::default()),
             dc_lru: UnsafeCell::new(
                 if Self::IS_R5K { vec![0u64; Self::DC_NUM_SETS.div_ceil(64)] } else { Vec::new() }.into_boxed_slice()),
-            #[cfg(feature = "debug_cache")]
-            debug_l1d_line,
-            #[cfg(feature = "debug_cache")]
-            debug_l2_line,
-            #[cfg(feature = "debug_cache")]
-            debug_companion_l1d_line,
-            #[cfg(feature = "debug_cache")]
-            debug_companion_l2_line,
-            #[cfg(feature = "debug_cache")]
-            debug_l1d_idx,
-            #[cfg(feature = "debug_cache")]
-            debug_l2_idx,
-            #[cfg(feature = "debug_cache")]
-            debug_companion_l2_idx,
         }
     }
 }
@@ -1783,83 +1715,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
     const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
-    /// Check if we're tracking this physical address (for debug purposes)
-    #[cfg(feature = "debug_cache")]
-    #[inline]
-    fn is_tracking_l1d(&self, phys_addr: u64) -> bool {
-        DEBUG_TRACK_ADDR.is_some() && {
-            let line = phys_addr & !(Self::DC_LINE_MASK as u64);
-            line == self.debug_l1d_line || line == self.debug_companion_l1d_line
-        }
-    }
-
-    #[cfg(feature = "debug_cache")]
-    #[inline]
-    fn is_tracking_l2(&self, phys_addr: u64) -> bool {
-        DEBUG_TRACK_ADDR.is_some() && {
-            let line = phys_addr & !(Self::L2_LINE_MASK as u64);
-            line == self.debug_l2_line || line == self.debug_companion_l2_line
-        }
-    }
-
-    #[cfg(feature = "debug_cache")]
-    #[inline]
-    fn is_tracking_l1d_idx(&self, idx: usize) -> bool {
-        DEBUG_TRACK_ADDR.is_some() && idx == self.debug_l1d_idx
-    }
-
-    #[cfg(feature = "debug_cache")]
-    #[inline]
-    fn is_tracking_l2_idx(&self, idx: usize) -> bool {
-        DEBUG_TRACK_ADDR.is_some() && (idx == self.debug_l2_idx || idx == self.debug_companion_l2_idx)
-    }
-
-    #[cfg(feature = "debug_cache")]
-    #[inline]
-    fn is_tracking_addr(&self, virt_addr: u64, phys_addr: u64) -> bool {
-        DEBUG_TRACK_ADDR.is_some() && {
-            // Check if the physical line matches (most reliable)
-            let line = phys_addr & !(Self::DC_LINE_MASK as u64);
-            if line == self.debug_l1d_line || line == self.debug_companion_l1d_line {
-                return true;
-            }
-            // Also check virtual address (for KSEG0 cached accesses)
-            if let Some(target) = DEBUG_TRACK_ADDR {
-                let companion = target ^ 0x00400000;
-                // Check both 32-bit and 64-bit sign-extended forms
-                virt_addr == (target | 0xffffffff80000000) ||
-                virt_addr == (companion | 0xffffffff80000000)
-            } else {
-                false
-            }
-        }
-    }
-
-    #[cfg(feature = "debug_cache")]
-    #[inline]
-    fn tracking_label(&self, phys_addr: u64) -> &'static str {
-        let line = phys_addr & !(Self::DC_LINE_MASK as u64);
-        if line == self.debug_l1d_line {
-            "TARGET"
-        } else if line == self.debug_companion_l1d_line {
-            "COMPANION"
-        } else {
-            "UNKNOWN"
-        }
-    }
-
-    #[cfg(feature = "debug_cache")]
-    #[inline]
-    fn tracking_label_l2_idx(&self, idx: usize) -> &'static str {
-        if idx == self.debug_l2_idx {
-            "TARGET"
-        } else if idx == self.debug_companion_l2_idx {
-            "COMPANION"
-        } else {
-            "UNKNOWN"
-        }
-    }
-
     /// Returns whether L2 is currently usable.
     /// - R4K / r5ksc (external): always true when Self::L2_SIZE > 0.
     /// - r5ksc_triton: gated by CONFIG_SE (l2_enabled field).
@@ -2157,15 +2012,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
         let tag: L1ITag = self.ic.get_tag(idx);
 
-        #[cfg(feature = "debug_cache")]
-        if tag.is_valid() {
-            let phys_addr = l1_tag_to_phys(tag, (idx << Self::IC_LINE_SHIFT) as u64);
-            if self.is_tracking_l1d(phys_addr) {
-                println!("[CACHE DEBUG] invalidate_l1i_line: {} idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:010x}",
-                         self.tracking_label(phys_addr), idx, phys_addr, tag.line_addr());
-            }
-        }
-
         if cascade && tag.is_valid() {
             let phys_addr = l1_tag_to_phys(tag, (idx << Self::IC_LINE_SHIFT) as u64);
             self.invalidate_l2_line_phys(phys_addr);
@@ -2180,17 +2026,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     fn invalidate_l1d_line(&self, idx: usize, coherent: bool, cascade: bool) {
         self.l1d_unforce(idx);
         let tag: L1DTag = self.dc.get_tag(idx);
-
-        #[cfg(feature = "debug_cache")]
-        if self.is_tracking_l1d_idx(idx) {
-            if tag.cs != L1D_CS_INVALID as u8 {
-                let phys_addr = l1d_tag_to_phys(tag, (idx << Self::DC_LINE_SHIFT) as u64);
-                println!("[CACHE DEBUG] invalidate_l1d_line: {} idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:010x}, cs={}, coherent={}",
-                         self.tracking_label(phys_addr), idx, phys_addr, tag.line_addr(), tag.cs, coherent);
-            } else {
-                println!("[CACHE DEBUG] invalidate_l1d_line: idx=0x{:x} (already invalid)", idx);
-            }
-        }
 
         // Only clear llbit for software-initiated coherency invalidations, not hardware fills.
         // On a uniprocessor R4000 there are no external snoops; llbit survives capacity evictions.
@@ -2212,18 +2047,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     fn invalidate_l2_line(&self, idx: usize) {
         self.clear_l2_xor((idx << Self::L2_LINE_SHIFT) as u64, L2_LINE);
         let l2_tag: L2Tag = self.l2.get_tag(idx);
-
-        #[cfg(feature = "debug_cache")]
-        if self.is_tracking_l2_idx(idx) {
-            if l2_tag.cs() != L2_CS_INVALID {
-                let phys_base = l2_tag_to_phys(l2_tag, (idx << Self::L2_LINE_SHIFT) as u64);
-                println!("[CACHE DEBUG] invalidate_l2_line: {} idx=0x{:x}, phys_base=0x{:08x}, ptag=0x{:05x}, cs={}",
-                         self.tracking_label_l2_idx(idx), idx, phys_base, l2_tag.ptag(), l2_tag.cs());
-            } else {
-                println!("[CACHE DEBUG] invalidate_l2_line: {} idx=0x{:x} (already invalid)",
-                         self.tracking_label_l2_idx(idx), idx);
-            }
-        }
 
         // If L2 line is already invalid, nothing to do
         if l2_tag.cs() == L2_CS_INVALID {
@@ -2383,15 +2206,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // nothing to copy out on a writeback. Both models.
         let transparent = self.tc_live();
 
-        #[cfg(feature = "debug_cache")]
-        {
-            let l2_idx_check = self.l2.get_index(phys_addr);
-            if self.is_tracking_l1d(phys_addr) || self.is_tracking_l2_idx(l2_idx_check) {
-                println!("[CACHE DEBUG] writeback_l1d_line: {} l1_idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:010x}, DIRTY → L2",
-                         self.tracking_label(phys_addr), l1_idx, phys_addr, tag.line_addr());
-            }
-        }
-
         // Find the line in L2 using physical address
         let l2_idx = self.l2.get_index(phys_addr);
         let mut l2_tag: L2Tag = self.l2.get_tag(l2_idx);
@@ -2442,18 +2256,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         if !transparent {
             for i in 0..Self::DC_CHUNKS_PER_LINE {
                 l2_data[l2_line_base + offset_in_l2_line + i] = dc_data[l1_start_chunk + i];
-            }
-        }
-
-        #[cfg(feature = "debug_cache")]
-        {
-            if self.is_tracking_l1d(phys_addr) || self.is_tracking_l2_idx(l2_idx) {
-                println!("[CACHE DEBUG] writeback_l1d_line: wrote {} chunks to L2 idx=0x{:x} offset=0x{:x}",
-                         Self::DC_CHUNKS_PER_LINE, l2_idx, offset_in_l2_line);
-                for i in 0..Self::DC_CHUNKS_PER_LINE {
-                    println!("    [{}] addr=0x{:08x} val=0x{:016x}",
-                             i, phys_addr + ((i as u64) << 3), dc_data[l1_start_chunk + i]);
-                }
             }
         }
 
@@ -2582,20 +2384,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // to reach RAM (window vs bus), never whether L2 holds data. The state
         // transition below still runs exactly as it always does.
         let tc_line = self.tc_live();
-
-        #[cfg(feature = "debug_cache")]
-        if self.is_tracking_l2_idx(idx) {
-            println!("[CACHE DEBUG] writeback_l2_line: {} idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:05x}, cs={}, WRITING TO MEMORY",
-                     self.tracking_label_l2_idx(idx), idx, phys_addr, tag.ptag(), cs);
-            // Dump the L2 line data being written
-            let l2_data = self.l2.data();
-            let start_chunk = idx << Self::L2_CHUNKS_PER_LINE_SHIFT;
-            println!("  L2 line data being written (16 x u64):");
-            for i in 0..Self::L2_CHUNKS_PER_LINE {
-                let val = l2_data[start_chunk + i];
-                println!("    [{}] addr=0x{:08x} val=0x{:016x}", i, phys_addr + ((i as u64) << 3), val);
-            }
-        }
 
         // NOTE: do NOT clear llbit here. On R4000, llbit tracks L1-D state only.
         // An L2 writeback/eviction is not a coherency action and must not break LL/SC.
@@ -2782,17 +2570,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // println!("[CACHE DEBUG] fill_l2_line: idx={}, phys_addr=0x{:08x}, ptag=0x{:05x}, pidx={}, state=CleanExclusive",
         //          l2_idx, phys_addr, ptag, pidx);
 
-        #[cfg(feature = "debug_cache")]
-        if self.is_tracking_l2_idx(l2_idx) {
-            println!("[CACHE DEBUG] fill_l2_line: {} line 0x{:08x}, idx=0x{:x}, phys_addr=0x{:08x}, ptag=0x{:05x}, pidx={}",
-                     self.tracking_label_l2_idx(l2_idx), line_base, l2_idx, phys_addr, ptag, pidx);
-            println!("  L2 line data (16 x u64):");
-            for i in 0..Self::L2_CHUNKS_PER_LINE {
-                let val = l2_data[start_chunk + i];
-                println!("    [{}] 0x{:016x}", i, val);
-            }
-        }
-
         true
     }
 
@@ -2940,24 +2717,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
 
         self.ic.set_tag(ic_eidx, L1ITag::valid(phys_addr));
-
-        #[cfg(feature = "debug_cache")]
-        if self.is_tracking_addr(index_addr, phys_addr) || self.is_tracking_l2_idx(self.l2.get_index(phys_addr)) {
-            let way = ic_eidx >> Self::IC_NUM_LINES_SHIFT;
-            let set = ic_eidx & Self::IC_NUM_LINES_MASK;
-            println!("[CACHE DEBUG] fill_l1i_line: {} virt 0x{:016x} phys 0x{:016x} → L1I eidx=0x{:x} way={} set=0x{:x}",
-                self.tracking_label(phys_addr), index_addr, phys_addr, ic_eidx, way, set);
-            if Self::IS_R5K {
-                let ic_instrs = self.ic_instrs.get();
-                let slot_base = ic_eidx << Self::IC_INSTR_SHIFT;
-                print!("  ic_instrs:");
-                for i in 0..Self::IC_INSTRS_PER_LINE {
-                    if i % 4 == 0 { print!("\n    "); }
-                    print!("{:08x} ", ic_instrs[slot_base + i].raw);
-                }
-                println!();
-            }
-        }
 
         (ic_eidx >> Self::IC_NUM_LINES_SHIFT) as u32
     }
@@ -3420,22 +3179,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // R5K: flip LRU — filled way is MRU, other way is now victim
         if Self::IS_R5K {
         unsafe { Self::lru_set(self.dc_lru.get(), dc_idx & Self::DC_NUM_LINES_MASK, victim_way ^ 1); }
-        }
-
-        #[cfg(feature = "debug_cache")]
-        {
-            let line_base_phys = phys_addr & !(Self::DC_LINE_MASK as u64);
-            let l2_idx_check = self.l2.get_index(phys_addr);
-            if self.is_tracking_l1d(line_base_phys) || self.is_tracking_l2_idx(l2_idx_check) {
-                let line_base_virt = virt_addr & !(Self::DC_LINE_MASK as u64);
-                let way = dc_idx >> Self::DC_NUM_LINES_SHIFT;
-                let set = dc_idx & Self::DC_NUM_LINES_MASK;
-                println!("[CACHE DEBUG] fill_l1d_line: {} virt 0x{:016x} phys 0x{:016x} → L1D eidx=0x{:x} way={} set=0x{:x}",
-                         self.tracking_label(line_base_phys), line_base_virt, line_base_phys, dc_idx, way, set);
-                for i in 0..Self::DC_CHUNKS_PER_LINE {
-                    println!("    [{}] 0x{:016x}", i, dc_data[dc_start_chunk + i]);
-                }
-            }
         }
 
         victim_way as u32
@@ -3902,14 +3645,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     #[inline(always)]
     fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         if Self::IS_R5K {
-            #[cfg(feature = "debug_cache")]
-            {
-                if self.is_tracking_addr(virt_addr, phys_addr) {
-                    println!("[CACHE DEBUG] fetch: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}",
-                             self.tracking_label(phys_addr), virt_addr, phys_addr);
-                }
-            }
-
             let set = self.ic.get_index(virt_addr);
             let way1_base = 1 << Self::IC_NUM_LINES_SHIFT;
 
@@ -3919,7 +3654,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let ic_eidx = if self.ic.get_tag(set).matches_phys(phys_addr) {
                 #[cfg(feature = "developer")]
                 self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
-                #[cfg(not(feature = "lightning"))]
+                #[cfg(feature = "developer")]
                 if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
                     crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=0", virt_addr, phys_addr, set);
                 }
@@ -3928,7 +3663,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             } else if self.ic.get_tag(set | way1_base).matches_phys(phys_addr) {
                 #[cfg(feature = "developer")]
                 self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
-                #[cfg(not(feature = "lightning"))]
+                #[cfg(feature = "developer")]
                 if devlog_is_active(LogModule::L1i) && devlog_mask(LogModule::L1i) & CACHE_LOG_HIT != 0 {
                     crate::dlog!(LogModule::L1i, "hit virt={:#x} phys={:#x} set={} way=1", virt_addr, phys_addr, set);
                 }
@@ -3947,25 +3682,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 FetchInstrResult::hit(slot)
             }
         } else {
-            #[cfg(feature = "debug_cache")]
-            let tracked = {
-                if self.is_tracking_addr(virt_addr, phys_addr) {
-                    println!("[CACHE DEBUG] fetch: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}",
-                             self.tracking_label(phys_addr), virt_addr, phys_addr);
-                    true
-                } else {
-                    let l2_idx = self.l2.get_index(phys_addr);
-                    if self.is_tracking_l2_idx(l2_idx) {
-                        let line_base = phys_addr & !(Self::L2_LINE_MASK as u64);
-                        println!("[CACHE DEBUG] fetch (L2 alias): idx=0x{:x}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}",
-                                 l2_idx, line_base, virt_addr, phys_addr);
-                        true
-                    } else {
-                        false
-                    }
-                }
-            };
-
             let ic_idx = self.ic.get_index(virt_addr);
             let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
 
@@ -3985,12 +3701,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 // here — see the comment there for why fetch() must not take get_mut().
                 let l2_slot_idx = ((phys_addr as usize) & (L2_CACHE_SIZE - 1)) >> 2;
                 let slot = &self.l2.instrs.get()[l2_slot_idx] as *const DecodedInstr;
-                #[cfg(feature = "debug_cache")]
-                if tracked {
-                    let raw = unsafe { (*slot).raw };
-                    println!("[CACHE DEBUG] fetch: virt 0x{:016x}, phys 0x{:016x} -> raw=0x{:08x}",
-                             virt_addr, phys_addr, raw);
-                }
                 FetchInstrResult::hit(slot)
             }
         }
@@ -4024,21 +3734,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
         self.ip28_trace("read", phys_addr, 0);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
-        #[cfg(feature = "debug_cache")]
-        {
-            if self.is_tracking_addr(virt_addr, phys_addr) {
-                println!("[CACHE DEBUG] read: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}, size {}",
-                         self.tracking_label(phys_addr), virt_addr, phys_addr, SIZE);
-            } else {
-                // Also track reads that will hit the same L2 index (cache line aliasing)
-                let l2_idx = self.l2.get_index(phys_addr);
-                if self.is_tracking_l2_idx(l2_idx) {
-                    let line_base = phys_addr & !(Self::L2_LINE_MASK as u64);
-                    println!("[CACHE DEBUG] read (L2 alias): idx=0x{:x}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}, size {}",
-                             l2_idx, line_base, virt_addr, phys_addr, SIZE);
-                }
-            }
-        }
 
         // R4K (1-way): way is always 0, dc_eidx == get_index(virt_addr), da == virt_addr.
         // Skip the generic ensure_l1d_line/dc_data_addr indirection entirely.
@@ -4052,17 +3747,12 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     return BusRead64 { status: r, data: 0 };
                 }
             }
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_idx);
             }
             // tcache: the cache stores no data — read RAM (window or bus).
             let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr), self.dc.dc_read::<SIZE>(virt_addr));
-            #[cfg(feature = "debug_cache")]
-            if self.is_tracking_addr(virt_addr, phys_addr) {
-                println!("[CACHE DEBUG] read{} result: {} virt 0x{:016x} phys 0x{:016x} val=0x{:016x}",
-                         SIZE * 8, self.tracking_label(phys_addr), virt_addr, phys_addr, result);
-            }
             return BusRead64::ok(result);
         }
         }
@@ -4074,7 +3764,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 return BusRead64 { status: way, data: 0 };
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_eidx);
             }
@@ -4083,11 +3773,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
                 self.dc.dc_read::<SIZE>(da)
             });
-            #[cfg(feature = "debug_cache")]
-            if self.is_tracking_addr(virt_addr, phys_addr) {
-                println!("[CACHE DEBUG] read{} result: {} virt 0x{:016x} phys 0x{:016x} val=0x{:016x}",
-                         SIZE * 8, self.tracking_label(phys_addr), virt_addr, phys_addr, result);
-            }
             BusRead64::ok(result)
         }
     }
@@ -4095,13 +3780,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
         self.ip28_trace("write", phys_addr, val);
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
-        #[cfg(feature = "debug_cache")]
-        {
-            if self.is_tracking_addr(virt_addr, phys_addr) {
-                println!("[CACHE DEBUG] write{}: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}, val 0x{:016x}",
-                         SIZE * 8, self.tracking_label(phys_addr), virt_addr, phys_addr, val);
-            }
-        }
 
         // R4K (1-way): way always 0, dc_eidx == get_index(virt_addr), da == virt_addr.
         if !Self::IS_R5K {
@@ -4117,7 +3795,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     return r;
                 }
             }
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_idx, val);
             }
@@ -4155,7 +3833,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 return way;
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
-            #[cfg(not(feature = "lightning"))]
+            #[cfg(feature = "developer")]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_eidx, val);
             }
@@ -4173,13 +3851,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
     fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
         // SDL/SDR only — arbitrary sub-doubleword mask, always a RMW on the full u64 slot
-        #[cfg(feature = "debug_cache")]
-        {
-            if self.is_tracking_addr(virt_addr, phys_addr) {
-                println!("[CACHE DEBUG] write64_masked: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}, val 0x{:016x}, mask 0x{:016x}",
-                         self.tracking_label(phys_addr), virt_addr, phys_addr, val, mask);
-            }
-        }
 
         // R4K (1-way): da == virt_addr directly.
         if !Self::IS_R5K {
@@ -4331,25 +4002,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let set = self.dc.get_index(virt_addr);
             if Self::IS_R5K { set | (((virt_addr >> 14) as usize & 1) << Self::DC_NUM_LINES_SHIFT) } else { set }
         };
-
-        #[cfg(feature = "debug_cache")]
-        {
-            let tracked = if is_l2 {
-                // hit ops: phys_addr is the real address; index ops: phys_addr == virt_addr (index)
-                self.is_tracking_l2_idx(idx)
-                    || self.is_tracking_addr(phys_addr, phys_addr)
-            } else {
-                // For both L1I and L1D: fire on phys address match OR set index match
-                self.is_tracking_addr(phys_addr, phys_addr)
-                    || self.is_tracking_l2_idx(self.l2.get_index(phys_addr))
-                    || self.is_tracking_l1d_idx(idx & Self::DC_NUM_LINES_MASK)
-            };
-            if tracked {
-                let way = if !is_l2 { idx >> Self::DC_NUM_LINES_SHIFT } else { 0 };
-                println!("[CACHE DEBUG] cache_op: {} virt={:#x} phys={:#x} idx=0x{:x} way={}",
-                         cache_op_name(cache_op), virt_addr, phys_addr, idx, way);
-            }
-        }
 
         // cascade: on R5K, L1 cache ops must propagate to L2 (and L2 to memory) because
         // the PROM only flushes L1 when SC=1, relying on hardware to keep L2 coherent.

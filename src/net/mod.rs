@@ -214,11 +214,8 @@ impl PcapStatus {
     }
 }
 
-// ── NAT debug/status control (shared between NatEngine thread and command handler) ─
+// ── NAT status control (shared between NatEngine thread and command handler) ─
 pub struct NatControl {
-    pub debug_tcp:  AtomicBool,
-    pub debug_udp:  AtomicBool,
-    pub debug_icmp: AtomicBool,
     pub snapshot:   Mutex<NatSnapshot>,
     /// Set to true to flush all NAT tables on the next NatEngine loop iteration.
     /// The NAT thread clears the flag after flushing.
@@ -281,9 +278,6 @@ impl NatControl {
     /// count a [`Link`] keeps.
     pub fn counting(frames: Arc<AtomicU64>) -> Arc<Self> {
         Arc::new(Self {
-            debug_tcp:  AtomicBool::new(false),
-            debug_udp:  AtomicBool::new(false),
-            debug_icmp: AtomicBool::new(false),
             snapshot:   Mutex::new(NatSnapshot::default()),
             reset_nat:  AtomicBool::new(false),
             guest_frames: frames,
@@ -320,7 +314,6 @@ impl NatControl {
     pub fn pcap_status(&self) -> PcapStatus {
         PcapStatus::from_u8(self.pcap_status.load(Ordering::Relaxed))
     }
-    pub fn dbg_tcp(&self)  -> bool { self.debug_tcp.load(Ordering::Relaxed) }
     /// The guest's likely default gateway (in-subnet ARP target it can't
     /// resolve), or None if none seen.
     pub fn observed_gateway(&self) -> Option<Ipv4Addr> {

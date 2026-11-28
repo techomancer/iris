@@ -23,7 +23,7 @@
 //! of 4 KiB slots over the R10000's 40-bit physical space, each pointing at
 //! the device that answers it.
 //!
-//! Set IRIS_IP30_TRACE=1 to log unmapped accesses as they happen.
+//! `log heart on` logs unmapped accesses as they happen.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,9 +110,7 @@ impl Unmapped {
         let pc = LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
         let mut u = self.misses.lock();
         if !u.iter().any(|&(a, w, _)| a == addr && w == write) {
-            if std::env::var_os("IRIS_IP30_TRACE").is_some() {
-                eprintln!("ip30: unmapped {} at {addr:#x} (pc {pc:#x})", if write { "write" } else { "read" });
-            }
+            crate::dlog!(crate::devlog::LogModule::Heart, "ip30: unmapped {} at {addr:#x} (pc {pc:#x})", if write { "write" } else { "read" });
             u.push((addr, write, pc));
             if u.len() == 64 {
                 self.full.store(true, Ordering::Relaxed);

@@ -140,8 +140,6 @@ pub mod build_features {
             ("pcap", cfg!(feature = "pcap")),
             ("ci_clock", cfg!(feature = "ci_clock")),
             ("developer", cfg!(feature = "developer")),
-            ("developer_ip7", cfg!(feature = "developer_ip7")),
-            ("debug_cache", cfg!(feature = "debug_cache")),
             ("jitv2_lockstep", cfg!(feature = "jitv2_lockstep")),
             ("jitv2_smc_check", cfg!(feature = "jitv2_smc_check")),
             ("fetchverify", cfg!(feature = "fetchverify")),

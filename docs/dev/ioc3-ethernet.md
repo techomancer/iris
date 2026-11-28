@@ -353,7 +353,7 @@ power-on test uses it (§5.1).
 ### 5.1 PROM 4.17
 
 Traced in IRIS during the bring-up, when the Ethernet registers were a
-register file and the bus logged every IOC3 access (`IRIS_IP30_TRACE=2`,
+register file and the bus logged every IOC3 access (an env trace,
 gone with the model that replaced the register file), then with two
 throwaway stubs (EMCR bit 21 after reset, and a DP83840 at PHY address 31
 with the link up) to see further.

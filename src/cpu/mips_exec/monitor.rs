@@ -269,9 +269,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
 
         let executor = self.executor.clone();
         let running = self.running.clone();
-        let debug = self.debug.clone();
         let exception_mask = self.exception_mask.clone();
-        let trace_file = self.trace_file.clone();
         let stop_note = self.stop_note.clone();
         let cpu_id = self.executor.lock().core.cpu_id;
 
@@ -368,8 +366,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                 }
 
                 // Display executed instruction from traceback (already captured by step())
-                let insn_trace = debug.load(Ordering::Relaxed) || mips_log(MIPS_LOG_INSN);
-                if insn_trace || count.is_some() || trace_file.lock().is_some() {
+                let insn_trace = mips_log(MIPS_LOG_INSN);
+                if insn_trace || count.is_some() {
                     if let Some(entry) = exec.traceback.get_last(1).into_iter().next() {
                         let symbols = exec.symbols.lock();
                         let sym_str = format_pc_symbol(entry.pc, &symbols);
@@ -377,15 +375,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let info = format!("{:#018x}{}: {:#010x} {}", entry.pc, sym_str, entry.instr, dis);
                         if insn_trace {
                             dlog_dev!(LogModule::Mips, "{}", info);
-                            writeln!(writer, "{}", info).unwrap();
                         }
                         if count.is_some() {
                             // Route through devlog writers so Exec: lines serialize with
                             // cache/device dlog output on the same TCP socket.
                             crate::dlog_unconditional!("Exec: {}", info);
-                        }
-                        if let Some(ref mut f) = *trace_file.lock() {
-                            let _ = writeln!(f, "{}", info);
                         }
                     } else if insn_trace {
                         writeln!(writer, "PC: {:016x} (Fetch failed)", exec.core.pc).unwrap();
@@ -458,7 +452,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             }
             #[cfg(feature = "developer")]
             { exec.skip_interrupts = false; }
-            if let Some(ref mut f) = *trace_file.lock() { let _ = f.flush(); }
 
             // Print next instruction
             let next_pc = exec.core.pc;
@@ -577,7 +570,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             ("setreg".to_string(), "Set register value: setreg <reg> <value>".to_string()),
             ("translate".to_string(), "Translate virtual address: translate <addr>".to_string()),
             ("t".to_string(), "Alias for translate".to_string()),
-            ("debug".to_string(), "CPU instruction trace: debug <on|off|file <path>> [DEV]".to_string()),
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear|resize <n>> [DEV]".to_string()),
             ("dt".to_string(), "Disassemble traceback: dt [count] | dt file [<path> [count]]".to_string()),
@@ -1646,37 +1638,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         3 => "Cacheable", 5 => "CacheableCoherent", _ => "Uncached",
                     };
                     writeln!(writer, "Translated {{ phys_addr: 0x{:08x}, cache_attr: {} }}", tr.phys, c).unwrap();
-                }
-                Ok(())
-            }
-            "debug" => {
-                if actual_args.is_empty() {
-                    return Err("Usage: debug <on|off|file> [filename]".to_string());
-                }
-                match actual_args[0] {
-                    "on" | "1" => {
-                        self.debug.store(true, Ordering::Relaxed);
-                        *self.trace_file.lock() = None;
-                        writeln!(writer, "CPU debug enabled (console output)").unwrap();
-                    }
-                    "off" | "0" => {
-                        self.debug.store(false, Ordering::Relaxed);
-                        *self.trace_file.lock() = None;
-                        writeln!(writer, "CPU debug disabled").unwrap();
-                    }
-                    "file" => {
-                        // file <path>: trace to file only, no socket spam
-                        let path = actual_args.get(1).ok_or("Usage: debug file <filename>")?;
-                        match std::fs::File::create(path) {
-                            Ok(f) => {
-                                self.debug.store(false, Ordering::Relaxed);
-                                *self.trace_file.lock() = Some(std::io::BufWriter::new(f));
-                                writeln!(writer, "CPU trace -> {}", path).unwrap();
-                            }
-                            Err(e) => return Err(format!("Cannot open {}: {}", path, e)),
-                        }
-                    }
-                    _ => return Err("Usage: debug <on|off|file> [filename]".to_string()),
                 }
                 Ok(())
             }

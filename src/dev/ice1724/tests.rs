@@ -1714,21 +1714,15 @@ fn a_big_endian_slot_word_through_a_real_pic_slot_plays_its_sample() {
 /// must count as underrun. The tone is in slots 0 and 1, which the host
 /// gets at unity as its front pair, and it drifts in pitch so that no
 /// frame is the same as one a lap earlier; the frames the card hands the
-/// host must follow one another in the guest's order, none replayed.
-fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend) {
+/// host must follow one another in the guest's order, none replayed. The
+/// clock is stepped, so a busy host cannot hold the guest up.
+#[test]
+fn a_tone_survives_an_underrun_on_a_stepped_clock() {
     use crate::host_audio::test_signal::*;
-    use std::time::{Duration, Instant};
-    let file = matches!(backend, Backend::File);
-    let Some(ear) = Listener::new(backend, "ice1724-underrun") else { return };
     const RATE: f64 = 48000.0;
     let (left, right) = (440.0, 880.0);
-    let c = Ice1724::new(&Arc::new(TimerManager::new()), Variant::Dm8);
-    let ram = Arc::new(Ram(std::sync::Mutex::new(vec![0; 0x10_0000])));
-    c.state().connect_dma(ram.clone());
-    c.attached();
-    map(&c);
-    c.enable_output(ear.cfg.clone());
-    Device::start(&c);
+    let c = rig(Variant::Dm8);
+    let mut host = detached_host(&c, 2);
     // The frames the card hands the host, before the host stream converts
     // them to its own clock.
     let tap = Arc::new(Mutex::new(Vec::new()));
@@ -1742,7 +1736,7 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
         (16000.0 * (std::f64::consts::TAU * (hz * t + t * t)).sin()).round() as i16
     };
     let fill = |written: &mut u64, upto: u64| {
-        let mut m = ram.0.lock().unwrap();
+        let mut m = c.ram.0.lock().unwrap();
         while *written < upto {
             let at = BUFFER as usize + (*written % IRIX_RING_FRAMES) as usize * 32;
             for (slot, hz) in [(0, left), (1, right)] {
@@ -1760,8 +1754,7 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
     // card may run one read-ahead past that position before the write
     // lands, and the position is at most one read-ahead past the one read
     // before, whose write has landed: with two, every frame the card reads
-    // is written, however long the host holds the guest up between its
-    // read and its write. IRIX writes less ahead (see the module notes).
+    // is written. IRIX writes less ahead (see the module notes).
     let lead = 2 * (u128::from(READ_AHEAD_NS) * 48000 / NS_PER_SEC) as u64;
     // Eight slots to a frame, at the reset rate of 48 kHz: the host
     // stream takes the frames unresampled.
@@ -1769,98 +1762,62 @@ fn a_tone_survives_an_underrun(backend: crate::host_audio::test_signal::Backend)
     mt_wl(&c, 0x10, BUFFER as u32);
     mt_wl(&c, 0x14, IRIX_RING_FRAMES as u32 * 8 - 1);
     let (mut written, mut read) = (0u64, 0u64);
-    // The hold lasts while reads come less than 50 ms apart; until the
-    // first read after a start the card runs on its clock, through the lap
-    // written before it. Each bound spans from before one read, or the
-    // start, to after the next read, or the stop, so it covers the card's
-    // own instants.
-    let (mut longest_gap, mut slowest_start) = (Duration::ZERO, Duration::ZERO);
+    let mut pcm = Vec::new();
+    // The card runs `ns` of machine time and the host takes the frames
+    // that time holds.
+    let mut run = |ns: i64| {
+        step(&c, ns);
+        pcm.extend(host.render((ns as u64 * 48000 / 1_000_000_000) as usize));
+    };
     // A stretch: write a lap from where the engine stopped, start it, and
-    // for 0.6 s read the position and write ahead of it about every half
+    // for 0.6 s read the position and write ahead of it every half
     // millisecond, looking away for 30 ms halfway; then stop it.
-    let mut stretch = || {
+    let mut stretch = |run: &mut dyn FnMut(i64)| {
         position(&mut read);
         fill(&mut written, read + IRIX_RING_FRAMES);
-        let started = Instant::now();
         mt_wb(&c, 0x18, 0x01);
-        let mut last: Option<Instant> = None;
         for half in 0..2 {
-            let end = Instant::now() + Duration::from_millis(300);
-            while Instant::now() < end {
-                let before = Instant::now();
+            for _ in 0..600 {
+                run(500_000);
                 position(&mut read);
-                match last {
-                    Some(t) => longest_gap = longest_gap.max(t.elapsed()),
-                    None => slowest_start = slowest_start.max(started.elapsed()),
-                }
-                last = Some(before);
                 fill(&mut written, read + lead);
-                std::thread::sleep(Duration::from_micros(500));
             }
             if half == 0 {
-                std::thread::sleep(Duration::from_millis(30));
+                run(30_000_000);
             }
         }
         mt_wb(&c, 0x18, 0x00);
-        longest_gap = longest_gap.max(last.map_or(Duration::ZERO, |t| t.elapsed()));
     };
     let moved = || c.stats().analog_frames as f64;
     let underruns = || c.sink.lock().as_ref().and_then(|s| s.host.as_ref()).map_or(0, |h| h.stats().underruns);
-    stretch();
+    stretch(&mut run);
     let (first, before) = (moved(), underruns());
-    std::thread::sleep(Duration::from_millis(300));
+    run(300_000_000);
     let (paused, underran) = (moved(), underruns() - before);
-    stretch();
+    stretch(&mut run);
     let second = moved() - paused;
     // What the host still holds plays out.
-    std::thread::sleep(Duration::from_millis(300));
-    Device::stop(&c);
-    c.sink.lock().take();
-    let heard = ear.heard();
+    run(300_000_000);
+    let heard = Heard { rate: 48000, channels: 2, pcm };
     assert_a_tone_either_side_of_a_pause(&heard, left, right, 8000, [first / RATE, second / RATE]);
     assert!(underran > 0, "the host stream ran dry while the output was stopped");
     assert_eq!(paused, first, "the engine moved while it was stopped");
-    // A host that kept the guest from reading for 40 ms lets the 50 ms
-    // hold run out, or for 18 ms after a start lets the card through the
-    // 21 ms lap written ahead less the 1.5 ms it may read past that first
-    // read, as it would a real guest: the card then reads frames not yet
-    // written, and the order check below would be a false alarm. So would
-    // a host ring that dropped more frames than the check looks ahead.
-    let dropped = c.stats().dropped_frames;
-    let calm = longest_gap < Duration::from_millis(40) && slowest_start < Duration::from_millis(18) && dropped < 4800;
-    if !calm {
-        eprintln!("the guest was kept away for {longest_gap:?}, {slowest_start:?} after a start, {dropped} frames dropped: not checking the order of the frames");
+    assert_eq!(c.stats().dropped_frames, 0);
+    let sent = tap.lock();
+    // The frames played, silence left out, are the guest's frames in
+    // order: each is later in the stream than the one before and no
+    // more than 100 ms after it. A replayed lap goes back.
+    let mut n = 0u64;
+    for (i, f) in sent.chunks_exact(2).filter(|f| f.iter().any(|&v| v != 0)).enumerate() {
+        let at = (n..n + 4800).find(|&k| f[0] == tone(left, k) && f[1] == tone(right, k));
+        let Some(k) = at else { panic!("frame {i} of the sound ({}, {}) is not the guest's frame {n} or any of the next 4800", f[0], f[1]) };
+        n = k + 1;
     }
-    if file {
-        assert_eq!((heard.rate, heard.channels), (crate::host_audio::FILE_RATE, 2));
+    // Unity gain into the front pair: each side reaches the tone's peak.
+    for ch in 0..2 {
+        assert!(peak(&channel(&heard.pcm, heard.channels, ch)) >= 15800, "channel {ch} peak {}", peak(&channel(&heard.pcm, heard.channels, ch)));
     }
-    if calm {
-        let sent = tap.lock();
-        // The frames played, silence left out, are the guest's frames in
-        // order: each is later in the stream than the one before and no
-        // more than 100 ms after it. A replayed lap goes back.
-        let mut n = 0u64;
-        for (i, f) in sent.chunks_exact(2).filter(|f| f.iter().any(|&v| v != 0)).enumerate() {
-            let at = (n..n + 4800).find(|&k| f[0] == tone(left, k) && f[1] == tone(right, k));
-            let Some(k) = at else { panic!("frame {i} of the sound ({}, {}) is not the guest's frame {n} or any of the next 4800", f[0], f[1]) };
-            n = k + 1;
-        }
-        // Unity gain into the front pair: each side reaches the tone's peak.
-        for c in 0..2 {
-            assert!(peak(&channel(&heard.pcm, heard.channels, c)) >= 15800, "channel {c} peak {}", peak(&channel(&heard.pcm, heard.channels, c)));
-        }
-        assert!(n as f64 >= 0.5 * (first + second), "{n} of the {} frames the card moved were heard", first + second);
-    }
-}
-
-#[test]
-fn a_tone_survives_an_underrun_into_a_file() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::File);
-}
-
-#[test]
-fn a_tone_survives_an_underrun_on_the_real_device() {
-    a_tone_survives_an_underrun(crate::host_audio::test_signal::Backend::RealDevice);
+    assert!(n as f64 >= 0.5 * (first + second), "{n} of the {} frames the card moved were heard", first + second);
 }
 
 /// The monitor's `ice1724` command shows a raised interrupt, the engine

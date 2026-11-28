@@ -1,5 +1,5 @@
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::fs::File;
 use std::io::Write as IoWrite;
@@ -339,6 +339,8 @@ impl InterruptController for Hpc3Interrupts {
 struct ArmSignal {
     gen: Mutex<u64>,
     cv: parking_lot::Condvar,
+    /// Told of every change of ACTIVE, under the channel lock (`DmaClient::on_active_change`).
+    listener: OnceLock<Box<dyn Fn(bool) + Send + Sync>>,
 }
 
 impl ArmSignal {
@@ -347,6 +349,12 @@ impl ArmSignal {
     fn notify(&self) {
         *self.gen.lock() += 1;
         self.cv.notify_all();
+    }
+
+    /// Wake waiters on a rise, and tell the listener of either change.
+    fn changed(&self, active: bool) {
+        if active { self.notify(); }
+        if let Some(f) = self.listener.get() { f(active); }
     }
 
     /// Sleep until the generation is no longer `seen` or `deadline` passes.
@@ -476,7 +484,7 @@ fn start_transaction(&mut self) {
             let rising = !self.is_active();
             self.ctrl |= self.active_mask;
             // A device thread may be waiting for this (see `ArmSignal`).
-            if rising { self.armed.notify(); }
+            if rising { self.armed.changed(true); }
         } else {
             if self.is_active() {
                 if self.log_active() {
@@ -484,8 +492,9 @@ fn start_transaction(&mut self) {
                         self.id, self.bytes_transferred, self.ctrl);
                 }
                 crate::pf_end!(crate::perfetto::events::PDMA_ACTIVE[self.id]);
+                self.ctrl &= !self.active_mask;
+                self.armed.changed(false);
             }
-            self.ctrl &= !self.active_mask;
         }
     }
 
@@ -894,6 +903,8 @@ impl DmaClient for PdmaClientImpl {
         self.armed.wait_past(seen, deadline);
         self.channel.lock().is_active()
     }
+    fn is_active(&self) -> bool { self.channel.lock().is_active() }
+    fn on_active_change(&self, f: Box<dyn Fn(bool) + Send + Sync>) { let _ = self.armed.listener.set(f); }
     fn rx_room(&self) -> RxRoom {
         let mut c = self.channel.lock();
         if c.id == HPC3_PDMA_CHAN_ENET_RX as usize { c.rx_room() } else { RxRoom::Room }
@@ -911,7 +922,7 @@ impl DmaClient for PdmaClientImpl {
 
 trait PdmaChannelOps: Send + Sync {
     fn read(&self, chan: &mut PdmaChannel, reg: u32) -> u32;
-    fn write(&self, chan: &mut PdmaChannel, reg: u32, val: u32);
+    fn write(&self, chan: &mut MutexGuard<PdmaChannel>, reg: u32, val: u32);
 
     fn read_dmacfg(&self, chan: &mut PdmaChannel) -> u32 { chan.dmacfg }
     fn write_dmacfg(&self, chan: &mut PdmaChannel, val: u32) { 
@@ -950,7 +961,7 @@ impl PdmaChannelOps for PbusDmaOps {
             _ => 0
         }
     }
-    fn write(&self, chan: &mut PdmaChannel, reg: u32, val: u32) {
+    fn write(&self, chan: &mut MutexGuard<PdmaChannel>, reg: u32, val: u32) {
         match reg {
             HPC3_PDMA_CBP => chan.cbp = val,
             HPC3_PDMA_NBDP => chan.nbdp = val,
@@ -1004,7 +1015,7 @@ impl PdmaChannelOps for ScsiDmaOps {
             _ => 0
         }
     }
-    fn write(&self, chan: &mut PdmaChannel, reg: u32, val: u32) {
+    fn write(&self, chan: &mut MutexGuard<PdmaChannel>, reg: u32, val: u32) {
         match reg {
             HPC3_PDMA_CBP => chan.cbp = val,
             HPC3_PDMA_NBDP => chan.nbdp = val,
@@ -1027,12 +1038,6 @@ impl PdmaChannelOps for ScsiDmaOps {
 
                 if reset { should_be_active = false; }
 
-                // Falling edge of RESET: pulse the WD33C93A chip reset.
-                // After reset the chip sets ASR.INT; OpenBSD wdsc_match() polls for this.
-                if prev_reset && !reset {
-                    if let Some(wd) = self.wd.get() { wd.power_on(); }
-                }
-
                 chan.set_active(should_be_active);
 
                 if !was_active && should_be_active {
@@ -1049,6 +1054,15 @@ impl PdmaChannelOps for ScsiDmaOps {
                     // Firing again on FLUSH leaves the bit stuck → IRQ storm.
                     chan.set_active(false);
                     chan.ctrl &= !(SCSI_CTRL_ACTIVE | SCSI_CTRL_FLUSH);
+                }
+
+                // Falling edge of RESET: pulse the WD33C93A chip reset.
+                // After reset the chip sets ASR.INT; OpenBSD wdsc_match() polls for this.
+                // The WD worker takes its state, then this channel: reset it unlocked.
+                if prev_reset && !reset {
+                    if let Some(wd) = self.wd.get() {
+                        MutexGuard::unlocked(chan, || wd.power_on());
+                    }
                 }
             }
             SCSI_GIO => chan.gio = val,
@@ -1118,7 +1132,7 @@ impl PdmaChannelOps for EnetRxDmaOps {
             _ => 0
         }
     }
-    fn write(&self, chan: &mut PdmaChannel, reg: u32, val: u32) {
+    fn write(&self, chan: &mut MutexGuard<PdmaChannel>, reg: u32, val: u32) {
         match reg {
             ENET_RX_CBP => chan.cbp = val,
             ENET_RX_NBDP => chan.nbdp = val,
@@ -1183,7 +1197,7 @@ impl PdmaChannelOps for EnetTxDmaOps {
             _ => 0
         }
     }
-    fn write(&self, chan: &mut PdmaChannel, reg: u32, val: u32) {
+    fn write(&self, chan: &mut MutexGuard<PdmaChannel>, reg: u32, val: u32) {
         match reg {
             ENET_TX_CBP => chan.cbp = val,
             ENET_TX_NBDP => chan.nbdp = val,
@@ -1380,6 +1394,7 @@ impl Hpc3 {
         };
 
         let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::with_audio(tm, dma_clients[0..8].to_vec(), audio))) };
+        if let Some(h) = &hal2 { h.watch_dma(); }
 
         Self {
             state,
@@ -1529,7 +1544,7 @@ impl Device for Hpc3 {
         cmds.push(("pdma".to_string(), "PDMA commands: pdma status | pdma chain <addr> | pdma dump <on|off|hal|scsi|enet|MASK> [DEV]".to_string()));
         cmds.extend(self.ioc.register_commands());
         cmds.extend(self.rtc.register_commands());
-        cmds.push(("nveeprom".to_string(), "NVRAM EEPROM commands (93CS56 @ 0x1fbb0008, stores env vars + MAC @ words 0x7D-0x7F — NOT the CPU/MC chip, see `eeprom`): nveeprom <on|off> | nveeprom dump | nveeprom r <word> | nveeprom w <word> <val> | nveeprom save [file]".to_string()));
+        cmds.push(("nveeprom".to_string(), "NVRAM EEPROM commands (93CS56 @ 0x1fbb0008, stores env vars + MAC @ words 0x7D-0x7F — NOT the CPU/MC chip, see `eeprom`): nveeprom dump | nveeprom r <word> | nveeprom w <word> <val> | nveeprom save [file]".to_string()));
         cmds.extend(self.seeq.register_commands());
         cmds.extend(self.scsi_dev.register_commands());
         // "scsi"/"cow" above already cover controller 0; scsi0 is an
@@ -1668,15 +1683,9 @@ impl Device for Hpc3 {
         }
         if cmd == "nveeprom" {
             if args.is_empty() {
-                return Err("Usage: nveeprom <on|off|dump|r|w|save> ...".to_string());
+                return Err("Usage: nveeprom <dump|r|w|save> ...".to_string());
             }
             match args[0] {
-                "on" | "1" | "off" | "0" => {
-                    let debug = matches!(args[0], "on" | "1");
-                    self.eeprom.lock().set_debug(debug);
-                    writeln!(writer, "NVRAM EEPROM debug {}", if debug { "enabled" } else { "disabled" }).unwrap();
-                    return Ok(());
-                }
                 "dump" => {
                     let eeprom = self.eeprom.lock();
                     for (i, chunk) in eeprom.get_data().chunks(8).enumerate() {
@@ -1729,7 +1738,7 @@ impl Device for Hpc3 {
                         Err(e) => return Err(format!("Failed to save NVRAM EEPROM: {}", e)),
                     }
                 }
-                _ => return Err("Usage: nveeprom <on|off|dump|r|w|save> ...".to_string()),
+                _ => return Err("Usage: nveeprom <dump|r|w|save> ...".to_string()),
             }
         }
         Err("Command not found".to_string())
@@ -2718,7 +2727,9 @@ mod tests {
 mod enet_rx_chain_tests {
     use super::*;
 
-    fn hpc3_for_test() -> Hpc3 {
+    fn hpc3_for_test() -> Hpc3 { hpc3_with_audio(false) }
+
+    fn hpc3_with_audio(audio: bool) -> Hpc3 {
         let tm = Arc::new(TimerManager::new());
         Hpc3::with_net(
             Arc::new(Mutex::new(Eeprom93c56::new())),
@@ -2726,7 +2737,7 @@ mod enet_rx_chain_tests {
             true,
             Arc::new(AtomicU64::new(0)),
             NetworkConfig::default(),
-            true,
+            !audio,
             AudioConfig::default(),
             String::new(),
             RtcOffset::default(),
@@ -3039,6 +3050,58 @@ mod enet_rx_chain_tests {
         let (active, waited) = waiter.join().unwrap();
         assert!(active);
         assert!(waited < std::time::Duration::from_secs(10), "woke only after {waited:?}: the arming did not wake it");
+    }
+
+    /// Falling edge of SCSI_CTRL RESET resets the chip, and so its targets.
+    /// The WD worker holds the chip's state and then takes the channel, so the
+    /// reset must run with the channel lock released.
+    #[test]
+    fn a_scsi_reset_edge_resets_the_chip_without_the_channel_lock() {
+        struct Probe(Arc<Mutex<PdmaChannel>>, Arc<std::sync::atomic::AtomicI32>);
+        impl crate::scsi::ScsiTarget for Probe {
+            fn request(&mut self, _: &crate::scsi::ScsiRequest) -> std::io::Result<crate::scsi::ScsiResponse> {
+                unreachable!()
+            }
+            fn power_on(&mut self) {
+                let free = self.0.try_lock().is_some();
+                self.1.store(free as i32, Ordering::SeqCst);
+            }
+        }
+        let (hpc3, _ram) = one_descriptor(0);
+        let free = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        hpc3.scsi_dev.bus().attach(1, Box::new(Probe(hpc3.pdma_channels[8].clone(), free.clone()))).unwrap();
+
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), SCSI_CTRL_RESET);
+        assert_eq!(free.load(Ordering::SeqCst), -1, "reset reached the chip before its edge fell");
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), 0);
+        assert_eq!(free.load(Ordering::SeqCst), 1, "the chip was reset under the channel lock, or not at all");
+        hpc3.release();
+    }
+
+    /// The board wires HAL2 to its codec channels.
+    #[test]
+    fn a_board_with_audio_listens_to_its_codec_channels() {
+        let hpc3 = hpc3_with_audio(true);
+        assert!(hpc3.pdma_channels[..8].iter().all(|c| c.lock().armed.listener.get().is_some()));
+    }
+
+    /// A listener hears each start and stop of a channel once, and nothing when
+    /// the guest arms a channel that is already running.
+    #[test]
+    fn a_listener_hears_a_scsi_channel_start_and_stop() {
+        let (hpc3, _ram) = one_descriptor(0);
+        let dma = PdmaClientImpl::new(hpc3.pdma_channels[8].clone());
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let h = heard.clone();
+        dma.on_active_change(Box::new(move |active| h.lock().push(active)));
+        assert!(!dma.is_active());
+        hpc3.write32(reg(SCSI0_BASE + SCSI_NBDP), 0x100);
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), SCSI_CTRL_ACTIVE);
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), SCSI_CTRL_ACTIVE);
+        assert!(dma.is_active());
+        hpc3.write32(reg(SCSI0_BASE + SCSI_CTRL), 0);
+        assert!(!dma.is_active());
+        assert_eq!(*heard.lock(), [true, false]);
     }
 
     /// An already active channel does not wait; one nobody arms waits out

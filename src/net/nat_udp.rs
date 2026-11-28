@@ -71,8 +71,8 @@ impl NatEngine {
             _ => {
                 // A read request that is not ours: say where it goes, since
                 // "no TFTP trace" otherwise looks the same as "no request".
-                if dport == super::services::TFTP_PORT && payload.starts_with(&[0, 1]) && super::tftp::trace_enabled() {
-                    eprintln!("iris: tftp: guest {}:{} -> {}:{} read request {}",
+                if dport == super::services::TFTP_PORT && payload.starts_with(&[0, 1]) {
+                    dlog!(LogModule::Net, "tftp: guest {}:{} -> {}:{} read request {}",
                               src_ip, sport, dst_ip, dport,
                               if to_gw { "relayed to the host's port 69: tftp_dir is not set" }
                               else { "relayed to that address: it is not the gateway" });

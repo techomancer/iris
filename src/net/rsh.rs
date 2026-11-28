@@ -320,21 +320,10 @@ enum Job {
     Grep { rd: BufReader<File>, pat: Vec<u8>, line: Vec<u8>, hits: u64 },
 }
 
-/// With `IRIS_RSH_TRACE` set, every request and how it ended is written to
-/// stderr, in any build (`dlog_dev!` output exists only in `developer` builds).
-/// It shows what a client asks for, how many bytes each request moved and how
-/// long it took, and requests that never finished, which is what slow or hung
-/// installs need.
-pub(super) fn trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("IRIS_RSH_TRACE").is_some())
-}
-
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct RshSession {
     id: u64,
-    trace: bool,
     started: Instant,
     command: String,
     /// Stdout bytes handed to the connection so far.
@@ -378,7 +367,7 @@ impl RshSession {
     /// Serve the built-in commands out of `root`. Nothing outside it is reachable.
     pub fn new(root: PathBuf) -> Self {
         Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed), trace: trace_enabled(),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             started: Instant::now(), command: String::new(), sent: 0,
             root, phase: Phase::Header, inbuf: Vec::new(), out: VecDeque::new(),
             job: Job::None, chan: None, side: None, finished: false,
@@ -436,9 +425,7 @@ impl RshSession {
         if port == 0 || self.chan.is_some() {
             return;
         }
-        if self.trace {
-            eprintln!("iris: rsh #{} stderr port {}: connecting back to the guest", self.id, port);
-        }
+        crate::dlog!(LogModule::Net, "rsh #{} stderr port {}: connecting back to the guest", self.id, port);
         let chan = Arc::new(Mutex::new(Chan::default()));
         self.side = Some(SideConnect { guest_port: port, service: Box::new(StderrService(chan.clone())) });
         self.chan = Some(chan);
@@ -448,10 +435,8 @@ impl RshSession {
         dlog_dev!(LogModule::Net, "NAT rsh local user {:?}, remote user {:?}: {:?}",
                   req.local_user, req.remote_user, req.command);
         self.phase = Phase::Running;
-        if self.trace {
-            eprintln!("iris: rsh #{} {}@{}: {:?} (stderr port {})", self.id, req.remote_user,
-                      req.local_user, req.command, req.stderr_port);
-        }
+        crate::dlog!(LogModule::Net, "rsh #{} {}@{}: {:?} (stderr port {})", self.id, req.remote_user,
+                     req.local_user, req.command, req.stderr_port);
         self.command = req.command.clone();
         self.requested = true;
         self.open_stderr(req.stderr_port); // a no-op: the first field already did
@@ -539,9 +524,7 @@ impl RshSession {
             };
             let raw: Vec<u8> = self.stdin.drain(..=nl).collect();
             let line = String::from_utf8_lossy(&raw).trim().to_string();
-            if self.trace {
-                eprintln!("iris: rsh #{} stdin: {:?}", self.id, line);
-            }
+            crate::dlog!(LogModule::Net, "rsh #{} stdin: {:?}", self.id, line);
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -1057,7 +1040,7 @@ fn mode_string(m: &fs::Metadata) -> String {
 
 impl Drop for RshSession {
     fn drop(&mut self) {
-        if !self.trace {
+        if !crate::devlog::devlog_is_active(LogModule::Net) {
             return;
         }
         let ms = self.started.elapsed().as_millis();
@@ -1071,7 +1054,7 @@ impl Drop for RshSession {
         } else {
             "closed by the guest before the command finished".to_string()
         };
-        eprintln!("iris: rsh #{} {:?}: {} bytes in {} ms, {}", self.id, self.command, self.sent, ms, how);
+        crate::dlog!(LogModule::Net, "rsh #{} {:?}: {} bytes in {} ms, {}", self.id, self.command, self.sent, ms, how);
     }
 }
 

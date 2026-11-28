@@ -33,6 +33,34 @@ hashes are given where a change is easiest to understand by reading the commit.
   the guest's clock, serve a folder over TFTP or rsh, and read the
   benchmark's figures as a table rather than a block of text. A dual Newport
   draws both heads again: the native shells had been showing only the first.
+### Snapshots
+
+- A failed snapshot load leaves the machine stopped, on every machine, and a snapshot of
+  another machine, CPU, disk or memory size is refused before anything is touched.
+
+### Tracing cleanup
+
+- The `debug` commands of `rtc`, `ps2`, `vino`, `scsi`, `rex`, `vc2`, `xmap`,
+  `cmap`, `bt445` and `dcb`, and `eeprom on|off` and `nveeprom on|off`, are
+  gone; `log <module> on` does the same (`log scsi1` for the second SCSI
+  controller).
+- `pit debug`, `net debug`, `phys error` and `phys hole` are gone: `log ioc`,
+  `log net` and the new `log phys` replace them. The timer and packet traces
+  need a `developer` build.
+- `IRIS_IP30_TRACE`, `IRIS_IP32_MEC_TRACE`, `IRIS_O2_AUDIO_TRACE`,
+  `IRIS_RSH_TRACE` and `IRIS_TFTP_TRACE` are gone: `log heart`, `log net` and
+  `log o2audio` show the same events (`log heart` also logs every HEART
+  register access and interrupt edge). The old traces wrote to stderr from
+  launch; `log` output goes to monitor clients, or to a file with
+  `log <module> file PATH`. `IRIS_IP32_HOT` is gone too; its counters were
+  never shown anywhere.
+- The CPU `debug` command is gone: `log mips mask insn` and `log mips on`
+  print each instruction `run` and `step` execute, and `log mips file PATH`
+  writes them to a file.
+- `phys trace` and the physical `trace` alias are gone: `log phys on` logs
+  every physical bus access. That and the `hit` category of `log l1i` and
+  `log l1d` need a `developer` build; before, every build but `lightning` paid
+  a check per access for them.
 
 ### Serial ports
 
@@ -930,6 +958,11 @@ image) where the guest test suites showed they differed:
   panel's width; coloured buttons (Start, Stop, Create, …) have white text;
   the status footer says "No network" instead of a network light on a machine
   with networking off, and names a stream network.
+
+### Developer builds
+
+- The `debug_cache` feature is gone.
+- The `developer_ip7` and `developerx` features and `IRIS_BREAK_CPU` are gone.
 
 ## October 2026
 

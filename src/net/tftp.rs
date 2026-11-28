@@ -40,22 +40,13 @@ const ERR_UNKNOWN_ID: u16 = 5;
 /// A client is identified by its address and source port (its TID).
 pub type ClientId = (Ipv4Addr, u16);
 
-/// With `IRIS_TFTP_TRACE` set, every request and how each transfer ended is
-/// written to stderr, in any build (`dlog_dev!` output exists only in
-/// `developer` builds): what was asked for, whether it was found, bytes,
+/// Traced under `log net`: what was asked for, whether it was found, bytes,
 /// blocks, retransmits, duplicate ACKs, the slowest ACK and the total time.
 /// Lock-step TFTP is as slow as its slowest round trip, so those numbers say
-/// where a slow or stalled PROM network boot spends its time.
-pub fn trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("IRIS_TFTP_TRACE").is_some())
-}
-
+/// where a slow PROM network boot spends its time.
 macro_rules! ttrace {
-    ($s:expr, $($a:tt)*) => {
-        if $s.trace {
-            eprintln!("iris: tftp {}", format_args!($($a)*));
-        }
+    ($($a:tt)*) => {
+        crate::dlog!(crate::devlog::LogModule::Net, "tftp {}", format_args!($($a)*))
     };
 }
 
@@ -97,13 +88,12 @@ pub struct TftpServer {
     root: PathBuf,
     transfers: HashMap<ClientId, Transfer>,
     timeout: Duration,
-    trace: bool,
 }
 
 impl TftpServer {
     /// Serve read-only out of `root`. Nothing outside it is ever reachable.
     pub fn new(root: PathBuf) -> Self {
-        Self { root, transfers: HashMap::new(), timeout: RETRANSMIT_TIMEOUT, trace: trace_enabled() }
+        Self { root, transfers: HashMap::new(), timeout: RETRANSMIT_TIMEOUT }
     }
 
     pub fn root(&self) -> &Path {
@@ -118,7 +108,7 @@ impl TftpServer {
         match u16::from_be_bytes([packet[0], packet[1]]) {
             OP_RRQ => Some(self.start_read(client, &packet[2..], now)),
             OP_WRQ => {
-                ttrace!(self, "{} WRQ refused: the server is read-only", who(client));
+                ttrace!("{} WRQ refused: the server is read-only", who(client));
                 Some(error_packet(ERR_ACCESS_VIOLATION, "server is read-only"))
             }
             OP_ACK => self.handle_ack(client, u16::from_be_bytes([packet[2], packet[3]]), now),
@@ -126,14 +116,14 @@ impl TftpServer {
                 let code = u16::from_be_bytes([packet[2], packet[3]]);
                 let msg = String::from_utf8_lossy(packet[4..].split(|&b| b == 0).next().unwrap_or(&[])).into_owned();
                 match self.transfers.remove(&client) {
-                    Some(t) => ttrace!(self, "{} aborted {:?} at block {} (error {}: {:?})",
+                    Some(t) => ttrace!("{} aborted {:?} at block {} (error {}: {:?})",
                                        who(client), t.name, t.block, code, msg),
-                    None => ttrace!(self, "{} sent error {}: {:?}", who(client), code, msg),
+                    None => ttrace!("{} sent error {}: {:?}", who(client), code, msg),
                 }
                 None
             }
             op => {
-                ttrace!(self, "{} unsupported opcode {}", who(client), op);
+                ttrace!("{} unsupported opcode {}", who(client), op);
                 Some(error_packet(ERR_ILLEGAL_OP, "only RRQ is supported"))
             }
         }
@@ -143,25 +133,20 @@ impl TftpServer {
     /// have exhausted their retries. Returns the packets to send.
     pub fn tick(&mut self, now: Instant) -> Vec<(ClientId, Vec<u8>)> {
         let timeout = self.timeout;
-        let trace = self.trace;
         let mut out = Vec::new();
         self.transfers.retain(|client, t| {
             if now.duration_since(t.sent_at) < timeout {
                 return true;
             }
             if t.retries >= MAX_RETRIES {
-                if trace {
-                    eprintln!("iris: tftp {} gave up on {:?} at block {}: no ACK after {} retransmits ({} ms in)",
+                ttrace!("{} gave up on {:?} at block {}: no ACK after {} retransmits ({} ms in)",
                               who(*client), t.name, t.block, MAX_RETRIES, now.duration_since(t.started).as_millis());
-                }
                 return false;
             }
             t.retries += 1;
             t.retransmits += 1;
             t.sent_at = now;
-            if trace {
-                eprintln!("iris: tftp {} retransmit {:?} block {} (try {})", who(*client), t.name, t.block, t.retries);
-            }
+            ttrace!("{} retransmit {:?} block {} (try {})", who(*client), t.name, t.block, t.retries);
             out.push((*client, t.last_packet.clone()));
             true
         });
@@ -174,31 +159,31 @@ impl TftpServer {
 
     fn start_read(&mut self, client: ClientId, body: &[u8], now: Instant) -> Vec<u8> {
         let Some((name, mode)) = parse_request(body) else {
-            ttrace!(self, "{} malformed request ({} bytes)", who(client), body.len());
+            ttrace!("{} malformed request ({} bytes)", who(client), body.len());
             return error_packet(ERR_NOT_DEFINED, "malformed request");
         };
-        ttrace!(self, "{} RRQ {:?} ({})", who(client), name, mode);
+        ttrace!("{} RRQ {:?} ({})", who(client), name, mode);
         // The PROM always asks for octet; command-line clients default to netascii.
         let netascii = mode.eq_ignore_ascii_case("netascii");
         if !netascii && !mode.eq_ignore_ascii_case("octet") {
-            ttrace!(self, "{} refused: mode {:?} is neither octet nor netascii", who(client), mode);
+            ttrace!("{} refused: mode {:?} is neither octet nor netascii", who(client), mode);
             return error_packet(ERR_NOT_DEFINED, "mode must be octet or netascii");
         }
         let Some(path) = self.resolve(&name) else {
-            ttrace!(self, "{} refused: {:?} is not under {} (or leaves it)", who(client), name, self.root.display());
+            ttrace!("{} refused: {:?} is not under {} (or leaves it)", who(client), name, self.root.display());
             return error_packet(ERR_FILE_NOT_FOUND, &format!("{}: not found", name));
         };
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                ttrace!(self, "{} refused: {:?}: {}", who(client), name, e);
+                ttrace!("{} refused: {:?}: {}", who(client), name, e);
                 return error_packet(ERR_FILE_NOT_FOUND, &format!("{}: {}", name, e));
             }
         };
         let source = if netascii {
             let mut raw = Vec::new();
             if let Err(e) = file.read_to_end(&mut raw) {
-                ttrace!(self, "{} refused: {:?}: {}", who(client), name, e);
+                ttrace!("{} refused: {:?}: {}", who(client), name, e);
                 return error_packet(ERR_NOT_DEFINED, &format!("{}: {}", name, e));
             }
             Source::Netascii(to_netascii(&raw))
@@ -228,25 +213,24 @@ impl TftpServer {
         match send_block(&mut t, 1, 0, now) {
             Ok(pkt) => {
                 if let Some(old) = self.transfers.insert(client, t) {
-                    ttrace!(self, "{} new request replaces {:?} (was at block {})", who(client), old.name, old.block);
+                    ttrace!("{} new request replaces {:?} (was at block {})", who(client), old.name, old.block);
                 }
                 match size {
-                    Some(n) => ttrace!(self, "{} sending {:?}: {} bytes, {} blocks", who(client), name, n, n / BLOCK_SIZE as u64 + 1),
-                    None => ttrace!(self, "{} sending {:?}", who(client), name),
+                    Some(n) => ttrace!("{} sending {:?}: {} bytes, {} blocks", who(client), name, n, n / BLOCK_SIZE as u64 + 1),
+                    None => ttrace!("{} sending {:?}", who(client), name),
                 }
                 pkt
             }
             Err(e) => {
-                ttrace!(self, "{} refused: {:?}: {}", who(client), name, e);
+                ttrace!("{} refused: {:?}: {}", who(client), name, e);
                 error_packet(ERR_NOT_DEFINED, &format!("{}: {}", name, e))
             }
         }
     }
 
     fn handle_ack(&mut self, client: ClientId, block: u16, now: Instant) -> Option<Vec<u8>> {
-        let trace = self.trace;
         let Some(t) = self.transfers.get_mut(&client) else {
-            ttrace!(self, "{} ACK {} with no transfer in progress", who(client), block);
+            ttrace!("{} ACK {} with no transfer in progress", who(client), block);
             return Some(error_packet(ERR_UNKNOWN_ID, "no transfer in progress"));
         };
         // A duplicate ACK (the classic Sorcerer's Apprentice case) must not
@@ -257,12 +241,12 @@ impl TftpServer {
         }
         let rtt = now.duration_since(t.sent_at);
         t.slowest_ack = t.slowest_ack.max(rtt);
-        if trace && rtt >= SLOW_ACK {
-            eprintln!("iris: tftp {} slow ACK for {:?} block {}: {} ms", who(client), t.name, block, rtt.as_millis());
+        if rtt >= SLOW_ACK {
+            ttrace!("{} slow ACK for {:?} block {}: {} ms", who(client), t.name, block, rtt.as_millis());
         }
         if t.final_block {
             if let Some(t) = self.transfers.remove(&client) {
-                ttrace!(self, "{} complete {:?}: {} bytes, {} blocks, {} retransmits, {} duplicate ACKs, slowest ACK {} ms, {} ms total",
+                ttrace!("{} complete {:?}: {} bytes, {} blocks, {} retransmits, {} duplicate ACKs, slowest ACK {} ms, {} ms total",
                         who(client), t.name, t.offset + t.last_packet.len().saturating_sub(4) as u64,
                         block, t.retransmits, t.dup_acks, t.slowest_ack.as_millis(),
                         now.duration_since(t.started).as_millis());
@@ -276,7 +260,7 @@ impl TftpServer {
             Ok(pkt) => Some(pkt),
             Err(e) => {
                 self.transfers.remove(&client);
-                ttrace!(self, "{} read error at block {}: {}", who(client), next_block, e);
+                ttrace!("{} read error at block {}: {}", who(client), next_block, e);
                 Some(error_packet(ERR_NOT_DEFINED, &e.to_string()))
             }
         }
@@ -647,13 +631,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Tracing only writes to stderr: every path behaves as it does untraced.
+    /// Refusals, stray ACKs and a transfer with a late and a wrong ACK.
     #[test]
-    fn tracing_changes_no_behaviour() {
+    fn refusals_and_stray_acks() {
         let root = tmp_root("trace");
         std::fs::write(root.join("f"), vec![7u8; 1100]).unwrap();
         let mut s = TftpServer::new(root.clone());
-        s.trace = true;
         let now = Instant::now();
         assert_eq!(opcode(&s.handle(CLIENT, &rrq("nope", "octet"), now).unwrap()), OP_ERROR);
         assert_eq!(opcode(&s.handle(CLIENT, &rrq("f", "mail"), now).unwrap()), OP_ERROR);

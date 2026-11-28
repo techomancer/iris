@@ -30,7 +30,7 @@ What you can inspect depends on how iris was built:
 |---|---|
 | plain `--release` | Everything in this document except the **[DEV]** items. Breakpoints and the traceback work. |
 | `lightning` (official releases) | Strips breakpoint checks and the traceback buffer for speed: breakpoints and `dt` do nothing. Inspection commands still work. |
-| `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`debug`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
+| `developer` (`cargo run --profile developer --features developer`) | Adds the undo buffer, `si`, instruction tracing (`log mips`, `trace`), `jitcheck`, per-module logging, graphics traces, and the `[DEV]` commands. The CPU starts **paused**: type `start`. Cannot be combined with `lightning`. |
 | `--features gputrace` | Graphics traces and recordings (`rex/gr2/mgras/vpro trace`, `rex/mgras rec`) without the rest of `developer`; works with `lightning`. `vpro rec` needs no feature. |
 | `--features jitv2` | The `j2` commands. `jitv2_lockstep` checks every JIT instruction against the interpreter. |
 | `--features perfetto` | Perfetto timeline traces ([docs/perfetto.md](docs/perfetto.md)). |
@@ -278,7 +278,6 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 | `undo on` / `undo off` | Enable / disable the undo buffer, which records stores to the machine's RAM **[DEV]** |
 | `undo [n]` / `u` | Step back `n` instructions, reversing register and memory changes **[DEV]** |
 | `undo clear` / `undo resize <n>` | Clear / resize the undo history **[DEV]** |
-| `debug <on\|off\|file <path>>` | Print every executed instruction, or write them to a file **[DEV]** |
 | `trace start <path>` / `trace stop` / `trace status` | Record full per-instruction architectural state to a file **[DEV]** |
 | `idleprof <on\|off\|report [n]\|stats>` | Sample the PC to find idle and spin loops (`idle-pause` builds); `stats` prints park counters |
 | `idle <on\|off\|status>` | Turn idle parking on or off at runtime, or show park counters (`wake_peer`: parks a multiprocessor ended early because another CPU was busy; `wake_slice`: parks that ended on their time bound with no line pending — on a multiprocessor after a slice with every CPU idle, to poll the run queue; on a uniprocessor after 100 ms with no interrupt (a PROM or standalone tool polling with every board source disabled), after which it parks 1 ms at a time until a line wakes it again; `alone`: idle-looking windows not parked because no other CPU was in the same loop; `probes`: batches jitv2 ran interpreted to look inside a compiled loop; `known_parks`: parks decided from a learned compiled exit signature; `learned`: probe runs whose signature was learned; `wake_kick`: parks ended because another CPU asked this one to poll; `kicks`: such requests; then interrupt wakes by Cause.IP line and by CPU), the CPUs seen, idle and parked, and the detector's last window (`idle-pause` builds) |
@@ -365,7 +364,6 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 | `scsi defer <on\|off>` | Deferred SCSI status interrupts |
 | `scsi dayna` | DaynaPort MAC, addresses and counters (any controller) |
 | `scsi wdt [N]` / `scsi wdt file <path>` | WD33C93A transaction ring: last `N` / all to a file **[DEV]** |
-| `scsi debug <on\|off>` | Per-command trace **[DEV]** |
 | `scsi0 ...` / `scsi1 ...` | The same, for controller 0 / controller 1 (Indigo2 and O2) |
 | `scsi2 ...` / `cow2 ...` | The same, for the Fibre Channel adapter's loop (its disks are by loop ID); `scsi2 notes` lists what the driver did that the model does not decode |
 | `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlays (`cow1 ...` on a second controller) |
@@ -374,13 +372,13 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 On the O2 the controllers are Adaptec 7880s: `scsi regs` shows that chip's
 interrupt status, queues and command totals, whether its worker thread is
 running (commands run on it, off the CPU's thread), any completions held
-for a paused sequencer and NetBSD's doorbell, and `wdt`, `defer` and `debug`
+for a paused sequencer and NetBSD's doorbell, and `wdt` and `defer`
 are not there. Ids are per controller, as in the slots of the `[[devices]]` entries
 (`scsi1/t1` is id 1 on controller 1, so `scsi1 eject 1`).
 
 On the Octane the controllers are ISP1040s: `scsi notes` (`scsi1 notes`)
-shows the command total and anything odd the driver did; `regs`, `wdt`,
-`defer` and `debug` are not there. It also has `heart status`
+shows the command total and anything odd the driver did; `regs`, `wdt`
+and `defer` are not there. It also has `heart status`
 (interrupt bits, mask, counter, bank descriptors), `heart unsupported`
 (HEART registers touched but not modelled) and `ip30 memcfg|bridge|gfx|xbow|unmapped`
 (the banks as HEART places them, the Bridge's interrupt routing, the graphics
@@ -392,7 +390,7 @@ On the Fuel the one controller is a two-channel ISP12160: `scsi` (or
 `scsi0`) and `cow` act on channel 0, `scsi1` and `cow1` on channel 1, and
 ids run 0 to 15 on each (`scsi1/t1` is id 1 on channel 1). `scsi notes`
 shows the whole chip's command total and anything odd the driver did, and
-has no `scsi1` form; `regs`, `wdt`, `defer` and `debug` are not there. The
+has no `scsi1` form; `regs`, `wdt` and `defer` are not there. The
 Tezro's ISP12160 answers the same way.
 
 Queue position `[0]` is the mounted disc, `[1]` the next on eject. A disc
@@ -417,12 +415,10 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, `REX3_REPLAY_ENGINE=resident` with `--features wgpu` for the GPU raster (`raster = "wgpu"`; prints its telemetry). Recording itself needs the CPU raster |
 | `rex fbdump [DIR]` | Framebuffers as files in `DIR` (default `.`) |
 | `rex cmap <on\|off>` | CMAP access trace |
-| `rex debug <on\|off>` | REX3 register trace **[DEV]** |
-| `vc2 status` / `vc2 ramdump` / `vc2 debug <on\|off>` | VC2 video timing and cursor state / RAM dump / trace **[DEV]** |
-| `xmap status` / `xmap debug <on\|off>` | XMAP9 state / trace **[DEV]** |
-| `cmap status` / `cmap debug <on\|off>` | CMAP state / trace **[DEV]** |
-| `bt445 status` / `bt445 identity` / `bt445 debug <on\|off>` | RAMDAC state, with the PLL's pixel clock and the video timing decoded from it and the VC2's tables / reset the palette to a linear ramp / trace **[DEV]** |
-| `dcb debug <on\|off>` | Display control bus trace **[DEV]** |
+| `vc2 status` / `vc2 ramdump` | VC2 video timing and cursor state / RAM dump |
+| `xmap status` | XMAP9 state |
+| `cmap status` | CMAP state |
+| `bt445 status` / `bt445 identity` | RAMDAC state, with the PLL's pixel clock and the video timing decoded from it and the VC2's tables / reset the palette to a linear ramp |
 | `rex1`, `vc21`, `xmap1`, `cmap1`, `bt4451`, `dcb1`, `disp1` | The Newport commands above on the second head (`graphics.heads = 2`): `vc21 status`, `rex1 status`. The first head then also answers to `rex0`, `vc20` and so on; the plain names always mean the first head |
 | `disp status` / `disp debug <on\|off>` | Display timing and framebuffer state |
 | `disp compositor <gl\|sw>` | Switch between the GL and software compositor |
@@ -576,8 +572,8 @@ devices are [listed below](#sgi-o2-ip32).
 | `mc dma` | VDMA (graphics DMA) state |
 | `mc dma xlate [vaddr] [w]` | Walk the VDMA address translation for `vaddr` (default MEMADR) without side effects; `w` = the transfer writes memory |
 | `mc vdma <on\|off>` | VDMA trace to `vdma.log` |
-| `eeprom <on\|off\|dump\|r <word>\|w <word> <val>>` | CPU/MC boot-configuration EEPROM (93C56; cache size etc.) |
-| `nveeprom <on\|off\|dump\|r <word>\|w <word> <val>\|save [file]>` | Indigo2 NVRAM EEPROM (93CS56: PROM environment and MAC) |
+| `eeprom <dump\|r <word>\|w <word> <val>>` | CPU/MC boot-configuration EEPROM (93C56; cache size etc.) |
+| `nveeprom <dump\|r <word>\|w <word> <val>\|save [file]>` | Indigo2 NVRAM EEPROM (93CS56: PROM environment and MAC) |
 | `hpc3 status` | HPC3 state |
 | `pdma status` / `pdma chain <addr>` | PBUS DMA channels / decode a descriptor chain at a physical address |
 | `pdma dump <on\|off\|hal\|scsi\|enet\|MASK>` | PDMA trace **[DEV]** |
@@ -586,20 +582,19 @@ devices are [listed below](#sgi-o2-ip32).
 | `rtc status` / `rtc dump` | RTC registers (and any `[rtc_offset]`) / NVRAM bytes |
 | `rtc save [file]` | Save the RTC NVRAM |
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
-| `rtc debug <on\|off>` | RTC trace **[DEV]** |
-| `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
+| `pit status` | 8254 timer state |
 | `audio status` | Every sound card's frames moved and skipped (stale, dry, ring full) and its host stream, or `No audio device.` |
 | `ice1724 [status]` | The ICE1724 audio card (an `ice1724` device; Tezro, Fuel, Origin 3200, Onyx 3000): the interrupt line (high or low, for how long, rises), the interrupt status and mask registers, the engine start, pause and FIFO-error bits, the pending timer, per engine whether it runs, its buffer address, size, position, interrupt interval, frames moved, times its interrupt fired and latched, and when the guest last read its position; frame and converter counts, PCI command and status |
 | `ice1724 regs` | Hex dump of the controller (CCS, BAR0) and multi-channel (MT, BAR1) registers |
 | `ice1724 log [n]` | The guest's last 64 (or n) register accesses, oldest first, with their age on the card clock; a run of the same access with the same value is one line with a count |
 | `ice1724 clear` | Start the counts and the access log again |
 | `envy ...` | The same as `ice1724 ...` (the chip is the Envy24HT) |
-| `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
+| `ps2 status` | PS/2 controller state |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot). On the Origin 3200 and Onyx 3000, and on a Fuel with `[fuel] usb_input = true`, these, `ps2 key` and `ps2 mouse` go to the USB keyboard and mouse, and `ps2 status` still shows the PS/2 side |
 | `ps2 key <shift\|ctrl\|alt> <down\|up>` | Hold or release a modifier |
 | `ps2 mouse <dx> <dy> [buttons]` | Relative mouse motion with an optional button mask (1 left, 2 right, 4 middle) |
 | `serial status` | SCC channel A/B registers and FIFOs (Indy, Indigo2) |
-| `vino status` / `vino debug <on\|off>` | VINO registers, channel state, descriptor cache / register and I2C trace |
+| `vino status` | VINO registers, channel state, descriptor cache |
 
 `nveeprom save` (Indigo2) and `rtc save` (Indy) persist PROM changes before
 a forced termination; a normal stop saves them automatically.
@@ -613,10 +608,8 @@ a forced termination; a normal stop saves them automatically.
 | `seeq status` | SEEQ 8003 ethernet state |
 | `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
 | `net interfaces` | Host interfaces available for PCAP |
-| `net debug <tcp\|udp\|icmp> <on\|off>` | Per-packet trace **[DEV]** |
 
-`IRIS_TFTP_TRACE` and `IRIS_RSH_TRACE` log the TFTP and rsh services
-([FEATURES.md](FEATURES.md#environment-and-diagnostic-controls)).
+`log net` also logs the built-in TFTP and rsh services.
 
 ### Physical bus
 
@@ -625,9 +618,6 @@ a forced termination; a normal stop saves them automatically.
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
 | `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane, Fuel) |
-| `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses. In a developer build `trace` is the CPU's instruction trace, so use `phys trace` |
-| `phys error <on\|off>` | Stop on bus errors |
-| `phys hole <on\|off>` | Stop on accesses to unmapped addresses |
 | `phys bench` / `bench` | Memory write benchmark: fills the first fully mapped 64 MB of RAM (overwrites it) |
 
 ### Logging
@@ -645,10 +635,18 @@ in every build.
 | `log <module> mask <cat\|hex>` | Category mask |
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
+`log mips mask insn` then `log mips on` prints every instruction `run` and
+`step` execute (`log mips file <path>` writes them to a file instead) **[DEV]**.
+A device's trace is its module: `log ps2 on`, `log scsi on`, `log rtc on`.
+`log net` traces packets, `log ioc` the 8254 timer, and `log phys` accesses
+that reach the black hole or a bus-error region and, in a developer build,
+every physical bus access. The `hit` category of `l1i` and `l1d` also needs a
+developer build.
+
 Modules (`help` lists them too): `net hpc3 seeq hal2 mc rex3 mips ioc scsi
 pdma vino dcb vc2 cmap xmap bt445 scc ps2 rtc eeprom l1i l1d l2c ultra scsi1
 nveeprom gr2 rad1 odyssey bedrock hub pci bridge heart nvme l1 usb module kona
-ice1724`. `scsi1` is the Indigo2's second SCSI controller, `nveeprom` its NVRAM
+ice1724 phys o2audio`. `scsi1` is the Indigo2's second SCSI controller, `nveeprom` its NVRAM
 EEPROM, `ultra` the N64 development board, `gr2` the GR2 board, `rad1` the RAD1
 audio of the Octane and the Onyx2's MediaIO card, `odyssey` the VPro and `kona`
 the InfiniteReality pipe. `hub`
@@ -662,7 +660,9 @@ register and translation-table accesses by name, and any transfer a PCI
 function started that reached no memory, and each interrupt pin's edges
 and the HEART vector it sets or clears. `heart` logs HEART's register
 accesses, one counter read in 256 with the host's clock, and every
-interrupt vector raised or lowered. Mask categories: `pdma` —
+interrupt vector raised or lowered, and on the Octane every access nothing
+answers. `o2audio` logs the O2's audio register accesses and codec writes.
+Mask categories: `pdma` —
 `hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
 every module also takes `on`/`all`, `off`/`none` or a hex mask.

@@ -530,22 +530,16 @@ impl Mec {
         }
     }
 
-    /// `IRIS_IP32_MEC_TRACE`: report frames sent and received, and why a
-    /// received one was dropped, the first 40 of each.
+    /// Frames sent and received, and why a received one was dropped, under
+    /// `log net`.
     fn trace(what: &str, frame: &[u8]) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static N: AtomicU32 = AtomicU32::new(0);
-        if !*ON.get_or_init(|| std::env::var_os("IRIS_IP32_MEC_TRACE").is_some()) {
-            return;
-        }
-        if N.fetch_add(1, Ordering::Relaxed) >= 120 {
+        if !crate::devlog::devlog_is_active(crate::devlog::LogModule::Net) {
             return;
         }
         let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(":");
         let et = if frame.len() >= 14 { u16::from_be_bytes([frame[12], frame[13]]) } else { 0 };
-        eprintln!("mec: {what} len {} dst {} src {} type {et:#06x}", frame.len(),
-                  hx(&frame[..6.min(frame.len())]), hx(&frame[6.min(frame.len())..12.min(frame.len())]));
+        crate::dlog!(crate::devlog::LogModule::Net, "mec: {what} len {} dst {} src {} type {et:#06x}", frame.len(),
+                     hx(&frame[..6.min(frame.len())]), hx(&frame[6.min(frame.len())..12.min(frame.len())]));
     }
 
     /// Whether the receive filter takes a frame to `dst`.

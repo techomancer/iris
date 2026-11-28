@@ -908,7 +908,7 @@ impl Device for Seeq8003 {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
             ("seeq".into(), "seeq status".into()),
-            ("net".into(),  "net status [tcp|udp|icmp|all] | net debug [tcp|udp|icmp] <on|off> [DEV] | net interfaces".into()),
+            ("net".into(),  "net status [tcp|udp|icmp|all] | net interfaces".into()),
         ]
     }
 
@@ -987,24 +987,6 @@ impl Device for Seeq8003 {
                             }
                         }
                     }
-                    Some("debug") => {
-                        let proto = args.get(1).copied().unwrap_or("");
-                        let onoff = args.get(2).copied().unwrap_or("");
-                        let enable = match onoff {
-                            "on"  | "1" => true,
-                            "off" | "0" => false,
-                            _ => return Err("usage: net debug [tcp|udp|icmp] [on|off]".into()),
-                        };
-                        match proto {
-                            "tcp"  => { self.nat_control().debug_tcp.store(enable,  std::sync::atomic::Ordering::Relaxed);
-                                        writeln!(w, "TCP debug {}", if enable { "on" } else { "off" }).ok(); }
-                            "udp"  => { self.nat_control().debug_udp.store(enable,  std::sync::atomic::Ordering::Relaxed);
-                                        writeln!(w, "UDP debug {}", if enable { "on" } else { "off" }).ok(); }
-                            "icmp" => { self.nat_control().debug_icmp.store(enable, std::sync::atomic::Ordering::Relaxed);
-                                        writeln!(w, "ICMP debug {}", if enable { "on" } else { "off" }).ok(); }
-                            _ => return Err("usage: net debug [tcp|udp|icmp] [on|off]".into()),
-                        }
-                    }
                     Some("interfaces") | Some("ifaces") => {
                         // List host interfaces available for PCAP bridging.
                         #[cfg(feature = "pcap")]
@@ -1016,7 +998,7 @@ impl Device for Seeq8003 {
                             writeln!(w, "PCAP support not built in (rebuild with --features pcap).").ok();
                         }
                     }
-                    _ => return Err("usage: net status [tcp|udp|icmp|all] | net debug [tcp|udp|icmp] [on|off] | net interfaces".into()),
+                    _ => return Err("usage: net status [tcp|udp|icmp|all] | net interfaces".into()),
                 }
             }
             _ => return Err("not found".into()),
