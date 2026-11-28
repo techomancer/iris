@@ -488,7 +488,7 @@ pub(super) mod tests {
         // MGRAS_REPLAY_TRACE_MASK: the categories (`mgras trace`'s, e.g.
         // `rss`), all by default.
         if let Ok(t) = std::env::var("MGRAS_REPLAY_TRACE") {
-            let mask = std::env::var("MGRAS_REPLAY_TRACE_MASK").map_or(crate::dev::mgras::debug::TRACE_ALL, |s| crate::dev::mgras::debug::trace_mask(&s));
+            let mask = std::env::var("MGRAS_REPLAY_TRACE_MASK").map_or(Ok(crate::dev::mgras::debug::TRACE_ALL), |s| crate::dev::mgras::debug::CLASSES.parse(&s))?;
             m.start_trace(&t, mask).map_err(|e| format!("{t}: {e}"))?;
         }
         // MGRAS_REPLAY_NOCHECK=1: a recording that starts mid-session (its

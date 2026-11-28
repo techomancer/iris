@@ -24,12 +24,11 @@
 //! All of it needs the `gputrace` feature (on with `developer`); without it
 //! `Trace::on` is a constant false and every hook compiles away.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
 
 use parking_lot::Mutex;
+
+use crate::trace_sink::{Classes, TraceFile, TraceRun};
 
 use super::board::Board;
 use super::consts::{
@@ -50,24 +49,19 @@ pub const TRACE_CPU: u32 = 4;
 pub const TRACE_DMA: u32 = 8;
 pub const TRACE_ALL: u32 = TRACE_FIFO | TRACE_DRAW | TRACE_CPU | TRACE_DMA;
 
-const CLASSES: [(&str, u32); 4] = [("fifo", TRACE_FIFO), ("draw", TRACE_DRAW), ("cpu", TRACE_CPU), ("dma", TRACE_DMA)];
+pub(super) const CLASSES: Classes = Classes {
+    names: &[("fifo", TRACE_FIFO), ("draw", TRACE_DRAW), ("cpu", TRACE_CPU), ("dma", TRACE_DMA)],
+    all: TRACE_ALL,
+};
 
-/// `all`, or a comma list of class names.
-pub(super) fn trace_mask(spec: &str) -> Result<u32, String> {
-    if spec == "all" {
-        return Ok(TRACE_ALL);
-    }
-    spec.split(',').try_fold(0, |m, c| match CLASSES.iter().find(|(n, _)| *n == c) {
-        Some((_, bit)) => Ok(m | bit),
-        None => Err(format!("unknown trace class '{c}' (fifo, draw, cpu, dma, all)")),
-    })
-}
+/// The line tags, in `CLASSES` order.
+const TAGS: [&str; 4] = ["FIFO", "DRAW", "CPU ", "DMA "];
 
 fn mask_names(mask: u32) -> String {
     if mask == TRACE_ALL {
         return "all".into();
     }
-    CLASSES.iter().filter(|(_, b)| mask & b != 0).map(|(n, _)| *n).collect::<Vec<_>>().join(",")
+    CLASSES.names.iter().filter(|(_, b)| mask & b != 0).map(|(n, _)| *n).collect::<Vec<_>>().join(",")
 }
 
 /// A run of one CPU access repeated, collapsed into one line.
@@ -79,40 +73,26 @@ struct CpuRun {
     count: u64,
 }
 
-/// The sink, behind `Trace::sink`.
-pub(super) struct TraceSink {
-    out: Option<BufWriter<File>>,
-    path: String,
-    start: Instant,
-    /// Lines per class, in `CLASSES` order.
-    seq: [u64; 4],
-    run: Option<CpuRun>,
-    last_flush: Instant,
-}
-
-impl TraceSink {
-    fn line(&mut self, class: usize, text: std::fmt::Arguments) {
-        self.seq[class] += 1;
-        let (seq, t) = (self.seq[class], self.start.elapsed().as_secs_f64());
-        if let Some(f) = self.out.as_mut() {
-            let _ = writeln!(f, "{t:12.6} {:<4} #{seq:06} {text}", CLASSES[class].0.to_ascii_uppercase());
-        }
+impl TraceRun for CpuRun {
+    fn merge(&mut self, n: &Self) -> bool {
+        let same = (self.write, self.off, self.size, self.val) == (n.write, n.off, n.size, n.val);
+        self.count += same as u64;
+        same
     }
 
-    /// Emit the pending collapsed CPU run, if any.
-    fn close_run(&mut self) {
-        let Some(r) = self.run.take() else { return };
-        let dir = if r.write { "wr" } else { "rd" };
-        let name = offset_name(r.off).map(|n| format!(" {n}")).unwrap_or_default();
-        let times = if r.count > 1 { format!("  (x{})", r.count) } else { String::new() };
-        self.line(2, format_args!("{dir} {:#x}{name} [{}] = {:#x}{times}", r.off, r.size, r.val));
+    fn emit(&self, seq: u64, line: impl FnOnce(std::fmt::Arguments)) {
+        let dir = if self.write { "wr" } else { "rd" };
+        let name = offset_name(self.off).map(|n| format!(" {n}")).unwrap_or_default();
+        let times = if self.count > 1 { format!("  (x{})", self.count) } else { String::new() };
+        line(format_args!("CPU  #{seq:06} {dir} {:#x}{name} [{}] = {:#x}{times}", self.off, self.size, self.val));
     }
 }
 
-/// The trace: its mask, read on every hook, and the sink.
+/// The trace: its mask, read on every hook, and the file. Counters, in
+/// `CLASSES` order, are the lines per class.
 pub(super) struct Trace {
     mask: AtomicU32,
-    sink: Mutex<TraceSink>,
+    sink: Mutex<TraceFile<CpuRun, 4>>,
 }
 
 impl Default for Trace {
@@ -123,11 +103,7 @@ impl Default for Trace {
 
 impl Trace {
     pub fn new() -> Self {
-        let now = Instant::now();
-        Trace {
-            mask: AtomicU32::new(0),
-            sink: Mutex::new(TraceSink { out: None, path: String::new(), start: now, seq: [0; 4], run: None, last_flush: now }),
-        }
+        Trace { mask: AtomicU32::new(0), sink: Mutex::new(TraceFile::new(["fifo", "draw", "cpu", "dma"], 2)) }
     }
 
     /// Whether a trace of `what` runs. A constant false without `gputrace`,
@@ -143,17 +119,9 @@ impl Trace {
         if !cfg!(feature = "gputrace") {
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "needs a build with the gputrace feature (on with developer)"));
         }
-        let f = File::create(path)?;
         let mut t = self.sink.lock();
-        t.out = Some(BufWriter::with_capacity(1 << 20, f));
-        t.path = path.to_string();
-        t.start = Instant::now();
-        t.last_flush = t.start;
-        t.seq = [0; 4];
-        t.run = None;
-        if let Some(f) = t.out.as_mut() {
-            let _ = writeln!(f, "# VPro trace ({})", mask_names(mask));
-        }
+        t.open(path)?;
+        t.raw(format_args!("# VPro trace ({})", mask_names(mask)));
         drop(t);
         self.mask.store(mask, Ordering::SeqCst);
         Ok(())
@@ -162,23 +130,14 @@ impl Trace {
     /// Stop and close the file; what was written, or None when no trace ran.
     pub fn stop(&self) -> Option<String> {
         self.mask.store(0, Ordering::SeqCst);
-        let mut t = self.sink.lock();
-        t.close_run();
-        let mut f = t.out.take()?;
-        let _ = f.flush();
-        Some(format!("{} ({})", t.path, Self::counts(&t)))
-    }
-
-    fn counts(t: &TraceSink) -> String {
-        CLASSES.iter().zip(t.seq).map(|((n, _), c)| format!("{n} {c}")).collect::<Vec<_>>().join(" / ")
+        self.sink.lock().stop()
     }
 
     /// "tracing to <path> (<classes>): <counts>", or None.
     pub fn status(&self) -> Option<String> {
         let mask = self.mask.load(Ordering::Relaxed);
         let t = self.sink.lock();
-        t.out.as_ref()?;
-        Some(format!("tracing to {} ({}): {}", t.path, mask_names(mask), Self::counts(&t)))
+        t.is_open().then(|| format!("tracing to {} ({}): {}", t.path(), mask_names(mask), t.counts()))
     }
 
     /// Write the buffered lines out: at most twice a second unless forced.
@@ -187,46 +146,25 @@ impl Trace {
         if self.mask.load(Ordering::Relaxed) == 0 && !force {
             return;
         }
-        let mut t = self.sink.lock();
-        if force || t.last_flush.elapsed().as_millis() >= 500 {
-            t.close_run();
-            if let Some(f) = t.out.as_mut() {
-                let _ = f.flush();
-            }
-            t.last_flush = Instant::now();
-        }
-    }
-
-    fn line(&self, class: usize, text: std::fmt::Arguments) {
-        let mut t = self.sink.lock();
-        t.close_run();
-        t.line(class, text);
+        self.sink.lock().flush(force);
     }
 
     pub fn fifo(&self, text: std::fmt::Arguments) {
-        self.line(0, text);
+        self.sink.lock().event(0, TAGS[0], text);
     }
 
     pub fn draw(&self, text: std::fmt::Arguments) {
-        self.line(1, text);
+        self.sink.lock().event(1, TAGS[1], text);
     }
 
     pub fn dma(&self, text: std::fmt::Arguments) {
-        self.line(3, text);
+        self.sink.lock().event(3, TAGS[3], text);
     }
 
     /// One bus access that is not a command store; repeats of one access
     /// collapse into a run.
     pub fn cpu(&self, write: bool, off: u64, size: u32, val: u64) {
-        let mut t = self.sink.lock();
-        if let Some(r) = t.run.as_mut() {
-            if r.write == write && r.off == off && r.size == size && r.val == val {
-                r.count += 1;
-                return;
-            }
-        }
-        t.close_run();
-        t.run = Some(CpuRun { write, off, size, val, count: 1 });
+        self.sink.lock().access(CpuRun { write, off, size, val, count: 1 });
     }
 }
 
@@ -562,9 +500,10 @@ mod tests {
 
     #[test]
     fn trace_classes_parse() {
-        assert_eq!(trace_mask("all"), Ok(TRACE_ALL));
-        assert_eq!(trace_mask("fifo,cpu"), Ok(TRACE_FIFO | TRACE_CPU));
-        assert!(trace_mask("hq").is_err());
+        assert_eq!(CLASSES.parse("all"), Ok(TRACE_ALL));
+        assert_eq!(CLASSES.parse("fifo,cpu"), Ok(TRACE_FIFO | TRACE_CPU));
+        assert!(CLASSES.parse("hq").is_err());
+        assert_eq!(CLASSES.parse("all,-dma"), Ok(TRACE_ALL & !TRACE_DMA));
         assert_eq!(mask_names(TRACE_DRAW | TRACE_DMA), "draw,dma");
     }
 

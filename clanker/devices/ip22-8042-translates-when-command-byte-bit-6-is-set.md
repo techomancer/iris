@@ -32,7 +32,7 @@ The PROM writes command bytes 0x20, 0x00, 0x10 and selects set 3, so it never
 translates; its menu and command monitor take keys as before. NetBSD leaves the
 command byte at 0x47 with the keyboard in set 2, and after the fix reads `E0 50`
 / `E0 D0` for Down, `E0 48` / `E0 C8` for Up and `1E` / `9E` for `a`. To trace
-this, use `log ps2 file <path>` then `log ps2 on`: `IRIS_DEBUG_LOG=ps2` logs
+this, use `log ps2 file <path>` then `log ps2 on`: `--log ps2` logs
 every status poll the PROM makes to stderr and to the monitor, and the monitor
 stops answering.
 
