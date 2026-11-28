@@ -4,11 +4,16 @@
 # Manual trigger only — run this when you're ready to submit a new build,
 # not on every commit.
 #
-# Version: App Store builds are numbered by date, YYYYMMDD.HHMM in UTC, as
-# they always have been (20260831.2042), for both CFBundleShortVersionString
-# and CFBundleVersion: App Store Connect wants a version above the last one it
-# approved and a new build number per upload. Set the `version` input to pick
-# another (YYYYMMDD.HHMM or X.Y.Z).
+# Version: CFBundleShortVersionString is the release, from
+# scripts/dist/appstore-version (2.0), the same for every upload until the
+# next release, so only the first TestFlight build of a version waits for
+# Beta App Review. It must match the version being prepared in App Store
+# Connect. The `version` input overrides it (X.Y or X.Y.Z).
+#
+# Build: CFBundleVersion is 20261129.<run number>. A Mac build number must be
+# above every build ever uploaded for the app, whatever its version, and the
+# dated builds before this scheme reached 20261128.156. Re-running a run that
+# already uploaded reuses its number and is refused; start a new run.
 #
 # Required repository secrets:
 #   APP_STORE_APP_CERT          base64-encoded Mac App Distribution .p12
@@ -41,7 +46,7 @@ on:
         required: false
         default: ''
       version:
-        description: Version YYYYMMDD.HHMM or X.Y.Z (leave empty for the UTC time, YYYYMMDD.HHMM)
+        description: Version X.Y or X.Y.Z (leave empty for scripts/dist/appstore-version)
         required: false
         default: ''
       validate_only:
@@ -94,11 +99,10 @@ jobs:
         env:
           VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
-          # One clock reading for both: the version and the build number are
-          # the same YYYYMMDD.HHMM unless a version is given. App Store Connect
-          # wants a new, numeric build number per upload.
-          BUNDLE_VERSION=$(date -u +"%Y%m%d.%H%M")
-          VERSION=$(scripts/dist/version.sh appstore "${VERSION_INPUT:-$BUNDLE_VERSION}")
+          # The release's version, and a build number from this run's number
+          # (scripts/dist/version.sh says why it starts with 20261129).
+          BUNDLE_VERSION=$(scripts/dist/version.sh appstore-build "${{ github.run_number }}")
+          VERSION=$(scripts/dist/version.sh appstore "$VERSION_INPUT")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "bundle_version=$BUNDLE_VERSION" >> $GITHUB_OUTPUT
           echo "App Store build $VERSION ($BUNDLE_VERSION)" >> $GITHUB_STEP_SUMMARY
