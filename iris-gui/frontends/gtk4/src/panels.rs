@@ -342,6 +342,10 @@ impl BenchWindow {
     }
 
     pub fn refresh(&self, machine_running: bool) {
+        // A finished run moves into `last` only when the controller is
+        // ticked; without this there are never any figures and Save report
+        // never lights up.
+        self.ctl.borrow_mut().tick();
         // The figures a finished run produced, from the controller.
         let results = self.ctl.borrow_mut().results();
         if *self.shown.borrow() != results {

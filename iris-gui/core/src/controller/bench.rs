@@ -367,7 +367,6 @@ impl BenchController {
         }
     }
 
-    /// The report as plain text, for copying.
     /// The results as a shell shows them: the figures that stand on their
     /// own, the per-category rates with the reference ratio beside them, the
     /// caveats, and the machine the run was made on. Built here so every
@@ -437,6 +436,7 @@ impl BenchController {
         Some(Results { headline, categories, caveats, machine: machine_rows(&run) })
     }
 
+    /// The report as plain text, for copying.
     pub fn report_text(run: &Run) -> String {
         report_text(run)
     }
