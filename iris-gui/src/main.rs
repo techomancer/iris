@@ -1424,7 +1424,7 @@ impl App {
     /// Draw the live REX3 framebuffer as an egui image, scaled to fit
     /// the available area while preserving aspect ratio.
     fn framebuffer_panel(&mut self, ui: &mut egui::Ui) {
-        if self.app.config().has_device("newport") {
+        if self.app.config().dual_head() {
             self.framebuffer_panel_dual(ui);
             return;
         }
@@ -2655,8 +2655,8 @@ impl eframe::App for App {
                     self.pending_launcher_fit = !Self::snap_window_to_fb(
                         ui.ctx(),
                         egui::vec2(
-                            self.app.config().graphics.host_display_size().0 as f32,
-                            self.app.config().graphics.host_display_size().1 as f32,
+                            self.app.config().host_display_size().0 as f32,
+                            self.app.config().host_display_size().1 as f32,
                         ),
                         ui.available_size(),
                         self.app.prefs().vm_scale,

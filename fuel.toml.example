@@ -31,10 +31,11 @@ l1_port = 18882
 # and mouse on the OHCI controller instead of the PS/2 pair (docs/fuel-ip34.md).
 # usb_input = true
 
-[graphics]
-# "v12" or "v10" fits a VPro in the graphics slot; IRIX needs a kernel with
-# the VPro driver. The console stays on serial either way.
-board = "none"
+# No graphics board by default. A "vpro" entry with model "v12" or "v10" puts a VPro in the
+# graphics slot; IRIX needs a kernel with the VPro driver. The console stays on serial either way.
+# [[devices]]
+# type  = "vpro"
+# model = "v12"
 
 [network]
 # Disconnected cable. For NAT, use mode = "nat".

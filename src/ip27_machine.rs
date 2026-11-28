@@ -385,14 +385,14 @@ fn onyx2(
     xbow.serve_bridge(ONYX2_BASEIO_WIDGET, &bridge);
 
     let status = crate::status::MachineStatus::without_ticks(heartbeat.clone());
-    let pipe = match cfg.graphics_board().kona() {
-        Some((product, rm_count)) => {
+    let pipe = match cfg.graphics_entry().and_then(|b| Some((b.model.kona()?, b))) {
+        Some((product, board)) => {
             let pipe_hosts = Arc::new(PipeHosts { widget: OnceLock::new(), up: upstream() });
-            let kona_cfg = KonaConfig::new(product, rm_count)?
+            let kona_cfg = KonaConfig::new(product, board.raster_managers.into())?
                 .with_host_widget(owner_widget)?
                 .with_widget(GRAPHICS_WIDGET)?
                 .with_pool(cfg.graphics.threads, cfg.graphics.tile);
-            let flash = cfg.graphics.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
+            let flash = board.flash.as_deref().map(|p| crate::dev::kona::flash_file(Path::new(p))).transpose()?;
             let pipe = Kona::new(kona_cfg, pipe_hosts.clone(), pipe_hosts.clone(), status.clone(), flash)?;
             let _ = pipe_hosts.widget.set(pipe.dma_widget_handle());
             // The driver's adaptor reset link-resets the pipe's widget before it pulses the board's

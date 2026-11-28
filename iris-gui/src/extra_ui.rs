@@ -6,7 +6,7 @@ use iris::topology::{slots_take, DeviceFamily, DevicePlacement, MachineSlotKind}
 use iris::devices::{DeviceModel, ConfiguredDevice};
 
 pub use iris_gui_core::model::hardware::{
-    board_supported, builtin_prom, has_nveeprom, mc_machine, new_nvme_path, parse_complete, scsi_name, switch_profile, takes_fibre_card,
+    board_choices, board_label, builtin_prom, has_nveeprom, mc_machine, new_nvme_path, parse_complete, scsi_name, switch_profile, takes_fibre_card,
 };
 
 /// A button filled with `fill` (the green Start, the red Stop, the blue
@@ -107,7 +107,13 @@ pub fn show(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                         }
                     });
             });
-            text(ui, &t!("extra-graphics-flash"), &mut cfg.graphics.flash);
+            if let Some(mut board) = cfg.graphics_entry().filter(|b| b.model.kona().is_some()) {
+                let before = board.flash.clone();
+                text(ui, &t!("extra-graphics-flash"), &mut board.flash);
+                if board.flash != before {
+                    cfg.set_graphics(Some(board));
+                }
+            }
         });
         ui.collapsing(t!("extra-connections"), |ui| {
             text(ui, &t!("extra-socket-a"), &mut cfg.serial_socket_a);

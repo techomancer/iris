@@ -71,10 +71,10 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     let status = crate::status::MachineStatus::new(heartbeat.clone(), fasttick.clone());
     status.set_scsi_wide(true);
     let graphics = cfg.graphics_board();
-    let vpro = (graphics != GraphicsBoard::None)
-        .then(|| attach_vpro(cfg, bedrock, WIDGET_VPRO, bedrock.interrupt_sender(WIDGET_VPRO, None), &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))
+    let vpro = graphics
+        .map(|_| attach_vpro(cfg, bedrock, WIDGET_VPRO, bedrock.interrupt_sender(WIDGET_VPRO, None), &status, |vpro| Ok(xbridge.attach_widget(WIDGET_VPRO, vpro))))
         .transpose()?;
-    eprintln!("iris: {}", if vpro.is_some() { graphics.label() } else { "no graphics" });
+    eprintln!("iris: {}", graphics.map_or("no graphics", GraphicsBoard::label));
     let mut io = build_baseio(cfg, &l1s[0], &xbridge, clock, timers, heartbeat, vpro.clone())?;
     io.status = Some(status);
     io.fasttick = Some(fasttick);
@@ -110,7 +110,8 @@ pub(crate) const HEAD_F_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[
 
 /// The Fuel's slots.
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
-    crate::topology::open_slot(s, &format!("xio{WIDGET_VPRO}"), &[crate::topology::DeviceFamily::Gfx], &[]);
+    crate::topology::open_slot(s, &format!("xio{WIDGET_VPRO}"), &[crate::topology::DeviceFamily::Gfx], &["graphics"]);
+    crate::topology::boards(s, &format!("xio{WIDGET_VPRO}"), &[GraphicsBoard::V10, GraphicsBoard::V12], None);
     crate::topology::pci_bus_slots(s, &format!("xio{HEAD_E}/pci0"), "Fuel XBridge head E", HEAD_E_SLOTS);
     crate::topology::pci_bus_slots(s, &format!("xio{HEAD_F}/pci0"), "Fuel XBridge head F", HEAD_F_SLOTS);
     // The ISP12160's two channels.

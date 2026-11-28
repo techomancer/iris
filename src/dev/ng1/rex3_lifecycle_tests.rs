@@ -359,11 +359,11 @@ fn resident_lifecycle_machine_head1_checkpoint_round_trip() {
     on_large_stack(|| {
         let mut cfg = crate::bench_runner::bench_config([16, 0, 0, 0], &crate::cpu::parts::R4400_150);
         cfg.headless = false;
-        cfg.set_device("newport", true);
+        cfg.set_graphics(Some(crate::devices::BoardConfig { resolution: crate::dev::ng1::vc2_timings::NewportResolution::Res1024x768, ..Default::default() }));
+        cfg.set_dual_head(true);
         cfg.nvram.clear();
         cfg.nveeprom.clear();
         cfg.monitor_port = Some(0);
-        cfg.graphics.resolution = crate::dev::ng1::vc2_timings::NewportResolution::Res1024x768;
         {
             let mut cpu_machine = Box::new(crate::machine::Machine::new(cfg.clone()));
             cpu_machine.save_snapshot("m7-head1").unwrap();

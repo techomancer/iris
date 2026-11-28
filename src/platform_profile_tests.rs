@@ -116,7 +116,7 @@ mod tests {
     fn impact_solid_on_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::SolidImpact)));
         cfg.validate().expect("Solid IMPACT on Indigo2");
     }
 
@@ -124,7 +124,7 @@ mod tests {
     fn impact_on_indy_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
-        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::SolidImpact)));
         cfg.validate().expect("Solid IMPACT on Indy");
     }
 
@@ -132,7 +132,7 @@ mod tests {
     fn newport_on_ip28_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.graphics.board = Some(GraphicsBoard::Newport);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Newport)));
         cfg.validate().expect("Newport on IP28");
     }
 
@@ -140,37 +140,32 @@ mod tests {
     fn xz_on_ip28_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.graphics.board = Some(GraphicsBoard::Xz);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Xz)));
         cfg.validate().expect("XZ on IP28");
     }
 
     #[test]
-    fn impact_keywords_parse() {
-        assert_eq!("solidimpact".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::SolidImpact);
-        assert_eq!("impact:solid".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::SolidImpact);
-        assert_eq!("highimpact".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::HighImpact);
-        assert_eq!("impact:high".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::HighImpact);
-        assert_eq!("maximpact".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::MaxImpact);
-        assert_eq!("impact:max".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::MaxImpact);
+    fn impact_models_parse_short_or_long() {
+        for (names, board) in [(["solid", "solidimpact"], GraphicsBoard::SolidImpact), (["high", "highimpact"], GraphicsBoard::HighImpact), (["max", "maximpact"], GraphicsBoard::MaxImpact)] {
+            for name in names {
+                assert_eq!(name.parse::<GraphicsBoard>().unwrap(), board, "{name}");
+            }
+            assert_eq!(board.as_str(), names[0], "the short form is written");
+        }
     }
 
     #[test]
-    fn cli_graphics_keywords() {
+    fn the_old_graphics_flag_still_parses_so_it_can_be_refused() {
         use clap::Parser;
         let cli = Cli::try_parse_from(["iris", "--graphics", "impact:high"]).unwrap();
-        let cfg = cli.apply(MachineConfig::default());
-        assert_eq!(cfg.graphics.board, Some(GraphicsBoard::HighImpact));
-
-        let cli = Cli::try_parse_from(["iris", "--board", "solidimpact"]).unwrap();
-        let cfg = cli.apply(MachineConfig::default());
-        assert_eq!(cfg.graphics.board, Some(GraphicsBoard::SolidImpact));
+        assert_eq!(cli.graphics.as_deref(), Some("impact:high"));
     }
 
     #[test]
     fn xz_on_indy_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
-        cfg.graphics.board = Some(GraphicsBoard::Xz);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Xz)));
         cfg.validate().expect("XZ board on Indy");
     }
 
@@ -178,7 +173,7 @@ mod tests {
     fn xz_on_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.graphics.board = Some(GraphicsBoard::Xz);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Xz)));
         cfg.validate().expect("XZ board on Indigo2");
     }
 
@@ -186,16 +181,16 @@ mod tests {
     fn extreme_on_indy_rejected() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
-        cfg.graphics.board = Some(GraphicsBoard::Extreme);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Extreme)));
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("indigo2_ip22"), "got: {err}");
+        assert!(err.contains("no free slot for a graphics board"), "got: {err}");
     }
 
     #[test]
     fn dual_head_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.set_device("newport", true);
+        cfg.set_dual_head(true);
         cfg.validate().expect("dual-head Indigo2");
     }
 

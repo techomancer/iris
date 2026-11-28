@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::config::{MachineConfig, MachineProfile};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
 use crate::cpu::parts::{self, Part};
 use crate::cpu::mips_cache_v2::MipsCache;
 use crate::cpu::smp::World;
@@ -77,11 +77,15 @@ const XIO_SLOTS: [(u8, &str); 4] = [(10, "slot_d"), (12, "slot_a"), (9, "slot_c"
 /// The Octane's slots.
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
     use crate::topology::DeviceFamily;
+    use GraphicsBoard as B;
+    const OCTANE_BOARDS: &[GraphicsBoard] = &[B::SolidImpact, B::HighImpact, B::MaxImpact, B::V6, B::V8, B::V10, B::V12];
     crate::topology::pci_bus_slots(s, &format!("xio{}/pci0", crate::ip30::WIDGET_BRIDGE), "Octane system board", SYSTEM_SLOTS);
     for (w, alias) in XIO_SLOTS {
         // The graphics board has the port it is fitted in whenever one is.
-        crate::topology::open_slot(s, &format!("xio{w}"), if w == WIDGET_GFX { &[DeviceFamily::Xio, DeviceFamily::Gfx] } else { &[DeviceFamily::Xio] }, &[alias]);
+        let (families, aliases): (&[DeviceFamily], &[&str]) = if w == WIDGET_GFX { (&[DeviceFamily::Xio, DeviceFamily::Gfx], &[alias, "graphics"]) } else { (&[DeviceFamily::Xio], &[alias]) };
+        crate::topology::open_slot(s, &format!("xio{w}"), families, aliases);
     }
+    crate::topology::boards(s, &format!("xio{WIDGET_GFX}"), OCTANE_BOARDS, Some(GraphicsBoard::SolidImpact));
     crate::topology::open_slot(s, &format!("xio{}", crate::dev::xio_pci::CAGE_WIDGET), &[DeviceFamily::Cage], &["pci_module", "shoebox"]);
 }
 
@@ -101,9 +105,9 @@ const BRIDGE_REVISION_OCTANE2: u32 = 4;
 
 /// The PROM revision a VPro board needs (007-4210-003): 4.0 for the V6 and
 /// V8, 4.5 for the V10 and V12.
-fn vpro_prom_needed(board: crate::config::GraphicsBoard) -> (u32, u32) {
+fn vpro_prom_needed(board: GraphicsBoard) -> (u32, u32) {
     match board {
-        crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12 => (4, 5),
+        GraphicsBoard::V10 | GraphicsBoard::V12 => (4, 5),
         _ => (4, 0),
     }
 }
@@ -325,14 +329,9 @@ impl OctaneMachine {
         MachineProfile::OctaneIp30.accepts_cpus(cpu_count)?;
         let banks = heart_banks(cfg);
         let kind = cfg.graphics_board();
-        let board = match kind {
-            crate::config::GraphicsBoard::None => None,
-            b if b.is_vpro() => None,
-            b if b.is_impact() => Some(b),
-            b => return Err(format!("graphics.board \"{}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)", b.as_str())),
-        };
-        let has_vpro = kind.is_vpro();
-        if has_vpro {
+        let board = kind.filter(|b| b.is_impact());
+        let vpro_kind = kind.filter(|b| b.is_vpro());
+        if let Some(kind) = vpro_kind {
             let needed = vpro_prom_needed(kind);
             if let Some(found) = prom_revision(&prom) {
                 if found < needed {
@@ -351,7 +350,7 @@ impl OctaneMachine {
         // (007-4210-003) requires Crossbow 1.4 for them. Choosing one gives
         // the machine the Octane2's Crossbow (revision 5) and Bridge
         // (revision 4); there is no separate option for the machine.
-        let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12);
+        let octane2 = matches!(kind, Some(GraphicsBoard::V10 | GraphicsBoard::V12));
         let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
         let (event_tx, event_rx) = crate::traits::MachineEvents::channel(4);
         let events = event_tx.clone();
@@ -368,7 +367,7 @@ impl OctaneMachine {
         let identity = if octane2 { Identity::octane2(processor) } else { Identity::octane(processor) };
         heart.set_microlan(identity.processor.bus());
 
-        let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
+        let gfx_link = if kind.is_some() { 1 << WIDGET_GFX } else { 0 };
         // The option boards, in config order, each on the port it was placed at.
         let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
         let xio_widgets: Vec<(crate::dev::xio_pci::Kind, u8)> = resolved.placed()
@@ -462,11 +461,9 @@ impl OctaneMachine {
         let gfx = board
             .map(|b| ImpactXio::with_raster(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone(), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str())))
             .transpose()?;
-        let vpro = if has_vpro {
-            Some(Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone(), status.clone(), (cfg.graphics.threads, cfg.graphics.tile), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()))?)
-        } else {
-            None
-        };
+        let vpro = vpro_kind
+            .map(|kind| Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone(), status.clone(), (cfg.graphics.threads, cfg.graphics.tile), (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str())))
+            .transpose()?;
 
         // The bus over them, then the table.
         let phys = Ip30Bus::new(ram.clone());
@@ -542,7 +539,7 @@ impl OctaneMachine {
             "iris: Octane with {} MB ({}), {}",
             banks.iter().sum::<u64>() >> 20,
             banks.iter().filter(|&&b| b != 0).map(|b| format!("{}", b >> 20)).collect::<Vec<_>>().join("+"),
-            if has_vpro { kind.label() } else { board.map_or("no graphics", |b| b.label()) }
+            kind.map_or("no graphics", |b| b.label())
         );
 
         let count_hz = cfg.clock.count_hz(part);
@@ -1438,7 +1435,7 @@ mod tests {
         use crate::config::{GraphicsBoard, MachineProfile};
         use crate::display_stop_tests::{big_stack, config, scratch};
         let dir = scratch("octane-drop");
-        for board in [GraphicsBoard::None, GraphicsBoard::SolidImpact] {
+        for board in [None, Some(GraphicsBoard::SolidImpact)] {
             let cfg = config(&dir, MachineProfile::OctaneIp30, board);
             let machine = big_stack(move || OctaneMachine::new(&cfg).expect("Octane"));
             let phys = Arc::downgrade(&machine.phys.phys);
@@ -1456,7 +1453,7 @@ mod tests {
         use crate::config::{GraphicsBoard, MachineProfile};
         use crate::display_stop_tests::{big_stack, config, scratch};
         let dir = scratch("octane-prom-size");
-        let cfg = config(&dir, MachineProfile::OctaneIp30, GraphicsBoard::None);
+        let cfg = config(&dir, MachineProfile::OctaneIp30, None);
         std::fs::write(&cfg.prom, vec![0u8; FLASH_SIZE + 1]).unwrap();
         let big = cfg.clone();
         let e = big_stack(move || OctaneMachine::new(&big).err()).expect("an oversized PROM is refused");
@@ -1522,7 +1519,6 @@ mod snapshot_tests {
         cfg.prom = prom.into();
         cfg.nvram = dir.join("nvram.bin").to_string_lossy().into_owned();
         cfg.headless = true;
-        cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
         // Not CI mode: its overlays share one path per process, and the
         // tests run in parallel; this way each sits beside its own disk.
         cfg.network.mode = crate::config::NetMode::Off;
@@ -1536,6 +1532,7 @@ mod snapshot_tests {
             std::fs::write(&disk, vec![0u8; 4 << 20]).unwrap();
         }
         cfg.devices.clear();
+        cfg.set_graphics(None);
         cfg.set_disk(1, toml::from_str(&format!("path = {:?}\noverlay = true", disk.to_string_lossy())).unwrap());
         edit(&mut cfg);
         OctaneMachine::new(&cfg).expect("an Octane")
@@ -2056,7 +2053,7 @@ mod snapshot_tests {
         std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
             let dir = scratch("impact");
             let prom = empty_prom(&dir);
-            let mut m = machine_with(&prom, &dir, |cfg| cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact));
+            let mut m = machine_with(&prom, &dir, |cfg| cfg.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::SolidImpact))));
             let gfx = m.gfx.as_ref().unwrap().clone();
             let board = gfx.mgras().clone();
             board.start_engines();
@@ -2112,7 +2109,7 @@ mod snapshot_tests {
                 let dir = scratch("vpro");
                 let prom = empty_prom(&dir);
                 let mut m = machine_with(&prom, &dir, |cfg| {
-                    cfg.graphics.board = Some(crate::config::GraphicsBoard::V6)
+                    cfg.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::V6)))
                 });
                 let vpro = m.vpro.as_ref().unwrap().clone();
                 let sw_token = widget_small_base(WIDGET_GFX) + 0x107c;

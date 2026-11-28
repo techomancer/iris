@@ -46,8 +46,8 @@ profile = "octane_ip30"
 cpu = "r10000"
 flash = "flash-ip30.bin"      # keep the PROM's flash records between runs
 
-[graphics]
-# board = "maximpact"         # "solidimpact" (default), "highimpact", "maximpact", "v6", "v8", "v10", "v12" or "none"
+# The graphics board is a device entry: type = "impact" (default model "solid"; "high", "max"),
+# type = "vpro" (model "v6", "v8", "v10" or "v12"), or type = "none" at = "graphics".
 
 [[port_forward]]
 proto = "tcp"
@@ -165,22 +165,24 @@ and red for red.
 
 The graphics board sits on widget 11: the same raster chips as the Indigo2
 IP28's IMPACT boards behind the Octane's XIO host interface (the HQ4), with
-interrupts and DMA through HEART. `[graphics] board` (or `--graphics`) picks
+interrupts and DMA through HEART. A device entry (`--device impact,model=max`) picks
 the board, as on the other machines:
 
 | Value | The PROM's name | GEs / REs | Texture |
 |---|---|---|---|
-| `solidimpact` (default) | SI | 1 / 1 | none |
-| `highimpact` | SI with texture option | 1 / 1 | 4 TRAMs |
-| `maximpact` | MXI | 2 / 2 | 4 TRAMs per RE |
-| `v6` (also `vpro:v6`) | V6 | (VPro, BUZZ A) | in its 32 MB board memory |
-| `v8` (also `vpro:v8`) | V8 | (VPro, BUZZ A) | in its 128 MB board memory |
-| `v10` (also `vpro:v10`) | V10 | (VPro, BUZZ B) | in its 32 MB board memory |
-| `v12` (also `vpro:v12`) | V12 | (VPro, BUZZ B) | in its 128 MB board memory |
+| `type`, `model` | The PROM's name | GEs / REs | Texture |
+|---|---|---|---|
+| `impact`, `solid` (default) | SI | 1 / 1 | none |
+| `impact`, `high` | SI with texture option | 1 / 1 | 4 TRAMs |
+| `impact`, `max` | MXI | 2 / 2 | 4 TRAMs per RE |
+| `vpro`, `v6` | V6 | (VPro, BUZZ A) | in its 32 MB board memory |
+| `vpro`, `v8` | V8 | (VPro, BUZZ A) | in its 128 MB board memory |
+| `vpro`, `v10` | V10 | (VPro, BUZZ B) | in its 32 MB board memory |
+| `vpro`, `v12` | V12 | (VPro, BUZZ B) | in its 128 MB board memory |
 
 The two textured boards are new and less tested than the SI. Its screen is the iris window
 and what iris-ci screenshots show; the keyboard and mouse are IOC3's PS/2
-ports. `board = "none"` leaves the port empty, and the machine
+ports. `type = "none"` at `graphics` leaves the port empty, and the machine
 then runs on its serial console with no window.
 
 `v6`, `v8`, `v10` and `v12` are the four Octane VPro boards on the same

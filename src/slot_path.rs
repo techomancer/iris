@@ -14,6 +14,7 @@ const TAGS: &[(&str, bool)] = &[
     ("f", true),    // PCI function N, reserved
     ("hpc3", false),
     ("gfx", false),
+    ("gbe", false),
     ("gio", true), // GIO expansion slot N
     ("c", true),   // channel N of a controller with more than one
     ("t", true),   // SCSI target N

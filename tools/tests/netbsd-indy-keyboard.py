@@ -105,7 +105,7 @@ class Guest:
             f'prom = "(embedded)"\nnvram = "nvram.bin"\nbanks = [128, 128, 0, 0]\n'
             f'headless = false\nno_audio = true\nmonitor_port = {b}\nci_socket = "{self.sock}"\n\n'
             f'[machine]\nprofile = "indy_ip24"\ncpu = "r4400_150"\n\n'
-            f'[graphics]\nboard = "newport"\n\n[network]\nmode = "nat"\n\n'
+            f'[network]\nmode = "nat"\n\n'
             f'[scsi.4]\npath = "{Path(self.args.iso).resolve()}"\ncdrom = true\n'
             f'kind = "cdrom"\noverlay = true\n')
         self.log = open(self.work / "iris.log", "w")

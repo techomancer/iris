@@ -1128,7 +1128,7 @@ mod placement_tests {
                 P::Origin200Ip29 | P::Origin2000Ip27 | P::Onyx2Ip27 => crate::ip27::test_support::config(p, &dir, 1),
                 P::FuelIp34 => crate::ip35::test_support::fuel_config(&dir),
                 P::TezroIp53 => crate::ip35::test_support::tezro_config(&dir, 1),
-                _ => crate::display_stop_tests::config(&dir, p, if p.ip28() { GraphicsBoard::SolidImpact } else { GraphicsBoard::default_for(p) }),
+                _ => crate::display_stop_tests::config(&dir, p, if p.ip28() { Some(GraphicsBoard::SolidImpact) } else { p.default_board() }),
             };
             cfg.headless = true;
             let disk = dir.join("disk.raw");

@@ -21,9 +21,6 @@ nodes = 2
 console = "l1"
 l1_port = 18882
 
-[graphics]
-board = "none"
-
 [network]
 mode = "off"
 

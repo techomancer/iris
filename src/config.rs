@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 
 use crate::cpu::parts::{self, Part};
 use crate::dev::kona::KonaProduct;
-use crate::devices::{ConfiguredDevice, DeviceModel};
+use crate::devices::{BoardConfig, ConfiguredDevice, DeviceModel};
 use crate::topology::{scsi_target, DevicePlacement};
 
 pub(crate) mod legacy;
@@ -1013,75 +1013,38 @@ impl MachineProfile {
     }
 }
 
-/// Graphics board selected for a machine; `supports` describes compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+/// A graphics board model; its family is the device type that places it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GraphicsBoard {
-    /// Newport (REX3) — fully emulated. Default.
     #[default]
-    #[clap(name = "newport", alias = "xl")]
     Newport,
     /// GR2 XZ (`src/dev/gr2`): 2 GE7 on Indigo2; on Indy the XZ has 4 GE7
     /// (the Elan's), so `xz` there is the 4-GE board. In bring-up.
-    #[clap(name = "xz", alias = "gr2", alias = "gr2_xz", alias = "gr2-xz")]
     Xz,
-    /// GR2 Elan (4 GE7) — Indigo2 only; hinv says GR3-Elan. An Indy's XZ is
-    /// already this board.
-    #[clap(name = "elan", alias = "gr2_elan", alias = "gr2-elan")]
+    /// GR2 Elan (4 GE7); hinv says GR3-Elan. An Indy's XZ is already this board.
     Elan,
-    /// GR2 Extreme (8 GE7) — Indigo2 only (`src/dev/gr2`). In bring-up.
-    #[clap(name = "extreme", alias = "gr2_extreme", alias = "gr2-extreme")]
+    /// GR2 Extreme (8 GE7) (`src/dev/gr2`). In bring-up.
     Extreme,
     /// Solid IMPACT (1 GE11, 1 RE4).
-    #[clap(name = "solidimpact", alias = "impact:solid", alias = "solid_impact")]
     SolidImpact,
     /// High IMPACT (2 GE11, 1 RE4).
-    #[clap(name = "highimpact", alias = "impact:high", alias = "high_impact")]
     HighImpact,
     /// Maximum IMPACT (2 GE11, 2 RE4).
-    #[clap(name = "maximpact", alias = "impact:max", alias = "max_impact")]
     MaxImpact,
-    /// VPro V6: BUZZ A, 32 MB. Octane only (`src/dev/odyssey`).
-    #[clap(name = "v6", alias = "vpro:v6", alias = "vpro_v6")]
     V6,
-    /// VPro V8: BUZZ A, 128 MB. Octane only.
-    #[clap(name = "v8", alias = "vpro:v8", alias = "vpro_v8")]
     V8,
-    /// VPro V10: BUZZ B, 32 MB. Octane and Fuel. On the Octane it shipped
-    /// only in the Octane2 and needs Crossbow 1.4, so the machine takes the
-    /// Octane2's Crossbow and Bridge revisions.
-    #[clap(name = "v10", alias = "vpro:v10", alias = "vpro_v10")]
+    /// VPro V10 (BUZZ B, 32 MB): on the Octane it gives the machine the Octane2's Crossbow and Bridge.
     V10,
-    /// VPro V12: BUZZ B, 128 MB. Octane, Fuel, Tezro and Onyx 3000. On the Octane it
-    /// shipped only in the Octane2 and needs Crossbow 1.4, so the machine
-    /// takes the Octane2's Crossbow and Bridge revisions.
-    #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
+    /// VPro V12 (BUZZ B, 128 MB), as the V10.
     V12,
-    /// InfiniteReality2 with one raster manager (`src/dev/kona`). Onyx2 only.
-    #[clap(name = "ir2", alias = "ir2:1rm", alias = "ir2_1rm", alias = "infinitereality2")]
     Ir2,
-    /// InfiniteReality2 with two raster managers. Onyx2 only.
-    #[clap(name = "ir2:2rm", alias = "ir2_2rm", alias = "ir2x2")]
-    Ir2x2,
-    /// InfiniteReality2E (GE16-4, RM9, 64 MB texture) with one raster manager.
-    /// Onyx2 only.
-    #[clap(name = "ir2e")]
+    /// InfiniteReality2E: GE16-4, RM9, 64 MB texture.
     Ir2e,
-    /// InfiniteReality2E with two raster managers. Onyx2 only.
-    #[clap(name = "ir2e:2rm")]
-    Ir2ex2,
-    /// InfiniteReality3 with one raster manager (`src/dev/kona`). Onyx 3000
-    /// only.
-    #[clap(name = "ir3", alias = "infinitereality3")]
     Ir3,
-    /// No graphics board: the machine runs on its serial console. Octane
-    /// Fuel and the IP27 machines.
-    #[clap(name = "none")]
-    None,
 }
 
 impl GraphicsBoard {
-    /// Every board, in the order menus list them, `None` last.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 14] = [
         Self::Newport,
         Self::Xz,
         Self::Elan,
@@ -1090,8 +1053,7 @@ impl GraphicsBoard {
         Self::HighImpact,
         Self::MaxImpact,
         Self::V6, Self::V8, Self::V10, Self::V12,
-        Self::Ir2, Self::Ir2x2, Self::Ir2e, Self::Ir2ex2, Self::Ir3,
-        Self::None,
+        Self::Ir2, Self::Ir2e, Self::Ir3,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1107,12 +1069,9 @@ impl GraphicsBoard {
             Self::V8 => "VPro V8",
             Self::V10 => "VPro V10",
             Self::V12 => "VPro V12",
-            Self::Ir2 => "InfiniteReality2 (1 RM)",
-            Self::Ir2x2 => "InfiniteReality2 (2 RM)",
-            Self::Ir2e => "InfiniteReality2E (1 RM)",
-            Self::Ir2ex2 => "InfiniteReality2E (2 RM)",
-            Self::Ir3 => "InfiniteReality3 (1 RM)",
-            Self::None => "None",
+            Self::Ir2 => "InfiniteReality2",
+            Self::Ir2e => "InfiniteReality2E",
+            Self::Ir3 => "InfiniteReality3",
         }
     }
 
@@ -1122,19 +1081,26 @@ impl GraphicsBoard {
             Self::Xz => "xz",
             Self::Elan => "elan",
             Self::Extreme => "extreme",
-            Self::SolidImpact => "solidimpact",
-            Self::HighImpact => "highimpact",
-            Self::MaxImpact => "maximpact",
+            Self::SolidImpact => "solid",
+            Self::HighImpact => "high",
+            Self::MaxImpact => "max",
             Self::V6 => "v6",
             Self::V8 => "v8",
             Self::V10 => "v10",
             Self::V12 => "v12",
             Self::Ir2 => "ir2",
-            Self::Ir2x2 => "ir2:2rm",
             Self::Ir2e => "ir2e",
-            Self::Ir2ex2 => "ir2e:2rm",
             Self::Ir3 => "ir3",
-            Self::None => "none",
+        }
+    }
+
+    pub fn family(self) -> &'static str {
+        match self {
+            Self::Newport => "newport",
+            Self::Xz | Self::Elan | Self::Extreme => "express",
+            Self::SolidImpact | Self::HighImpact | Self::MaxImpact => "impact",
+            Self::V6 | Self::V8 | Self::V10 | Self::V12 => "vpro",
+            Self::Ir2 | Self::Ir2e | Self::Ir3 => "kona",
         }
     }
 
@@ -1147,59 +1113,12 @@ impl GraphicsBoard {
         matches!(self, Self::V6 | Self::V8 | Self::V10 | Self::V12)
     }
 
-    /// The InfiniteReality boards (`src/dev/kona`).
-    pub fn is_kona(self) -> bool {
-        self.kona().is_some()
-    }
-
-    /// The product and raster manager count of an InfiniteReality board.
-    pub fn kona(self) -> Option<(KonaProduct, u32)> {
+    pub fn kona(self) -> Option<KonaProduct> {
         match self {
-            Self::Ir2 => Some((KonaProduct::Ir2, 1)),
-            Self::Ir2x2 => Some((KonaProduct::Ir2, 2)),
-            Self::Ir2e => Some((KonaProduct::Ir2e, 1)),
-            Self::Ir2ex2 => Some((KonaProduct::Ir2e, 2)),
-            Self::Ir3 => Some((KonaProduct::Ir3, 1)),
+            Self::Ir2 => Some(KonaProduct::Ir2),
+            Self::Ir2e => Some(KonaProduct::Ir2e),
+            Self::Ir3 => Some(KonaProduct::Ir3),
             _ => None,
-        }
-    }
-
-    /// The raster managers an InfiniteReality board carries.
-    pub fn rm_count(self) -> Option<u32> {
-        self.kona().map(|(_, rms)| rms)
-    }
-
-    /// Whether `validate()` accepts this board on `profile`. The Octane
-    /// models only IMPACT (High as the SI with texture option, Maximum as
-    /// the MXI), VPro or no board. The Onyx2 takes an InfiniteReality2 or
-    /// none.
-    pub fn supports(self, profile: MachineProfile) -> bool {
-        match profile {
-            MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
-            MachineProfile::Onyx2Ip27 => self.is_kona() || self == Self::None,
-            p if p.is_ip27() => self == Self::None,
-            MachineProfile::FuelIp34 => matches!(self, Self::V10 | Self::V12 | Self::None),
-            MachineProfile::TezroIp53 => matches!(self, Self::None | Self::V12),
-            MachineProfile::Origin3200Ip35 => self == Self::None,
-            // One InfiniteReality pipe on a G-brick, of a product the table
-            // ships in an Onyx 3000 (`KonaProduct::check_host`), or a V12 on
-            // a V-brick.
-            MachineProfile::Onyx3000Ip35 => matches!(self, Self::Ir3 | Self::V12),
-            MachineProfile::Indigo2Ip22 => !self.is_vpro() && !self.is_kona() && self != Self::None,
-            _ => !self.is_vpro() && !self.is_kona() && !matches!(self, Self::Extreme | Self::Elan | Self::None),
-        }
-    }
-
-    /// The board a machine gets when `[graphics] board` is not set.
-    pub fn default_for(profile: MachineProfile) -> Self {
-        match profile {
-            MachineProfile::OctaneIp30 => Self::SolidImpact,
-            p if p.is_ip27() => Self::None,
-            MachineProfile::FuelIp34 | MachineProfile::TezroIp53 | MachineProfile::Origin3200Ip35 => Self::None,
-            // The Onyx 3000 is the Origin 3200 with graphics: no graphics
-            // board is the other profile.
-            MachineProfile::Onyx3000Ip35 => Self::Ir3,
-            _ => Self::Newport,
         }
     }
 }
@@ -1209,28 +1128,13 @@ impl std::str::FromStr for GraphicsBoard {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let lower = s.trim().to_ascii_lowercase();
-        match lower.as_str() {
-            "newport" | "xl" => Ok(Self::Newport),
-            "xz" | "gr2" | "gr2_xz" | "gr2-xz" => Ok(Self::Xz),
-            "elan" | "gr2_elan" | "gr2-elan" => Ok(Self::Elan),
-            "extreme" | "gr2_extreme" | "gr2-extreme" => Ok(Self::Extreme),
-            "solidimpact" | "impact:solid" | "solid_impact" | "solid-impact" | "solid" => Ok(Self::SolidImpact),
-            "highimpact" | "impact:high" | "high_impact" | "high-impact" | "high" => Ok(Self::HighImpact),
-            "maximpact" | "impact:max" | "max_impact" | "max-impact" | "maximumimpact" | "maximum_impact" | "maximum-impact" | "max" => Ok(Self::MaxImpact),
-            "v6" | "vpro:v6" | "vpro_v6" | "vpro-v6" => Ok(Self::V6),
-            "v8" | "vpro:v8" | "vpro_v8" | "vpro-v8" => Ok(Self::V8),
-            "v10" | "vpro:v10" | "vpro_v10" | "vpro-v10" => Ok(Self::V10),
-            "v12" | "vpro:v12" | "vpro_v12" | "vpro-v12" => Ok(Self::V12),
-            "ir2" | "ir2:1rm" | "ir2_1rm" | "ir2-1rm" | "infinitereality2" => Ok(Self::Ir2),
-            "ir2:2rm" | "ir2_2rm" | "ir2-2rm" | "ir2x2" => Ok(Self::Ir2x2),
-            "ir2e" => Ok(Self::Ir2e),
-            "ir2e:2rm" => Ok(Self::Ir2ex2),
-            "ir3" | "infinitereality3" => Ok(Self::Ir3),
-            "none" => Ok(Self::None),
-            _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, ir2, ir2:2rm, ir2e, ir2e:2rm, ir3, none)"
-            )),
-        }
+        let key = match lower.as_str() {
+            "solidimpact" => "solid",
+            "highimpact" => "high",
+            "maximpact" => "max",
+            k => k,
+        };
+        Self::ALL.into_iter().find(|b| b.as_str() == key).ok_or_else(|| format!("unknown graphics model \"{s}\""))
     }
 }
 
@@ -1260,8 +1164,7 @@ impl std::fmt::Display for GraphicsBoard {
 }
 
 /// Deprecated `[impact]` section: the IMPACT slot population of the Indigo2
-/// preview, replaced by `[graphics] board = "solidimpact"` (or `highimpact`,
-/// `maximpact`). Kept so configs written before the change still load;
+/// preview, replaced by an `impact` device entry. Kept so configs written before the change still load;
 /// [`MachineConfig::fold_deprecated`] moves `gfx` over and it is never written
 /// back. Slots held `none`, `solid`, `high` or `max`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1275,25 +1178,19 @@ pub struct LegacyImpactSection {
     pub exp1: Option<String>,
 }
 
-/// `[graphics]` section — Newport head count and display options.
+/// `[graphics]` section: how the host draws and rasterizes the board, which is a `[[devices]]` entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
-    /// Graphics board: Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum,
-    /// VPro V6/V8/V10/V12, InfiniteReality (IR2, IR2E, IR3) or none, as each
-    /// machine takes them (see `validate`). Unset: the machine's default
-    /// ([`GraphicsBoard::default_for`]); read it with
-    /// [`MachineConfig::graphics_board`]. Extreme is restricted to IP22;
-    /// non-Newport boards require one head
-    /// and Guest resolution. See [`MachineConfig::validate`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub board: Option<GraphicsBoard>,
-    /// The older second-head key, read by `legacy`.
-    #[serde(default = "default_graphics_heads")]
-    pub heads: u8,
-    /// Host-forced Newport video mode at VM start (`guest` = IRIX/setmon controls VC2).
-    #[serde(default)]
-    pub resolution: crate::dev::ng1::vc2_timings::NewportResolution,
+    /// Moved to `[[devices]]` entries: read only so `legacy` can refuse or convert them.
+    #[serde(default, skip_serializing)]
+    pub board: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub heads: Option<u8>,
+    #[serde(default, skip_serializing)]
+    pub resolution: Option<crate::dev::ng1::vc2_timings::NewportResolution>,
+    #[serde(default, skip_serializing)]
+    pub flash: Option<String>,
     /// Worker threads the board's fragment pipeline draws on, at least 1.
     /// VPro: the screen tiles' owners, besides its front-end and raster
     /// threads.
@@ -1317,11 +1214,6 @@ pub struct GraphicsSection {
     /// `dx12` or `gl`.
     #[serde(default = "default_gpu_backend")]
     pub gpu_backend: String,
-    /// InfiniteReality2: the file that keeps the pipe's flash EEPROM between
-    /// runs, exactly the flash's size; created blank when absent. Unset
-    /// means volatile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flash: Option<String>,
 }
 
 /// What draws the host window (`renderer`, `--renderer`).
@@ -1352,19 +1244,11 @@ pub enum NewportWgpuMode {
 }
 
 impl GraphicsSection {
-    /// Pixel size for host window layout when a preset is selected.
-    pub fn host_display_size(&self) -> (u32, u32) {
-        self.resolution
-            .visible_size()
-            .unwrap_or((1280, 1024))
-    }
-
     pub fn newport_wgpu_mode(&self) -> NewportWgpuMode {
         self.newport_mode.unwrap_or_default()
     }
 }
 
-fn default_graphics_heads() -> u8 { 1 }
 fn default_graphics_threads() -> usize { 2 }
 fn default_graphics_tile() -> u32 { 32 }
 fn default_gpu_backend() -> String { "auto".into() }
@@ -1373,14 +1257,14 @@ impl Default for GraphicsSection {
     fn default() -> Self {
         Self {
             board: None,
-            heads: default_graphics_heads(),
-            resolution: crate::dev::ng1::vc2_timings::NewportResolution::default(),
+            heads: None,
+            resolution: None,
+            flash: None,
             threads: default_graphics_threads(),
             tile: default_graphics_tile(),
             raster: RasterUnit::Cpu,
             newport_mode: None,
             gpu_backend: default_gpu_backend(),
-            flash: None,
         }
     }
 }
@@ -2967,14 +2851,18 @@ impl MachineConfig {
     /// Parse a config file's text as [`try_load`](Self::try_load) does, for
     /// front ends that read the file themselves: remembers whether it set
     /// `banks` and `[jitv2] threads`, folds in older spellings and settles
-    /// an unset thread count.
+    /// an unset thread count. Unlike `try_load`, it converts the older `[graphics]` board keys to entries.
     pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
-        Self::parse_toml(text)
+        Self::parse_with(text, true)
+    }
+
+    fn parse_toml(text: &str) -> Result<Self, toml::de::Error> {
+        Self::parse_with(text, false)
     }
 
     /// Parse a config file's text, remembering whether it listed `banks`, and
     /// folding in the spellings older versions wrote.
-    fn parse_toml(text: &str) -> Result<Self, toml::de::Error> {
+    fn parse_with(text: &str, migrate: bool) -> Result<Self, toml::de::Error> {
         let mut cfg = toml::from_str::<Self>(text).map_err(|e| legacy::name_replacement(e, text))?;
         let table = toml::from_str::<toml::Table>(text)?;
         cfg.banks_set = table.contains_key("banks");
@@ -2985,6 +2873,7 @@ impl MachineConfig {
         if !table.contains_key("scsi") && !none && cfg.devices.is_empty() {
             cfg.devices.splice(0..0, default_disks());
         }
+        legacy::graphics(&mut cfg, migrate).map_err(<toml::de::Error as serde::de::Error>::custom)?;
         cfg.fold_machine_keys().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         cfg.settle_jitv2_threads();
         Ok(cfg)
@@ -3214,7 +3103,7 @@ impl MachineConfig {
     /// section. Unset, one, except an Onyx 3000 with a V12: two, the V-brick
     /// on the second.
     pub fn c_bricks(&self) -> usize {
-        let vbrick = self.machine.profile == MachineProfile::Onyx3000Ip35 && self.graphics_board().is_vpro();
+        let vbrick = self.machine.profile == MachineProfile::Onyx3000Ip35 && self.graphics_board().is_some_and(GraphicsBoard::is_vpro);
         self.ip35_section().c_bricks.map_or(if vbrick { 2 } else { 1 }, usize::from)
     }
 
@@ -3329,20 +3218,62 @@ impl MachineConfig {
         Ok(banks.to_vec())
     }
 
-    /// The configured graphics board, or `GraphicsBoard::default_for` this profile.
-    pub fn graphics_board(&self) -> GraphicsBoard {
-        self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
+    /// The machine's board: the config's own entry, else the graphics slot's default, none if the config says `none`.
+    /// Reads the entries without placing them, so a front end may ask every frame.
+    pub fn graphics_entry(&self) -> Option<BoardConfig> {
+        let mut main = self.devices.iter().filter(|d| matches!(d.device, DeviceModel::Board(_) | DeviceModel::Empty) && !Self::is_head(d)).map(|d| &d.device);
+        match main.clone().find(|d| matches!(d, DeviceModel::Board(_))).or(main.next()) {
+            Some(DeviceModel::Board(b)) => Some(b.clone()),
+            Some(_) => None,
+            None => self.machine.profile.default_board().map(BoardConfig::new),
+        }
+    }
+
+    pub fn graphics_board(&self) -> Option<GraphicsBoard> {
+        self.graphics_entry().map(|b| b.model)
+    }
+
+    pub fn host_display_size(&self) -> (u32, u32) {
+        let main = self.devices.iter().find(|d| d.names_graphics(self.machine.profile));
+        main.and_then(|d| match &d.device {
+            DeviceModel::Board(b) => b.resolution.visible_size(),
+            _ => None,
+        }).unwrap_or((1280, 1024))
+    }
+
+    /// Make `board` (none: no board) the machine's graphics board.
+    pub fn set_graphics(&mut self, board: Option<BoardConfig>) {
+        self.devices.retain(|d| !d.names_graphics(self.machine.profile));
+        self.devices.push(match board {
+            Some(b) => ConfiguredDevice { at: None, ..ConfiguredDevice::new("", DeviceModel::Board(b)) },
+            None => ConfiguredDevice::new("graphics", DeviceModel::Empty),
+        });
+    }
+
+    fn is_head(d: &ConfiguredDevice) -> bool {
+        matches!(d.device, DeviceModel::Board(_)) && d.at.as_deref().is_some_and(|at| at.starts_with("gio"))
+    }
+
+    pub fn dual_head(&self) -> bool {
+        self.devices.iter().any(Self::is_head)
+    }
+
+    pub fn set_dual_head(&mut self, on: bool) {
+        self.devices.retain(|d| !Self::is_head(d));
+        if on {
+            self.devices.push(ConfiguredDevice::new("gio0", DeviceModel::Board(BoardConfig::default())));
+        }
     }
 
     /// Validate Newport's authoritative GPU mode independently so checked
     /// machine construction enforces it even without full config validation.
     pub(crate) fn validate_newport_raster_gate(&self) -> Result<(), String> {
-        let newport = self.graphics_board() == GraphicsBoard::Newport;
+        let newport = self.graphics_board() == Some(GraphicsBoard::Newport);
         if self.graphics.newport_mode.is_some()
             && (!newport || self.graphics.raster != RasterUnit::Wgpu)
         {
             return Err(
-                "graphics.newport_mode applies only to graphics.board = \"newport\" \
+                "graphics.newport_mode applies only to a newport board \
                  with graphics.raster = \"wgpu\""
                     .into(),
             );
@@ -3506,7 +3437,7 @@ impl MachineConfig {
         DevicePlacement::new(self).map(drop)
     }
 
-    /// Turn the older card flags (`[ultra64]`, `graphics.heads = 2`, `test_device`, `[virtio_*]`) into `[[devices]]`
+    /// Turn the older card flags (`[ultra64]`, `test_device`, `[virtio_*]`) into `[[devices]]`
     /// entries. A front end that reads a file itself calls this, so it sees what a run builds; a second fold adds nothing.
     pub fn fold_cards(&mut self) -> Result<(), String> {
         legacy::gio_cards(self)?;
@@ -3527,39 +3458,6 @@ impl MachineConfig {
         self.machine.profile.accepts_cpus(self.machine.cpus())?;
         crate::dev::serial_dev::validate(self)?;
         let board = self.graphics_board();
-        if board != GraphicsBoard::Newport {
-            let name = board.as_str();
-            if matches!(board, GraphicsBoard::Extreme | GraphicsBoard::Elan)
-                && self.machine.profile != MachineProfile::Indigo2Ip22
-            {
-                return Err(format!(
-                    "graphics.board \"{name}\" is only valid on Indigo2 (machine.profile = indigo2_ip22)"
-                ));
-            }
-            if !board.supports(self.machine.profile) {
-                return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
-                    format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
-                } else if self.machine.profile == MachineProfile::Origin3200Ip35 {
-                    format!("graphics.board \"{name}\" is not a board of the Origin 3200 (valid: none)")
-                } else if self.machine.profile == MachineProfile::Onyx3000Ip35 {
-                    format!("graphics.board \"{name}\" is not modelled on the Onyx 3000 (valid: ir3, v12)")
-                } else if self.machine.profile == MachineProfile::Onyx2Ip27 {
-                    format!("graphics.board \"{name}\" is not modelled on the Onyx2 (valid: ir2, ir2:2rm, ir2e, ir2e:2rm, none)")
-                } else if self.machine.profile.is_ip27() {
-                    format!("graphics.board \"{name}\" is not modelled on the {} (valid: none)", self.machine.profile.product_name().unwrap_or_default())
-                } else if self.machine.profile == MachineProfile::FuelIp34 {
-                    format!("graphics.board \"{name}\" is not a Fuel board (valid: v12, v10, none)")
-                } else {
-                    format!("graphics.board \"{name}\" is only valid on the Octane")
-                });
-            }
-            if self.has_device("newport") {
-                return Err(format!("graphics.board \"{name}\" does not support a second Newport head"));
-            }
-            if !self.graphics.resolution.is_guest() {
-                return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
-            }
-        }
         let p = self.machine.profile;
         for d in self.devices.iter().filter(|d| d.device.scsi().is_some_and(ScsiDeviceConfig::is_daynaport)) {
             let at = d.at.as_deref().unwrap_or_default();
@@ -3635,9 +3533,6 @@ impl MachineConfig {
             if self.banks[..2] != [256, 256] {
                 return Err("Fuel currently requires banks = [256, 256] (512 MiB)".into());
             }
-            if !board.supports(MachineProfile::FuelIp34) {
-                return Err(format!("graphics.board \"{}\" is not a Fuel board (valid: v12, v10, none)", board.as_str()));
-            }
             if let Some(text) = &self.fuel.l1_revision {
                 crate::dev::l1::parse_revision(text).map_err(|e| format!("machine.l1_revision: {e}"))?;
             }
@@ -3653,18 +3548,14 @@ impl MachineConfig {
             }
             if onyx {
                 crate::ip35_machine::graphics_port(self)?;
-                if let Some((product, _)) = board.kona() {
+                if board.is_none() {
+                    return Err("the Onyx 3000 needs a graphics board: the Origin 3200 is the machine without one".into());
+                }
+                if let Some(product) = board.and_then(GraphicsBoard::kona) {
                     product.spec().check_host(crate::dev::kona::KonaHost::Onyx3000)?;
                 }
             }
             self.ip35_banks()?;
-            if !board.supports(self.machine.profile) {
-                return Err(if onyx {
-                    format!("graphics.board \"{}\" is not modelled on the Onyx 3000 (valid: ir3, v12)", board.as_str())
-                } else {
-                    format!("graphics.board \"{}\" is not a board of the Origin 3200 (valid: none)", board.as_str())
-                });
-            }
             if let Some(text) = &section.l1_revision {
                 crate::dev::l1::parse_revision(text).map_err(|e| format!("machine.l1_revision: {e}"))?;
             }
@@ -3677,9 +3568,6 @@ impl MachineConfig {
             }
             crate::ip53_machine::chip(self.cpu()).accepts_cpus(self.machine.cpus())?;
             crate::ip53_machine::check_banks_for_cpus(&self.tezro_memory()?, usize::from(self.machine.cpus())).map_err(|e| format!("banks: {e}"))?;
-            if !board.supports(MachineProfile::TezroIp53) {
-                return Err(format!("graphics.board \"{}\" is not a Tezro board (valid: v12, none)", board.as_str()));
-            }
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
             // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
             // bank 0 without a gap, 8 GB at most (SGI's memory upgrade guide).
@@ -3698,13 +3586,7 @@ impl MachineConfig {
                 }
             }
             if let Some(old) = &self.octane.graphics {
-                return Err(format!(
-                    "octane.graphics has moved: set the board in [graphics] as board = \"{}\"",
-                    old.trim()
-                ));
-            }
-            if self.graphics.board == Some(GraphicsBoard::Newport) {
-                return Err("graphics.board \"newport\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)".into());
+                return Err(format!("octane.graphics has moved: write the board as a [[devices]] entry (was \"{}\")", old.trim()));
             }
         } else {
             for (i, &sz) in self.banks.iter().enumerate().take(bank_count) {
@@ -3751,13 +3633,12 @@ impl MachineConfig {
             return Err(format!("machine identity: emu_id = {emu_id} is not taken by this machine; only the Fuel and Tezro take it"));
         }
         let placement = DevicePlacement::new(self)?;
-        let written = self.devices.iter().filter(|d| matches!(d.device, DeviceModel::Graphics)).count();
-        if written > 1 {
-            // Octane dual head, Onyx2 and Onyx 3000 pipes and the Indy's dual-head board are real; iris builds one board.
-            return Err(format!("[[devices]] graphics: iris builds one graphics board on the {}", placement.machine()));
+        if placement.boards(false).count() > 1 {
+            // Octane dual head, Onyx2 and Onyx 3000 pipes are real; iris builds one board.
+            return Err(format!("iris builds one graphics board on the {}; `none` at graphics drops its default", placement.machine()));
         }
-        if written == 1 && board == GraphicsBoard::None {
-            return Err("[[devices]] graphics: the board `[graphics] board` names is none".into());
+        if placement.heads().count() > 0 && board != Some(GraphicsBoard::Newport) {
+            return Err("a second Newport head needs a Newport board in the graphics slot".into());
         }
         if self.has_device("nvme") {
             self.machine.profile.refuse_nvme()?;
@@ -4104,9 +3985,9 @@ pub struct Cli {
     #[arg(long = "cache", value_name = "MODEL")]
     pub cache: Option<CacheModel>,
 
-    /// Graphics board: `newport`, `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`), `v6`, `v8`, `v10`, `v12`, `ir2`, `ir2:2rm`, `ir2e`, `ir2e:2rm`, `ir3` or `none`; default: the machine's own.
-    #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
-    pub graphics: Option<GraphicsBoard>,
+    /// Moved to `--device`; read only so it can be refused.
+    #[arg(long = "graphics", alias = "board", alias = "graphics-board", value_name = "BOARD", hide = true)]
+    pub graphics: Option<String>,
 
     /// Where the raster unit runs: `cpu` (default) or `wgpu` (the host GPU through wgpu compute; needs a build with the `wgpu` feature).
     #[arg(long = "raster", value_name = "UNIT")]
@@ -4296,8 +4177,12 @@ impl Cli {
                 eprintln!("iris: {e}");
                 std::process::exit(1);
             });
-            // A named device replaces the file's device of that name.
-            match cfg.devices.iter().position(|d| d.name.is_some() && d.name == e.name) {
+            // A device replaces the file's of its name or its slot; a board with no slot is for the graphics slot.
+            let same = |d: &ConfiguredDevice| match (&d.name, &e.name) {
+                (Some(a), Some(b)) => a == b,
+                _ => d.at.is_some() && d.at == e.at || d.names_graphics(cfg.machine.profile) && e.names_graphics(cfg.machine.profile),
+            };
+            match cfg.devices.iter().position(same) {
                 Some(i) => cfg.devices[i] = e,
                 None => cfg.devices.push(e),
             }
@@ -4313,7 +4198,6 @@ impl Cli {
         // DevicePlacement by `MachineConfig::cpu_part` once the profile is final.
         if let Some(cpu) = &self.cpu { cfg.machine.cpu = Some(cpu.clone()); }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
-        if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
         if let Some(r) = self.raster { cfg.graphics.raster = r; }
         if let Some(m) = self.newport_mode { cfg.graphics.newport_mode = Some(m); }
         if let Some(r) = self.renderer { cfg.renderer = r; }
@@ -4437,7 +4321,8 @@ pub fn load_config() -> (MachineConfig, u32) {
 
     let toml_cfg = MachineConfig::load_toml(&cli.config);
     let mut cfg = cli.apply(toml_cfg);
-    if let Err(e) = cfg.resolve_slots() {
+    let moved = cli.graphics.as_deref().map_or(Ok(()), |_| Err(format!("--graphics {}", legacy::GRAPHICS_MOVED)));
+    if let Err(e) = moved.and_then(|()| cfg.resolve_slots()) {
         eprintln!("Configuration error: {e}");
         std::process::exit(1);
     }
@@ -4545,7 +4430,7 @@ mod export_tests {
         let error = cfg.validate().unwrap_err();
         assert!(error.contains("applies only"), "{error}");
         cfg.graphics.raster = RasterUnit::Wgpu;
-        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::SolidImpact)));
         assert!(cfg.validate().unwrap_err().contains("applies only"));
     }
 
@@ -4555,11 +4440,11 @@ mod export_tests {
         assert_eq!(cfg.graphics.raster, RasterUnit::Cpu);
         assert!(cfg.validate_newport_raster_gate().is_ok());
         cfg.graphics.raster = RasterUnit::Wgpu;
-        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::SolidImpact)));
         assert!(cfg.validate_newport_raster_gate().is_ok());
-        cfg.graphics.board = Some(GraphicsBoard::V10);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V10)));
         assert!(cfg.validate_newport_raster_gate().is_ok());
-        cfg.graphics.board = Some(GraphicsBoard::Newport);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Newport)));
         cfg.renderer = UiRenderer::Wgpu;
         assert_eq!(
             cfg.validate_newport_raster_gate().is_ok(),
@@ -4607,31 +4492,34 @@ mod export_tests {
             let mut c: MachineConfig =
                 toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n{t}"))
                     .expect("parse");
-            c.devices.clear();
+            c.devices.retain(|d| matches!(d.device, DeviceModel::Board(_) | DeviceModel::Empty));
             c
         };
         let cfg = octane("");
-        assert_eq!(cfg.graphics_board(), GraphicsBoard::SolidImpact);
+        assert_eq!(cfg.graphics_board(), Some(GraphicsBoard::SolidImpact));
         cfg.validate().expect("default Octane");
-        for (t, b) in [("none", GraphicsBoard::None), ("impact:solid", GraphicsBoard::SolidImpact),
-                       ("maximpact", GraphicsBoard::MaxImpact), ("highimpact", GraphicsBoard::HighImpact),
-                       ("v6", GraphicsBoard::V6), ("vpro:v8", GraphicsBoard::V8), ("v10", GraphicsBoard::V10),
-                       ("v12", GraphicsBoard::V12), ("vpro:v12", GraphicsBoard::V12)] {
-            let cfg = octane(&format!("[graphics]\nboard = \"{t}\""));
-            assert_eq!(cfg.graphics_board(), b, "{t}");
+        let entry = |t: &str, m: &str| format!("[[devices]]\ntype = \"{t}\"\n{}", if m.is_empty() { String::new() } else { format!("model = \"{m}\"\n") });
+        for (t, m, b) in [("impact", "solid", Some(GraphicsBoard::SolidImpact)),
+                          ("impact", "maximpact", Some(GraphicsBoard::MaxImpact)), ("impact", "high", Some(GraphicsBoard::HighImpact)),
+                          ("vpro", "v6", Some(GraphicsBoard::V6)), ("vpro", "v8", Some(GraphicsBoard::V8)),
+                          ("vpro", "v10", Some(GraphicsBoard::V10)), ("vpro", "v12", Some(GraphicsBoard::V12))] {
+            let cfg = octane(&entry(t, m));
+            assert_eq!(cfg.graphics_board(), b, "{t} {m}");
             cfg.validate().expect(t);
         }
-        for t in ["xz", "extreme", "newport"] {
-            assert!(octane(&format!("[graphics]\nboard = \"{t}\"")).validate().is_err(), "{t} is not modelled on the Octane");
+        let none = octane("[[devices]]\ntype = \"none\"\nat = \"graphics\"\n");
+        assert_eq!(none.graphics_board(), None);
+        none.validate().expect("no board");
+        for (t, m) in [("express", "xz"), ("express", "extreme"), ("newport", "")] {
+            assert!(octane(&entry(t, m)).validate().is_err(), "{t} {m} is not modelled on the Octane");
         }
         let err = octane("[octane]\ngraphics = \"maximpact\"").validate().unwrap_err();
-        assert!(err.contains("[graphics]"), "the retired key names its replacement: {err}");
+        assert!(err.contains("[[devices]]"), "the retired key names its replacement: {err}");
         // Elsewhere the default stays Newport, and none is the Octane's alone.
-        let cfg: MachineConfig = toml::from_str("").expect("parse");
-        assert_eq!(cfg.graphics_board(), GraphicsBoard::Newport);
-        assert!(!GraphicsBoard::None.supports(MachineProfile::IndyIp24));
-        assert!(!GraphicsBoard::V12.supports(MachineProfile::IndyIp24));
-        assert!(!GraphicsBoard::V12.supports(MachineProfile::Indigo2Ip22));
+        let mut cfg: MachineConfig = toml::from_str("").expect("parse");
+        assert_eq!(cfg.graphics_board(), Some(GraphicsBoard::Newport));
+        cfg.set_graphics(Some(BoardConfig::new(GraphicsBoard::V12)));
+        assert!(cfg.validate().unwrap_err().contains("no free slot"), "no VPro in an Indy");
     }
 
     #[test]
@@ -5148,33 +5036,35 @@ mod export_tests {
         assert!(load("[machine]\nprofile = \"fuel_ip34\"\nconsole = \"ioc4_a\"\n").unwrap_err().contains("is not a console"));
     }
 
-    /// A `graphics` device says where the board plugs in, on the machines with a choice.
     #[test]
-    fn a_graphics_device_places_the_board() {
+    fn a_boards_at_places_it() {
         let load = |profile: &str, machine: &str, rest: &str| {
             let mut cfg = MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"{profile}\"\n{machine}\n{rest}")).unwrap();
             cfg.resolve_slots().and_then(|_| cfg.validate()).map(|_| cfg)
         };
-        let gfx = |board: &str, at: &str| format!("[graphics]\nboard = \"{board}\"\n[[devices]]\ntype = \"graphics\"\nat = \"{at}\"\n");
+        let board = |ty: &str, model: &str, at: &str| format!("[[devices]]\ntype = \"{ty}\"\nmodel = \"{model}\"\nat = \"{at}\"\n");
+        let none = "[[devices]]\ntype = \"none\"\nat = \"graphics\"\n";
         let onyx = |nodes: u8, rest: String| load("onyx3000_ip35", &format!("nodes = {nodes}"), &rest);
-        onyx(2, gfx("v12", "node1/xio12")).unwrap();
-        onyx(2, gfx("v12", "xio11")).unwrap();
-        onyx(2, gfx("ir3", "node1/xio8")).unwrap();
-        assert!(onyx(1, gfx("ir3", "node1/xio11")).unwrap_err().contains("the machine has 1 C-brick"));
-        assert!(onyx(1, gfx("v12", "xio8")).unwrap_err().contains("has no slot xio8"), "the I-brick's pipe port is B");
-        assert!(onyx(2, gfx("v12", "node1/xio10")).unwrap_err().contains("has no slot node1/xio10"), "10 is the host");
-        let v12 = onyx(2, "[graphics]\nboard = \"v12\"\n".into()).unwrap();
+        onyx(2, board("vpro", "v12", "node1/xio12") + none).unwrap();
+        onyx(2, board("vpro", "v12", "xio11")).unwrap();
+        onyx(2, board("kona", "ir3", "node1/xio8") + none).unwrap();
+        assert!(onyx(1, board("kona", "ir3", "node1/xio11") + none).unwrap_err().contains("has no slot node1/xio11"), "the second C-brick is not there");
+        assert!(onyx(1, board("vpro", "v12", "xio8")).unwrap_err().contains("has no slot xio8"), "the I-brick's pipe port is B");
+        assert!(onyx(2, board("vpro", "v12", "node1/xio10")).unwrap_err().contains("has no slot node1/xio10"), "10 is the host");
+        assert!(onyx(2, board("vpro", "v12", "node1/xio12")).unwrap_err().contains("builds one graphics board"), "beside the default pipe");
+        let v12 = onyx(2, "[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n".into()).unwrap();
         assert_eq!(DevicePlacement::new(&v12).unwrap().graphics().unwrap().to_string(), "node1/xio8", "a V12 with no slot takes the V-brick");
         let tezro = |rest: String| load("tezro_ip53", "", &rest);
-        tezro(gfx("v12", "xio13")).unwrap();
-        assert!(tezro(gfx("v12", "xio11")).unwrap_err().contains("has no slot xio11"), "11 is the second PIC");
-        assert_eq!(DevicePlacement::new(&tezro(gfx("v12", "xio13")).unwrap()).unwrap().graphics().unwrap().to_string(), "xio13");
-        assert_eq!(DevicePlacement::new(&tezro("[graphics]\nboard = \"v12\"\n".into()).unwrap()).unwrap().graphics().unwrap().to_string(), "xio12");
-        // One device, for a board that is fitted.
-        let two = format!("{}[[devices]]\ntype = \"graphics\"\n", gfx("v12", "xio13"));
+        tezro(board("vpro", "v12", "xio13")).unwrap();
+        assert!(tezro(board("vpro", "v12", "xio11")).unwrap_err().contains("has no slot xio11"), "11 is the second PIC");
+        assert_eq!(DevicePlacement::new(&tezro(board("vpro", "v12", "xio13")).unwrap()).unwrap().graphics().unwrap().to_string(), "xio13");
+        assert_eq!(DevicePlacement::new(&tezro("[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n".into()).unwrap()).unwrap().graphics().unwrap().to_string(), "xio12");
+        let two = board("vpro", "v12", "xio13") + "[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n";
         assert!(tezro(two).unwrap_err().contains("builds one graphics board"));
-        assert!(tezro("[[devices]]\ntype = \"graphics\"\n".into()).unwrap_err().contains("is none"), "the Tezro has no board by default");
-        assert!(load("o2_ip32", "", "[[devices]]\ntype = \"graphics\"\n").unwrap_err().contains("no free slot for a graphics board"));
+        tezro(none.into()).unwrap();
+        let o2 = |rest: &str| load("o2_ip32", "", rest).unwrap_err();
+        assert!(o2("[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n").contains("no free slot for a graphics board"));
+        assert!(o2(&board("vpro", "v12", "graphics")).contains("no free slot for a graphics board on gbe"), "the built-in display takes nothing");
     }
 
     /// The graphics board is a placed device, so it holds its port: an Octane's default
@@ -5201,19 +5091,27 @@ mod export_tests {
     #[test]
     fn the_graphics_board_is_a_placed_device() {
         let at = |profile: &str, rest: &str| -> Vec<String> {
-            let cfg = MachineConfig::from_toml_str(&format!("devices = []\n[machine]\nprofile = \"{profile}\"\n{rest}")).unwrap();
+            let mut cfg = MachineConfig::from_toml_str(&format!("[machine]\nprofile = \"{profile}\"\n{rest}")).unwrap();
+            cfg.devices.retain(|d| matches!(d.device, DeviceModel::Board(_) | DeviceModel::Empty));
             DevicePlacement::new(&cfg).unwrap().graphics().map(|at| at.to_string()).into_iter().collect()
         };
         assert_eq!(at("octane_ip30", ""), ["xio11"]);
         assert_eq!(at("indy_ip24", ""), ["gfx"]);
-        assert_eq!(at("onyx2_ip27", "[graphics]\nboard = \"ir2\"\n"), ["xio8"]);
-        assert_eq!(at("fuel_ip34", "[graphics]\nboard = \"v12\"\n"), ["xio13"]);
-        for none in [at("octane_ip30", "[graphics]\nboard = \"none\"\n"), at("fuel_ip34", ""), at("o2_ip32", "")] {
+        assert_eq!(at("onyx2_ip27", "[[devices]]\ntype = \"kona\"\nmodel = \"ir2\"\n"), ["xio8"]);
+        assert_eq!(at("fuel_ip34", "[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n"), ["xio13"]);
+        for none in [at("octane_ip30", "[[devices]]\ntype = \"none\"\nat = \"graphics\"\n"), at("fuel_ip34", ""), at("o2_ip32", "")] {
             assert!(none.is_empty());
         }
-        let cfg = MachineConfig::from_toml_str("devices = []\n[machine]\nprofile = \"octane_ip30\"\n").unwrap();
+        let mut cfg = MachineConfig::from_toml_str("[machine]\nprofile = \"octane_ip30\"\n").unwrap();
+        cfg.devices.clear();
         let listing = DevicePlacement::new(&cfg).unwrap().list_slots();
-        assert!(listing.lines().any(|l| l.starts_with("xio11 ") && l.contains("graphics")), "{listing}");
+        assert!(listing.lines().any(|l| l.starts_with("xio11 ") && l.contains("impact solid (default)")), "{listing}");
+        let mut none = cfg.clone();
+        none.set_graphics(None);
+        let listing = DevicePlacement::new(&none).unwrap().list_slots();
+        assert!(listing.lines().any(|l| l.starts_with("xio11 ") && l.contains(" none ")), "{listing}");
+        let indy = DevicePlacement::new(&MachineConfig::from_toml_str("").unwrap()).unwrap().list_slots();
+        assert!(indy.contains("newport (default)") && indy.contains("a graphics board (newport)"), "{indy}");
     }
 
     /// Each IP27 product reads the table named for it, and only that one.
@@ -5277,8 +5175,8 @@ mod export_tests {
         for (profile, product) in [("origin200_ip29", "Origin 200"), ("origin2000_ip27", "Origin 2000"), ("onyx2_ip27", "Onyx2")] {
             let e = ip27_config(profile, "[scsi.4]\nkind = \"daynaport\"\n").validate().unwrap_err();
             assert!(e.contains(&format!("not available on the {product} ")), "{e}");
-            let e = ip27_config(profile, "[graphics]\nboard = \"v12\"\n").validate().unwrap_err();
-            assert!(e.contains(&format!("not modelled on the {product} ")), "{e}");
+            let e = ip27_config(profile, "[[devices]]\ntype = \"vpro\"\nmodel = \"v12\"\n").validate().unwrap_err();
+            assert!(e.contains(&format!("graphics board on the {product}")), "{e}");
             let e = ip27_config(profile, "[virtio_serial]\nenabled = true\n").resolve_slots().unwrap_err();
             assert!(e.contains(&format!("no free slot for virtio devices on the {product}")), "{e}");
         }
@@ -5463,30 +5361,18 @@ mod export_tests {
         assert_eq!(cfg.prom, "mine.bin");
     }
 
-    /// Configs written before `[impact]` became `[graphics] board` still
-    /// load; an empty one is dropped, a populated gfx slot becomes the board,
-    /// and the section is never written back.
+    /// `[impact]` is dropped when empty; a populated gfx slot becomes the board.
     #[test]
     fn legacy_impact_section_loads_and_folds() {
-        let mut cfg: MachineConfig = toml::from_str(r#"
-            [impact]
-            gfx = "none"
-            exp0 = "none"
-            exp1 = "none"
-        "#).expect("parse");
-        cfg.fold_deprecated().unwrap();
+        let cfg = MachineConfig::from_toml_str("[impact]\ngfx = \"none\"\nexp0 = \"none\"\nexp1 = \"none\"\n").unwrap();
         assert!(cfg.impact.is_none());
-        assert_eq!(cfg.graphics.board, None);
+        assert_eq!(cfg.graphics_board(), Some(GraphicsBoard::Newport), "the Indy's own board");
 
-        let mut cfg: MachineConfig = toml::from_str(r#"
-            [machine]
-            profile = "indigo2_ip22"
-            [impact]
-            gfx = "high"
-        "#).expect("parse");
-        cfg.fold_deprecated().unwrap();
-        assert_eq!(cfg.graphics.board, Some(GraphicsBoard::HighImpact));
+        let text = "[machine]\nprofile = \"indigo2_ip22\"\n[impact]\ngfx = \"high\"\n";
+        let cfg = MachineConfig::from_toml_str(text).unwrap();
+        assert_eq!(cfg.graphics_board(), Some(GraphicsBoard::HighImpact));
         assert!(!toml::to_string(&cfg).unwrap().contains("[impact]"));
+        assert_eq!(MachineConfig::parse_toml(text).unwrap().graphics_board(), Some(GraphicsBoard::HighImpact), "a config file still loads it");
 
         // The GUI's settings file holds the same struct as JSON.
         let json = r#"{"impact":{"gfx":"none","exp0":"none","exp1":"none"}}"#;
@@ -5890,20 +5776,20 @@ mod fuel_input_tests {
         cfg.banks[0] = 256;
         cfg.banks[1] = 256;
         cfg.devices.clear();
-        assert_eq!(cfg.graphics_board(), GraphicsBoard::None);
+        assert_eq!(cfg.graphics_board(), None);
         cfg.network.mode = NetMode::Off;
         cfg.validate().unwrap();
         cfg.network.mode = NetMode::Pcap;
         cfg.validate().unwrap();
-        cfg.graphics.board = Some(GraphicsBoard::Newport);
-        assert!(cfg.validate().unwrap_err().contains("none"));
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Newport)));
+        assert!(cfg.validate().unwrap_err().contains("no free slot for a graphics board"));
         for board in [GraphicsBoard::V12, GraphicsBoard::V10] {
-            cfg.graphics.board = Some(board);
+            cfg.set_graphics(Some(crate::devices::BoardConfig::new(board)));
             cfg.validate().unwrap();
         }
-        cfg.graphics.board = Some(GraphicsBoard::V6);
-        assert!(cfg.validate().unwrap_err().contains("not a Fuel board"));
-        cfg.graphics.board = None;
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V6)));
+        assert!(cfg.validate().unwrap_err().contains("no free slot for a graphics board"));
+        cfg.set_graphics(None);
         cfg.banks[1] = 0;
         assert!(cfg.validate().unwrap_err().contains("256, 256"));
     }
@@ -6051,13 +5937,13 @@ mod tezro_config_tests {
         }
         assert_eq!(MachineProfile::TezroIp53.cpus(), [&parts::R16000_700_EARLY, &parts::R16000_800, &parts::R16000_900, &parts::R16000_1000]);
         let mut cfg = tezro();
-        assert_eq!(cfg.graphics_board(), GraphicsBoard::None);
-        cfg.graphics.board = Some(GraphicsBoard::Newport);
+        assert_eq!(cfg.graphics_board(), None);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::Newport)));
         assert!(cfg.validate().is_err());
-        cfg.graphics.board = Some(GraphicsBoard::V10);
+        cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V10)));
         assert!(cfg.validate().is_err(), "the V10 is not a Tezro board");
         for cpus in [1, 4] {
-            cfg.graphics.board = Some(GraphicsBoard::V12);
+            cfg.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V12)));
             cfg.machine.cpus = Some(cpus);
             cfg.validate().unwrap();
         }

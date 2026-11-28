@@ -796,14 +796,9 @@ cpu     = "r4400"           # unset: the machine's first. Indy, IP22: r4400/r500
 # cpus  = 2                 # per node board. Octane: 1 or 2 (docs/octane-ip30-multiprocessor.md); Tezro: 1, 2 or 4 (default 4);
                             # Origin 3200, Onyx 3000: 1, 2 or 4 on each C-brick; Origin 200/2000, Onyx2: 1 or 2 on each node board
 
+# The graphics board is a [[devices]] entry (below). [graphics] holds how the host draws it.
 [graphics]
-board      = "newport"      # Indy, Indigo2: "newport", "xz", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); "elan", "extreme" on IP22 only (an Indy's "xz" has the Elan's 4 GE7s)
-                            # Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
-                            # Onyx2: "ir2", "ir2:2rm", "ir2e", "ir2e:2rm" or "none" (default); Onyx 3000: "ir3" (default) or "v12"
-                            # Fuel: "v10", "v12" or "none" (default); Tezro: "v12" or "none" (default); Origin 200/2000/3200: "none"
-heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 0; turns the Ultra64 board off)
-resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
-# threads  = 2              # VPro: fragment pipeline workers (more on a host with cores to spare)
+# threads  = 2              # VPro, InfiniteReality: fragment pipeline workers (more on a host with cores to spare)
 # tile     = 32             # VPro: screen tile size, a power of two from 8 to 256
 # raster   = "cpu"          # VPro, IMPACT, Newport: "wgpu" draws on the host GPU (needs the wgpu feature)
 # newport_mode = "direct"   # Newport wgpu only: "direct" or explicit slow "readback" compatibility
@@ -908,8 +903,25 @@ prebuf_ms = 20              # sound held before playing: the margin against a la
 # What one machine has beyond these keys also goes in [machine] and is described in
 # its guide in docs/: for example nodes = 2 (C-bricks or node boards), flash, console
 # and usb_input = true (the Fuel's USB keyboard and mouse).
-# The graphics board's slot is a device too: type = "graphics" and `at` (xio11, node1/xio8 on the Onyx 3000);
-# left out, the machine places it. Which board it is stays [graphics] board.
+
+# The graphics board is a device too. Its type is its family and `model` picks the board in it:
+#   newport  (no model; `resolution` = "1024x768", "1280x960" or "1280x1024" forces a video mode, default "guest")
+#   express  model = "xz", "elan" or "extreme"   (elan and extreme: Indigo2 only; an Indy's xz has the Elan's 4 GE7s)
+#   impact   model = "solid", "high" or "max"    ("solidimpact" and so on also work)
+#   vpro     model = "v6", "v8", "v10" or "v12"  (need IRIX 6.5.10 or later with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12)
+#   kona     model = "ir2", "ir2e" or "ir3"; raster_managers = 1 or 2; flash = "pipe.flash" keeps the pipe's flash EEPROM
+# With no `at`, or `at = "graphics"`, the entry replaces the machine's own board (Indy, Indigo2: newport;
+# Octane: impact solid; Onyx 3000: kona ir3; none on the others). An entry at another slot adds to it.
+# `type = "none"` at the graphics slot leaves it empty: the Octane, Fuel, Tezro and Onyx2 then run on the serial console.
+# [[devices]]
+# type  = "vpro"
+# model = "v12"
+# [[devices]]                # no graphics board
+# type = "none"
+# at   = "graphics"
+# [[devices]]                # dual-head Indy: a second Newport in GIO slot 0 (turns the Ultra64 board off)
+# type = "newport"
+# at   = "gio0"
 
 # ── Host tuning and debugging ────────────────────────────────────────────────
 
@@ -958,19 +970,39 @@ IRIX look for devices on it only at targets 1–3. Put a CD-ROM, and any fourth
 disk, on the external bus: `scsi1/t4`. iris warns at start-up about a device it
 will never find.
 
+### Graphics boards
+
+The graphics board is a `[[devices]]` entry (or `--device`), as in the configuration above. These older
+spellings no longer load. The `[graphics]` keys and `--graphics` are refused with a pointer here, and iris-gui
+reads the keys and saves the new form.
+
+| Before | Now |
+|---|---|
+| `[graphics] board = "newport"` (or `"xl"`) | `type = "newport"` |
+| `board = "xz"`, `"elan"`, `"extreme"` (or `gr2_xz` and so on) | `type = "express"`, `model = "xz"`, `"elan"`, `"extreme"` |
+| `board = "solidimpact"` (or `"impact:solid"`), `"highimpact"`, `"maximpact"` | `type = "impact"`, `model = "solid"`, `"high"`, `"max"` |
+| `board = "v12"` (or `"vpro:v12"`), `"v6"`, `"v8"`, `"v10"` | `type = "vpro"`, `model = "v12"` and so on |
+| `board = "ir2"`, `"ir2:2rm"`, `"ir2e"`, `"ir2e:2rm"`, `"ir3"` | `type = "kona"`, `model = "ir2"`, `"ir2e"`, `"ir3"`, with `raster_managers = 2` for the `:2rm` boards |
+| `board = "none"` | `type = "none"`, `at = "graphics"` |
+| `heads = 2` | a second `type = "newport"` entry, `at = "gio0"` |
+| `resolution`, `flash` | the same keys on the `newport` and `kona` entry |
+| `--graphics v12`, `--board`, `--graphics-board` | `--device vpro@graphics,model=v12` |
+| `type = "graphics"` (placement only, the board was `[graphics] board`) | the board's own entry |
+
 ### Old keys
 
 The keys iris wrote before `[[devices]]` still load, with a warning that says
 what each became, and will be removed in a later release. `[scsi.N]` tables
 (`[scsi.17]` is target 1 of `scsi1`), `controller`, `kind` and `cdrom` in them,
 `[ultra64]`, `[virtio_serial]` and `[virtio_9p]` with their `slot`,
-`graphics.heads = 2` and `test_device` become `[[devices]]` entries; the
+and `test_device` become `[[devices]]` entries; the
 command-line `--scsi1`, `--cdrom4` and `--test-device` and their relatives
 become `--device` overrides. Snapshots from before this change are refused.
 
 `[nvme]`, `[[xio_board]]`, `[fibre_channel]`, `[machine] audio_card`, the `audio`
-flags, `[graphics] node` and `widget`, and `bridge_slot` no longer load. A file
-with one is refused, and the error names the `[[devices]]` entry to write instead.
+flags, `[graphics] node` and `widget`, `[graphics] board`, `heads`, `resolution` and
+`flash` and `bridge_slot` no longer load. A file with one is
+refused, and the error says where to look (for the graphics keys, [Graphics boards](#graphics-boards)).
 
 ---
 
@@ -1012,8 +1044,6 @@ Configuration
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --machine <NAME>            Machine to emulate (a [machine] profile name); `help` lists them
   --ip22                      Same as --machine indigo2_ip22
-  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12,
-                              ir2, ir2:2rm, ir2e, ir2e:2rm, ir3 or none, as the machine allows
   --cpu <MODEL>               A family (r4400, r5000, r10000, r12000, r14000, r16000) or a part
                               (r14000_600), as the machine allows; default the machine's first
   --cache <MODEL>             CPU cache model: auto (default), full or shadow (R10000 family: always shadow)
@@ -1022,7 +1052,8 @@ Configuration
 
 Storage
   --device <SPEC>             Place a device: [NAME:]TYPE[@SLOT][,KEY=VALUE]..., as a [[devices]]
-                              entry (hdd@scsi0/t1,path=irix65.raw). A named one replaces the file's
+                              entry (hdd@scsi0/t1,path=irix65.raw, vpro@graphics,model=v12). One with the
+                              name or the slot of the file's replaces it; `none@graphics` leaves the graphics slot empty
   --list-slots                Print every slot on the machine, what is in it and what it takes
   --no-write-cache            Turn every hard disk's and the NVMe card's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts

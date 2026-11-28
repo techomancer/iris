@@ -7,8 +7,8 @@ Newport is the graphics board of the Indy (IP24) and the Indigo2 XL (IP22). Its
 drawing chip is REX3. Iris models two planes of 2048 x 1024 words, an RGB plane and an auxiliary one. Video timing is VC2, the window-ID cross-map is XMAP9, the
 colour map is CMAP, and the RAMDAC is Bt445. The guest reaches the drawing engine
 through an 8 KB register window. A draw is one register write, or a run of them,
-followed by a GO. The machine can give a second head (`graphics.heads = 2`),
-which is a second `Rex3`. `graphics.resolution` forces a video mode (`1024x768`, `1280x960` or `1280x1024`) at start instead of leaving VC2 to the guest; the default is `guest`.
+followed by a GO. The machine can give a second head (a `newport` device entry at `gio0`),
+which is a second `Rex3`. A `newport` entry's `resolution` forces a video mode (`1024x768`, `1280x960` or `1280x1024`) at start instead of leaving VC2 to the guest; the default is `guest`.
 
 The board keeps the FIFO shape the README describes. Stores go into a ring, and
 one thread drains it and does the drawing. A separate thread composes the screen

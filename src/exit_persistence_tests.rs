@@ -233,12 +233,12 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
         Machine::Octane => {
             std::fs::write(dir.file("prom"), vec![0u8; 1024 * 1024]).unwrap();
             cfg.prom = dir.file("prom").display().to_string();
-            cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+            cfg.set_graphics(None);
         }
         Machine::Tezro => {
             std::fs::write(dir.file("prom"), vec![0u8; 1024 * 1024]).unwrap();
             cfg.prom = dir.file("prom").display().to_string();
-            cfg.graphics.board = Some(crate::config::GraphicsBoard::None);
+            cfg.set_graphics(None);
             // One 1 GiB bank, and the boot flash with the other files.
             cfg.banks = crate::config::banks_from4([1024, 0, 0, 0]);
             cfg.banks_set = true;

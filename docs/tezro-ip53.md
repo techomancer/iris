@@ -74,7 +74,7 @@ widget 11, with nothing on its buses. It sits on link 11 of the IO9 PIC's
 PXBOW, beside the hub's link 10 and the IO9's link 15, so the PROM and IRIX
 find it through that crossbar's link status. Whether it has a crossbar of
 its own in front of it is not known. Either board takes a V12 at widget 12
-with `[graphics] board = "v12"`.
+with a `vpro` entry whose `model` is `v12`.
 
 The IO9's PCI bus, head 0 of the PIC at widget 15, holds the IOC4 at device
 1, a TI PCI2050 PCI-to-PCI bridge (`104c:ac28`, revision 1) at device 2, the
@@ -284,14 +284,14 @@ A disk installed for another machine family, for example an Octane install,
 does not boot a Tezro: the PROM loads that disk's `/unix` and stops with
 `Cannot load dksc(0,1,0)unix`.
 
-With `[graphics] board = "v12"` the PROM autoboots (a fresh NVRAM has
+With that `vpro` entry the PROM autoboots (a fresh NVRAM has
 `AutoLoad=Yes` and `OSLoadFilename=unix`). Without graphics it stops at the
 PROM menu.
 
 `stopgfx` turns the `windowsystem` setting off, so a later reboot has no X
 until `chkconfig windowsystem on`.
 
-`[graphics] board = "v12"` fits a VPro V12 at widget 12 behind the PXBOW,
+A `vpro` entry with `model = "v12"` puts a VPro V12 at widget 12 behind the PXBOW,
 on either board, using the VPro model the Octane and the Fuel use. On the
 two- and four-processor board this is QEMU's graphics slot. On the
 one-processor board the tower guide gives one XIO connector for a VPro board
