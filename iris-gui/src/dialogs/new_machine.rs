@@ -1,5 +1,6 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
-use iris::config::{MachineConfig, MachineProfile, VALID_BANK_SIZES};
+use iris::config::{GraphicsBoard, MachineConfig, MachineProfile, VALID_BANK_SIZES};
+use iris::devices::BoardConfig;
 use iris::cpu::parts::{self, Part};
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
@@ -14,7 +15,7 @@ pub struct NewMachineDialog {
     /// Emulated SGI machine profile.
     pub profile: MachineProfile,
     pub cpu: &'static Part,
-    pub graphics: iris::config::GraphicsBoard,
+    pub graphics: Option<BoardConfig>,
     /// Host-forced Newport video mode (`Guest` leaves it to IRIX/setmon).
     pub resolution: NewportResolution,
     pub prom_path: String,
@@ -44,7 +45,7 @@ impl Default for NewMachineDialog {
             name: default_name(MachineProfile::default()).into(),
             profile: MachineProfile::default(),
             cpu: &parts::R4400_150,
-            graphics: iris::config::GraphicsBoard::Newport,
+            graphics: Some(BoardConfig::default()),
             resolution: NewportResolution::default(),
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
@@ -110,7 +111,7 @@ impl NewMachineDialog {
                             self.name = default_name(self.profile).into();
                         }
                         self.cpu = self.profile.cpus()[0];
-                        self.graphics = if self.profile.ip28() { iris::config::GraphicsBoard::SolidImpact } else { iris::config::GraphicsBoard::default_for(self.profile) };
+                        self.graphics = if self.profile.ip28() { Some(GraphicsBoard::SolidImpact) } else { self.profile.default_board() }.map(BoardConfig::new);
                         self.use_embedded_prom = true;
                         self.ram_total_mb = crate::ram::ram_presets(self.profile)[0];
                         self.ram_banks = distribute_ram(self.ram_total_mb, self.profile);
@@ -139,9 +140,10 @@ impl NewMachineDialog {
                     ui.end_row();
 
                     ui.label(t!("config-graphics-board"));
-                    ComboBox::from_id_salt("nm_graphics").selected_text(if self.profile == MachineProfile::O2Ip32 { t!("extra-gbe") } else { self.graphics.label().to_string() }).show_ui(ui, |ui| {
-                        for board in iris::config::GraphicsBoard::ALL {
-                            if crate::extra_ui::board_supported(board, self.profile) { ui.selectable_value(&mut self.graphics, board, board.label()); }
+                    ComboBox::from_id_salt("nm_graphics").selected_text(if self.profile == MachineProfile::O2Ip32 { t!("extra-gbe") } else { crate::extra_ui::board_label(&self.graphics) }).show_ui(ui, |ui| {
+                        for board in crate::extra_ui::board_choices(self.profile) {
+                            let label = crate::extra_ui::board_label(&board);
+                            ui.selectable_value(&mut self.graphics, board, label);
                         }
                     });
                     ui.end_row();
@@ -311,7 +313,7 @@ impl NewMachineDialog {
                             name: self.name.clone(),
                             profile: self.profile,
                             cpu: self.cpu,
-                            graphics: self.graphics,
+                            graphics: self.graphics.clone(),
                             resolution: self.resolution,
                             use_embedded_prom: self.use_embedded_prom,
                             prom_path: self.prom_path.clone(),

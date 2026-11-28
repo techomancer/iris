@@ -104,7 +104,7 @@ fn the_configuration_refuses_what_the_row_does_not_hold() {
     cfg.set_disk(2, toml::from_str("path = \"d.raw\"").unwrap());
     assert!(refused(&cfg).contains("has no slot scsi0/t2"), "{}", refused(&cfg));
     let mut cfg = config(&dir, 1);
-    cfg.graphics.board = Some(crate::config::GraphicsBoard::V12);
+    cfg.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::V12)));
     assert!(refused(&cfg).contains("Origin 3200"));
 }
 /// `r12000` and `r12000_400` name the C-brick's processor, the 400 MHz part
@@ -159,9 +159,15 @@ fn the_loop_has_the_configured_disks() {
     assert_eq!(with_machine(config(&dir, 1), attached), [Vec::<usize>::new()], "the adapter is on the I-brick");
 }
 
+/// Put the board in the graphics slot, the I-brick's port: the only place a V12 goes with one C-brick.
+fn at_graphics(cfg: &mut MachineConfig) {
+    let p = cfg.machine.profile;
+    cfg.devices.iter_mut().filter(|d| d.names_graphics(p)).for_each(|d| d.at = Some("graphics".into()));
+}
+
 fn onyx_config(dir: &Path, board: GraphicsBoard) -> MachineConfig {
     let mut cfg = headless(dir, MachineProfile::Onyx3000Ip35);
-    cfg.graphics.board = Some(board);
+    cfg.set_graphics(Some(crate::devices::BoardConfig::new(board)));
     cfg.onyx3000.l1_port = Some(0);
     cfg
 }
@@ -252,15 +258,21 @@ fn a_link_reset_of_the_pipes_port_leaves_the_boards_own_registers() {
 fn the_configuration_refuses_what_the_onyx_does_not_hold() {
     let dir = TempPath::dir("o3k-ir-config");
     onyx_config(&dir, GraphicsBoard::Ir3).validate().unwrap();
-    for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2e, GraphicsBoard::None, GraphicsBoard::V10, GraphicsBoard::V8] {
-        assert!(refused(&onyx_config(&dir, board)).contains("Onyx 3000"), "{}", board.as_str());
+    for board in [GraphicsBoard::Ir2, GraphicsBoard::Ir2e, GraphicsBoard::V10, GraphicsBoard::V8] {
+        assert!(refused(&onyx_config(&dir, board)).contains("no free slot for a graphics board"), "{}", board.as_str());
     }
+    let mut none = onyx_config(&dir, GraphicsBoard::Ir3);
+    none.set_graphics(None);
+    assert!(refused(&none).contains("Onyx 3000 needs a graphics board"), "{}", refused(&none));
     // The C-bricks are `[onyx3000] c_bricks`, whichever the board: unset, one, or two with a V12.
     for board in [GraphicsBoard::Ir3, GraphicsBoard::V12] {
         let mut cfg = onyx_config(&dir, board);
         assert_eq!(cfg.c_bricks(), if board == GraphicsBoard::V12 { 2 } else { 1 });
         for count in [1u8, 2] {
             cfg.onyx3000.c_bricks = Some(count);
+            if count == 1 {
+                at_graphics(&mut cfg);
+            }
             cfg.validate().unwrap();
             assert_eq!((cfg.c_bricks(), node_specs(&cfg).unwrap().len()), (usize::from(count), usize::from(count)));
         }
@@ -278,9 +290,10 @@ fn the_configuration_refuses_what_the_onyx_does_not_hold() {
     assert_eq!(cfg.ip35_section().l1_port, Some(8882));
     assert_eq!(cfg.ip35_section().brick_serial, None, "`[origin3200]` is not read");
     let mut cfg = onyx_config(&dir, GraphicsBoard::Ir3);
-    cfg.graphics.board = None;
+    let p = cfg.machine.profile;
+    cfg.devices.retain(|d| !d.names_graphics(p));
     cfg.validate().unwrap();
-    assert_eq!(cfg.graphics_board(), GraphicsBoard::Ir3, "the default");
+    assert_eq!(cfg.graphics_board(), Some(GraphicsBoard::Ir3), "the default");
 }
 
 /// The V12 reads back at widget 8 of the second C-brick's crossbar; the first
@@ -322,6 +335,7 @@ fn either_board_takes_one_or_two_c_bricks() {
     let dir = TempPath::dir("o3k-free-bricks");
     let mut cfg = onyx_config(&dir, GraphicsBoard::V12);
     cfg.onyx3000.c_bricks = Some(1);
+    at_graphics(&mut cfg);
     let specs = node_specs(&cfg).unwrap();
     assert_eq!(specs[0].l1.attached.map(|b| (b.type_code, b.graphics_bay)), Some((0x49, Some(G_BRICK_BAY))));
     with_machine(cfg, |m| {
@@ -341,12 +355,19 @@ fn either_board_takes_one_or_two_c_bricks() {
     });
 }
 
-/// A `graphics` device moves the board: a V12 in a brick of its own answers at the slot named,
+/// A board's `at` moves it: a V12 in a brick of its own answers at the slot named,
 /// and a pipe named onto the second C-brick answers there and not on the I-brick.
 #[test]
-fn a_graphics_device_places_the_board() {
+fn a_boards_at_places_it() {
     let dir = TempPath::dir("o3k-placement");
-    let at = |cfg: &mut MachineConfig, at: &str| cfg.devices.push(ConfiguredDevice::new(at, DeviceModel::Graphics));
+    let at = |cfg: &mut MachineConfig, at: &str| {
+        let p = cfg.machine.profile;
+        cfg.devices.iter_mut().find(|d| d.names_graphics(p)).expect("a board").at = Some(at.into());
+        // A board away from the graphics slot leaves the slot's default there; `none` drops it.
+        if at != "xio11" {
+            cfg.devices.push(ConfiguredDevice::new("graphics", DeviceModel::Empty));
+        }
+    };
     let mut cfg = onyx_config(&dir, GraphicsBoard::V12);
     at(&mut cfg, "node1/xio12");
     assert_eq!(graphics_port(&cfg), Ok(GraphicsPort { node: 1, widget: 12 }));

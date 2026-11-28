@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
 use crate::dev::isp2200::LOOP_ID_MAX;
-use crate::devices::{ConfiguredDevice, DeviceModel};
+use crate::devices::{BoardConfig, ConfiguredDevice, DeviceModel};
 use crate::slot_path::MachineSlotPath;
 use crate::pci::PciBus;
 
@@ -26,6 +26,7 @@ pub enum DeviceFamily {
     Virtio,
     /// A device on a serial port: a host serial port, a MIDI synth or a host MIDI port.
     Serial,
+    Empty,
 }
 
 impl DeviceFamily {
@@ -39,6 +40,7 @@ impl DeviceFamily {
             DeviceFamily::Gfx => "a graphics board",
             DeviceFamily::Virtio => "virtio devices",
             DeviceFamily::Serial => "serial devices",
+            DeviceFamily::Empty => "nothing",
         }
     }
 }
@@ -66,8 +68,10 @@ impl MachineSlotKind {
     /// Whether a device of `family` fits; a card fits an extra slot only when `named`.
     pub fn takes(&self, family: DeviceFamily, named: bool) -> bool {
         match self {
-            // A serial device goes only where it is named: left to choose, it would take the console.
-            MachineSlotKind::Open(families) => families.contains(&family) && (named || family != DeviceFamily::Serial),
+            MachineSlotKind::Open(_) | MachineSlotKind::Extra { .. } if family == DeviceFamily::Empty => true,
+            // A serial device or a GIO slot's board (a second head) goes only where it is named.
+            MachineSlotKind::Open(families) if family == DeviceFamily::Serial || family == DeviceFamily::Gfx && families.contains(&DeviceFamily::Gio) => named && families.contains(&family),
+            MachineSlotKind::Open(families) => families.contains(&family),
             MachineSlotKind::Extra { .. } => family == DeviceFamily::Virtio || (named && family == DeviceFamily::Pci),
             _ => false,
         }
@@ -92,6 +96,29 @@ pub struct MachineSlot {
     pub path: MachineSlotPath,
     pub kind: MachineSlotKind,
     pub aliases: Vec<String>,
+    pub boards: &'static [GraphicsBoard],
+    /// Boards that go here only when an entry names the slot.
+    pub named: &'static [GraphicsBoard],
+    pub default: Option<GraphicsBoard>,
+}
+
+impl MachineSlot {
+    pub fn takes(&self, device: &DeviceModel, named: bool) -> bool {
+        let takes_board = |b: &BoardConfig| self.boards.contains(&b.model) || named && self.named.contains(&b.model);
+        self.kind.takes(device.spec().family, named) && !matches!(device, DeviceModel::Board(b) if !takes_board(b))
+    }
+
+    fn label(&self) -> String {
+        match [self.boards, self.named].concat() {
+            boards if boards.is_empty() => self.kind.label(),
+            boards => format!("{} ({})", self.kind.label(), board_label(&boards)),
+        }
+    }
+}
+
+/// `newport, impact solid, vpro v6`.
+fn board_label(boards: &[GraphicsBoard]) -> String {
+    boards.iter().map(|b| if b.family() == b.as_str() { b.as_str().into() } else { format!("{} {b}", b.family()) }).collect::<Vec<_>>().join(", ")
 }
 
 fn slot_path(at: &str) -> MachineSlotPath {
@@ -104,7 +131,7 @@ fn insert_slot(slots: &mut Vec<MachineSlot>, path: MachineSlotPath, kind: Machin
     assert!(!slots.iter().any(|s| s.path == path), "{path} declared twice");
     let parent = path.parent().unwrap_or_default();
     let i = slots.iter().rposition(|s| s.path.starts_with(&parent)).map_or(slots.len(), |i| i + 1);
-    slots.insert(i, MachineSlot { path, kind, aliases });
+    slots.insert(i, MachineSlot { path, kind, aliases, boards: &[], named: &[], default: None });
 }
 
 fn names(aliases: &[&str]) -> Vec<String> {
@@ -114,6 +141,15 @@ fn names(aliases: &[&str]) -> Vec<String> {
 /// A slot at `at` that takes devices of `families`, with machine aliases.
 pub fn open_slot(slots: &mut Vec<MachineSlot>, at: &str, families: &'static [DeviceFamily], aliases: &[&str]) {
     insert_slot(slots, slot_path(at), MachineSlotKind::Open(families), names(aliases));
+}
+
+pub fn boards(slots: &mut [MachineSlot], at: &str, boards: &'static [GraphicsBoard], default: Option<GraphicsBoard>) {
+    let slot = slots.iter_mut().find(|s| s.path == slot_path(at)).expect("a declared slot");
+    (slot.boards, slot.default) = (boards, default);
+}
+
+pub fn named_boards(slots: &mut [MachineSlot], at: &str, named: &'static [GraphicsBoard]) {
+    slots.iter_mut().find(|s| s.path == slot_path(at)).expect("a declared slot").named = named;
 }
 
 pub fn fixed_slot(slots: &mut Vec<MachineSlot>, at: &str, part: &'static str, aliases: &[&str]) {
@@ -217,6 +253,13 @@ pub fn drive_id(profile: MachineProfile, spec: &str) -> Result<usize, String> {
     Ok(usize::from(crate::config::scsi_slot(n, id)))
 }
 
+/// The IP22 adds the GR2 Elan and Extreme.
+const GIO_BOARDS: &[GraphicsBoard] = &[GraphicsBoard::Newport, GraphicsBoard::Xz, GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact];
+const IP22_BOARDS: &[GraphicsBoard] = &[
+    GraphicsBoard::Newport, GraphicsBoard::Xz, GraphicsBoard::Elan, GraphicsBoard::Extreme,
+    GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact,
+];
+
 impl MachineProfile {
     /// The slots of the machine, in the order automatic placement tries them.
     pub fn slots(self) -> Vec<MachineSlot> {
@@ -225,10 +268,12 @@ impl MachineProfile {
         match self {
             P::IndyIp24 | P::Indigo2Ip22 | P::Indigo2Ip28 => {
                 crate::dev::hpc3::Hpc3::slots(&mut s, self.guinness());
-                open_slot(&mut s, "gfx", &[DeviceFamily::Gfx], &[]);
+                open_slot(&mut s, "gfx", &[DeviceFamily::Gfx], &["graphics"]);
+                boards(&mut s, "gfx", if self == P::Indigo2Ip22 { IP22_BOARDS } else { GIO_BOARDS }, Some(GraphicsBoard::Newport));
                 // gio1 first, so a card with no `at` leaves gio0, where a second head answers; only virtio goes in gio1.
                 open_slot(&mut s, "gio1", &[DeviceFamily::Virtio], &[]);
-                open_slot(&mut s, "gio0", &[DeviceFamily::Gio, DeviceFamily::Virtio], &[]);
+                open_slot(&mut s, "gio0", &[DeviceFamily::Gio, DeviceFamily::Virtio, DeviceFamily::Gfx], &[]);
+                boards(&mut s, "gio0", &[GraphicsBoard::Newport], None);
             }
             P::O2Ip32 => crate::ip32_machine::slots(&mut s),
             P::OctaneIp30 => crate::ip30_machine::slots(&mut s),
@@ -242,6 +287,29 @@ impl MachineProfile {
             open_slot(&mut s, &format!("serial{n}"), &[DeviceFamily::Serial], &[]);
         }
         s
+    }
+
+    /// The machine's graphics slot, built once: a front end asks every frame.
+    fn graphics_slot(self) -> Option<&'static MachineSlot> {
+        static SLOTS: std::sync::OnceLock<Vec<(MachineProfile, Option<MachineSlot>)>> = std::sync::OnceLock::new();
+        let all = SLOTS.get_or_init(|| {
+            let find = |p: MachineProfile| p.slots().into_iter().find(|s| s.aliases.iter().any(|a| a == "graphics"));
+            MachineProfile::EVERY.into_iter().map(|p| (p, find(p))).collect()
+        });
+        all.iter().find(|(p, _)| *p == self).and_then(|(_, s)| s.as_ref())
+    }
+
+    /// Whether `at` names the machine's graphics slot: `graphics`, its path or another alias.
+    pub fn is_graphics_slot(self, at: &str) -> bool {
+        self.graphics_slot().is_some_and(|s| s.aliases.iter().any(|a| a == at) || s.path.to_string() == at)
+    }
+
+    pub fn graphics_boards(self) -> &'static [GraphicsBoard] {
+        self.graphics_slot().map_or(&[], |s| s.boards)
+    }
+
+    pub fn default_board(self) -> Option<GraphicsBoard> {
+        self.graphics_slot().and_then(|s| s.default)
     }
 }
 
@@ -260,23 +328,32 @@ impl DevicePlacement {
     /// The config's own devices, each in a slot of its machine: the first error of a device that is not a default.
     pub fn new(cfg: &MachineConfig) -> Result<DevicePlacement, String> {
         let p = DevicePlacement::lenient(cfg, &cfg.devices);
-        match p.devices.iter().zip(&p.at).find_map(|(d, at)| at.as_ref().err().filter(|_| !d.default)) {
+        match p.devices.iter().zip(&p.at).find_map(|(d, at)| at.as_ref().err().filter(|_| !waits(d))) {
             Some(e) => Err(e.clone()),
             None => Ok(p),
         }
     }
 
     /// `devices` on `cfg`'s machine, each in its slot where it has one, whatever else is wrong: what an editor shows mid-edit.
-    /// The graphics board no entry names claims its board's default slot, as a named device would.
+    /// A slot's default board is placed unless an entry names the slot: a board with no `at`, or a board or `none` at it.
     pub fn lenient(cfg: &MachineConfig, devices: &[ConfiguredDevice]) -> DevicePlacement {
         let machine = machine_name(cfg.machine.profile);
-        let slots = cfg.machine.profile.slots();
+        let mut slots = cfg.machine.profile.slots();
+        // A C-brick the config does not have has no slots.
+        if let (true, Some(bricks)) = (cfg.machine.profile.is_ip35_bricks(), cfg.ip35_section().c_bricks) {
+            slots.retain(|s| s.path.xio_port().is_none_or(|(node, _)| node < bricks));
+        }
         let mut devices = devices.to_vec();
-        let named = devices.iter().any(|d| matches!(d.device, DeviceModel::Graphics));
-        if !named && cfg.graphics_board() != GraphicsBoard::None && slots_take(&slots, DeviceFamily::Gfx) {
-            let first = || slots.iter().find(|s| s.kind.takes(DeviceFamily::Gfx, false)).map(|s| s.path.to_string());
-            let at = (cfg.machine.profile == MachineProfile::Onyx3000Ip35).then(|| crate::ip35_machine::default_at(cfg)).flatten().or_else(first);
-            devices.push(ConfiguredDevice { at, ..ConfiguredDevice::new("", DeviceModel::Graphics) });
+        for slot in slots.iter().filter(|s| s.default.is_some()) {
+            let at_slot = |at: &str| expand(machine, &slots, at, &mut |_| Ok(None)).is_ok_and(|p| p == slot.path);
+            let named = devices.iter().any(|d| match &d.device {
+                DeviceModel::Board(_) => d.at.as_deref().is_none_or(at_slot),
+                DeviceModel::Empty => d.at.as_deref().is_some_and(at_slot),
+                _ => false,
+            });
+            if let (false, Some(model)) = (named, slot.default) {
+                devices.push(ConfiguredDevice { default: true, ..ConfiguredDevice::new(&slot.path.to_string(), DeviceModel::Board(BoardConfig::new(model))) });
+            }
         }
         let (slots, at) = layout(machine, slots, &devices);
         DevicePlacement { slots, machine, devices, at, pci: HashMap::new() }
@@ -296,9 +373,23 @@ impl DevicePlacement {
         self.devices.iter().zip(&self.at).filter_map(|(d, at)| Some((d, at.as_ref().ok()?)))
     }
 
-    /// Where the graphics board goes, on a machine with a slot for one.
+    pub fn boards(&self, gio: bool) -> impl Iterator<Item = (&BoardConfig, &MachineSlotPath)> {
+        self.placed().filter_map(move |(d, at)| match &d.device {
+            DeviceModel::Board(b) if self.slot(at)?.kind.takes(DeviceFamily::Gio, true) == gio => Some((b, at)),
+            _ => None,
+        })
+    }
+
+    pub fn board(&self) -> Option<&BoardConfig> {
+        self.boards(false).next().map(|b| b.0)
+    }
+
     pub fn graphics(&self) -> Option<&MachineSlotPath> {
-        self.placed().find(|(d, _)| matches!(d.device, DeviceModel::Graphics)).map(|p| p.1)
+        self.boards(false).next().map(|b| b.1)
+    }
+
+    pub fn heads(&self) -> impl Iterator<Item = &BoardConfig> {
+        self.boards(true).map(|b| b.0)
     }
 
     /// The slot with this path.
@@ -369,7 +460,7 @@ impl DevicePlacement {
                 MachineSlotKind::Open(_) | MachineSlotKind::Extra { .. } => match has(&s.path) {
                     Some(h) => [s.path.to_string(), alias(s), h, "-".into()],
                     // A slot with its own name, or at the root, has a line to itself.
-                    None if !s.aliases.is_empty() || s.path.depth() < 2 => [s.path.to_string(), alias(s), "-".into(), s.kind.label()],
+                    None if !s.aliases.is_empty() || s.path.depth() < 2 => [s.path.to_string(), alias(s), "-".into(), s.label()],
                     None => {
                         let id = s.path.last_number().unwrap_or(0);
                         let (at, al) = (s.path.to_string(), alias(s));
@@ -381,7 +472,7 @@ impl DevicePlacement {
                             continue;
                         }
                         free = target.then_some((lines.len(), id));
-                        lines.push([at, al, "-".into(), s.kind.label()]);
+                        lines.push([at, al, "-".into(), s.label()]);
                         continue;
                     }
                 },
@@ -392,6 +483,11 @@ impl DevicePlacement {
         let w: Vec<usize> = (0..3).map(|c| lines.iter().map(|l| l[c].len()).max().unwrap_or(0)).collect();
         lines.iter().map(|l| format!("{:w0$}  {:w1$}  {:w2$}  {}\n", l[0], l[1], l[2], l[3], w0 = w[0], w1 = w[1], w2 = w[2])).collect()
     }
+}
+
+/// A default disk waits for the file's devices and is dropped without a slot; a default board does neither.
+fn waits(d: &ConfiguredDevice) -> bool {
+    d.default && !matches!(d.device, DeviceModel::Board(_))
 }
 
 /// How a device claims a slot: by a full path, by naming a bus, or anywhere.
@@ -423,7 +519,7 @@ fn layout(machine: &str, mut slots: Vec<MachineSlot>, devices: &[ConfiguredDevic
     for defaults in [false, true] {
         'claim: loop {
             for class in [SlotRequest::Full, SlotRequest::Bus, SlotRequest::Any] {
-                for i in (0..devices.len()).filter(|&i| devices[i].default == defaults) {
+                for i in (0..devices.len()).filter(|&i| waits(&devices[i]) == defaults) {
                     let d = &devices[i];
                     if out[i].is_some() {
                         continue;
@@ -450,9 +546,14 @@ fn layout(machine: &str, mut slots: Vec<MachineSlot>, devices: &[ConfiguredDevic
                     let ty = d.device.spec();
                     let got = match (own, base) {
                         (SlotRequest::Full, Some(Ok(loc))) => match slot {
-                            Some(s) if !s.kind.takes(ty.family, true) => Err(format!("{loc} does not take a {}", ty.name)),
+                            Some(s) if !s.takes(&d.device, true) => {
+                                Err(match &d.device {
+                                    DeviceModel::Board(_) => format!("{loc} does not take the {}", d.device.summary()),
+                                    _ => format!("{loc} does not take a {}", ty.name),
+                                })
+                            }
                             _ => match taken.get(&loc) {
-                                Some(&j) if matches!(d.device, DeviceModel::Graphics) => {
+                                Some(&j) if matches!(d.device, DeviceModel::Board(_)) => {
                                     Err(format!("{loc} is the graphics board's port, taken by the {} there", devices[j].device.spec().name))
                                 }
                                 Some(&j) => Err(format!("{loc} is taken by the {} there", devices[j].device.spec().name)),
@@ -462,7 +563,7 @@ fn layout(machine: &str, mut slots: Vec<MachineSlot>, devices: &[ConfiguredDevic
                         (_, under) => {
                             let under = under.map(|b| b.expect("checked above"));
                             let free = slots.iter().find(|s| {
-                                s.kind.takes(ty.family, false) && !taken.contains_key(&s.path) && under.as_ref().is_none_or(|b| s.path.starts_with(b))
+                                s.takes(&d.device, false) && !taken.contains_key(&s.path) && under.as_ref().is_none_or(|b| s.path.starts_with(b))
                             });
                             match free {
                                 Some(s) => Ok(s.path.clone()),
@@ -476,7 +577,10 @@ fn layout(machine: &str, mut slots: Vec<MachineSlot>, devices: &[ConfiguredDevic
                             if let Some(bring) = ty.slots {
                                 bring(&d.device, &loc, &mut slots);
                             }
-                            taken.insert(loc.clone(), i);
+                            // `none` only keeps the slot's default board out; the slot stays free.
+                            if !matches!(d.device, DeviceModel::Empty) {
+                                taken.insert(loc.clone(), i);
+                            }
                             out[i] = Some(Ok(loc));
                             continue 'claim;
                         }
@@ -514,7 +618,7 @@ fn layout(machine: &str, mut slots: Vec<MachineSlot>, devices: &[ConfiguredDevic
 }
 
 fn device_error(d: &ConfiguredDevice, e: &str) -> String {
-    if matches!(d.device, DeviceModel::Graphics) {
+    if matches!(d.device, DeviceModel::Board(_)) {
         return format!("the graphics board{}: {e}", d.at.as_ref().map(|at| format!(" at \"{at}\"")).unwrap_or_default());
     }
     match &d.at {
@@ -553,17 +657,21 @@ mod tests {
     use crate::pci::PciBus;
     use std::sync::Arc;
 
-    /// A machine under test, with no graphics board so its slots stay free.
     struct Map(MachineConfig);
 
     fn fill(p: MachineProfile) -> Map {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = p;
-        cfg.graphics.board = Some(GraphicsBoard::None);
         Map(cfg)
     }
 
     impl Map {
+        /// `devs` after `none` at the graphics slot, if open, and how many came first.
+        fn without_board(&self, devs: &[ConfiguredDevice]) -> (Vec<ConfiguredDevice>, usize) {
+            let open = self.slots().iter().any(|s| s.aliases.iter().any(|a| a == "graphics") && matches!(s.kind, MachineSlotKind::Open(_)));
+            let none: Vec<_> = open.then(|| ConfiguredDevice::new("graphics", DeviceModel::Empty)).into_iter().collect();
+            (none.iter().chain(devs).cloned().collect(), none.len())
+        }
         fn slots(&self) -> Vec<MachineSlot> { self.0.machine.profile.slots() }
         fn alias(&self, name: &str) -> Option<MachineSlotPath> { slot_alias(&self.slots(), name).cloned() }
         fn row(&self, at: &MachineSlotPath) -> Option<MachineSlot> { self.slots().into_iter().find(|s| &s.path == at) }
@@ -574,19 +682,21 @@ mod tests {
 
     fn place(devs: &[ConfiguredDevice], map: &Map) -> Result<Vec<Option<MachineSlotPath>>, String> {
         let mut cfg = map.0.clone();
-        cfg.devices = devs.to_vec();
+        let (devices, skip) = map.without_board(devs);
+        cfg.devices = devices;
         let p = DevicePlacement::new(&cfg)?;
-        Ok((0..devs.len()).map(|i| p.at(i).cloned()).collect())
+        Ok((0..devs.len()).map(|i| p.at(i + skip).cloned()).collect())
     }
 
     fn locate(devs: &[ConfiguredDevice], map: &Map) -> Vec<Option<MachineSlotPath>> {
-        let p = DevicePlacement::lenient(&map.0, devs);
-        (0..devs.len()).map(|i| p.at(i).cloned()).collect()
+        let (devices, skip) = map.without_board(devs);
+        let p = DevicePlacement::lenient(&map.0, &devices);
+        (0..devs.len()).map(|i| p.at(i + skip).cloned()).collect()
     }
 
     fn list_slots(devs: &[ConfiguredDevice], map: &Map) -> Result<String, String> {
         let mut cfg = map.0.clone();
-        cfg.devices = devs.to_vec();
+        cfg.devices = map.without_board(devs).0;
         DevicePlacement::new(&cfg).map(|p| p.list_slots())
     }
 
@@ -854,9 +964,9 @@ mod tests {
             vec!["hpc3/c0/t2-3", "scsi0/t2-3", "-", "scsi devices"],
             vec!["hpc3/c0/t4", "scsi0/t4", "cdrom (default)", "-"],
             vec!["hpc3/c0/t5-7", "scsi0/t5-7", "-", "scsi devices"],
-            vec!["gfx", "-", "-", "a graphics board"],
+            vec!["gfx", "graphics", "none", "-"],
             vec!["gio1", "-", "-", "virtio devices"],
-            vec!["gio0", "-", "-", "gio cards, virtio devices"],
+            vec!["gio0", "-", "-", "gio cards, virtio devices, a graphics board (newport)"],
             vec!["serial1", "-", "-", "serial devices"],
             vec!["serial2", "-", "-", "serial devices"],
         ]);
@@ -874,10 +984,10 @@ mod tests {
         let map = fill(MachineProfile::IndyIp24);
         let e = place(&[card("ultra64", Some("gio0")), card("test_device", Some("gio0"))], &map).unwrap_err();
         assert_eq!(e, "[[devices]] test_device at \"gio0\": gio0 is taken by the ultra64 there");
-        let e = place(&[card("newport", None), card("ultra64", None)], &map).unwrap_err();
+        let e = place(&[card("newport", Some("gio0")), card("ultra64", None)], &map).unwrap_err();
         assert!(e.starts_with("[[devices]] ultra64: no free slot for gio cards"), "{e}");
         let e = place(&[card("newport", Some("gio1"))], &map).unwrap_err();
-        assert!(e.contains("gio1 does not take a newport"), "{e}");
+        assert!(e.contains("gio1 does not take the newport"), "{e}");
         let e = place(&[card("virtio_serial", Some("gio1")), card("virtio_9p", Some("gio1"))], &map).unwrap_err();
         assert!(e.contains("gio1 is taken by the virtio_serial"), "{e}");
         let e = place(&[card("ultra64", None)], &fill(MachineProfile::OctaneIp30)).unwrap_err();
@@ -908,7 +1018,7 @@ mod tests {
     #[test]
     fn a_virtio_card_with_no_slot_leaves_slot_0_to_the_cards_that_need_it() {
         let map = fill(MachineProfile::Indigo2Ip22);
-        assert_eq!(place(&[card("virtio_serial", None), card("newport", None)], &map).unwrap(), [Some(loc("gio1")), Some(loc("gio0"))]);
+        assert_eq!(place(&[card("virtio_serial", None), card("newport", Some("gio0"))], &map).unwrap(), [Some(loc("gio1")), Some(loc("gio0"))]);
         let two = place(&[card("virtio_9p", None), card("virtio_serial", None)], &map).unwrap();
         assert_eq!(two.iter().map(|at| at.as_ref().and_then(|a| a.gio_slot())).collect::<Vec<_>>(), [Some(1), Some(0)]);
     }

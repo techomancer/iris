@@ -3,6 +3,7 @@
 //! RAM and the name that followed the old model).
 
 use iris::config::{GraphicsBoard, MachineConfig, MachineProfile, ScsiDeviceConfig, MAX_BANKS};
+use iris::devices::BoardConfig;
 use iris::cpu::parts::Part;
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
@@ -18,7 +19,8 @@ pub struct NewMachineSpec {
     pub name: String,
     pub profile: MachineProfile,
     pub cpu: &'static Part,
-    pub graphics: GraphicsBoard,
+    /// The board; none for no board.
+    pub graphics: Option<BoardConfig>,
     pub resolution: NewportResolution,
     pub use_embedded_prom: bool,
     pub prom_path: String,
@@ -41,7 +43,7 @@ impl Default for NewMachineSpec {
             name: String::new(),
             profile,
             cpu: profile.cpus()[0],
-            graphics: GraphicsBoard::Newport,
+            graphics: Some(BoardConfig::default()),
             resolution: NewportResolution::default(),
             use_embedded_prom: true,
             prom_path: "prom.bin".into(),
@@ -72,7 +74,7 @@ impl NewMachineSpec {
         }
         self.profile = p;
         self.cpu = p.cpus()[0];
-        self.graphics = if p.ip28() { GraphicsBoard::SolidImpact } else { GraphicsBoard::default_for(p) };
+        self.graphics = if p.ip28() { Some(GraphicsBoard::SolidImpact) } else { p.default_board() }.map(BoardConfig::new);
         self.use_embedded_prom = true;
         self.ram_total_mb = ram::ram_presets(p)[0];
         self.ram_banks = distribute_ram(self.ram_total_mb, p);
@@ -123,9 +125,12 @@ impl NewMachineSpec {
         cfg.machine.profile = p;
         cfg.set_cpu(self.cpu);
         cfg.banks_set = true;
-        cfg.graphics.board = Some(self.graphics);
-        cfg.graphics.resolution =
-            if self.graphics == GraphicsBoard::Newport { self.resolution } else { NewportResolution::Guest };
+        if !p.graphics_boards().is_empty() {
+            cfg.set_graphics(self.graphics.clone().map(|b| BoardConfig {
+                resolution: if b.model == GraphicsBoard::Newport { self.resolution } else { b.resolution },
+                ..b
+            }));
+        }
         // "(embedded)" names the PROM built into iris.
         cfg.prom = if self.use_embedded_prom || self.prom_path.is_empty() {
             "(embedded)".into()
@@ -204,8 +209,7 @@ impl NewMachineSpec {
         let p = self.profile;
         let one = |n: usize, why: String| Enabled::when(n > 1, || why);
         let cpus = p.cpus();
-        let boards: Vec<GraphicsBoard> =
-            GraphicsBoard::ALL.iter().copied().filter(|b| crate::model::hardware::board_supported(*b, p)).collect();
+        let boards = crate::model::hardware::board_choices(p);
         let presets = self.ram_presets();
         let mut f = vec![
             Field {
@@ -240,8 +244,8 @@ impl NewMachineSpec {
                 label: t!("config-graphics-board"),
                 help: None,
                 kind: K::Choice {
-                    options: boards.iter().map(|b| b.label().to_string()).collect(),
-                    selected: boards.iter().position(|b| *b == self.graphics).unwrap_or(0),
+                    options: boards.iter().map(crate::model::hardware::board_label).collect(),
+                    selected: crate::model::hardware::board_position(&boards, &self.graphics),
                 },
                 enabled: one(boards.len(), t!("settings-one-board")),
             });
@@ -316,13 +320,7 @@ impl NewMachineSpec {
                 }
             }
             (field::GRAPHICS, Value::Index(i)) => {
-                let p = self.profile;
-                if let Some(b) = GraphicsBoard::ALL
-                    .iter()
-                    .copied()
-                    .filter(|b| crate::model::hardware::board_supported(*b, p))
-                    .nth(i)
-                {
+                if let Some(b) = crate::model::hardware::board_choices(self.profile).into_iter().nth(i) {
                     self.graphics = b;
                 }
             }

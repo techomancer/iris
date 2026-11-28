@@ -95,7 +95,9 @@ pub(crate) const IO9_BUS1_SLOTS: &[(u8, MachineSlotKind, Option<&str>)] = &[(1, 
 pub(crate) fn slots(s: &mut Vec<crate::topology::MachineSlot>) {
     // The V12's port first, the only one known to work; the others are for experiment.
     for w in [VPRO_WIDGET, 8, 9, 13, 14] {
-        crate::topology::open_slot(s, &format!("xio{w}"), &[crate::topology::DeviceFamily::Gfx], &[]);
+        let at = format!("xio{w}");
+        crate::topology::open_slot(s, &at, &[crate::topology::DeviceFamily::Gfx], if w == VPRO_WIDGET { &["graphics"] } else { &[] });
+        crate::topology::boards(s, &at, &[GraphicsBoard::V12], None);
     }
     crate::topology::pci_bus_slots(s, &format!("xio{IO9_WIDGET}/pci0"), "Tezro IO9 PIC, bus 0", IO9_BUS0_SLOTS);
     // The ISP12160's two channels.
@@ -338,7 +340,7 @@ pub(crate) fn node_specs(cfg: &MachineConfig) -> Result<Vec<NodeSpec>, String> {
     let banks = cfg.tezro_memory()?;
     let cpus = usize::from(cfg.machine.cpus());
     let chip = chip(cfg.cpu());
-    let vpro = cfg.graphics_board() == GraphicsBoard::V12;
+    let vpro = cfg.graphics_board() == Some(GraphicsBoard::V12);
     Ok(vec![spec(chip, cpus, &banks, cfg.network().mac, Some(cfg.tezro_system_serial()), vpro, cfg.tezro.flash.as_deref().map(PathBuf::from))?])
 }
 
@@ -370,7 +372,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     // The V12's interrupt packets and DMA reach Bedrock IO as the PIC's do. Nothing counts the
     // processors' stores into its graphics page or returns credits for them.
     let mut resolved = crate::topology::DevicePlacement::new(cfg)?;
-    let vpro = (cfg.graphics_board() == GraphicsBoard::V12)
+    let vpro = (cfg.graphics_board() == Some(GraphicsBoard::V12))
         .then(|| {
             let widget = resolved.graphics().and_then(|at| at.xio_port()).map_or(VPRO_WIDGET, |p| p.1);
             attach_vpro(cfg, bedrock, widget, bedrock.interrupt_sender(widget, Some(INBOUND_DEVICE)), &status, |vpro| {
@@ -420,7 +422,7 @@ pub(crate) fn build_io(cfg: &MachineConfig, nodes: &[NodeBoard<Bedrock, Flash>],
     resolved.bind_pci(&format!("xio{IO9_WIDGET}/pci0/{TI_BRIDGE_DEVICE}/pci0"), ti.secondary().clone())?;
     let scratch = crate::scsi::attach_without_daynaport(cfg, table, product, &resolved, &buses)?;
     let cards = Arc::new(resolved.build_cards(cfg, timers)?);
-    eprintln!("iris: {}", if vpro.is_some() { cfg.graphics_board().label() } else { "no graphics" });
+    eprintln!("iris: {}", cfg.graphics_board().map_or("no graphics", GraphicsBoard::label));
     let console_index = cfg.tezro.console.index();
     connect_serial_ports(cfg, "Tezro", &serial_ports(cfg, l1, &ioc4, &serial), console_index)?;
     let console = cfg.ci.then(|| serial[console_index].clone());

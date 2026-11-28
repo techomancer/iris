@@ -184,9 +184,9 @@ fn a_fibre_channel_adapter_in_a_slot_is_built_with_its_loop() {
 }
 
 /// A Fuel with `graphics` in its graphics slot.
-fn fuel_with_graphics(dir: &TempPath, graphics: crate::config::GraphicsBoard) -> crate::config::MachineConfig {
+fn fuel_with_graphics(dir: &TempPath, graphics: Option<crate::config::GraphicsBoard>) -> crate::config::MachineConfig {
     let mut cfg = fuel_config(dir);
-    cfg.graphics.board = (graphics != crate::config::GraphicsBoard::None).then_some(graphics);
+    cfg.set_graphics(graphics.map(crate::devices::BoardConfig::new));
     cfg
 }
 /// A Fuel IRIX inventory lists its VPro under xtalk/13: the processor must
@@ -195,7 +195,7 @@ fn fuel_with_graphics(dir: &TempPath, graphics: crate::config::GraphicsBoard) ->
 fn the_vpro_answers_at_widget_13_with_its_link_alive() {
     let dir = TempPath::dir("fuel-vpro-id");
     for (graphics, revision) in [(crate::config::GraphicsBoard::V12, 0xa), (crate::config::GraphicsBoard::V10, 0xa)] {
-        with_machine(fuel_with_graphics(&dir, graphics), move |m| {
+        with_machine(fuel_with_graphics(&dir, Some(graphics)), move |m| {
             let pio = m.nodes[0].chip.pio();
             let identity = pio.read32(VPRO_PIO | (ODSY_IDENTITY + 4));
             assert_eq!(identity.status, BUS_OK);
@@ -213,7 +213,7 @@ fn the_monitor_resolves_vpro_commands_only_with_a_vpro() {
     let dir = TempPath::dir("vpro-monitor");
     for (what, plain) in [("Fuel", fuel_config(&dir)), ("Tezro", tezro_config(&dir, 1))] {
         let mut with_vpro = plain.clone();
-        with_vpro.graphics.board = Some(crate::config::GraphicsBoard::V12);
+        with_vpro.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::V12)));
         for (cfg, vpro) in [(with_vpro, true), (plain, false)] {
             let seen = with_machine(cfg, |m| {
                 let has = |command: &str| m.io.monitor.iter().any(|d| d.register_commands().iter().any(|(c, _)| c == command));
@@ -232,11 +232,11 @@ fn a_vpro_interrupt_packet_sets_and_clears_the_pending_bit_its_address_names() {
     use crate::config::{GraphicsBoard, MachineProfile};
     let dir = TempPath::dir("vpro-irq");
     let mut fuel = fuel_config(&dir);
-    fuel.graphics.board = Some(GraphicsBoard::V12);
+    fuel.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V12)));
     let mut tezro = tezro_config(&dir, 1);
-    tezro.graphics.board = Some(GraphicsBoard::V12);
+    tezro.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V12)));
     let mut vbrick = headless(&dir, MachineProfile::Onyx3000Ip35);
-    vbrick.graphics.board = Some(GraphicsBoard::V12);
+    vbrick.set_graphics(Some(crate::devices::BoardConfig::new(GraphicsBoard::V12)));
     vbrick.onyx3000.l1_port = Some(0);
     for (what, cfg, node, widget) in [("Fuel", fuel, 0, 13), ("Tezro", tezro, 0, 12), ("V-brick", vbrick, 1, 8)] {
         with_machine(cfg, move |m| {
@@ -264,7 +264,7 @@ fn a_vpro_interrupt_packet_sets_and_clears_the_pending_bit_its_address_names() {
 #[test]
 fn a_graphics_link_reset_resets_the_vpro() {
     let dir = TempPath::dir("fuel-vpro-reset");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
+    with_machine(fuel_with_graphics(&dir, Some(crate::config::GraphicsBoard::V12)), |m| {
         let pio = m.nodes[0].chip.pio();
         let destination = VPRO_PIO | (ODSY_INT_DEST_LOWER + 4);
         assert_eq!(pio.write32(destination, 0x55), BUS_OK);
@@ -278,7 +278,7 @@ fn a_graphics_link_reset_resets_the_vpro() {
 #[test]
 fn a_fuel_without_graphics_has_no_widget_13() {
     let dir = TempPath::dir("fuel-no-vpro");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::None), |m| {
+    with_machine(fuel_with_graphics(&dir, None), |m| {
         let pio = m.nodes[0].chip.pio();
         assert!(m.io.display.is_none());
         assert_ne!(pio.read32(VPRO_PIO | 4).status, BUS_OK);
@@ -291,7 +291,7 @@ fn a_fuel_without_graphics_has_no_widget_13() {
 #[test]
 fn processor_interface_graphics_registers_keep_their_writes() {
     let dir = TempPath::dir("fuel-pi-graphics");
-    with_machine(fuel_with_graphics(&dir, crate::config::GraphicsBoard::V12), |m| {
+    with_machine(fuel_with_graphics(&dir, Some(crate::config::GraphicsBoard::V12)), |m| {
         // Slot A's credit counter and bias; PI1 keeps its own block.
         assert_eq!(pi_regs(m, 0).write64(0x308, 100), BUS_OK);
         assert_eq!(pi_regs(m, 0).write64(0x310, 0x1000 | 68), BUS_OK);

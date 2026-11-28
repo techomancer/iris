@@ -67,7 +67,7 @@ mod tests {
 
     fn config(path: &Path, profile: P) -> MachineConfig {
         match profile {
-            P::O2Ip32 | P::OctaneIp30 => crate::display_stop_tests::config(path, profile, GraphicsBoard::None),
+            P::O2Ip32 | P::OctaneIp30 => crate::display_stop_tests::config(path, profile, None),
             P::Origin200Ip29 | P::Origin2000Ip27 | P::Onyx2Ip27 => crate::ip27::test_support::config(profile, path, 1),
             P::FuelIp34 => crate::ip35::test_support::fuel_config(path),
             P::TezroIp53 => crate::ip35::test_support::tezro_config(path, 2),

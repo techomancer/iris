@@ -37,7 +37,7 @@ scsi = {}
 profile = "$profile"
 EOT
 # Only the Octane has a graphics board to leave out.
-[ "$machine" = octane ] && printf '[graphics]\nboard = "none"\n' >> iris.toml
+[ "$machine" = octane ] && printf '[[devices]]\ntype = "none"\nat = "graphics"\n' >> iris.toml
 "$bin" --config iris.toml > out.log 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT

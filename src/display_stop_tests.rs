@@ -12,6 +12,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile};
+use crate::devices::BoardConfig;
 use crate::dev::ng1::rex3::Renderer;
 use crate::test_temp::TempPath;
 use crate::workstation::Workstation;
@@ -67,7 +68,7 @@ pub(crate) fn scratch(test: &str) -> TempPath {
     TempPath::dir(&format!("display-stop-{test}"))
 }
 
-pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) -> MachineConfig {
+pub(crate) fn config(dir: &Path, profile: MachineProfile, board: Option<GraphicsBoard>) -> MachineConfig {
     let mb = match profile {
         MachineProfile::OctaneIp30 => 64,
         MachineProfile::O2Ip32 => 32,
@@ -87,12 +88,12 @@ pub(crate) fn config(dir: &Path, profile: MachineProfile, board: GraphicsBoard) 
         std::fs::write(&prom, vec![0u8; len]).unwrap();
         cfg.prom = prom.to_string_lossy().into_owned();
     }
-    // The O2's GBE is its own display; it has no `[graphics] board`.
-    cfg.graphics.board = (profile != MachineProfile::O2Ip32).then_some(board);
-    if board == GraphicsBoard::Newport {
+    // The O2's GBE is its own display; its graphics slot takes no board.
+    if profile != MachineProfile::O2Ip32 {
         // A Newport shows nothing until a video mode is programmed. Set it
         // here rather than wait for a guest to get that far.
-        cfg.graphics.resolution = crate::dev::ng1::vc2_timings::NewportResolution::Res1280x1024;
+        let resolution = crate::dev::ng1::vc2_timings::NewportResolution::Res1280x1024;
+        cfg.set_graphics(board.map(|b| BoardConfig { resolution: if b == GraphicsBoard::Newport { resolution } else { Default::default() }, ..BoardConfig::new(b) }));
     }
     cfg
 }
@@ -150,7 +151,7 @@ fn stopping_from_the_main_thread_never_waits_on_the_renderer() {
                     m
                 }
                 None => {
-                    let cfg = config(&dir, profile, board);
+                    let cfg = config(&dir, profile, Some(board));
                     let mut m = big_stack(move || crate::workstation::build(cfg).expect("machine"));
                     *m.get_display().expect("a display").renderer_slot().lock() = Some(Box::new(probe.clone()));
                     m.start();
@@ -188,7 +189,7 @@ fn stopping_from_the_main_thread_never_waits_on_the_renderer() {
 fn the_octane_stops_its_disks_before_its_graphics() {
     use crate::traits::Device;
     let dir = scratch("octane-order");
-    let cfg = config(&dir, MachineProfile::OctaneIp30, GraphicsBoard::SolidImpact);
+    let cfg = config(&dir, MachineProfile::OctaneIp30, Some(GraphicsBoard::SolidImpact));
     let mut machine = big_stack(move || crate::ip30_machine::OctaneMachine::new(&cfg).expect("Octane"));
     let (scsi, ioc3) = (machine.scsi.clone(), machine.ioc3.clone());
     let (probe, overlap) = Probe::watching(move || ioc3.is_running() || scsi.iter().any(|s| s.is_running()));

@@ -153,7 +153,7 @@ pub struct Machine {
     /// Configured nvram file path, recorded in snapshot manifests.
     nvram_path: String,
     /// Host-forced Newport resolution from `[graphics] resolution` at construction.
-    display_resolution: crate::dev::ng1::vc2_timings::NewportResolution,
+    display_resolution: [crate::dev::ng1::vc2_timings::NewportResolution; 2],
     /// Whether Newport is active (not headless and Newport is selected).
     newport_active: bool,
     /// Indigo2 IP22 fullhouse layout (`!guinness`).
@@ -275,8 +275,10 @@ impl Machine {
         let (jitv2_threads, jitv2_threads_reason) = cfg.jitv2_pool_size();
         #[cfg(feature = "jitv2")]
         let jitv2_compile = cfg.jitv2.compile;
-        let display_resolution = cfg.graphics.resolution;
-        let newport_active = !cfg.headless && cfg.graphics_board() == GraphicsBoard::Newport;
+        let board = resolved.board().cloned();
+        let display_resolution = [board.as_ref(), resolved.heads().next()].map(|b| b.map_or_else(Default::default, |b| b.resolution));
+        let board = board.map(|b| b.model);
+        let newport_active = !cfg.headless && board == Some(GraphicsBoard::Newport);
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let cfg_cpu_model = cfg.cpu_part().expect("validate() accepted the cpu");
 
@@ -513,7 +515,7 @@ impl Machine {
         };
 
         // REX3 Graphics — Newport only; skipped in headless mode or when non-Newport board selected.
-        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
+        let rex3: Option<Arc<Rex3>> = if cfg.headless || board != Some(GraphicsBoard::Newport) {
             None
         } else {
             let r = Rex3::new(status.clone());
@@ -534,7 +536,7 @@ impl Machine {
             Some(r)
         };
 
-        let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || !gio.iter().any(|c| matches!(c.1, Card::Newport)) {
+        let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || !gio.iter().any(|c| matches!(c.1, Card::Board(_))) {
             None
         } else {
             let r = Rex3::new(status.clone());
@@ -569,15 +571,14 @@ impl Machine {
 
         // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
         // selecting the board is explicit, and the PROM needs it to probe.
-        let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
-            crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Elan | crate::config::GraphicsBoard::Extreme => {
-                use crate::config::GraphicsBoard;
+        let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match board {
+            Some(GraphicsBoard::Xz | GraphicsBoard::Elan | GraphicsBoard::Extreme) => {
                 use crate::dev::gr2::{Gr2, Gr2Variant};
                 // The Indy's XZ has 4 GE7s (libGLcore calls it GR3-Elan);
                 // the Indigo2 sold XZ with 2 and Elan with 4.
-                let variant = match cfg.graphics_board() {
-                    GraphicsBoard::Extreme => Gr2Variant::Extreme,
-                    GraphicsBoard::Elan => Gr2Variant::Elan,
+                let variant = match board {
+                    Some(GraphicsBoard::Extreme) => Gr2Variant::Extreme,
+                    Some(GraphicsBoard::Elan) => Gr2Variant::Elan,
                     _ if guinness => Gr2Variant::Elan,
                     _ => Gr2Variant::Xz,
                 };
@@ -603,11 +604,9 @@ impl Machine {
         };
 
         // IMPACT graphics in the GIO graphics slot.
-        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = match cfg.graphics_board() {
-            crate::config::GraphicsBoard::SolidImpact
-            | crate::config::GraphicsBoard::HighImpact
-            | crate::config::GraphicsBoard::MaxImpact => {
-                Some(crate::dev::mgras::Mgras::with_raster(cfg.graphics_board(), {
+        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = match board {
+            Some(kind @ (GraphicsBoard::SolidImpact | GraphicsBoard::HighImpact | GraphicsBoard::MaxImpact)) => {
+                Some(crate::dev::mgras::Mgras::with_raster(kind, {
                     use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
                     [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
                 }, status.clone(), cfg.graphics.raster, &cfg.graphics.gpu_backend).unwrap_or_else(|e| {
@@ -984,29 +983,24 @@ impl Machine {
         if !self.newport_active {
             return;
         }
-        let mode = if self.display_resolution.is_guest() {
-            // Fullhouse + guest-selected resolution: IRIX/PROM may never program VC2
-            // (embedded Indy PROM, gfxinit mismatch). Bootstrap 1280×1024 so the GUI
-            // refresh thread has non-zero dimensions; guest can reprogram VC2 later.
-            if self.fullhouse {
-                crate::dev::ng1::vc2_timings::NewportResolution::Res1280x1024
-            } else {
-                return;
-            }
-        } else {
-            self.display_resolution
-        };
-        let apply = |rex3: &Rex3| {
+        for (rex3, resolution) in [&self.board.rex3, &self.board.rex3_head1].into_iter().zip(self.display_resolution) {
+            let Some(rex3) = rex3 else { continue };
+            let mode = match (resolution.is_guest(), self.fullhouse) {
+                (false, _) => resolution,
+                // Fullhouse + guest-selected resolution: IRIX/PROM may never program VC2
+                // (embedded Indy PROM, gfxinit mismatch). Bootstrap 1280×1024 so the GUI
+                // refresh thread has non-zero dimensions; guest can reprogram VC2 later.
+                (true, true) => crate::dev::ng1::vc2_timings::NewportResolution::Res1280x1024,
+                (true, false) => continue,
+            };
             #[cfg(feature = "wgpu")]
             if rex3.resident_active() {
                 rex3.apply_resident_display_resolution(mode, true)
                     .unwrap_or_else(|error| panic!("REX3 {error}"));
-                return;
+                continue;
             }
             rex3.apply_display_resolution(mode);
-        };
-        if let Some(rex3) = &self.board.rex3 { apply(rex3); }
-        if let Some(rex3) = &self.board.rex3_head1 { apply(rex3); }
+        }
     }
 
     /// Path of the configured scratch SCSI volume, if any. Used by the CI
@@ -1813,7 +1807,7 @@ mod drop_tests {
             (MachineProfile::Indigo2Ip22, GraphicsBoard::Xz),
             (MachineProfile::Indigo2Ip28, GraphicsBoard::SolidImpact),
         ] {
-            let cfg = config(&dir, profile, board);
+            let cfg = config(&dir, profile, Some(board));
             let machine = big_stack(move || Machine::new(cfg));
             let bus = Arc::downgrade(&machine.board.phys);
             let cpu = Arc::downgrade(&machine.cpu);
@@ -2100,7 +2094,7 @@ mod production_newport_wgpu_tests {
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 let mut cfg = production_config(&nv_dir);
-                cfg.set_device("newport", true);
+                cfg.set_dual_head(true);
 
                 let mut machine = Machine::try_new(cfg).expect("construct production resident machine");
                 let primary = machine.get_rex3().expect("primary Newport");
@@ -2223,7 +2217,7 @@ mod gr2_checkpoint_tests {
     use std::path::Path;
 
     fn config(dir: &Path, board: GraphicsBoard) -> MachineConfig {
-        let mut cfg = crate::display_stop_tests::config(dir, MachineProfile::Indigo2Ip22, board);
+        let mut cfg = crate::display_stop_tests::config(dir, MachineProfile::Indigo2Ip22, Some(board));
         cfg.headless = true;
         cfg
     }
@@ -2408,7 +2402,7 @@ mod virtio_tests {
                 if profile == MachineProfile::Indigo2Ip28 {
                     cfg.machine.cpu = Some("r10000".into());
                     cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
-                    cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact);
+                    cfg.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::SolidImpact)));
                 }
                 // One unconnected port: no sockets in a unit test.
                 cfg.devices.push(card(&format!("type = \"virtio_serial\"\nat = \"{slot}\"\n[[port]]")));
@@ -2431,7 +2425,7 @@ mod virtio_tests {
             let dir = crate::display_stop_tests::scratch("indy-virtio");
             let saves = dir.join("saves");
             let cfg = |extra: String| {
-                let mut cfg = crate::display_stop_tests::config(&dir, MachineProfile::IndyIp24, crate::config::GraphicsBoard::Newport);
+                let mut cfg = crate::display_stop_tests::config(&dir, MachineProfile::IndyIp24, Some(crate::config::GraphicsBoard::Newport));
                 cfg.devices.push(card(&extra));
                 cfg
             };
@@ -2465,7 +2459,7 @@ mod virtio_tests {
                 crate::test_temp::nvram_in(&mut cfg, &nv_dir);
                 cfg.devices.clear();
                 cfg.machine.profile = MachineProfile::IndyIp24;
-                cfg.set_device("newport", true);
+                cfg.set_dual_head(true);
                 let m = Machine::new(cfg);
                 let sys_id = m.board.phys.read32((IOC_BASE + crate::dev::ioc::IOC_SYS_ID) as u64).data;
                 assert!((sys_id >> 1) & 0xF >= 4, "a baseboard revision that takes a second board");
@@ -2524,7 +2518,7 @@ mod virtio_tests {
                 cfg.machine.profile = MachineProfile::Indigo2Ip28;
                 cfg.machine.cpu = Some("r10000".into());
                 cfg.banks = [512, 512, 0, 0, 0, 0, 0, 0];
-                cfg.graphics.board = Some(crate::config::GraphicsBoard::SolidImpact);
+                cfg.set_graphics(Some(crate::devices::BoardConfig::new(crate::config::GraphicsBoard::SolidImpact)));
                 cfg.devices.push(card("type = \"virtio_serial\"\nat = \"gio1\"\n[[port]]"));
                 cfg.devices.push(card(&format!("type = \"virtio_9p\"\nat = \"gio0\"\npath = {:?}", std::env::temp_dir().display().to_string())));
                 assert_eq!(cfg.validate(), Ok(()));

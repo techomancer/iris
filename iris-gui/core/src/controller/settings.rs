@@ -14,6 +14,7 @@ use iris::config::{
     ForwardBind, ForwardProto, GraphicsBoard, MachineConfig, MachineProfile, NetMode, PortForwardConfig,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
+use iris::devices::BoardConfig;
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
 use super::icons::Icon;
@@ -503,24 +504,24 @@ impl SettingsController {
 
         // Display.
         let mut f = Vec::new();
-        let boards: Vec<GraphicsBoard> =
-            GraphicsBoard::ALL.iter().copied().filter(|b| hardware::board_supported(*b, p)).collect();
-        let board = cfg.graphics_board();
+        let boards = hardware::board_choices(p);
+        let entry = cfg.graphics_entry();
+        let board = entry.as_ref().map(|b| b.model);
         if p == MachineProfile::O2Ip32 {
             f.push(note(Severity::Info, t!("settings-o2-display")));
-        } else {
+        } else if !boards.is_empty() {
             f.push(Field {
                 id: field::BOARD,
                 label: t!("config-graphics-board"),
                 help: None,
                 kind: FieldKind::Choice {
-                    options: boards.iter().map(|b| b.label().to_string()).collect(),
-                    selected: boards.iter().position(|b| *b == board).unwrap_or(0),
+                    options: boards.iter().map(hardware::board_label).collect(),
+                    selected: hardware::board_position(&boards, &entry),
                 },
                 enabled: if boards.len() < 2 { Enabled::No(t!("settings-one-board")) } else { at_power_on() },
             });
         }
-        let newport = hardware::mc_machine(p) && board == GraphicsBoard::Newport && !cfg.headless;
+        let newport = hardware::mc_machine(p) && board == Some(GraphicsBoard::Newport) && !cfg.headless;
         if newport {
             f.push(Field {
                 id: field::RESOLUTION,
@@ -528,7 +529,7 @@ impl SettingsController {
                 help: None,
                 kind: FieldKind::Choice {
                     options: NewportResolution::ALL.iter().map(|r| r.label().to_string()).collect(),
-                    selected: NewportResolution::ALL.iter().position(|r| *r == cfg.graphics.resolution).unwrap_or(0),
+                    selected: NewportResolution::ALL.iter().position(|r| Some(*r) == entry.as_ref().map(|b| b.resolution)).unwrap_or(0),
                 },
                 enabled: at_power_on(),
             });
@@ -537,7 +538,7 @@ impl SettingsController {
                     id: field::HEADS,
                     label: t!("settings-heads"),
                     help: None,
-                    kind: FieldKind::Choice { options: vec!["1".into(), "2".into()], selected: usize::from(cfg.has_device("newport")) },
+                    kind: FieldKind::Choice { options: vec!["1".into(), "2".into()], selected: usize::from(cfg.dual_head()) },
                     enabled: at_power_on(),
                 });
             }
@@ -545,7 +546,7 @@ impl SettingsController {
         out.push(Section {
             id: super::ids::settings::DISPLAY,
             title: t!("settings-section-display"),
-            summary: if p == MachineProfile::O2Ip32 { "GBE".into() } else { board.label().to_string() },
+            summary: if p == MachineProfile::O2Ip32 { "GBE".into() } else { hardware::board_label(&entry) },
             icon: Icon::DisplayScale,
             fields: f,
         });
@@ -1180,19 +1181,20 @@ fn set(cfg: &mut MachineConfig, field: &'static str, value: Value) -> bool {
         (field::NVRAM, Value::Text(s)) => replace(&mut cfg.nvram, s),
         (field::NVEEPROM, Value::Text(s)) => replace(&mut cfg.nveeprom, s),
         (field::BOARD, Value::Index(i)) => {
-            let boards: Vec<GraphicsBoard> =
-                GraphicsBoard::ALL.iter().copied().filter(|b| hardware::board_supported(*b, p)).collect();
-            match boards.get(i) {
-                Some(&b) if b != cfg.graphics_board() => {
-                    cfg.graphics.board = Some(b);
+            match hardware::board_choices(p).into_iter().nth(i) {
+                Some(b) if hardware::board_label(&b) != hardware::board_label(&cfg.graphics_entry()) => {
+                    if b.as_ref().map(|b| b.model) != Some(GraphicsBoard::Newport) {
+                        cfg.set_dual_head(false);
+                    }
+                    cfg.set_graphics(b);
                     true
                 }
                 _ => false,
             }
         }
-        (field::RESOLUTION, Value::Index(i)) => match NewportResolution::ALL.get(i) {
-            Some(&r) if r != cfg.graphics.resolution => {
-                cfg.graphics.resolution = r;
+        (field::RESOLUTION, Value::Index(i)) => match (NewportResolution::ALL.get(i), cfg.graphics_entry()) {
+            (Some(&r), Some(b)) if r != b.resolution => {
+                cfg.set_graphics(Some(BoardConfig { resolution: r, ..b }));
                 true
             }
             _ => false,
@@ -1200,10 +1202,10 @@ fn set(cfg: &mut MachineConfig, field: &'static str, value: Value) -> bool {
         (field::HEADS, Value::Index(i)) => {
             // The second head is a Newport card in a GIO slot.
             let dual = i >= 1;
-            if dual == cfg.has_device("newport") {
+            if dual == cfg.dual_head() {
                 return false;
             }
-            cfg.set_device("newport", dual);
+            cfg.set_dual_head(dual);
             true
         }
         (field::NET_MODE, Value::Index(i)) => match net_modes().get(i) {
