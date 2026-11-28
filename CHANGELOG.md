@@ -137,6 +137,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   TrueColor X windows draw their colour; they came out as a red ramp. Same
   on the CPU, the REX3 JIT and the GPU raster.
 
+### Graphics boards by slot
+
+- Every graphics board is a `[[devices]]` entry: `newport`, `express`, `impact`, `vpro` or `kona`, with a
+  `model` (`xz`, `solid`, `v12`, `ir2e`), and `raster_managers`, `flash` and `resolution` where the board
+  has them. `type = "none"` at `graphics` leaves the slot empty. `[graphics] board`, `heads`, `resolution` and
+  `flash` and `--graphics` are refused with the entry to write; iris-gui reads them as entries.
+
 ### Disks and cards by slot
 
 - Disks, CD-ROMs, DaynaPorts and cards are `[[devices]]` entries with an

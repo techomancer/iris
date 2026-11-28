@@ -15,9 +15,9 @@ implement, compares them, and describes the structure they share.
 | IMPACT (MGRAS) | Indigo2 IMPACT, Octane | [mgras.md](mgras.md) |
 | O2 graphics (CRIME, GBE) | O2 | [o2.md](o2.md) |
 | VPro (Odyssey) | Octane, Fuel, Tezro and V-brick systems | [vpro.md](vpro.md) |
-| InfiniteReality (KONA) | Onyx, Onyx2 and later Onyx systems; modelled on [Onyx2](../onyx2-ip27.md) and [Onyx 3000](../onyx3000-ip35.md) with `[graphics] board` | [kona.md](kona.md) |
+| InfiniteReality (KONA) | Onyx, Onyx2 and later Onyx systems; modelled on [Onyx2](../onyx2-ip27.md) and [Onyx 3000](../onyx3000-ip35.md) with a `kona` device entry | [kona.md](kona.md) |
 
-The Machines column lists the machines each board shipped in. Iris accepts some boards on more machine profiles than the column shows; `GraphicsBoard::supports` in `src/config.rs` lists them.
+The Machines column lists the machines each board shipped in. Iris accepts some boards on more machine profiles than the column shows; each machine's slot list (`iris --list-slots`) says which it takes.
 
 ## The graphics pipeline
 

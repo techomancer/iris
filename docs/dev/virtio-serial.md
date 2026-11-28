@@ -27,7 +27,7 @@ The Indy and Indigo2 have no PCI bus, so they get the memory-mapped transport
 in a 64 KB window of an empty GIO expansion slot (an empty slot otherwise
 answers with a GIO timeout, so nothing real is displaced). Slot 1 is the
 default. Slot 0 is shared with `test_device` and the Ultra64 board; slot 1 is
-shared with the second Newport head (`graphics.heads = 2`). A clash is refused
+shared with the second Newport head (a `newport` entry at `gio0`). A clash is refused
 when the configuration is validated.
 
 The O2's transport is complete and tested but the machine does not use it: its
